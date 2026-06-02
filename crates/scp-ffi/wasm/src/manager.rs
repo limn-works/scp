@@ -2703,8 +2703,6 @@ impl WasmContextManager {
         &mut self,
         params: OpenOutletStreamParams<'_>,
     ) -> Result<String, ScpWasmError> {
-        use scp_protocol::context::outlets::stream::OutletStreamChunk;
-
         let OpenOutletStreamParams {
             context_id,
             outlet_id,
@@ -2742,13 +2740,86 @@ impl WasmContextManager {
             }
         }
 
+        // SCP-OUT-037 W3 (r2 HIGH fix): the admission slot is now held.
+        // Every fallible step below this point — context lookup, outlet
+        // lookup, input-schema validation (caller-controlled input!),
+        // handler / output-schema failure, on-demand chunk signing, and
+        // the duplicate-`request_id` rejection in `insert_stream_session`
+        // — MUST release the slot before propagating, or the per-invoker
+        // / per-origin / per-outlet caps leak a slot per failed open and
+        // wedge the invoker (8 bad opens) or the whole outlet (~128). The
+        // native bridges get this for free (runtime `release_admission`
+        // on every dispatch error path); the WASM reimplementation must
+        // do it explicitly. To keep a SINGLE owner of error-release —
+        // avoiding any double-release with the eviction sites — the
+        // post-gate body lives in `open_outlet_stream_admitted`, and this
+        // is the one and only place that releases on its `Err`. The
+        // session is not built yet on these paths, so its `Drop` cannot
+        // compensate (and `Drop` is a no-op for admission by design); the
+        // release routes through the admission map directly under the
+        // pinned `(invoker, origin=invoker, outlet)` triple — exactly
+        // what `try_admit` incremented.
+        self.open_outlet_stream_admitted(OpenOutletStreamParams {
+            context_id,
+            outlet_id,
+            input_json,
+            identity_did,
+            caveats_binding,
+            stream_epoch,
+            credit_window,
+        })
+        .inspect_err(|_| {
+            Self::release_admission_slot(
+                &mut self.outlet_stream_admission,
+                context_id,
+                identity_did,
+                outlet_id,
+            );
+        })
+    }
+
+    /// Post-admission body of [`Self::open_outlet_stream`]. Runs every
+    /// fallible step after the admission slot is reserved; on ANY `Err`
+    /// the caller ([`Self::open_outlet_stream`]) releases the slot
+    /// exactly once. Extracted so the admission-release guard has a
+    /// single owner and so the open path stays under the workspace's
+    /// `clippy::too_many_lines` ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every post-gate failure unchanged (outlet-not-found,
+    /// input/output-schema violation, handler failure, chunk-signing
+    /// failure, duplicate-`request_id` conflict). The caller compensates
+    /// the admission slot on each.
+    fn open_outlet_stream_admitted(
+        &mut self,
+        params: OpenOutletStreamParams<'_>,
+    ) -> Result<String, ScpWasmError> {
+        use scp_protocol::context::outlets::stream::OutletStreamChunk;
+
+        let OpenOutletStreamParams {
+            context_id,
+            outlet_id,
+            input_json,
+            identity_did,
+            caveats_binding,
+            stream_epoch,
+            credit_window,
+        } = params;
+
         let ctx = self.require_active_context_mut(context_id)?;
 
         let registration =
             ctx.outlet_registry
                 .get(outlet_id)
                 .ok_or_else(|| ScpWasmError::Tool {
-                    message: format!("tool '{outlet_id}' not found in context '{context_id}'"),
+                    // ADR-049 §4: input-free static message on the
+                    // streaming open surface — do not echo the
+                    // caller-supplied `outlet_id` / `context_id`. Matches
+                    // the native UniFFI bridge's static "tool not
+                    // registered" open-path string; the `SCP-TOOL-6002`
+                    // code carries the machine signal.
+                    message: "tool not registered".to_owned(),
                     code: codes::TOOL_6002.to_owned(),
                 })?;
 
@@ -2886,9 +2957,15 @@ impl WasmContextManager {
     /// requires `request_id` uniqueness per context) is a
     /// `protocol.session-id-conflict`. On a duplicate the freshly-built
     /// `session` is dropped (its `caveats_binding` scrubbed by its
-    /// `Drop`) and the admission slot the open path reserved is released
-    /// via [`Self::release_admission_once`] so the rejected open does not
-    /// leak a slot, then the conflict error is returned.
+    /// `Drop`) and the conflict error is returned.
+    ///
+    /// Admission-slot release on this conflict is NOT done here: it is
+    /// owned by the single error-release guard in
+    /// [`Self::open_outlet_stream`] (r2 HIGH fix). Routing every
+    /// post-gate error — including this duplicate-key rejection —
+    /// through that one guard keeps a SINGLE owner of admission-release
+    /// and removes the double-release hazard that arises when both this
+    /// method and the open guard try to release the same slot.
     ///
     /// # Spec note (code/slug pairing)
     ///
@@ -2907,29 +2984,29 @@ impl WasmContextManager {
     /// the composite key.
     fn insert_stream_session(
         &mut self,
-        mut session: WasmOutletStreamSession,
+        session: WasmOutletStreamSession,
         context_id: &str,
         request_id_hex: &str,
     ) -> Result<(), ScpWasmError> {
-        use scp_protocol::context::outlets::error_codes::{
-            CODE_PROTOCOL_SESSION, SLUG_PROTOCOL_SESSION_ID_CONFLICT,
-        };
+        use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
         use std::collections::hash_map::Entry;
 
         let key = (context_id.to_owned(), request_id_hex.to_owned());
         match self.outlet_streams.entry(key) {
             Entry::Occupied(_) => {
-                // Release the admission slot this open reserved before
-                // returning the conflict — a rejected open MUST NOT leak
-                // a slot (W3 + W5). Use the rejected session's own
-                // identity triple (it matches what the gate admitted
-                // under: invoker == origin on WASM single-hop).
-                Self::release_admission_once(&mut self.outlet_stream_admission, &mut session);
+                // The freshly-built `session` is dropped here (its
+                // `caveats_binding` is scrubbed by `Drop`). The admission
+                // slot the open reserved is released by the single guard
+                // in `open_outlet_stream`, which compensates on this
+                // `Err` — not here.
+                //
+                // ADR-049 §4: input-free static message — never echo the
+                // caller-influenced `request_id_hex` / `context_id`. The
+                // `SCP-TOOL-6101` code + `protocol.session-id-conflict`
+                // slug carry the machine signal.
+                drop(session);
                 Err(ScpWasmError::Context {
-                    message: format!(
-                        "stream '{request_id_hex}' already open in context \
-                         '{context_id}' ({SLUG_PROTOCOL_SESSION_ID_CONFLICT})"
-                    ),
+                    message: "stream already open (protocol.session-id-conflict)".to_owned(),
                     code: CODE_PROTOCOL_SESSION.to_owned(),
                 })
             }
@@ -2959,8 +3036,7 @@ impl WasmContextManager {
         request_id_hex: &str,
     ) -> Option<scp_protocol::context::outlets::stream::OutletStreamChunk> {
         use scp_protocol::context::outlets::error_codes::{
-            CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_CREDIT,
-            SLUG_EXECUTION_CANCEL_ACK_TIMEOUT, SLUG_EXECUTION_CREDIT_EXHAUSTED,
+            CODE_EXECUTION_CREDIT, SLUG_EXECUTION_CREDIT_EXHAUSTED,
         };
         use scp_protocol::context::outlets::stream::ChunkPayload;
 
@@ -2969,31 +3045,49 @@ impl WasmContextManager {
 
         // §5.4.5 cancellation point — checked BEFORE popping the next
         // queued chunk so a cancel observed between two consumer pulls
-        // truncates the stream and surfaces as a signed synthetic
-        // terminal `Error` chunk. WASM's pre-materialised pipeline has
-        // no executor pump to suspend; this is the equivalent of the
+        // truncates the stream and surfaces as a signed terminal
+        // cancel-ack chunk. WASM's pre-materialised pipeline has no
+        // executor pump to suspend; this is the equivalent of the
         // runtime path's `CancelAckTracker::should_force_close` —
         // chunks beyond the cancel point MUST NOT be emitted, and the
         // SDK consumer MUST observe a terminal closure (not a silent
         // `None`).
+        //
+        // §5.4.5 cancel-ack shape: an ordinary invoker cancel where the
+        // executor produces the terminal within the cancel-ack window is
+        // a *normal* terminal chunk (`End` or `Error{terminal:true}`),
+        // and that terminal chunk IS the cancel-ack (spec §5.4.5 step 3).
+        // The dedicated `execution.cancel-ack-timeout` code
+        // (`SCP-TOOL-6135`) is reserved exclusively for the framework
+        // *timer* firing before the executor emits a terminal — the
+        // runtime mints it only from `CancelAckTracker::should_force_close`
+        // via `cancel_ack_timeout_payload`. On WASM the lazy generator IS
+        // the executor and always produces its terminal synchronously on
+        // the next pull (never the timeout path), so this branch emits a
+        // normal terminal `End` cancel-ack — never 6135. The framework
+        // timeout path on WASM is `outlet_stream_terminate` with
+        // `TerminateReason::CancelAckTimeout`, which is the only site that
+        // mints `SCP-TOOL-6135`.
         if session.cancelled && !session.terminated {
-            // SCP-OUT-037 W3: the synthetic terminal takes the
+            // SCP-OUT-037 W3: the cancel-ack terminal takes the
             // next-emission sequence (`emitted_count`), NOT
             // `emitted_count + queued_tail_len`. The dropped tail's
             // sequence numbers are never emitted, so the terminal must
             // land at the cursor to keep the per-stream sequence space
             // contiguous from the receiver's perspective.
             let sequence = Self::next_emission_sequence(session);
-            let error_payload = ChunkPayload::Error {
-                code: CODE_EXECUTION_CANCEL_ACK_TIMEOUT.to_owned(),
-                message: format!(
-                    "{SLUG_EXECUTION_CANCEL_ACK_TIMEOUT}: stream cancelled by invoker"
-                ),
-                terminal: true,
+            // The stream was truncated by the cancel before completing,
+            // so the aggregate is `null` (no completed output) rather
+            // than a fabricated value; provenance is the same minimal
+            // local-context record the well-formed `End` chunk carries.
+            let end_payload = ChunkPayload::End {
+                aggregate: serde_json::Value::Null,
+                provenance: build_minimal_stream_end_provenance(&session.context_id),
+                execution_time_ms: 0,
             };
             // SCP-OUT-037 W1: sign on-demand under a transient key — the
             // session holds only the public verifying key.
-            let chunk = Self::sign_synthetic_terminal(session, sequence, error_payload)?;
+            let chunk = Self::sign_synthetic_terminal(session, sequence, end_payload)?;
             session.terminated = true;
             // Cancel truncates: drop any chunks queued past the cancel
             // point — the spec says "Already-emitted chunks remain
@@ -3202,10 +3296,12 @@ impl WasmContextManager {
             .outlet_streams
             .get_mut(&key)
             .ok_or_else(|| ScpWasmError::Context {
-                message: format!(
-                    "stream '{request_id_hex}' not found in context '{context_id}' \
-                         registry (protocol.unknown-session)"
-                ),
+                // ADR-049 §4: input-free static message — never echo the
+                // caller-supplied `request_id_hex` / `context_id` back.
+                // Matches the native bridges' static control-plane string;
+                // the `SCP-TOOL-6101` code + `protocol.unknown-session`
+                // slug carry the machine signal.
+                message: "stream not found in registry (protocol.unknown-session)".to_owned(),
                 code: CODE_PROTOCOL_SESSION.to_owned(),
             })?;
         // SCP-OUT-037 W2 triple-identity check + CRITICAL #1: the
@@ -3215,10 +3311,13 @@ impl WasmContextManager {
         // pinned invoker_did before signing under the invoker key.
         if session.context_id != context_id || session.invoker_did != caller_did {
             return Err(ScpWasmError::Context {
-                message: format!(
-                    "caller {caller_did} is not the pinned invoker for stream \
-                     '{request_id_hex}' in context '{context_id}' (authorization.denied)"
-                ),
+                // ADR-049 §4: input-free static message — never echo the
+                // caller-supplied `caller_did` / `request_id_hex` /
+                // `context_id` back. Matches the native bridges' static
+                // control-plane string; the `SCP-PERM-3001` code +
+                // `authorization.denied` slug carry the machine signal.
+                message: "caller is not the pinned invoker for this stream (authorization.denied)"
+                    .to_owned(),
                 code: codes::PERM_3001.to_owned(),
             });
         }
@@ -3339,10 +3438,12 @@ impl WasmContextManager {
             .outlet_streams
             .get_mut(&key)
             .ok_or_else(|| ScpWasmError::Context {
-                message: format!(
-                    "stream '{request_id_hex}' not found in context '{context_id}' \
-                         registry (protocol.unknown-session)"
-                ),
+                // ADR-049 §4: input-free static message — never echo the
+                // caller-supplied `request_id_hex` / `context_id` back.
+                // Matches the native bridges' static control-plane string;
+                // the `SCP-TOOL-6101` code + `protocol.unknown-session`
+                // slug carry the machine signal.
+                message: "stream not found in registry (protocol.unknown-session)".to_owned(),
                 code: CODE_PROTOCOL_SESSION.to_owned(),
             })?;
         // SCP-OUT-037 W2 triple-identity check + CRITICAL #1: re-assert
@@ -3350,10 +3451,13 @@ impl WasmContextManager {
         // against the pinned invoker before any state mutation.
         if session.context_id != context_id || session.invoker_did != caller_did {
             return Err(ScpWasmError::Context {
-                message: format!(
-                    "caller {caller_did} is not the pinned invoker for stream \
-                     '{request_id_hex}' in context '{context_id}' (authorization.denied)"
-                ),
+                // ADR-049 §4: input-free static message — never echo the
+                // caller-supplied `caller_did` / `request_id_hex` /
+                // `context_id` back. Matches the native bridges' static
+                // control-plane string; the `SCP-PERM-3001` code +
+                // `authorization.denied` slug carry the machine signal.
+                message: "caller is not the pinned invoker for this stream (authorization.denied)"
+                    .to_owned(),
                 code: codes::PERM_3001.to_owned(),
             });
         }
@@ -3415,13 +3519,17 @@ impl WasmContextManager {
         // chunks here and DO NOT flip `terminated` synchronously.
         // Instead, `outlet_stream_next` consults `cancelled` BEFORE
         // popping the next chunk and, on `cancelled = true`, builds a
-        // signed synthetic terminal `Error` chunk (code
-        // `SCP-TOOL-6135`, slug `execution.cancel-ack-timeout` — the
-        // canonical §5.4.5 closure for executor-initiated stream
-        // ends after a cancel signal) and stops producing real
-        // chunks. That moves the cancellation observation from the
-        // synchronous cancel call to the consumer's pull, which is
-        // the behaviour the runtime path delivers via `should_force_close`.
+        // signed terminal `End` cancel-ack chunk (a *normal* terminal
+        // per §5.4.5 step 3 — the executor's terminal chunk IS the
+        // cancel-ack) and stops producing real chunks. The dedicated
+        // `execution.cancel-ack-timeout` code (`SCP-TOOL-6135`) is NOT
+        // used here: the spec reserves it for the framework cancel-ack
+        // *timer* firing before the executor emits a terminal, which on
+        // WASM is the `outlet_stream_terminate` /
+        // `TerminateReason::CancelAckTimeout` path. Emitting the normal
+        // `End` cancel-ack moves the cancellation observation from the
+        // synchronous cancel call to the consumer's pull, matching the
+        // runtime path delivered via `should_force_close`.
         Ok(Some(next_seq))
     }
 
@@ -3477,20 +3585,25 @@ impl WasmContextManager {
             .outlet_streams
             .get_mut(&key)
             .ok_or_else(|| ScpWasmError::Context {
-                message: format!(
-                    "stream '{request_id_hex}' not found in context '{context_id}' \
-                         registry (protocol.unknown-session)"
-                ),
+                // ADR-049 §4: input-free static message — never echo the
+                // caller-supplied `request_id_hex` / `context_id` back.
+                // Matches the native bridges' static control-plane string;
+                // the `SCP-TOOL-6101` code + `protocol.unknown-session`
+                // slug carry the machine signal.
+                message: "stream not found in registry (protocol.unknown-session)".to_owned(),
                 code: CODE_PROTOCOL_SESSION.to_owned(),
             })?;
         // SCP-OUT-037 W2 triple-identity check + CRITICAL #1: re-assert
         // context_id AND caller_did against the pinned invoker.
         if session.context_id != context_id || session.invoker_did != caller_did {
             return Err(ScpWasmError::Context {
-                message: format!(
-                    "caller {caller_did} is not the pinned invoker for stream \
-                     '{request_id_hex}' in context '{context_id}' (authorization.denied)"
-                ),
+                // ADR-049 §4: input-free static message — never echo the
+                // caller-supplied `caller_did` / `request_id_hex` /
+                // `context_id` back. Matches the native bridges' static
+                // control-plane string; the `SCP-PERM-3001` code +
+                // `authorization.denied` slug carry the machine signal.
+                message: "caller is not the pinned invoker for this stream (authorization.denied)"
+                    .to_owned(),
                 code: codes::PERM_3001.to_owned(),
             });
         }
@@ -7668,38 +7781,31 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Asserts a chunk is the canonical cancel-ack synthetic terminal
-    /// (`SCP-TOOL-6135` / `execution.cancel-ack-timeout`, `terminal:
-    /// true`) and that its signature round-trips under `signing`'s
-    /// verifying key for context `"ctx"` / outlet `"outlet"`. Shared by
-    /// the direct cancel test and the cancellation-vector replay so both
-    /// pin the same surface without duplicating the match arms.
+    /// Asserts a chunk is the canonical cancel-ack terminal — a normal
+    /// terminal `End` chunk (§5.4.5 step 3: an ordinary invoker cancel's
+    /// terminal IS the cancel-ack, NOT a `SCP-TOOL-6135`
+    /// `execution.cancel-ack-timeout` error, which is reserved for the
+    /// framework timer-fired path) — and that its signature round-trips
+    /// under `signing`'s verifying key for context `"ctx"` / outlet
+    /// `"outlet"`. Shared by the direct cancel test and the
+    /// cancellation-vector replay so both pin the same surface without
+    /// duplicating the match arms.
     fn assert_cancel_ack_terminal(
         chunk: &scp_protocol::context::outlets::stream::OutletStreamChunk,
         signing: &ed25519_dalek::SigningKey,
         caveats_binding: &[u8; 32],
     ) {
-        use scp_protocol::context::outlets::error_codes::{
-            CODE_EXECUTION_CANCEL_ACK_TIMEOUT, SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
-        };
         use scp_protocol::context::outlets::stream::ChunkPayload;
         match &chunk.payload {
-            ChunkPayload::Error {
-                code,
-                terminal,
-                message,
-            } => {
-                assert!(*terminal, "synthetic chunk MUST be terminal");
+            ChunkPayload::End { aggregate, .. } => {
                 assert_eq!(
-                    code, CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
-                    "cancel-initiated synthetic terminal uses cancel-ack-timeout code"
-                );
-                assert!(
-                    message.contains(SLUG_EXECUTION_CANCEL_ACK_TIMEOUT),
-                    "synthetic message includes the canonical slug, got: {message}"
+                    *aggregate,
+                    serde_json::Value::Null,
+                    "cancel-ack End aggregate is null — the stream was truncated, \
+                     not completed"
                 );
             }
-            other => panic!("expected synthetic terminal Error, got {other:?}"),
+            other => panic!("expected terminal End cancel-ack, got {other:?}"),
         }
         assert!(
             scp_protocol::context::outlets::stream::verify_chunk_signature(
@@ -7709,7 +7815,7 @@ mod tests {
                 "outlet",
                 caveats_binding,
             ),
-            "synthetic cancel-ack terminal chunk signature must verify"
+            "cancel-ack terminal chunk signature must verify"
         );
     }
 
@@ -9617,9 +9723,10 @@ mod tests {
 
     /// Cancel-mid-stream test: after `outlet_stream_cancel` lands while
     /// chunks remain queued, the next `outlet_stream_next` call MUST
-    /// return a signed synthetic terminal `Error` chunk
-    /// (`SCP-TOOL-6135` / `execution.cancel-ack-timeout`) and the
-    /// remaining queued chunks MUST be dropped — the consumer NEVER
+    /// return a signed terminal `End` cancel-ack chunk (§5.4.5 step 3 —
+    /// the executor's terminal IS the cancel-ack; NOT `SCP-TOOL-6135`,
+    /// which is reserved for the framework cancel-ack *timer* path) and
+    /// the remaining queued chunks MUST be dropped — the consumer NEVER
     /// observes the 4th chunk after cancelling on chunk 3.
     #[test]
     fn wasm_outlet_stream_next_emits_synthetic_terminal_after_cancel() {
@@ -9801,10 +9908,12 @@ mod tests {
     //   secret key is materialised on-demand via `with_signing_key`,
     //   never retained on the session — SCP-OUT-037 W1).
     // - The cancellation vector's `outlet_stream_cancel` →
-    //   synthetic-terminal flow surfaces the `SCP-TOOL-6135`
-    //   (`execution.cancel-ack-timeout`) terminal error on the next
-    //   `outlet_stream_next` pull — matching the runtime cancel-ack
-    //   ceiling on native bridges.
+    //   terminal flow surfaces a normal terminal `End` cancel-ack
+    //   chunk on the next `outlet_stream_next` pull (§5.4.5 step 3 —
+    //   the executor's terminal IS the cancel-ack; `SCP-TOOL-6135`
+    //   `execution.cancel-ack-timeout` is reserved for the framework
+    //   timer-fired path, not an ordinary invoker cancel) — matching
+    //   the runtime cancel-ack ceiling on native bridges.
     // - The credit_exhaustion vector's zero-grant flow surfaces the
     //   `SCP-TOOL-6131` (`execution.credit-exhausted`) terminal error
     //   on the second pull after the credit window depletes.
@@ -10209,13 +10318,23 @@ mod tests {
 
     /// SCP-OUT-039 AC4 — `cancellation` vector through WASM bridge.
     ///
-    /// Vector expectation (runtime): receiver issues `OutletCancel`
-    /// mid-stream; framework synthesises a terminal cancel-ack chunk
-    /// under `SCP-TOOL-6135` (`execution.cancel-ack-timeout`). WASM
-    /// bridge maps: `outlet_stream_cancel` flips `session.cancelled`;
-    /// the next `outlet_stream_next` pull synthesises the terminal
-    /// cancel-ack Error chunk (per the lazy-generator pattern
-    /// documented in `crates/scp-ffi/wasm/CLAUDE.md` →
+    /// Vector expectation (§5.4.5): receiver issues `OutletCancel`
+    /// mid-stream; the stream terminates with status `Cancelled`. On
+    /// the runtime path the vector's executor *parks*, so the framework
+    /// cancel-ack *timer* fires and force-closes with a terminal
+    /// `Error`. On WASM there is no parking executor and no timer: the
+    /// pre-materialised lazy generator IS the executor and always
+    /// honors the cancel by emitting its terminal synchronously on the
+    /// next pull — the §5.4.5 step-3 "executor's terminal IS the
+    /// cancel-ack" case — so the WASM cancel-ack is a *normal* terminal
+    /// `End` chunk, never the `SCP-TOOL-6135`
+    /// (`execution.cancel-ack-timeout`) timer code (which is
+    /// unreachable on WASM by construction — only
+    /// `outlet_stream_terminate` with `TerminateReason::CancelAckTimeout`
+    /// mints it). WASM bridge maps: `outlet_stream_cancel` flips
+    /// `session.cancelled`; the next `outlet_stream_next` pull builds
+    /// the terminal `End` cancel-ack chunk (per the lazy-generator
+    /// pattern documented in `crates/scp-ffi/wasm/CLAUDE.md` →
     /// "Outlet Streaming — Lazy Cancellation Point"). This test drives
     /// the same flow the existing
     /// `wasm_outlet_stream_next_emits_synthetic_terminal_after_cancel`
@@ -10276,11 +10395,12 @@ mod tests {
             "WASM cancel-ack-seq = emitted_count at cancel time"
         );
 
-        // Next pull → synthetic terminal Error under
-        // `SCP-TOOL-6135` (`execution.cancel-ack-timeout`). The shared
-        // helper pins the terminal shape AND the per-chunk signature
-        // round-trip under the session's pinned operator key — AC4's
-        // signature invariant on the cancellation funnel.
+        // Next pull → normal terminal `End` cancel-ack (§5.4.5 step 3 —
+        // the executor's terminal IS the cancel-ack; NOT the
+        // `SCP-TOOL-6135` timer code). The shared helper pins the
+        // terminal shape AND the per-chunk signature round-trip under
+        // the session's pinned operator key — AC4's signature invariant
+        // on the cancellation funnel.
         let terminal = mgr
             .outlet_stream_next("ctx", &req_hex)
             .expect("synthetic terminal after cancel");
@@ -10756,18 +10876,21 @@ mod tests {
 
     /// W5: opening a stream whose `(context_id, request_id_hex)` already
     /// exists is rejected with `SCP-TOOL-6101` /
-    /// `protocol.session-id-conflict`; the original session is left
-    /// untouched; and the admission slot the rejected open reserved is
-    /// released (the per-invoker count is not permanently doubled).
+    /// `protocol.session-id-conflict` and the original session is left
+    /// untouched.
     ///
-    /// Drives the real `open_outlet_stream` path twice with a
-    /// clock-pinned identical `request_id` by seeding the first session
-    /// directly under a known key and then attempting a duplicate insert
-    /// through `insert_stream_session` semantics — exercised here by a
-    /// direct second `insert_test_session`-shaped open via the manager's
-    /// duplicate guard.
+    /// Admission-release contract (r2 HIGH fix): `insert_stream_session`
+    /// itself does NOT release the admission slot on the duplicate-key
+    /// rejection — that responsibility moved to the single error-release
+    /// guard in `open_outlet_stream`, which compensates on every
+    /// post-gate `Err` uniformly. This test therefore asserts the slot
+    /// is STILL held after a direct `insert_stream_session` rejection
+    /// (the guard never ran because we bypassed `open_outlet_stream`);
+    /// the end-to-end release on the duplicate path through the real open
+    /// path is pinned by
+    /// `wasm_open_outlet_stream_error_paths_release_admission_slot`.
     #[test]
-    fn wasm_w5_duplicate_registry_key_rejected_and_admission_not_doubled() {
+    fn wasm_w5_duplicate_registry_key_rejected() {
         use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
         use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
 
@@ -10798,7 +10921,10 @@ mod tests {
 
         // Build a DUPLICATE-keyed session and reserve a second admission
         // slot (as the open path's gate would), then route it through
-        // the manager's duplicate guard.
+        // the manager's duplicate guard directly. NOTE: because we bypass
+        // `open_outlet_stream` (the owner of admission-release), the slot
+        // the gate reserved is NOT released by `insert_stream_session`
+        // alone — that is the r2 HIGH single-owner contract.
         let (dup_session, _did) = make_test_session(
             &signing,
             "ctx",
@@ -10832,12 +10958,15 @@ mod tests {
             other => panic!("expected Context error, got {other:?}"),
         }
 
-        // W5: the rejected open released its reserved slot — the count
-        // is back to 1 (the original's), NOT doubled.
+        // r2 HIGH single-owner contract: `insert_stream_session` does
+        // NOT release on rejection — the slot stays held because we
+        // bypassed `open_outlet_stream`'s guard. The end-to-end release
+        // through the real open path is pinned separately by
+        // `wasm_open_outlet_stream_error_paths_release_admission_slot`.
         assert_eq!(
             admission_count(&mgr, "ctx", &invoker_did),
-            1,
-            "rejected duplicate open released its admission slot (W5 + W3)"
+            2,
+            "insert_stream_session does not release on its own — the open guard owns release"
         );
 
         // The ORIGINAL session is untouched: still present, still
@@ -10856,5 +10985,123 @@ mod tests {
             }
             other => panic!("expected original Data chunk, got {other:?}"),
         }
+    }
+
+    /// r2 HIGH fix — a post-gate error in `open_outlet_stream` releases
+    /// the admission slot it reserved on ALL three counters
+    /// (per-invoker / per-origin / per-outlet), so a failed open does
+    /// NOT leak a slot. Drives the real `open_outlet_stream` funnel with
+    /// a schema-violating input (caller-controlled — the highest-risk
+    /// leak surface: 8 bad opens would otherwise lock an invoker out of
+    /// streaming on the context with a false rate-limit) and asserts:
+    ///   1. the open fails (input-schema rejection, after the gate),
+    ///   2. all three admission counters return to the pre-open baseline,
+    ///   3. a subsequent well-formed open by the SAME invoker/outlet
+    ///      succeeds (the cap was not silently consumed).
+    #[test]
+    fn wasm_open_outlet_stream_error_paths_release_admission_slot() {
+        let mut mgr = WasmContextManager::new();
+
+        // Register an identity whose key the open path resolves via
+        // `with_signing_key(identity_did)`, and a context + outlet with
+        // an input schema that requires `a`/`b` to be numbers.
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+        let invoker_did = crate::identity::register_identity_for_test(&signing);
+        let (context_id, outlet_id) = vector_replay_setup(&mut mgr, "admission-leak", &invoker_did);
+
+        // Helper: read all three admission counters for the pinned
+        // (invoker, origin=invoker, outlet) triple on this context.
+        let counters = |mgr: &WasmContextManager| -> (u32, u32, u32) {
+            mgr.outlet_stream_admission
+                .get(&context_id)
+                .map_or((0, 0, 0), |t| {
+                    (
+                        t.per_invoker.get(&invoker_did).copied().unwrap_or(0),
+                        t.per_origin_invoker.get(&invoker_did).copied().unwrap_or(0),
+                        t.per_outlet.get(&outlet_id).copied().unwrap_or(0),
+                    )
+                })
+        };
+
+        assert_eq!(
+            counters(&mgr),
+            (0, 0, 0),
+            "baseline: no admission slots held before any open"
+        );
+
+        // A schema-violating input: `a` must be a number, give it a
+        // string. This trips `validate_value_against_schema` on the
+        // streaming open path — AFTER the admission gate incremented all
+        // three counters.
+        let bad_input = serde_json::json!({"a": "not-a-number"});
+        let bad_params = open_params_for(
+            &context_id,
+            &outlet_id,
+            &invoker_did,
+            &bad_input,
+            [0x11u8; 32],
+            0,
+            32,
+        );
+        let err = mgr
+            .open_outlet_stream(bad_params)
+            .expect_err("schema-violating open MUST fail");
+        match err {
+            ScpWasmError::Tool { code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::TOOL_6002,
+                    "input-schema rejection surfaces SCP-TOOL-6002"
+                );
+            }
+            other => panic!("expected Tool error from schema validation, got {other:?}"),
+        }
+
+        // The slot the gate reserved MUST be released on this error
+        // path — all three counters back to baseline, no leak.
+        assert_eq!(
+            counters(&mgr),
+            (0, 0, 0),
+            "failed open released its admission slot on all three counters (no leak)"
+        );
+        // No half-built session left dangling either.
+        assert!(
+            mgr.outlet_streams.is_empty(),
+            "a failed open leaves no session in the registry"
+        );
+
+        // A subsequent well-formed open by the SAME invoker/outlet
+        // succeeds — proving the cap was not silently consumed by the
+        // failed attempt.
+        let good_input = serde_json::json!({"a": 1, "b": 2});
+        let good_params = open_params_for(
+            &context_id,
+            &outlet_id,
+            &invoker_did,
+            &good_input,
+            [0x22u8; 32],
+            0,
+            32,
+        );
+        let request_id_hex = mgr
+            .open_outlet_stream(good_params)
+            .expect("a fresh well-formed open succeeds after the failed open released its slot");
+        assert_eq!(
+            counters(&mgr),
+            (1, 1, 1),
+            "the successful open holds exactly one slot on each counter"
+        );
+
+        // Drain the successful stream to its terminal so the slot
+        // releases again (end-to-end sanity).
+        while mgr
+            .outlet_stream_next(&context_id, &request_id_hex)
+            .is_some()
+        {}
+        assert_eq!(
+            counters(&mgr),
+            (0, 0, 0),
+            "draining the successful stream to terminal releases its slot"
+        );
     }
 }

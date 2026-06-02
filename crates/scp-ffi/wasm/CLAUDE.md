@@ -105,14 +105,30 @@ into `WasmOutletStreamSession::chunks: VecDeque<OutletStreamChunk>`.
 synchronously. It only sets `cancelled = true`. The cancellation
 *observation* happens on the next consumer pull: `outlet_stream_next`
 consults `session.cancelled && !session.terminated` BEFORE popping and,
-on `true`, builds and returns a signed synthetic terminal `Error` chunk
-(`SCP-TOOL-6135` / `execution.cancel-ack-timeout`) and drops any queued
-tail. This is the WASM equivalent of the runtime path's
-`CancelAckTracker::should_force_close` — the consumer always observes a
-terminal chunk after cancel, never a silent end-of-stream. Without this,
-a mid-stream cancel after the SDK had already pulled N chunks would
-result in `next()` returning `None` immediately, leaving the SDK to
-think the stream completed cleanly with no terminal observation.
+on `true`, builds and returns a signed terminal `End` cancel-ack chunk
+and drops any queued tail. This is the WASM equivalent of the runtime
+path's `CancelAckTracker::should_force_close` — the consumer always
+observes a terminal chunk after cancel, never a silent end-of-stream.
+Without this, a mid-stream cancel after the SDK had already pulled N
+chunks would result in `next()` returning `None` immediately, leaving
+the SDK to think the stream completed cleanly with no terminal
+observation.
+
+**Cancel-ack code (§5.4.5 step 3).** An ordinary invoker cancel where
+the executor produces the terminal within the cancel-ack window emits a
+*normal* terminal chunk (`End` or `Error{terminal:true}`), and that
+terminal chunk IS the cancel-ack. On WASM the lazy generator IS the
+executor and always produces its terminal synchronously on the next
+pull, so it always honors the cancel within the window — the cancel-ack
+is therefore a normal terminal `End` chunk (aggregate `null`, since the
+stream was truncated, not completed). The dedicated
+`execution.cancel-ack-timeout` code (`SCP-TOOL-6135`) is reserved
+exclusively for the framework cancel-ack *timer* firing before the
+executor emits a terminal — the runtime mints it only from
+`CancelAckTracker::should_force_close` / `cancel_ack_timeout_payload`.
+On WASM the only site that mints `SCP-TOOL-6135` is
+`outlet_stream_terminate` with `TerminateReason::CancelAckTimeout`; the
+ordinary `outlet_stream_cancel` path never uses it.
 
 The model is documented as a "lazy generator" pattern: between consumer
 pulls, the session yields control; on each pull, the generator checks
