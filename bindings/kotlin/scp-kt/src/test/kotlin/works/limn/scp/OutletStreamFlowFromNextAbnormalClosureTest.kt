@@ -1,18 +1,16 @@
-// HIGH wave 4 — abnormal-closure handling for OutletStreamFlow.
+// HIGH wave 4 — abnormal-closure handling for outlet stream flows.
 //
-// When the bridge's `OutletStreamHandle.next()` returns `null` BEFORE
-// the executor emits a terminal chunk (End / Error{terminal:true}),
-// the SDK MUST surface this as `ExecutionError` (`SCP-TOOL-6131`, NO
-// slug) per §5.4.4 — NOT a silent end-of-flow that callers would
-// mistake for clean completion. The no-slug shape is converged across
+// When the bridge's stream `next()` returns `null` BEFORE the executor
+// emits a terminal chunk (End / Error{terminal:true}), the SDK MUST
+// surface this as `ExecutionError` (`SCP-TOOL-6131`, NO slug) per §5.4.4
+// — NOT a silent end-of-flow that callers would mistake for clean
+// completion. The no-slug shape is converged across
 // Python / TypeScript / Swift / Kotlin.
 //
-// The production `OutletStreamFlow.asFlow()` method calls into
-// `outletStreamFlowFromNext` (the testable seam carved out for this
-// fix) with a closure that pulls from `handle.next()`. These tests
-// drive `outletStreamFlowFromNext` directly with a synthetic chunk
-// source so the lifecycle is exercised without a UniFFI
-// `OutletStreamHandle` (the binary cdylib).
+// The reusable `outletStreamFlowFromNext` seam carries this contract for
+// any `next()` cursor. These tests drive it directly with a synthetic
+// chunk source so the lifecycle is exercised without a UniFFI stream
+// handle (the binary cdylib).
 
 package works.limn.scp
 
@@ -25,7 +23,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Test
 
 @Suppress("StringLiteralDuplication")
-class OutletStreamFlowAbnormalClosureTest {
+class OutletStreamFlowFromNextAbnormalClosureTest {
 
     // --------------------------------------------------------------------
     // Helpers — build a synthetic StreamChunkSource and a cursor.
