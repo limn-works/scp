@@ -215,15 +215,78 @@ pub enum StorageConfig {
     /// SQLCipher-encrypted storage at `{path}/scp.db`.
     ///
     /// Wraps [`scp_platform::sqlite::SqliteStorage`]. Persists across
-    /// process restarts. The `key` is raw encryption key material wrapped in
-    /// `Zeroizing` so the caller's copy is wiped after construction.
+    /// process restarts. The encryption key material is selected via
+    /// [`SqliteKeyMaterial`] — either raw key bytes or a passphrase that is
+    /// run through Argon2id (spec §17.6). Both forms are held in `Zeroizing`
+    /// so the caller's copy is wiped after construction.
     Sqlite {
         /// Directory the database file is created in.
         path: PathBuf,
-        /// Raw encryption key material (32 bytes recommended).
-        key: Zeroizing<Vec<u8>>,
+        /// Encryption key material — raw bytes or passphrase (mutually
+        /// exclusive; the type enforces "exactly one").
+        key: SqliteKeyMaterial,
     },
 }
+
+/// `SQLCipher` key-material selector for [`StorageConfig::Sqlite`] (spec §17.6).
+///
+/// The caller supplies EITHER raw key material OR a passphrase — never both,
+/// never neither. The sum type makes that mutual exclusion unrepresentable as
+/// an invalid state: there is exactly one happy path per variant. Both forms
+/// are wrapped in `Zeroizing` so they are wiped from memory on drop.
+///
+/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+///   mode; the existing, unchanged path).
+/// - [`SqliteKeyMaterial::Passphrase`] feeds
+///   [`SqliteStorage::with_passphrase`], which derives the `SQLCipher`
+///   PRAGMA key from the passphrase via the shared Argon2id parameterization with a
+///   persisted per-database salt sidecar.
+#[derive(Debug, Clone)]
+pub enum SqliteKeyMaterial {
+    /// Raw encryption key material (32 bytes recommended).
+    Raw(Zeroizing<Vec<u8>>),
+    /// Human-chosen passphrase; the `SQLCipher` key is derived via Argon2id.
+    Passphrase(Zeroizing<String>),
+}
+
+/// Bridge-internal error returned by [`PyBridgeInstance::with_storage_py`]
+/// when a durable storage backend cannot be opened.
+///
+/// Surfacing this (rather than silently degrading to in-memory or no storage)
+/// is the fail-closed contract from spec §17.6: a failed durable-backend open
+/// is a terminal error the caller observes, never a condition the system
+/// recovers from by downgrading durability. Converted to a Python
+/// `ValidationError` at the [`PyScp::with_storage`](crate::scp::PyScp) factory
+/// surface.
+///
+/// Kept as a dedicated enum so the `runtime` layer does not depend on the
+/// bridge error vocabulary and so future durable backends can extend it
+/// without touching every caller.
+#[derive(Debug)]
+pub enum StorageInitError {
+    /// `SqliteStorage::new` / `SqliteStorage::with_passphrase` failed —
+    /// directory permission denied, key/passphrase rejected by `SQLCipher` on an
+    /// existing DB, salt-sidecar fail-closed condition, corrupt file, and so
+    /// on. The message never contains key or passphrase bytes.
+    SqliteOpen {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for StorageInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SqliteOpen { path, message } => {
+                write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StorageInitError {}
 
 /// Concrete storage provider backing a [`PyBridgeInstance`].
 ///
@@ -268,6 +331,27 @@ impl StorageProvider {
     /// dropped — `SQLCipher` retains its own derived key internally.
     pub fn new_sqlite(path: &std::path::Path, key: &[u8]) -> Result<Self, PlatformError> {
         let storage = SqliteStorage::new(path, key)?;
+        Ok(Self::Sqlite(Arc::new(storage)))
+    }
+
+    /// Constructs a `SQLCipher`-encrypted provider whose key is derived from a
+    /// passphrase via Argon2id (spec §17.6).
+    ///
+    /// Delegates to [`SqliteStorage::with_passphrase`], which loads-or-creates
+    /// the per-database salt sidecar and derives the `SQLCipher` PRAGMA key with
+    /// the shared Argon2id parameterization. The passphrase bytes are not
+    /// retained — `SQLCipher` holds its own derived key internally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::StorageError`] if the database cannot be
+    /// opened, the salt sidecar is in a fail-closed state (present-db /
+    /// missing-salt, wrong-length salt), or the passphrase is rejected.
+    pub fn new_sqlite_passphrase(
+        path: &std::path::Path,
+        passphrase: &[u8],
+    ) -> Result<Self, PlatformError> {
+        let storage = SqliteStorage::with_passphrase(path, passphrase)?;
         Ok(Self::Sqlite(Arc::new(storage)))
     }
 }
@@ -462,16 +546,22 @@ impl PyBridgeInstance {
     ///   also registered as `storage_provider` so identity, event log,
     ///   trust, and MCP reads hit the same connection pool (one DB
     ///   connection per process — `SQLite` cannot share one across two
-    ///   `SqliteStorage::new` calls). If opening fails, the bridge is
-    ///   returned with neither `storage_provider` nor `persistence` set
-    ///   and the caller sees the existing "storage not initialized" error
-    ///   paths. Errors are logged via `tracing::error!` so they are not
-    ///   silently swallowed.
+    ///   `SqliteStorage::new` calls). If opening fails, a
+    ///   [`StorageInitError::SqliteOpen`] is returned to the caller (and
+    ///   logged via `tracing::error!`) — the bridge FAILS CLOSED (spec
+    ///   §17.6). There is no silent degrade to in-memory or no-storage; a
+    ///   failed durable open is terminal. The key material is selected via
+    ///   [`SqliteKeyMaterial`]: raw bytes feed [`SqliteStorage::new`];
+    ///   a passphrase feeds [`SqliteStorage::with_passphrase`] (Argon2id).
     ///
-    /// For fallible construction that surfaces the `SQLite` error, use
-    /// [`PyBridgeInstance::new_py`] + [`PyBridgeInstance::init_sqlite_storage`].
-    #[must_use]
-    pub fn with_storage_py(cfg: StorageConfig) -> Self {
+    /// # Errors
+    ///
+    /// Returns [`StorageInitError::SqliteOpen`] if the `SQLCipher` database
+    /// cannot be opened (bad key/passphrase, permission denied, corrupt file,
+    /// schema mismatch, salt-sidecar fail-closed condition). In-memory storage
+    /// is reachable only via [`StorageConfig::InMemory`] — never as a
+    /// degradation path from a failed durable open.
+    pub fn with_storage_py(cfg: StorageConfig) -> Result<Self, StorageInitError> {
         match cfg {
             StorageConfig::InMemory => {
                 let instance = Self::new_py();
@@ -480,7 +570,7 @@ impl PyBridgeInstance {
                 let _ = instance
                     .storage_provider
                     .set(StorageProvider::new_in_memory_encrypted());
-                instance
+                Ok(instance)
             }
             StorageConfig::Sqlite { path, key } => {
                 // Open the database once — `SqliteStorage` owns a single
@@ -489,48 +579,56 @@ impl PyBridgeInstance {
                 // draft called `SqliteStorage::new` twice (once for the
                 // provider, once for the persistence bridge) and hit
                 // `SQLITE_BUSY` the moment both tried to write.
-                match SqliteStorage::new(&path, &key) {
-                    Ok(storage) => {
-                        let arc_storage = Arc::new(storage);
-                        // Build persistence bridge first so we can share
-                        // the same Arc across CoreFields + storage_provider.
-                        let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        let persistence: Arc<dyn ContextPersistence + Send + Sync> =
-                            Arc::new(ProtocolRepositoryContextBridge::new(repo));
-                        let instance = Self {
-                            core: CoreFields::with_persistence_arc(persistence),
-                            identity_registry: Arc::new(DashMap::new()),
-                            storage_provider: OnceLock::new(),
-                            ffi_bridge_state: Arc::new(DashMap::new()),
-                            mcp_server_registry: Arc::new(DashMap::new()),
-                            mcp_client_registry: Arc::new(DashMap::new()),
-                            credential_store: Arc::new(
-                                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-                            ),
-                            connected_relay_url: RwLock::new(None),
-                            #[cfg(feature = "allow_in_memory_custody")]
-                            network: std::sync::Mutex::new(None),
-                        };
-                        let _ = instance
-                            .storage_provider
-                            .set(StorageProvider::Sqlite(arc_storage));
-                        // `key` is `Zeroizing<Vec<u8>>`, zeroed on drop here.
-                        // SQLCipher has already retained its derived key
-                        // internally, so the caller's key material is safe
-                        // to wipe at this point.
-                        drop(key);
-                        instance
+                //
+                // FAIL CLOSED (spec §17.6): on open failure we return the
+                // error to the caller rather than degrading to no-storage.
+                // The key/passphrase material is wiped on drop regardless of
+                // outcome; the error message never carries key bytes.
+                let open_result = match &key {
+                    SqliteKeyMaterial::Raw(bytes) => SqliteStorage::new(&path, bytes),
+                    SqliteKeyMaterial::Passphrase(pass) => {
+                        SqliteStorage::with_passphrase(&path, pass.as_bytes())
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            path = %path.display(),
-                            "with_storage_py: SqliteStorage::new failed — instance created without storage or persistence"
-                        );
-                        drop(key);
-                        Self::new_py()
+                };
+                let storage = open_result.map_err(|e| {
+                    tracing::error!(
+                        error = %e,
+                        path = %path.display(),
+                        "with_storage_py: SQLCipher open failed — failing closed, no in-memory fallback"
+                    );
+                    StorageInitError::SqliteOpen {
+                        path: path.display().to_string(),
+                        message: e.to_string(),
                     }
-                }
+                })?;
+                // `key` (Raw bytes or Passphrase string) is `Zeroizing`; wipe
+                // the caller's copy now that SQLCipher has retained its own
+                // derived key internally.
+                drop(key);
+                let arc_storage = Arc::new(storage);
+                // Build persistence bridge first so we can share the same Arc
+                // across CoreFields + storage_provider (one SQLite connection).
+                let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                let persistence: Arc<dyn ContextPersistence + Send + Sync> =
+                    Arc::new(ProtocolRepositoryContextBridge::new(repo));
+                let instance = Self {
+                    core: CoreFields::with_persistence_arc(persistence),
+                    identity_registry: Arc::new(DashMap::new()),
+                    storage_provider: OnceLock::new(),
+                    ffi_bridge_state: Arc::new(DashMap::new()),
+                    mcp_server_registry: Arc::new(DashMap::new()),
+                    mcp_client_registry: Arc::new(DashMap::new()),
+                    credential_store: Arc::new(
+                        scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+                    ),
+                    connected_relay_url: RwLock::new(None),
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    network: std::sync::Mutex::new(None),
+                };
+                let _ = instance
+                    .storage_provider
+                    .set(StorageProvider::Sqlite(arc_storage));
+                Ok(instance)
             }
         }
     }
@@ -865,15 +963,30 @@ pub fn init_supervisor(local_did: &str) {
         return;
     }
 
+    // Storage-before-supervisor (spec §17.6): the supervisor requires a
+    // single Storage handle for its `mls_storage` consumer. The legacy
+    // default-instance free-function flow has no `with_storage(...)`
+    // selection point, so the bridge layer makes the explicit in-memory
+    // dev-affordance selection here when none was set. The runtime core
+    // itself never defaults storage — this is a bridge-layer choice.
+    ensure_default_instance_storage(bi);
+
     let did = local_did.to_owned();
     let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let persistence = build_persistence_provider();
-    let supervisor_arc = build_supervisor(
+    let supervisor_arc = match build_supervisor(
+        bi,
         crypto,
         Box::new(NotConfiguredTransportProvider),
         Box::new(NoOpEventLogProvider),
         persistence,
-    );
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "init_supervisor: build_supervisor failed");
+            return;
+        }
+    };
 
     bi.core.set_supervisor(supervisor_arc);
 }
@@ -919,8 +1032,15 @@ pub fn init_supervisor_with(
     if bi.core.has_supervisor() {
         return;
     }
+    ensure_default_instance_storage(bi);
     let persistence = persistence.or_else(build_persistence_provider);
-    let supervisor_arc = build_supervisor(crypto, transport, event_log, persistence);
+    let supervisor_arc = match build_supervisor(bi, crypto, transport, event_log, persistence) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "init_supervisor_with: build_supervisor failed");
+            return;
+        }
+    };
     bi.core.set_supervisor(supervisor_arc);
 }
 
@@ -943,17 +1063,45 @@ pub fn init_supervisor_for_test() {
     if bi.core.has_supervisor() {
         return;
     }
+    // Test inits set up the in-memory storage provider explicitly (dev
+    // opt-in, spec §17.6) so the storage-before-supervisor precondition in
+    // `build_supervisor` is satisfied.
+    ensure_default_instance_storage(bi);
     let persistence = build_persistence_provider();
-    let supervisor_arc = build_supervisor(
+    let supervisor_arc = match build_supervisor(
+        bi,
         Arc::new(MlsCryptoProvider::new(
             "did:test:pyo3-bridge-test".to_owned(),
         )),
         Box::new(scp_core::context::LocalTransportProvider),
         Box::new(NoOpEventLogProvider),
         persistence,
-    );
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "init_supervisor_for_test: build_supervisor failed");
+            return;
+        }
+    };
 
     bi.core.set_supervisor(supervisor_arc);
+}
+
+/// Ensures the legacy default-instance has an in-memory storage provider.
+///
+/// The per-instance `SCP.with_storage({...})` factory selects storage
+/// explicitly; the legacy default-instance free-function flow
+/// (`py_identity_create` / `py_context_create`) has no such selection point.
+/// To satisfy the storage-before-supervisor precondition (spec §17.6) the
+/// bridge layer makes the explicit in-memory dev-affordance selection here
+/// when none was set. This is a bridge-layer choice — the runtime core never
+/// defaults storage. A no-op if a provider is already set (`OnceLock`).
+fn ensure_default_instance_storage(bi: &PyBridgeInstance) {
+    if bi.storage_provider().is_none() {
+        let _ = bi
+            .storage_provider
+            .set(StorageProvider::new_in_memory_encrypted());
+    }
 }
 
 /// Constructs a [`ProtocolRepositoryContextBridge`] from the global storage provider,
@@ -1064,21 +1212,36 @@ impl ContextPersistence for ArcContextPersistence {
     }
 }
 
-/// Constructs a fresh per-instance `Supervisor` with the given
-/// providers.
+/// Constructs a fresh per-instance `Supervisor` with the given providers.
 ///
 /// ADR-049 commit 12c.9g.3.6 — the FFI bridge no longer touches
-/// `ContextManager` at all. `Supervisor::with_providers` is the
-/// single entry point that constructs the supervisor + populates the
-/// lifted-provider slots. The supervisor is the only handle returned
-/// to the bridge layer.
+/// `ContextManager` at all. `Supervisor::with_providers` is the single entry
+/// point that constructs the supervisor + populates the lifted-provider slots.
+/// The supervisor is the only handle returned to the bridge layer.
+///
+/// The supervisor's `mls_storage` consumer (the `OpenMLS` storage view) is
+/// derived from the bridge instance's single chosen Storage: `storage_provider()`
+/// is wrapped ONCE via [`SpawnBlockingStorageAdapter`] into an
+/// `Arc<dyn OpenMlsStorageAdapter>`. This is the same `StorageProvider` that
+/// backs persistence and the event log, so all three consumers share one
+/// backend (spec §17.6).
+///
+/// # Errors
+///
+/// Returns a [`ScpPyError::ContextError`] if the bridge instance has no
+/// storage provider set (storage-before-supervisor precondition). The runtime
+/// never defaults storage; the caller (bridge layer) must supply it first. In
+/// the production / test `init_supervisor*` paths this is guaranteed by
+/// `ensure_default_instance_storage`.
 fn build_supervisor(
+    bi: &PyBridgeInstance,
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
-) -> Arc<scp_core::context::supervisor::Supervisor> {
-    scp_core::context::supervisor::Supervisor::with_providers(
+) -> Result<Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
+    let mls_storage = derive_mls_storage(bi)?;
+    Ok(scp_core::context::supervisor::Supervisor::with_providers(
         crypto,
         transport,
         event_log,
@@ -1087,7 +1250,39 @@ fn build_supervisor(
         None,
         None,
         None,
-    )
+        mls_storage,
+    ))
+}
+
+/// Derives the supervisor's `OpenMLS` storage adapter from the bridge instance's
+/// single chosen [`StorageProvider`] (spec §17.6).
+///
+/// `StorageProvider` implements `Storage` (enum dispatch) and `Clone`, so we
+/// wrap a clone in [`SpawnBlockingStorageAdapter`] to obtain the dyn-safe
+/// `OpenMlsStorageAdapter` view. The clone shares the same inner backend
+/// (`Arc<EncryptingAdapter<InMemoryStorage>>` or `Arc<SqliteStorage>`), so the
+/// `OpenMLS` view, persistence, and event log all read/write one backend.
+///
+/// # Errors
+///
+/// Returns [`ScpPyError::ContextError`] when no storage provider is set — the
+/// storage-before-supervisor precondition. No fabrication, no default.
+fn derive_mls_storage(
+    bi: &PyBridgeInstance,
+) -> Result<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>, ScpPyError> {
+    let provider = bi.storage_provider().ok_or_else(|| {
+        ScpPyError::context(
+            "storage-before-supervisor precondition failed: no storage provider              set on the bridge instance — the runtime never defaults storage              (spec §17.6). Select storage via SCP.with_storage({...}) first."
+                .to_owned(),
+        )
+    })?;
+    let adapter = scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+        Arc::new(provider.clone()),
+    );
+    Ok(Arc::new(adapter)
+        as Arc<
+            dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        >)
 }
 
 // ---------------------------------------------------------------------------
@@ -2435,19 +2630,23 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Build an isolated CoreFields (not the global default PyBridgeInstance)
-        // to avoid interfering with the OnceLock-based singleton used by other
-        // tests. `CoreFields` is imported at module top via `use
-        // scp_ffi_common::bridge_instance::CoreFields`.
-        let persistence = build_persistence_provider();
+        // Build an isolated PyBridgeInstance (not the global default) to avoid
+        // interfering with the OnceLock-based singleton used by other tests.
+        // It carries an explicit in-memory storage provider so the
+        // storage-before-supervisor precondition in `build_supervisor` is
+        // satisfied.
+        let isolated = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
+            .expect("in-memory storage construction is infallible");
         let supervisor_arc = build_supervisor(
+            &isolated,
             Arc::new(MlsCryptoProvider::new(
                 "did:test:pyo3-bridge-test".to_owned(),
             )),
             Box::new(scp_core::context::LocalTransportProvider),
             Box::new(NoOpEventLogProvider),
-            persistence,
-        );
+            None,
+        )
+        .expect("build_supervisor must succeed with in-memory storage set");
         let bi = CoreFields::with_supervisor(supervisor_arc);
 
         let ran = Arc::new(AtomicBool::new(false));
@@ -2539,10 +2738,69 @@ mod tests {
 
     #[test]
     fn test_py_bridge_instance_with_storage_py_initializes_storage() {
-        let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory);
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
+            .expect("in-memory storage construction is infallible");
         assert!(
             bi.storage_provider().is_some(),
             "with_storage_py(InMemory) must initialize the storage provider"
+        );
+    }
+
+    #[test]
+    fn derive_mls_storage_errors_when_storage_unset() {
+        // Storage-before-supervisor precondition (spec §17.6): an instance with
+        // no storage provider set must NOT yield an mls_storage adapter — it
+        // must error rather than fabricate a default.
+        let bi = PyBridgeInstance::new_py();
+        assert!(
+            bi.storage_provider().is_none(),
+            "fresh new_py() instance must have no storage provider"
+        );
+        let result = derive_mls_storage(&bi);
+        assert!(
+            result.is_err(),
+            "derive_mls_storage must fail closed when storage is unset"
+        );
+        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("storage-before-supervisor"),
+            "precondition error must name the storage-before-supervisor invariant, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_supervisor_fails_closed_without_storage() {
+        // The supervisor construction surface refuses to build without a
+        // caller-supplied backend; the runtime never defaults storage.
+        let bi = PyBridgeInstance::new_py();
+        let result = build_supervisor(
+            &bi,
+            Arc::new(MlsCryptoProvider::new("did:test:no-storage".to_owned())),
+            Box::new(scp_core::context::LocalTransportProvider),
+            Box::new(NoOpEventLogProvider),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "build_supervisor must fail closed when no storage provider is set"
+        );
+    }
+
+    #[test]
+    fn build_supervisor_succeeds_with_in_memory_storage() {
+        // Explicit in-memory selection (dev opt-in) satisfies the precondition.
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
+            .expect("in-memory storage construction is infallible");
+        let result = build_supervisor(
+            &bi,
+            Arc::new(MlsCryptoProvider::new("did:test:in-memory".to_owned())),
+            Box::new(scp_core::context::LocalTransportProvider),
+            Box::new(NoOpEventLogProvider),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "build_supervisor must succeed once in-memory storage is selected"
         );
     }
 }

@@ -29,8 +29,8 @@ use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 
 use crate::error::ScpPyError;
 use crate::runtime::{
-    DEFAULT_BRIDGE_INSTANCE, PyBridgeInstance, StorageConfig, default_bridge_instance,
-    ensure_bridge_instance,
+    DEFAULT_BRIDGE_INSTANCE, PyBridgeInstance, SqliteKeyMaterial, StorageConfig,
+    default_bridge_instance, ensure_bridge_instance,
 };
 
 /// Python-facing `SCP` instance.
@@ -66,17 +66,27 @@ impl PyScp {
     /// Accepted shapes:
     /// - `{"type": "in_memory"}` — encrypted in-memory storage (ephemeral).
     /// - `{"type": "sqlite", "path": "/path/to/dir", "key": b"\x00..."}`
-    ///   — SQLCipher-encrypted storage at `{path}/scp.db`. `key` must be a
-    ///   `bytes` object holding raw encryption key material (32 bytes
-    ///   recommended).
+    ///   — SQLCipher-encrypted storage at `{path}/scp.db` keyed by raw
+    ///   encryption key material (`key` must be `bytes`, 32 bytes recommended).
+    /// - `{"type": "sqlite", "path": "/path/to/dir", "passphrase": "..."}`
+    ///   — SQLCipher-encrypted storage whose key is derived from a passphrase
+    ///   via Argon2id (`passphrase` must be `str`). Spec §17.6.
     ///
-    /// Unknown types or malformed shapes raise `ValidationError`.
+    /// For the `sqlite` type, exactly ONE of `key` or `passphrase` must be
+    /// supplied — providing both, or neither, is a `ValidationError`.
+    ///
+    /// Unknown types or malformed shapes raise `ValidationError`. A failed
+    /// `SQLCipher` open (bad key/passphrase, permission denied, corrupt file)
+    /// also raises `ValidationError` — the factory FAILS CLOSED (spec §17.6)
+    /// and never silently degrades to in-memory.
     ///
     /// # Errors
     ///
     /// Raises `ValidationError` if `config["type"]` is missing or not a
-    /// recognised storage variant, or if required fields for the selected
-    /// variant are missing or wrongly typed.
+    /// recognised storage variant, if required fields for the selected variant
+    /// are missing or wrongly typed, if `key` and `passphrase` are both or
+    /// neither supplied for `sqlite`, or if the durable backend cannot be
+    /// opened.
     #[staticmethod]
     pub fn with_storage(_py: Python<'_>, config: &Bound<'_, PyDict>) -> PyResult<Self> {
         let storage_type: String = match config.get_item("type")? {
@@ -102,23 +112,48 @@ impl PyScp {
                         .into());
                     }
                 };
-                let key_bytes: Vec<u8> = match config.get_item("key")? {
-                    Some(v) => v.extract().map_err(|e| {
-                        ScpPyError::validation(format!(
-                            "SCP.with_storage(sqlite): 'key' must be bytes — {e}"
-                        ))
-                    })?,
-                    None => {
+                // Exactly one of `key` (raw bytes) or `passphrase` (str) must
+                // be supplied — the SqliteKeyMaterial sum type enforces mutual
+                // exclusion at the type level; here we enforce it at the dict
+                // boundary (spec §17.6). Passphrase is moved into Zeroizing
+                // immediately so it never lingers in an un-wiped String.
+                let key_item = config.get_item("key")?;
+                let passphrase_item = config.get_item("passphrase")?;
+                let key_material = match (key_item, passphrase_item) {
+                    (Some(_), Some(_)) => {
                         return Err(ScpPyError::validation(
-                            "SCP.with_storage(sqlite): missing required key 'key' (raw encryption key bytes)"
+                            "SCP.with_storage(sqlite): supply exactly one of 'key' or                              'passphrase', not both"
                                 .to_owned(),
                         )
                         .into());
                     }
+                    (None, None) => {
+                        return Err(ScpPyError::validation(
+                            "SCP.with_storage(sqlite): missing key material — supply                              either 'key' (raw encryption key bytes) or 'passphrase' (str)"
+                                .to_owned(),
+                        )
+                        .into());
+                    }
+                    (Some(key_val), None) => {
+                        let key_bytes: Vec<u8> = key_val.extract().map_err(|e| {
+                            ScpPyError::validation(format!(
+                                "SCP.with_storage(sqlite): 'key' must be bytes — {e}"
+                            ))
+                        })?;
+                        SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(key_bytes))
+                    }
+                    (None, Some(pass_val)) => {
+                        let passphrase: String = pass_val.extract().map_err(|e| {
+                            ScpPyError::validation(format!(
+                                "SCP.with_storage(sqlite): 'passphrase' must be str — {e}"
+                            ))
+                        })?;
+                        SqliteKeyMaterial::Passphrase(zeroize::Zeroizing::new(passphrase))
+                    }
                 };
                 StorageConfig::Sqlite {
                     path: std::path::PathBuf::from(path_str),
-                    key: zeroize::Zeroizing::new(key_bytes),
+                    key: key_material,
                 }
             }
             other => {
@@ -128,8 +163,10 @@ impl PyScp {
                 .into());
             }
         };
+        let bi = PyBridgeInstance::with_storage_py(cfg)
+            .map_err(|e| ScpPyError::validation(e.to_string()))?;
         Ok(Self {
-            inner: Arc::new(PyBridgeInstance::with_storage_py(cfg)),
+            inner: Arc::new(bi),
         })
     }
 

@@ -2225,7 +2225,19 @@ mod tests {
     use scp_core::context::LocalTransportProvider;
     use scp_core::context::builder::{ContextCreationError, ContextEventLogProvider};
     use scp_core::crypto::mls::provider::MlsCryptoProvider;
+    use scp_core::crypto::mls::storage_adapter::{
+        OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
+    };
     use std::pin::Pin;
+
+    /// Test-only in-memory `OpenMLS` storage adapter for the required
+    /// `mls_storage` arg of `Supervisor::with_providers`. The runtime never
+    /// defaults storage; tests supply this explicit dev affordance.
+    fn test_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
+        Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+            scp_platform::testing::InMemoryStorage::new(),
+        )))
+    }
 
     use scp_core::envelope::outer::OuterEnvelope;
     use scp_transport::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportError};
@@ -2273,6 +2285,7 @@ mod tests {
             None,
             None,
             None,
+            test_mls_storage(),
         )
     }
 
@@ -3461,6 +3474,7 @@ mod tests {
             None,
             None,
             None,
+            test_mls_storage(),
         );
 
         let instance = CoreFields::with_persistence(persistence_for_instance);

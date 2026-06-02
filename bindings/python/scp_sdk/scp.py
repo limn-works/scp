@@ -121,15 +121,28 @@ class SCP:
             * ``{"type": "in_memory"}`` — ephemeral encrypted in-memory
               storage (the default when ``storage`` is ``None``).
             * ``{"type": "sqlite", "path": str, "key": bytes}`` —
-              SQLCipher-encrypted on-disk storage at ``{path}/scp.db``.
-              ``key`` is the raw encryption key material (32 bytes
-              recommended) and is zeroized on the Rust side once the
-              database is opened. Landed in Phase 4 PR 3 (#1549).
+              SQLCipher-encrypted on-disk storage at ``{path}/scp.db``
+              using raw key material. ``key`` is the raw encryption key
+              (32 bytes recommended), zeroized on the Rust side once the
+              database is opened.
+            * ``{"type": "sqlite", "path": str, "passphrase": str}`` —
+              SQLCipher-encrypted on-disk storage whose key is derived from
+              a passphrase via Argon2id (spec §17.6), with a persisted
+              per-database salt sidecar. The passphrase is held in zeroizing
+              memory across the FFI boundary.
+
+            For the ``sqlite`` type, supply exactly one of ``key`` or
+            ``passphrase`` — providing both, or neither, is a
+            ``ValidationError``. A failed SQLCipher open (bad key/passphrase,
+            permission denied, corrupt file) also raises a
+            ``ValidationError``: storage selection FAILS CLOSED (spec §17.6)
+            and never silently degrades to in-memory.
 
             When ``None``, defaults to in-memory storage.
         :raises ValidationError: If ``storage`` contains an unknown
-            ``type`` or is missing required fields for the selected
-            variant.
+            ``type``, is missing required fields for the selected variant,
+            supplies both/neither of ``key``/``passphrase`` for ``sqlite``,
+            or the durable backend cannot be opened.
 
         .. note::
 

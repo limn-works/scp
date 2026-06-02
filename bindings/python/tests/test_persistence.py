@@ -122,19 +122,17 @@ def test_sqlite_rejects_mismatched_key() -> None:
         scp1.shutdown(timeout=1.0)
 
         wrong_key = b"\x11" * 32
-        # The underlying SqliteStorage::new returns an error; the bridge
-        # currently logs and falls back to an in-memory-only instance
-        # (documented in `with_storage_py`). Construction therefore
-        # succeeds, but the persistence provider on the returned
-        # instance is not wired to the mismatched-key database. Asserting
-        # that the fallback did NOT corrupt the original DB is more
-        # valuable than asserting construction raises.
-        scp2 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": wrong_key})
-        scp2.shutdown(timeout=1.0)
+        # FAIL CLOSED (spec §17.6): opening the existing encrypted DB with a
+        # different key MUST raise — the bridge no longer silently degrades to
+        # an in-memory-only instance. SQLCipher rejects the wrong key, so the
+        # `SqliteStorage` open fails and `with_storage` surfaces a
+        # ValidationError rather than returning a no-storage instance.
+        with pytest.raises(_scp_core.ValidationError):
+            SCP(storage={"type": "sqlite", "path": tmpdir, "key": wrong_key})
 
-        # Reopen with the correct key — the original encrypted state
-        # must still be intact (not overwritten by the mismatched-key
-        # attempt).
+        # Reopen with the correct key — the original encrypted state must
+        # still be intact (the failed mismatched-key attempt did not corrupt
+        # or overwrite it).
         scp3 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})
         scp3.shutdown(timeout=1.0)
 
@@ -143,3 +141,86 @@ def test_sqlite_missing_path_field_raises() -> None:
     """Malformed sqlite config must surface a ValidationError at the boundary."""
     with pytest.raises(_scp_core.ValidationError):
         SCP(storage={"type": "sqlite", "key": _SQLITE_KEY})  # no 'path'
+
+
+def test_sqlite_passphrase_roundtrip() -> None:
+    """A passphrase-keyed SQLite DB re-derives the same key across restarts.
+
+    Spec §17.6 passphrase mode: create with a passphrase, drop the
+    instance, reopen the same directory with the same passphrase — the
+    Argon2id-derived key plus the persisted salt sidecar must re-open the
+    same encrypted database (not a fresh empty one).
+    """
+    passphrase = "correct horse battery staple"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "scp.db"
+        salt_path = Path(tmpdir) / "scp.salt"
+
+        scp1 = SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": passphrase})
+        scp1.shutdown(timeout=1.0)
+        assert db_path.exists(), "passphrase mode must create scp.db"
+        assert salt_path.exists(), "passphrase mode must persist the salt sidecar"
+
+        # Reopen with the SAME passphrase — must succeed (same derived key).
+        scp2 = SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": passphrase})
+        scp2.shutdown(timeout=1.0)
+
+
+def test_sqlite_wrong_passphrase_fails_closed() -> None:
+    """A wrong passphrase MUST fail closed — never a silent fresh DB.
+
+    Spec §17.6: SQLCipher rejects the wrong-passphrase-derived key on the
+    first query; the bridge surfaces a ValidationError instead of opening
+    an empty database in its place.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        scp1 = SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": "the right one"})
+        scp1.shutdown(timeout=1.0)
+
+        with pytest.raises(_scp_core.ValidationError):
+            SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": "the wrong one"})
+
+        # Original DB remains intact under the correct passphrase.
+        scp3 = SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": "the right one"})
+        scp3.shutdown(timeout=1.0)
+
+
+def test_sqlite_key_and_passphrase_both_supplied_raises() -> None:
+    """Supplying both 'key' and 'passphrase' is a validation error (§17.6)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(_scp_core.ValidationError):
+            SCP(
+                storage={
+                    "type": "sqlite",
+                    "path": tmpdir,
+                    "key": _SQLITE_KEY,
+                    "passphrase": "also a passphrase",
+                }
+            )
+
+
+def test_sqlite_neither_key_nor_passphrase_raises() -> None:
+    """Supplying neither 'key' nor 'passphrase' is a validation error (§17.6)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(_scp_core.ValidationError):
+            SCP(storage={"type": "sqlite", "path": tmpdir})
+
+
+def test_sqlite_open_failure_fails_closed_not_no_storage() -> None:
+    """A SQLite open at an unusable path raises — never a no-storage instance.
+
+    Spec §17.6 fail-closed: a failed durable-backend open is terminal. The
+    bridge must NOT return a degraded instance.
+    """
+    # A path whose parent is a regular file cannot host scp.db.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        not_a_dir = Path(tmpdir) / "regular_file"
+        not_a_dir.write_bytes(b"not a directory")
+        with pytest.raises(_scp_core.ValidationError):
+            SCP(
+                storage={
+                    "type": "sqlite",
+                    "path": str(not_a_dir / "sub"),
+                    "key": _SQLITE_KEY,
+                }
+            )
