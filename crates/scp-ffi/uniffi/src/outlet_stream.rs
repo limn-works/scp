@@ -282,6 +282,14 @@ impl scp_runtime::context::outlets::invoke::StreamSettlementSink for UniffiStrea
                     settlement.billed_count,
                     settlement.request_id,
                     &settlement.outlet_id,
+                    // §5.4.5 MED-HIGH (H8): forward the open-time economic
+                    // policy snapshot so a context torn down mid-stream still
+                    // captures the receipt for already-rendered service. The
+                    // runtime snapshotted this at `OutletStreamOpen` acceptance
+                    // (`open_outlet_stream` fills it from live governance state
+                    // when the bridge passes `None`); the dispatch pump
+                    // round-trips it through `StreamSettlement` to here.
+                    settlement.economic_policy_snapshot,
                 )
                 .await
             {
@@ -1255,6 +1263,51 @@ async fn open_stream_internal(
         reserved_escrow,
     );
 
+    // §7.3.8 / §5.4.5 crypto-MED — build the post-input caveat hook from the
+    // VALIDATED-NARROWED effective caveats (the leaf UCAN `nb`, already
+    // resolved above). The stream validates its input ONCE at open (§5.4.5),
+    // so the runtime runs this hook exactly once before the pump spawns. It
+    // mirrors the synchronous local half of the non-streaming invoke's §7.3.8
+    // gate (`check_invocation_local`: `input_schema` / `amount_max_per_call`
+    // / `allowed_adapters` / `allowed_target_dids`). The UniFFI invocation
+    // surface does not negotiate a payment adapter or a cross-context target
+    // DID (parity with `outlet_invoke`, which passes neither), so both are
+    // `None`; `cost_per_chunk` is the per-invocation estimate the
+    // `amount_max_per_call` cap checks against. The hook returns
+    // `InvocationError` shaped so `open_stream_session` maps each failure to
+    // the precise §5.4.4 slug (schema → `input.schema-violation`; every other
+    // caveat rule → its `CheckInvocationError::slug()`), routing identically
+    // to the non-streaming caveat path. `effective_caveats` is cloned for the
+    // hook; the original moves into `build_open_stream_params`.
+    let caveats_for_hook = effective_caveats.clone();
+    let caveat_post_input_check: Option<
+        scp_runtime::context::outlets::invoke::CaveatPostInputCheck<'_>,
+    > = Some(Box::new(move |input: &Value| {
+        let caveats = caveats_for_hook.clone();
+        let input = input.clone();
+        Box::pin(async move {
+            caveats
+                .check_invocation_local(&input, cost_per_chunk, None, None)
+                .map_err(|err| {
+                    use scp_protocol::trust::caveats::CheckInvocationError;
+                    let message = err.to_string();
+                    match err {
+                        CheckInvocationError::InputSchemaViolation { .. } => {
+                            scp_runtime::context::outlets::invoke::InvocationError::InputValidationFailed {
+                                message,
+                            }
+                        }
+                        other => {
+                            scp_runtime::context::outlets::invoke::InvocationError::CaveatViolation {
+                                slug: other.slug(),
+                                message,
+                            }
+                        }
+                    }
+                })
+        })
+    }));
+
     let params = build_open_stream_params(
         handle.context_id.clone(),
         outlet_id.to_owned(),
@@ -1308,6 +1361,9 @@ async fn open_stream_internal(
             settlement_sink,
             params,
             admission,
+            // §7.3.8 / §5.4.5 crypto-MED — run the post-input caveat hook
+            // once at open before the pump spawns.
+            caveat_post_input_check,
         )
         .await;
     let mut runtime_handle = match open_result {
@@ -1437,6 +1493,19 @@ fn build_open_stream_params(
         ucan_cid,
         request_id,
         revocation_checker,
+        // §5.4.5 MED-HIGH (H8) — `None`: the bridge does not hold an
+        // authoritative economic-policy snapshot. The bridge's
+        // `ContextHandle::economic_policy` mirror is only ever populated via
+        // governance read-back and may be stale or absent, whereas
+        // `ContextManager::open_outlet_stream` reads the LIVE
+        // `governance.economic_policy` under the context lock at acceptance
+        // and fills this field when the caller passes `None` (its
+        // `is_none()` guard — "caller-supplied value wins"). Passing `None`
+        // therefore yields the AUTHORITATIVE open-time snapshot rather than a
+        // stale bridge mirror; the runtime round-trips it through
+        // `StreamSettlement` so close-time settlement survives a mid-stream
+        // context teardown.
+        economic_policy_snapshot: None,
     }
 }
 
@@ -1519,6 +1588,11 @@ pub async fn outlet_stream_grant_credit(
     // zero-cost / Query streams it debits nothing and returns `Amount(0)`.
     let invoker_did_typed: scp_primitives::DID = entry.invoker_did.clone().into();
     let manager = runtime::context_manager_expect()?;
+    // LOW-b — build the refund sink BEFORE the reserve debits anything. The
+    // sink only depends on the (already-resolved) manager, so constructing it
+    // here cannot strand a debit: there is no fallible step between the debit
+    // and arming the Drop-guard below.
+    let refund_sink = bridge_stream_escrow_refund_sink()?;
     let reserved_top_up = manager
         .outlet_stream_reserve_grant(
             &entry.context_id,
@@ -1533,24 +1607,55 @@ pub async fn outlet_stream_grant_credit(
             code: codes::CTX_2000.to_owned(),
         })?;
 
+    // LOW-b — guard the just-debited top-up with the same Drop-guard
+    // discipline the open path uses for the open-time hold
+    // ([`StreamEscrowTicket`]). The top-up is DEBITED now; if anything between
+    // here and a successful `apply_credit_grant` early-returns OR panics
+    // (`apply_credit_grant` runs sync, but a future maintainer adding a
+    // fallible step in between, or a panic inside the apply, would otherwise
+    // strand the debit), dropping the ticket fires the async reverse-spend
+    // through the same refund sink. On the `Ok` path we `consume()` it (the
+    // top-up was accepted onto the escrow ledger and the close-time
+    // settlement now owns its refund); on the `Err` path we let it drop so the
+    // §5.4.5 atomicity invariant holds (rejected grant → top-up reversed). A
+    // zero-amount ticket (Query / zero-cost stream) is a no-op on both paths.
+    let top_up_ticket = scp_runtime::context::outlets::dispatch::StreamEscrowTicket::new(
+        refund_sink,
+        entry.context_id.clone(),
+        invoker_did_typed,
+        reserved_top_up,
+    );
+
     // Apply with the already-debited top-up. On runtime rejection
-    // (signature / replay) AFTER a successful reserve, reverse the debit so
-    // the §5.4.5 atomicity invariant holds.
+    // (signature / replay / post-close `StreamClosed`) the ticket drops →
+    // refund; the §5.4.5 atomicity invariant holds.
     match entry.handle.apply_credit_grant(&credit, reserved_top_up) {
-        Ok(new_total) => Ok(new_total),
+        Ok(new_total) => {
+            // Top-up accepted onto the escrow ledger; close-time settlement
+            // now owns its refund — do NOT also refund via the Drop-guard.
+            top_up_ticket.consume();
+            Ok(new_total)
+        }
         Err(grant_err) => {
-            if reserved_top_up.value() > 0 {
-                manager
-                    .outlet_stream_reverse_spend(
-                        &entry.context_id,
-                        &invoker_did_typed,
-                        reserved_top_up,
-                    )
-                    .await;
-            }
+            // Drop `top_up_ticket` here → async reverse-spend of the debited
+            // top-up (HIGH-1: a post-terminal grant rejected with
+            // `GrantError::StreamClosed` reverses the budget exactly like a
+            // signature / replay rejection). Explicit drop documents the
+            // refund point.
+            drop(top_up_ticket);
+            // HIGH-1 — surface the runtime's authoritative §5.4.4 slug + code
+            // so `StreamClosed` carries `protocol.stream-already-closed` /
+            // `SCP-TOOL-6101` (Protocol class), NOT the generic `CTX_2000`.
+            // Every `GrantError` variant routes through the shared
+            // slug / code mappers so the SDK error surface stays in lockstep
+            // with the protocol catalog.
             Err(ScpError::Context {
-                msg: format!("credit grant rejected: {grant_err:?}"),
-                code: codes::CTX_2000.to_owned(),
+                msg: format!(
+                    "credit grant rejected ({})",
+                    scp_runtime::context::outlets::stream::grant_error_to_slug(grant_err)
+                ),
+                code: scp_runtime::context::outlets::stream::grant_error_to_code(grant_err)
+                    .to_owned(),
             })
         }
     }
@@ -1710,6 +1815,16 @@ pub enum TerminateReason {
     /// lifecycle event, NOT a UCAN revocation, and MUST NOT be recorded as
     /// one. See §5.4.5 "Context teardown vs. revocation (round 8)".
     ContextClosedMidStream,
+    /// `execution.credit-exhausted` / `SCP-TOOL-6131` (Execution class).
+    /// The §5.4.5:758 HARD cumulative billable-chunk ceiling
+    /// (`min(credit_window, max_calls)`) was reached: no further billable
+    /// chunk may flow regardless of executor behavior, and additional
+    /// credit grants cannot raise the cumulative cap. The runtime's
+    /// per-chunk gate (`StreamGateOutcome::CreditExhausted`) drives this
+    /// path internally when a billable chunk arrives at an already-
+    /// saturated stream; this `UniFFI` variant lets the SDK framework's
+    /// recheck loop surface the same terminal cause explicitly.
+    CreditExhausted,
 }
 
 impl From<TerminateReason> for scp_protocol::context::outlets::stream::TerminateReason {
@@ -1719,6 +1834,7 @@ impl From<TerminateReason> for scp_protocol::context::outlets::stream::Terminate
             TerminateReason::CancelAckTimeout => Self::CancelAckTimeout,
             TerminateReason::CreditStall => Self::CreditStall,
             TerminateReason::ContextClosedMidStream => Self::ContextClosedMidStream,
+            TerminateReason::CreditExhausted => Self::CreditExhausted,
         }
     }
 }
@@ -2308,6 +2424,58 @@ mod tests {
         );
     }
 
+    /// HIGH-1 — the grant path surfaces a post-terminal grant
+    /// (`GrantError::StreamClosed`) as the Protocol-class
+    /// `protocol.stream-already-closed` / `SCP-TOOL-6101` pair, NOT the
+    /// generic `CTX_2000`. This pins the exact slug / code mappers the
+    /// `Err(grant_err)` arm of [`outlet_stream_grant_credit`] uses, so a
+    /// regression that re-routes a closed-stream grant away from 6101 (e.g.
+    /// reverting to a `{grant_err:?}` Debug message under `CTX_2000`) fails
+    /// here. The runtime layer already proves `apply_credit_grant` rejects a
+    /// grant with `StreamClosed` BEFORE touching escrow or the credit counter
+    /// (so the budget is left unchanged) and that the bridge's Drop-guard
+    /// reverses the per-grant top-up it debited; this assertion guards the
+    /// bridge's surfaced error envelope.
+    #[test]
+    fn stream_closed_grant_maps_to_protocol_session_6101() {
+        use scp_runtime::context::outlets::stream::{
+            GrantError, grant_error_to_code, grant_error_to_slug,
+        };
+        // The bridge's `Err(grant_err)` arm constructs the error from these
+        // two mappers. Pin both for the `StreamClosed` variant.
+        assert_eq!(
+            grant_error_to_slug(GrantError::StreamClosed),
+            scp_protocol::context::outlets::error_codes::SLUG_PROTOCOL_STREAM_ALREADY_CLOSED,
+            "post-terminal grant must surface protocol.stream-already-closed"
+        );
+        assert_eq!(
+            grant_error_to_code(GrantError::StreamClosed),
+            scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
+            "post-terminal grant must carry the Protocol-class SCP-TOOL-6101 code, \
+             not the generic CTX_2000"
+        );
+        // Reconstruct the exact ScpError the bridge builds so the assertion
+        // exercises the bridge's error-shaping expressions, not just the
+        // runtime mappers in isolation.
+        let surfaced = ScpError::Context {
+            msg: format!(
+                "credit grant rejected ({})",
+                grant_error_to_slug(GrantError::StreamClosed)
+            ),
+            code: grant_error_to_code(GrantError::StreamClosed).to_owned(),
+        };
+        assert!(
+            matches!(
+                &surfaced,
+                ScpError::Context { code, msg }
+                    if code == "SCP-TOOL-6101"
+                        && msg.contains("protocol.stream-already-closed")
+            ),
+            "bridge must surface a Protocol-class SCP-TOOL-6101 Context error \
+             carrying the stream-already-closed slug: {surfaced:?}"
+        );
+    }
+
     /// `outlet_stream_cancel` returns `Context` error when the
     /// `request_id_hex` does not match any registry entry.
     #[tokio::test]
@@ -2472,6 +2640,16 @@ mod tests {
         assert_eq!(
             Proto::from(TerminateReason::ContextClosedMidStream),
             Proto::ContextClosedMidStream
+        );
+        assert_eq!(
+            Proto::from(TerminateReason::CreditExhausted),
+            Proto::CreditExhausted
+        );
+        // The CreditExhausted terminate carries the Execution-class
+        // `execution.credit-exhausted` / `SCP-TOOL-6131` pair (§5.4.5:758).
+        assert_eq!(
+            Proto::CreditExhausted.code(),
+            scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CREDIT,
         );
     }
 }

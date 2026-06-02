@@ -4366,7 +4366,17 @@ pub(crate) fn validate_outlet_ucan_uniffi(
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
-            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+            // HIGH-3 (§5.4.5 / §7.3.8): outlet invocation authorization reads
+            // each token's §7.3.8 invocation caveats from its signed `nb`
+            // field so the per-edge narrow loop (Step 7b) and leaf time-box
+            // (Step 11b) bind the VALIDATED-NARROWED effective-caveat set the
+            // §5.4.5 `caveats_binding` commits to — not an unverified leaf
+            // assertion. The generic `ucan_validate` and broadcast paths
+            // intentionally keep `NoCaveatResolver`: only outlet invocation
+            // opts into caveat enforcement. This shared helper backs BOTH
+            // `outlet_invoke` and the streaming `open_stream_internal`, so the
+            // switch here covers both invocation surfaces in one place.
+            caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 
         validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, kind, &mut ctx)
@@ -6526,7 +6536,13 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                     clock: &scp_primitives::SystemClock,
-                    caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                    // HIGH-3 (§5.4.5 / §7.3.8): the MCP capability check is an
+                    // outlet invocation (`validate_outlet_invocation_ucan`), so
+                    // it reads each token's §7.3.8 caveats from the signed `nb`
+                    // field exactly like the direct outlet-invoke path. The
+                    // generic `ucan_validate` and broadcast paths keep
+                    // `NoCaveatResolver`.
+                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                 };
 
                 scp_core::context::outlets::validate_outlet_invocation_ucan(
