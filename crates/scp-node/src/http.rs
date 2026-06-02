@@ -215,6 +215,45 @@ pub struct NodeState {
     /// tests or when bridges are not configured), the bridge router is mounted
     /// without authentication.
     pub(crate) bridge_lookup: Option<Arc<dyn crate::bridge_auth::BridgeLookup>>,
+
+    /// Shared PUBLISH rate limiter from the relay server.
+    ///
+    /// Cloned from the WebSocket relay so the QUIC listener enforces the same
+    /// per-IP PUBLISH budget across both transports (unified rate limiting,
+    /// ADR-037 AC3, spec §10.14.3). Only present when the `quic` feature is
+    /// enabled, since it is consumed exclusively by the QUIC listener.
+    #[cfg(feature = "quic")]
+    pub(crate) publish_rate_limiter: PublishRateLimiter,
+
+    /// Pre-built QUIC server config for the relay-side QUIC listener.
+    ///
+    /// `Some` only in domain mode with a provisioned TLS certificate: the same
+    /// certificate that terminates WSS also authenticates QUIC, so the relay
+    /// cert covers both protocols (spec §10.14.3 item 1). `None` in no-domain
+    /// mode (plaintext `ws://`, no certificate) — QUIC requires TLS and is not
+    /// served there.
+    ///
+    /// When `Some`, [`ApplicationNode::serve`] starts a [`QuicListener`] bound
+    /// to UDP on the same port as the WebSocket TCP listener, sharing this
+    /// node's [`SubscriptionRegistry`], [`BlobStorageBackend`], and
+    /// [`ConnectionTracker`] (spec §10.14.3 item 2: cross-transport delivery).
+    ///
+    /// [`QuicListener`]: scp_transport::quic::listener::QuicListener
+    #[cfg(feature = "quic")]
+    pub(crate) quic_server_config: Option<quinn::ServerConfig>,
+
+    /// Whether the relay-side QUIC listener actually bound and started.
+    ///
+    /// Set to `true` by [`ApplicationNode::serve`] only after
+    /// [`spawn_quic_listener`] reports a successful UDP bind, and stays `false`
+    /// if the bind fails (port held, permission denied) or no
+    /// [`quic_server_config`](Self::quic_server_config) is present. This is the
+    /// value `.well-known/scp` reads to decide whether to advertise `"quic"`, so
+    /// the advertisement reflects the *running* listener — not merely that the
+    /// config was built. Closes the advertise-but-don't-serve gap for the
+    /// bind-failure case (spec §10.14.3 item 1).
+    #[cfg(feature = "quic")]
+    pub(crate) quic_listening: std::sync::atomic::AtomicBool,
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +672,24 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         let local_addr = listener
             .local_addr()
             .map_err(|e| NodeError::Serve(e.to_string()))?;
+
+        // Start the relay-side QUIC listener on the SAME port as the WebSocket
+        // TCP listener, but UDP (spec §10.14.3 item 1). We start it after the
+        // TCP bind so that, when `http_bind_addr` requests an OS-assigned port
+        // (port 0), QUIC binds the *actual* bound port rather than a second,
+        // unrelated OS-assigned port. Shares subscription + blob state with the
+        // WebSocket relay (spec §10.14.3 item 2). No-op without the `quic`
+        // feature or in no-domain mode (no TLS certificate).
+        #[cfg(feature = "quic")]
+        {
+            // The bind is synchronous (it completes before `start()` returns),
+            // so the flag is settled before the server future below is awaited
+            // and before the first `.well-known/scp` request can be served.
+            let started = spawn_quic_listener(&state, local_addr.port());
+            state
+                .quic_listening
+                .store(started, std::sync::atomic::Ordering::Release);
+        }
         let shutdown_token = state.shutdown_token.clone();
         let token = shutdown_token.clone();
         tokio::spawn(async move {
@@ -1019,6 +1076,12 @@ mod tests {
             hostname_index: RwLock::new(HashMap::new()),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
+            #[cfg(feature = "quic")]
+            publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
+            #[cfg(feature = "quic")]
+            quic_server_config: None,
+            #[cfg(feature = "quic")]
+            quic_listening: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1206,6 +1269,12 @@ mod vhost_tests {
             hostname_index: RwLock::new(hostname_index),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
+            #[cfg(feature = "quic")]
+            publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
+            #[cfg(feature = "quic")]
+            quic_server_config: None,
+            #[cfg(feature = "quic")]
+            quic_listening: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1575,4 +1644,76 @@ fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: 
             }
         }
     });
+}
+
+/// Starts the relay-side QUIC listener when a QUIC server config is present.
+///
+/// The listener binds UDP on the **same port** as the WebSocket TCP listener
+/// (`tcp_port`, the actually-bound port of the public TLS listener), so a relay
+/// accepts QUIC and WebSocket on one TLS port (spec §10.14.3 item 1). It shares
+/// this node's [`SubscriptionRegistry`], [`BlobStorageBackend`],
+/// [`ConnectionTracker`], and PUBLISH rate limiter with the WebSocket relay, so
+/// a QUIC subscriber receives blobs published over WebSocket and vice-versa
+/// (spec §10.14.3 item 2).
+///
+/// Returns `true` if the listener was started, `false` otherwise (no config, or
+/// bind failure — in which case the node degrades to WebSocket-only).
+///
+/// The listener's lifecycle is tied to `state.shutdown_token`: a small task
+/// awaits cancellation and then signals the QUIC listener to stop, so
+/// [`ApplicationNode::shutdown`] (and `serve()`'s graceful shutdown) stop both
+/// transports together.
+#[cfg(feature = "quic")]
+fn spawn_quic_listener(state: &Arc<NodeState>, tcp_port: u16) -> bool {
+    use scp_transport::quic::listener::{QuicListener, QuicListenerConfig};
+
+    let Some(server_config) = state.quic_server_config.clone() else {
+        return false;
+    };
+
+    // Bind UDP on the same interface and port as the public WebSocket/TLS
+    // listener so both transports share one address (spec §10.14.3 item 1).
+    let bind_addr = SocketAddr::new(state.http_bind_addr.ip(), tcp_port);
+
+    // Mirror the relay's operational limits so QUIC and WebSocket enforce the
+    // same policy.
+    let rc = &state.relay_config;
+    let config = QuicListenerConfig {
+        bind_addr,
+        max_blob_size: rc.max_blob_size,
+        max_blob_ttl: rc.max_blob_ttl,
+        max_subscriptions_per_connection: rc.max_subscriptions_per_connection,
+        max_query_limit: rc.max_query_limit,
+        max_connections_per_ip: rc.max_connections_per_ip,
+        max_total_connections: rc.max_total_connections,
+        rate_limit_publishes_per_second: rc.rate_limit_publishes_per_second,
+        rate_limit_subscribes_per_minute: rc.rate_limit_subscribes_per_minute,
+        delivery_jitter_ms: rc.delivery_jitter_ms,
+    };
+
+    let listener = QuicListener::new(
+        config,
+        Arc::clone(&state.blob_storage),
+        state.subscription_registry.clone(),
+        state.publish_rate_limiter.clone(),
+        state.connection_tracker.clone(),
+    );
+
+    match listener.start(server_config) {
+        Ok((quic_handle, local_addr)) => {
+            tracing::info!(addr = %local_addr, "relay QUIC listener started");
+            // Bridge the node's cancellation token to the QUIC shutdown handle so
+            // graceful shutdown stops both transports.
+            let shutdown_token = state.shutdown_token.clone();
+            tokio::spawn(async move {
+                shutdown_token.cancelled().await;
+                quic_handle.shutdown();
+            });
+            true
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to start relay QUIC listener — serving WebSocket only");
+            false
+        }
+    }
 }

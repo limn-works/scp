@@ -2760,6 +2760,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
         let connection_tracker = relay_server.connection_tracker();
         let subscription_registry = relay_server.subscriptions();
+        // Shared PUBLISH rate limiter — the QUIC listener reuses it so PUBLISH
+        // budgets are enforced uniformly across WebSocket and QUIC (ADR-037 AC3).
+        #[cfg(feature = "quic")]
+        let publish_rate_limiter = relay_server.publish_rate_limiter();
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
         let dev_token = self.local_api_addr.map(generate_dev_token);
         let http_bind_addr = self.http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
@@ -2798,6 +2802,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     cert_data,
                     connection_tracker.clone(),
                     subscription_registry.clone(),
+                    #[cfg(feature = "quic")]
+                    publish_rate_limiter.clone(),
                     acme_challenges,
                     #[cfg(feature = "http3")]
                     self.http3_config,
@@ -2835,6 +2841,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     self.network_detector,
                     connection_tracker,
                     subscription_registry,
+                    #[cfg(feature = "quic")]
+                    publish_rate_limiter,
                 )
                 .await
             }
@@ -3310,6 +3318,8 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     cert_data: tls::CertificateData,
     connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
+    #[cfg(feature = "quic")]
+    publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
     acme_challenges: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
@@ -3322,6 +3332,29 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     // without restarting the server (spec section 18.6.3).
     let (tls_server_config, cert_resolver) =
         tls::build_reloadable_tls_config(&cert_data).map_err(NodeError::Tls)?;
+
+    // Build the QUIC server config from the SAME provisioned certificate so the
+    // relay cert covers both WebSocket (TCP) and QUIC (UDP) on the public TLS
+    // port (spec §10.14.3 item 1). The listener itself is started lazily in
+    // `serve()`; here we only prepare the config so `serve()` has everything it
+    // needs without re-parsing the certificate.
+    #[cfg(feature = "quic")]
+    let quic_server_config = {
+        let cert_chain = cert_data.certificate_chain_der().map_err(NodeError::Tls)?;
+        let private_key = cert_data.private_key_der().map_err(NodeError::Tls)?;
+        match scp_transport::quic::listener::build_server_config(cert_chain, private_key) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                // A malformed cert should not prevent the node from serving
+                // WebSocket; degrade to WebSocket-only and log loudly.
+                tracing::error!(
+                    domain = %domain, error = %e,
+                    "failed to build QUIC server config — serving WebSocket only"
+                );
+                None
+            }
+        }
+    };
 
     tracing::info!(
         domain = %domain, relay_url = %relay_url,
@@ -3368,6 +3401,13 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
+        #[cfg(feature = "quic")]
+        publish_rate_limiter,
+        #[cfg(feature = "quic")]
+        quic_server_config,
+        // Set to `true` by `serve()` once the QUIC listener binds (§10.14.3).
+        #[cfg(feature = "quic")]
+        quic_listening: std::sync::atomic::AtomicBool::new(false),
     });
 
     Ok(ApplicationNode {
@@ -3393,6 +3433,23 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
 // Shared no-domain build logic (used by HasNoDomain::build and domain fallthrough)
 // ---------------------------------------------------------------------------
 
+/// Appends an `SCPRelay` service entry to the DID document for `relay_url`.
+///
+/// The service id is suffixed with the next sequential index so multiple relays
+/// can coexist on one document (`<did>#scp-relay-<n>`).
+fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
+    let relay_count = document
+        .service
+        .iter()
+        .filter(|s| s.service_type == "SCPRelay")
+        .count();
+    document.service.push(scp_identity::document::Service {
+        id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
+        service_type: "SCPRelay".to_owned(),
+        service_endpoint: relay_url.to_owned(),
+    });
+}
+
 // Node builder internal: all parameters are required for server construction.
 #[allow(clippy::too_many_arguments)]
 async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
@@ -3414,6 +3471,8 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
+    #[cfg(feature = "quic")]
+    publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
 ) -> Result<ApplicationNode<S>, NodeError> {
     // NAT strategy needs the public HTTP port, not the internal relay port (#641).
     let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
@@ -3427,17 +3486,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         ReachabilityTier::Bridge { bridge_url } => bridge_url.clone(),
     };
 
-    let relay_count = document
-        .service
-        .iter()
-        .filter(|s| s.service_type == "SCPRelay")
-        .count();
-
-    document.service.push(scp_identity::document::Service {
-        id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
-        service_type: "SCPRelay".to_owned(),
-        service_endpoint: relay_url.clone(),
-    });
+    push_relay_service(&mut document, &relay_url);
 
     // 4. Publish DID document.
     did_method.publish(&identity, &document).await?;
@@ -3504,6 +3553,14 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
+        // No-domain mode is plaintext `ws://` (no cert), so QUIC is not served (§10.14.3).
+        #[cfg(feature = "quic")]
+        publish_rate_limiter,
+        #[cfg(feature = "quic")]
+        quic_server_config: None,
+        // No QUIC config means `serve()` never sets this; stays `false`.
+        #[cfg(feature = "quic")]
+        quic_listening: std::sync::atomic::AtomicBool::new(false),
     });
 
     Ok(ApplicationNode {
@@ -3607,6 +3664,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
         let connection_tracker = relay_server.connection_tracker();
         let subscription_registry = relay_server.subscriptions();
+        // Shared PUBLISH rate limiter (unused in no-domain mode because QUIC is
+        // not served without TLS, but kept on NodeState for a uniform struct).
+        #[cfg(feature = "quic")]
+        let publish_rate_limiter = relay_server.publish_rate_limiter();
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 4. Generate dev API token if local_api was configured.
@@ -3641,6 +3702,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             self.network_detector,
             connection_tracker,
             subscription_registry,
+            #[cfg(feature = "quic")]
+            publish_rate_limiter,
         )
         .await
     }

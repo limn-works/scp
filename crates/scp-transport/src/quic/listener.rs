@@ -300,7 +300,15 @@ pub fn build_server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     private_key: PrivateKeyDer<'static>,
 ) -> Result<ServerConfig, QuicListenerError> {
-    let mut tls_config = rustls::ServerConfig::builder()
+    // Pin the ring crypto provider explicitly rather than relying on the
+    // process default. When a binary links both the `ring` and `aws-lc-rs`
+    // rustls providers (e.g. via aws-sdk / reqwest pulling aws-lc-rs alongside
+    // our ring backend), `ServerConfig::builder()` has no unambiguous default
+    // and panics. SCP is ring-only, so name the provider directly.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| QuicListenerError::TlsError(e.to_string()))?
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .map_err(|e| QuicListenerError::TlsError(e.to_string()))?;
