@@ -87,7 +87,14 @@ async fn auto_wire_context_manager(
     .await
     {
         Ok(adapter) => {
-            crate::runtime::init_context_manager_with_relay_transport(bi, did, adapter);
+            // The bearer auto-wire path stays WebSocket-only (QUIC has no
+            // bearer-upgrade surface, spec §10.14.3 item 4), so it connects
+            // directly via `connect_sourced_with_bearer` rather than the QUIC
+            // selector. The shared `init_context_manager_with_relay_transport`
+            // helper now takes a `Box<dyn TransportAdapter>` (so the discovering
+            // connect sites can hand it the selector's boxed adapter); box the
+            // concrete bearer adapter here to match.
+            crate::runtime::init_context_manager_with_relay_transport(bi, did, Box::new(adapter));
 
             // Also populate the BridgeInstance transport manager so that
             // broadcast publish, context subscribe, and discovery probing

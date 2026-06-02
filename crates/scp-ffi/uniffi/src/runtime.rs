@@ -625,7 +625,7 @@ impl UniffiBridgeInstance {
     pub fn init_context_manager_with_relay_transport(
         &self,
         local_did: &str,
-        adapter: scp_transport::native::adapter::NativeRelayAdapter,
+        adapter: Box<dyn scp_transport::TransportAdapter>,
     ) {
         if self.core.has_context_manager() {
             tracing::warn!(

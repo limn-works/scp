@@ -252,26 +252,41 @@ pub(crate) async fn transport_connect_on(
 
     let start = std::time::Instant::now();
     let profile = scp_transport::profile::TransportProfile::platform_default();
-    let adapter_result =
-        scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await;
+    // Route through the instance-scoped transport selector for transparent
+    // QUIC↔WebSocket selection (spec §10.14.3 item 4; ADR-037). The discovering
+    // variant fetches the relay's advertised transports from `.well-known/scp`
+    // (spec §10.5.1) at connect time and feeds that list into the
+    // QUIC-vs-WebSocket decision — failing open to WebSocket when the relay
+    // serves no well-known. The selector is owned by the bridge instance so its
+    // per-relay QUIC-suppression and well-known caches survive across connects.
+    // Mirrors the PyO3 reference bridge's `transport_connect`. The selector
+    // surfaces the suppression receiver (drained into reliability scoring,
+    // #1533 AC5) for the WebSocket branch; cover traffic auto-starts via the
+    // profile inside `finalize_connection` (#1532 AC6).
+    let selector = bi.core.transport_selector();
+    let adapter_result = selector
+        .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
+        .await;
 
     match adapter_result {
-        Ok(mut adapter) => {
+        Ok((adapter, suppression_rx)) => {
             // Connection succeeded. Measure latency.
             #[allow(clippy::cast_precision_loss)]
             let latency = start.elapsed().as_millis() as f64;
 
-            // Extract the suppression event receiver BEFORE moving the adapter
-            // into the TransportManager. The spawned task drains suppression
-            // events and downgrades the relay's reliability score (#1533 AC5).
-            let suppression_rx = adapter.take_suppression_receiver();
+            // The suppression receiver is surfaced by the selector (the
+            // concrete `NativeRelayAdapter::take_suppression_receiver` lives
+            // behind the `Box<dyn TransportAdapter>` the selector returns, so
+            // we cannot call it here — the selector hands it back directly,
+            // exactly like the PyO3 bridge).
 
-            // Wrap the adapter in a TransportManager for multi-relay support,
-            // then store it on the bridge instance. Same pattern as the
-            // PyO3 bridge's `py_transport_connect`.
-            // Cover traffic is already running — `connect_sourced` with a
-            // profile auto-starts it via `finalize_connection` (#1532 AC6).
-            let manager = scp_transport::TransportManager::new(Box::new(adapter));
+            // Wrap the selected adapter in a TransportManager for multi-relay
+            // support, then store it on the bridge instance. Same pattern as
+            // the PyO3 bridge's `transport_connect`. The selector returns a
+            // `Box<dyn TransportAdapter>`; the blanket
+            // `impl TransportAdapter for Box<dyn TransportAdapter>` lets it be
+            // used anywhere a concrete adapter is expected.
+            let manager = scp_transport::TransportManager::new(adapter);
             set_transport_manager_on(bi, manager)?;
 
             // Register the URL on the bridge's pending-reconnect set so
@@ -415,13 +430,20 @@ pub(crate) async fn configure_relay_transport_on(
     };
 
     let profile = scp_transport::profile::TransportProfile::platform_default();
-    let adapter =
-        scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
-            .await
-            .map_err(|e| ScpNapiError::Transport {
-                message: format!("failed to connect to relay '{relay_url}': {e}"),
-                code: codes::TRANS_5001.to_owned(),
-            })?;
+    // Route through the instance-scoped transport selector for transparent
+    // QUIC↔WebSocket selection (spec §10.14.3 item 4; ADR-037). The discovering
+    // variant reads the relay's advertised transports from `.well-known/scp`
+    // (spec §10.5.1) at connect time to enable QUIC, failing open to WebSocket
+    // when discovery is unavailable. Mirrors the PyO3 reference bridge's
+    // `configure_relay_transport`.
+    let selector = bi.core.transport_selector();
+    let adapter = selector
+        .select_and_connect_discovering(&sourced, Some(&profile))
+        .await
+        .map_err(|e| ScpNapiError::Transport {
+            message: format!("failed to connect to relay '{relay_url}': {e}"),
+            code: codes::TRANS_5001.to_owned(),
+        })?;
 
     crate::runtime::init_context_manager_with_relay_transport(bi, &local_did, adapter);
     Ok(())
@@ -467,24 +489,25 @@ pub(crate) async fn transport_add_relay_on(
         source: scp_transport::relay::connection::RelayUrlSource::Explicit,
     };
     let profile = scp_transport::profile::TransportProfile::platform_default();
-    // Cover traffic auto-starts per adapter via `connect_sourced` with a
-    // profile — `finalize_connection` launches the cover traffic background
-    // task based on the profile's tier (#1532 AC6).
-    let mut adapter =
-        scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
-            .await
-            .map_err(|e| ScpNapiError::Transport {
-                message: format!("failed to connect to relay '{relay_url}': {e}"),
-                code: codes::TRANS_5001.to_owned(),
-            })?;
-
-    // Extract the suppression event receiver BEFORE moving the adapter into
-    // the TransportManager. The spawned task drains suppression events and
-    // downgrades the relay's reliability score (#1533 AC5).
-    let suppression_rx = adapter.take_suppression_receiver();
+    // Route through the instance-scoped transport selector for transparent
+    // QUIC↔WebSocket selection (spec §10.14.3 item 4; ADR-037). The discovering
+    // variant reads the relay's advertised transports from `.well-known/scp`
+    // (spec §10.5.1) at connect time to enable QUIC, failing open to WebSocket
+    // when discovery is unavailable. Cover traffic auto-starts per adapter via
+    // the profile inside `finalize_connection` (#1532 AC6). The selector
+    // surfaces the suppression receiver (drained into reliability scoring,
+    // #1533 AC5). Mirrors the PyO3 reference bridge's `transport_add_relay`.
+    let selector = bi.core.transport_selector();
+    let (adapter, suppression_rx) = selector
+        .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
+        .await
+        .map_err(|e| ScpNapiError::Transport {
+            message: format!("failed to connect to relay '{relay_url}': {e}"),
+            code: codes::TRANS_5001.to_owned(),
+        })?;
 
     let count = with_transport_manager_mut_on(bi, |manager| {
-        let _eviction = manager.add_adapter(Box::new(adapter));
+        let _eviction = manager.add_adapter(adapter);
         #[allow(clippy::cast_possible_truncation)]
         Ok(manager.adapter_count() as u32)
     })?;
@@ -679,9 +702,10 @@ mod tests {
         let _ = clear_transport_manager_on(&bi);
     }
 
-    // Note: set_transport_manager_on requires a real `NativeRelayAdapter`
-    // which can only be obtained by connecting to a live relay. Full
-    // set→clear roundtrip coverage is in E2E tests.
+    // Note: a populated transport manager requires a real adapter, which can
+    // only be obtained by connecting to a live relay (the connect now routes
+    // through the bridge instance's transport selector). Full set→clear
+    // roundtrip coverage is in E2E tests.
 
     // -----------------------------------------------------------------------
     // NapiTransportManager — connected state and defense-in-depth
@@ -816,5 +840,105 @@ mod tests {
             "fresh NapiBridgeInstance instances must have distinct ids — otherwise the \
              per-instance isolation test below is meaningless"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Selector routing — connect sites must go through the instance selector
+    // (cross-SDK QUIC selection). The in-memory relay serves no
+    // `.well-known/scp`, so the selector's discovering connect fails open to
+    // WebSocket and still succeeds. These tests prove each napi connect site
+    // routes through `bi.core.transport_selector()` rather than dialing
+    // `NativeRelayAdapter::connect_sourced` directly.
+    // -----------------------------------------------------------------------
+
+    /// `transport_connect_on` must route through the instance selector and
+    /// connect via WebSocket fallback against a relay that advertises no QUIC.
+    /// After the call the bridge instance must own a transport manager.
+    #[test]
+    fn transport_connect_routes_through_selector_ws_fallback() {
+        let rt = crate::runtime();
+        // An in-memory relay serves no `.well-known/scp`; QUIC is never
+        // advertised, so a selector-routed connect must fail open to WS.
+        let relay = rt
+            .block_on(scp_ffi_common::server::start_relay_in_memory())
+            .unwrap();
+        let relay_url = relay.relay_url().to_owned();
+
+        let bi = Arc::new(NapiBridgeInstance::new_napi());
+        let handle = rt
+            .block_on(transport_connect_on(&bi, relay_url.clone()))
+            .expect("selector-routed connect to a no-QUIC relay must succeed via WS fallback");
+
+        assert!(
+            handle.is_connected(),
+            "handle must report connected after selector-routed connect"
+        );
+        assert_eq!(handle.relay_url().as_deref(), Some(relay_url.as_str()));
+        assert!(
+            has_transport_manager_on(&bi),
+            "transport manager must be populated on the bridge instance after \
+             the selector-routed connect"
+        );
+
+        // Drop the handle explicitly so its Drop decrements the handle count.
+        drop(handle);
+        relay.shutdown();
+    }
+
+    /// `transport_add_relay_on` must route through the instance selector and
+    /// add a second WS-fallback adapter to the manager.
+    #[test]
+    fn transport_add_relay_routes_through_selector_ws_fallback() {
+        let rt = crate::runtime();
+        let relay = rt
+            .block_on(scp_ffi_common::server::start_relay_in_memory())
+            .unwrap();
+        let relay_url = relay.relay_url().to_owned();
+
+        let bi = Arc::new(NapiBridgeInstance::new_napi());
+        // First connect establishes the manager (also selector-routed).
+        let handle = rt
+            .block_on(transport_connect_on(&bi, relay_url.clone()))
+            .expect("initial selector-routed connect must succeed");
+        assert_eq!(transport_adapter_count_on(&bi).unwrap(), 1);
+
+        // add_relay must also route through the selector and fall open to WS.
+        let count = rt
+            .block_on(transport_add_relay_on(&bi, relay_url))
+            .expect("selector-routed add_relay to a no-QUIC relay must succeed via WS fallback");
+        assert_eq!(
+            count, 2,
+            "second selector-routed adapter must be registered in the manager"
+        );
+
+        drop(handle);
+        relay.shutdown();
+    }
+
+    /// `configure_relay_transport_on` must route through the instance selector
+    /// and install a `RelayTransportProvider` over the WS-fallback adapter.
+    #[test]
+    fn configure_relay_transport_routes_through_selector_ws_fallback() {
+        let rt = crate::runtime();
+        let relay = rt
+            .block_on(scp_ffi_common::server::start_relay_in_memory())
+            .unwrap();
+        let relay_url = relay.relay_url().to_owned();
+
+        let bi = NapiBridgeInstance::new_napi();
+        let did = "did:dht:z6MkTestConfigureRelay".to_owned();
+        rt.block_on(configure_relay_transport_on(&bi, relay_url, did))
+            .expect(
+                "selector-routed configure_relay_transport to a no-QUIC relay must succeed via \
+                 WS fallback and install a ContextManager",
+            );
+
+        assert!(
+            bi.core.has_context_manager(),
+            "ContextManager must be attached after configure_relay_transport routes through \
+             the selector"
+        );
+
+        relay.shutdown();
     }
 }
