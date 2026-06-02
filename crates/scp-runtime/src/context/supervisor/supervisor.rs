@@ -285,6 +285,10 @@ pub struct Supervisor {
     event_tx: OnceLock<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
     /// Shared task set for TTL timers + governance timeouts.
     task_set: OnceLock<Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>>,
+    /// OpenMLS storage adapter — the bridge's chosen Storage, erased once via
+    /// `SpawnBlockingStorageAdapter`. Runtime NEVER defaults this. Lock-free
+    /// read per ADR-049 §Decision 12.
+    mls_storage: OnceLock<Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>,
 
     // -----------------------------------------------------------------
     // ADR-049 commit 12 — supervisor-authoritative direct fields.
@@ -373,6 +377,7 @@ impl Supervisor {
             payment_adapter: OnceLock::new(),
             event_tx: OnceLock::new(),
             task_set: OnceLock::new(),
+            mls_storage: OnceLock::new(),
             // ADR-049 commit 12 — direct authoritative state.
             contexts: Arc::new(DashMap::new()),
             next_generation: std::sync::atomic::AtomicU64::new(1),
@@ -437,6 +442,13 @@ impl Supervisor {
     /// * `event_tx` — optional broadcast sender for event fan-out.
     /// * `clock` — optional [`Clock`] override; defaults to
     ///   [`scp_primitives::SystemClock`] when `None`.
+    /// * `mls_storage` — **required** OpenMLS storage adapter (the
+    ///   bridge's chosen `Storage`, erased once via
+    ///   [`SpawnBlockingStorageAdapter`](crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter)).
+    ///   The runtime never defaults or manufactures storage — the caller
+    ///   supplies it at the bridge/builder layer, enforced by the type
+    ///   system (non-`Option`). In-memory storage is a bridge-layer dev
+    ///   opt-in, never a runtime default.
     ///
     /// # Returns
     ///
@@ -453,6 +465,7 @@ impl Supervisor {
         payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Arc<Self> {
         // The supervisor's own `persistence` field is non-Option (saga
         // code requires a value); when the caller passes `None`, wire
@@ -500,6 +513,10 @@ impl Supervisor {
         let _ = supervisor.task_set.set(Arc::new(tokio::sync::Mutex::new(
             tokio::task::JoinSet::new(),
         )));
+        // Required, non-Option — the runtime never defaults storage. The
+        // freshly-constructed supervisor's slot is always empty here, so
+        // `set` cannot fail; `let _ =` discards the `Result` for clippy.
+        let _ = supervisor.mls_storage.set(mls_storage);
 
         supervisor
     }
@@ -596,6 +613,21 @@ impl Supervisor {
         &self,
     ) -> Option<&Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>> {
         self.task_set.get()
+    }
+
+    /// Cheap reference to the supervisor's OpenMLS storage adapter
+    /// (lock-free read per ADR-049 §Decision 12). Returns `None` if
+    /// [`Self::with_providers`] was not used (e.g. a supervisor built
+    /// via [`Self::for_query_shim`] / [`Self::new`]).
+    // Non-test callers land when `dispatch_lifecycle_direct` switches to
+    // actor-shape (storage-foundation Step 5); until then this accessor is
+    // reached only from `build_actor_deps`' test fixtures.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub(in crate::context) fn mls_storage_ref(
+        &self,
+    ) -> Option<&Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>> {
+        self.mls_storage.get()
     }
 
     // -------------------------------------------------------------------
@@ -790,22 +822,57 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
-    /// bundle from the supervisor's own provider slots (ADR-049 commit
-    /// 12).
+    /// Get-or-spawn this identity's
+    /// [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor),
+    /// returning a clone of its handle.
     ///
-    /// Reads providers from the supervisor's `OnceLock`s populated by
-    /// [`Self::with_providers`]. Caller-supplied backends (split per
-    /// ADR §6: `MlsBackend` + `HpkeBackend` + `OpenMlsStorageAdapter`)
-    /// and supervisor-scoped handles (`SupervisorHandle`, this
-    /// identity's `KeyPackageStoreHandle`) arrive as parameters
-    /// because they're not part of the supervisor's own owned state.
+    /// Lock-free fast path: a [`DashMap::get`] probe (ADR-049 §Decision
+    /// 12 — no read-path lock). On a miss the [`Self::write_lock`] is
+    /// acquired and the probe is re-checked under the lock (double-
+    /// checked) before spawning, so concurrent callers never spawn two
+    /// actors for the same identity.
+    // Non-test callers land when `dispatch_lifecycle_direct` switches to
+    // actor-shape (storage-foundation Step 5); until then this is reached
+    // only from `build_actor_deps`' test fixtures.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::context) async fn key_package_store_for(
+        &self,
+        identity: &DID,
+    ) -> crate::context::supervisor::key_package_actor::KeyPackageStoreHandle {
+        if let Some(handle) = self.key_package_stores.get(identity) {
+            return handle.value().clone();
+        }
+        let _guard = self.write_lock.lock().await;
+        if let Some(handle) = self.key_package_stores.get(identity) {
+            return handle.value().clone();
+        }
+        let handle = crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn(
+            identity.clone(),
+        );
+        self.key_package_stores
+            .insert(identity.clone(), handle.clone());
+        handle
+    }
+
+    /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
+    /// bundle entirely from the supervisor's own provider slots
+    /// (ADR-049 §1 / commit 12), scoped to `owning_did`.
+    ///
+    /// Self-sources every collaborator from the `OnceLock`s populated by
+    /// [`Self::with_providers`]: the `MlsBackend` / `HpkeBackend` pair is
+    /// read transitively through `crypto.mls_backend()` /
+    /// `crypto.hpke_backend()` (the [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
+    /// owns the only instance — no second supervisor field, so there is
+    /// one source of truth per ADR §6). The OpenMLS storage adapter is
+    /// the supervisor's `mls_storage` slot. The `KeyPackageStoreHandle`
+    /// is resolved (get-or-spawn) for `owning_did` via
+    /// [`Self::key_package_store_for`]. Persistence falls back to the
+    /// no-op stub when no helper-side backend is wired.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::NotInitialized`] if any required
-    /// provider slot is empty (i.e. [`Self::with_providers`] was not
-    /// used).
+    /// Returns [`ContextError::NotInitialized`] if any required provider
+    /// slot is empty (i.e. [`Self::with_providers`] was not used).
     ///
     /// # Method receiver
     ///
@@ -817,41 +884,35 @@ impl Supervisor {
     /// [`SupervisorHandle::local_dids`](crate::context::supervisor::SupervisorHandle::local_dids)
     /// / [`SupervisorHandle::standing_peer`](crate::context::supervisor::SupervisorHandle::standing_peer)
     /// would read empty state.
-    #[allow(clippy::unused_async)]
-    // Test fixtures call `build_actor_deps(...).await` on this method;
-    // keeping it `async` preserves the call shape across migration even
-    // though the body no longer awaits anything after ADR-049 commit 12
-    // dropped the legacy ContextManager attach.
-    pub async fn build_actor_deps(
+    // Non-test callers land when `dispatch_lifecycle_direct` switches to
+    // actor-shape (storage-foundation Step 5); until then this is reached
+    // only from the supervisor + actor test fixtures.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::context) async fn build_actor_deps(
         self: &Arc<Self>,
-        persistence: Arc<dyn ContextPersistence>,
-        mls: Arc<dyn crate::crypto::mls::backend::MlsBackend>,
-        hpke: Arc<dyn crate::crypto::hpke_backend::HpkeBackend>,
-        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
-        key_package_store: crate::context::supervisor::key_package_actor::KeyPackageStoreHandle,
+        owning_did: &DID,
     ) -> Result<crate::context::actor::deps::ActorDeps, ContextError> {
         use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
-        let crypto =
-            Arc::clone(self.crypto_ref().ok_or_else(|| {
-                ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned())
-            })?);
-        let transport =
-            Arc::clone(self.transport_ref().ok_or_else(|| {
-                ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned())
-            })?);
-        let event_log =
-            Arc::clone(self.event_log_ref().ok_or_else(|| {
-                ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned())
-            })?);
-        let clock =
-            Arc::clone(self.clock_ref().ok_or_else(|| {
-                ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned())
-            })?);
-        let key_resolver = self
-            .key_resolver_ref()
-            .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?
-            .clone();
+        let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
 
+        let crypto = Arc::clone(self.crypto_ref().ok_or_else(not_init)?);
+        // mls/hpke stay transitive — the MlsCryptoProvider owns the only
+        // backend pair (ADR §6); no Supervisor field mirrors them.
+        let mls = Arc::clone(crypto.mls_backend());
+        let hpke = Arc::clone(crypto.hpke_backend());
+        let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
+        let event_log = Arc::clone(self.event_log_ref().ok_or_else(not_init)?);
+        let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
+        let key_resolver = self.key_resolver_ref().ok_or_else(not_init)?.clone();
+        let mls_storage = Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?);
+        let persistence = self.persistence_ref().map_or_else(
+            || {
+                Arc::new(crate::context::persistence::NoopContextPersistence)
+                    as Arc<dyn ContextPersistence>
+            },
+            Arc::clone,
+        );
+        let key_package_store = self.key_package_store_for(owning_did).await;
         let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(Arc::clone(self));
 
         Ok(crate::context::actor::deps::ActorDeps {
@@ -4681,25 +4742,8 @@ mod tests {
     async fn test_actor_deps(
         supervisor: &Arc<Supervisor>,
     ) -> crate::context::actor::deps::ActorDeps {
-        use scp_platform::testing::InMemoryStorage;
-
-        let persistence: Arc<dyn ContextPersistence> = Arc::new(TestPersistence);
-        let mls: Arc<dyn crate::crypto::mls::backend::MlsBackend> =
-            Arc::new(crate::crypto::mls::production_backend::ProductionMlsBackend::new());
-        let hpke: Arc<dyn crate::crypto::hpke_backend::HpkeBackend> =
-            Arc::new(crate::crypto::hpke_backend::ProductionHpkeBackend::new());
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                    InMemoryStorage::new(),
-                )),
-            );
-        let kp_store = crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn(
-            DID("did:example:spawn-state-test".to_owned()),
-        );
-
         supervisor
-            .build_actor_deps(persistence, mls, hpke, mls_storage, kp_store)
+            .build_actor_deps(&DID("did:example:spawn-state-test".to_owned()))
             .await
             .expect("build_actor_deps requires providers populated")
     }
@@ -4753,6 +4797,12 @@ mod tests {
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
         let key_resolver: KeyResolver = Arc::new(|_: &DID| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
         Supervisor::with_providers(
             crypto,
             transport,
@@ -4762,6 +4812,7 @@ mod tests {
             None,
             None,
             None,
+            mls_storage,
         )
     }
 
@@ -4899,5 +4950,182 @@ mod tests {
             Err(other) => panic!("expected ContextNotRegistered, got {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-049 §1 — `build_actor_deps` self-sourcing (storage foundation)
+    //
+    // `build_actor_deps` is `pub(in crate::context)` (only dispatch arms
+    // call it), so these live in-crate rather than in
+    // `tests/actor_deps_complete.rs`, which was an external-crate
+    // integration test back when the method was `pub`.
+    // -----------------------------------------------------------------
+
+    /// A `MlsStorage`-witnessing fixture that retains the supervisor's
+    /// authoritative `crypto` + `mls_storage` Arcs so tests can assert
+    /// `build_actor_deps` self-sources the exact same handles.
+    fn build_deps_fixture() -> (
+        Arc<Supervisor>,
+        Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    ) {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestBuildDeps".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(TestEventLog);
+        // Resolver returns Some for every DID — witnesses key_resolver
+        // propagation.
+        let key_resolver: KeyResolver = Arc::new(|did: &DID| {
+            let mut seed = [0u8; 32];
+            for (i, b) in did.as_ref().as_bytes().iter().enumerate() {
+                seed[i % 32] ^= *b;
+            }
+            Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+        });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = Supervisor::with_providers(
+            Arc::clone(&crypto),
+            transport,
+            event_log,
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+            Arc::clone(&mls_storage),
+        );
+        (supervisor, crypto, mls_storage)
+    }
+
+    /// `build_actor_deps` populates every `ActorDeps` field from the
+    /// supervisor's own slots; mls/hpke are the single backend pair owned
+    /// by the `MlsCryptoProvider` (ADR-049 §6 — no second source).
+    #[tokio::test]
+    async fn build_actor_deps_reads_single_backend_pair() {
+        let (supervisor, crypto, mls_storage) = build_deps_fixture();
+        let deps = supervisor
+            .build_actor_deps(&DID("did:example:alice".to_owned()))
+            .await
+            .expect("build_actor_deps succeeds when providers are populated");
+
+        assert!(
+            Arc::ptr_eq(&deps.mls, crypto.mls_backend()),
+            "mls must be the crypto provider's single MlsBackend"
+        );
+        assert!(
+            Arc::ptr_eq(&deps.hpke, crypto.hpke_backend()),
+            "hpke must be the crypto provider's single HpkeBackend"
+        );
+        assert!(
+            Arc::ptr_eq(&deps.mls_storage, &mls_storage),
+            "mls_storage must be the exact Arc threaded into with_providers"
+        );
+        assert!(
+            (deps.key_resolver)(&DID("did:example:alice".to_owned())).is_some(),
+            "key_resolver must populate from the supervisor"
+        );
+        assert!(
+            deps.payment_adapter.is_none(),
+            "payment_adapter is None when unconfigured"
+        );
+        assert!(
+            deps.local_dids.load().is_empty(),
+            "local_dids snapshots the fresh supervisor's empty set"
+        );
+        deps.key_package_store
+            .send_shutdown()
+            .await
+            .expect("KP store handle is live");
+    }
+
+    /// `build_actor_deps` propagates the supervisor's `mls_storage` slot
+    /// verbatim — the single-handle storage-foundation guarantee.
+    #[tokio::test]
+    async fn build_actor_deps_propagates_supervisor_mls_storage() {
+        let (supervisor, _crypto, mls_storage) = build_deps_fixture();
+        let deps = supervisor
+            .build_actor_deps(&DID("did:example:storage".to_owned()))
+            .await
+            .expect("build_actor_deps succeeds");
+        assert!(
+            Arc::ptr_eq(&deps.mls_storage, &mls_storage),
+            "ActorDeps.mls_storage must be the same Arc set on the supervisor"
+        );
+        deps.key_package_store
+            .send_shutdown()
+            .await
+            .expect("KP store handle is live");
+    }
+
+    /// `build_actor_deps` fails clean when no providers were attached
+    /// (`for_query_shim` path).
+    #[tokio::test]
+    async fn build_actor_deps_fails_when_no_providers() {
+        let supervisor = Arc::new(Supervisor::for_query_shim());
+        match supervisor
+            .build_actor_deps(&DID("did:example:none".to_owned()))
+            .await
+        {
+            Ok(_) => panic!("build_actor_deps must fail when providers are unpopulated"),
+            Err(ContextError::NotInitialized(_)) => {}
+            Err(other) => panic!("expected NotInitialized, got {other:?}"),
+        }
+    }
+
+    /// The returned `SupervisorHandle` wraps a clone of the OUTER
+    /// supervisor `Arc` (regression guard for the `self: &Arc<Self>`
+    /// receiver) — `strong_count` bumps when the handle is built.
+    #[tokio::test]
+    async fn build_actor_deps_handle_holds_outer_arc() {
+        let (supervisor, _crypto, _mls_storage) = build_deps_fixture();
+        let before = Arc::strong_count(&supervisor);
+        let deps = supervisor
+            .build_actor_deps(&DID("did:example:alice".to_owned()))
+            .await
+            .expect("build_actor_deps succeeds");
+        let after = Arc::strong_count(&supervisor);
+        assert!(
+            after > before,
+            "SupervisorHandle must clone the outer Arc (count {before} -> {after})"
+        );
+        assert!(deps.supervisor.local_dids().is_empty());
+        deps.key_package_store
+            .send_shutdown()
+            .await
+            .expect("KP store handle is live");
+    }
+
+    /// `key_package_store_for` is idempotent: two calls for the same DID
+    /// return handles to the same actor (double-checked get-or-spawn).
+    #[tokio::test]
+    async fn key_package_store_for_is_idempotent() {
+        let supervisor = supervisor_with_providers();
+        let did = DID("did:example:kp-idem".to_owned());
+        let first = supervisor.key_package_store_for(&did).await;
+        let second = supervisor.key_package_store_for(&did).await;
+        // The registry holds exactly one entry for this DID.
+        assert_eq!(
+            supervisor.key_package_stores.len(),
+            1,
+            "exactly one KeyPackageStoreActor must be spawned per identity"
+        );
+        // A different DID spawns a distinct actor.
+        let other = supervisor
+            .key_package_store_for(&DID("did:example:kp-other".to_owned()))
+            .await;
+        assert_eq!(supervisor.key_package_stores.len(), 2);
+        first.send_shutdown().await.expect("first handle is live");
+        // `second` targets the same actor as `first`; the actor may have
+        // already shut down, so a failed send is acceptable here.
+        let _ = second.send_shutdown().await;
+        other.send_shutdown().await.expect("other handle is live");
     }
 }

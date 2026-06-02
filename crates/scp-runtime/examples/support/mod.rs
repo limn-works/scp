@@ -31,6 +31,19 @@ pub fn example_crypto(did: &str) -> std::sync::Arc<MlsCryptoProvider> {
     std::sync::Arc::new(MlsCryptoProvider::new(did.to_owned()))
 }
 
+/// Convenience constructor: an in-memory `OpenMLS` storage adapter for the
+/// required `mls_storage` provider. Examples are dev affordances, so the
+/// in-memory backend (a bridge-layer dev opt-in) is the correct choice —
+/// production wires a real `Storage` (`SQLCipher`).
+pub fn example_mls_storage()
+-> std::sync::Arc<dyn scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
+    std::sync::Arc::new(
+        scp_runtime::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+            std::sync::Arc::new(scp_platform::testing::InMemoryStorage::new()),
+        ),
+    )
+}
+
 /// Mock transport provider — reports connected, all sends succeed silently.
 pub struct MockTransport;
 

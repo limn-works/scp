@@ -226,9 +226,11 @@ const fn _assert_send_sync() {
 /// # Non-production
 ///
 /// `persistence`, `payment_adapter`, `event_tx`, and `clock` default to
-/// `None` (i.e. no-op persistence and a `SystemClock`). Tests that
-/// exercise any of those specific surfaces must construct their own
-/// supervisor explicitly via
+/// `None` (i.e. no-op persistence and a `SystemClock`). The required
+/// `mls_storage` provider is wired to an in-memory backend — a
+/// test-only dev opt-in; production bridges supply a real `Storage`.
+/// Tests that exercise any of those specific surfaces must construct
+/// their own supervisor explicitly via
 /// [`supervisor::Supervisor::with_providers`].
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
@@ -238,6 +240,11 @@ pub fn test_supervisor(
     event_log: Box<dyn builder::ContextEventLogProvider>,
     key_resolver: scp_protocol::context::governance::KeyResolver,
 ) -> Arc<supervisor::Supervisor> {
+    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
+        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+            scp_platform::testing::InMemoryStorage::new(),
+        )),
+    );
     supervisor::Supervisor::with_providers(
         crypto,
         transport,
@@ -247,6 +254,7 @@ pub fn test_supervisor(
         None,
         None,
         None,
+        mls_storage,
     )
 }
 

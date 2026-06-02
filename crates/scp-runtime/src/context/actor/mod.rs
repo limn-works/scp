@@ -1493,35 +1493,33 @@ mod tests {
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
         let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_| None);
-
-        let persistence: Arc<dyn crate::context::persistence::ContextPersistence> =
-            Arc::new(TestPersistence);
-        let supervisor = Supervisor::with_providers(
-            crypto,
-            transport,
-            event_log,
-            key_resolver,
-            None,
-            None,
-            None,
-            None,
-        );
-
-        let mls: Arc<dyn crate::crypto::mls::backend::MlsBackend> =
-            Arc::new(crate::crypto::mls::production_backend::ProductionMlsBackend::new());
-        let hpke: Arc<dyn crate::crypto::hpke_backend::HpkeBackend> =
-            Arc::new(crate::crypto::hpke_backend::ProductionHpkeBackend::new());
+        let persistence: Box<dyn crate::context::persistence::ContextPersistence> =
+            Box::new(TestPersistence);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
                     InMemoryStorage::new(),
                 )),
             );
-        let kp_store = crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn(
-            DID("did:example:actor-with-state-test".to_owned()),
+
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            None,
+            mls_storage,
         );
+
+        // `build_actor_deps` self-sources crypto/transport/event_log/clock/
+        // key_resolver/mls_storage/persistence from the supervisor and the
+        // MLS/HPKE backends transitively through `crypto`; only the owning
+        // DID is supplied (resolves this identity's KeyPackageStoreActor).
         supervisor
-            .build_actor_deps(persistence, mls, hpke, mls_storage, kp_store)
+            .build_actor_deps(&DID("did:example:actor-with-state-test".to_owned()))
             .await
             .expect("build_actor_deps")
     }

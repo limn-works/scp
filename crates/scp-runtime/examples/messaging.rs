@@ -33,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         None,
         None,
+        support::example_mls_storage(),
     );
 
     // 2. Register two participants.
