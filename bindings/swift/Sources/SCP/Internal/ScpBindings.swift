@@ -2646,7 +2646,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * # Errors
      *
      * Returns `ScpError::Validation` when `did` is not a syntactically
-     * valid DID, mirroring the PyO3 reference bridge's `identity_remove`.
+     * valid DID, mirroring the `PyO3` reference bridge's `identity_remove`.
      */
     func identityRemove(did: String) throws 
     
@@ -2663,7 +2663,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * # Errors
      *
      * Returns `ScpError::Validation` when `did` is not a syntactically
-     * valid DID, mirroring the PyO3 reference bridge's
+     * valid DID, mirroring the `PyO3` reference bridge's
      * `identity_remove_if_present`.
      */
     func identityRemoveIfPresent(did: String) throws  -> Bool
@@ -4994,7 +4994,7 @@ open func identityMigrate(identity: Identity)async throws  -> Identity  {
      * # Errors
      *
      * Returns `ScpError::Validation` when `did` is not a syntactically
-     * valid DID, mirroring the PyO3 reference bridge's `identity_remove`.
+     * valid DID, mirroring the `PyO3` reference bridge's `identity_remove`.
      */
 open func identityRemove(did: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_identity_remove(self.uniffiClonePointer(),
@@ -5016,7 +5016,7 @@ open func identityRemove(did: String)throws   {try rustCallWithError(FfiConverte
      * # Errors
      *
      * Returns `ScpError::Validation` when `did` is not a syntactically
-     * valid DID, mirroring the PyO3 reference bridge's
+     * valid DID, mirroring the `PyO3` reference bridge's
      * `identity_remove_if_present`.
      */
 open func identityRemoveIfPresent(did: String)throws  -> Bool  {
@@ -15020,10 +15020,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove() != 10016) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove() != 20795) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_if_present() != 7918) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_if_present() != 1563) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 51771) {
