@@ -618,6 +618,18 @@ export class SCP {
     );
   }
 
+  petnameApplyEvent(ownerDid: string, eventJson: string): void {
+    (this.#native.petnameApplyEvent as (o: string, e: string) => void)(ownerDid, eventJson);
+  }
+
+  petnameDidCount(ownerDid: string): number {
+    return (this.#native.petnameDidCount as (o: string) => number)(ownerDid);
+  }
+
+  petnameContextCount(ownerDid: string): number {
+    return (this.#native.petnameContextCount as (o: string) => number)(ownerDid);
+  }
+
   // ───────────────────────────────────────────────────────────────────────
   // Domain: Handle / Scope / Address
   // ───────────────────────────────────────────────────────────────────────

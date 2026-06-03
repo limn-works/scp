@@ -371,6 +371,54 @@ mod tests {
         assert_eq!(ids[0], "ctx-napi-1");
     }
 
+    #[test]
+    fn petname_apply_event_and_counts() {
+        let owner = "did:dht:zNapiTestApply".to_owned();
+        let scp = crate::scp::Scp::new().unwrap();
+        scp.petname_apply_event(
+            owner.clone(),
+            r#"{"SetPetname": {"did": "did:dht:zAlice", "name": "alice"}}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(scp.petname_did_count(owner.clone()).unwrap(), 1);
+
+        let json = scp
+            .petname_resolve_did(owner.clone(), "alice".to_owned())
+            .unwrap();
+        let dids: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(dids, vec!["did:dht:zAlice".to_owned()]);
+
+        scp.petname_apply_event(
+            owner.clone(),
+            r#"{"SetContextPetname": {"context_id": "ctx-1", "name": "work"}}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(scp.petname_context_count(owner.clone()).unwrap(), 1);
+
+        scp.petname_apply_event(
+            owner.clone(),
+            r#"{"RemovePetname": {"did": "did:dht:zAlice"}}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(scp.petname_did_count(owner).unwrap(), 0);
+    }
+
+    #[test]
+    fn petname_apply_event_rejects_malformed_napi() {
+        let scp = crate::scp::Scp::new().unwrap();
+        assert!(
+            scp.petname_apply_event("did:dht:zOwner".to_owned(), "nope".to_owned())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn petname_counts_empty_owner_errors_napi() {
+        let scp = crate::scp::Scp::new().unwrap();
+        assert!(scp.petname_did_count(String::new()).is_err());
+        assert!(scp.petname_context_count(String::new()).is_err());
+    }
+
     // -- Handle bridge tests -------------------------------------------------
 
     #[test]

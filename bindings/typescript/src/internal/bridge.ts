@@ -392,6 +392,9 @@ export interface Bridge {
   petnameResolveContext(ownerDid: string, name: string): string;
   petnameGetForDid(ownerDid: string, targetDid: string): string | null;
   petnameGetForContext(ownerDid: string, contextId: string): string | null;
+  petnameApplyEvent(ownerDid: string, eventJson: string): void;
+  petnameDidCount(ownerDid: string): number;
+  petnameContextCount(ownerDid: string): number;
 
   // Handle Registry (section 22.3.1)
   handleRegister(

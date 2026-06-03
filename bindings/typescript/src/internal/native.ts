@@ -1286,6 +1286,18 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
+    petnameApplyEvent(ownerDid: string, eventJson: string): void {
+      (native.petnameApplyEvent as (o: string, e: string) => void)(ownerDid, eventJson);
+    },
+
+    petnameDidCount(ownerDid: string): number {
+      return (native.petnameDidCount as (o: string) => number)(ownerDid);
+    },
+
+    petnameContextCount(ownerDid: string): number {
+      return (native.petnameContextCount as (o: string) => number)(ownerDid);
+    },
+
     // Handle Registry (§22.3.1)
     handleRegister(
       discoveryContextId: string,

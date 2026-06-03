@@ -1169,6 +1169,21 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.migrationState] on [inner]. */
     suspend fun migrationState(handle: ContextHandle): String? = inner.migrationState(handle = handle)
 
+    /** Forwards to [NativeScp.petnameApplyEvent] on [inner]. */
+    fun petnameApplyEvent(
+        ownerDid: String,
+        eventJson: String,
+    ) = inner.petnameApplyEvent(
+        ownerDid = ownerDid,
+        eventJson = eventJson,
+    )
+
+    /** Forwards to [NativeScp.petnameContextCount] on [inner]. */
+    fun petnameContextCount(ownerDid: String): UInt = inner.petnameContextCount(ownerDid = ownerDid)
+
+    /** Forwards to [NativeScp.petnameDidCount] on [inner]. */
+    fun petnameDidCount(ownerDid: String): UInt = inner.petnameDidCount(ownerDid = ownerDid)
+
     /** Forwards to [NativeScp.petnameGetForContext] on [inner]. */
     fun petnameGetForContext(
         ownerDid: String,

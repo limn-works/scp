@@ -1752,6 +1752,57 @@
       ]
     },
     {
+      "canonical": "petname_apply_event",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "petname_apply_event"
+      ],
+      "uniffi": [
+        "petname_apply_event"
+      ],
+      "napi": [
+        "petname_apply_event"
+      ],
+      "wasm": [
+        "petname_apply_event"
+      ]
+    },
+    {
+      "canonical": "petname_did_count",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "petname_did_count"
+      ],
+      "uniffi": [
+        "petname_did_count"
+      ],
+      "napi": [
+        "petname_did_count"
+      ],
+      "wasm": [
+        "petname_did_count"
+      ]
+    },
+    {
+      "canonical": "petname_context_count",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "petname_context_count"
+      ],
+      "uniffi": [
+        "petname_context_count"
+      ],
+      "napi": [
+        "petname_context_count"
+      ],
+      "wasm": [
+        "petname_context_count"
+      ]
+    },
+    {
       "canonical": "handle_register",
       "category": "handle",
       "wasm_required": true,

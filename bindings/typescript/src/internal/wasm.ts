@@ -184,6 +184,9 @@ interface WasmModule {
   petname_resolve_context: (ownerDid: string, name: string) => string;
   petname_get_for_did: (ownerDid: string, targetDid: string) => unknown;
   petname_get_for_context: (ownerDid: string, contextId: string) => unknown;
+  petname_apply_event: (ownerDid: string, eventJson: string) => void;
+  petname_did_count: (ownerDid: string) => number;
+  petname_context_count: (ownerDid: string) => number;
   // Handle Registry (§22.3.1)
   handle_register: (
     discoveryContextId: string,
@@ -1609,6 +1612,21 @@ export function createWasmBridge(): Bridge {
       const result = wasm.petname_get_for_context(ownerDid, contextId);
       if (result == null || result === undefined) return null;
       return result as string;
+    },
+
+    petnameApplyEvent(ownerDid: string, eventJson: string): void {
+      const wasm = getWasm();
+      wasm.petname_apply_event(ownerDid, eventJson);
+    },
+
+    petnameDidCount(ownerDid: string): number {
+      const wasm = getWasm();
+      return wasm.petname_did_count(ownerDid);
+    },
+
+    petnameContextCount(ownerDid: string): number {
+      const wasm = getWasm();
+      return wasm.petname_context_count(ownerDid);
     },
 
     // Handle Registry (§22.3.1)

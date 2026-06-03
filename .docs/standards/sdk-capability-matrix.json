@@ -1129,6 +1129,27 @@
           "swift": true
         },
         {
+          "name": "petname_apply_event",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "petname_did_count",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "petname_context_count",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
           "name": "handle_register",
           "python": true,
           "typescript": true,

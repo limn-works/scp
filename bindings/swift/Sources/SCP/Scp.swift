@@ -674,6 +674,21 @@ public extension SCP {
         try await inner.nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
     }
 
+    /// Forwards to ``Scp/petnameApplyEvent`` on ``inner``.
+    func petnameApplyEvent(ownerDid: String, eventJson: String) throws {
+        try inner.petnameApplyEvent(ownerDid: ownerDid, eventJson: eventJson)
+    }
+
+    /// Forwards to ``Scp/petnameContextCount`` on ``inner``.
+    func petnameContextCount(ownerDid: String) throws -> UInt32 {
+        try inner.petnameContextCount(ownerDid: ownerDid)
+    }
+
+    /// Forwards to ``Scp/petnameDidCount`` on ``inner``.
+    func petnameDidCount(ownerDid: String) throws -> UInt32 {
+        try inner.petnameDidCount(ownerDid: ownerDid)
+    }
+
     /// Forwards to ``Scp/petnameGetForContext`` on ``inner``.
     func petnameGetForContext(ownerDid: String, contextId: String) throws -> String? {
         try inner.petnameGetForContext(ownerDid: ownerDid, contextId: contextId)

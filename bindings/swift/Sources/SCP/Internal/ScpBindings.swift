@@ -2791,6 +2791,28 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?) async throws  -> NodeHandle
     
     /**
+     * Applies a serialized petname event to the owner's petname map.
+     *
+     * The event JSON must match the `PetnameEvent` serde format (§22.9.2).
+     * This is the event-driven mutation path matching `PetnameMap::apply_event`.
+     */
+    func petnameApplyEvent(ownerDid: String, eventJson: String) throws 
+    
+    /**
+     * Returns the number of context petnames for an owner.
+     *
+     * Mirrors `PetnameMap::context_petname_count`.
+     */
+    func petnameContextCount(ownerDid: String) throws  -> UInt32
+    
+    /**
+     * Returns the number of DID petnames for an owner.
+     *
+     * Mirrors `PetnameMap::did_petname_count`.
+     */
+    func petnameDidCount(ownerDid: String) throws  -> UInt32
+    
+    /**
      * Per-instance equivalent of the free-function `petname_get_for_context`.
      */
     func petnameGetForContext(ownerDid: String, contextId: String) throws  -> String?
@@ -5311,6 +5333,46 @@ open func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: Strin
 }
     
     /**
+     * Applies a serialized petname event to the owner's petname map.
+     *
+     * The event JSON must match the `PetnameEvent` serde format (§22.9.2).
+     * This is the event-driven mutation path matching `PetnameMap::apply_event`.
+     */
+open func petnameApplyEvent(ownerDid: String, eventJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_apply_event(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(eventJson),$0
+    )
+}
+}
+    
+    /**
+     * Returns the number of context petnames for an owner.
+     *
+     * Mirrors `PetnameMap::context_petname_count`.
+     */
+open func petnameContextCount(ownerDid: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_context_count(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),$0
+    )
+})
+}
+    
+    /**
+     * Returns the number of DID petnames for an owner.
+     *
+     * Mirrors `PetnameMap::did_petname_count`.
+     */
+open func petnameDidCount(ownerDid: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_did_count(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),$0
+    )
+})
+}
+    
+    /**
      * Per-instance equivalent of the free-function `petname_get_for_context`.
      */
 open func petnameGetForContext(ownerDid: String, contextId: String)throws  -> String?  {
@@ -7131,7 +7193,7 @@ public func FfiConverterTypeBatchPublishResult_lower(_ value: BatchPublishResult
  * Bridge credential metadata result.
  *
  * Returned by `bridge_credential_provision` and `bridge_credential_rotate`.
- * Mirrors the PyO3 dict (`bridge_id`, `credential_type`, `created_at`).
+ * Mirrors the `PyO3` dict (`bridge_id`, `credential_type`, `created_at`).
  * The encrypted credential bytes never cross the FFI boundary — only
  * non-secret metadata.
  *
@@ -14987,6 +15049,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 59051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_apply_event() != 32223) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_context_count() != 27524) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_did_count() != 49985) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_get_for_context() != 8149) {

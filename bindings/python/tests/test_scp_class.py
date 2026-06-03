@@ -40,6 +40,7 @@ except (ImportError, AttributeError):
 from scp_sdk.scp import SCP as WrapperSCP
 
 SCP = _scp_core.SCP
+NativeValidationError = _scp_core.ValidationError
 
 
 def test_scp_constructs_successfully() -> None:
@@ -139,6 +140,94 @@ def test_configure_local_transport_rejects_invalid_did() -> None:
     scp = SCP()
     with pytest.raises(_scp_core.ValidationError):
         scp.configure_local_transport("not-a-valid-did")
+
+
+def test_petname_apply_event_and_counts() -> None:
+    """`petname_apply_event` replays a serialized event into the owner's map.
+
+    Mirrors the WASM `petname_apply_event` / `petname_did_count` /
+    `petname_context_count` surface promoted to cross-bridge parity. The
+    DID and context petname maps are per-owner and per-instance, so a
+    fresh `SCP()` starts empty.
+    """
+    scp = SCP()
+    owner = "did:dht:zPyPetnameApply"
+
+    assert scp.petname_did_count(owner) == 0
+    assert scp.petname_context_count(owner) == 0
+
+    scp.petname_apply_event(
+        owner,
+        '{"SetPetname": {"did": "did:dht:zAlice", "name": "alice"}}',
+    )
+    assert scp.petname_did_count(owner) == 1
+
+    scp.petname_apply_event(
+        owner,
+        '{"SetContextPetname": {"context_id": "ctx-1", "name": "work"}}',
+    )
+    assert scp.petname_context_count(owner) == 1
+
+    scp.petname_apply_event(
+        owner,
+        '{"RemovePetname": {"did": "did:dht:zAlice"}}',
+    )
+    assert scp.petname_did_count(owner) == 0
+    # Context petname is untouched by the DID removal.
+    assert scp.petname_context_count(owner) == 1
+
+
+def test_petname_apply_event_matches_set_petname() -> None:
+    """An applied `SetPetname` event resolves identically to `petname_set`.
+
+    The event-replay path and the convenience setter share the same
+    backing `PetnameMap`, so the resolved DID list must match.
+    """
+    scp = SCP()
+    owner = "did:dht:zPyPetnameParity"
+
+    scp.petname_apply_event(
+        owner,
+        '{"SetPetname": {"did": "did:dht:zBob", "name": "bob"}}',
+    )
+    # The PyO3 bridge returns a native ``list[str]`` (per-SDK idiom — it does
+    # not JSON-encode the resolution like the WASM/NAPI string surfaces).
+    resolved = scp.petname_resolve_did(owner, "bob")
+    assert resolved == ["did:dht:zBob"]
+
+
+def test_petname_apply_event_rejects_malformed_json() -> None:
+    """A malformed event JSON raises the native `_scp_core.ValidationError`."""
+    scp = SCP()
+    with pytest.raises(NativeValidationError):
+        scp.petname_apply_event("did:dht:zPyOwner", "not-valid-event-json")
+
+
+def test_petname_counts_reject_empty_owner() -> None:
+    """Empty `owner_did` is rejected at the boundary for count queries."""
+    scp = SCP()
+    with pytest.raises(NativeValidationError):
+        scp.petname_did_count("")
+    with pytest.raises(NativeValidationError):
+        scp.petname_context_count("")
+
+
+def test_petname_maps_are_per_instance() -> None:
+    """A petname applied on one instance must not leak into another.
+
+    The petname maps live in the per-instance `BridgeInstance` (ADR-048
+    §1 per-instance isolation), keyed by owner DID.
+    """
+    owner = "did:dht:zPyPetnameIsolation"
+    a = SCP()
+    a.petname_apply_event(
+        owner,
+        '{"SetPetname": {"did": "did:dht:zCarol", "name": "carol"}}',
+    )
+    assert a.petname_did_count(owner) == 1
+
+    b = SCP()
+    assert b.petname_did_count(owner) == 0
 
 
 def test_repr_contains_instance_id() -> None:

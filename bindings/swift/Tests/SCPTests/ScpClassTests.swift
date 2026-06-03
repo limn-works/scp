@@ -177,6 +177,100 @@ final class ScpClassTests: XCTestCase {
         XCTAssertThrowsError(try scp.bridgeCredentialGetKey(bridgeId: bridgeId))
     }
 
+    // MARK: - Petname event replay and counts (§22.4, §22.9.2)
+
+    /// `petnameApplyEvent` replays a serialized `PetnameEvent` into the
+    /// owner's map; the count queries reflect the resulting state.
+    func testPetnameApplyEventAndCounts() throws {
+        let owner = "did:dht:zSwiftPetnameApply"
+
+        XCTAssertEqual(try scp.petnameDidCount(ownerDid: owner), 0)
+        XCTAssertEqual(try scp.petnameContextCount(ownerDid: owner), 0)
+
+        try scp.petnameApplyEvent(
+            ownerDid: owner,
+            eventJson: #"{"SetPetname": {"did": "did:dht:zAlice", "name": "alice"}}"#
+        )
+        XCTAssertEqual(try scp.petnameDidCount(ownerDid: owner), 1)
+
+        try scp.petnameApplyEvent(
+            ownerDid: owner,
+            eventJson: #"{"SetContextPetname": {"context_id": "ctx-1", "name": "work"}}"#
+        )
+        XCTAssertEqual(try scp.petnameContextCount(ownerDid: owner), 1)
+
+        try scp.petnameApplyEvent(
+            ownerDid: owner,
+            eventJson: #"{"RemovePetname": {"did": "did:dht:zAlice"}}"#
+        )
+        XCTAssertEqual(try scp.petnameDidCount(ownerDid: owner), 0)
+        // Removing the DID petname leaves the context petname intact.
+        XCTAssertEqual(try scp.petnameContextCount(ownerDid: owner), 1)
+    }
+
+    /// An applied `SetPetname` event resolves identically to `petnameSet`,
+    /// because both mutate the same backing `PetnameMap`.
+    func testPetnameApplyEventMatchesSet() throws {
+        let owner = "did:dht:zSwiftPetnameParity"
+
+        try scp.petnameApplyEvent(
+            ownerDid: owner,
+            eventJson: #"{"SetPetname": {"did": "did:dht:zBob", "name": "bob"}}"#
+        )
+        let json = try scp.petnameResolveDid(ownerDid: owner, name: "bob")
+        let resolved = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String]
+        )
+        XCTAssertEqual(resolved, ["did:dht:zBob"])
+    }
+
+    /// A malformed event JSON is rejected at the bridge boundary with a
+    /// validation error.
+    func testPetnameApplyEventRejectsMalformedJson() throws {
+        XCTAssertThrowsError(
+            try scp.petnameApplyEvent(
+                ownerDid: "did:dht:zSwiftOwner",
+                eventJson: "not-valid-event-json"
+            )
+        ) { error in
+            guard case ScpError.Validation = error else {
+                XCTFail("expected ScpError.Validation, got \(error)")
+                return
+            }
+        }
+    }
+
+    /// Empty `ownerDid` is rejected for the count queries.
+    func testPetnameCountsRejectEmptyOwner() throws {
+        XCTAssertThrowsError(try scp.petnameDidCount(ownerDid: "")) { error in
+            guard case ScpError.Validation = error else {
+                XCTFail("expected ScpError.Validation, got \(error)")
+                return
+            }
+        }
+        XCTAssertThrowsError(try scp.petnameContextCount(ownerDid: "")) { error in
+            guard case ScpError.Validation = error else {
+                XCTFail("expected ScpError.Validation, got \(error)")
+                return
+            }
+        }
+    }
+
+    /// A petname applied on one instance must not leak into another
+    /// (ADR-048 §1 per-instance isolation).
+    func testPetnameMapsArePerInstance() throws {
+        let owner = "did:dht:zSwiftPetnameIsolation"
+        try scp.petnameApplyEvent(
+            ownerDid: owner,
+            eventJson: #"{"SetPetname": {"did": "did:dht:zCarol", "name": "carol"}}"#
+        )
+        XCTAssertEqual(try scp.petnameDidCount(ownerDid: owner), 1)
+
+        let other = SCP()
+        defer { Task { try? await other.shutdown(timeoutMillis: 1000) } }
+        XCTAssertEqual(try other.petnameDidCount(ownerDid: owner), 0)
+    }
+
     /// A credential provisioned on one instance must not be visible on
     /// another (ADR-048 §1 per-instance isolation).
     func testBridgeCredentialStoreIsPerInstance() throws {

@@ -14085,6 +14085,100 @@ impl Scp {
             .and_then(|map| map.petname_for_context(&context_id).map(str::to_owned)))
     }
 
+    /// Applies a serialized petname event to the owner's petname map.
+    ///
+    /// The event JSON must match the `PetnameEvent` serde format (§22.9.2).
+    /// This is the event-driven mutation path matching `PetnameMap::apply_event`.
+    pub fn petname_apply_event(
+        &self,
+        owner_did: String,
+        event_json: String,
+    ) -> Result<(), ScpError> {
+        use scp_core::discovery::petnames::PetnameEvent;
+
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        let event: PetnameEvent =
+            serde_json::from_str(&event_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid petname event JSON: {e}"),
+                code: codes::VALID_7115.to_owned(),
+            })?;
+        let mut guard =
+            self.inner
+                .core
+                .petname_maps()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("petname lock poisoned: {e}"),
+                    code: codes::VALID_7112.to_owned(),
+                })?;
+        let map = guard.entry(owner_did).or_default();
+        map.apply_event(&event);
+        Ok(())
+    }
+
+    /// Returns the number of DID petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::did_petname_count`.
+    pub fn petname_did_count(&self, owner_did: String) -> Result<u32, ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        let guard = self
+            .inner
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let count = guard.get(&owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::did_petname_count,
+        );
+        u32::try_from(count).map_err(|_| ScpError::Validation {
+            msg: "petname count exceeds u32::MAX".to_owned(),
+            code: codes::VALID_7116.to_owned(),
+        })
+    }
+
+    /// Returns the number of context petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::context_petname_count`.
+    pub fn petname_context_count(&self, owner_did: String) -> Result<u32, ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        let guard = self
+            .inner
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let count = guard.get(&owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::context_petname_count,
+        );
+        u32::try_from(count).map_err(|_| ScpError::Validation {
+            msg: "petname count exceeds u32::MAX".to_owned(),
+            code: codes::VALID_7116.to_owned(),
+        })
+    }
+
     // ----- Handle registry methods -----
 
     /// Per-instance equivalent of the free-function `handle_register`.
@@ -16881,5 +16975,53 @@ mod tests {
                 .is_err(),
             "credential provisioned on instance A must not be visible on instance B"
         );
+    }
+
+    #[test]
+    fn petname_apply_event_and_counts_uniffi() {
+        let scp = scp_test();
+        let owner = "did:dht:zUniffiApply".to_owned();
+        scp.petname_apply_event(
+            owner.clone(),
+            r#"{"SetPetname": {"did": "did:dht:zAlice", "name": "alice"}}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(scp.petname_did_count(owner.clone()).unwrap(), 1);
+
+        let json = scp
+            .petname_resolve_did(owner.clone(), "alice".to_owned())
+            .unwrap();
+        let dids: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(dids, vec!["did:dht:zAlice".to_owned()]);
+
+        scp.petname_apply_event(
+            owner.clone(),
+            r#"{"SetContextPetname": {"context_id": "ctx-1", "name": "work"}}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(scp.petname_context_count(owner.clone()).unwrap(), 1);
+
+        scp.petname_apply_event(
+            owner.clone(),
+            r#"{"RemovePetname": {"did": "did:dht:zAlice"}}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(scp.petname_did_count(owner).unwrap(), 0);
+    }
+
+    #[test]
+    fn petname_apply_event_rejects_malformed_uniffi() {
+        let scp = scp_test();
+        assert!(
+            scp.petname_apply_event("did:dht:zOwner".to_owned(), "nope".to_owned())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn petname_counts_empty_owner_errors_uniffi() {
+        let scp = scp_test();
+        assert!(scp.petname_did_count(String::new()).is_err());
+        assert!(scp.petname_context_count(String::new()).is_err());
     }
 }

@@ -2025,6 +2025,18 @@ class SCP:
             tags,
         )
 
+    async def petname_apply_event(self, owner_did: str, event_json: str) -> Any:
+        """Delegate to ``_scp_core.SCP.petname_apply_event``."""
+        return await asyncio.to_thread(self._native.petname_apply_event, owner_did, event_json)
+
+    async def petname_context_count(self, owner_did: str) -> int:
+        """Delegate to ``_scp_core.SCP.petname_context_count``."""
+        return await asyncio.to_thread(self._native.petname_context_count, owner_did)
+
+    async def petname_did_count(self, owner_did: str) -> int:
+        """Delegate to ``_scp_core.SCP.petname_did_count``."""
+        return await asyncio.to_thread(self._native.petname_did_count, owner_did)
+
     async def petname_get_for_context(self, owner_did: str, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.petname_get_for_context``."""
         return await asyncio.to_thread(self._native.petname_get_for_context, owner_did, context_id)

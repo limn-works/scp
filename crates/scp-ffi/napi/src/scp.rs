@@ -1646,6 +1646,95 @@ impl Scp {
             .and_then(|map| map.petname_for_context(&context_id).map(str::to_owned)))
     }
 
+    /// Applies a serialized petname event to the owner's petname map.
+    ///
+    /// The event JSON must match the `PetnameEvent` serde format (§22.9.2).
+    /// This is the event-driven mutation path matching `PetnameMap::apply_event`.
+    #[napi(js_name = "petnameApplyEvent")]
+    pub fn petname_apply_event(&self, owner_did: String, event_json: String) -> napi::Result<()> {
+        use scp_core::discovery::petnames::PetnameEvent;
+
+        if owner_did.is_empty() {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }));
+        }
+        let event: PetnameEvent = serde_json::from_str(&event_json).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid petname event JSON: {e}"),
+                code: codes::VALID_7115.to_owned(),
+            })
+        })?;
+        let mut guard = self.inner.core.petname_maps().lock().map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })
+        })?;
+        let map = guard.entry(owner_did).or_default();
+        map.apply_event(&event);
+        Ok(())
+    }
+
+    /// Returns the number of DID petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::did_petname_count`.
+    #[napi(js_name = "petnameDidCount")]
+    pub fn petname_did_count(&self, owner_did: String) -> napi::Result<u32> {
+        if owner_did.is_empty() {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }));
+        }
+        let guard = self.inner.core.petname_maps().lock().map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })
+        })?;
+        let count = guard.get(&owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::did_petname_count,
+        );
+        u32::try_from(count).map_err(|_| {
+            NapiError::from(ScpNapiError::Validation {
+                message: "petname count exceeds u32::MAX".to_owned(),
+                code: codes::VALID_7116.to_owned(),
+            })
+        })
+    }
+
+    /// Returns the number of context petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::context_petname_count`.
+    #[napi(js_name = "petnameContextCount")]
+    pub fn petname_context_count(&self, owner_did: String) -> napi::Result<u32> {
+        if owner_did.is_empty() {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }));
+        }
+        let guard = self.inner.core.petname_maps().lock().map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })
+        })?;
+        let count = guard.get(&owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::context_petname_count,
+        );
+        u32::try_from(count).map_err(|_| {
+            NapiError::from(ScpNapiError::Validation {
+                message: "petname count exceeds u32::MAX".to_owned(),
+                code: codes::VALID_7116.to_owned(),
+            })
+        })
+    }
+
     /// Per-instance equivalent of `handle_register`.
     #[napi(js_name = "handleRegister")]
     pub fn handle_register(

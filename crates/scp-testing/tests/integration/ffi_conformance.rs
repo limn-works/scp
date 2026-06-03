@@ -1626,6 +1626,13 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "petname_resolve_context",
     "petname_get_for_did",
     "petname_get_for_context",
+    // Batch 4 (#1543 §4.7 Group B) — petname event-replay + count queries
+    // promoted from WASM-only to cross-bridge parity. Backed by
+    // scp_protocol::discovery::petnames::PetnameMap apply_event / did_petname_count
+    // / context_petname_count (the same shared type the other petname ops use).
+    "petname_apply_event",
+    "petname_did_count",
+    "petname_context_count",
     // Handle/Scope
     "handle_register",
     "handle_lookup",
