@@ -1841,16 +1841,20 @@ impl ContextManager {
     /// R4 HIGH-1 — releases the UNSPENT portion of a stream's open-time
     /// cumulative-counter reserve at close-time settlement.
     ///
-    /// The open reserved `cost_per_chunk × reserved_chunks` against the
-    /// durable [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
+    /// The open reserved the WORST-CASE billable spend
+    /// (`amount_cumulative_reserved` = `cost_per_chunk ×
+    /// effective_max_billable_chunks`, `<= cap` by construction) against the
+    /// durable
+    /// [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
     /// counter; only `billed_count` chunks were actually billed, so
-    /// `(reserved_chunks − billed_count) × cost_per_chunk` (clamped to the
-    /// reserved amount) is returned to the counter. The cap is thereby debited
-    /// by exactly the billed spend, not the full reservation. A no-op when
-    /// nothing was reserved (no cap / no store / overflow / zero cost). Runs
-    /// independently of payment capture — even if capture later fails the
-    /// counter must reflect true consumption; a release failure leaves the
-    /// counter conservatively over-charged (never under-charged) and logs.
+    /// `amount_cumulative_reserved − billed_count × cost_per_chunk` (saturating)
+    /// is returned to the counter. The cap is thereby debited by exactly the
+    /// billed spend, not the worst-case reservation. A no-op when nothing was
+    /// reserved (no cap / no store / zero cost). Runs independently of payment
+    /// capture — even if capture later fails the counter must reflect true
+    /// consumption; a release failure (or a degenerate `billed × cost` overflow)
+    /// leaves the counter conservatively over-charged (never under-charged) and
+    /// logs.
     async fn release_unspent_cumulative_reserve(
         &self,
         context_id: &str,
@@ -1864,16 +1868,16 @@ impl ContextManager {
         let Some(store) = self.caveat_counter_store() else {
             return;
         };
-        // unspent_chunks = reserved_chunks − billed_count (saturating: a
-        // stream cannot bill more than it reserved, but clamp defensively).
-        let unspent_chunks =
-            u64::from(counter_reserve.reserved_chunks.saturating_sub(billed_count));
-        // unspent_amount = unspent_chunks × cost_per_chunk, clamped to the
-        // amount actually reserved (defensive against arithmetic drift).
-        let unspent_amount = unspent_chunks
-            .checked_mul(counter_reserve.cost_per_chunk.value())
-            .unwrap_or(counter_reserve.amount_cumulative_reserved)
-            .min(counter_reserve.amount_cumulative_reserved);
+        // AMOUNT-based reconciliation: release `reserved − billed_count ×
+        // cost_per_chunk`. The open reserves the WORST CASE
+        // (`cumulative_reserve_amount` = `cost × effective_max_billable_chunks`,
+        // and the per-chunk gate blocks billing past that same ceiling), so the
+        // billed amount can never exceed the reserve. The counter is thereby
+        // debited by EXACTLY the billed cumulative spend, regardless of how
+        // small the declared estimate was. (`reserved_chunks` is retained on the
+        // settlement record for diagnostics but is no longer load-bearing here,
+        // since the reserve is no longer `cost × reserved_chunks`.)
+        let unspent_amount = counter_reserve.unspent_release_amount(billed_count);
         if unspent_amount == 0 {
             return;
         }
@@ -9828,66 +9832,92 @@ mod stream_caveat_post_input_tests {
         );
     }
 
-    /// R4 HIGH-1 — `amount_max_cumulative` is RESERVED at
-    /// `cost_per_chunk × estimated_chunk_count` at the final gate, NOT charged
-    /// once at `cost_per_chunk`. A reserve that exceeds the cap rejects; a
-    /// reserve at/below the cap admits.
+    /// `amount_max_cumulative` is RESERVED at the WORST-CASE billable spend
+    /// `cost_per_chunk × effective_max_billable_chunks` at the final gate — NOT
+    /// at the invoker-declared `estimated_chunk_count` (which the invoker can
+    /// declare arbitrarily low) and NOT once at `cost_per_chunk`. The effective
+    /// ceiling AND-folds `max_calls` with `floor(cap / cost)`, so the reserve is
+    /// `<= cap` and the open admits; the cap is then enforced cross-stream by the
+    /// reservation (a second concurrent open cannot reserve against an
+    /// already-reserved counter).
     #[tokio::test]
-    async fn amount_max_cumulative_reserves_full_estimated_spend() {
-        // Cap = 100, cost_per_chunk = 10. Reserving for 20 chunks → 200 > 100
-        // rejects (the HIGH-1 bug would have charged only 10 and admitted).
-        let store = make_store(1_000);
+    async fn amount_max_cumulative_reserves_full_worst_case_spend() {
+        use crate::context::outlets::stream::effective_max_billable_chunks;
+
+        // Cap = 100, cost_per_chunk = 10, max_calls = 20. floor(100/10) = 10, so
+        // the effective billable ceiling = min(20, 10) = 10 chunks → worst-case
+        // reserve = 10 × 10 = 100 == cap. The under-declared-estimate evasion
+        // (declare estimate 1) would have reserved only 10 and let 50 chunks
+        // bill against the cap.
+        let cost = Amount::new(10);
         let mut caveats = InvocationCaveats::empty();
         caveats.amount_max_cumulative = Some(Amount::new(100));
-        let reservation =
-            expect_reservation(&caveats, Amount::new(10), &erase(&store), "cumulative");
-        let err = commit(&reservation, Amount::new(10), 20)
-            .await
-            .expect_err("reserving cost_per_chunk × 20 = 200 > cap 100 must reject");
-        assert!(
-            matches!(
-                err,
-                crate::context::outlets::dispatch::OpenStreamRejection::CaveatPostInputViolation { .. }
-            ),
-            "cumulative reserve over the cap rejects, got {err:?}"
+        caveats.max_calls = Some(20);
+        assert_eq!(
+            effective_max_billable_chunks(cost, &caveats),
+            Some(10),
+            "effective ceiling folds the value cap: min(max_calls 20, floor(cap 100 / cost 10) = 10)"
         );
 
-        // estimate = 10 → reserve 100 == cap → admit.
-        let store_ok = make_store(1_000);
-        let reservation_ok = expect_reservation(
-            &caveats,
-            Amount::new(10),
-            &erase(&store_ok),
-            "cumulative (at cap)",
-        );
-        commit(&reservation_ok, Amount::new(10), 10)
+        let store = make_store(1_000);
+        let reservation = expect_reservation(&caveats, cost, &erase(&store), "cumulative");
+        // Declared estimate = 1 (attacker-minimal) — the reserve must IGNORE it
+        // and use the effective ceiling (10).
+        commit(&reservation, cost, 1)
             .await
-            .expect("reserving exactly the cap must admit");
-        let counters = store_ok
+            .expect("worst-case reserve 100 == cap admits");
+        let counters = store
             .load_counters(TEST_CTX, TEST_CID)
             .await
             .expect("load")
             .expect("record");
         assert_eq!(
             counters.amount_cumulative_used, 100,
-            "the open reserves the FULL estimated spend (10 × 10), not a single cost_per_chunk"
+            "the open reserves the WORST-CASE spend (cost 10 × effective ceiling 10 = 100), \
+             NOT the declared estimate (1 → 10)"
+        );
+
+        // A second concurrent open on the SAME ucan_cid cannot reserve any more
+        // cumulative capacity — the counter is already at the cap. This is the
+        // cross-stream enforcement the under-declared estimate previously evaded.
+        let reservation2 = expect_reservation(&caveats, cost, &erase(&store), "second open");
+        let err = commit(&reservation2, cost, 1)
+            .await
+            .expect_err("a second open over the exhausted cumulative cap must reject");
+        assert!(
+            matches!(
+                err,
+                crate::context::outlets::dispatch::OpenStreamRejection::CaveatPostInputViolation { .. }
+            ),
+            "second open rejects with the cumulative-cap violation, got {err:?}"
         );
     }
 
-    /// R4 HIGH-1 — close-time settlement releases the unspent reserve. Reserve
-    /// 20 chunks @ 10 = 200, terminate after billing 4 → settle releases
-    /// (20 − 4) × 10 = 160, leaving the counter at 40; a subsequent open whose
-    /// reserve fits in the remaining 60 admits, one that needs 70 rejects.
+    /// Close-time settlement releases the unspent reserve. Reserve the
+    /// worst-case 20 chunks @ 10 = 200 (`max_calls = 20`), terminate after
+    /// billing 4 → settle releases `200 − 4 × 10 = 160`, leaving the counter at
+    /// 40; a subsequent open whose worst-case reserve fits in the remaining 160
+    /// admits, one that needs more than the remaining 100 rejects. Each open
+    /// declares a minimal estimate (1) to prove the reserve uses `max_calls`,
+    /// not the declared estimate.
     #[tokio::test]
     async fn cumulative_reserve_released_at_settle_then_reconciled() {
         let store = make_store(1_000);
-        let mut caveats = InvocationCaveats::empty();
-        caveats.amount_max_cumulative = Some(Amount::new(200));
         let cost = Amount::new(10);
+        let cap = Amount::new(200);
+        // Helper: caveats with the shared cap and a per-open `max_calls`.
+        let with_max_calls = |max_calls: u64| {
+            let mut c = InvocationCaveats::empty();
+            c.amount_max_cumulative = Some(cap);
+            c.max_calls = Some(max_calls);
+            c
+        };
 
-        // Open: reserve 20 chunks → 200.
-        let reservation = expect_reservation(&caveats, cost, &erase(&store), "open reserve 200");
-        commit(&reservation, cost, 20)
+        // Open: max_calls = 20 → worst-case reserve 200. Declared estimate 1.
+        let caveats_open = with_max_calls(20);
+        let reservation =
+            expect_reservation(&caveats_open, cost, &erase(&store), "open reserve 200");
+        commit(&reservation, cost, 1)
             .await
             .expect("reserve 200 == cap admits");
         let used = store
@@ -9895,10 +9925,22 @@ mod stream_caveat_post_input_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(used.amount_cumulative_used, 200, "reserved full estimate");
+        assert_eq!(
+            used.amount_cumulative_used, 200,
+            "reserved worst-case spend (max_calls 20 × 10), not the declared estimate"
+        );
 
-        // Settle after billing 4 of 20 chunks → release (20 − 4) × 10 = 160.
-        let unspent = u64::from(20u32 - 4) * 10;
+        // Settle after billing 4 of 20 chunks → release via the SAME
+        // amount-based reconciliation the production close path uses:
+        // 200 − 4 × 10 = 160.
+        let settlement = crate::context::outlets::dispatch::CounterReserveSettlement {
+            amount_cumulative_reserved: 200,
+            reserved_chunks: 1, // diagnostics only — declared estimate
+            ucan_cid: TEST_CID.to_owned(),
+            cost_per_chunk: cost,
+        };
+        let unspent = settlement.unspent_release_amount(4);
+        assert_eq!(unspent, 160, "unspent = reserved 200 − billed 4 × 10");
         store
             .release(
                 TEST_CTX,
@@ -9918,16 +9960,21 @@ mod stream_caveat_post_input_tests {
             "counter reflects only the 4 billed chunks × 10"
         );
 
-        // Subsequent open reserving 60 (6 chunks) → 40 + 60 = 100 ≤ 200, admit.
-        let reservation_ok = expect_reservation(&caveats, cost, &erase(&store), "open reserve 60");
-        commit(&reservation_ok, cost, 6)
+        // Subsequent open: max_calls = 6 → worst-case reserve 60 → 40 + 60 =
+        // 100 ≤ 200, admit.
+        let caveats_ok = with_max_calls(6);
+        let reservation_ok =
+            expect_reservation(&caveats_ok, cost, &erase(&store), "open reserve 60");
+        commit(&reservation_ok, cost, 1)
             .await
             .expect("reserve 60 fits in remaining 160");
 
-        // A further open reserving 110 (11 chunks) → 100 + 110 = 210 > 200, reject.
+        // A further open: max_calls = 11 → worst-case reserve 110 → 100 + 110 =
+        // 210 > 200, reject.
+        let caveats_reject = with_max_calls(11);
         let reservation_reject =
-            expect_reservation(&caveats, cost, &erase(&store), "open reserve 110");
-        let err = commit(&reservation_reject, cost, 11)
+            expect_reservation(&caveats_reject, cost, &erase(&store), "open reserve 110");
+        let err = commit(&reservation_reject, cost, 1)
             .await
             .expect_err("reserve 110 over the remaining 100 must reject");
         assert!(
@@ -9936,6 +9983,182 @@ mod stream_caveat_post_input_tests {
                 crate::context::outlets::dispatch::OpenStreamRejection::CaveatPostInputViolation { .. }
             ),
             "over-cap subsequent reserve rejects, got {err:?}"
+        );
+    }
+
+    /// REGRESSION (under-declared-estimate evasion closed). The reported attack:
+    /// declare `estimated_chunk_count = 1`, `max_calls = 50`,
+    /// `cost_per_chunk = 10`, `amount_max_cumulative = 100`. The OLD code
+    /// reserved `cost × estimated = 10` while a stream could bill up to 50
+    /// chunks → the cap was debited for 10 while 500 was spendable, evading the
+    /// cap cross-stream. The fix reserves the WORST-CASE effective spend
+    /// (`cost × min(max_calls 50, floor(cap 100 / cost 10) = 10) = 100`) and
+    /// pins the SAME effective ceiling (10) into the per-chunk billing gate, so
+    /// no stream can bill past 10 chunks regardless of the declared estimate.
+    #[tokio::test]
+    async fn under_declared_estimate_cannot_evade_cumulative_cap() {
+        use crate::context::outlets::stream::{
+            cumulative_reserve_amount, effective_max_billable_chunks,
+        };
+
+        let cost = Amount::new(10);
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(100));
+        caveats.max_calls = Some(50);
+
+        // The effective billable ceiling folds the value cap in: the stream can
+        // bill at most floor(100/10) = 10 chunks, NOT max_calls = 50.
+        assert_eq!(
+            effective_max_billable_chunks(cost, &caveats),
+            Some(10),
+            "value cap lowers the billable ceiling to floor(cap / cost) = 10"
+        );
+        // The reserve is the worst-case spend over that ceiling — 100 — NOT the
+        // declared estimate (1 → 10) the old code would have used.
+        assert_eq!(
+            cumulative_reserve_amount(cost, &caveats),
+            Some(100),
+            "reserve = cost 10 × effective ceiling 10 = 100, independent of declared estimate"
+        );
+
+        // First open: declare estimate = 1 (attacker-minimal). The reserve still
+        // debits the full 100 (the whole cap), proving the declared estimate is
+        // not the reservation basis.
+        let store = make_store(1_000);
+        let r1 = expect_reservation(&caveats, cost, &erase(&store), "open 1");
+        commit(&r1, cost, 1)
+            .await
+            .expect("first open admits at cap");
+        let after_open1 = store
+            .load_counters(TEST_CTX, TEST_CID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_open1.amount_cumulative_used, 100,
+            "reserve debits the worst-case 100, not the declared-estimate 10"
+        );
+
+        // A second concurrent open on the same ucan_cid is now BLOCKED — the
+        // cumulative cap is fully reserved. Under the old code the second open
+        // (also reserving only 10) would have admitted, and the two streams
+        // together could bill 1000 against a 100 cap.
+        let r2 = expect_reservation(&caveats, cost, &erase(&store), "open 2");
+        let err = commit(&r2, cost, 1)
+            .await
+            .expect_err("second open over the exhausted cap must reject");
+        assert!(
+            matches!(
+                err,
+                crate::context::outlets::dispatch::OpenStreamRejection::CaveatPostInputViolation { .. }
+            ),
+            "blocked with the cumulative-cap violation, got {err:?}"
+        );
+    }
+
+    /// RECONCILIATION: a stream that terminates early settles the cumulative
+    /// counter to EXACTLY the billed value. Open reserves the worst case
+    /// (`cost 10 × effective ceiling 10 = 100`); the stream bills only 3 chunks
+    /// (30); close-time settlement releases `100 − 30 = 70`, leaving the counter
+    /// at 30 — the true billed spend. A subsequent open then sees the freed
+    /// capacity.
+    #[tokio::test]
+    async fn cumulative_counter_reconciles_to_billed_on_early_terminate() {
+        let cost = Amount::new(10);
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(100));
+        caveats.max_calls = Some(50);
+
+        let store = make_store(1_000);
+        let r1 = expect_reservation(&caveats, cost, &erase(&store), "open");
+        commit(&r1, cost, 1).await.expect("open reserves 100");
+
+        // Terminate after billing 3 of the (effective-ceiling 10) chunks. The
+        // close-time settlement releases the unspent portion via the SAME
+        // amount-based reconciliation the production close path uses.
+        let settlement = crate::context::outlets::dispatch::CounterReserveSettlement {
+            amount_cumulative_reserved: 100,
+            reserved_chunks: 1, // diagnostics-only declared estimate
+            ucan_cid: TEST_CID.to_owned(),
+            cost_per_chunk: cost,
+        };
+        let unspent = settlement.unspent_release_amount(3);
+        assert_eq!(unspent, 70, "unspent = reserved 100 − billed 3 × 10");
+        store
+            .release(
+                TEST_CTX,
+                TEST_CID,
+                scp_protocol::trust::CaveatKind::AmountCumulative,
+                unspent,
+            )
+            .await
+            .expect("release succeeds");
+        let after = store
+            .load_counters(TEST_CTX, TEST_CID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.amount_cumulative_used, 30,
+            "counter reconciles to EXACTLY the 3 billed chunks × 10 = 30"
+        );
+    }
+
+    /// REGRESSION (normal stream still works). When the declared estimate equals
+    /// the effective ceiling (`max_calls` is the binding constraint, well under
+    /// `floor(cap / cost)`), the reserve and close behave exactly as a
+    /// well-behaved invoker expects: reserve `cost × max_calls`, bill all of
+    /// them, counter ends at the full billed amount.
+    #[tokio::test]
+    async fn normal_stream_estimate_equals_ceiling_reconciles_to_billed() {
+        use crate::context::outlets::stream::effective_max_billable_chunks;
+
+        let cost = Amount::new(2);
+        let mut caveats = InvocationCaveats::empty();
+        // cap 1000 ≫ cost × max_calls (2 × 5 = 10): max_calls is the binding
+        // constraint, the value cap never bites.
+        caveats.amount_max_cumulative = Some(Amount::new(1_000));
+        caveats.max_calls = Some(5);
+        assert_eq!(
+            effective_max_billable_chunks(cost, &caveats),
+            Some(5),
+            "max_calls binds: min(5, floor(1000/2) = 500) = 5"
+        );
+
+        let store = make_store(1_000);
+        // Declared estimate == effective ceiling (5) — the well-behaved case.
+        let r = expect_reservation(&caveats, cost, &erase(&store), "normal open");
+        commit(&r, cost, 5).await.expect("open reserves 10");
+        let opened = store
+            .load_counters(TEST_CTX, TEST_CID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            opened.amount_cumulative_used, 10,
+            "reserve = cost 2 × ceiling 5 = 10"
+        );
+
+        // Bill all 5 chunks → nothing unspent to release; counter stays at 10.
+        let settlement = crate::context::outlets::dispatch::CounterReserveSettlement {
+            amount_cumulative_reserved: 10,
+            reserved_chunks: 5,
+            ucan_cid: TEST_CID.to_owned(),
+            cost_per_chunk: cost,
+        };
+        assert_eq!(
+            settlement.unspent_release_amount(5),
+            0,
+            "billing the full ceiling leaves nothing to release"
+        );
+        let after = store
+            .load_counters(TEST_CTX, TEST_CID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.amount_cumulative_used, 10,
+            "counter ends at the full billed amount (5 × 2 = 10)"
         );
     }
 

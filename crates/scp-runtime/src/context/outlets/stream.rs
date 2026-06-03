@@ -613,6 +613,96 @@ pub fn coerce_estimated_chunk_count(declared: Option<u32>, caveats: &InvocationC
     })
 }
 
+/// The EFFECTIVE hard billable-chunk ceiling for a stream — the §5.4.5:758
+/// [`CreditTracker::max_billable`] AND-folded with the `amount_max_cumulative`
+/// value cap.
+///
+/// Two independent caveats jointly bound how many billable (Data) chunks a
+/// stream may ever emit:
+/// - `max_calls` bounds the chunk COUNT directly (coerced to `u32`).
+/// - `amount_max_cumulative` bounds the cumulative VALUE; at `cost_per_chunk`
+///   per chunk, that is at most `floor(cap / cost_per_chunk)` billable chunks.
+///
+/// The effective ceiling is the MINIMUM of the two. Folding the value cap into
+/// the chunk ceiling is what physically prevents a stream from billing more
+/// cumulative value than the cap permits: the per-chunk gate
+/// ([`crate::context::outlets::invoke::apply_stream_chunk_gate`]) consults
+/// [`CreditTracker::cumulative_ceiling_reached`] and terminates the stream once
+/// `billed_emitted` reaches this ceiling, regardless of available credit or how
+/// small the invoker-declared `estimated_chunk_count` was. `credit_window` only
+/// bounds the INITIAL window — grants extend billing up to this ceiling (clamped
+/// by [`CreditTracker::replenish_clamped`]) but never past it.
+///
+/// Returns `None` (unbounded) only when BOTH `max_calls` is absent AND there is
+/// no value-cap constraint (no `amount_max_cumulative`, or `cost_per_chunk == 0`
+/// so cumulative value is always zero). A zero-cost stream with `max_calls`
+/// still returns that `max_calls` ceiling.
+#[must_use]
+pub fn effective_max_billable_chunks(
+    cost_per_chunk: Amount,
+    caveats: &InvocationCaveats,
+) -> Option<u32> {
+    let max_calls_ceiling = caveats
+        .max_calls
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+    // The value cap constrains the chunk count only when chunks actually bill
+    // (cost > 0). `floor(cap / cost)` is the most billable chunks whose
+    // cumulative value stays at/under the cap.
+    let cost = cost_per_chunk.value();
+    let cap_ceiling = match caveats.amount_max_cumulative {
+        Some(cap) if cost > 0 => Some(u32::try_from(cap.value() / cost).unwrap_or(u32::MAX)),
+        _ => None,
+    };
+    match (max_calls_ceiling, cap_ceiling) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+/// Computes the cumulative-counter reserve amount for a streaming open
+/// (§5.4.5 `amount_max_cumulative`).
+///
+/// The reserve is the WORST-CASE billable spend a stream can incur — the
+/// EFFECTIVE billable-chunk ceiling ([`effective_max_billable_chunks`], which
+/// already folds the value cap into the chunk ceiling) times `cost_per_chunk`.
+/// Reserving over this worst case — NOT over the invoker-declared
+/// `estimated_chunk_count`, which an invoker can declare as low as `1` while
+/// `max_calls = 50` — means the durable
+/// [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind) counter can
+/// never be billed for more than it reserved. Close-time settlement releases the
+/// unspent portion, so the counter ends at exactly the billed spend.
+///
+/// Because the chunk ceiling already incorporates `floor(cap / cost)`, the
+/// reserve `cost × ceiling` is `<= cap` by construction (no overflow, no clamp
+/// needed).
+///
+/// Returns `None` when there is no `amount_max_cumulative` cap to enforce (the
+/// caller skips the cumulative CAS entirely), or `Some(0)` for a zero-cost
+/// stream that has a cap (it never bills, so the reservation is zero).
+#[must_use]
+pub fn cumulative_reserve_amount(
+    cost_per_chunk: Amount,
+    caveats: &InvocationCaveats,
+) -> Option<u64> {
+    // No value cap ⇒ no cumulative reservation at all.
+    caveats.amount_max_cumulative?;
+    let cost = cost_per_chunk.value();
+    if cost == 0 {
+        // Zero-cost streams never bill against the cumulative counter.
+        return Some(0);
+    }
+    // With a value cap AND non-zero cost, `effective_max_billable_chunks` always
+    // yields a bounded ceiling (the `floor(cap / cost)` term). Fall back to
+    // `floor(cap / cost)` directly so this never silently reserves 0. Reserve
+    // `cost × ceiling`, which is `<= cap` by construction; `saturating_mul`
+    // guards the degenerate `u32::MAX` ceiling defensively.
+    let cap = caveats.amount_max_cumulative.map_or(0, Amount::value);
+    let ceiling = effective_max_billable_chunks(cost_per_chunk, caveats)
+        .unwrap_or_else(|| u32::try_from(cap / cost).unwrap_or(u32::MAX));
+    Some(u64::from(ceiling).saturating_mul(cost))
+}
+
 /// Outcome of [`enforce_estimated_chunk_count_bound`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenError {
@@ -1607,6 +1697,134 @@ mod tests {
         );
         // estimated <= max_calls OK
         assert!(enforce_estimated_chunk_count_bound(5, 32, &caveats).is_ok());
+    }
+
+    // -------- Effective billable ceiling + cumulative reserve --------
+
+    #[test]
+    fn effective_ceiling_folds_value_cap_below_max_calls() {
+        // max_calls = 50 but cap 100 / cost 10 = 10 → ceiling 10.
+        let mut caveats = InvocationCaveats::empty();
+        caveats.max_calls = Some(50);
+        caveats.amount_max_cumulative = Some(Amount::new(100));
+        assert_eq!(
+            effective_max_billable_chunks(Amount::new(10), &caveats),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn effective_ceiling_max_calls_binds_when_below_value_cap() {
+        // cap 1000 / cost 2 = 500, but max_calls = 5 → ceiling 5.
+        let mut caveats = InvocationCaveats::empty();
+        caveats.max_calls = Some(5);
+        caveats.amount_max_cumulative = Some(Amount::new(1_000));
+        assert_eq!(
+            effective_max_billable_chunks(Amount::new(2), &caveats),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn effective_ceiling_value_cap_only_when_max_calls_absent() {
+        // No max_calls; cap 100 / cost 10 = 10 → ceiling 10 (NOT unbounded).
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(100));
+        assert_eq!(
+            effective_max_billable_chunks(Amount::new(10), &caveats),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn effective_ceiling_unbounded_when_no_constraint() {
+        // No max_calls, no value cap → unbounded.
+        let caveats = InvocationCaveats::empty();
+        assert_eq!(
+            effective_max_billable_chunks(Amount::new(10), &caveats),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_ceiling_zero_cost_ignores_value_cap() {
+        // Zero cost: cumulative value is always 0, so the cap does not bound
+        // chunks. max_calls still binds.
+        let mut caveats = InvocationCaveats::empty();
+        caveats.max_calls = Some(7);
+        caveats.amount_max_cumulative = Some(Amount::new(100));
+        assert_eq!(
+            effective_max_billable_chunks(Amount::new(0), &caveats),
+            Some(7)
+        );
+        // Zero cost AND no max_calls → unbounded (the cap on a free stream
+        // never bites).
+        let mut only_cap = InvocationCaveats::empty();
+        only_cap.amount_max_cumulative = Some(Amount::new(100));
+        assert_eq!(
+            effective_max_billable_chunks(Amount::new(0), &only_cap),
+            None
+        );
+    }
+
+    #[test]
+    fn cumulative_reserve_none_without_value_cap() {
+        // No `amount_max_cumulative` → no cumulative reservation at all.
+        let mut caveats = InvocationCaveats::empty();
+        caveats.max_calls = Some(50);
+        assert_eq!(cumulative_reserve_amount(Amount::new(10), &caveats), None);
+    }
+
+    #[test]
+    fn cumulative_reserve_is_worst_case_spend_over_effective_ceiling() {
+        // cap 100, cost 10, max_calls 50 → effective ceiling 10 → reserve 100.
+        // The reserve is INDEPENDENT of any declared estimate; it always equals
+        // `cost × effective_ceiling`, never `cost × estimated_chunk_count`.
+        let mut caveats = InvocationCaveats::empty();
+        caveats.max_calls = Some(50);
+        caveats.amount_max_cumulative = Some(Amount::new(100));
+        assert_eq!(
+            cumulative_reserve_amount(Amount::new(10), &caveats),
+            Some(100)
+        );
+        // The reserve never exceeds the cap.
+        let reserve = cumulative_reserve_amount(Amount::new(10), &caveats).unwrap();
+        assert!(reserve <= 100, "reserve {reserve} must be <= cap 100");
+    }
+
+    #[test]
+    fn cumulative_reserve_max_calls_binds_below_cap() {
+        // cap 1000, cost 2, max_calls 5 → effective ceiling 5 → reserve 10.
+        let mut caveats = InvocationCaveats::empty();
+        caveats.max_calls = Some(5);
+        caveats.amount_max_cumulative = Some(Amount::new(1_000));
+        assert_eq!(
+            cumulative_reserve_amount(Amount::new(2), &caveats),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn cumulative_reserve_unbounded_max_calls_reserves_up_to_cap() {
+        // No max_calls; cap 95, cost 10 → floor(95/10) = 9 chunks → reserve 90
+        // (the largest multiple of cost at/under the cap). The leftover 5 < cost
+        // can never be billed (a 10th chunk would exceed the cap, and the
+        // per-chunk gate blocks it).
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(95));
+        assert_eq!(
+            cumulative_reserve_amount(Amount::new(10), &caveats),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn cumulative_reserve_zero_cost_is_zero() {
+        // Zero-cost stream with a cap → reserves nothing (never bills).
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(100));
+        caveats.max_calls = Some(50);
+        assert_eq!(cumulative_reserve_amount(Amount::new(0), &caveats), Some(0));
     }
 
     // -------------- StreamEscrow tests --------------

@@ -89,8 +89,9 @@ use super::invoke::{
 use super::stream::{
     AdmissionCaps, AdmissionOutcome, CancelAckTracker, CreditTracker, GrantError, OpenError,
     StreamAdmissionTracker, StreamEscrow, StreamIdentity, admission_outcome_to_slug,
-    coerce_estimated_chunk_count, compute_chunks_billed_ref, enforce_estimated_chunk_count_bound,
-    open_error_to_slug, verify_chunks_billed,
+    coerce_estimated_chunk_count, compute_chunks_billed_ref, cumulative_reserve_amount,
+    effective_max_billable_chunks, enforce_estimated_chunk_count_bound, open_error_to_slug,
+    verify_chunks_billed,
 };
 
 use scp_protocol::context::outlets::registry::OutletRegistry;
@@ -1291,15 +1292,19 @@ fn release_admission(admission: &Arc<Mutex<StreamAdmissionTracker>>, params: &Op
 /// ONLY when the open will actually succeed, so a `StreamCapExhausted` /
 /// `invoke_outlet` failure leaves the counters untouched.
 ///
-/// HIGH-1: the cumulative-value cap was charged ONCE per open at
-/// `cost_per_chunk`, but a stream emits up to `min(credit_window, max_calls)`
-/// billable chunks — so the cap was evaded `N`×. The fix RESERVES the full
-/// `cost_per_chunk × estimated_chunk_count` against the
-/// [`CaveatKind::AmountCumulative`] counter at this gate (the same
-/// `estimated_chunk_count` the open already bounds at
-/// [`enforce_estimated_chunk_count_bound`]); close-time settlement releases
-/// the unspent `(reserved − billed) × cost_per_chunk` via
-/// [`crate::trust::CaveatCounterApi::release`].
+/// Cumulative-value cap reserve: a stream emits up to its EFFECTIVE billable
+/// ceiling (`min(max_calls, floor(cap / cost_per_chunk))`, the §5.4.5:758
+/// ceiling AND-folded with the value cap — no grant can raise it), so the cap
+/// must be reserved over the WORST-CASE spend at open — NOT over the
+/// invoker-declared `estimated_chunk_count`, which the invoker can set as low
+/// as `1` while `max_calls = 50` to evade the cap cross-stream. The gate
+/// RESERVES
+/// [`super::stream::cumulative_reserve_amount`]
+/// (`cost_per_chunk × effective_max_billable_chunks`, `<= cap` by construction)
+/// against the [`CaveatKind::AmountCumulative`] counter; close-time settlement
+/// releases the unspent `reserved − billed_count × cost_per_chunk` via
+/// [`crate::trust::CaveatCounterApi::release`]. The invariant: a stream can
+/// never bill more cumulative value than it reserved here.
 pub struct StreamCounterReservation {
     /// The durable per-(context, ucan) caveat counter store.
     pub counter_store: Arc<dyn crate::trust::CaveatCounterApi>,
@@ -1311,14 +1316,18 @@ pub struct StreamCounterReservation {
 
 /// Outcome of committing the durable counter reservation at the final gate.
 struct CounterCommitOutcome {
-    /// The cumulative amount RESERVED against the `AmountCumulative` counter
-    /// (`cost_per_chunk × reserved_chunks`). Recorded so close-time
-    /// settlement can release the unspent portion. `0` when the cap is absent
-    /// or the reserve arithmetic overflowed (fail open — see below).
+    /// The cumulative amount RESERVED against the `AmountCumulative` counter —
+    /// the WORST-CASE billable spend from
+    /// [`super::stream::cumulative_reserve_amount`]
+    /// (`cost_per_chunk × effective_max_billable_chunks`, `<= cap` by
+    /// construction). Recorded so close-time settlement releases the unspent
+    /// portion (`reserved − billed_count × cost_per_chunk`). `0` when the cap is
+    /// absent or `cost_per_chunk == 0`.
     amount_cumulative_reserved: u64,
-    /// The chunk count the cumulative reserve was computed over (the same
-    /// `estimated_chunk_count` the open bounded). Recorded for settlement
-    /// reconciliation (`unspent = (reserved_chunks − billed) × cost_per_chunk`).
+    /// The invoker-declared `estimated_chunk_count` the open bounded. Carried
+    /// for diagnostics / event reporting only — close-time reconciliation is
+    /// now AMOUNT-based (`unspent = reserved − billed_count × cost_per_chunk`),
+    /// so this is NOT the chunk count the reserve was computed over.
     reserved_chunks: u32,
 }
 
@@ -1335,11 +1344,17 @@ struct CounterCommitOutcome {
 /// leaves capacity stranded (e.g. `max_calls` committed, then
 /// `amount_cumulative` exhausted → release the `max_calls` increment).
 ///
-/// HIGH-1 reserve: the `AmountCumulative` charge is
-/// `cost_per_chunk × estimated_chunk_count`, computed with
-/// [`u64::checked_mul`] — on overflow the reserve FAILS OPEN (skips the
-/// cumulative CAS) rather than rejecting a legitimate open, matching the
-/// open's other saturating/fail-open arithmetic.
+/// Cumulative-cap reserve: the `AmountCumulative` charge is the WORST-CASE
+/// billable spend from
+/// [`super::stream::cumulative_reserve_amount`] —
+/// `cost_per_chunk × effective_max_billable_chunks` (the §5.4.5:758 ceiling
+/// AND-folded with `floor(cap / cost)`), `<= cap` by construction. It is
+/// deliberately INDEPENDENT of the invoker-declared `estimated_chunk_count`
+/// (`estimated_chunk_count` still drives ESCROW reserve and the per-grant escrow
+/// top-up, but the durable cumulative cap reserves the worst case so a small
+/// declared estimate can never under-count the cap). The same effective ceiling
+/// is pinned into the `CreditTracker`, so the per-chunk gate physically blocks
+/// billing past it — the reserve and the runtime billing ceiling agree.
 async fn commit_counter_reservation(
     reservation: &StreamCounterReservation,
     context_id: &str,
@@ -1366,13 +1381,22 @@ async fn commit_counter_reservation(
         max_calls_committed = true;
     }
 
-    // 2. amount_max_cumulative — RESERVE the full estimated spend
-    //    (cost_per_chunk × estimated_chunk_count). Fail OPEN on overflow
-    //    (the `checked_mul` returning `None` skips the cumulative CAS).
-    if let Some(max) = caveats.amount_max_cumulative
-        && let Some(reserve) = cost_per_chunk
-            .value()
-            .checked_mul(u64::from(estimated_chunk_count))
+    // 2. amount_max_cumulative — RESERVE the WORST-CASE billable spend, NOT
+    //    the invoker-declared `estimated_chunk_count`. The declared estimate is
+    //    invoker-controlled and may be as low as 1 even when `max_calls = 50`,
+    //    so reserving over it lets a stream bill up to its effective ceiling
+    //    while the cumulative cap is debited for only the tiny declared estimate
+    //    — the cap is evaded cross-stream. `cumulative_reserve_amount` instead
+    //    reserves `cost_per_chunk × effective_max_billable_chunks` (the
+    //    §5.4.5:758 ceiling AND-folded with `floor(cap / cost)`), which is
+    //    `<= cap` by construction. The same effective ceiling is pinned into the
+    //    `CreditTracker` (`build_shared_state`), so the per-chunk gate physically
+    //    blocks billing past it. Close-time settlement releases the unspent
+    //    portion, so the counter ends at exactly the billed spend. The
+    //    invariant: a stream can never bill more cumulative value than it
+    //    reserved here.
+    if let Some(reserve) = cumulative_reserve_amount(cost_per_chunk, caveats)
+        && let Some(max) = caveats.amount_max_cumulative
     {
         if let Err(err) = store
             .check_and_increment(
@@ -1603,16 +1627,18 @@ fn build_shared_state(
     admission: &Arc<Mutex<StreamAdmissionTracker>>,
     context_handle: ContextHandle,
 ) -> Arc<Mutex<SharedSessionState>> {
-    // §5.4.5:758 HARD cumulative billable-chunk ceiling = the
-    // VALIDATED-NARROWED `caveats.max_calls`, coerced to `u32` (saturating
-    // — a `max_calls` above `u32::MAX` is clamped). `None` = unbounded.
-    // Once Phase 2 switches the resolver to `TokenNbCaveatResolver`, the
-    // `params.caveats` threaded in here are the post-narrowing effective
-    // caveats, so the pinned ceiling is the validated-narrowed `max_calls`.
-    let max_billable: Option<u32> = params
-        .caveats
-        .max_calls
-        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+    // §5.4.5:758 HARD billable-chunk ceiling = the EFFECTIVE ceiling: the
+    // VALIDATED-NARROWED `caveats.max_calls` AND-folded with the
+    // `amount_max_cumulative` value cap (`floor(cap / cost_per_chunk)`). `None`
+    // = unbounded (no `max_calls` AND no value-cap constraint). Folding the
+    // value cap in here is what physically prevents a stream from billing more
+    // cumulative value than the cap permits: the per-chunk gate terminates the
+    // stream once `billed_emitted` reaches this ceiling, regardless of available
+    // credit — so an invoker who declared a tiny `estimated_chunk_count` still
+    // cannot bill past `floor(cap / cost)` chunks. The `params.caveats` here are
+    // the post-narrowing effective caveats (`TokenNbCaveatResolver`).
+    let max_billable: Option<u32> =
+        effective_max_billable_chunks(params.cost_per_chunk, &params.caveats);
     let credit = CreditTracker::new(
         params.credit_window,
         params.invoker_pk,
@@ -1698,19 +1724,23 @@ pub(crate) struct PumpEventEmissionInputs {
 /// reserved [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
 /// charge at settlement.
 ///
-/// At the open-time final gate the runtime reserves
-/// `cost_per_chunk × reserved_chunks` against the cumulative counter
-/// ([`commit_counter_reservation`]). At close the stream billed only
-/// `billed_count` chunks, so `(reserved_chunks − billed_count) ×
-/// cost_per_chunk` (clamped to `amount_cumulative_reserved`) is given back to
-/// the counter — the cap ends up debited by exactly the billed spend.
+/// At the open-time final gate the runtime reserves the WORST-CASE billable
+/// spend `amount_cumulative_reserved` (= `cost_per_chunk ×
+/// effective_max_billable_chunks`, `<= cap` by construction) against the
+/// cumulative counter ([`commit_counter_reservation`] via
+/// [`super::stream::cumulative_reserve_amount`]). At
+/// close the stream billed only `billed_count` chunks, so
+/// `amount_cumulative_reserved − billed_count × cost_per_chunk` (saturating) is
+/// given back to the counter — the cap ends up debited by exactly the billed
+/// spend, regardless of how small the declared estimate was.
 #[derive(Debug, Clone)]
 pub struct CounterReserveSettlement {
-    /// The cumulative amount reserved at open (`0` when no cap / no store /
-    /// reserve overflow).
+    /// The worst-case cumulative amount reserved at open (`0` when no cap / no
+    /// store / `cost_per_chunk == 0`).
     pub amount_cumulative_reserved: u64,
-    /// Chunk count the reserve was computed over (the open's bounded
-    /// `estimated_chunk_count`).
+    /// Invoker-declared `estimated_chunk_count` (diagnostics / event field
+    /// only). NOT the count the reserve was computed over — the reserve is the
+    /// worst-case spend and the close-time release reconciles by AMOUNT.
     pub reserved_chunks: u32,
     /// Opening UCAN CID — the cumulative counter's key.
     pub ucan_cid: String,
@@ -1729,6 +1759,26 @@ impl CounterReserveSettlement {
             ucan_cid: String::new(),
             cost_per_chunk: Amount::new(0),
         }
+    }
+
+    /// The UNSPENT portion of the open-time worst-case reserve to release back
+    /// to the durable `AmountCumulative` counter at close: `reserved −
+    /// billed_count × cost_per_chunk` (saturating). After the release the
+    /// counter is debited by exactly the billed cumulative spend, regardless of
+    /// the (worst-case) amount reserved at open.
+    ///
+    /// AMOUNT-based, so it is correct regardless of the effective ceiling the
+    /// open reserved over (`cost × effective_max_billable_chunks`). A degenerate
+    /// `billed_count × cost_per_chunk` overflow FAILS CLOSED — releases nothing,
+    /// leaving the counter conservatively over-charged (never under-charged).
+    #[must_use]
+    pub fn unspent_release_amount(&self, billed_count: u32) -> u64 {
+        u64::from(billed_count)
+            .checked_mul(self.cost_per_chunk.value())
+            .map_or(0, |billed_amount| {
+                self.amount_cumulative_reserved
+                    .saturating_sub(billed_amount)
+            })
     }
 }
 

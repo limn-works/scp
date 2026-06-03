@@ -592,20 +592,23 @@ pub struct StreamSettlement {
     /// zero-cost / Query streams and legacy/test callers without an
     /// economic policy at open.
     pub economic_policy_snapshot: Option<EconomicPolicySnapshot>,
-    /// R4 HIGH-1 — the cumulative amount RESERVED against the
+    /// The WORST-CASE cumulative amount RESERVED against the
     /// [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
-    /// counter at the open-time final gate
-    /// (`cost_per_chunk × reserved_chunks`). `0` when the cap is absent, the
-    /// reserve overflowed (fail-open), or no counter store was wired. Close-
-    /// time settlement releases the UNSPENT portion of this reserve —
-    /// `(reserved_chunks − billed_count) × cost_per_chunk`, clamped to this
-    /// reserved amount — back to the counter via
-    /// [`crate::trust::CaveatCounterApi::release`], so the cumulative cap is
-    /// debited by exactly the billed spend rather than the full reservation.
+    /// counter at the open-time final gate — `cost_per_chunk ×
+    /// effective_max_billable_chunks` (`<= cap` by construction), from
+    /// [`super::stream::cumulative_reserve_amount`].
+    /// `0` when the cap is absent, `cost_per_chunk == 0`, or no counter store
+    /// was wired. Close-time settlement releases the UNSPENT portion —
+    /// `amount_cumulative_reserved − billed_count × cost_per_chunk` (saturating)
+    /// — back to the counter via [`crate::trust::CaveatCounterApi::release`], so
+    /// the cumulative cap is debited by exactly the billed spend rather than the
+    /// worst-case reservation, regardless of how small the declared estimate
+    /// was.
     pub amount_cumulative_reserved: u64,
-    /// R4 HIGH-1 — the chunk count the cumulative reserve was computed over
-    /// (the open's bounded `estimated_chunk_count`). The settlement
-    /// reconciliation computes `unspent = (reserved_chunks − billed_count)`.
+    /// The invoker-declared `estimated_chunk_count` (diagnostics / event field
+    /// only). NOT the count the reserve was computed over — the reserve is the
+    /// worst-case spend and the close-time release reconciles by AMOUNT
+    /// (`unspent = amount_cumulative_reserved − billed_count × cost_per_chunk`).
     pub reserved_chunks: u32,
     /// R4 HIGH-1 — the opening UCAN CID, the key the
     /// [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)

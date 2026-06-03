@@ -39,10 +39,14 @@ use crate::error::ScpNapiError;
 ///   (narrow) + 11b (time-box); that VALIDATED-NARROWED set is exactly what
 ///   the §5.4.5 `caveats_binding` commits to (R3 STEP 0).
 /// - The non-streaming invocation paths (`outlet_invoke`,
-///   `outlet_invoke_cross_context`, `outlet_session_invoke`) pass
-///   [`scp_core::crypto::ucan::validate::NoCaveatResolver`], preserving their
-///   prior behaviour (the post-input caveat enforcement for those paths runs
-///   in the `ContextManager` economy pipeline, not here).
+///   `outlet_invoke_cross_context`, `outlet_session_invoke`) likewise pass
+///   [`scp_core::crypto::ucan::validate::TokenNbCaveatResolver`] (R4): they are
+///   outlet-invocation sites, so each token's signed `nb` is resolved and run
+///   through Step 7b (per-edge narrow over the whole chain) and Step 11b
+///   (time-box), matching the streaming open path and the `PyO3` and `UniFFI`
+///   non-streaming outlet sites. (The capability-subset checks run
+///   resolver-independently; this resolver controls only the caveat-narrow
+///   dimension.)
 ///
 /// The generic UCAN-validation entry point (`crate::ucan::ucan_validate`)
 /// builds its own `ValidationContext` and is NOT routed through this helper,
@@ -92,8 +96,10 @@ pub(crate) fn validate_outlet_invocation_ucan_napi(
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
-            // HIGH-3 (R3): resolver is caller-selected — streaming passes
-            // `TokenNbCaveatResolver`, non-streaming passes `NoCaveatResolver`.
+            // Resolver is caller-selected. Every outlet-invocation site
+            // (streaming open + all three non-streaming invoke paths) passes
+            // `TokenNbCaveatResolver` (R4); only the generic `ucan_validate`
+            // entry point stays on `NoCaveatResolver`.
             caveat_resolver,
         };
 
@@ -781,9 +787,14 @@ pub async fn outlet_invoke_cross_context(
         &invoker_did,
         &ucan_token,
         &proof_resolver,
-        // Non-streaming cross-context invoke: caveat-free validation here
-        // (HIGH-3 R3).
-        &scp_core::crypto::ucan::validate::NoCaveatResolver,
+        // §5.4.5 / §7.3.8 (R4): the non-streaming cross-context outlet invoke
+        // is an outlet-invocation site, so it resolves effective caveats from
+        // each token's signed `nb` field. This makes §7.3.8 Step 7b (per-edge
+        // caveat narrow over the whole chain) and Step 11b (time-box) run over
+        // the VALIDATED-NARROWED caveat set — matching the in-context
+        // `outlet_invoke` site above and the PyO3 and UniFFI non-streaming
+        // outlet sites, which already use `TokenNbCaveatResolver`.
+        &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
     )
     .map_err(napi::Error::from)?;
 
@@ -993,8 +1004,14 @@ pub async fn outlet_session_invoke(
         &invoker_did,
         &ucan_token,
         &proof_resolver,
-        // Non-streaming session invoke: caveat-free validation here (HIGH-3 R3).
-        &scp_core::crypto::ucan::validate::NoCaveatResolver,
+        // §5.4.5 / §7.3.8 (R4): the non-streaming session outlet invoke is an
+        // outlet-invocation site, so it resolves effective caveats from each
+        // token's signed `nb` field. This makes §7.3.8 Step 7b (per-edge
+        // caveat narrow over the whole chain) and Step 11b (time-box) run over
+        // the VALIDATED-NARROWED caveat set — matching the in-context
+        // `outlet_invoke` site and the PyO3 and UniFFI non-streaming outlet
+        // sites, which already use `TokenNbCaveatResolver`.
+        &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
     )
     .map_err(napi::Error::from)?;
 
@@ -2034,5 +2051,67 @@ mod tests {
 
         // Clean up global state.
         crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Caveat-resolver parity (R4): every NAPI outlet-INVOCATION site must run
+    // the §7.3.8 caveat narrow/time-box over the token's signed `nb` set via
+    // `TokenNbCaveatResolver`, matching the PyO3, UniFFI, and streaming paths.
+    // The generic `ucan_validate` entry point (`crate::ucan`) intentionally
+    // stays on `NoCaveatResolver` and lives in a different module, so it cannot
+    // regress this file. This is a structural assertion over the real source:
+    // it isolates each invocation function body and inspects the resolver
+    // argument passed to `validate_outlet_invocation_ucan_napi`.
+    // -----------------------------------------------------------------------
+
+    /// Returns the source span of `fn <name>(` up to the next top-level
+    /// `pub async fn`/`pub fn`/`#[cfg(test)]`, i.e. one function body.
+    fn function_body<'a>(src: &'a str, fn_header: &str) -> &'a str {
+        let start = src
+            .find(fn_header)
+            .expect("source must contain the named fn header");
+        let rest = &src[start + fn_header.len()..];
+        // Each invocation function is followed by another top-level item.
+        let end_rel = rest
+            .find("\npub async fn ")
+            .or_else(|| rest.find("\npub fn "))
+            .or_else(|| rest.find("\n#[cfg(test)]"))
+            .unwrap_or(rest.len());
+        &rest[..end_rel]
+    }
+
+    #[test]
+    fn all_outlet_invocation_sites_use_token_nb_caveat_resolver() {
+        let src = include_str!("outlets.rs");
+
+        // The three non-streaming outlet-invocation entry points. Each must
+        // call the shared validator with `TokenNbCaveatResolver` and never with
+        // `NoCaveatResolver`.
+        let invocation_fns = [
+            "pub async fn outlet_invoke(",
+            "pub async fn outlet_invoke_cross_context(",
+            "pub async fn outlet_session_invoke(",
+        ];
+
+        for fn_header in invocation_fns {
+            let body = function_body(src, fn_header);
+            assert!(
+                body.contains("validate_outlet_invocation_ucan_napi("),
+                "`{fn_header}` must route through validate_outlet_invocation_ucan_napi"
+            );
+            assert!(
+                body.contains("crypto::ucan::validate::TokenNbCaveatResolver"),
+                "`{fn_header}` must pass TokenNbCaveatResolver (R4 caveat-narrow parity)"
+            );
+            // Guard against a future regression flipping the argument back.
+            // Match the resolver passed as a `&...NoCaveatResolver` argument
+            // specifically (the doc string in the helper module is elsewhere).
+            assert!(
+                !body.contains("&scp_core::crypto::ucan::validate::NoCaveatResolver")
+                    && !body.contains("&scp_protocol::crypto::ucan::validate::NoCaveatResolver"),
+                "`{fn_header}` must NOT pass NoCaveatResolver — that would skip \
+                 §7.3.8 caveat narrowing on the outlet path"
+            );
+        }
     }
 }
