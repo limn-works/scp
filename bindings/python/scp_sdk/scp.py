@@ -43,7 +43,7 @@ import asyncio
 import logging
 import math
 from types import TracebackType
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
@@ -53,10 +53,73 @@ logger = logging.getLogger("scp_sdk")
 __all__ = [
     "SCP",
     "InMemoryStorage",
+    "KeyCustodyProvider",
     "McpAllowlistState",
     "SqliteStorage",
     "StorageConfig",
 ]
+
+
+@runtime_checkable
+class KeyCustodyProvider(Protocol):
+    """Caller-supplied custody backend for :meth:`SCP.identity_create_with_custody`.
+
+    Implement this protocol to back a DID's key material with a platform
+    keystore (OS keychain, hardware token, HSM wrapper, etc.). The private
+    key material never crosses into the Rust core — every cryptographic
+    operation is delegated back to your implementation (ADR-006).
+
+    Mirrors the UniFFI ``KeyCustodyProvider`` callback interface so Swift,
+    Kotlin, and Python implementations share an identical contract. All
+    methods are invoked synchronously by the bridge (the Rust side releases
+    the GIL while orchestrating, then re-acquires it per call), so a method
+    body may block on a keystore without stalling the asyncio event loop.
+
+    Key identifiers are opaque, numeric-string handles your implementation
+    assigns in :meth:`generate_keypair` and maps internally to real key
+    material. Byte values are passed and returned as ``bytes``.
+    """
+
+    def generate_keypair(self, key_type: str) -> str:
+        """Generate a keypair (``"ed25519"`` or ``"x25519"``); return its id."""
+        ...
+
+    def sign(self, key_id: str, message: bytes) -> bytes:
+        """Return the 64-byte Ed25519 signature of ``message`` under ``key_id``."""
+        ...
+
+    def get_public_key(self, key_id: str) -> bytes:
+        """Return the 32 public-key bytes for ``key_id``."""
+        ...
+
+    def destroy_key(self, key_id: str) -> None:
+        """Destroy key material for ``key_id``; subsequent ops must fail."""
+        ...
+
+    def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
+        """Return the 32-byte X25519 shared secret with ``peer_public``."""
+        ...
+
+    def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
+        """Derive a context-scoped pseudonym keypair.
+
+        Returns ``public_key_bytes (32) || key_id_utf8`` — the 32-byte
+        pseudonym public key concatenated with the UTF-8 numeric id of the
+        derived signing key.
+        """
+        ...
+
+    def export_signing_key_bytes(self, key_id: str) -> bytes:
+        """Return the 32 raw Ed25519 private-seed bytes for ``key_id``.
+
+        Required for governance vote signing. Hardware-bound custody that
+        cannot export key material should raise an exception.
+        """
+        ...
+
+    def custody_type(self, key_id: str) -> str:
+        """Return ``"hardware"``, ``"software"``, or ``"in_memory"``."""
+        ...
 
 
 class McpAllowlistState(TypedDict):
@@ -467,6 +530,30 @@ class SCP:
         raw = await asyncio.to_thread(self._native.identity_create_with_agent_key, custody_str)
         return Identity(raw)
 
+    async def identity_create_with_custody(self, provider: KeyCustodyProvider) -> Any:
+        """Create a DID whose key material lives in a caller-provided custody.
+
+        Delegate to ``_scp_core.SCP.identity_create_with_custody``. The
+        ``provider`` is any object implementing the
+        :class:`KeyCustodyProvider` protocol — the private key material never
+        crosses into the Rust core (ADR-006). Use this to back a DID with a
+        platform keychain, hardware token, or HSM wrapper.
+
+        The blocking bridge call runs in :func:`asyncio.to_thread` so the
+        provider's (potentially blocking) keystore operations do not stall the
+        asyncio event loop.
+
+        :param provider: A :class:`KeyCustodyProvider` implementation.
+        :returns: An :class:`Identity` wrapper.
+        :raises ScpError: if the provider is missing required methods
+            (``ValidationError``) or key/DID creation fails inside the
+            provider (``IdentityError``).
+        """
+        from scp_sdk.identity import Identity
+
+        raw = await asyncio.to_thread(self._native.identity_create_with_custody, provider)
+        return Identity(raw)
+
     async def identity_execute_custody_migration(
         self, did: str, target: str, context_ids: list[str]
     ) -> dict[str, Any]:
@@ -577,6 +664,24 @@ class SCP:
 
         raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
         return Identity(raw)
+
+    async def identity_remove(self, did: str) -> None:
+        """Remove a DID from this instance's SCP-side identity registry.
+
+        Drops the retained identity state for ``did``. Idempotent — returns
+        without error when the DID is not present. Delegates to
+        ``_scp_core.SCP.identity_remove``.
+        """
+        await asyncio.to_thread(self._native.identity_remove, did)
+
+    async def identity_remove_if_present(self, did: str) -> bool:
+        """Remove a DID from the identity registry if present.
+
+        Returns ``True`` if the identity was found and removed, ``False`` if
+        the DID was not in the registry. Delegates to
+        ``_scp_core.SCP.identity_remove_if_present``.
+        """
+        return await asyncio.to_thread(self._native.identity_remove_if_present, did)
 
     async def identity_renew_attestation(self, did: str, attestation_id: str) -> Any:
         """Renew an identity link attestation (§3.5.2).
@@ -1315,6 +1420,10 @@ class SCP:
         """Delegate to ``_scp_core.SCP.configure_relay_transport``."""
         return await asyncio.to_thread(self._native.configure_relay_transport, relay_url, local_did)
 
+    async def configure_local_transport(self, local_did: str) -> Any:
+        """Delegate to ``_scp_core.SCP.configure_local_transport``."""
+        return await asyncio.to_thread(self._native.configure_local_transport, local_did)
+
     async def transport_adapter_count(self) -> Any:
         """Delegate to ``_scp_core.SCP.transport_adapter_count``."""
         return await asyncio.to_thread(self._native.transport_adapter_count)
@@ -1364,6 +1473,30 @@ class SCP:
 
         raw = await asyncio.to_thread(
             self._native.event_log_checkpoint, context_id, identity_did, epoch
+        )
+        return SignedCheckpoint(
+            context_id=raw.context_id,
+            sender_did=raw.sender_did,
+            event_count=raw.event_count,
+            merkle_root=raw.merkle_root,
+            epoch=raw.epoch,
+            timestamp=raw.timestamp,
+            signature=raw.signature,
+        )
+
+    async def event_log_checkpoint_by_did(self, context_id: str, did: str, epoch: int) -> Any:
+        """Delegate to ``_scp_core.SCP.event_log_checkpoint_by_did``.
+
+        Generates a signed consistency checkpoint scoped to a member ``did``.
+        The DID is looked up in this instance's identity registry for signing
+        key material and recorded as the checkpoint's ``sender_did``. Returns a
+        :class:`~scp_sdk.event_log.SignedCheckpoint` with an Ed25519 signature
+        over the canonical checkpoint fields.
+        """
+        from scp_sdk.event_log import SignedCheckpoint
+
+        raw = await asyncio.to_thread(
+            self._native.event_log_checkpoint_by_did, context_id, did, epoch
         )
         return SignedCheckpoint(
             context_id=raw.context_id,
@@ -1891,6 +2024,18 @@ class SCP:
             description,
             tags,
         )
+
+    async def petname_apply_event(self, owner_did: str, event_json: str) -> Any:
+        """Delegate to ``_scp_core.SCP.petname_apply_event``."""
+        return await asyncio.to_thread(self._native.petname_apply_event, owner_did, event_json)
+
+    async def petname_context_count(self, owner_did: str) -> int:
+        """Delegate to ``_scp_core.SCP.petname_context_count``."""
+        return await asyncio.to_thread(self._native.petname_context_count, owner_did)
+
+    async def petname_did_count(self, owner_did: str) -> int:
+        """Delegate to ``_scp_core.SCP.petname_did_count``."""
+        return await asyncio.to_thread(self._native.petname_did_count, owner_did)
 
     async def petname_get_for_context(self, owner_did: str, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.petname_get_for_context``."""

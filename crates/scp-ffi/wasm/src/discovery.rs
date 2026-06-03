@@ -38,7 +38,10 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use scp_ffi_common::validate::validate_did;
 use scp_protocol::discovery::petnames::{PetnameEvent, PetnameMap};
+
+use crate::error::ScpWasmError;
 
 // ---------------------------------------------------------------------------
 // Constants (mirror scp-core::discovery::addressing)
@@ -714,12 +717,21 @@ fn lock_petname_maps()
         .map_err(|e| JsError::new(&format!("[SCP-VALID-7112] petname lock poisoned: {e}")))
 }
 
-/// Validates that `owner_did` is non-empty.
+/// Validates that `owner_did` is a syntactically well-formed DID.
+///
+/// Delegates to the shared [`validate_did`] used by the `PyO3`, `NAPI`, and
+/// `UniFFI` bridges so that all four bridges enforce the same
+/// `did:{method}:{id}` syntax
+/// (non-empty, `did:` prefix, lowercase-alphanumeric method, control-character
+/// rejection, length bounds) rather than only an emptiness check. The empty
+/// case keeps the discovery-specific `SCP-VALID-7110` code for backward
+/// compatibility with existing callers; all other malformed-DID cases surface
+/// the shared `SCP-VALID-7000` validation code.
 fn validate_owner_did(owner_did: &str) -> Result<(), JsError> {
     if owner_did.is_empty() {
         return Err(JsError::new("[SCP-VALID-7110] owner_did must not be empty"));
     }
-    Ok(())
+    validate_did(owner_did).map_err(|e| ScpWasmError::from(e).into_js())
 }
 
 /// Sets a petname for a DID.
@@ -728,7 +740,8 @@ fn validate_owner_did(owner_did: &str) -> Result<(), JsError> {
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` or `target_did` is empty, or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, if `target_did`
+/// is empty, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_set(owner_did: String, target_did: String, name: String) -> Result<(), JsError> {
     validate_owner_did(&owner_did)?;
@@ -750,7 +763,7 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> Resul
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), JsError> {
     validate_owner_did(&owner_did)?;
@@ -767,7 +780,8 @@ pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), JsErr
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` or `context_id` is empty, or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, if `context_id`
+/// is empty, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_set_context(
     owner_did: String,
@@ -794,7 +808,7 @@ pub fn petname_set_context(
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(), JsError> {
     validate_owner_did(&owner_did)?;
@@ -808,7 +822,7 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, JsError> {
     validate_owner_did(&owner_did)?;
@@ -823,7 +837,7 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, Js
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String, JsError> {
     validate_owner_did(&owner_did)?;
@@ -838,7 +852,7 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_get_for_did(owner_did: String, target_did: String) -> Result<JsValue, JsError> {
     validate_owner_did(&owner_did)?;
@@ -852,7 +866,7 @@ pub fn petname_get_for_did(owner_did: String, target_did: String) -> Result<JsVa
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_get_for_context(owner_did: String, context_id: String) -> Result<JsValue, JsError> {
     validate_owner_did(&owner_did)?;
@@ -878,8 +892,8 @@ pub fn petname_get_for_context(owner_did: String, context_id: String) -> Result<
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty, the JSON is malformed,
-/// or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, the JSON is
+/// malformed, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_apply_event(owner_did: String, event_json: String) -> Result<(), JsError> {
     validate_owner_did(&owner_did)?;
@@ -899,7 +913,7 @@ pub fn petname_apply_event(owner_did: String, event_json: String) -> Result<(), 
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_list_events(owner_did: String) -> Result<String, JsError> {
     validate_owner_did(&owner_did)?;
@@ -916,7 +930,7 @@ pub fn petname_list_events(owner_did: String) -> Result<String, JsError> {
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_did_count(owner_did: String) -> Result<u32, JsError> {
     validate_owner_did(&owner_did)?;
@@ -933,7 +947,7 @@ pub fn petname_did_count(owner_did: String) -> Result<u32, JsError> {
 ///
 /// # Errors
 ///
-/// Returns `JsError` if `owner_did` is empty or the lock is poisoned.
+/// Returns `JsError` if `owner_did` is empty or not a valid DID, or the lock is poisoned.
 #[wasm_bindgen]
 pub fn petname_context_count(owner_did: String) -> Result<u32, JsError> {
     validate_owner_did(&owner_did)?;

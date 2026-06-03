@@ -392,6 +392,9 @@ export interface Bridge {
   petnameResolveContext(ownerDid: string, name: string): string;
   petnameGetForDid(ownerDid: string, targetDid: string): string | null;
   petnameGetForContext(ownerDid: string, contextId: string): string | null;
+  petnameApplyEvent(ownerDid: string, eventJson: string): void;
+  petnameDidCount(ownerDid: string): number;
+  petnameContextCount(ownerDid: string): number;
 
   // Handle Registry (section 22.3.1)
   handleRegister(
@@ -485,6 +488,18 @@ export interface Bridge {
   ): Promise<string>;
   identityLinkAttestations(did: string): string;
   identityRemoveLinkAttestation(did: string, attestationId: string): boolean;
+
+  /**
+   * Removes a DID from this instance's SCP-side identity registry.
+   * Idempotent — does nothing when the DID is not present.
+   */
+  identityRemove(did: string): void;
+
+  /**
+   * Removes a DID from the identity registry if present. Returns `true`
+   * if the identity was found and removed, `false` otherwise.
+   */
+  identityRemoveIfPresent(did: string): boolean;
   identityVerifyLinkAttestation(
     attestationJson: string,
     issuerPublicKeyHex: string,

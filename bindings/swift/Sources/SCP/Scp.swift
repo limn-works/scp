@@ -284,6 +284,11 @@ public extension SCP {
         try await inner.broadcastUnsubscribe(handle: handle, subscriberDid: subscriberDid, rotateKeys: rotateKeys)
     }
 
+    /// Forwards to ``Scp/configureLocalTransport`` on ``inner``.
+    func configureLocalTransport(localDid: String) throws {
+        try inner.configureLocalTransport(localDid: localDid)
+    }
+
     /// Forwards to ``Scp/configureRelayTransport`` on ``inner``.
     func configureRelayTransport(relayUrl: String, localDid: String) async throws {
         try await inner.configureRelayTransport(relayUrl: relayUrl, localDid: localDid)
@@ -412,6 +417,11 @@ public extension SCP {
     /// Forwards to ``Scp/eventLogCheckpoint`` on ``inner``.
     func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: UInt64) async throws -> Checkpoint {
         try await inner.eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
+    }
+
+    /// Forwards to ``Scp/eventLogCheckpointByDid`` on ``inner``.
+    func eventLogCheckpointByDid(handle: ContextHandle, identity: Identity, did: String, epoch: UInt64) async throws -> Checkpoint {
+        try await inner.eventLogCheckpointByDid(handle: handle, identity: identity, did: did, epoch: epoch)
     }
 
     /// Forwards to ``Scp/eventLogQuery`` on ``inner``.
@@ -546,6 +556,29 @@ public extension SCP {
         inner.identityRemoveLinkAttestation(did: did, attestationId: attestationId)
     }
 
+    /// Forwards to ``Scp/identityRemove`` on ``inner``.
+    ///
+    /// Removes the DID from this instance's SCP-side identity registry.
+    /// Idempotent — succeeds silently when the DID is a syntactically valid
+    /// DID not present in the registry.
+    ///
+    /// - Throws: ``ScpError`` when `did` is not a syntactically valid DID,
+    ///   mirroring the PyO3 reference bridge's `identity_remove`.
+    func identityRemove(did: String) throws {
+        try inner.identityRemove(did: did)
+    }
+
+    /// Forwards to ``Scp/identityRemoveIfPresent`` on ``inner``.
+    ///
+    /// Returns `true` if the identity was found and removed, `false` if the
+    /// DID was not in the registry.
+    ///
+    /// - Throws: ``ScpError`` when `did` is not a syntactically valid DID,
+    ///   mirroring the PyO3 reference bridge's `identity_remove_if_present`.
+    func identityRemoveIfPresent(did: String) throws -> Bool {
+        try inner.identityRemoveIfPresent(did: did)
+    }
+
     // `identityResolve`, `identityVerifyDeviceAttestation`, and
     // `identityVerifyLinkAttestation` moved to UniFFI-generated free
     // top-level functions under ADR-048 §1 + §7 Swift bullet. Call them
@@ -648,6 +681,21 @@ public extension SCP {
         try await inner.nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
     }
 
+    /// Forwards to ``Scp/petnameApplyEvent`` on ``inner``.
+    func petnameApplyEvent(ownerDid: String, eventJson: String) throws {
+        try inner.petnameApplyEvent(ownerDid: ownerDid, eventJson: eventJson)
+    }
+
+    /// Forwards to ``Scp/petnameContextCount`` on ``inner``.
+    func petnameContextCount(ownerDid: String) throws -> UInt32 {
+        try inner.petnameContextCount(ownerDid: ownerDid)
+    }
+
+    /// Forwards to ``Scp/petnameDidCount`` on ``inner``.
+    func petnameDidCount(ownerDid: String) throws -> UInt32 {
+        try inner.petnameDidCount(ownerDid: ownerDid)
+    }
+
     /// Forwards to ``Scp/petnameGetForContext`` on ``inner``.
     func petnameGetForContext(ownerDid: String, contextId: String) throws -> String? {
         try inner.petnameGetForContext(ownerDid: ownerDid, contextId: contextId)
@@ -745,6 +793,90 @@ public extension SCP {
     /// Forwards to ``Scp/scpidVerify`` on ``inner``.
     func scpidVerify(responseJson: String, challengeJson: String) throws -> String {
         try inner.scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
+    }
+
+    // MARK: - Bridge credential store (spec §12.11)
+
+    //
+    // Per-instance credential store ops. Each forwards to ``inner`` — the
+    // credentials live in THIS instance's store (ADR-048 §1). The encrypted
+    // credential bytes never cross the FFI boundary; only metadata is
+    // returned for provision/rotate.
+
+    /// Provisions (stores) an encrypted credential for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialProvision`` on ``inner``.
+    func bridgeCredentialProvision(
+        bridgeId: String,
+        credentialType: String,
+        plaintext: Data,
+        bridgeCredentialKey: Data
+    ) throws -> BridgeCredentialResult {
+        try inner.bridgeCredentialProvision(
+            bridgeId: bridgeId,
+            credentialType: credentialType,
+            plaintext: plaintext,
+            bridgeCredentialKey: bridgeCredentialKey
+        )
+    }
+
+    /// Retrieves and decrypts a credential for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialRetrieve`` on ``inner``.
+    func bridgeCredentialRetrieve(
+        bridgeId: String,
+        credentialType: String,
+        bridgeCredentialKey: Data
+    ) throws -> Data {
+        try inner.bridgeCredentialRetrieve(
+            bridgeId: bridgeId,
+            credentialType: credentialType,
+            bridgeCredentialKey: bridgeCredentialKey
+        )
+    }
+
+    /// Rotates (replaces) a credential for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialRotate`` on ``inner``.
+    func bridgeCredentialRotate(
+        bridgeId: String,
+        credentialType: String,
+        newPlaintext: Data,
+        bridgeCredentialKey: Data
+    ) throws -> BridgeCredentialResult {
+        try inner.bridgeCredentialRotate(
+            bridgeId: bridgeId,
+            credentialType: credentialType,
+            newPlaintext: newPlaintext,
+            bridgeCredentialKey: bridgeCredentialKey
+        )
+    }
+
+    /// Revokes all credentials for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialRevoke`` on ``inner``.
+    func bridgeCredentialRevoke(bridgeId: String) throws {
+        try inner.bridgeCredentialRevoke(bridgeId: bridgeId)
+    }
+
+    /// Lists all credential types stored for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialList`` on ``inner``.
+    func bridgeCredentialList(bridgeId: String) throws -> [String] {
+        try inner.bridgeCredentialList(bridgeId: bridgeId)
+    }
+
+    /// Stores a bridge credential key in the custody boundary.
+    /// Forwards to ``Scp/bridgeCredentialStoreKey`` on ``inner``.
+    func bridgeCredentialStoreKey(bridgeId: String, key: Data) throws {
+        try inner.bridgeCredentialStoreKey(bridgeId: bridgeId, key: key)
+    }
+
+    /// Retrieves a bridge credential key from the custody boundary.
+    /// Forwards to ``Scp/bridgeCredentialGetKey`` on ``inner``.
+    func bridgeCredentialGetKey(bridgeId: String) throws -> Data {
+        try inner.bridgeCredentialGetKey(bridgeId: bridgeId)
+    }
+
+    /// Deletes and zeroizes a bridge credential key.
+    /// Forwards to ``Scp/bridgeCredentialDeleteKey`` on ``inner``.
+    func bridgeCredentialDeleteKey(bridgeId: String) throws {
+        try inner.bridgeCredentialDeleteKey(bridgeId: bridgeId)
     }
 
     /// Forwards to ``Scp/setEconomicPolicy`` on ``inner``.

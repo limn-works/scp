@@ -411,6 +411,10 @@ pub struct PyBridgeInstance {
     /// Migrated from a process-global `OnceLock<InMemoryCredentialStore>`
     /// singleton in commit 5. Production deployments should replace this with
     /// a `Storage`-backed implementation when it lands (spec §12.11.2).
+    /// Dropping the `Arc` on shutdown zeroizes any retained bridge credential
+    /// keys via the store's `Zeroizing` fields — there is no explicit clear
+    /// step in `bridge_specific_shutdown`, so the store lives exactly as long
+    /// as its last `Arc` reference.
     pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
 
     /// Most recently connected relay URL (replaces `CONNECTED_RELAY_URL` in
@@ -828,6 +832,46 @@ pub fn init_context_manager_with(
     }
     let persistence = persistence.or_else(|| build_persistence_provider(bi));
     let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+    bi.core.set_context_manager(cm_arc);
+}
+
+/// Initializes the given bridge instance's [`ContextManager`] with a
+/// `LocalTransportProvider`.
+///
+/// Identical to [`init_context_manager`] except the transport provider is
+/// `LocalTransportProvider` (silently succeeds on all send/publish calls)
+/// instead of `NotConfiguredTransportProvider` (rejects everything). Like
+/// production initialization, it installs a real `MlsCryptoProvider` bound to
+/// `local_did` so encryption is exercised end to end against an in-process
+/// loopback transport.
+///
+/// **Must be called before any `context_create` / `context_join` /
+/// `context_import`** — those functions call `init_context_manager` which wins
+/// the `OnceLock` race if called first.
+///
+/// Exposed to Python via `PyScp::configure_local_transport` so that E2E tests
+/// can exercise `context_send` and `broadcast_publish` without a real relay
+/// server.
+///
+/// No-op if the bridge already has a `ContextManager` attached.
+pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_did: &str) {
+    if bi.core.has_context_manager() {
+        tracing::warn!(
+            requested_did = %local_did,
+            "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
+        );
+        return;
+    }
+    let did = local_did.to_owned();
+    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let persistence = build_persistence_provider(bi);
+    let cm_arc = build_context_manager(
+        crypto,
+        Box::new(scp_core::context::LocalTransportProvider),
+        build_event_log_provider(bi),
+        persistence,
+    );
+
     bi.core.set_context_manager(cm_arc);
 }
 

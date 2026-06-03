@@ -34,6 +34,7 @@
 // standalone at runtime — the handle-wrapping helpers call
 // `_fromHandle` statics which are resolved lazily inside the SCP
 // methods via dynamic `import()` calls.
+import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
 import { ValidationError } from "./errors";
 import type { Identity } from "./identity";
@@ -255,6 +256,50 @@ export interface McpAllowlistState {
   readonly unrestricted: boolean;
 }
 
+/**
+ * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
+ *
+ * Implement this to back a DID's key material with a platform keystore (OS
+ * keychain, hardware token, HSM wrapper, etc.). The private key material never
+ * crosses into the native core — every cryptographic operation is delegated
+ * back to your callbacks (ADR-006). Mirrors the Swift/Kotlin (`UniFFI`)
+ * `KeyCustodyProvider` callback interface and the Python `KeyCustodyProvider`
+ * protocol so all SDKs share an identical contract.
+ *
+ * Callbacks are invoked synchronously from the native bridge (marshalled onto
+ * the Node.js event loop). Key identifiers are opaque, numeric-string handles
+ * your implementation assigns in {@link generateKeypair}. Byte values are
+ * passed and returned as `Uint8Array`.
+ *
+ * Only available on the NAPI (Node.js / Bun) backend — the browser/WASM build
+ * does not expose the multi-instance `SCP` class (ADR-034 / ADR-048).
+ */
+export interface KeyCustodyProvider {
+  /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
+  generateKeypair(keyType: string): string;
+  /** Return the 64-byte Ed25519 signature of `message` under `keyId`. */
+  sign(keyId: string, message: Uint8Array): Uint8Array;
+  /** Return the 32 public-key bytes for `keyId`. */
+  getPublicKey(keyId: string): Uint8Array;
+  /** Destroy key material for `keyId`; subsequent operations must fail. */
+  destroyKey(keyId: string): void;
+  /** Return the 32-byte X25519 shared secret with `peerPublic`. */
+  dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
+  /**
+   * Derive a context-scoped pseudonym keypair. Returns
+   * `publicKey(32) || keyIdUtf8` — the 32-byte pseudonym public key
+   * concatenated with the UTF-8 numeric id of the derived signing key.
+   */
+  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array;
+  /**
+   * Return the 32 raw Ed25519 private-seed bytes for `keyId`. Required for
+   * governance vote signing; hardware-bound custody should throw.
+   */
+  exportSigningKeyBytes(keyId: string): Uint8Array;
+  /** Return `"hardware"`, `"software"`, or `"in_memory"`. */
+  custodyType(keyId: string): string;
+}
+
 // ---------------------------------------------------------------------------
 // SCP class
 // ---------------------------------------------------------------------------
@@ -409,6 +454,79 @@ export class SCP {
     return IdentityCls._fromHandle(this, raw);
   }
 
+  /**
+   * Create a DID whose key material lives in a caller-provided custody backend.
+   *
+   * `provider` is any object implementing {@link KeyCustodyProvider} — the
+   * private key material never crosses into the native core (ADR-006). Use this
+   * to back a DID with an OS keychain, hardware token, or HSM wrapper.
+   *
+   * Node.js / Bun only: the browser (WASM) build of `@limn-works/scp-ts` does
+   * not expose the `SCP` class (ADR-034 / ADR-048), so calling `new SCP(...)`
+   * there already throws before this method is reachable.
+   *
+   * @throws ValidationError if the provider is missing required methods, or
+   *   IdentityError if key/DID creation fails inside the provider.
+   */
+  async identityCreateWithCustody(provider: KeyCustodyProvider): Promise<Identity> {
+    // Validate provider completeness up front. The byte-converting adapter
+    // below always supplies all eight closures, so a provider missing a method
+    // would otherwise surface only later as a cryptic native "oneshot canceled"
+    // failure. Checking here makes the returned promise reject early with a
+    // clear, actionable error. Mirrors the eight methods on KeyCustodyProvider.
+    const REQUIRED = [
+      "generateKeypair",
+      "sign",
+      "getPublicKey",
+      "destroyKey",
+      "dhAgree",
+      "derivePseudonym",
+      "exportSigningKeyBytes",
+      "custodyType",
+    ] as const;
+    for (const method of REQUIRED) {
+      if (typeof (provider as unknown as Record<string, unknown>)[method] !== "function") {
+        throw new ValidationError(
+          `KeyCustodyProvider is missing required method: ${method}`,
+          "SCP-VALID-7005",
+        );
+      }
+    }
+    // NAPI marshals each provider method as a ThreadsafeFunction WITHOUT
+    // preserving `this`, and Rust `Vec<u8>` crosses the wire as a JS
+    // `Array<number>` (not `Uint8Array`). The adapter below (a) closes over
+    // `provider` in each arrow so `this` is bound, and (b) converts byte args
+    // inbound (`Array<number>` → `Uint8Array`) and byte returns outbound
+    // (`Uint8Array` → `Array<number>`). Methods with no byte payload
+    // (`generateKeypair`, `destroyKey`, `custodyType`) pass through unchanged.
+    // Additionally, napi-rs delivers a multi-element Rust tuple
+    // (`(String, Vec<u8>)`) to the JS callback as a SINGLE `[keyId, bytes]`
+    // array argument — not as two positional args — so the tuple callbacks
+    // (`sign`, `dhAgree`, `derivePseudonym`) accept one array and destructure
+    // it. Single-value callbacks receive their positional argument normally.
+    const adapter = {
+      generateKeypair: (keyType: string): string => provider.generateKeypair(keyType),
+      // napi-rs delivers a `(String, Vec<u8>)` tuple as a single `[keyId, bytes]`
+      // array arg (not positional), so the two-value callbacks destructure it.
+      sign: ([keyId, message]: [string, number[]]): number[] =>
+        Array.from(provider.sign(keyId, Uint8Array.from(message))),
+      getPublicKey: (keyId: string): number[] => Array.from(provider.getPublicKey(keyId)),
+      destroyKey: (keyId: string): void => provider.destroyKey(keyId),
+      dhAgree: ([keyId, peerPublic]: [string, number[]]): number[] =>
+        Array.from(provider.dhAgree(keyId, Uint8Array.from(peerPublic))),
+      derivePseudonym: ([keyId, contextId]: [string, number[]]): number[] =>
+        Array.from(provider.derivePseudonym(keyId, Uint8Array.from(contextId))),
+      exportSigningKeyBytes: (keyId: string): number[] =>
+        Array.from(provider.exportSigningKeyBytes(keyId)),
+      custodyType: (keyId: string): string => provider.custodyType(keyId),
+    };
+    const raw = await (
+      this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>
+    )(adapter);
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
   async identityLoad(did: string): Promise<Identity> {
     const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
     const { Identity: IdentityCls } = await import("./identity");
@@ -549,6 +667,18 @@ export class SCP {
       ownerDid,
       contextId,
     );
+  }
+
+  petnameApplyEvent(ownerDid: string, eventJson: string): void {
+    (this.#native.petnameApplyEvent as (o: string, e: string) => void)(ownerDid, eventJson);
+  }
+
+  petnameDidCount(ownerDid: string): number {
+    return (this.#native.petnameDidCount as (o: string) => number)(ownerDid);
+  }
+
+  petnameContextCount(ownerDid: string): number {
+    return (this.#native.petnameContextCount as (o: string) => number)(ownerDid);
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2102,6 +2232,115 @@ export class SCP {
         c: string | undefined,
       ) => unknown
     )(bridgeId, platformHandle, bridgeMode, contextId);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Bridge credentials (spec §12.11)
+  //
+  // Per-instance credential store ops. Each routes through `this.#native`
+  // (the NAPI SCP handle) — credentials are isolated to THIS instance's
+  // store (ADR-048 §1). The SCP class is native-only by construction (the
+  // WASM build throws at `new SCP(...)`), so there is no WASM path here;
+  // the credential store lives only in scp-runtime (ADR-034).
+  // ───────────────────────────────────────────────────────────────────────
+
+  /** Provisions (stores) an encrypted credential for a bridge instance. */
+  bridgeCredentialProvision(
+    bridgeId: string,
+    credentialType: string,
+    plaintext: Uint8Array | readonly number[],
+    bridgeCredentialKey: Uint8Array | readonly number[],
+  ): BridgeCredential {
+    // NAPI marshals Rust `Vec<u8>` as a JS `Array<number>`, not `Uint8Array`;
+    // convert byte inputs before crossing the boundary (cf. `broadcastPublish`).
+    const plaintextArray = ArrayBuffer.isView(plaintext)
+      ? Array.from(plaintext as Uint8Array)
+      : (plaintext as readonly number[]);
+    const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
+      ? Array.from(bridgeCredentialKey as Uint8Array)
+      : (bridgeCredentialKey as readonly number[]);
+    return (
+      this.#native.bridgeCredentialProvision as (
+        b: string,
+        t: string,
+        p: readonly number[],
+        k: readonly number[],
+      ) => BridgeCredential
+    )(bridgeId, credentialType, plaintextArray, keyArray);
+  }
+
+  /** Retrieves and decrypts a credential for a bridge instance. */
+  bridgeCredentialRetrieve(
+    bridgeId: string,
+    credentialType: string,
+    bridgeCredentialKey: Uint8Array | readonly number[],
+  ): Uint8Array {
+    const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
+      ? Array.from(bridgeCredentialKey as Uint8Array)
+      : (bridgeCredentialKey as readonly number[]);
+    const raw = (
+      this.#native.bridgeCredentialRetrieve as (
+        b: string,
+        t: string,
+        k: readonly number[],
+      ) => number[]
+    )(bridgeId, credentialType, keyArray);
+    return Uint8Array.from(raw as readonly number[]);
+  }
+
+  /** Rotates (replaces) a credential for a bridge instance. */
+  bridgeCredentialRotate(
+    bridgeId: string,
+    credentialType: string,
+    newPlaintext: Uint8Array | readonly number[],
+    bridgeCredentialKey: Uint8Array | readonly number[],
+  ): BridgeCredential {
+    const newPlaintextArray = ArrayBuffer.isView(newPlaintext)
+      ? Array.from(newPlaintext as Uint8Array)
+      : (newPlaintext as readonly number[]);
+    const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
+      ? Array.from(bridgeCredentialKey as Uint8Array)
+      : (bridgeCredentialKey as readonly number[]);
+    return (
+      this.#native.bridgeCredentialRotate as (
+        b: string,
+        t: string,
+        p: readonly number[],
+        k: readonly number[],
+      ) => BridgeCredential
+    )(bridgeId, credentialType, newPlaintextArray, keyArray);
+  }
+
+  /** Revokes all credentials for a bridge instance. */
+  bridgeCredentialRevoke(bridgeId: string): void {
+    (this.#native.bridgeCredentialRevoke as (b: string) => void)(bridgeId);
+  }
+
+  /** Lists all credential types stored for a bridge instance. */
+  bridgeCredentialList(bridgeId: string): string[] {
+    return (this.#native.bridgeCredentialList as (b: string) => string[])(bridgeId);
+  }
+
+  /** Stores a bridge credential key in the custody boundary. */
+  bridgeCredentialStoreKey(bridgeId: string, key: Uint8Array | readonly number[]): void {
+    const keyArray = ArrayBuffer.isView(key)
+      ? Array.from(key as Uint8Array)
+      : (key as readonly number[]);
+    (this.#native.bridgeCredentialStoreKey as (b: string, k: readonly number[]) => void)(
+      bridgeId,
+      keyArray,
+    );
+  }
+
+  /** Retrieves a bridge credential key from the custody boundary. */
+  bridgeCredentialGetKey(bridgeId: string): Uint8Array {
+    const raw = (this.#native.bridgeCredentialGetKey as (b: string) => number[])(bridgeId);
+    return Uint8Array.from(raw as readonly number[]);
+  }
+
+  /** Deletes and zeroizes a bridge credential key. */
+  bridgeCredentialDeleteKey(bridgeId: string): void {
+    (this.#native.bridgeCredentialDeleteKey as (b: string) => void)(bridgeId);
   }
 
   // ───────────────────────────────────────────────────────────────────────

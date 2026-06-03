@@ -44,6 +44,7 @@ use scp_core::discovery::handles::{
     HandleDeregisterParams, HandleLookupParams, HandleMetadata, HandleRegisterParams,
     HandleRegistry, HandleTypeFilter,
 };
+use scp_core::discovery::petnames::PetnameEvent;
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
 use scp_identity::DID;
 
@@ -342,17 +343,12 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID or target DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID,
+    /// or if the target DID is empty.
     #[pyo3(name = "petname_set")]
     pub fn petname_set(&self, owner_did: &str, target_did: &str, name: &str) -> PyResult<()> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         if target_did.is_empty() {
             return Err(ScpPyError::ValidationError {
                 message: "target_did must not be empty".to_owned(),
@@ -382,17 +378,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID or target DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_remove")]
     pub fn petname_remove(&self, owner_did: &str, target_did: &str) -> PyResult<()> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let mut guard = bi
             .core
             .petname_maps()
@@ -417,7 +407,8 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID or context ID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID,
+    /// or if the context ID is empty.
     #[pyo3(name = "petname_set_context")]
     pub fn petname_set_context(
         &self,
@@ -426,13 +417,7 @@ impl crate::scp::PyScp {
         name: &str,
     ) -> PyResult<()> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         if context_id.is_empty() {
             return Err(ScpPyError::ValidationError {
                 message: "context_id must not be empty".to_owned(),
@@ -462,17 +447,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_remove_context")]
     pub fn petname_remove_context(&self, owner_did: &str, context_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let mut guard = bi
             .core
             .petname_maps()
@@ -503,17 +482,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_resolve_did")]
     pub fn petname_resolve_did(&self, owner_did: &str, name: &str) -> PyResult<Vec<String>> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()
@@ -549,17 +522,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_resolve_context")]
     pub fn petname_resolve_context(&self, owner_did: &str, name: &str) -> PyResult<Vec<String>> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()
@@ -588,7 +555,7 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_get_for_did")]
     pub fn petname_get_for_did(
         &self,
@@ -596,13 +563,7 @@ impl crate::scp::PyScp {
         target_did: &str,
     ) -> PyResult<Option<String>> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()
@@ -631,7 +592,7 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_get_for_context")]
     pub fn petname_get_for_context(
         &self,
@@ -639,13 +600,7 @@ impl crate::scp::PyScp {
         context_id: &str,
     ) -> PyResult<Option<String>> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()
@@ -659,6 +614,121 @@ impl crate::scp::PyScp {
                 .map(str::to_owned)
         });
         Ok(name)
+    }
+
+    /// Applies a serialized petname event to the owner's petname map.
+    ///
+    /// The event JSON must match the `PetnameEvent` serde format (§22.9.2):
+    /// `{"SetPetname": {"did": "...", "name": "..."}}`,
+    /// `{"RemovePetname": {"did": "..."}}`,
+    /// `{"SetContextPetname": {"context_id": "...", "name": "..."}}`, or
+    /// `{"RemoveContextPetname": {"context_id": "..."}}`.
+    ///
+    /// This is the event-driven mutation path matching `PetnameMap::apply_event`.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    /// * `event_json` -- The serialized `PetnameEvent`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID is empty, the JSON is malformed,
+    /// or the petname lock is poisoned.
+    #[pyo3(name = "petname_apply_event")]
+    pub fn petname_apply_event(&self, owner_did: &str, event_json: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        crate::validate::validate_did(owner_did)?;
+        let event: PetnameEvent =
+            serde_json::from_str(event_json).map_err(|e| ScpPyError::ValidationError {
+                message: format!("invalid petname event JSON: {e}"),
+                code: codes::VALID_7115.to_owned(),
+            })?;
+        let mut guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let map = guard.entry(owner_did.to_owned()).or_default();
+        map.apply_event(&event);
+        Ok(())
+    }
+
+    /// Returns the number of DID petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::did_petname_count`.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID is empty, the petname lock is
+    /// poisoned, or the count exceeds `u32::MAX`.
+    #[pyo3(name = "petname_did_count")]
+    pub fn petname_did_count(&self, owner_did: &str) -> PyResult<u32> {
+        let bi = &*self.inner;
+        crate::validate::validate_did(owner_did)?;
+        let guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let count = guard.get(owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::did_petname_count,
+        );
+        u32::try_from(count).map_err(|_| {
+            ScpPyError::ValidationError {
+                message: "petname count exceeds u32::MAX".to_owned(),
+                code: codes::VALID_7116.to_owned(),
+            }
+            .into()
+        })
+    }
+
+    /// Returns the number of context petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::context_petname_count`.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID is empty, the petname lock is
+    /// poisoned, or the count exceeds `u32::MAX`.
+    #[pyo3(name = "petname_context_count")]
+    pub fn petname_context_count(&self, owner_did: &str) -> PyResult<u32> {
+        let bi = &*self.inner;
+        crate::validate::validate_did(owner_did)?;
+        let guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let count = guard.get(owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::context_petname_count,
+        );
+        u32::try_from(count).map_err(|_| {
+            ScpPyError::ValidationError {
+                message: "petname count exceeds u32::MAX".to_owned(),
+                code: codes::VALID_7116.to_owned(),
+            }
+            .into()
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1432,10 +1502,80 @@ mod tests {
     }
 
     #[test]
+    fn petname_apply_event_mutates_state() {
+        let owner = "did:dht:zTestOwnerApply";
+        reset_petname_map_for(owner);
+        let scp = default_scp();
+        let event = r#"{"SetPetname": {"did": "did:dht:zAlice", "name": "alice"}}"#;
+        scp.petname_apply_event(owner, event).unwrap();
+
+        let dids = scp.petname_resolve_did(owner, "alice").unwrap();
+        assert_eq!(dids, vec!["did:dht:zAlice".to_owned()]);
+        assert_eq!(scp.petname_did_count(owner).unwrap(), 1);
+
+        let remove = r#"{"RemovePetname": {"did": "did:dht:zAlice"}}"#;
+        scp.petname_apply_event(owner, remove).unwrap();
+        assert!(scp.petname_resolve_did(owner, "alice").unwrap().is_empty());
+        assert_eq!(scp.petname_did_count(owner).unwrap(), 0);
+    }
+
+    #[test]
+    fn petname_apply_event_rejects_malformed_json() {
+        let scp = default_scp();
+        assert!(
+            scp.petname_apply_event("did:dht:zOwner", "not json")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn petname_did_and_context_counts_track() {
+        let owner = "did:dht:zTestOwnerCounts";
+        reset_petname_map_for(owner);
+        let scp = default_scp();
+        assert_eq!(scp.petname_did_count(owner).unwrap(), 0);
+        assert_eq!(scp.petname_context_count(owner).unwrap(), 0);
+
+        scp.petname_set(owner, "did:dht:zA", "a").unwrap();
+        scp.petname_set(owner, "did:dht:zB", "b").unwrap();
+        scp.petname_set_context(owner, "ctx-1", "one").unwrap();
+        assert_eq!(scp.petname_did_count(owner).unwrap(), 2);
+        assert_eq!(scp.petname_context_count(owner).unwrap(), 1);
+
+        scp.petname_remove(owner, "did:dht:zA").unwrap();
+        assert_eq!(scp.petname_did_count(owner).unwrap(), 1);
+    }
+
+    #[test]
+    fn petname_counts_empty_owner_errors() {
+        let scp = default_scp();
+        assert!(scp.petname_did_count("").is_err());
+        assert!(scp.petname_context_count("").is_err());
+        assert!(scp.petname_apply_event("", "{}").is_err());
+    }
+
+    #[test]
     fn petname_empty_owner_errors() {
         let scp = default_scp();
         assert!(scp.petname_set("", "did:dht:z1", "test").is_err());
         assert!(scp.petname_resolve_did("", "test").is_err());
+    }
+
+    #[test]
+    fn petname_malformed_owner_rejected() {
+        // A non-empty owner that is not a syntactically valid DID must be
+        // rejected by the pre-existing petname ops, matching the strict
+        // `validate_did` gate the WASM bridge and the §4.7 ops already enforce.
+        let scp = default_scp();
+        let bad = "not-a-did";
+        assert!(scp.petname_set(bad, "did:dht:z1", "test").is_err());
+        assert!(scp.petname_remove(bad, "did:dht:z1").is_err());
+        assert!(scp.petname_set_context(bad, "ctx-1", "work").is_err());
+        assert!(scp.petname_remove_context(bad, "ctx-1").is_err());
+        assert!(scp.petname_resolve_did(bad, "alice").is_err());
+        assert!(scp.petname_resolve_context(bad, "work").is_err());
+        assert!(scp.petname_get_for_did(bad, "did:dht:z1").is_err());
+        assert!(scp.petname_get_for_context(bad, "ctx-1").is_err());
     }
 
     // -- Handle registry bridge tests ----------------------------------------

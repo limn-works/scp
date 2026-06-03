@@ -661,22 +661,29 @@ fn event_log_verify_impl(
 /// found in the registry.
 ///
 /// See ADR-011 acceptance criterion 8 and ADR-030.
+///
+/// The `did` parameter is the signing member's DID: it drives both the
+/// identity-registry lookup (for key material) and the recorded `sender_did`.
+/// Both public entry points (`event_log_checkpoint`, which takes the identity's
+/// own DID, and `event_log_checkpoint_by_did`, which takes a member DID) share
+/// this implementation — they are distinct public surface but identical in
+/// behavior, mirroring the WASM bridge's single `checkpoint_promise` helper.
 fn event_log_checkpoint_impl(
     bi: &PyBridgeInstance,
     context_id: &str,
-    identity_did: &str,
+    did: &str,
     epoch: u64,
 ) -> PyResult<PyCheckpoint> {
     validate::validate_context_id(context_id)?;
-    validate::validate_did(identity_did)?;
+    validate::validate_did(did)?;
     let rt = crate::runtime()?;
 
     let context_id_owned = context_id.to_owned();
-    let identity_did_owned = identity_did.to_owned();
+    let did_owned = did.to_owned();
 
-    let sender_did = scp_identity::DID(identity_did_owned.clone());
+    let sender_did = scp_identity::DID(did_owned.clone());
 
-    let checkpoint = crate::runtime::with_identity(bi, &identity_did_owned, |entry| {
+    let checkpoint = crate::runtime::with_identity(bi, &did_owned, |entry| {
         crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {
             let result = rt.block_on(async {
                 let signer = scp_core::event_log::KeyCustodySigner {
@@ -836,6 +843,42 @@ impl crate::scp::PyScp {
     ) -> PyResult<PyCheckpoint> {
         let bi = &*self.inner;
         event_log_checkpoint_impl(bi, context_id, identity_did, epoch)
+    }
+
+    /// Generates a signed consistency checkpoint scoped to a member DID.
+    ///
+    /// Looks the signing identity up from this instance's identity registry by
+    /// DID string, then signs a snapshot of the context event log's Merkle root
+    /// and event count. The DID drives both the key-material lookup and the
+    /// recorded `sender_did`. This is the canonical "checkpoint by DID" entry
+    /// point, mirroring the NAPI bridge's `event_log_checkpoint_by_did`.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The ID of the context whose event log to checkpoint.
+    /// * `did` -- The DID of the member generating the checkpoint. Must be
+    ///   present in this instance's identity registry.
+    /// * `epoch` -- The current MLS epoch (pass 0 for Broadcast contexts).
+    ///
+    /// # Returns
+    ///
+    /// A [`PyCheckpoint`] containing the signed checkpoint data.
+    ///
+    /// # Errors
+    ///
+    /// Raises `IdentityError` if `did` is not in the identity registry, or
+    /// `ContextError` if the context is not registered or signing fails.
+    ///
+    /// See ADR-011 acceptance criterion 8 and ADR-030.
+    #[pyo3(name = "event_log_checkpoint_by_did")]
+    pub fn event_log_checkpoint_by_did(
+        &self,
+        context_id: &str,
+        did: &str,
+        epoch: u64,
+    ) -> PyResult<PyCheckpoint> {
+        let bi = &*self.inner;
+        event_log_checkpoint_impl(bi, context_id, did, epoch)
     }
 }
 

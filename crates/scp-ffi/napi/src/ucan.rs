@@ -358,7 +358,7 @@ pub(crate) async fn ucan_mint_on(
         // Sign the token using the real InMemoryKeyCustody via scp-core.
         // napi-rs async functions already run on the tokio runtime, so we
         // can await directly without spawning a separate task.
-        let token = mint_ucan(&params, &custody.0, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, custody.as_ref(), &scp_primitives::SystemClock)
             .await
             .map_err(|e| {
                 napi::Error::from(ScpNapiError::Permission {
@@ -516,7 +516,12 @@ pub(crate) async fn ucan_delegate_on(
             let rt_handle = tokio::runtime::Handle::current();
             let result = tokio::task::block_in_place(|| {
                 rt_handle.block_on(async {
-                    delegate_ucan(&params, &entry.custody.0, &scp_primitives::SystemClock).await
+                    delegate_ucan(
+                        &params,
+                        entry.custody.as_ref(),
+                        &scp_primitives::SystemClock,
+                    )
+                    .await
                 })
             });
 
@@ -1086,8 +1091,12 @@ mod tests {
         use scp_platform::testing::InMemoryKeyCustody;
 
         // Create two distinct identities (creator and delegator).
-        let custody_a = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
-        let custody_b = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
+        let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
         let pre_rotation_custody_a =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let pre_rotation_custody_b =
@@ -1102,10 +1111,10 @@ mod tests {
             .unwrap();
 
         let (identity_a, doc_a, pre_rotation_handle_a) = rt
-            .block_on(dht_a.create(&custody_a.0, pre_rotation_custody_a.as_ref()))
+            .block_on(dht_a.create(&*custody_a, pre_rotation_custody_a.as_ref()))
             .unwrap();
         let (identity_b, doc_b, pre_rotation_handle_b) = rt
-            .block_on(dht_b.create(&custody_b.0, pre_rotation_custody_b.as_ref()))
+            .block_on(dht_b.create(&*custody_b, pre_rotation_custody_b.as_ref()))
             .unwrap();
 
         // Verify different DIDs were generated.
@@ -1198,7 +1207,9 @@ mod tests {
         use scp_identity::DidMethod;
         use scp_platform::testing::InMemoryKeyCustody;
 
-        let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::new();
@@ -1209,7 +1220,7 @@ mod tests {
             .unwrap();
 
         let (identity, doc, pre_rotation_handle) = rt
-            .block_on(dht.create(&custody.0, pre_rotation_custody.as_ref()))
+            .block_on(dht.create(&*custody, pre_rotation_custody.as_ref()))
             .unwrap();
         let did = identity.did.clone();
 
@@ -1255,7 +1266,9 @@ mod tests {
         use scp_identity::DidMethod;
         use scp_platform::testing::InMemoryKeyCustody;
 
-        let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::new();
@@ -1266,7 +1279,7 @@ mod tests {
             .unwrap();
 
         let (identity, doc, pre_rotation_handle) = rt
-            .block_on(dht.create(&custody.0, pre_rotation_custody.as_ref()))
+            .block_on(dht.create(&*custody, pre_rotation_custody.as_ref()))
             .unwrap();
         let did = identity.did.clone();
 

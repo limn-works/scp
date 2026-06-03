@@ -2052,6 +2052,48 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String) throws  -> ShadowIdentityResult
     
     /**
+     * Deletes and zeroizes a bridge credential key (spec §12.11).
+     */
+    func bridgeCredentialDeleteKey(bridgeId: String) throws 
+    
+    /**
+     * Retrieves a bridge credential key from the custody boundary (spec §12.11).
+     */
+    func bridgeCredentialGetKey(bridgeId: String) throws  -> Data
+    
+    /**
+     * Lists all credential types stored for a bridge instance (spec §12.11).
+     */
+    func bridgeCredentialList(bridgeId: String) throws  -> [String]
+    
+    /**
+     * Provisions (stores) an encrypted credential for a bridge instance
+     * (spec §12.11). Routes through `&self.inner` — credentials live in
+     * THIS instance's credential store (ADR-048 §1).
+     */
+    func bridgeCredentialProvision(bridgeId: String, credentialType: String, plaintext: Data, bridgeCredentialKey: Data) throws  -> BridgeCredentialResult
+    
+    /**
+     * Retrieves and decrypts a credential for a bridge instance (spec §12.11).
+     */
+    func bridgeCredentialRetrieve(bridgeId: String, credentialType: String, bridgeCredentialKey: Data) throws  -> Data
+    
+    /**
+     * Revokes all credentials for a bridge instance (spec §12.11).
+     */
+    func bridgeCredentialRevoke(bridgeId: String) throws 
+    
+    /**
+     * Rotates (replaces) a credential for a bridge instance (spec §12.11).
+     */
+    func bridgeCredentialRotate(bridgeId: String, credentialType: String, newPlaintext: Data, bridgeCredentialKey: Data) throws  -> BridgeCredentialResult
+    
+    /**
+     * Stores a bridge credential key in the custody boundary (spec §12.11).
+     */
+    func bridgeCredentialStoreKey(bridgeId: String, key: Data) throws 
+    
+    /**
      * Per-instance equivalent of the free-function `broadcast_admission`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
@@ -2145,6 +2187,21 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `instance_id` does not match this `SCP`'s.
      */
     func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `configure_local_transport`.
+     *
+     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+     * an in-process loopback `LocalTransportProvider` on this instance's
+     * `ContextManager`. Unlike `configure_relay_transport`, this performs no
+     * network I/O — it wires test infrastructure so `context_send` and
+     * `broadcast_publish` succeed (encryption included) without a real relay.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if `local_did` fails DID validation.
+     */
+    func configureLocalTransport(localDid: String) throws 
     
     /**
      * Per-instance equivalent of the free-function `configure_relay_transport`.
@@ -2354,6 +2411,22 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: UInt64) async throws  -> Checkpoint
     
     /**
+     * Generates a signed consistency checkpoint scoped to a member DID.
+     *
+     * Signs with the supplied `identity`'s key material and records `did` as
+     * the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
+     * `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
+     * handle is passed explicitly for key material while `did` names the
+     * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom). The
+     * `did` is validated for well-formedness and MUST equal the supplied
+     * identity's own DID — the recorded signer is always the actual signer.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func eventLogCheckpointByDid(handle: ContextHandle, identity: Identity, did: String, epoch: UInt64) async throws  -> Checkpoint
+    
+    /**
      * Per-instance equivalent of the free-function `event_log_query`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
@@ -2559,6 +2632,43 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityMigrate(identity: Identity) async throws  -> Identity
     
     /**
+     * Removes a DID from this instance's SCP-side identity registry.
+     *
+     * Drops the retained identity state — the custody provider / key
+     * handle and any link attestations — for `did` on `&*self.inner`.
+     * Idempotent: succeeds silently when the DID is not in the registry,
+     * matching the NAPI bridge's `identity_remove` semantics (where a
+     * single registry entry bundles custody and attestations).
+     *
+     * The DID document published to the DHT is unaffected; this only
+     * releases the bridge's in-memory state.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically
+     * valid DID, mirroring the `PyO3` reference bridge's `identity_remove`.
+     */
+    func identityRemove(did: String) throws 
+    
+    /**
+     * Removes a DID from this instance's SCP-side identity registry if
+     * present, reporting whether the identity was removed.
+     *
+     * Returns `true` if the identity was found in the custody registry and
+     * removed, `false` if the DID was not present. Any link attestations
+     * for the DID are dropped alongside the identity. Companion to
+     * [`Scp::identity_remove`] (which is unconditional), matching the NAPI
+     * bridge's `identity_remove_if_present` semantics.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically
+     * valid DID, mirroring the `PyO3` reference bridge's
+     * `identity_remove_if_present`.
+     */
+    func identityRemoveIfPresent(did: String) throws  -> Bool
+    
+    /**
      * Per-instance equivalent of the free-function
      * `identity_remove_link_attestation`.
      *
@@ -2692,6 +2802,28 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * is supplied, it must have been minted by this `Scp`.
      */
     func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?) async throws  -> NodeHandle
+    
+    /**
+     * Applies a serialized petname event to the owner's petname map.
+     *
+     * The event JSON must match the `PetnameEvent` serde format (§22.9.2).
+     * This is the event-driven mutation path matching `PetnameMap::apply_event`.
+     */
+    func petnameApplyEvent(ownerDid: String, eventJson: String) throws 
+    
+    /**
+     * Returns the number of context petnames for an owner.
+     *
+     * Mirrors `PetnameMap::context_petname_count`.
+     */
+    func petnameContextCount(ownerDid: String) throws  -> UInt32
+    
+    /**
+     * Returns the number of DID petnames for an owner.
+     *
+     * Mirrors `PetnameMap::did_petname_count`.
+     */
+    func petnameDidCount(ownerDid: String) throws  -> UInt32
     
     /**
      * Per-instance equivalent of the free-function `petname_get_for_context`.
@@ -3366,6 +3498,102 @@ open func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMod
 }
     
     /**
+     * Deletes and zeroizes a bridge credential key (spec §12.11).
+     */
+open func bridgeCredentialDeleteKey(bridgeId: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_delete_key(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),$0
+    )
+}
+}
+    
+    /**
+     * Retrieves a bridge credential key from the custody boundary (spec §12.11).
+     */
+open func bridgeCredentialGetKey(bridgeId: String)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_get_key(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),$0
+    )
+})
+}
+    
+    /**
+     * Lists all credential types stored for a bridge instance (spec §12.11).
+     */
+open func bridgeCredentialList(bridgeId: String)throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_list(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),$0
+    )
+})
+}
+    
+    /**
+     * Provisions (stores) an encrypted credential for a bridge instance
+     * (spec §12.11). Routes through `&self.inner` — credentials live in
+     * THIS instance's credential store (ADR-048 §1).
+     */
+open func bridgeCredentialProvision(bridgeId: String, credentialType: String, plaintext: Data, bridgeCredentialKey: Data)throws  -> BridgeCredentialResult  {
+    return try  FfiConverterTypeBridgeCredentialResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_provision(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterString.lower(credentialType),
+        FfiConverterData.lower(plaintext),
+        FfiConverterData.lower(bridgeCredentialKey),$0
+    )
+})
+}
+    
+    /**
+     * Retrieves and decrypts a credential for a bridge instance (spec §12.11).
+     */
+open func bridgeCredentialRetrieve(bridgeId: String, credentialType: String, bridgeCredentialKey: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_retrieve(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterString.lower(credentialType),
+        FfiConverterData.lower(bridgeCredentialKey),$0
+    )
+})
+}
+    
+    /**
+     * Revokes all credentials for a bridge instance (spec §12.11).
+     */
+open func bridgeCredentialRevoke(bridgeId: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_revoke(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),$0
+    )
+}
+}
+    
+    /**
+     * Rotates (replaces) a credential for a bridge instance (spec §12.11).
+     */
+open func bridgeCredentialRotate(bridgeId: String, credentialType: String, newPlaintext: Data, bridgeCredentialKey: Data)throws  -> BridgeCredentialResult  {
+    return try  FfiConverterTypeBridgeCredentialResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_rotate(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterString.lower(credentialType),
+        FfiConverterData.lower(newPlaintext),
+        FfiConverterData.lower(bridgeCredentialKey),$0
+    )
+})
+}
+    
+    /**
+     * Stores a bridge credential key in the custody boundary (spec §12.11).
+     */
+open func bridgeCredentialStoreKey(bridgeId: String, key: Data)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_store_key(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterData.lower(key),$0
+    )
+}
+}
+    
+    /**
      * Per-instance equivalent of the free-function `broadcast_admission`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
@@ -3626,6 +3854,26 @@ open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rot
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `configure_local_transport`.
+     *
+     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+     * an in-process loopback `LocalTransportProvider` on this instance's
+     * `ContextManager`. Unlike `configure_relay_transport`, this performs no
+     * network I/O — it wires test infrastructure so `context_send` and
+     * `broadcast_publish` succeed (encryption included) without a real relay.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if `local_did` fails DID validation.
+     */
+open func configureLocalTransport(localDid: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_configure_local_transport(self.uniffiClonePointer(),
+        FfiConverterString.lower(localDid),$0
+    )
+}
 }
     
     /**
@@ -4186,6 +4434,37 @@ open func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: U
 }
     
     /**
+     * Generates a signed consistency checkpoint scoped to a member DID.
+     *
+     * Signs with the supplied `identity`'s key material and records `did` as
+     * the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
+     * `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
+     * handle is passed explicitly for key material while `did` names the
+     * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom). The
+     * `did` is validated for well-formedness and MUST equal the supplied
+     * identity's own DID — the recorded signer is always the actual signer.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func eventLogCheckpointByDid(handle: ContextHandle, identity: Identity, did: String, epoch: UInt64)async throws  -> Checkpoint  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_event_log_checkpoint_by_did(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(did),FfiConverterUInt64.lower(epoch)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCheckpoint_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function `event_log_query`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
@@ -4701,6 +4980,54 @@ open func identityMigrate(identity: Identity)async throws  -> Identity  {
 }
     
     /**
+     * Removes a DID from this instance's SCP-side identity registry.
+     *
+     * Drops the retained identity state — the custody provider / key
+     * handle and any link attestations — for `did` on `&*self.inner`.
+     * Idempotent: succeeds silently when the DID is not in the registry,
+     * matching the NAPI bridge's `identity_remove` semantics (where a
+     * single registry entry bundles custody and attestations).
+     *
+     * The DID document published to the DHT is unaffected; this only
+     * releases the bridge's in-memory state.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically
+     * valid DID, mirroring the `PyO3` reference bridge's `identity_remove`.
+     */
+open func identityRemove(did: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_identity_remove(self.uniffiClonePointer(),
+        FfiConverterString.lower(did),$0
+    )
+}
+}
+    
+    /**
+     * Removes a DID from this instance's SCP-side identity registry if
+     * present, reporting whether the identity was removed.
+     *
+     * Returns `true` if the identity was found in the custody registry and
+     * removed, `false` if the DID was not present. Any link attestations
+     * for the DID are dropped alongside the identity. Companion to
+     * [`Scp::identity_remove`] (which is unconditional), matching the NAPI
+     * bridge's `identity_remove_if_present` semantics.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically
+     * valid DID, mirroring the `PyO3` reference bridge's
+     * `identity_remove_if_present`.
+     */
+open func identityRemoveIfPresent(did: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_identity_remove_if_present(self.uniffiClonePointer(),
+        FfiConverterString.lower(did),$0
+    )
+})
+}
+    
+    /**
      * Per-instance equivalent of the free-function
      * `identity_remove_link_attestation`.
      *
@@ -5029,6 +5356,46 @@ open func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: Strin
             liftFunc: FfiConverterTypeNodeHandle_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Applies a serialized petname event to the owner's petname map.
+     *
+     * The event JSON must match the `PetnameEvent` serde format (§22.9.2).
+     * This is the event-driven mutation path matching `PetnameMap::apply_event`.
+     */
+open func petnameApplyEvent(ownerDid: String, eventJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_apply_event(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(eventJson),$0
+    )
+}
+}
+    
+    /**
+     * Returns the number of context petnames for an owner.
+     *
+     * Mirrors `PetnameMap::context_petname_count`.
+     */
+open func petnameContextCount(ownerDid: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_context_count(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),$0
+    )
+})
+}
+    
+    /**
+     * Returns the number of DID petnames for an owner.
+     *
+     * Mirrors `PetnameMap::did_petname_count`.
+     */
+open func petnameDidCount(ownerDid: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_did_count(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),$0
+    )
+})
 }
     
     /**
@@ -6845,6 +7212,114 @@ public func FfiConverterTypeBatchPublishResult_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeBatchPublishResult_lower(_ value: BatchPublishResult) -> RustBuffer {
     return FfiConverterTypeBatchPublishResult.lower(value)
+}
+
+
+/**
+ * Bridge credential metadata result.
+ *
+ * Returned by `bridge_credential_provision` and `bridge_credential_rotate`.
+ * Mirrors the `PyO3` dict (`bridge_id`, `credential_type`, `created_at`).
+ * The encrypted credential bytes never cross the FFI boundary — only
+ * non-secret metadata.
+ *
+ * See spec section 12.11 (Credential Lifecycle) and ADR-023.
+ */
+public struct BridgeCredentialResult {
+    /**
+     * The bridge instance this credential belongs to.
+     */
+    public var bridgeId: String
+    /**
+     * The credential type string (e.g. `"ApiKey"`, `"OAuthAccessToken"`,
+     * `"Custom:<name>"`).
+     */
+    public var credentialType: String
+    /**
+     * Unix timestamp (seconds) when the credential was created.
+     */
+    public var createdAt: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The bridge instance this credential belongs to.
+         */bridgeId: String, 
+        /**
+         * The credential type string (e.g. `"ApiKey"`, `"OAuthAccessToken"`,
+         * `"Custom:<name>"`).
+         */credentialType: String, 
+        /**
+         * Unix timestamp (seconds) when the credential was created.
+         */createdAt: UInt64) {
+        self.bridgeId = bridgeId
+        self.credentialType = credentialType
+        self.createdAt = createdAt
+    }
+}
+
+#if compiler(>=6)
+extension BridgeCredentialResult: Sendable {}
+#endif
+
+
+extension BridgeCredentialResult: Equatable, Hashable {
+    public static func ==(lhs: BridgeCredentialResult, rhs: BridgeCredentialResult) -> Bool {
+        if lhs.bridgeId != rhs.bridgeId {
+            return false
+        }
+        if lhs.credentialType != rhs.credentialType {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(bridgeId)
+        hasher.combine(credentialType)
+        hasher.combine(createdAt)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBridgeCredentialResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BridgeCredentialResult {
+        return
+            try BridgeCredentialResult(
+                bridgeId: FfiConverterString.read(from: &buf), 
+                credentialType: FfiConverterString.read(from: &buf), 
+                createdAt: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BridgeCredentialResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.bridgeId, into: &buf)
+        FfiConverterString.write(value.credentialType, into: &buf)
+        FfiConverterUInt64.write(value.createdAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBridgeCredentialResult_lift(_ buf: RustBuffer) throws -> BridgeCredentialResult {
+    return try FfiConverterTypeBridgeCredentialResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBridgeCredentialResult_lower(_ value: BridgeCredentialResult) -> RustBuffer {
+    return FfiConverterTypeBridgeCredentialResult.lower(value)
 }
 
 
@@ -14332,6 +14807,30 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_create_shadow() != 8590) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_delete_key() != 40862) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_get_key() != 4810) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_list() != 16239) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_provision() != 36927) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_retrieve() != 15897) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_revoke() != 22652) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_rotate() != 19177) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_store_key() != 48091) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_admission() != 47745) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14363,6 +14862,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 48267) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 42668) {
@@ -14443,6 +14945,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint() != 31004) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint_by_did() != 25225) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 26119) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14515,6 +15020,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove() != 20795) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_if_present() != 1563) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 51771) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14564,6 +15075,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 59051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_apply_event() != 32223) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_context_count() != 27524) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_did_count() != 49985) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_get_for_context() != 8149) {

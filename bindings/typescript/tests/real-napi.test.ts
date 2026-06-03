@@ -268,6 +268,38 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(migrated.did).not.toBe(handle.did);
     });
 
+    test("removes an existing identity from the registry", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      // `identityRemove` is void and idempotent; after it runs the DID is
+      // no longer present, so `identityRemoveIfPresent` reports false.
+      napi.identityRemove(handle.did);
+      expect(napi.identityRemoveIfPresent(handle.did)).toBe(false);
+    });
+
+    test("identityRemoveIfPresent reports true then false", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      // First call finds the identity and removes it.
+      expect(napi.identityRemoveIfPresent(handle.did)).toBe(true);
+      // Second call finds nothing.
+      expect(napi.identityRemoveIfPresent(handle.did)).toBe(false);
+    });
+
+    test("removing a non-existent identity is silent", () => {
+      const missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest";
+      // No throw; idempotent no-op matching the cross-bridge contract.
+      expect(() => napi.identityRemove(missing)).not.toThrow();
+      expect(napi.identityRemoveIfPresent(missing)).toBe(false);
+    });
+
+    test("removing a malformed DID is rejected", () => {
+      // Both removal ops gate on the shared `validate_did` validator before
+      // touching the registry, matching the PyO3 reference bridge. A
+      // syntactically invalid DID throws rather than silently no-op'ing.
+      const bad = "not-a-did";
+      expect(() => napi.identityRemove(bad)).toThrow();
+      expect(() => napi.identityRemoveIfPresent(bad)).toThrow();
+    });
+
     test("generates and verifies a device attestation", async () => {
       const handle = await napi.identityCreate("in_memory");
       const token = await napi.identityAttestDevice(handle.did);
@@ -654,6 +686,13 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(checkpoint.root).toBeTruthy();
       expect(typeof checkpoint.eventCount).toBe("number");
       expect(typeof checkpoint.timestamp).toBe("number");
+      // The native (NAPI) bridge signs the checkpoint in-process and the SDK
+      // surfaces the Ed25519 signature (hex). On native, `signature` is present
+      // and `signingPayloadHash` is absent (the inverse holds for WASM).
+      expect(typeof checkpoint.signature).toBe("string");
+      expect(checkpoint.signature).toMatch(/^[0-9a-f]+$/);
+      expect((checkpoint.signature as string).length).toBeGreaterThan(0);
+      expect(checkpoint.signingPayloadHash).toBeUndefined();
     });
   });
 
@@ -938,6 +977,67 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         const reg = addon.bridgeRegister(`ctx-${mode}`, "did:key:op", "did:key:gov", "slack", mode);
         expect(reg.status).toBe("active");
       }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 9b. Bridge credential store (spec §12.11) — per-instance SCP methods
+  // ---------------------------------------------------------------------------
+
+  describe("Bridge credentials (real NAPI)", () => {
+    const key = new Uint8Array(32).fill(7);
+
+    test("provision -> retrieve -> rotate -> revoke lifecycle", () => {
+      const bridgeId = "bridge-cred-ts-001";
+
+      const provisioned = scpInstance.bridgeCredentialProvision(
+        bridgeId,
+        "ApiKey",
+        new TextEncoder().encode("first-secret"),
+        key,
+      );
+      expect(provisioned.bridgeId).toBe(bridgeId);
+      expect(provisioned.credentialType).toBe("ApiKey");
+      expect(typeof provisioned.createdAt).toBe("number");
+
+      const retrieved = scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key);
+      expect(new TextDecoder().decode(retrieved)).toBe("first-secret");
+
+      scpInstance.bridgeCredentialRotate(
+        bridgeId,
+        "ApiKey",
+        new TextEncoder().encode("second-secret"),
+        key,
+      );
+      const rotated = scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key);
+      expect(new TextDecoder().decode(rotated)).toBe("second-secret");
+
+      expect(scpInstance.bridgeCredentialList(bridgeId)).toEqual(["ApiKey"]);
+
+      scpInstance.bridgeCredentialRevoke(bridgeId);
+      expect(() => scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key)).toThrow();
+    });
+
+    test("credential key store -> get -> delete lifecycle", () => {
+      const bridgeId = "bridge-cred-ts-002";
+
+      scpInstance.bridgeCredentialStoreKey(bridgeId, key);
+      const got = scpInstance.bridgeCredentialGetKey(bridgeId);
+      expect(Array.from(got)).toEqual(Array.from(key));
+
+      scpInstance.bridgeCredentialDeleteKey(bridgeId);
+      expect(() => scpInstance.bridgeCredentialGetKey(bridgeId)).toThrow();
+    });
+
+    test("rejects a non-32-byte credential key", () => {
+      expect(() =>
+        scpInstance.bridgeCredentialProvision(
+          "bridge-cred-ts-003",
+          "ApiKey",
+          new TextEncoder().encode("secret"),
+          new Uint8Array(16),
+        ),
+      ).toThrow();
     });
   });
 

@@ -50,8 +50,6 @@ use scp_identity::{
 };
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
-#[cfg(feature = "allow_in_memory_custody")]
-use scp_platform::traits::KeyCustody;
 use scp_primitives::Clock;
 #[cfg(feature = "allow_in_memory_custody")]
 use std::fmt;
@@ -140,8 +138,9 @@ pub(crate) fn ensure_did_resolver_initialized_on(bi: &crate::runtime::NapiBridge
 pub(crate) async fn publish_to_shared_dht_for(
     identity: &ScpIdentity,
     document: &DidDocument,
-    custody: &OpaqueInMemoryKeyCustody,
+    custody: &crate::custody::NapiKeyCustody,
 ) {
+    use scp_platform::traits::KeyCustody as _;
     let Some(dht_client) = crate::runtime::shared_dht_client() else {
         return; // Resolver not initialized; nothing to seed.
     };
@@ -168,7 +167,7 @@ pub(crate) async fn publish_to_shared_dht_for(
     // Build BEP44 signable payload and sign with the identity key.
     let seq: u64 = 1;
     let signable = scp_identity::dht::bep44_signable(value, seq);
-    let sig_bytes = match custody.0.sign(&identity.identity_key, &signable).await {
+    let sig_bytes = match custody.sign(&identity.identity_key, &signable).await {
         Ok(sig) => sig.into_bytes(),
         Err(e) => {
             tracing::warn!("publish_to_shared_dht: signing failed: {e}");
@@ -206,19 +205,21 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
     }
 }
 
-/// Creates a `DidDht` instance with a signing function derived from the
-/// custody held inside an [`OpaqueInMemoryKeyCustody`].
+/// Creates a `DidDht` instance with a signing function derived from a
+/// [`NapiKeyCustody`](crate::custody::NapiKeyCustody).
 ///
 /// `DidDht::new()` creates an instance with `sign_fn: None`, which causes
 /// all DHT publish operations (used by `add_agent_key`, `rotate_agent_key`,
 /// `remove_agent_key`, `rotate_active_key`) to fail. This helper constructs
 /// a properly configured instance with the signing function wired to the
-/// custody's key material.
+/// custody's key material — dispatching through the enum so it works for both
+/// in-memory and callback custody.
 #[cfg(feature = "allow_in_memory_custody")]
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer(
-    custody: &Arc<OpaqueInMemoryKeyCustody>,
+    custody: &Arc<crate::custody::NapiKeyCustody>,
 ) -> DidDht<InMemoryDhtClient, scp_identity::cache::SystemClock> {
+    use scp_platform::traits::KeyCustody as _;
     let custody_clone = Arc::clone(custody);
     let sign_fn: Arc<
         dyn Fn(
@@ -232,10 +233,10 @@ fn make_dht_with_signer(
         let kc = Arc::clone(&custody_clone);
         Box::pin(async move {
             let handle = scp_platform::traits::KeyHandle::new(key_id);
-            let sig =
-                kc.0.sign(&handle, &data)
-                    .await
-                    .map_err(IdentityError::Platform)?;
+            let sig = kc
+                .sign(&handle, &data)
+                .await
+                .map_err(IdentityError::Platform)?;
             Ok(sig.into_bytes())
         })
     });
@@ -261,11 +262,16 @@ pub(crate) struct NapiIdentityInner {
     /// Holds the `KeyHandle`s into `in_memory_custody`. Must outlive any
     /// signing or key-rotation operation on this handle.
     pub(crate) scp_identity: Option<ScpIdentity>,
-    /// Retained `InMemoryKeyCustody` for in-memory custody paths.
+    /// Retained custody backing this handle's key material.
     ///
-    /// Key material lives here. Dropping this destroys all private keys.
+    /// Shares the same `Arc<NapiKeyCustody>` as the identity registry entry
+    /// so handle-based crypto (event-log checkpoints, SCPID signing) and
+    /// registry-based crypto operate on identical key material. Enum-dispatched
+    /// so it backs either an in-memory test key or a callback custody. Dropping
+    /// the last `Arc` destroys all in-memory private keys. `None` for
+    /// externally loaded identities (DID-string-only handles).
     #[cfg(feature = "allow_in_memory_custody")]
-    pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
+    pub(crate) in_memory_custody: Option<Arc<crate::custody::NapiKeyCustody>>,
     /// Retained DID document for this identity.
     ///
     /// Used by agent key operations to read/modify the document. `None` for
@@ -458,7 +464,7 @@ impl NapiIdentity {
 
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
-                .rotate_active_key(&scp_identity, &document, &custody.0)
+                .rotate_active_key(&scp_identity, &document, &*custody)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -552,7 +558,7 @@ impl NapiIdentity {
 
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
-                .add_agent_key(&scp_identity, &document, &custody.0)
+                .add_agent_key(&scp_identity, &document, &*custody)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -648,7 +654,7 @@ impl NapiIdentity {
 
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
-                .rotate_agent_key(&scp_identity, &document, &custody.0)
+                .rotate_agent_key(&scp_identity, &document, &*custody)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -864,7 +870,7 @@ impl NapiIdentity {
                     &document,
                     &pre_rotation_handle,
                     pre_rotation_custody.as_ref(),
-                    &custody.0,
+                    &*custody,
                     rotated_at,
                 )
                 .await
@@ -940,11 +946,11 @@ impl NapiIdentity {
 /// parity requires every bridge to expose the DID-deriving identity key.
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) async fn identity_verifying_key_hex(
-    custody: &Arc<OpaqueInMemoryKeyCustody>,
+    custody: &Arc<crate::custody::NapiKeyCustody>,
     handle: &scp_platform::traits::KeyHandle,
 ) -> Option<String> {
+    use scp_platform::traits::KeyCustody as _;
     custody
-        .0
         .public_key(handle)
         .await
         .ok()
@@ -959,12 +965,12 @@ impl NapiIdentity {
         self.inner.instance_id
     }
 
-    /// Returns the retained `InMemoryKeyCustody` if this identity uses in-memory
-    /// custody. Used by context creation for routing ID derivation (SCP-214).
+    /// Returns the retained custody if this identity has live key material.
+    /// Used by context creation for routing ID derivation (SCP-214).
     #[cfg(feature = "allow_in_memory_custody")]
     #[allow(dead_code)]
-    pub(crate) fn in_memory_custody(&self) -> Option<&InMemoryKeyCustody> {
-        self.inner.in_memory_custody.as_ref().map(|c| &c.0)
+    pub(crate) fn in_memory_custody(&self) -> Option<&crate::custody::NapiKeyCustody> {
+        self.inner.in_memory_custody.as_deref()
     }
 
     /// Returns the retained `ScpIdentity` if available. Used by context creation
@@ -974,17 +980,22 @@ impl NapiIdentity {
         self.inner.scp_identity.as_ref()
     }
 
-    /// Extracts the in-memory crypto state required for agent key operations.
+    /// Extracts the retained crypto state required for agent key operations.
     ///
-    /// Returns the `ScpIdentity`, `InMemoryKeyCustody` (via `Arc`), and
-    /// `DidDocument` if this identity was created with in-memory custody.
-    /// Returns an error for externally loaded identities that have no
-    /// retained crypto state.
+    /// Returns the `ScpIdentity`, custody (via `Arc<NapiKeyCustody>`), and
+    /// `DidDocument` if this identity has retained crypto state. Returns an
+    /// error for externally loaded identities that have none. The custody is
+    /// enum-dispatched so the agent-key paths work for both in-memory and
+    /// callback-backed identities.
     #[cfg(feature = "allow_in_memory_custody")]
     fn extract_in_memory_state(
         &self,
         operation: &str,
-    ) -> napi::Result<(ScpIdentity, Arc<OpaqueInMemoryKeyCustody>, DidDocument)> {
+    ) -> napi::Result<(
+        ScpIdentity,
+        Arc<crate::custody::NapiKeyCustody>,
+        DidDocument,
+    )> {
         let scp_identity = self
             .inner
             .scp_identity
@@ -1172,12 +1183,14 @@ mod tests {
     /// identity (stamped with a dedicated `NapiBridgeInstance`) and its
     /// initial active signing key's public key (multibase).
     async fn create_test_identity() -> (NapiIdentity, String) {
-        let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = DidDht::new();
         let (scp_identity, document, pre_rotation_handle) = dht
-            .create(&key_custody.0, pre_rotation_custody.as_ref())
+            .create(&*key_custody, pre_rotation_custody.as_ref())
             .await
             .expect("identity creation must succeed");
 

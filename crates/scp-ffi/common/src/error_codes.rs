@@ -720,6 +720,10 @@ pub const VALID_7112: &str = "SCP-VALID-7112";
 pub const VALID_7113: &str = "SCP-VALID-7113";
 /// Handle/petname address validation error.
 pub const VALID_7114: &str = "SCP-VALID-7114";
+/// Petname event JSON deserialization error (malformed `PetnameEvent`).
+pub const VALID_7115: &str = "SCP-VALID-7115";
+/// Petname count exceeds `u32::MAX` and cannot be represented at the FFI boundary.
+pub const VALID_7116: &str = "SCP-VALID-7116";
 /// Handle registry lock error.
 pub const VALID_7120: &str = "SCP-VALID-7120";
 /// Handle registry operation error.

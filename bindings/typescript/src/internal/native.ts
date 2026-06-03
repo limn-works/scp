@@ -1123,12 +1123,17 @@ export function createNativeBridge(scp: SCP): Bridge {
           merkleRoot: string;
           eventCount: number;
           timestamp: number;
+          signature: string;
         }>
       )(handle, identityDid, epoch);
       return {
         root: raw.merkleRoot,
         eventCount: raw.eventCount,
         timestamp: raw.timestamp,
+        // Native bridges sign the checkpoint in-process; surface the Ed25519
+        // signature (hex). The WASM backend has no `signature` and returns
+        // `signingPayloadHash` instead (see `Checkpoint` type doc).
+        signature: raw.signature,
       };
     },
 
@@ -1284,6 +1289,18 @@ export function createNativeBridge(scp: SCP): Bridge {
         ownerDid,
         contextId,
       );
+    },
+
+    petnameApplyEvent(ownerDid: string, eventJson: string): void {
+      (native.petnameApplyEvent as (o: string, e: string) => void)(ownerDid, eventJson);
+    },
+
+    petnameDidCount(ownerDid: string): number {
+      return (native.petnameDidCount as (o: string) => number)(ownerDid);
+    },
+
+    petnameContextCount(ownerDid: string): number {
+      return (native.petnameContextCount as (o: string) => number)(ownerDid);
     },
 
     // Handle Registry (§22.3.1)
@@ -1558,6 +1575,14 @@ export function createNativeBridge(scp: SCP): Bridge {
         did,
         attestationId,
       );
+    },
+
+    identityRemove(did: string): void {
+      (native.identityRemove as (d: string) => void)(did);
+    },
+
+    identityRemoveIfPresent(did: string): boolean {
+      return (native.identityRemoveIfPresent as (d: string) => boolean)(did);
     },
 
     async identityVerifyLinkAttestation(

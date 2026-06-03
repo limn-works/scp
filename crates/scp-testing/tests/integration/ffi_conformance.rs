@@ -1331,10 +1331,32 @@ fn cross_bridge_parity_matrix() {
         "NAPI coverage {:.1}% below 95% threshold",
         napi.coverage_pct()
     );
+    // WASM legitimately omits ADR-034-exempt operations (it cannot depend on
+    // scp-runtime). Measuring coverage over the FULL parity set would
+    // mechanically drift this floor down every time an exempt op is added —
+    // the metric would punish WASM for ops it is correctly NOT expected to
+    // implement. So coverage is computed over the NON-EXEMPT operations WASM
+    // is actually expected to cover (present / (total - wasm-exempt)). This is
+    // drift-immune: adding an exempt op increases both the exempt count and
+    // the total by one, leaving the non-exempt denominator unchanged. The hard
+    // requirement (every `wasm_required` op present) is enforced separately by
+    // `wasm_bridge_covers_core_operations`, and exemption legitimacy by
+    // `every_exemption_reason_cites_durable_provenance`.
+    let wasm_exempt = exemptions_for("wasm").len();
+    let wasm_non_exempt_total = wasm.total.saturating_sub(wasm_exempt);
+    let wasm_non_exempt_pct = if wasm_non_exempt_total == 0 {
+        100.0
+    } else {
+        (wasm.present.len() as f64 / wasm_non_exempt_total as f64) * 100.0
+    };
     assert!(
-        wasm.coverage_pct() >= 70.0,
-        "WASM coverage {:.1}% below 70% threshold",
-        wasm.coverage_pct()
+        wasm_non_exempt_pct >= 70.0,
+        "WASM coverage of non-exempt operations {:.1}% below 70% threshold \
+         ({} present / {} non-exempt total; {} exempt)",
+        wasm_non_exempt_pct,
+        wasm.present.len(),
+        wasm_non_exempt_total,
+        wasm_exempt
     );
 }
 
@@ -1529,6 +1551,8 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "identity_create",
     "identity_load",
     "identity_resolve",
+    "identity_remove",
+    "identity_remove_if_present",
     "identity_migrate",
     "identity_attest_device",
     "identity_verify_device_attestation",
@@ -1567,6 +1591,7 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "event_log_query",
     "event_log_verify",
     "event_log_checkpoint",
+    "event_log_checkpoint_by_did",
     // Broadcast
     "broadcast_subscribe",
     "broadcast_unsubscribe",
@@ -1601,6 +1626,13 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "petname_resolve_context",
     "petname_get_for_did",
     "petname_get_for_context",
+    // Petname event-replay + count queries
+    // promoted from WASM-only to cross-bridge parity. Backed by
+    // scp_protocol::discovery::petnames::PetnameMap apply_event / did_petname_count
+    // / context_petname_count (the same shared type the other petname ops use).
+    "petname_apply_event",
+    "petname_did_count",
+    "petname_context_count",
     // Handle/Scope
     "handle_register",
     "handle_lookup",

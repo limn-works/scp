@@ -439,6 +439,34 @@ class TestScpEventLogCheckpoint:
         assert sc.epoch == 3
         assert sc.signature == "cd" * 64
 
+    @pytest.mark.asyncio
+    async def test_by_did_returns_signed_checkpoint(self) -> None:
+        from scp_sdk.scp import SCP
+
+        native = MagicMock()
+        native.event_log_checkpoint_by_did.return_value = SimpleNamespace(
+            context_id="ctx-by-did",
+            sender_did="did:dht:z6MkBob",
+            event_count=7,
+            merkle_root="ef" * 32,
+            epoch=5,
+            timestamp=1_700_000_500,
+            signature="ab" * 64,
+        )
+        scp = _make_scp(native)
+
+        sc = await SCP.event_log_checkpoint_by_did(scp, "ctx-by-did", "did:dht:z6MkBob", 5)
+        assert isinstance(sc, SignedCheckpoint)
+        assert sc.context_id == "ctx-by-did"
+        assert sc.sender_did == "did:dht:z6MkBob"
+        assert sc.event_count == 7
+        assert sc.merkle_root == "ef" * 32
+        assert sc.epoch == 5
+        assert sc.signature == "ab" * 64
+        native.event_log_checkpoint_by_did.assert_called_once_with(
+            "ctx-by-did", "did:dht:z6MkBob", 5
+        )
+
 
 # -----------------------------------------------------------------------
 # Module __all__ exports

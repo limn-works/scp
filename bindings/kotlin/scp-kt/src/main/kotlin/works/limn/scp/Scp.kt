@@ -27,6 +27,7 @@ package works.limn.scp
 import uniffi.scp.AssetEntry
 import uniffi.scp.AttestationVerificationResult
 import uniffi.scp.BatchPublishResult
+import uniffi.scp.BridgeCredentialResult
 import uniffi.scp.ChallengeResult
 import uniffi.scp.Checkpoint
 import uniffi.scp.ContextHandle
@@ -272,6 +273,69 @@ class SCP internal constructor(
         callerDid = callerDid,
     )
 
+    // Bridge credential store (spec §12.11). Per-instance credential store
+    // ops; each forwards to [inner]. Credentials live in THIS instance's
+    // store (ADR-048 §1). The encrypted bytes never cross the FFI boundary;
+    // only metadata is returned for provision/rotate.
+
+    /** Forwards to [NativeScp.bridgeCredentialProvision] on [inner]. */
+    suspend fun bridgeCredentialProvision(
+        bridgeId: String,
+        credentialType: String,
+        plaintext: ByteArray,
+        bridgeCredentialKey: ByteArray,
+    ): BridgeCredentialResult =
+        inner.bridgeCredentialProvision(
+            bridgeId = bridgeId,
+            credentialType = credentialType,
+            plaintext = plaintext,
+            bridgeCredentialKey = bridgeCredentialKey,
+        )
+
+    /** Forwards to [NativeScp.bridgeCredentialRetrieve] on [inner]. */
+    suspend fun bridgeCredentialRetrieve(
+        bridgeId: String,
+        credentialType: String,
+        bridgeCredentialKey: ByteArray,
+    ): ByteArray =
+        inner.bridgeCredentialRetrieve(
+            bridgeId = bridgeId,
+            credentialType = credentialType,
+            bridgeCredentialKey = bridgeCredentialKey,
+        )
+
+    /** Forwards to [NativeScp.bridgeCredentialRotate] on [inner]. */
+    suspend fun bridgeCredentialRotate(
+        bridgeId: String,
+        credentialType: String,
+        newPlaintext: ByteArray,
+        bridgeCredentialKey: ByteArray,
+    ): BridgeCredentialResult =
+        inner.bridgeCredentialRotate(
+            bridgeId = bridgeId,
+            credentialType = credentialType,
+            newPlaintext = newPlaintext,
+            bridgeCredentialKey = bridgeCredentialKey,
+        )
+
+    /** Forwards to [NativeScp.bridgeCredentialRevoke] on [inner]. */
+    suspend fun bridgeCredentialRevoke(bridgeId: String) = inner.bridgeCredentialRevoke(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.bridgeCredentialList] on [inner]. */
+    suspend fun bridgeCredentialList(bridgeId: String): List<String> = inner.bridgeCredentialList(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.bridgeCredentialStoreKey] on [inner]. */
+    suspend fun bridgeCredentialStoreKey(
+        bridgeId: String,
+        key: ByteArray,
+    ) = inner.bridgeCredentialStoreKey(bridgeId = bridgeId, key = key)
+
+    /** Forwards to [NativeScp.bridgeCredentialGetKey] on [inner]. */
+    suspend fun bridgeCredentialGetKey(bridgeId: String): ByteArray = inner.bridgeCredentialGetKey(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.bridgeCredentialDeleteKey] on [inner]. */
+    suspend fun bridgeCredentialDeleteKey(bridgeId: String) = inner.bridgeCredentialDeleteKey(bridgeId = bridgeId)
+
     /** Forwards to [NativeScp.addCheckpointCosignature] on [inner]. */
     suspend fun addCheckpointCosignature(
         handle: ContextHandle,
@@ -461,6 +525,9 @@ class SCP internal constructor(
         subscriberDid = subscriberDid,
         rotateKeys = rotateKeys,
     )
+
+    /** Forwards to [NativeScp.configureLocalTransport] on [inner]. */
+    fun configureLocalTransport(localDid: String) = inner.configureLocalTransport(localDid = localDid)
 
     /** Forwards to [NativeScp.configureRelayTransport] on [inner]. */
     suspend fun configureRelayTransport(
@@ -721,6 +788,27 @@ class SCP internal constructor(
             epoch = epoch,
         )
 
+    /**
+     * Forwards to [NativeScp.eventLogCheckpointByDid] on [inner].
+     *
+     * Signs with [identity]'s key material and records [did] as the
+     * checkpoint sender. The UniFFI bridge has no DID-keyed identity
+     * registry, so [identity] supplies the key material while [did] names
+     * the member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom).
+     */
+    suspend fun eventLogCheckpointByDid(
+        handle: ContextHandle,
+        identity: Identity,
+        did: String,
+        epoch: ULong,
+    ): Checkpoint =
+        inner.eventLogCheckpointByDid(
+            handle = handle,
+            identity = identity,
+            did = did,
+            epoch = epoch,
+        )
+
     /** Forwards to [NativeScp.eventLogQuery] on [inner]. */
     suspend fun eventLogQuery(
         handle: ContextHandle,
@@ -951,6 +1039,22 @@ class SCP internal constructor(
         )
 
     /**
+     * Forwards to [NativeScp.identityRemove] on [inner].
+     *
+     * Removes the DID from this instance's SCP-side identity registry.
+     * Idempotent — succeeds silently when the DID is not present.
+     */
+    fun identityRemove(did: String) = inner.identityRemove(did = did)
+
+    /**
+     * Forwards to [NativeScp.identityRemoveIfPresent] on [inner].
+     *
+     * Returns `true` if the identity was found and removed, `false` if the
+     * DID was not in the registry.
+     */
+    fun identityRemoveIfPresent(did: String): Boolean = inner.identityRemoveIfPresent(did = did)
+
+    /**
      * Routes through the UniFFI-generated free function
      * [uniffi.scp.identityResolve]. ADR-048 §1 + §7 Kotlin bullet.
      */
@@ -1064,6 +1168,21 @@ class SCP internal constructor(
 
     /** Forwards to [NativeScp.migrationState] on [inner]. */
     suspend fun migrationState(handle: ContextHandle): String? = inner.migrationState(handle = handle)
+
+    /** Forwards to [NativeScp.petnameApplyEvent] on [inner]. */
+    fun petnameApplyEvent(
+        ownerDid: String,
+        eventJson: String,
+    ) = inner.petnameApplyEvent(
+        ownerDid = ownerDid,
+        eventJson = eventJson,
+    )
+
+    /** Forwards to [NativeScp.petnameContextCount] on [inner]. */
+    fun petnameContextCount(ownerDid: String): UInt = inner.petnameContextCount(ownerDid = ownerDid)
+
+    /** Forwards to [NativeScp.petnameDidCount] on [inner]. */
+    fun petnameDidCount(ownerDid: String): UInt = inner.petnameDidCount(ownerDid = ownerDid)
 
     /** Forwards to [NativeScp.petnameGetForContext] on [inner]. */
     fun petnameGetForContext(

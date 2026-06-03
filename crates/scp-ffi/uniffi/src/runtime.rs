@@ -231,6 +231,20 @@ pub struct UniffiBridgeInstance {
     /// `OnceLock<DashMap<String, McpClientEntry>>` singleton in commit 4.
     /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) mcp_client_registry: Arc<DashMap<String, crate::bridge::McpClientEntry>>,
+
+    /// Per-instance bridge credential store (spec §12.11).
+    ///
+    /// Mirrors `PyBridgeInstance::credential_store` and
+    /// `NapiBridgeInstance::credential_store` — each `Scp` instance owns its
+    /// own `InMemoryCredentialStore` so OAuth tokens, API keys, and bridge
+    /// credential keys provisioned through one instance are isolated from
+    /// every other instance in the same process (ADR-048 §1 multi-instance
+    /// neutrality). Thread-safe via the store's internal
+    /// `tokio::sync::RwLock`. Production deployments should replace this with
+    /// a `Storage`-backed implementation when it lands (spec §12.11.2).
+    /// Dropping the `Arc` on shutdown zeroizes any retained bridge
+    /// credential keys via the store's `Zeroizing` fields.
+    pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
 }
 
 impl UniffiBridgeInstance {
@@ -254,6 +268,9 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -280,6 +297,9 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -400,6 +420,9 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -407,6 +430,20 @@ impl UniffiBridgeInstance {
     #[must_use]
     pub const fn instance_id(&self) -> u64 {
         self.core.instance_id()
+    }
+
+    /// Returns a reference to this instance's bridge credential store.
+    ///
+    /// Mirrors `PyBridgeInstance::credential_store` /
+    /// `NapiBridgeInstance::credential_store`. The returned
+    /// `Arc<InMemoryCredentialStore>` is the same instance the
+    /// `UniffiBridgeInstance` holds — thread-safe via internal
+    /// `tokio::sync::RwLock`.
+    #[must_use]
+    pub const fn credential_store(
+        &self,
+    ) -> &Arc<scp_core::bridge::credentials::InMemoryCredentialStore> {
+        &self.credential_store
     }
 
     /// Returns a reference to the typed UCAN registry.
@@ -637,6 +674,34 @@ impl UniffiBridgeInstance {
         let did = local_did.to_owned();
         let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
+        let event_log = self.protocol_repository.event_log_provider();
+        let persistence = self.core.persistence_arc_clone();
+        let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+
+        self.core.set_context_manager(cm_arc);
+    }
+
+    /// Per-instance initializer that installs an `MlsCryptoProvider(local_did)`
+    /// and an in-process loopback `LocalTransportProvider` on this instance.
+    ///
+    /// Mirrors [`UniffiBridgeInstance::init_context_manager_with_relay_transport`]
+    /// except the transport silently succeeds on all send/publish calls instead
+    /// of routing through a real relay. Used by `Scp::configure_local_transport`
+    /// so that E2E tests can exercise `context_send` / `broadcast_publish`
+    /// (encryption included) without a real relay server. No-op if a
+    /// `ContextManager` is already attached.
+    #[allow(dead_code)]
+    pub fn init_context_manager_with_local_transport(&self, local_did: &str) {
+        if self.core.has_context_manager() {
+            tracing::warn!(
+                requested_did = %local_did,
+                "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
+            );
+            return;
+        }
+        let did = local_did.to_owned();
+        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let transport = Box::new(scp_core::context::LocalTransportProvider);
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
         let cm_arc = build_context_manager(crypto, transport, event_log, persistence);

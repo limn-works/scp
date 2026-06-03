@@ -187,6 +187,42 @@ class TestIdentity:
         removed = await scp.identity_remove_agent_key(rotated._raw_handle)
         assert not removed._raw_handle.has_agent_key
 
+    async def test_remove_existing_identity(self, scp: SCP):
+        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        # The DID is in the registry, so removal succeeds. `identity_remove`
+        # returns None (void) and the subsequent if_present probe reports the
+        # DID is no longer present.
+        result = await scp.identity_remove(identity.did)
+        assert result is None
+        assert await scp.identity_remove_if_present(identity.did) is False
+
+    async def test_remove_if_present_true_then_false(self, scp: SCP):
+        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        # First removal finds the identity and reports True.
+        assert await scp.identity_remove_if_present(identity.did) is True
+        # Second removal finds nothing and reports False.
+        assert await scp.identity_remove_if_present(identity.did) is False
+
+    async def test_remove_nonexistent_is_silent(self, scp: SCP):
+        # Removing a DID that was never registered is a silent no-op (for a
+        # syntactically valid DID), matching the cross-bridge `identity_remove`
+        # contract.
+        missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest"
+        result = await scp.identity_remove(missing)
+        assert result is None
+        assert await scp.identity_remove_if_present(missing) is False
+
+    async def test_remove_rejects_malformed_did(self, scp: SCP):
+        # Both removal ops gate on the shared `validate_did` validator (the
+        # PyO3 reference bridge) before touching the registry. A non-empty but
+        # syntactically invalid DID raises the native ValidationError rather
+        # than silently no-op'ing. Mirrors the petname malformed-owner tests.
+        bad = "not-a-did"
+        with pytest.raises(_scp_core.ValidationError):
+            await scp.identity_remove(bad)
+        with pytest.raises(_scp_core.ValidationError):
+            await scp.identity_remove_if_present(bad)
+
     async def test_create_with_agent_key(self, scp: SCP):
         identity = await scp.identity_create_with_agent_key(CustodyType.IN_MEMORY)
         assert identity._raw_handle.has_agent_key

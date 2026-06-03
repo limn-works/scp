@@ -460,7 +460,7 @@ pub(crate) fn event_log_checkpoint_on(
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
             let signer = scp_core::event_log::KeyCustodySigner {
-                custody: &custody.0,
+                custody: custody.as_ref(),
                 key: &scp_id.active_signing_key,
             };
 
@@ -535,7 +535,7 @@ pub(crate) fn event_log_checkpoint_by_did_on(
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
             let signer = scp_core::event_log::KeyCustodySigner {
-                custody: &custody.0,
+                custody: custody.as_ref(),
                 key: &scp_id.active_signing_key,
             };
 

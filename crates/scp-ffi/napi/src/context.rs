@@ -27,8 +27,6 @@ use scp_ffi_common::validate::validate_did;
 
 use crate::error::ScpNapiError;
 use crate::identity::NapiIdentity;
-#[cfg(feature = "allow_in_memory_custody")]
-use crate::identity::OpaqueInMemoryKeyCustody;
 use crate::runtime::{NapiBridgeInstance, context_manager};
 use crate::{decrement_handle_count, increment_handle_count};
 
@@ -115,9 +113,11 @@ pub struct NapiContextHandle {
     governance: String,
     /// Optional economic policy string.
     economic_policy: Option<String>,
-    /// Retained [`InMemoryKeyCustody`] for UCAN signing.
+    /// Retained custody for UCAN signing — shares the creator identity's
+    /// `Arc<NapiKeyCustody>` so context-level signing uses the same key
+    /// material (and works for callback-backed identities too).
     #[cfg(feature = "allow_in_memory_custody")]
-    pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
+    pub(crate) in_memory_custody: Option<Arc<crate::custody::NapiKeyCustody>>,
     /// Handle to the creator's active signing key for UCAN minting.
     /// Only read inside `#[cfg(feature = "allow_in_memory_custody")]` blocks.
     #[allow(dead_code)]
@@ -382,7 +382,6 @@ async fn derive_context_pseudonym(identity: &NapiIdentity, context_id: &str) -> 
         identity.inner.in_memory_custody.as_ref()?,
     );
     let pseudonym = custody
-        .0
         .derive_pseudonym(&scp_id.identity_key, context_id.as_bytes())
         .await
         .ok()?;
@@ -574,7 +573,7 @@ pub(crate) async fn context_create_on(
             })
             .ok();
             if let Some((custody, key_handle)) = custody_and_key
-                && let Ok(sk) = custody.0.export_ed25519_signing_key(&key_handle).await
+                && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
             {
                 let sender_did = DID(creator_did.clone());
                 if let Ok(mgr) = context_manager(bi) {
@@ -680,7 +679,6 @@ pub(crate) async fn context_join_on(
             .ok();
             match custody_and_key {
                 Some((custody, identity_key)) => custody
-                    .0
                     .derive_pseudonym(&identity_key, context_id.as_bytes())
                     .await
                     .ok()
@@ -717,7 +715,7 @@ pub(crate) async fn context_join_on(
             })
             .ok();
             if let Some((custody, key_handle)) = custody_and_key
-                && let Ok(sk) = custody.0.export_ed25519_signing_key(&key_handle).await
+                && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
             {
                 let sender_did = DID(identity_did.clone());
                 if let (Some(mgr), Ok(ann_handle)) =
@@ -868,7 +866,7 @@ pub(crate) async fn context_send_on(
             signing_key_id: scp_identity::SigningKeyId::Active,
         };
 
-        scp_core::envelope::create_inner_envelope(&params, &custody.0, &signing_key)
+        scp_core::envelope::create_inner_envelope(&params, custody.as_ref(), &signing_key)
             .await
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Crypto {
@@ -1648,7 +1646,13 @@ pub(crate) async fn broadcast_publish_on(
         })?;
 
         manager
-            .publish_broadcast(&context_id, &author_did, &payload, &custody.0, &signing_key)
+            .publish_broadcast(
+                &context_id,
+                &author_did,
+                &payload,
+                custody.as_ref(),
+                &signing_key,
+            )
             .await
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     }
@@ -1798,7 +1802,7 @@ pub(crate) async fn broadcast_publish_asset_on(
                 &context_id,
                 &author_did_val,
                 content,
-                &custody.0,
+                custody.as_ref(),
                 &signing_key,
             )
             .await
@@ -1928,7 +1932,7 @@ pub(crate) async fn broadcast_publish_assets_on(
                     &context_id,
                     &author_did_val,
                     content,
-                    &custody.0,
+                    custody.as_ref(),
                     &signing_key,
                 )
                 .await
@@ -2163,7 +2167,6 @@ async fn resolve_napi_signing_key(
         })
     })?;
     custody
-        .0
         .export_ed25519_signing_key(&key_handle)
         .await
         .map_err(|e| {

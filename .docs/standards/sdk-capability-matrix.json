@@ -44,6 +44,13 @@
           "swift": true
         },
         {
+          "name": "create_with_custody",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
           "name": "add_agent_key",
           "python": true,
           "typescript": true,
@@ -63,6 +70,22 @@
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "identity_remove",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Per-instance removal of retained SCP-side identity state for a DID. Surfaced in all four SDKs (scp.identityRemove / identity_remove). Validates the DID via the shared validate_did gate on every bridge (pyo3/napi/uniffi/wasm). Exported by all four bridges; see scripts/bridge-aliases.json (wasm_required true)."
+        },
+        {
+          "name": "identity_remove_if_present",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Conditional companion to identity_remove reporting whether the DID was present. Surfaced in all four SDKs. Validates the DID via the shared validate_did gate on every bridge. Exported by all four bridges; see scripts/bridge-aliases.json (wasm_required true)."
         },
         {
           "name": "migrate",
@@ -904,6 +927,14 @@
           "python": true,
           "typescript": true,
           "kotlin": true,
+          "swift": true,
+          "notes": "Runtime-dependent on TypeScript: the NAPI-backed (Node/Bun) TS runtime signs the canonical checkpoint payload in-process AND the TS SDK surfaces the resulting Ed25519 signature on Checkpoint.signature (mapped through bindings/typescript/src/internal/native.ts), so typescript:true is honest for the default runtime. The WASM/browser-TS fallback CANNOT sign in-process (ADR-006/ADR-034 — signing is a JS-side WebCrypto responsibility); its eventLogCheckpoint returns the unsigned signable payload via Checkpoint.signingPayloadHash (no signature), and SubtleCrypto Ed25519 signing is a separate not-yet-implemented TS-SDK story. This WASM-vs-native difference is recorded as an ADR-048 §7b cross-bridge semantic divergence for event_log_checkpoint*; the row stays true because the primary NAPI-backed runtime signs and surfaces the signature, while the WASM fallback returns the unsigned payload hash."
+        },
+        {
+          "name": "checkpoint_by_did",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
           "swift": true
         }
       ]
@@ -935,6 +966,14 @@
             "python": "no explicit disconnect wrapper exposed",
             "typescript": "no explicit disconnect wrapper exposed"
           }
+        },
+        {
+          "name": "configure_local_transport",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Attaches the in-process loopback transport for a local DID. Surfaced in all four SDKs (scp.configureLocalTransport / configure_local_transport) and validates the DID at the boundary. Exported by the pyo3/napi/uniffi bridges; the wasm bridge is exempt (no scp-runtime LocalTransportProvider / ContextManager on wasm32 per ADR-034). See the wasm exemption in scripts/bridge-aliases.json."
         }
       ]
     },
@@ -1109,6 +1148,27 @@
         },
         {
           "name": "petname_get_for_context",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "petname_apply_event",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "petname_did_count",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "petname_context_count",
           "python": true,
           "typescript": true,
           "kotlin": true,
@@ -1624,6 +1684,62 @@
         },
         {
           "name": "create_shadow",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_provision",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_retrieve",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_rotate",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_revoke",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_list",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_store_key",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_get_key",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_delete_key",
           "python": true,
           "typescript": true,
           "kotlin": true,

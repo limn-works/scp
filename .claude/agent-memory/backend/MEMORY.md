@@ -1,1 +1,3 @@
 - [Swift UniFFI bindings regenerated in CI](reference_swift_uniffi_regen.md) — stale committed ScpBindings.swift can hide signature drift; local swift build passes while CI fails
+- [Petname owner_did validation parity](project_petname_owner_did_parity.md) — all petname FFI ops validate_did(owner_did) across 4 bridges; address_resolve stays is_empty()
+- [WASM JsError errors not host-testable](feedback_wasm_jserror_offwasm_testable.md) — wasm bridge Err-arm construction panics off-wasm; test the underlying validate_did, not the wrapped op

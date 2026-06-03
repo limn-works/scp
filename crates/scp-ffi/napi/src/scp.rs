@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use napi::Env;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
@@ -378,12 +379,14 @@ impl Scp {
                     .map_or_else(InMemoryKeyCustody::new, |seed| {
                         InMemoryKeyCustody::from_seed_bytes(**seed)
                     });
-                let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(in_memory));
+                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+                    crate::identity::OpaqueInMemoryKeyCustody(in_memory),
+                ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = DidDht::new();
                 let (scp_identity, document, pre_rotation_handle) = dht
-                    .create(&key_custody.0, pre_rotation_custody.as_ref())
+                    .create(&*key_custody, pre_rotation_custody.as_ref())
                     .await
                     .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -501,14 +504,14 @@ impl Scp {
                 use scp_platform::testing::InMemoryKeyCustody;
                 use scp_identity::DidDht;
 
-                let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(
-                    InMemoryKeyCustody::new(),
+                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+                    crate::identity::OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
                 ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = DidDht::new();
                 let (scp_identity, document, pre_rotation_handle) = dht
-                    .create_with_agent_key(&key_custody.0, pre_rotation_custody.as_ref())
+                    .create_with_agent_key(&*key_custody, pre_rotation_custody.as_ref())
                     .await
                     .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -576,6 +579,122 @@ impl Scp {
                 ),
             }
             .into()),
+        }
+    }
+
+    /// Creates a new DID identity whose key material lives in a caller-provided
+    /// custody backend.
+    ///
+    /// `provider` is a JS object implementing the `KeyCustodyProvider` record
+    /// (`generateKeypair`, `sign`, `getPublicKey`, `destroyKey`, `dhAgree`,
+    /// `derivePseudonym`, `exportSigningKeyBytes`, `custodyType`). Private key
+    /// material never crosses into the Rust core (ADR-006): every crypto op is
+    /// marshalled back to the Node.js event loop via threadsafe functions and
+    /// awaited. This is the Node/Bun equivalent of the `UniFFI` bridge's
+    /// `identity_create_with_custody`, used to back a DID with an OS keychain,
+    /// hardware token, or HSM wrapper.
+    ///
+    /// The callbacks run on the JS thread; the pre-rotation seed is generated
+    /// locally (it never traverses the consumer callbacks), per ADR-006.
+    #[napi(
+        js_name = "identityCreateWithCustody",
+        ts_return_type = "Promise<NapiIdentity>"
+    )]
+    #[cfg_attr(not(feature = "allow_in_memory_custody"), allow(unused_variables))]
+    pub fn identity_create_with_custody<'env>(
+        &self,
+        env: &'env Env,
+        provider: crate::custody::NapiKeyCustodyProvider,
+    ) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'env, crate::identity::NapiIdentity>> {
+        // SYNC entry point. The JS `Function` fields on `provider` are not
+        // `Send`, so they MUST be promoted to `ThreadsafeFunction`s on the JS
+        // thread (here), before any work crosses to a tokio worker. We then
+        // hand the resulting `Send` custody to `Env::spawn_future`, which runs
+        // the async DID-creation on the tokio runtime and resolves the JS
+        // Promise on the event loop — leaving the loop free to service the
+        // custody callbacks the creation flow invokes. (An `async fn` taking
+        // the `Function`s directly cannot compile: its future would capture
+        // the non-`Send` callbacks.)
+
+        // The identity registry (which retains the callback custody so later
+        // signing / event-log / SCPID operations can reach it) is compiled
+        // only under `allow_in_memory_custody`, matching every other
+        // key-bearing identity path in this bridge.
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            return Err(ScpNapiError::Identity {
+                message: "identityCreateWithCustody requires the allow_in_memory_custody \
+                          build feature (the identity registry that retains the callback \
+                          custody is gated on it)"
+                    .to_owned(),
+                code: codes::IDENT_1008.to_owned(),
+            }
+            .into());
+        }
+
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            use scp_identity::DidDht;
+
+            use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
+
+            let bi_arc = Arc::clone(&self.inner);
+            ensure_did_resolver_initialized_on(&bi_arc);
+
+            // Promote the JS callbacks to threadsafe functions on the JS
+            // thread (consuming the non-Send `Function`s). A malformed
+            // provider fails fast here, before any DID-creation work.
+            let callback = crate::custody::NapiCallbackKeyCustody::from_provider(provider)?;
+            let key_custody = Arc::new(crate::custody::NapiKeyCustody::Callback(callback));
+
+            env.spawn_future(async move {
+                let bi = &*bi_arc;
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                let dht = DidDht::new();
+                let (scp_identity, document, pre_rotation_handle) = dht
+                    .create(&*key_custody, pre_rotation_custody.as_ref())
+                    .await
+                    .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                    &key_custody,
+                    &scp_identity.identity_key,
+                )
+                .await;
+
+                crate::runtime::register_identity(
+                    bi,
+                    &scp_identity.did,
+                    crate::runtime::NapiIdentityEntry {
+                        identity: scp_identity.clone(),
+                        custody: Arc::clone(&key_custody),
+                        document: document.clone(),
+                        identity_link_attestations: Vec::new(),
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                    },
+                );
+
+                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
+                    .await;
+
+                let handle = crate::identity::NapiIdentity {
+                    inner: Arc::new(NapiIdentityInner {
+                        did: scp_identity.did.clone(),
+                        custody_type: "callback".to_owned(),
+                        scp_identity: Some(scp_identity),
+                        in_memory_custody: Some(key_custody),
+                        document: Some(document),
+                        bi: Arc::clone(&bi_arc),
+                        verifying_key_hex,
+                        instance_id: bi.instance_id(),
+                        rotation_event_json: None,
+                    }),
+                };
+                crate::increment_handle_count();
+                Ok(handle)
+            })
         }
     }
 
@@ -723,21 +842,40 @@ impl Scp {
     /// Per-instance equivalent of `identity_remove`.
     ///
     /// Drops retained key material for the DID. Idempotent — succeeds
-    /// silently when the DID is not in the registry.
+    /// silently when the DID is a syntactically valid DID not present in
+    /// the registry.
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error when `did` is not a syntactically valid
+    /// DID, mirroring the `PyO3` reference bridge's `identity_remove`.
     #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "identityRemove")]
-    pub fn identity_remove(&self, did: String) {
+    pub fn identity_remove(&self, did: String) -> napi::Result<()> {
+        scp_ffi_common::validate::validate_did(&did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         crate::runtime::remove_identity(&self.inner, &did);
+        Ok(())
     }
 
     /// Per-instance equivalent of `identity_remove_if_present`.
     ///
     /// Returns `true` if the identity was present and removed.
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error when `did` is not a syntactically valid
+    /// DID, mirroring the `PyO3` reference bridge's
+    /// `identity_remove_if_present`.
     #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "identityRemoveIfPresent")]
-    #[must_use]
-    pub fn identity_remove_if_present(&self, did: String) -> bool {
-        crate::runtime::remove_identity_if_present(&self.inner, &did)
+    pub fn identity_remove_if_present(&self, did: String) -> napi::Result<bool> {
+        scp_ffi_common::validate::validate_did(&did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        Ok(crate::runtime::remove_identity_if_present(
+            &self.inner,
+            &did,
+        ))
     }
 
     /// Per-instance equivalent of `identity_attest_device`.
@@ -859,7 +997,7 @@ impl Scp {
         })?;
 
         let sig = tokio::task::block_in_place(|| {
-            rt.block_on(custody.0.sign(&key_handle, &built.canonical_bytes))
+            rt.block_on(custody.sign(&key_handle, &built.canonical_bytes))
         })
         .map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
@@ -1314,12 +1452,8 @@ impl Scp {
     ) -> napi::Result<()> {
         use scp_identity::DID;
 
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         if target_did.is_empty() {
             return Err(NapiError::from(ScpNapiError::Validation {
                 message: "target_did must not be empty".to_owned(),
@@ -1342,12 +1476,8 @@ impl Scp {
     pub fn petname_remove(&self, owner_did: String, target_did: String) -> napi::Result<()> {
         use scp_identity::DID;
 
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let mut guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1368,12 +1498,8 @@ impl Scp {
         context_id: String,
         name: String,
     ) -> napi::Result<()> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         if context_id.is_empty() {
             return Err(NapiError::from(ScpNapiError::Validation {
                 message: "context_id must not be empty".to_owned(),
@@ -1398,12 +1524,8 @@ impl Scp {
         owner_did: String,
         context_id: String,
     ) -> napi::Result<()> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let mut guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1419,12 +1541,8 @@ impl Scp {
     /// Per-instance equivalent of `petname_resolve_did`.
     #[napi(js_name = "petnameResolveDid")]
     pub fn petname_resolve_did(&self, owner_did: String, name: String) -> napi::Result<String> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1451,12 +1569,8 @@ impl Scp {
     /// Per-instance equivalent of `petname_resolve_context`.
     #[napi(js_name = "petnameResolveContext")]
     pub fn petname_resolve_context(&self, owner_did: String, name: String) -> napi::Result<String> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1484,12 +1598,8 @@ impl Scp {
     ) -> napi::Result<Option<String>> {
         use scp_identity::DID;
 
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1509,12 +1619,8 @@ impl Scp {
         owner_did: String,
         context_id: String,
     ) -> napi::Result<Option<String>> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1524,6 +1630,83 @@ impl Scp {
         Ok(guard
             .get(&owner_did)
             .and_then(|map| map.petname_for_context(&context_id).map(str::to_owned)))
+    }
+
+    /// Applies a serialized petname event to the owner's petname map.
+    ///
+    /// The event JSON must match the `PetnameEvent` serde format (§22.9.2).
+    /// This is the event-driven mutation path matching `PetnameMap::apply_event`.
+    #[napi(js_name = "petnameApplyEvent")]
+    pub fn petname_apply_event(&self, owner_did: String, event_json: String) -> napi::Result<()> {
+        use scp_core::discovery::petnames::PetnameEvent;
+
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        let event: PetnameEvent = serde_json::from_str(&event_json).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid petname event JSON: {e}"),
+                code: codes::VALID_7115.to_owned(),
+            })
+        })?;
+        let mut guard = self.inner.core.petname_maps().lock().map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })
+        })?;
+        let map = guard.entry(owner_did).or_default();
+        map.apply_event(&event);
+        Ok(())
+    }
+
+    /// Returns the number of DID petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::did_petname_count`.
+    #[napi(js_name = "petnameDidCount")]
+    pub fn petname_did_count(&self, owner_did: String) -> napi::Result<u32> {
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        let guard = self.inner.core.petname_maps().lock().map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })
+        })?;
+        let count = guard.get(&owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::did_petname_count,
+        );
+        u32::try_from(count).map_err(|_| {
+            NapiError::from(ScpNapiError::Validation {
+                message: "petname count exceeds u32::MAX".to_owned(),
+                code: codes::VALID_7116.to_owned(),
+            })
+        })
+    }
+
+    /// Returns the number of context petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::context_petname_count`.
+    #[napi(js_name = "petnameContextCount")]
+    pub fn petname_context_count(&self, owner_did: String) -> napi::Result<u32> {
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        let guard = self.inner.core.petname_maps().lock().map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })
+        })?;
+        let count = guard.get(&owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::context_petname_count,
+        );
+        u32::try_from(count).map_err(|_| {
+            NapiError::from(ScpNapiError::Validation {
+                message: "petname count exceeds u32::MAX".to_owned(),
+                code: codes::VALID_7116.to_owned(),
+            })
+        })
     }
 
     /// Per-instance equivalent of `handle_register`.
@@ -3735,6 +3918,97 @@ impl Scp {
     }
 
     // -------------------------------------------------------------------
+    // Bridge credential store (§12.11)
+    //
+    // Per-instance equivalents of the PyO3 `bridge_credential_*` methods.
+    // Each routes through `&*self.inner` — credentials live in THIS
+    // instance's `InMemoryCredentialStore`, isolated from every other `Scp`
+    // in the process (ADR-048 §1).
+    // -------------------------------------------------------------------
+
+    /// Provisions (stores) an encrypted credential for a bridge instance.
+    #[napi(js_name = "bridgeCredentialProvision")]
+    pub fn bridge_credential_provision(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> napi::Result<crate::bridge_connector::NapiBridgeCredential> {
+        crate::bridge_connector::bridge_credential_provision_on(
+            &self.inner,
+            bridge_id,
+            credential_type,
+            plaintext,
+            bridge_credential_key,
+        )
+    }
+
+    /// Retrieves and decrypts a credential for a bridge instance.
+    #[napi(js_name = "bridgeCredentialRetrieve")]
+    pub fn bridge_credential_retrieve(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        bridge_credential_key: Vec<u8>,
+    ) -> napi::Result<Vec<u8>> {
+        crate::bridge_connector::bridge_credential_retrieve_on(
+            &self.inner,
+            bridge_id,
+            credential_type,
+            bridge_credential_key,
+        )
+    }
+
+    /// Rotates (replaces) a credential for a bridge instance.
+    #[napi(js_name = "bridgeCredentialRotate")]
+    pub fn bridge_credential_rotate(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        new_plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> napi::Result<crate::bridge_connector::NapiBridgeCredential> {
+        crate::bridge_connector::bridge_credential_rotate_on(
+            &self.inner,
+            bridge_id,
+            credential_type,
+            new_plaintext,
+            bridge_credential_key,
+        )
+    }
+
+    /// Revokes all credentials for a bridge instance.
+    #[napi(js_name = "bridgeCredentialRevoke")]
+    pub fn bridge_credential_revoke(&self, bridge_id: String) -> napi::Result<()> {
+        crate::bridge_connector::bridge_credential_revoke_on(&self.inner, bridge_id)
+    }
+
+    /// Lists all credential types stored for a bridge instance.
+    #[napi(js_name = "bridgeCredentialList")]
+    pub fn bridge_credential_list(&self, bridge_id: String) -> napi::Result<Vec<String>> {
+        crate::bridge_connector::bridge_credential_list_on(&self.inner, bridge_id)
+    }
+
+    /// Stores a bridge credential key in the custody boundary.
+    #[napi(js_name = "bridgeCredentialStoreKey")]
+    pub fn bridge_credential_store_key(&self, bridge_id: String, key: Vec<u8>) -> napi::Result<()> {
+        crate::bridge_connector::bridge_credential_store_key_on(&self.inner, bridge_id, key)
+    }
+
+    /// Retrieves a bridge credential key from the custody boundary.
+    #[napi(js_name = "bridgeCredentialGetKey")]
+    pub fn bridge_credential_get_key(&self, bridge_id: String) -> napi::Result<Vec<u8>> {
+        crate::bridge_connector::bridge_credential_get_key_on(&self.inner, bridge_id)
+    }
+
+    /// Deletes and zeroizes a bridge credential key.
+    #[napi(js_name = "bridgeCredentialDeleteKey")]
+    pub fn bridge_credential_delete_key(&self, bridge_id: String) -> napi::Result<()> {
+        crate::bridge_connector::bridge_credential_delete_key_on(&self.inner, bridge_id)
+    }
+
+    // -------------------------------------------------------------------
     // SCPID authentication (§3.11)
     // -------------------------------------------------------------------
 
@@ -3823,12 +4097,14 @@ mod concurrency_cap_tests {
             .build()
             .unwrap();
 
-        let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::new();
         let (identity, document, pre_rotation_handle) = rt
-            .block_on(dht.create(&custody.0, pre_rotation_custody.as_ref()))
+            .block_on(dht.create(&*custody, pre_rotation_custody.as_ref()))
             .unwrap();
         let did = identity.did.clone();
 
@@ -4020,6 +4296,96 @@ mod concurrency_cap_tests {
             scp_arc.inner.recovery_semaphore.available_permits(),
             RECOVERY_CONCURRENCY_CAP,
             "pool must return to full capacity once permits are dropped"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod petname_validation_tests {
+    use super::*;
+
+    /// Non-empty but syntactically invalid owner DIDs must be rejected by the
+    /// pre-existing petname ops, matching the strict `validate_did` gate the
+    /// WASM bridge and the §4.7 ops already enforce. Without this the native
+    /// bridges would be looser than WASM on the same operation.
+    #[test]
+    fn petname_malformed_owner_rejected() {
+        let scp = Scp::new().unwrap();
+        let bad = "not-a-did".to_owned();
+        assert!(
+            scp.petname_set(bad.clone(), "did:dht:z1".to_owned(), "test".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_remove(bad.clone(), "did:dht:z1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_set_context(bad.clone(), "ctx-1".to_owned(), "work".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_remove_context(bad.clone(), "ctx-1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_resolve_did(bad.clone(), "alice".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_resolve_context(bad.clone(), "work".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_get_for_did(bad.clone(), "did:dht:z1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_get_for_context(bad, "ctx-1".to_owned())
+                .is_err()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "allow_in_memory_custody"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod identity_remove_validation_tests {
+    use super::*;
+
+    /// `identity_remove` and `identity_remove_if_present` must reject a
+    /// non-empty but syntactically invalid DID via the shared `validate_did`
+    /// gate — matching the `PyO3` reference bridge — before touching the
+    /// registry. Without this the NAPI bridge would be looser than `PyO3` and
+    /// WASM on the same operation. Mirrors `petname_malformed_owner_rejected`.
+    #[test]
+    fn identity_remove_malformed_did_rejected() {
+        let scp = Scp::new().unwrap();
+        let bad = "not-a-did".to_owned();
+        assert!(
+            scp.identity_remove(bad.clone()).is_err(),
+            "identity_remove must reject a malformed DID"
+        );
+        assert!(
+            scp.identity_remove_if_present(bad).is_err(),
+            "identity_remove_if_present must reject a malformed DID"
+        );
+    }
+
+    /// A syntactically valid DID that is not registered is accepted: the
+    /// validation gate passes and the op is a no-op (idempotent removal).
+    /// `identity_remove` returns `Ok(())`; `identity_remove_if_present`
+    /// returns `Ok(false)`.
+    #[test]
+    fn identity_remove_valid_absent_did_is_ok_noop() {
+        let scp = Scp::new().unwrap();
+        let valid_absent = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest".to_owned();
+        scp.identity_remove(valid_absent.clone())
+            .expect("valid DID must not be rejected by identity_remove");
+        assert!(
+            !scp.identity_remove_if_present(valid_absent)
+                .expect("valid DID must not be rejected by identity_remove_if_present"),
+            "removing an unregistered DID must report false"
         );
     }
 }

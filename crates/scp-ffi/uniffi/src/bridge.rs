@@ -2831,6 +2831,55 @@ pub(crate) fn identity_custody_registry(
     bi.identity_custody_registry.as_ref()
 }
 
+/// Registers an in-memory identity's custody + active signing key in the
+/// per-instance identity custody registry, keyed by `did`.
+///
+/// Shared by `identity_create` (so a freshly created in-memory identity is
+/// immediately present in the registry, matching the NAPI bridge whose
+/// `identity_create` registers a bundled entry) and the link-attestation
+/// path (which needs the custody retained for later re-signing). Centralizing
+/// the entry/cap logic keeps the two call sites in sync and avoids duplicating
+/// the TOCTOU-safe capacity check.
+///
+/// Uses the `entry()` API to avoid a TOCTOU window between `contains_key` and
+/// `insert`:
+/// - Occupied: always updates to the caller's current key. The `UniFFI`
+///   `Identity` is an immutable `Arc` snapshot — the held key is the one the
+///   caller signs with; after a legitimate rotation the stale handle is
+///   replaced.
+/// - Vacant: enforces `UNIFFI_CUSTODY_REGISTRY_CAP` before inserting,
+///   surfacing `SCP-VALID-7403` on overflow.
+#[cfg(feature = "allow_in_memory_custody")]
+fn register_identity_custody(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    did: &str,
+    custody: &Arc<OpaqueInMemoryKeyCustody>,
+    active_key: scp_platform::KeyHandle,
+) -> Result<(), ScpError> {
+    use scp_ffi_common::error_codes as codes;
+
+    let registry = identity_custody_registry(bi);
+    let len = registry.len();
+    match registry.entry(did.to_owned()) {
+        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+            occ.insert((Arc::clone(custody), active_key));
+        }
+        dashmap::mapref::entry::Entry::Vacant(vac) => {
+            if len >= UNIFFI_CUSTODY_REGISTRY_CAP {
+                return Err(ScpError::Identity {
+                    msg: format!(
+                        "custody registry has reached capacity \
+                         ({UNIFFI_CUSTODY_REGISTRY_CAP}) — cannot store additional entries"
+                    ),
+                    code: codes::VALID_7403.to_owned(),
+                });
+            }
+            vac.insert((Arc::clone(custody), active_key));
+        }
+    }
+    Ok(())
+}
+
 /// Creates an identity link attestation for an external platform identity.
 ///
 /// See spec §3.5.1, §3.5.2.
@@ -2910,34 +2959,9 @@ async fn identity_create_link_attestation_impl(
         })?;
     attestation.signature = sig.as_bytes().to_vec();
 
-    // Store custody for later verification lookups.
-    // Use entry() API to avoid TOCTOU between contains_key and insert.
-    {
-        let registry = identity_custody_registry(bi);
-        let len = registry.len();
-        match registry.entry(identity.did.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                // Always update to the caller's current key. The UniFFI
-                // `Identity` is an immutable Arc snapshot — if the caller
-                // holds an Identity with key N, that is the key they used to
-                // sign.  After a legitimate key rotation the old key handle
-                // sits in the registry and the new one should replace it.
-                occ.insert((Arc::clone(custody), active_key));
-            }
-            dashmap::mapref::entry::Entry::Vacant(vac) => {
-                if len >= UNIFFI_CUSTODY_REGISTRY_CAP {
-                    return Err(ScpError::Identity {
-                        msg: format!(
-                            "custody registry has reached capacity \
-                             ({UNIFFI_CUSTODY_REGISTRY_CAP}) — cannot store additional entries"
-                        ),
-                        code: codes::VALID_7403.to_owned(),
-                    });
-                }
-                vac.insert((Arc::clone(custody), active_key));
-            }
-        }
-    }
+    // Store custody for later verification lookups. Shared with
+    // `identity_create` so the registry contract stays in sync.
+    register_identity_custody(bi, &identity.did, custody, active_key)?;
 
     // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
@@ -4454,6 +4478,150 @@ async fn event_log_checkpoint_impl(
     _bi: Arc<crate::runtime::UniffiBridgeInstance>,
     _handle: Arc<ContextHandle>,
     _identity: Arc<Identity>,
+    _epoch: u64,
+) -> Result<Checkpoint, ScpError> {
+    Err(ScpError::Permission {
+        msg: "event log checkpoint requires key custody — the in_memory custody path \
+                  is not available in this build. Enable the \
+                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
+                  a KeyCustodyProvider for production."
+            .to_owned(),
+        code: codes::PERM_3008.to_owned(),
+    })
+}
+
+/// Generates a signed consistency checkpoint scoped to a member DID.
+///
+/// The `UniFFI` bridge holds no DID-keyed identity registry — identities are
+/// opaque `Arc<Identity>` handles, not entries looked up by string. So unlike
+/// the PyO3/NAPI/WASM bridges (which resolve key material from a registry keyed
+/// by DID), this variant takes the `Identity` handle for key material AND an
+/// explicit `did` string that is recorded as the checkpoint's `sender_did`.
+/// This honours the per-SDK idiom (ADR-048 §7): the no-registry constraint of
+/// the `UniFFI` object model is respected rather than forcing a registry into
+/// existence.
+///
+/// The `did` is validated for syntactic well-formedness (matching the `PyO3`
+/// bridge) AND must equal the supplied `identity`'s own DID. The other bridges
+/// bind the signing key to the recorded `sender_did` implicitly via the
+/// DID-keyed registry lookup; this bridge has no registry, so the binding is
+/// enforced here explicitly. Without it, a caller could record a checkpoint as
+/// having been signed by an arbitrary `sender_did` while signing with an
+/// unrelated identity's key — a provenance forgery. The argument is retained
+/// (rather than dropped in favour of `identity.did`) so the call site reads
+/// symmetrically with the other bridges' `*_by_did` signatures.
+#[cfg(feature = "allow_in_memory_custody")]
+async fn event_log_checkpoint_by_did_impl(
+    bi: Arc<crate::runtime::UniffiBridgeInstance>,
+    handle: Arc<ContextHandle>,
+    identity: Arc<Identity>,
+    did: String,
+    epoch: u64,
+) -> Result<Checkpoint, ScpError> {
+    validate_did(&did)?;
+    // Bind the recorded sender_did to the signing identity. The key material
+    // comes from `identity`; recording any other DID as the signer would be a
+    // provenance forgery (the registry-backed bridges get this binding for
+    // free via DID-keyed lookup).
+    if did != identity.did {
+        return Err(ScpError::Validation {
+            msg: format!(
+                "checkpoint sender_did '{did}' does not match the signing identity's \
+                 DID '{}' — the checkpoint must be attributed to the identity that \
+                 signs it",
+                identity.did
+            ),
+            code: codes::VALID_7000.to_owned(),
+        });
+    }
+    runtime()
+        .spawn(async move {
+            let custody =
+                identity
+                    .in_memory_custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        msg: "event log checkpoint requires key custody — create the identity \
+                              with in_memory custody (identity_create(\"in_memory\"))"
+                            .to_owned(),
+                        code: codes::PERM_3008.to_owned(),
+                    })?;
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: "event log checkpoint requires retained identity state — the identity \
+                          was externally loaded"
+                        .to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
+                })?;
+
+            // Ensure UCAN state (which contains the event log) is registered
+            // on this bridge instance.
+            bi.ensure_ucan_registered(
+                &handle.context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
+
+            let sender_did = scp_identity::DID(did);
+            let context_id = handle.context_id.clone();
+
+            let checkpoint = bi
+                .with_ucan_state(&context_id, |ucan_state| {
+                    let signer = scp_core::event_log::KeyCustodySigner {
+                        custody: &custody.0,
+                        key: &core_id.active_signing_key,
+                    };
+                    // generate_checkpoint is async — use block_in_place to allow
+                    // blocking inside this spawned async task. block_in_place moves
+                    // the worker thread to blocking mode (requires multi-thread runtime).
+                    let handle = tokio::runtime::Handle::current();
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async {
+                            scp_event_log::checkpoint::generate_checkpoint(
+                                &ucan_state.event_log,
+                                &sender_did,
+                                epoch,
+                                &signer,
+                            )
+                            .await
+                            .map_err(|e| ScpError::Context {
+                                msg: format!("checkpoint generation failed: {e}"),
+                                code: codes::CTX_2027.to_owned(),
+                            })
+                        })
+                    })
+                })
+                .ok_or_else(|| ScpError::Context {
+                    msg: format!("context '{context_id}' not found in UCAN registry"),
+                    code: codes::CTX_2027.to_owned(),
+                })??;
+
+            Ok(Checkpoint {
+                context_id: checkpoint.context_id,
+                sender_did: checkpoint.sender_did.0,
+                event_count: checkpoint.event_count,
+                merkle_root: hex::encode(checkpoint.merkle_root),
+                epoch: checkpoint.epoch,
+                timestamp: checkpoint.timestamp,
+                signature: hex::encode(checkpoint.signature),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during event log checkpoint: {e}"),
+            code: codes::CTX_2028.to_owned(),
+        })?
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)]
+async fn event_log_checkpoint_by_did_impl(
+    _bi: Arc<crate::runtime::UniffiBridgeInstance>,
+    _handle: Arc<ContextHandle>,
+    _identity: Arc<Identity>,
+    _did: String,
     _epoch: u64,
 ) -> Result<Checkpoint, ScpError> {
     Err(ScpError::Permission {
@@ -5986,6 +6154,25 @@ pub struct ShadowIdentityResult {
     pub provenance_status: String,
 }
 
+/// Bridge credential metadata result.
+///
+/// Returned by `bridge_credential_provision` and `bridge_credential_rotate`.
+/// Mirrors the `PyO3` dict (`bridge_id`, `credential_type`, `created_at`).
+/// The encrypted credential bytes never cross the FFI boundary — only
+/// non-secret metadata.
+///
+/// See spec section 12.11 (Credential Lifecycle) and ADR-023.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BridgeCredentialResult {
+    /// The bridge instance this credential belongs to.
+    pub bridge_id: String,
+    /// The credential type string (e.g. `"ApiKey"`, `"OAuthAccessToken"`,
+    /// `"Custom:<name>"`).
+    pub credential_type: String,
+    /// Unix timestamp (seconds) when the credential was created.
+    pub created_at: u64,
+}
+
 /// Registers a new bridge connector with a context.
 ///
 /// Creates a bridge registration, submits a registration request, and
@@ -6208,6 +6395,223 @@ fn bridge_create_shadow_on(
         attributed_role: shadow.attributed_role,
         provenance_status: format!("{:?}", shadow.provenance_status),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Bridge credential store operations (§12.11)
+//
+// Per-bridge-instance helpers mirroring the PyO3 `*_impl` functions in
+// `crates/scp-ffi/src/bridge_connector.rs`. Each resolves the credential
+// store from `bi.credential_store()` and drives the async
+// `BridgeCredentialStore` trait via the shared tokio runtime
+// (`crate::runtime().block_on(...)`). UniFFI bridge methods are sync; the
+// shared runtime supplies the async context.
+// ---------------------------------------------------------------------------
+
+use scp_core::bridge::credentials::{BridgeCredentialStore, CredentialType};
+
+/// Parses a credential type string into a [`CredentialType`].
+///
+/// Accepts the four standard variants plus the `Custom:<name>` prefix form,
+/// mirroring the `PyO3` `parse_credential_type` helper.
+fn parse_credential_type(s: &str) -> Result<CredentialType, ScpError> {
+    match s {
+        "OAuthAccessToken" => Ok(CredentialType::OAuthAccessToken),
+        "OAuthRefreshToken" => Ok(CredentialType::OAuthRefreshToken),
+        "ApiKey" => Ok(CredentialType::ApiKey),
+        "WebhookSecret" => Ok(CredentialType::WebhookSecret),
+        other => other.strip_prefix("Custom:").map_or_else(
+            || {
+                Err(ScpError::Validation {
+                    msg: format!(
+                        "invalid credential type '{other}': expected 'OAuthAccessToken', \
+                         'OAuthRefreshToken', 'ApiKey', 'WebhookSecret', or 'Custom:<name>'"
+                    ),
+                    code: codes::VALID_7058.to_owned(),
+                })
+            },
+            |name| Ok(CredentialType::Custom(name.to_owned())),
+        ),
+    }
+}
+
+/// Validates that a credential key is exactly 32 bytes, returning it
+/// wrapped in [`Zeroizing`] so the copy is zeroed on drop.
+fn parse_credential_key_bytes(key: &[u8]) -> Result<Zeroizing<[u8; 32]>, ScpError> {
+    <[u8; 32]>::try_from(key)
+        .map(Zeroizing::new)
+        .map_err(|_| ScpError::Validation {
+            msg: format!(
+                "bridge_credential_key must be exactly 32 bytes, got {}",
+                key.len()
+            ),
+            code: codes::VALID_7057.to_owned(),
+        })
+}
+
+/// Maps a `scp-core` `BridgeCredential` to the FFI metadata result. The
+/// encrypted bytes are intentionally dropped — only non-secret metadata
+/// crosses the boundary.
+fn credential_to_result(
+    credential: &scp_core::bridge::credentials::BridgeCredential,
+) -> BridgeCredentialResult {
+    BridgeCredentialResult {
+        bridge_id: credential.bridge_id.clone(),
+        credential_type: credential.credential_type.to_string(),
+        created_at: credential.created_at,
+    }
+}
+
+/// Per-instance implementation of `bridge_credential_provision`.
+fn bridge_credential_provision_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+    credential_type: &str,
+    plaintext: &[u8],
+    bridge_credential_key: &[u8],
+) -> Result<BridgeCredentialResult, ScpError> {
+    let ct = parse_credential_type(credential_type)?;
+    let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
+    let store = bi.credential_store();
+
+    let credential = crate::runtime()
+        .block_on(store.provision(bridge_id, ct, plaintext, &key_bytes))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential provision failed: {e}"),
+            code: codes::CTX_2105.to_owned(),
+        })?;
+
+    Ok(credential_to_result(&credential))
+}
+
+/// Per-instance implementation of `bridge_credential_retrieve`.
+fn bridge_credential_retrieve_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+    credential_type: &str,
+    bridge_credential_key: &[u8],
+) -> Result<Vec<u8>, ScpError> {
+    let ct = parse_credential_type(credential_type)?;
+    let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
+    let store = bi.credential_store();
+
+    let plaintext = crate::runtime()
+        .block_on(store.retrieve(bridge_id, &ct, &key_bytes))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential retrieve failed: {e}"),
+            code: codes::CTX_2106.to_owned(),
+        })?;
+
+    Ok(plaintext.to_vec())
+}
+
+/// Per-instance implementation of `bridge_credential_rotate`.
+fn bridge_credential_rotate_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+    credential_type: &str,
+    new_plaintext: &[u8],
+    bridge_credential_key: &[u8],
+) -> Result<BridgeCredentialResult, ScpError> {
+    let ct = parse_credential_type(credential_type)?;
+    let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
+    let store = bi.credential_store();
+
+    let credential = crate::runtime()
+        .block_on(store.rotate(bridge_id, &ct, new_plaintext, &key_bytes))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential rotate failed: {e}"),
+            code: codes::CTX_2107.to_owned(),
+        })?;
+
+    Ok(credential_to_result(&credential))
+}
+
+/// Per-instance implementation of `bridge_credential_revoke`.
+fn bridge_credential_revoke_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+) -> Result<(), ScpError> {
+    let store = bi.credential_store();
+
+    crate::runtime()
+        .block_on(store.revoke(bridge_id))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential revoke failed: {e}"),
+            code: codes::CTX_2108.to_owned(),
+        })?;
+
+    Ok(())
+}
+
+/// Per-instance implementation of `bridge_credential_list`.
+fn bridge_credential_list_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+) -> Result<Vec<String>, ScpError> {
+    let store = bi.credential_store();
+
+    let types = crate::runtime()
+        .block_on(store.list(bridge_id))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential list failed: {e}"),
+            code: codes::CTX_2109.to_owned(),
+        })?;
+
+    Ok(types.iter().map(std::string::ToString::to_string).collect())
+}
+
+/// Per-instance implementation of `bridge_credential_store_key`.
+fn bridge_credential_store_key_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+    key: &[u8],
+) -> Result<(), ScpError> {
+    let key_bytes = parse_credential_key_bytes(key)?;
+    let store = bi.credential_store();
+
+    crate::runtime()
+        .block_on(store.store_bridge_credential_key(bridge_id, key_bytes))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential key store failed: {e}"),
+            code: codes::CTX_2111.to_owned(),
+        })?;
+
+    Ok(())
+}
+
+/// Per-instance implementation of `bridge_credential_get_key`.
+fn bridge_credential_get_key_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+) -> Result<Vec<u8>, ScpError> {
+    let store = bi.credential_store();
+
+    let key = crate::runtime()
+        .block_on(store.get_bridge_credential_key(bridge_id))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential key retrieval failed: {e}"),
+            code: codes::CTX_2112.to_owned(),
+        })?;
+
+    Ok(key.to_vec())
+}
+
+/// Per-instance implementation of `bridge_credential_delete_key`.
+fn bridge_credential_delete_key_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+) -> Result<(), ScpError> {
+    let store = bi.credential_store();
+
+    crate::runtime()
+        .block_on(store.delete_bridge_credential_key(bridge_id))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential key deletion failed: {e}"),
+            code: codes::CTX_2113.to_owned(),
+        })?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -7210,6 +7614,21 @@ impl Scp {
                                 tokio::runtime::Handle::current(),
                             )?;
 
+                            // Register the freshly created in-memory identity
+                            // in the per-instance custody registry, keyed by DID,
+                            // so `identity_remove_if_present` reports presence —
+                            // matching the NAPI bridge whose identity creation
+                            // paths register a bundled entry. Shares the
+                            // entry/cap logic with the link-attestation path.
+                            // Done before `identity` is moved into the handle so
+                            // the DID and active signing key are still available.
+                            register_identity_custody(
+                                &bi,
+                                &identity.did,
+                                &key_custody,
+                                identity.active_signing_key,
+                            )?;
+
                             let handle = Arc::new(Identity {
                                 did: identity.did.clone(),
                                 custody_type: CustodyMethod::InMemory,
@@ -7480,6 +7899,53 @@ impl Scp {
         let before = entry.len();
         entry.retain(|a| a.id != attestation_id);
         entry.len() < before
+    }
+
+    /// Removes a DID from this instance's SCP-side identity registry.
+    ///
+    /// Drops the retained identity state — the custody provider / key
+    /// handle and any link attestations — for `did` on `&*self.inner`.
+    /// Idempotent: succeeds silently when the DID is not in the registry,
+    /// matching the NAPI bridge's `identity_remove` semantics (where a
+    /// single registry entry bundles custody and attestations).
+    ///
+    /// The DID document published to the DHT is unaffected; this only
+    /// releases the bridge's in-memory state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Validation` when `did` is not a syntactically
+    /// valid DID, mirroring the `PyO3` reference bridge's `identity_remove`.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub fn identity_remove(&self, did: String) -> Result<(), ScpError> {
+        validate_did(&did)?;
+        identity_custody_registry(&self.inner).remove(&did);
+        identity_link_attestation_registry(&self.inner).remove(&did);
+        Ok(())
+    }
+
+    /// Removes a DID from this instance's SCP-side identity registry if
+    /// present, reporting whether the identity was removed.
+    ///
+    /// Returns `true` if the identity was found in the custody registry and
+    /// removed, `false` if the DID was not present. Any link attestations
+    /// for the DID are dropped alongside the identity. Companion to
+    /// [`Scp::identity_remove`] (which is unconditional), matching the NAPI
+    /// bridge's `identity_remove_if_present` semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Validation` when `did` is not a syntactically
+    /// valid DID, mirroring the `PyO3` reference bridge's
+    /// `identity_remove_if_present`.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub fn identity_remove_if_present(&self, did: String) -> Result<bool, ScpError> {
+        validate_did(&did)?;
+        let removed = identity_custody_registry(&self.inner)
+            .remove(&did)
+            .is_some();
+        identity_link_attestation_registry(&self.inner).remove(&did);
+        Ok(removed)
     }
 
     // ===== Context lifecycle — per-instance methods on `Scp` =====
@@ -11345,6 +11811,37 @@ impl Scp {
         event_log_checkpoint_impl(Arc::clone(&self.inner), handle, identity, epoch).await
     }
 
+    /// Generates a signed consistency checkpoint scoped to a member DID.
+    ///
+    /// Signs with the supplied `identity`'s key material and records `did` as
+    /// the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
+    /// `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
+    /// handle is passed explicitly for key material while `did` names the
+    /// member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom). The
+    /// `did` is validated for well-formedness and MUST equal the supplied
+    /// identity's own DID — the recorded signer is always the actual signer.
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    pub async fn event_log_checkpoint_by_did(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+        did: String,
+        epoch: u64,
+    ) -> Result<Checkpoint, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        event_log_checkpoint_by_did_impl(Arc::clone(&self.inner), handle, identity, did, epoch)
+            .await
+    }
+
     /// Per-instance equivalent of the free-function `ucan_validate`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
@@ -11877,6 +12374,24 @@ impl Scp {
         Ok(())
     }
 
+    /// Per-instance equivalent of the free-function `configure_local_transport`.
+    ///
+    /// Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+    /// an in-process loopback `LocalTransportProvider` on this instance's
+    /// `ContextManager`. Unlike `configure_relay_transport`, this performs no
+    /// network I/O — it wires test infrastructure so `context_send` and
+    /// `broadcast_publish` succeed (encryption included) without a real relay.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Validation` if `local_did` fails DID validation.
+    pub fn configure_local_transport(&self, local_did: String) -> Result<(), ScpError> {
+        validate_did(&local_did)?;
+        self.inner
+            .init_context_manager_with_local_transport(&local_did);
+        Ok(())
+    }
+
     /// Per-instance equivalent of the free-function `mcp_server_create`.
     ///
     /// Routes through `&*self.inner`. The MCP server registry is
@@ -12315,6 +12830,86 @@ impl Scp {
             bridge_mode,
             context_id,
         )
+    }
+
+    /// Provisions (stores) an encrypted credential for a bridge instance
+    /// (spec §12.11). Routes through `&self.inner` — credentials live in
+    /// THIS instance's credential store (ADR-048 §1).
+    pub fn bridge_credential_provision(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> Result<BridgeCredentialResult, ScpError> {
+        bridge_credential_provision_on(
+            &self.inner,
+            &bridge_id,
+            &credential_type,
+            &plaintext,
+            &bridge_credential_key,
+        )
+    }
+
+    /// Retrieves and decrypts a credential for a bridge instance (spec §12.11).
+    pub fn bridge_credential_retrieve(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        bridge_credential_key: Vec<u8>,
+    ) -> Result<Vec<u8>, ScpError> {
+        bridge_credential_retrieve_on(
+            &self.inner,
+            &bridge_id,
+            &credential_type,
+            &bridge_credential_key,
+        )
+    }
+
+    /// Rotates (replaces) a credential for a bridge instance (spec §12.11).
+    pub fn bridge_credential_rotate(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        new_plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> Result<BridgeCredentialResult, ScpError> {
+        bridge_credential_rotate_on(
+            &self.inner,
+            &bridge_id,
+            &credential_type,
+            &new_plaintext,
+            &bridge_credential_key,
+        )
+    }
+
+    /// Revokes all credentials for a bridge instance (spec §12.11).
+    pub fn bridge_credential_revoke(&self, bridge_id: String) -> Result<(), ScpError> {
+        bridge_credential_revoke_on(&self.inner, &bridge_id)
+    }
+
+    /// Lists all credential types stored for a bridge instance (spec §12.11).
+    pub fn bridge_credential_list(&self, bridge_id: String) -> Result<Vec<String>, ScpError> {
+        bridge_credential_list_on(&self.inner, &bridge_id)
+    }
+
+    /// Stores a bridge credential key in the custody boundary (spec §12.11).
+    pub fn bridge_credential_store_key(
+        &self,
+        bridge_id: String,
+        key: Vec<u8>,
+    ) -> Result<(), ScpError> {
+        bridge_credential_store_key_on(&self.inner, &bridge_id, &key)
+    }
+
+    /// Retrieves a bridge credential key from the custody boundary (spec §12.11).
+    pub fn bridge_credential_get_key(&self, bridge_id: String) -> Result<Vec<u8>, ScpError> {
+        bridge_credential_get_key_on(&self.inner, &bridge_id)
+    }
+
+    /// Deletes and zeroizes a bridge credential key (spec §12.11).
+    pub fn bridge_credential_delete_key(&self, bridge_id: String) -> Result<(), ScpError> {
+        bridge_credential_delete_key_on(&self.inner, &bridge_id)
     }
 
     /// Per-instance equivalent of the free-function `scpid_sign`.
@@ -12957,6 +13552,21 @@ impl Scp {
                                 tokio::runtime::Handle::current(),
                             )?;
 
+                            // Register the freshly created in-memory identity
+                            // in the per-instance custody registry, keyed by DID,
+                            // so `identity_remove_if_present` reports presence —
+                            // matching the NAPI bridge whose identity creation
+                            // paths register a bundled entry. Shares the
+                            // entry/cap logic with the link-attestation path.
+                            // Done before `identity` is moved into the handle so
+                            // the DID and active signing key are still available.
+                            register_identity_custody(
+                                &bi,
+                                &identity.did,
+                                &key_custody,
+                                identity.active_signing_key,
+                            )?;
+
                             let handle = Arc::new(Identity {
                                 did: identity.did.clone(),
                                 custody_type: CustodyMethod::InMemory,
@@ -13344,12 +13954,7 @@ impl Scp {
         target_did: String,
         name: String,
     ) -> Result<(), ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         if target_did.is_empty() {
             return Err(ScpError::Validation {
                 msg: "target_did must not be empty".to_owned(),
@@ -13372,12 +13977,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `petname_remove`.
     pub fn petname_remove(&self, owner_did: String, target_did: String) -> Result<(), ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let mut guard =
             self.inner
                 .core
@@ -13400,12 +14000,7 @@ impl Scp {
         context_id: String,
         name: String,
     ) -> Result<(), ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         if context_id.is_empty() {
             return Err(ScpError::Validation {
                 msg: "context_id must not be empty".to_owned(),
@@ -13432,12 +14027,7 @@ impl Scp {
         owner_did: String,
         context_id: String,
     ) -> Result<(), ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let mut guard =
             self.inner
                 .core
@@ -13455,12 +14045,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `petname_resolve_did`.
     pub fn petname_resolve_did(&self, owner_did: String, name: String) -> Result<String, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core
@@ -13491,12 +14076,7 @@ impl Scp {
         owner_did: String,
         name: String,
     ) -> Result<String, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core
@@ -13522,12 +14102,7 @@ impl Scp {
         owner_did: String,
         target_did: String,
     ) -> Result<Option<String>, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core
@@ -13549,12 +14124,7 @@ impl Scp {
         owner_did: String,
         context_id: String,
     ) -> Result<Option<String>, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core
@@ -13567,6 +14137,85 @@ impl Scp {
         Ok(guard
             .get(&owner_did)
             .and_then(|map| map.petname_for_context(&context_id).map(str::to_owned)))
+    }
+
+    /// Applies a serialized petname event to the owner's petname map.
+    ///
+    /// The event JSON must match the `PetnameEvent` serde format (§22.9.2).
+    /// This is the event-driven mutation path matching `PetnameMap::apply_event`.
+    pub fn petname_apply_event(
+        &self,
+        owner_did: String,
+        event_json: String,
+    ) -> Result<(), ScpError> {
+        use scp_core::discovery::petnames::PetnameEvent;
+
+        validate_did(&owner_did)?;
+        let event: PetnameEvent =
+            serde_json::from_str(&event_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid petname event JSON: {e}"),
+                code: codes::VALID_7115.to_owned(),
+            })?;
+        let mut guard =
+            self.inner
+                .core
+                .petname_maps()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("petname lock poisoned: {e}"),
+                    code: codes::VALID_7112.to_owned(),
+                })?;
+        let map = guard.entry(owner_did).or_default();
+        map.apply_event(&event);
+        Ok(())
+    }
+
+    /// Returns the number of DID petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::did_petname_count`.
+    pub fn petname_did_count(&self, owner_did: String) -> Result<u32, ScpError> {
+        validate_did(&owner_did)?;
+        let guard = self
+            .inner
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let count = guard.get(&owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::did_petname_count,
+        );
+        u32::try_from(count).map_err(|_| ScpError::Validation {
+            msg: "petname count exceeds u32::MAX".to_owned(),
+            code: codes::VALID_7116.to_owned(),
+        })
+    }
+
+    /// Returns the number of context petnames for an owner.
+    ///
+    /// Mirrors `PetnameMap::context_petname_count`.
+    pub fn petname_context_count(&self, owner_did: String) -> Result<u32, ScpError> {
+        validate_did(&owner_did)?;
+        let guard = self
+            .inner
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let count = guard.get(&owner_did).map_or(
+            0,
+            scp_core::discovery::petnames::PetnameMap::context_petname_count,
+        );
+        u32::try_from(count).map_err(|_| ScpError::Validation {
+            msg: "petname count exceeds u32::MAX".to_owned(),
+            code: codes::VALID_7116.to_owned(),
+        })
     }
 
     // ----- Handle registry methods -----
@@ -14365,6 +15014,41 @@ mod tests {
         // Policy should remain None.
         let result = scp.get_economic_policy(handle).unwrap();
         assert!(result.is_none());
+    }
+
+    /// `configure_local_transport` with a valid DID attaches a
+    /// `ContextManager` to this instance (loopback transport, no network I/O).
+    #[test]
+    fn configure_local_transport_attaches_manager_for_valid_did() {
+        let scp = scp_test();
+        assert!(
+            !scp.inner.core.has_context_manager(),
+            "fresh instance must not have a ContextManager attached"
+        );
+        let result =
+            scp.configure_local_transport("did:key:z6MkfreshLocalTransportTest".to_owned());
+        assert!(result.is_ok(), "valid DID should configure local transport");
+        assert!(
+            scp.inner.core.has_context_manager(),
+            "configure_local_transport must attach a ContextManager"
+        );
+    }
+
+    /// `configure_local_transport` rejects a malformed DID at the FFI boundary
+    /// with `ScpError::Validation` and leaves no `ContextManager` attached.
+    #[test]
+    fn configure_local_transport_rejects_invalid_did() {
+        let scp = scp_test();
+        let result = scp.configure_local_transport("not-a-valid-did".to_owned());
+        let err = result.expect_err("invalid DID must be rejected");
+        assert!(
+            matches!(err, ScpError::Validation { .. }),
+            "expected ScpError::Validation, got {err:?}"
+        );
+        assert!(
+            !scp.inner.core.has_context_manager(),
+            "a rejected DID must not leave a ContextManager attached"
+        );
     }
 
     #[test]
@@ -16224,5 +16908,332 @@ mod tests {
         );
 
         relay.shutdown();
+    }
+
+    // -------------------------------------------------------------------
+    // Bridge credential store lifecycle (§12.11)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_credential_type_variants() {
+        assert!(matches!(
+            parse_credential_type("ApiKey").unwrap(),
+            CredentialType::ApiKey
+        ));
+        assert_eq!(
+            parse_credential_type("Custom:discord").unwrap(),
+            CredentialType::Custom("discord".to_owned())
+        );
+        assert!(parse_credential_type("Nope").is_err());
+    }
+
+    #[test]
+    fn parse_credential_key_bytes_rejects_wrong_length() {
+        assert!(parse_credential_key_bytes(&[0u8; 16]).is_err());
+        assert!(parse_credential_key_bytes(&[0u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn credential_provision_retrieve_rotate_revoke_lifecycle() {
+        let scp = scp_test();
+        let bridge_id = "bridge-cred-uniffi-001".to_owned();
+        let key = vec![9u8; 32];
+
+        let provisioned = scp
+            .bridge_credential_provision(
+                bridge_id.clone(),
+                "ApiKey".to_owned(),
+                b"first-secret".to_vec(),
+                key.clone(),
+            )
+            .unwrap();
+        assert_eq!(provisioned.bridge_id, bridge_id);
+        assert_eq!(provisioned.credential_type, "ApiKey");
+
+        let retrieved = scp
+            .bridge_credential_retrieve(bridge_id.clone(), "ApiKey".to_owned(), key.clone())
+            .unwrap();
+        assert_eq!(retrieved, b"first-secret");
+
+        scp.bridge_credential_rotate(
+            bridge_id.clone(),
+            "ApiKey".to_owned(),
+            b"second-secret".to_vec(),
+            key.clone(),
+        )
+        .unwrap();
+        let rotated = scp
+            .bridge_credential_retrieve(bridge_id.clone(), "ApiKey".to_owned(), key.clone())
+            .unwrap();
+        assert_eq!(rotated, b"second-secret");
+
+        let types = scp.bridge_credential_list(bridge_id.clone()).unwrap();
+        assert_eq!(types, vec!["ApiKey".to_owned()]);
+
+        scp.bridge_credential_revoke(bridge_id.clone()).unwrap();
+        assert!(
+            scp.bridge_credential_retrieve(bridge_id, "ApiKey".to_owned(), key)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn credential_key_store_get_delete_lifecycle() {
+        let scp = scp_test();
+        let bridge_id = "bridge-cred-uniffi-002".to_owned();
+        let key = vec![3u8; 32];
+
+        scp.bridge_credential_store_key(bridge_id.clone(), key.clone())
+            .unwrap();
+        let got = scp.bridge_credential_get_key(bridge_id.clone()).unwrap();
+        assert_eq!(got, key);
+
+        scp.bridge_credential_delete_key(bridge_id.clone()).unwrap();
+        assert!(scp.bridge_credential_get_key(bridge_id).is_err());
+    }
+
+    #[test]
+    fn credential_store_is_per_instance() {
+        let scp_a = scp_test();
+        let scp_b = scp_test();
+        let bridge_id = "bridge-cred-uniffi-003".to_owned();
+        let key = vec![1u8; 32];
+
+        scp_a
+            .bridge_credential_provision(
+                bridge_id.clone(),
+                "ApiKey".to_owned(),
+                b"only-in-a".to_vec(),
+                key.clone(),
+            )
+            .unwrap();
+
+        assert!(
+            scp_b
+                .bridge_credential_retrieve(bridge_id, "ApiKey".to_owned(), key)
+                .is_err(),
+            "credential provisioned on instance A must not be visible on instance B"
+        );
+    }
+
+    #[test]
+    fn petname_apply_event_and_counts_uniffi() {
+        let scp = scp_test();
+        let owner = "did:dht:zUniffiApply".to_owned();
+        scp.petname_apply_event(
+            owner.clone(),
+            r#"{"SetPetname": {"did": "did:dht:zAlice", "name": "alice"}}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(scp.petname_did_count(owner.clone()).unwrap(), 1);
+
+        let json = scp
+            .petname_resolve_did(owner.clone(), "alice".to_owned())
+            .unwrap();
+        let dids: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(dids, vec!["did:dht:zAlice".to_owned()]);
+
+        scp.petname_apply_event(
+            owner.clone(),
+            r#"{"SetContextPetname": {"context_id": "ctx-1", "name": "work"}}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(scp.petname_context_count(owner.clone()).unwrap(), 1);
+
+        scp.petname_apply_event(
+            owner.clone(),
+            r#"{"RemovePetname": {"did": "did:dht:zAlice"}}"#.to_owned(),
+        )
+        .unwrap();
+        assert_eq!(scp.petname_did_count(owner).unwrap(), 0);
+    }
+
+    #[test]
+    fn petname_apply_event_rejects_malformed_uniffi() {
+        let scp = scp_test();
+        assert!(
+            scp.petname_apply_event("did:dht:zOwner".to_owned(), "nope".to_owned())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn petname_counts_empty_owner_errors_uniffi() {
+        let scp = scp_test();
+        assert!(scp.petname_did_count(String::new()).is_err());
+        assert!(scp.petname_context_count(String::new()).is_err());
+    }
+
+    #[test]
+    fn petname_malformed_owner_rejected_uniffi() {
+        // Non-empty but syntactically invalid owner DIDs must be rejected by
+        // the pre-existing petname ops, matching the strict `validate_did`
+        // gate already enforced by the WASM bridge and the §4.7 ops.
+        let scp = scp_test();
+        let bad = "not-a-did".to_owned();
+        assert!(
+            scp.petname_set(bad.clone(), "did:dht:z1".to_owned(), "test".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_remove(bad.clone(), "did:dht:z1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_set_context(bad.clone(), "ctx-1".to_owned(), "work".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_remove_context(bad.clone(), "ctx-1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_resolve_did(bad.clone(), "alice".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_resolve_context(bad.clone(), "work".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_get_for_did(bad.clone(), "did:dht:z1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_get_for_context(bad, "ctx-1".to_owned())
+                .is_err()
+        );
+    }
+
+    /// `identity_remove` / `identity_remove_if_present` must reject a
+    /// non-empty but syntactically invalid DID via the shared `validate_did`
+    /// gate — matching the `PyO3` reference bridge — before touching the
+    /// registry. A syntactically valid but absent DID is accepted as an
+    /// idempotent no-op. Mirrors `petname_malformed_owner_rejected_uniffi`.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[test]
+    fn identity_remove_malformed_did_rejected_uniffi() {
+        let scp = scp_test();
+        let bad = "not-a-did".to_owned();
+        assert!(
+            scp.identity_remove(bad.clone()).is_err(),
+            "identity_remove must reject a malformed DID"
+        );
+        assert!(
+            scp.identity_remove_if_present(bad).is_err(),
+            "identity_remove_if_present must reject a malformed DID"
+        );
+
+        // Accept side: a valid but unregistered DID is a no-op success.
+        let valid_absent = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest".to_owned();
+        scp.identity_remove(valid_absent.clone())
+            .expect("valid DID must not be rejected by identity_remove");
+        assert!(
+            !scp.identity_remove_if_present(valid_absent)
+                .expect("valid DID must not be rejected by identity_remove_if_present"),
+            "removing an unregistered DID must report false"
+        );
+    }
+
+    /// A freshly created in-memory identity must be present in the custody
+    /// registry so `identity_remove_if_present` reports `true` on first
+    /// removal and `false` on the second — matching the NAPI bridge whose
+    /// `identity_create` registers a bundled entry. Pins the §4.1 port-gap
+    /// fix: before it, `identity_create` never populated the registry, so a
+    /// created identity reported `false`. Also exercises the unconditional
+    /// `identity_remove` on a separately created identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn identity_remove_if_present_reports_presence() {
+        let scp = scp_test();
+
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let did = identity.did();
+
+        // First removal of a freshly created identity must report presence.
+        assert!(
+            scp.identity_remove_if_present(did.clone())
+                .expect("identity_remove_if_present must accept a valid DID"),
+            "a freshly created in-memory identity must be present in the \
+             custody registry and report true on first removal"
+        );
+
+        // Second removal must report absence (idempotent).
+        assert!(
+            !scp.identity_remove_if_present(did)
+                .expect("identity_remove_if_present must accept a valid DID"),
+            "removing an already-removed identity must report false"
+        );
+
+        // The unconditional `identity_remove` must succeed on a fresh,
+        // separately created identity.
+        let other = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (second identity)");
+        scp.identity_remove(other.did())
+            .expect("identity_remove must succeed on a registered identity");
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint sender_did ↔ signing-identity binding
+    //
+    // The UniFFI bridge has no DID-keyed identity registry, so the recorded
+    // `sender_did` is bound to the signing `Identity` explicitly inside
+    // `event_log_checkpoint_by_did_impl` (the `did != identity.did` guard).
+    // Without it a caller could record a checkpoint as signed by an arbitrary
+    // DID while signing with an unrelated identity's key — a provenance
+    // forgery. These tests pin that guard so a future re-order or removal of
+    // the binding check breaks here rather than at the Swift/Kotlin boundary.
+    // -----------------------------------------------------------------------
+
+    /// A `did` that differs from the signing identity's own DID must be
+    /// rejected with `SCP-VALID-7000`, and the matching `did` must succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn checkpoint_by_did_binds_recorded_sender_to_signing_identity() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = test_handle_for(&scp);
+
+        // Mismatch: a different, syntactically valid DID is rejected because it
+        // does not match the signing identity's DID.
+        let foreign_did = "did:dht:z6MkForeignSignerThatIsNotTheIdentity".to_owned();
+        assert_ne!(foreign_did, identity.did);
+        let mismatch = scp
+            .event_log_checkpoint_by_did(Arc::clone(&handle), Arc::clone(&identity), foreign_did, 0)
+            .await;
+        match mismatch {
+            Err(ScpError::Validation { code, .. }) => {
+                assert_eq!(
+                    code,
+                    codes::VALID_7000,
+                    "sender_did != identity.did must surface SCP-VALID-7000"
+                );
+            }
+            other => panic!("expected ScpError::Validation (VALID_7000), got {other:?}"),
+        }
+
+        // Happy path: did == identity.did succeeds and the produced checkpoint
+        // is attributed to (and signed by) that same identity.
+        let own_did = identity.did();
+        let checkpoint = scp
+            .event_log_checkpoint_by_did(handle, Arc::clone(&identity), own_did.clone(), 0)
+            .await
+            .expect("checkpoint with matching did must succeed");
+        assert_eq!(
+            checkpoint.sender_did, own_did,
+            "the checkpoint must be attributed to the signing identity's DID"
+        );
+        assert!(
+            !checkpoint.signature.is_empty(),
+            "a successful checkpoint must carry a signature"
+        );
     }
 }

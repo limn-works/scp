@@ -129,7 +129,7 @@ pub(crate) fn scpid_sign_on(
 
         let rt = crate::runtime();
         let response = rt.block_on(core_sign(
-            &entry.custody.0,
+            entry.custody.as_ref(),
             &key_handle,
             &did,
             key_id,

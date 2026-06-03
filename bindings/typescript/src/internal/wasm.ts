@@ -184,6 +184,9 @@ interface WasmModule {
   petname_resolve_context: (ownerDid: string, name: string) => string;
   petname_get_for_did: (ownerDid: string, targetDid: string) => unknown;
   petname_get_for_context: (ownerDid: string, contextId: string) => unknown;
+  petname_apply_event: (ownerDid: string, eventJson: string) => void;
+  petname_did_count: (ownerDid: string) => number;
+  petname_context_count: (ownerDid: string) => number;
   // Handle Registry (§22.3.1)
   handle_register: (
     discoveryContextId: string,
@@ -279,6 +282,8 @@ interface WasmModule {
   ) => Promise<string>;
   identity_link_attestations: (did: string) => string;
   identity_remove_link_attestation: (did: string, attestationId: string) => boolean;
+  identity_remove: (did: string) => void;
+  identity_remove_if_present: (did: string) => boolean;
   identity_verify_link_attestation: (
     attestationJson: string,
     issuerPublicKeyHex: string,
@@ -1497,10 +1502,15 @@ export function createWasmBridge(): Bridge {
     ): Promise<Checkpoint> {
       const wasm = getWasm();
       const result = await wasm.event_log_checkpoint(handle, identityDid, epoch);
+      // WASM cannot sign in-process (ADR-006/ADR-034); it returns the unsigned
+      // signable payload hash for a JS SDK to sign. Surface it so the capability
+      // is actually usable (ADR-048 §7b semantic divergence — see the
+      // `signingPayloadHash` doc on the `Checkpoint` type).
       return {
         root: result.merkleRoot,
         eventCount: result.eventCount,
         timestamp: result.timestamp,
+        signingPayloadHash: result.signingPayloadHash,
       };
     },
 
@@ -1607,6 +1617,21 @@ export function createWasmBridge(): Bridge {
       const result = wasm.petname_get_for_context(ownerDid, contextId);
       if (result == null || result === undefined) return null;
       return result as string;
+    },
+
+    petnameApplyEvent(ownerDid: string, eventJson: string): void {
+      const wasm = getWasm();
+      wasm.petname_apply_event(ownerDid, eventJson);
+    },
+
+    petnameDidCount(ownerDid: string): number {
+      const wasm = getWasm();
+      return wasm.petname_did_count(ownerDid);
+    },
+
+    petnameContextCount(ownerDid: string): number {
+      const wasm = getWasm();
+      return wasm.petname_context_count(ownerDid);
     },
 
     // Handle Registry (§22.3.1)
@@ -1847,6 +1872,16 @@ export function createWasmBridge(): Bridge {
     identityRemoveLinkAttestation(did: string, attestationId: string): boolean {
       const wasm = getWasm();
       return wasm.identity_remove_link_attestation(did, attestationId);
+    },
+
+    identityRemove(did: string): void {
+      const wasm = getWasm();
+      wasm.identity_remove(did);
+    },
+
+    identityRemoveIfPresent(did: string): boolean {
+      const wasm = getWasm();
+      return wasm.identity_remove_if_present(did);
     },
 
     async identityVerifyLinkAttestation(

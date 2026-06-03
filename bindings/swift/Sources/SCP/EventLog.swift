@@ -171,3 +171,37 @@ public func generateEventLogCheckpoint(
 ) async throws -> Checkpoint {
     try await scp.eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
 }
+
+/// Generates a signed consistency checkpoint scoped to a member DID.
+///
+/// Signs with the supplied ``identity``'s key material and records ``did`` as
+/// the checkpoint's sender. The UniFFI bridge holds no DID-keyed identity
+/// registry, so the ``Identity`` handle supplies the key material while
+/// ``did`` names the member the checkpoint is attributed to (e.g. an agent
+/// key). Forwards to ``SCP/eventLogCheckpointByDid(handle:identity:did:epoch:)``.
+///
+/// - Parameters:
+///   - scp: The SDK-level ``SCP`` instance that owns ``handle``.
+///   - handle: The ``ContextHandle`` for the context whose event log to
+///     checkpoint.
+///   - identity: The ``Identity`` whose key material signs the checkpoint.
+///   - did: The DID of the member the checkpoint is attributed to.
+///   - epoch: The current MLS epoch (pass 0 for broadcast contexts).
+/// - Returns: A ``Checkpoint`` containing the signed checkpoint data.
+/// - Throws: ``ScpError/Context(msg:code:)`` if the context is not found.
+///   ``ScpError/Permission(msg:code:)`` if key custody is not available.
+///
+/// ## Provenance
+///
+/// - ADR-011 (Event Log) acceptance criterion 8 in `.docs/adrs/phase-2.md`
+/// - ADR-030 (Pruning/Checkpointing)
+/// - ADR-048 (Multi-instance SCP) §7 (per-SDK idiom)
+public func generateEventLogCheckpointByDid(
+    scp: SCP,
+    handle: ContextHandle,
+    identity: Identity,
+    did: String,
+    epoch: UInt64
+) async throws -> Checkpoint {
+    try await scp.eventLogCheckpointByDid(handle: handle, identity: identity, did: did, epoch: epoch)
+}
