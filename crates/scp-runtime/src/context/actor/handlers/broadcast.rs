@@ -10,19 +10,24 @@
 //! The shim entry points remain during Phase 2A and route through
 //! [`crate::context::broadcast_helpers_legacy`].
 //!
-//! # Publish + key-custody plumbing
+//! # Publish + key-custody plumbing (two-phase reservation)
 //!
 //! The publish entry points on `ContextManager` take
 //! `custody: &impl KeyCustody`. Because
 //! [`KeyCustody`](scp_platform::KeyCustody) uses RPITIT (not
 //! `dyn`-safe), the actor mailbox cannot carry a custody reference
-//! directly. The shim-dispatch methods
-//! [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody)
-//! accepts the custody as a generic parameter and threads it through to
-//! [`dispatch_from_shim_with_custody`]; the command variant carries
-//! only the `KeyHandle`. Non-publish variants use actor mailbox routing
-//! when a target actor exists, even if they arrive through the custody
-//! entry point.
+//! directly — and the actor must not hold `&mut PerContextState` across
+//! an arbitrary-duration host-language `custody.sign().await`. Publish is
+//! therefore split into two custody-free mailbox commands plus a release:
+//! [`BroadcastCommand::ReserveBroadcastPublish`] reserves the sequence and
+//! returns the signing-payload digest; the supervisor signs OUTSIDE the
+//! actor with the caller's custody (see
+//! [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody));
+//! [`BroadcastCommand::ApplyBroadcastPublish`] seals the reserved
+//! sequence. A reservation that is never applied is rolled back via
+//! [`BroadcastCommand::ReleaseBroadcastReservation`]. Each mailbox phase
+//! holds `&mut PerContextState` only briefly, and concurrent publishes
+//! each reserve a distinct sequence.
 //!
 //! # SAGA WIRING DEFERRED — see
 //! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
@@ -37,15 +42,15 @@
 
 use std::time::Duration;
 
-use scp_platform::KeyCustody;
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
 use crate::context::actor::commands::{
-    BlockBroadcastSubscriberReply, BroadcastAdmissionReply, BroadcastBlockPayload,
-    BroadcastCommand, HandleBroadcastKeyRequestReply, PublishBroadcastContentPayload,
-    PublishBroadcastPayload, PublishBroadcastReply, SubscribeBroadcastPayload,
-    SubscribeBroadcastReply, UnsubscribeBroadcastPayload, UnsubscribeBroadcastReply,
+    ApplyBroadcastPublishPayload, BlockBroadcastSubscriberReply, BroadcastAdmissionReply,
+    BroadcastBlockPayload, BroadcastCommand, HandleBroadcastKeyRequestReply, PublishBroadcastReply,
+    ReleaseBroadcastReservationPayload, ReserveBroadcastPublishPayload,
+    ReserveBroadcastPublishReply, SubscribeBroadcastPayload, SubscribeBroadcastReply,
+    UnsubscribeBroadcastPayload, UnsubscribeBroadcastReply,
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
@@ -57,10 +62,13 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatch a [`BroadcastCommand`] against actor-owned state and deps.
 ///
-/// Publish variants require a key custody reference which cannot cross
-/// the actor mailbox; this entry point rejects them with a typed error
-/// directing the caller to the generic
-/// [`dispatch_from_shim_with_custody`] path instead.
+/// The single-shot `PublishBroadcast` / `PublishBroadcastContent`
+/// variants require a key custody reference which cannot cross the actor
+/// mailbox; this entry point rejects them with a typed error directing
+/// the caller to the two-phase reserve/apply path. The custody-free
+/// `ReserveBroadcastPublish` / `ApplyBroadcastPublish` /
+/// `ReleaseBroadcastReservation` variants ARE handled here against
+/// actor-owned state.
 pub async fn dispatch(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -76,20 +84,6 @@ pub(crate) async fn dispatch_from_shim(
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
     Box::pin(shim_dispatch_inner_no_custody(supervisor, cmd)).await
-}
-
-/// Shim-callable dispatch for publish variants that need a key custody
-/// reference. The caller (shim) provides its concrete custody type; the
-/// handler passes it straight through to the hoisted
-/// [`broadcast_helpers::publish_broadcast`](crate::context::broadcast_helpers_legacy::publish_broadcast_legacy)
-/// / [`broadcast_helpers::publish_broadcast_content`](crate::context::broadcast_helpers_legacy::publish_broadcast_content_legacy)
-/// free functions.
-pub(crate) async fn dispatch_from_shim_with_custody<C: KeyCustody>(
-    supervisor: &Supervisor,
-    cmd: BroadcastCommand,
-    custody: &C,
-) -> Outcome<()> {
-    Box::pin(shim_dispatch_inner_with_custody(supervisor, cmd, custody)).await
 }
 
 async fn dispatch_inner(
@@ -149,6 +143,15 @@ async fn dispatch_inner(
                  route through Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
             let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
             Outcome::err(ContextError::InvalidState(MSG.to_owned()))
+        }
+        BroadcastCommand::ReserveBroadcastPublish { payload, reply } => {
+            handle_reserve_broadcast_publish(state, deps, *payload, reply).await
+        }
+        BroadcastCommand::ApplyBroadcastPublish { payload, reply } => {
+            handle_apply_broadcast_publish(state, deps, *payload, reply).await
+        }
+        BroadcastCommand::ReleaseBroadcastReservation { payload, reply } => {
+            handle_release_broadcast_reservation(state, *payload, reply)
         }
         BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => {
             reply_saga_deferred(reply)
@@ -216,28 +219,32 @@ async fn shim_dispatch_inner_no_custody(
             let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
             Outcome::err(ContextError::InvalidState(MSG.to_owned()))
         }
+        BroadcastCommand::ReserveBroadcastPublish { payload, reply } => {
+            // Two-phase publish requires a per-context actor (the
+            // reservation lives in actor-owned state). Reaching the shim
+            // means no actor is registered — surface a typed error rather
+            // than fall back to a DashMap read.
+            const MSG: &str = "ReserveBroadcastPublish requires a registered per-context actor";
+            let _ = (&payload.context_id, &payload.author_did);
+            let _ = reply.send(Err(ContextError::ContextNotRegistered(MSG.to_owned())));
+            Outcome::err(ContextError::ContextNotRegistered(MSG.to_owned()))
+        }
+        BroadcastCommand::ApplyBroadcastPublish { payload, reply } => {
+            const MSG: &str = "ApplyBroadcastPublish requires a registered per-context actor";
+            let _ = &payload.context_id;
+            let _ = reply.send(Err(ContextError::ContextNotRegistered(MSG.to_owned())));
+            Outcome::err(ContextError::ContextNotRegistered(MSG.to_owned()))
+        }
+        BroadcastCommand::ReleaseBroadcastReservation { payload, reply } => {
+            // No actor → no reservation could have been issued. Idempotent
+            // release: reply Ok so an abort path never errors spuriously.
+            let _ = &payload.context_id;
+            let _ = reply.send(Ok(()));
+            Outcome::ok(())
+        }
         BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => {
             reply_saga_deferred(reply)
         }
-    }
-}
-
-async fn shim_dispatch_inner_with_custody<C: KeyCustody>(
-    supervisor: &Supervisor,
-    cmd: BroadcastCommand,
-    custody: &C,
-) -> Outcome<()> {
-    match cmd {
-        BroadcastCommand::PublishBroadcast { payload, reply } => {
-            shim_handle_publish_broadcast(supervisor, *payload, custody, reply).await
-        }
-        BroadcastCommand::PublishBroadcastContent { payload, reply } => {
-            shim_handle_publish_broadcast_content(supervisor, *payload, custody, reply).await
-        }
-        // Non-publish variants do not need a custody reference. Fall
-        // through to the no-custody dispatch so the custody-generic
-        // shim method can carry every variant (not just publish).
-        other => shim_dispatch_inner_no_custody(supervisor, other).await,
     }
 }
 
@@ -581,32 +588,30 @@ async fn shim_handle_unsubscribe_broadcast(
     outcome
 }
 
-async fn shim_handle_publish_broadcast<C: KeyCustody>(
-    supervisor: &Supervisor,
-    p: PublishBroadcastPayload,
-    custody: &C,
-    reply: PublishBroadcastReply,
+async fn handle_reserve_broadcast_publish(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    p: ReserveBroadcastPublishPayload,
+    reply: ReserveBroadcastPublishReply,
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
 
-    let publish_fut = crate::context::broadcast_helpers_legacy::publish_broadcast_legacy(
-        supervisor,
-        &p.context_id,
-        &p.author_did,
-        &p.payload,
-        custody,
-        &p.signing_key_handle,
-    );
+    let reserve_fut = async {
+        crate::context::broadcast_helpers::reserve_broadcast_publish(state, deps, &p.author_did)
+    };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, publish_fut).await {
-        Ok(Ok(env)) => (Outcome::ok_mutated(()), Ok(env)),
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reserve_fut).await {
+        // Reservation mutates actor state (consumes the sequence), so the
+        // outcome is `mutated` even on the happy path — the apply or a
+        // later release reconciles it.
+        Ok(Ok(out)) => (Outcome::ok_mutated(()), Ok(out)),
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);
             (Outcome::err_mutated(sketch), Err(e))
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "publish_broadcast exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "reserve_broadcast_publish exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -617,24 +622,26 @@ async fn shim_handle_publish_broadcast<C: KeyCustody>(
     outcome
 }
 
-async fn shim_handle_publish_broadcast_content<C: KeyCustody>(
-    supervisor: &Supervisor,
-    p: PublishBroadcastContentPayload,
-    custody: &C,
+async fn handle_apply_broadcast_publish(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    p: ApplyBroadcastPublishPayload,
     reply: PublishBroadcastReply,
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
 
-    let publish_fut = crate::context::broadcast_helpers_legacy::publish_broadcast_content_legacy(
-        supervisor,
-        &p.context_id,
-        &p.author_did,
-        p.content,
-        custody,
-        &p.signing_key_handle,
-    );
+    let apply_fut = async {
+        crate::context::broadcast_helpers::apply_broadcast_publish(
+            state,
+            deps,
+            &p.context_id,
+            &p.reservation_id,
+            &p.signature,
+            &p.payload,
+        )
+    };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, publish_fut).await {
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, apply_fut).await {
         Ok(Ok(env)) => (Outcome::ok_mutated(()), Ok(env)),
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);
@@ -642,7 +649,7 @@ async fn shim_handle_publish_broadcast_content<C: KeyCustody>(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "publish_broadcast_content exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "apply_broadcast_publish exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -651,6 +658,18 @@ async fn shim_handle_publish_broadcast_content<C: KeyCustody>(
 
     let _ = reply.send(reply_result);
     outcome
+}
+
+fn handle_release_broadcast_reservation(
+    state: &mut PerContextState,
+    p: ReleaseBroadcastReservationPayload,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let ReleaseBroadcastReservationPayload { reservation_id, .. } = p;
+    crate::context::broadcast_helpers::release_broadcast_reservation(state, &reservation_id);
+    let _ = reply.send(Ok(()));
+    // Releasing rolls the reserved sequence back — that is a mutation.
+    Outcome::ok_mutated(())
 }
 
 async fn shim_handle_block_broadcast_subscriber(

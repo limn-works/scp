@@ -145,6 +145,64 @@ pub struct WelcomeProcessing {
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast-publish reservation (ADR-049 §SequenceReservation, two-phase
+// mailbox publish)
+// ---------------------------------------------------------------------------
+
+/// Opaque identifier for an in-flight broadcast-publish reservation.
+///
+/// Minted at phase 1 (`ReserveBroadcastPublish`) and echoed back by the
+/// caller at phase 2 (`ApplyBroadcastPublish`) so the actor can match the
+/// apply to the exact reservation it issued. Random per reservation so a
+/// stale or replayed apply cannot collide with a live reservation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BroadcastReservationId(pub String);
+
+impl BroadcastReservationId {
+    /// Mint a fresh random reservation id.
+    #[must_use]
+    pub fn new_random() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+
+/// State the actor holds between the two phases of a broadcast publish.
+///
+/// Phase 1 ([`reserve_broadcast_publish`]) reserves the broadcast
+/// sequence and records everything the seal will need so phase 2
+/// ([`apply_broadcast_publish`]) is deterministic — the apply seals with
+/// the EXACT `reserved_sequence`, `timestamp`, and `nonce` the caller
+/// signed, so the signature remains valid. The `payload` itself is not
+/// signed (the signing payload binds only a `None`-provenance hash), so
+/// the caller supplies it at apply time.
+///
+/// Held in [`PerContextState::pending_broadcast_publishes`]. If the apply
+/// never arrives the reservation is rolled back (the reserved sequence is
+/// returned to the author's counter when it is still the head).
+///
+/// [`reserve_broadcast_publish`]: crate::context::broadcast_helpers::reserve_broadcast_publish
+/// [`apply_broadcast_publish`]: crate::context::broadcast_helpers::apply_broadcast_publish
+#[derive(Debug, Clone)]
+pub struct PendingBroadcastPublish {
+    /// Author DID this reservation belongs to.
+    pub author_did: DID,
+    /// The broadcast sequence reserved for this publish (consumed from
+    /// the author's `next_sequence` at phase 1). The apply phase seals
+    /// with exactly this value.
+    pub reserved_sequence: u64,
+    /// The author's broadcast key epoch at reservation time. Carried so
+    /// apply can detect an epoch change between phases (key rotation) and
+    /// reject a stale reservation rather than seal under the wrong key.
+    pub key_epoch: u64,
+    /// Unix-ms timestamp captured at reservation time and bound into the
+    /// signed payload; apply seals with the same value.
+    pub timestamp: u64,
+    /// AES-256-GCM nonce captured at reservation time and bound into the
+    /// signed payload; apply seals with the same value.
+    pub nonce: [u8; 12],
+}
+
+// ---------------------------------------------------------------------------
 // RecvSequenceTracker — minimal skeleton for the actor's anti-replay counter
 // ---------------------------------------------------------------------------
 
@@ -741,6 +799,20 @@ pub struct PerContextState {
     /// rejecting new Prepare while this map is non-empty.
     pub saga_pending: HashMap<SagaId, SagaPreparedState>,
 
+    /// In-flight broadcast-publish reservations awaiting their apply
+    /// phase (ADR-049 §SequenceReservation). Phase 1
+    /// (`ReserveBroadcastPublish`) reserves a broadcast sequence and
+    /// inserts a [`PendingBroadcastPublish`] here keyed by a fresh
+    /// [`BroadcastReservationId`]; the caller signs the broadcast signing
+    /// payload outside the actor (the `KeyCustody` signer is not
+    /// mailbox-addressable), then phase 2 (`ApplyBroadcastPublish`)
+    /// removes the entry and seals with the reserved sequence. A
+    /// reservation that is never applied (signing failed, caller dropped)
+    /// is rolled back so the sequence is not burned — matching the legacy
+    /// single-phase behavior where a signing failure preceded any
+    /// increment. Empty outside an in-flight publish.
+    pub pending_broadcast_publishes: HashMap<BroadcastReservationId, PendingBroadcastPublish>,
+
     /// Scratchpad held during multi-step MLS Welcome processing. `None`
     /// outside an active Welcome flow.
     pub welcome_scratchpad: Option<WelcomeProcessing>,
@@ -875,6 +947,7 @@ impl PerContextState {
             send_tracker: SendSequenceTracker::new(),
             recv_tracker: RecvSequenceTracker::new(),
             saga_pending: HashMap::new(),
+            pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
             lifecycle_state: ContextLifecycleState::Open,
             mode,
@@ -1012,6 +1085,7 @@ mod tests {
             send_tracker,
             recv_tracker,
             saga_pending,
+            pending_broadcast_publishes,
             welcome_scratchpad,
             lifecycle_state,
             mode,
@@ -1064,6 +1138,7 @@ mod tests {
         assert_eq!(send_tracker.last_issued(), 0);
         let _ = recv_tracker.last_seen(&DID("did:example:any".to_owned()));
         assert!(saga_pending.is_empty());
+        assert!(pending_broadcast_publishes.is_empty());
         assert!(welcome_scratchpad.is_none());
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);
 
@@ -1109,6 +1184,7 @@ mod tests {
             send_tracker: _,
             recv_tracker: _,
             saga_pending: _,
+            pending_broadcast_publishes: _,
             welcome_scratchpad: _,
             lifecycle_state: _,
             mode,

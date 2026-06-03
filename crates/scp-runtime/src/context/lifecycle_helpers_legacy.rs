@@ -336,6 +336,7 @@ pub async fn create_context_legacy(
         // start empty at creation; lifecycle is Open.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,

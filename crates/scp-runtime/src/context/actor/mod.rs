@@ -1324,6 +1324,18 @@ impl ContextActor {
                 reply,
                 "broadcast::broadcast_admission (use Supervisor::dispatch_broadcast_command during commit 11)",
             ),
+            BroadcastCommand::ReserveBroadcastPublish { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::reserve_broadcast_publish (use Supervisor::dispatch_broadcast_command_with_custody)",
+            ),
+            BroadcastCommand::ApplyBroadcastPublish { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::apply_broadcast_publish (use Supervisor::dispatch_broadcast_command_with_custody)",
+            ),
+            BroadcastCommand::ReleaseBroadcastReservation { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::release_broadcast_reservation (use Supervisor::dispatch_broadcast_command_with_custody)",
+            ),
             BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => ack_not_impl(
                 reply,
                 "broadcast::initiate_broadcast_hosting_handshake (saga wiring deferred to commit 11.5 — see DEFERRED-commit-11-saga-use-cases.md)",

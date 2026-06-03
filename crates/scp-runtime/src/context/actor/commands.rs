@@ -1143,6 +1143,14 @@ pub type UnsubscribeBroadcastReply =
 pub type PublishBroadcastReply =
     oneshot::Sender<Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError>>;
 
+/// Reply-channel type alias for [`BroadcastCommand::ReserveBroadcastPublish`]
+/// (phase 1 of the two-phase publish path). Returns the reservation id plus
+/// the signing-payload digest the caller must sign. Factored out to satisfy
+/// `clippy::type_complexity`.
+pub type ReserveBroadcastPublishReply = oneshot::Sender<
+    Result<crate::context::broadcast_helpers::BroadcastPublishReservationOutcome, ContextError>,
+>;
+
 /// Reply-channel type alias for
 /// [`BroadcastCommand::BlockBroadcastSubscriber`]. Factored out to satisfy
 /// `clippy::type_complexity`.
@@ -1242,6 +1250,44 @@ pub struct PublishBroadcastContentPayload {
     pub signing_key_handle: scp_platform::KeyHandle,
 }
 
+/// Payload for [`BroadcastCommand::ReserveBroadcastPublish`] — phase 1 of
+/// the two-phase publish path (ADR-049 §SequenceReservation). Custody-free:
+/// the actor reserves the broadcast sequence and returns the signing-payload
+/// digest; the caller signs it OUTSIDE the actor and applies the reservation
+/// via [`BroadcastCommand::ApplyBroadcastPublish`].
+pub struct ReserveBroadcastPublishPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Author DID (registered in the broadcast context).
+    pub author_did: scp_identity::DID,
+}
+
+/// Payload for [`BroadcastCommand::ApplyBroadcastPublish`] — phase 2 of the
+/// two-phase publish path. Carries the caller-produced signature plus the
+/// reservation id and the plaintext payload. Custody-free: signing already
+/// happened outside the actor.
+pub struct ApplyBroadcastPublishPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Reservation id returned by phase 1.
+    pub reservation_id: crate::context::actor::state::BroadcastReservationId,
+    /// Ed25519 signature (64 bytes) over the phase-1 signing payload.
+    pub signature: Vec<u8>,
+    /// Plaintext payload bytes to seal.
+    pub payload: Vec<u8>,
+}
+
+/// Payload for [`BroadcastCommand::ReleaseBroadcastReservation`] — abort of
+/// a two-phase publish whose apply will never arrive (the caller's signing
+/// failed, or the caller is aborting). Releases the reserved sequence so it
+/// is not burned. Custody-free.
+pub struct ReleaseBroadcastReservationPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Reservation id returned by phase 1.
+    pub reservation_id: crate::context::actor::state::BroadcastReservationId,
+}
+
 /// Payload for
 /// [`BroadcastCommand::BlockBroadcastSubscriber`] and
 /// [`BroadcastCommand::UnblockBroadcastSubscriber`]. Boxed for
@@ -1322,6 +1368,39 @@ pub enum BroadcastCommand {
         payload: Box<PublishBroadcastContentPayload>,
         /// Oneshot reply channel. See [`PublishBroadcastReply`].
         reply: PublishBroadcastReply,
+    },
+
+    /// Phase 1 of the two-phase publish path (ADR-049
+    /// §SequenceReservation). Reserve the broadcast sequence and return
+    /// the signing-payload digest. Custody-free — the caller signs
+    /// outside the actor. Routed through the per-context actor mailbox.
+    ReserveBroadcastPublish {
+        /// Boxed owned payload.
+        payload: Box<ReserveBroadcastPublishPayload>,
+        /// Oneshot reply channel. See [`ReserveBroadcastPublishReply`].
+        reply: ReserveBroadcastPublishReply,
+    },
+
+    /// Phase 2 of the two-phase publish path. Seal the reserved sequence
+    /// with the caller-produced signature, emit the event, send on the
+    /// transport, and append to the event log. Custody-free. Routed
+    /// through the per-context actor mailbox.
+    ApplyBroadcastPublish {
+        /// Boxed owned payload.
+        payload: Box<ApplyBroadcastPublishPayload>,
+        /// Oneshot reply channel. See [`PublishBroadcastReply`].
+        reply: PublishBroadcastReply,
+    },
+
+    /// Abort a two-phase publish whose apply will never arrive (signing
+    /// failed, or the caller is aborting). Releases the reserved sequence
+    /// so it is not burned. Custody-free. Routed through the per-context
+    /// actor mailbox.
+    ReleaseBroadcastReservation {
+        /// Boxed owned payload.
+        payload: Box<ReleaseBroadcastReservationPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
     /// Block a subscriber from receiving future broadcasts from a

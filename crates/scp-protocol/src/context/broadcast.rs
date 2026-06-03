@@ -450,6 +450,40 @@ pub struct BroadcastPublishMetadata<'a> {
     pub key_epoch: u64,
 }
 
+/// Outcome of [`BroadcastContext::reserve_publish`] (phase 1 of the
+/// two-phase publish path).
+///
+/// Holds the sequence number atomically consumed for this in-flight
+/// publish plus the author's current key epoch. The caller signs the
+/// broadcast signing payload (built from these values) outside the
+/// state-owning actor, then either applies the reservation via
+/// [`BroadcastContext::apply_reserved_publish`] (phase 2) or releases it
+/// via [`BroadcastContext::rollback_reserved_publish`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BroadcastPublishReservation {
+    /// The sequence number reserved for this publish. Stable across the
+    /// two phases — the apply phase seals with exactly this value.
+    pub reserved_sequence: u64,
+    /// The author's broadcast key epoch at reservation time.
+    pub key_epoch: u64,
+}
+
+/// Sealed-publish inputs for [`BroadcastContext::apply_reserved_publish`].
+///
+/// Bundles the values captured at reservation time (phase 2) plus the
+/// caller-produced signature so the apply seals exactly what was signed.
+#[derive(Debug, Clone)]
+pub struct ReservedPublishApply {
+    /// The reserved sequence to seal with (NOT re-incremented).
+    pub sequence: u64,
+    /// Unix-ms timestamp captured at reservation time.
+    pub timestamp: u64,
+    /// Ed25519 signature over the phase-1 signing payload.
+    pub signature: ed25519_dalek::Signature,
+    /// Optional provenance metadata (§7.7.1).
+    pub provenance: Option<crate::provenance::DataProvenance>,
+}
+
 // ---------------------------------------------------------------------------
 // BroadcastContext
 // ---------------------------------------------------------------------------
@@ -1212,6 +1246,137 @@ impl BroadcastContext {
 
         seal_broadcast(&broadcast_key, payload, nonce, &params)
             .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // Reserve / apply publish (two-phase, actor-mailbox split)
+    // -----------------------------------------------------------------------
+
+    /// Reserve the next broadcast sequence number for `author_did`,
+    /// consuming the slot atomically.
+    ///
+    /// This is phase 1 of the two-phase publish path used when the
+    /// signature is produced outside the state-owning actor (the
+    /// `KeyCustody` signer is not addressable across the actor mailbox,
+    /// so the actor cannot hold `&mut self` across the async sign — see
+    /// ADR-049). Phase 1 reserves the sequence so a concurrent publish on
+    /// the same author cannot be handed the same number; phase 2
+    /// ([`apply_reserved_publish`](Self::apply_reserved_publish)) seals
+    /// with the reserved sequence after the signature returns.
+    ///
+    /// Increments the author's `next_sequence` and returns the reserved
+    /// value plus the current `key_epoch`. If the caller never applies the
+    /// reservation (signing failed, the caller dropped before phase 2),
+    /// it MUST call
+    /// [`rollback_reserved_publish`](Self::rollback_reserved_publish) so
+    /// the sequence is not burned — matching the legacy single-phase
+    /// behavior, where a signing failure occurred before any increment.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if `author_did` is not a
+    ///   registered author (does not hold `messages:write`).
+    /// - [`ContextError::MemberNotFound`] if the author entry is missing.
+    /// - [`ContextError::CryptoFailed`] on sequence overflow.
+    pub fn reserve_publish(
+        &mut self,
+        author_did: &str,
+    ) -> Result<BroadcastPublishReservation, ContextError> {
+        if !self.can_write(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "{author_did} is not an author (messages:write required)"
+            )));
+        }
+
+        let author = self.authors.get_mut(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        let reserved_sequence = author.next_sequence;
+        author.next_sequence = reserved_sequence
+            .checked_add(1)
+            .ok_or_else(|| ContextError::CryptoFailed("broadcast sequence overflow".to_owned()))?;
+
+        Ok(BroadcastPublishReservation {
+            reserved_sequence,
+            key_epoch: author.epoch,
+        })
+    }
+
+    /// Apply a reservation produced by
+    /// [`reserve_publish`](Self::reserve_publish): seal `payload` with the
+    /// already-reserved `sequence` instead of consuming a fresh one.
+    ///
+    /// This is phase 2 of the two-phase publish path. It does NOT
+    /// increment `next_sequence` (phase 1 already did). The resulting
+    /// `BroadcastEnvelope` is byte-identical to the single-phase
+    /// [`publish`](Self::publish) output for the same `(sequence,
+    /// timestamp, signature, nonce, provenance)` inputs.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if `author_did` is no longer a
+    ///   registered author (e.g. removed between phases).
+    /// - [`ContextError::MemberNotFound`] if the author entry is missing.
+    /// - [`ContextError::CryptoFailed`] if the AES-256-GCM seal fails.
+    pub fn apply_reserved_publish(
+        &mut self,
+        author_did: &str,
+        payload: &[u8],
+        nonce: &[u8; 12],
+        apply: ReservedPublishApply,
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        if !self.can_write(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "{author_did} is not an author (messages:write required)"
+            )));
+        }
+
+        let author = self.authors.get(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        let broadcast_key = BroadcastKey::from_parts(
+            author.broadcast_key.clone(),
+            author.epoch,
+            author.author_did.clone(),
+        );
+
+        let params = SealBroadcastParams {
+            context_id: &self.context_id,
+            sequence: apply.sequence,
+            timestamp: apply.timestamp,
+            provenance: apply.provenance,
+            signature: apply.signature,
+        };
+
+        seal_broadcast(&broadcast_key, payload, nonce, &params)
+            .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
+    }
+
+    /// Roll back a reservation produced by
+    /// [`reserve_publish`](Self::reserve_publish) that was never applied.
+    ///
+    /// Only the head reservation is rolled back: the decrement fires iff
+    /// `author.next_sequence == reserved_sequence + 1` (i.e. no younger
+    /// reservation has advanced the counter past this one). This mirrors
+    /// [`MembershipState::rollback_sequence_number`] and
+    /// `SendSequenceTracker::rollback` — a stale (non-head) rollback is a
+    /// silent no-op, so a younger in-flight reservation's number is never
+    /// re-used. A non-head rollback leaves a one-slot gap rather than
+    /// corrupting monotonicity; this matches the legacy transport-failure
+    /// behavior, which also burned the sequence rather than reusing it.
+    ///
+    /// No-op if the author is not registered (e.g. removed between
+    /// phases).
+    ///
+    /// [`MembershipState::rollback_sequence_number`]: crate::context::membership::MembershipState::rollback_sequence_number
+    pub fn rollback_reserved_publish(&mut self, author_did: &str, reserved_sequence: u64) {
+        if let Some(author) = self.authors.get_mut(author_did)
+            && author.next_sequence == reserved_sequence.saturating_add(1)
+        {
+            author.next_sequence = reserved_sequence;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3492,6 +3657,145 @@ mod tests {
                 "{sub_did} must decrypt the correct plaintext"
             );
         }
+    }
+
+    /// Apply a two-phase publish using an already-built reservation:
+    /// signs the phase-1 payload and seals with the reserved sequence.
+    fn test_apply_reserved(
+        ctx: &mut BroadcastContext,
+        author_did: &str,
+        payload: &[u8],
+        reservation: BroadcastPublishReservation,
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        use crate::crypto::sender_keys::{
+            SigningPayloadFields, build_broadcast_signing_payload, compute_provenance_hash,
+            generate_broadcast_nonce,
+        };
+        use ed25519_dalek::Signer;
+
+        let sk = test_broadcast_signing_key();
+        let timestamp = 1_700_000_000_000;
+        let nonce = generate_broadcast_nonce();
+        let provenance_hash =
+            compute_provenance_hash(None).map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let context_id = ctx.context_id().to_owned();
+        let signing_payload = build_broadcast_signing_payload(&SigningPayloadFields {
+            version: crate::envelope::SCP_PROTOCOL_VERSION,
+            context_id: &context_id,
+            author_did,
+            sequence: reservation.reserved_sequence,
+            key_epoch: reservation.key_epoch,
+            timestamp,
+            nonce: &nonce,
+            provenance_hash: &provenance_hash,
+        })
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let signature = sk.sign(&signing_payload);
+
+        ctx.apply_reserved_publish(
+            author_did,
+            payload,
+            &nonce,
+            ReservedPublishApply {
+                sequence: reservation.reserved_sequence,
+                timestamp,
+                signature,
+                provenance: None,
+            },
+        )
+    }
+
+    /// Two concurrent reservations against the same author get DISTINCT
+    /// sequence numbers — the core invariant the two-phase split must
+    /// preserve. Even when both reservations are taken before either is
+    /// applied (the concurrent-publish hazard the single-phase shim could
+    /// not close), the reserved sequences never collide.
+    #[test]
+    fn concurrent_reservations_get_distinct_sequences() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        // Reserve twice before applying either — models two publishes
+        // racing through phase 1.
+        let r1 = ctx.reserve_publish("did:example:alice").unwrap();
+        let r2 = ctx.reserve_publish("did:example:alice").unwrap();
+
+        assert_ne!(
+            r1.reserved_sequence, r2.reserved_sequence,
+            "concurrent reservations must not share a sequence",
+        );
+        assert_eq!(r1.reserved_sequence, 1);
+        assert_eq!(r2.reserved_sequence, 2);
+
+        // Apply both, out of reservation order, and confirm the sealed
+        // envelopes carry exactly the reserved sequences.
+        let env2 = test_apply_reserved(&mut ctx, "did:example:alice", b"second", r2).unwrap();
+        let env1 = test_apply_reserved(&mut ctx, "did:example:alice", b"first", r1).unwrap();
+        assert_eq!(env1.sequence, 1);
+        assert_eq!(env2.sequence, 2);
+    }
+
+    /// A reservation that is rolled back (never applied) returns its
+    /// sequence to the author's counter when it is still the head, so the
+    /// next reservation reuses it — no gap, matching the legacy
+    /// signing-failure-before-increment behavior.
+    #[test]
+    fn rolled_back_head_reservation_is_reused() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let r1 = ctx.reserve_publish("did:example:alice").unwrap();
+        assert_eq!(r1.reserved_sequence, 1);
+        // Never apply r1 — roll it back.
+        ctx.rollback_reserved_publish("did:example:alice", r1.reserved_sequence);
+
+        let r2 = ctx.reserve_publish("did:example:alice").unwrap();
+        assert_eq!(
+            r2.reserved_sequence, 1,
+            "head rollback frees the sequence for reuse",
+        );
+    }
+
+    /// Rolling back a NON-head reservation is a no-op: a younger
+    /// reservation already advanced the counter, so the older one's
+    /// sequence must not be reused (monotonicity wins over no-gap).
+    #[test]
+    fn rolled_back_non_head_reservation_is_noop() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let r1 = ctx.reserve_publish("did:example:alice").unwrap();
+        let r2 = ctx.reserve_publish("did:example:alice").unwrap();
+        assert_eq!(r1.reserved_sequence, 1);
+        assert_eq!(r2.reserved_sequence, 2);
+
+        // Roll back r1 (the non-head) — must NOT free sequence 1, since
+        // r2 is still in flight holding sequence 2.
+        ctx.rollback_reserved_publish("did:example:alice", r1.reserved_sequence);
+
+        let r3 = ctx.reserve_publish("did:example:alice").unwrap();
+        assert_eq!(
+            r3.reserved_sequence, 3,
+            "non-head rollback leaves a gap rather than reusing a live sequence",
+        );
+    }
+
+    /// The two-phase reserve+apply path produces an envelope with the
+    /// same sequence the single-phase `publish` would, proving behavior
+    /// parity for the sequence field.
+    #[test]
+    fn reserve_apply_matches_single_phase_sequence() {
+        let mut ctx_single = make_open_ctx();
+        ctx_single.add_author("did:example:alice").unwrap();
+        let single = test_publish(&mut ctx_single, "did:example:alice", b"hi").unwrap();
+
+        let mut ctx_two = make_open_ctx();
+        ctx_two.add_author("did:example:alice").unwrap();
+        let r = ctx_two.reserve_publish("did:example:alice").unwrap();
+        let two = test_apply_reserved(&mut ctx_two, "did:example:alice", b"hi", r).unwrap();
+
+        assert_eq!(single.sequence, two.sequence);
+        assert_eq!(single.sequence, 1);
     }
 
     /// SCP-227 integration test: blocked author's post-block messages are

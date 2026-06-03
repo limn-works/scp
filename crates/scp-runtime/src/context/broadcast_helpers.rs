@@ -28,7 +28,6 @@ use scp_protocol::context::broadcast::{
     BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision, SubscriptionResult,
     UnsubscribeResult,
 };
-use scp_protocol::context::broadcast_content::{BroadcastContent, serialize_broadcast_content};
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::roles::Capability;
 use scp_protocol::crypto::sender_keys::BroadcastEnvelope;
@@ -38,7 +37,9 @@ use scp_protocol::crypto::ucan::validate::{
 };
 
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::PerContextState;
+use crate::context::actor::state::{
+    BroadcastReservationId, PendingBroadcastPublish, PerContextState,
+};
 use crate::context::state::{context_id_to_bytes, require_active, strip_event_payload};
 
 // ---------------------------------------------------------------------------
@@ -169,14 +170,50 @@ pub fn unsubscribe_broadcast(
 }
 
 // ---------------------------------------------------------------------------
-// publish_broadcast
+// Two-phase broadcast publish (reserve + apply)
 // ---------------------------------------------------------------------------
+//
+// `KeyCustody` is an RPITIT trait and is not `dyn`-safe, so the signer
+// cannot cross the actor mailbox; and the actor must not hold `&mut
+// PerContextState` across an arbitrary-duration host-language
+// `custody.sign().await`. The publish is therefore split into two
+// mailbox commands, each holding `&mut state` only briefly:
+//
+//   1. `reserve_broadcast_publish` (phase 1) reserves the broadcast
+//      sequence, builds the signing payload, and stores a
+//      `PendingBroadcastPublish`. Returns the signing payload + the
+//      reservation id.
+//   2. The caller signs the payload with its own custody, OUTSIDE the
+//      actor.
+//   3. `apply_broadcast_publish` (phase 2) validates the reservation,
+//      seals with the RESERVED sequence, emits the event, sends on the
+//      transport, appends to the event log, and removes the reservation.
+//
+// A reservation that is never applied (signing failed, caller dropped)
+// is released by `release_broadcast_reservation` so the sequence is not
+// burned — matching the legacy single-phase path, where a signing
+// failure occurred before any sequence increment. Concurrent publishes
+// each reserve a distinct sequence, closing the double-sequence /
+// signature-mismatch hazard the single-phase shim had under
+// decomposition.
 
-/// Publishes a message to a broadcast context using actor-owned state.
-///
-/// This helper is actor-shaped, but the Phase 2A mailbox path cannot call it
-/// because `KeyCustody` is not `dyn`-safe. The supervisor shim continues to
-/// use [`crate::context::broadcast_helpers_legacy::publish_broadcast_legacy`].
+/// Outcome of [`reserve_broadcast_publish`] (phase 1). Carries the
+/// reservation id (echoed back at apply) and the exact bytes the caller
+/// must sign with its key custody.
+#[derive(Debug, Clone)]
+pub struct BroadcastPublishReservationOutcome {
+    /// Identifier of the stored reservation. Pass back to
+    /// [`apply_broadcast_publish`] to seal the reserved sequence.
+    pub reservation_id: BroadcastReservationId,
+    /// Canonical broadcast signing-payload digest (32-byte hash) to hand
+    /// to `KeyCustody::sign`. Matches the legacy single-phase signer
+    /// input exactly.
+    pub signing_payload: [u8; 32],
+}
+
+/// Phase 1 of the two-phase broadcast publish: reserve the sequence and
+/// build the signing payload. Holds `&mut state` only for this call —
+/// never across the caller's async sign.
 ///
 /// # Errors
 ///
@@ -185,23 +222,20 @@ pub fn unsubscribe_broadcast(
 ///   context.
 /// - [`ContextError::PermissionDenied`] if the sender is not an author or
 ///   write access is suspended.
-#[allow(
-    dead_code,
-    reason = "Actor-shaped publish helper is reserved until custody becomes mailbox-addressable; Phase 2A routes publish through the generic shim."
-)]
-pub async fn publish_broadcast(
+pub fn reserve_broadcast_publish(
     state: &mut PerContextState,
     deps: &ActorDeps,
-    context_id: &str,
     author_did: &DID,
-    payload: &[u8],
-    custody: &impl scp_platform::KeyCustody,
-    signing_key_handle: &scp_platform::KeyHandle,
-) -> Result<BroadcastEnvelope, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
-
+) -> Result<BroadcastPublishReservationOutcome, ContextError> {
     require_active(&state.handle)?;
 
+    // Suspension-aware capability check (§9.17, ADR-038). In broadcast
+    // contexts, authors may be registered with the BroadcastContext
+    // without being members of the role_state, so we check the
+    // suspension overlay directly: only members whose MessagesWrite
+    // capability has been explicitly suspended via governance Revoke are
+    // blocked here. The downstream `bc.reserve_publish` enforces author
+    // registration.
     if state
         .role_state
         .suspended_capabilities
@@ -214,120 +248,232 @@ pub async fn publish_broadcast(
     }
 
     let timestamp = deps.clock.now_millis();
-    let (_meta, nonce, signing_payload) = {
-        let bc = state
-            .broadcast_context
-            .as_ref()
-            .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+    let nonce = scp_protocol::crypto::sender_keys::generate_broadcast_nonce();
 
-        let meta = bc.publish_metadata(author_did)?;
-        let nonce = scp_protocol::crypto::sender_keys::generate_broadcast_nonce();
-        let provenance_hash = scp_protocol::crypto::sender_keys::compute_provenance_hash(None)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        let signing_payload = scp_protocol::crypto::sender_keys::build_broadcast_signing_payload(
-            &scp_protocol::crypto::sender_keys::SigningPayloadFields {
-                version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-                context_id: meta.context_id,
-                author_did: meta.author_did,
-                sequence: meta.next_sequence,
-                key_epoch: meta.key_epoch,
-                timestamp,
-                nonce: &nonce,
-                provenance_hash: &provenance_hash,
-            },
-        )
+    let bc = state
+        .broadcast_context
+        .as_mut()
+        .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+    // Reserve the broadcast sequence atomically. A concurrent publish on
+    // the same author gets the next number, never this one.
+    let reservation = bc.reserve_publish(author_did.as_ref())?;
+
+    let provenance_hash = scp_protocol::crypto::sender_keys::compute_provenance_hash(None)
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        (meta, nonce, signing_payload)
+    let signing_payload = scp_protocol::crypto::sender_keys::build_broadcast_signing_payload(
+        &scp_protocol::crypto::sender_keys::SigningPayloadFields {
+            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+            context_id: bc.context_id(),
+            author_did: author_did.as_ref(),
+            sequence: reservation.reserved_sequence,
+            key_epoch: reservation.key_epoch,
+            timestamp,
+            nonce: &nonce,
+            provenance_hash: &provenance_hash,
+        },
+    )
+    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+    let reservation_id = BroadcastReservationId::new_random();
+    state.pending_broadcast_publishes.insert(
+        reservation_id.clone(),
+        PendingBroadcastPublish {
+            author_did: author_did.clone(),
+            reserved_sequence: reservation.reserved_sequence,
+            key_epoch: reservation.key_epoch,
+            timestamp,
+            nonce,
+        },
+    );
+
+    Ok(BroadcastPublishReservationOutcome {
+        reservation_id,
+        signing_payload,
+    })
+}
+
+/// Phase 2 of the two-phase broadcast publish: seal the reserved
+/// sequence with the caller-produced `signature`, emit the event, send
+/// on the transport, and append to the event log. Holds `&mut state`
+/// only for this call.
+///
+/// On any failure before the seal succeeds the reservation is released
+/// (sequence returned to the author's counter if still the head) so the
+/// sequence is not burned. After the seal succeeds the sequence is
+/// permanently consumed even if transport delivery fails — matching the
+/// legacy path, which also burned the broadcast sequence on a
+/// post-seal transport failure.
+///
+/// # Errors
+///
+/// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+/// - [`ContextError::InvalidState`] if `reservation_id` does not match a
+///   live reservation (already applied, expired, or never issued).
+/// - [`ContextError::MembershipFailed`] if the actor is not a broadcast
+///   context.
+/// - [`ContextError::CryptoFailed`] on a signature-length mismatch, an
+///   epoch change between phases, or a seal failure.
+pub fn apply_broadcast_publish(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    reservation_id: &BroadcastReservationId,
+    signature: &[u8],
+    payload: &[u8],
+) -> Result<BroadcastEnvelope, ContextError> {
+    let context_id_bytes = context_id_to_bytes(context_id);
+
+    // Resolve the reservation first so a stale/duplicate apply is a
+    // clean typed error and never touches sequence state.
+    let pending = state
+        .pending_broadcast_publishes
+        .remove(reservation_id)
+        .ok_or_else(|| {
+            ContextError::InvalidState(format!(
+                "no live broadcast-publish reservation for id {}",
+                reservation_id.0
+            ))
+        })?;
+
+    // From here on, any early return must release the reserved sequence
+    // (it was consumed at phase 1 but never sealed). `apply_guarded`
+    // owns that rollback discipline.
+    apply_guarded(
+        state,
+        deps,
+        context_id,
+        &context_id_bytes,
+        &pending,
+        signature,
+        payload,
+    )
+}
+
+/// Inner apply body. Separated so the caller-facing
+/// [`apply_broadcast_publish`] can guarantee the reserved sequence is
+/// released on every error path.
+fn apply_guarded(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    pending: &PendingBroadcastPublish,
+    signature: &[u8],
+    payload: &[u8],
+) -> Result<BroadcastEnvelope, ContextError> {
+    // Seal under the reserved sequence. On any failure before the seal
+    // succeeds, release the reserved sequence so it is not burned.
+    let envelope = match seal_reserved(state, pending, signature, payload) {
+        Ok(env) => env,
+        Err(e) => {
+            release_reserved(state, pending);
+            return Err(e);
+        }
     };
 
-    let platform_sig = custody
-        .sign(signing_key_handle, &signing_payload)
-        .await
-        .map_err(|e| ContextError::CryptoFailed(format!("custody signing failed: {e}")))?;
-    let sig_bytes: [u8; 64] = platform_sig.as_bytes().try_into().map_err(|_| {
-        ContextError::CryptoFailed(format!(
-            "custody signature has wrong length: expected 64, got {}",
-            platform_sig.as_bytes().len()
-        ))
-    })?;
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-    require_active(&state.handle)?;
-
-    let envelope = {
-        let bc = state
-            .broadcast_context
-            .as_mut()
-            .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-        let envelope = bc.publish(author_did, payload, timestamp, signature, &nonce, None)?;
-
-        let seq = state
-            .membership
-            .next_sequence_number(author_did)
-            .ok_or_else(|| ContextError::MemberNotFound(author_did.to_string()))?;
-        emit_event(
-            state,
-            ContextEvent::MessageSent {
-                sender_did: author_did.clone(),
-                sequence_number: seq,
-                payload: payload.to_vec(),
-            },
-            context_id,
-            deps.event_tx.as_ref(),
-        );
-
-        envelope
-    };
+    // Seal succeeded — the broadcast sequence is now permanently consumed
+    // (matches legacy: a post-seal transport failure burns it too).
+    let seq = state
+        .membership
+        .next_sequence_number(pending.author_did.as_ref())
+        .ok_or_else(|| ContextError::MemberNotFound(pending.author_did.to_string()))?;
+    emit_event(
+        state,
+        ContextEvent::MessageSent {
+            sender_did: pending.author_did.clone(),
+            sequence_number: seq,
+            payload: payload.to_vec(),
+        },
+        context_id,
+        deps.event_tx.as_ref(),
+    );
 
     let envelope_bytes = rmp_serde::to_vec_named(&envelope)
         .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?;
     deps.transport
-        .send_message(&context_id_bytes, &envelope_bytes)?;
+        .send_message(context_id_bytes, &envelope_bytes)?;
 
-    deps.event_log
-        .append_context_event(&context_id_bytes, "MessageSent", author_did.as_ref())?;
+    deps.event_log.append_context_event(
+        context_id_bytes,
+        "MessageSent",
+        pending.author_did.as_ref(),
+    )?;
     state.checkpoint_events_since += 1;
 
     Ok(envelope)
 }
 
-// ---------------------------------------------------------------------------
-// publish_broadcast_content
-// ---------------------------------------------------------------------------
-
-/// Publishes a [`BroadcastContent`] to a broadcast context.
-///
-/// See [`publish_broadcast`] for the custody migration note.
-///
-/// # Errors
-///
-/// Returns [`ContextError::CryptoFailed`] if content serialization fails, or
-/// any error returned by [`publish_broadcast`].
-#[allow(
-    dead_code,
-    reason = "Actor-shaped publish helper is reserved until custody becomes mailbox-addressable; Phase 2A routes publish through the generic shim."
-)]
-pub async fn publish_broadcast_content(
+/// Validate the context and seal the reserved-sequence broadcast. Pure
+/// up to the seal — performs no event emission or transport. Returns the
+/// sealed envelope without mutating membership / checkpoint counters.
+fn seal_reserved(
     state: &mut PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
-    author_did: &DID,
-    content: BroadcastContent,
-    custody: &impl scp_platform::KeyCustody,
-    signing_key_handle: &scp_platform::KeyHandle,
+    pending: &PendingBroadcastPublish,
+    signature: &[u8],
+    payload: &[u8],
 ) -> Result<BroadcastEnvelope, ContextError> {
-    let payload = serialize_broadcast_content(&content)
-        .map_err(|e| ContextError::CryptoFailed(format!("content serialization failed: {e}")))?;
-    publish_broadcast(
-        state,
-        deps,
-        context_id,
-        author_did,
-        &payload,
-        custody,
-        signing_key_handle,
+    require_active(&state.handle)?;
+
+    let sig_bytes: [u8; 64] = signature.try_into().map_err(|_| {
+        ContextError::CryptoFailed(format!(
+            "custody signature has wrong length: expected 64, got {}",
+            signature.len()
+        ))
+    })?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+    let bc = state
+        .broadcast_context
+        .as_mut()
+        .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+    // Detect a key rotation between reserve and apply — sealing under a
+    // rotated key would produce a ciphertext whose epoch the signed
+    // payload no longer matches.
+    let current_epoch = bc.publish_metadata(pending.author_did.as_ref())?.key_epoch;
+    if current_epoch != pending.key_epoch {
+        return Err(ContextError::CryptoFailed(format!(
+            "broadcast key epoch changed between reserve and apply for {} \
+             (reserved at {}, now {})",
+            pending.author_did, pending.key_epoch, current_epoch
+        )));
+    }
+
+    bc.apply_reserved_publish(
+        pending.author_did.as_ref(),
+        payload,
+        &pending.nonce,
+        scp_protocol::context::broadcast::ReservedPublishApply {
+            sequence: pending.reserved_sequence,
+            timestamp: pending.timestamp,
+            signature,
+            provenance: None,
+        },
     )
-    .await
+}
+
+/// Roll back the reserved sequence for a pending publish that will not be
+/// applied. No-op if the context is no longer a broadcast context.
+fn release_reserved(state: &mut PerContextState, pending: &PendingBroadcastPublish) {
+    if let Some(bc) = state.broadcast_context.as_mut() {
+        bc.rollback_reserved_publish(pending.author_did.as_ref(), pending.reserved_sequence);
+    }
+}
+
+/// Release a broadcast-publish reservation that will never be applied
+/// (the caller's signing failed, or the caller is aborting). Removes the
+/// stored reservation and rolls the reserved sequence back if it is still
+/// the head. No-op if the reservation id is unknown.
+pub fn release_broadcast_reservation(
+    state: &mut PerContextState,
+    reservation_id: &BroadcastReservationId,
+) {
+    if let Some(pending) = state.pending_broadcast_publishes.remove(reservation_id)
+        && let Some(bc) = state.broadcast_context.as_mut()
+    {
+        bc.rollback_reserved_publish(pending.author_did.as_ref(), pending.reserved_sequence);
+    }
 }
 
 // ---------------------------------------------------------------------------

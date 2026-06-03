@@ -1131,6 +1131,7 @@ pub async fn create_context(
         // lazily by the messaging handler.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
@@ -1557,6 +1558,7 @@ pub async fn import_context(
         // succeeded and the snapshot validated.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
@@ -1911,6 +1913,7 @@ pub async fn restore_context(
         // re-launch so cross-context sagas are restarted from scratch.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
