@@ -56,6 +56,20 @@ macro_rules! transport_conformance {
                     .expect("test envelope construction should succeed")
             }
 
+            /// The canonical relay blob identity: SHA-256 of the *full*
+            /// `MessagePack`-serialized outer envelope. This matches what every
+            /// SCP relay computes on PUBLISH (`blob_id = SHA-256(blob)`, where
+            /// `blob` is `OuterEnvelope::to_bytes()`), so it is the identity an
+            /// adapter's `send` returns and the one a queried/streamed envelope
+            /// must reproduce. Hashing only `encrypted_blob` would be wrong: the
+            /// relay keys on the whole envelope, not the inner ciphertext.
+            fn envelope_blob_id(env: &scp_core::envelope::OuterEnvelope) -> BlobId {
+                let bytes = env
+                    .to_bytes()
+                    .expect("envelope re-serialization should succeed");
+                BlobId::from_sha256(&bytes)
+            }
+
             #[tokio::test]
             async fn send_subscribe_roundtrip() {
                 let adapter = $factory;
@@ -65,9 +79,16 @@ macro_rules! transport_conformance {
                 // Send the envelope.
                 let blob_id = adapter.send(&envelope).await.expect("send should succeed");
 
-                // Subscribe to the routing_id with no since (backfill everything).
+                // Subscribe AFTER sending, requesting backfill from the epoch
+                // (`since = 1`) so the already-stored envelope is replayed onto
+                // the subscription stream. Per the relay contract (spec
+                // §10.14.4 / ADR-004), `since = None` means "live only — no
+                // backfill", so a None subscription opened after the send would
+                // never observe it. `since = Some(1)` selects every blob stored
+                // at epoch second 1 or later, which is every blob a test could
+                // have written.
                 let mut stream = adapter
-                    .subscribe(&routing_id, None)
+                    .subscribe(&routing_id, Some(1))
                     .await
                     .expect("subscribe should succeed");
 
@@ -79,7 +100,7 @@ macro_rules! transport_conformance {
                         .await
                     {
                         Ok(Some(TransportEvent::Envelope(env))) => {
-                            if BlobId::from_sha256(&env.encrypted_blob) == blob_id {
+                            if envelope_blob_id(&env) == blob_id {
                                 found = true;
                                 break;
                             }
@@ -91,7 +112,9 @@ macro_rules! transport_conformance {
                                 break;
                             }
                         }
-                        Ok(Some(_)) => continue,
+                        // Other transport events (errors, reconnects) are not
+                        // the envelope we are waiting for; keep draining.
+                        Ok(Some(_)) => {}
                         Ok(None) | Err(_) => break,
                     }
                 }
@@ -110,6 +133,15 @@ macro_rules! transport_conformance {
                     let bid = adapter.send(&envelope).await.expect("send should succeed");
                     blob_ids.push(bid);
                 }
+
+                // Distinct content must yield distinct blob IDs (content-addressed
+                // storage): three different payloads, three different SHA-256s.
+                let unique: std::collections::HashSet<_> = blob_ids.iter().copied().collect();
+                assert_eq!(
+                    unique.len(),
+                    blob_ids.len(),
+                    "distinct envelope payloads should produce distinct blob IDs"
+                );
 
                 // Query all to learn the first blob's timestamp-equivalent context.
                 let all = adapter
@@ -182,9 +214,7 @@ macro_rules! transport_conformance {
                     "query should return at least one envelope"
                 );
 
-                let found = results
-                    .iter()
-                    .any(|env| BlobId::from_sha256(&env.encrypted_blob) == blob_id);
+                let found = results.iter().any(|env| envelope_blob_id(env) == blob_id);
                 assert!(found, "query results should include the sent envelope");
             }
 
@@ -208,9 +238,7 @@ macro_rules! transport_conformance {
                     .await
                     .expect("query should succeed");
 
-                let still_present = results
-                    .iter()
-                    .any(|env| BlobId::from_sha256(&env.encrypted_blob) == blob_id);
+                let still_present = results.iter().any(|env| envelope_blob_id(env) == blob_id);
                 assert!(
                     !still_present,
                     "deleted envelope should not appear in query results"
@@ -247,7 +275,7 @@ macro_rules! transport_conformance {
 
                 let count = results
                     .iter()
-                    .filter(|env| BlobId::from_sha256(&env.encrypted_blob) == blob_id_1)
+                    .filter(|env| envelope_blob_id(env) == blob_id_1)
                     .count();
                 assert_eq!(
                     count, 1,

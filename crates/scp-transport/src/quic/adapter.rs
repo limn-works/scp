@@ -951,95 +951,17 @@ fn map_subscribe_relay_message(
     clippy::too_many_lines
 )]
 mod tests {
-    use std::net::SocketAddr;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use futures::StreamExt;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use scp_core::envelope::create_outer_envelope;
 
     use super::*;
-    use crate::native::storage::InMemoryBlobStorage;
     use crate::profile::TransportProfile;
-    use crate::quic::lifecycle::{QuicLifecycleManager, SessionTicketStore};
-    use crate::quic::listener::{
-        QuicListener, QuicListenerConfig, QuicShutdownHandle, SCP_ALPN, build_server_config,
-    };
-    use crate::relay::rate_limit::{self, PublishRateLimiter};
-    use crate::relay::subscription::{self, SubscriptionRegistry};
-
-    // -----------------------------------------------------------------------
-    // Test helpers
-    // -----------------------------------------------------------------------
-
-    fn test_server_config() -> (quinn::ServerConfig, Vec<CertificateDer<'static>>) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_der = CertificateDer::from(cert.cert);
-        let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let server_config =
-            build_server_config(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key_der)).unwrap();
-        (server_config, vec![cert_der])
-    }
-
-    fn test_client_config(server_certs: &[CertificateDer<'static>]) -> quinn::ClientConfig {
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in server_certs {
-            root_store.add(cert.clone()).unwrap();
-        }
-        let mut tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        tls_config.alpn_protocols = vec![SCP_ALPN.to_vec()];
-
-        let quic_client_config =
-            quinn::crypto::rustls::QuicClientConfig::try_from(tls_config).unwrap();
-        quinn::ClientConfig::new(Arc::new(quic_client_config))
-    }
-
-    fn start_test_listener() -> (
-        QuicShutdownHandle,
-        SocketAddr,
-        Vec<CertificateDer<'static>>,
-        Arc<InMemoryBlobStorage>,
-        SubscriptionRegistry,
-    ) {
-        let (server_config, certs) = test_server_config();
-        let storage = Arc::new(InMemoryBlobStorage::new());
-        let subscriptions = subscription::new_registry();
-        let publish_rate_limiter = PublishRateLimiter::new(100);
-        let connection_tracker = rate_limit::new_connection_tracker();
-
-        let config = QuicListenerConfig {
-            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            delivery_jitter_ms: 0,
-            ..QuicListenerConfig::default()
-        };
-
-        let listener = QuicListener::new(
-            config,
-            Arc::clone(&storage),
-            Arc::clone(&subscriptions),
-            publish_rate_limiter,
-            connection_tracker,
-        );
-        let (handle, addr) = listener.start(server_config).unwrap();
-
-        (handle, addr, certs, storage, subscriptions)
-    }
-
-    fn test_lifecycle() -> QuicLifecycleManager {
-        QuicLifecycleManager::new(TransportProfile::Desktop, SessionTicketStore::new())
-    }
-
-    async fn connect_adapter(addr: SocketAddr, certs: &[CertificateDer<'static>]) -> QuicAdapter {
-        let client_config = test_client_config(certs);
-        let lifecycle = test_lifecycle();
-        QuicAdapter::connect(addr, "localhost", client_config, lifecycle)
-            .await
-            .expect("failed to connect QuicAdapter")
-    }
+    // The QUIC test harness (listener + matching client) is shared with the
+    // out-of-crate conformance/migration integration tests; see
+    // `crate::quic::test_support` for why it lives in `src/`.
+    use crate::quic::test_support::{connect_adapter, start_test_listener, test_lifecycle};
 
     fn test_envelope() -> OuterEnvelope {
         create_outer_envelope(&[0xAA; 32], None, 3600, vec![0x01, 0x02, 0x03]).unwrap()
