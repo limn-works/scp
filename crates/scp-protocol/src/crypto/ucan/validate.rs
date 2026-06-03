@@ -780,6 +780,17 @@ where
     // token could widen a capability or relax a caveat that an ancestor
     // bound.
 
+    // Step 7c (§7.3.8 leaf/terminus stem consistency): mirror the mint guard
+    // on the PRESENTING token itself, independent of the chain walk. The
+    // per-edge checks above only fire on edges (which need a parent), so a
+    // FORGED depth-1 (no-proof) outlet token presented directly is never
+    // stem-checked. This gate rejects a forged mixed-family outlet token
+    // (attestations span both outlet_query and outlet_call) UNCONDITIONALLY,
+    // and rejects an `nb.origin_kind` that contradicts the token's own stem
+    // family — even with no proofs. An honest mint never produces either
+    // shape, so this never rejects a legitimately-minted token.
+    verify_leaf_outlet_stem_consistency(token, ctx.caveat_resolver)?;
+
     // Step 8: Ceiling — verify capability is within context ceiling.
     verify_ceiling_compliance(std::slice::from_ref(required_capability), ctx.ceiling)?;
 
@@ -1425,9 +1436,85 @@ fn verify_edge_attenuation(
                 .map_err(UcanError::CaveatAttenuationViolation)?;
             verify_origin_kind_matches_stem_family(&child_caveats, child_is_outlet_edge, child)?;
         }
-        (None, None) => {}
+        (None, None) => {
+            // §7.3.8 rule-4: every NON-ROOT OUTLET delegation MUST materialize
+            // an explicit `origin_kind`. An all-`nb=None` outlet delegation
+            // chain (e.g. root[outlet_call] -> mid[outlet_call] ->
+            // leaf[outlet_call], every token `nb=None`) would otherwise slip
+            // through this arm with no origin_kind check — laundering the
+            // rule-4 materialization requirement. When the CHILD carries an
+            // outlet stem, reject with `OriginKindUnspecified` (the parent had
+            // no caveat bound, hence `parent: None`). This makes the validator
+            // symmetric with the mint, which never emits an outlet child with
+            // `nb=None` (`build_delegated_caveats` always materializes the
+            // inherited/inferred `origin_kind` on an outlet child). A NON-outlet
+            // child stays admissible: outlet-scoped caveats do not apply to a
+            // non-outlet capability, so `nb=None` is legitimate there.
+            if child_is_outlet_edge {
+                return Err(UcanError::CaveatAttenuationViolation(
+                    crate::trust::caveats::AttenuationViolation::OriginKindUnspecified {
+                        parent: None,
+                    },
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// Classifies the single outlet stem family of a token's attestation set,
+/// rejecting a mixed-family set UNCONDITIONALLY (mirroring the mint guard
+/// [`InvocationCaveats::try_new_for_root`](crate::trust::caveats::InvocationCaveats::try_new_for_root)).
+///
+/// Returns the inferred [`OutletKind`](crate::context::outlets::OutletKind) —
+/// `Query` for `outlet_query`, `Action` for `outlet_call` — when the set
+/// carries exactly one family. A token whose attestations span BOTH families
+/// has an ambiguous `origin_kind` and is rejected with
+/// [`AttenuationViolation::OriginKindMixedStem`](crate::trust::caveats::AttenuationViolation::OriginKindMixedStem),
+/// regardless of whether the token declares an `nb.origin_kind`. This is the
+/// validator's analogue of the mint's `origin-kind-mixed-stem-root` rejection.
+///
+/// Callers must only invoke this on a token already known to carry an outlet
+/// stem ([`att_set_has_outlet_stem`](crate::crypto::ucan::capability::att_set_has_outlet_stem)
+/// returned `true`); a `(false, false)` classification is therefore an
+/// internal classifier disagreement and fails closed.
+fn classify_outlet_stem_family(
+    token: &UcanToken,
+) -> Result<crate::context::outlets::OutletKind, UcanError> {
+    use crate::context::outlets::OutletKind;
+
+    let mut has_query = false;
+    let mut has_action = false;
+    for a in &token.payload.att {
+        let uri: CapabilityUri = a.with.parse().map_err(|e: UcanError| {
+            UcanError::MalformedToken(format!(
+                "unparseable capability URI '{}' while classifying outlet stem family: {e}",
+                a.with
+            ))
+        })?;
+        match uri.resource() {
+            "outlet_query" => has_query = true,
+            "outlet_call" => has_action = true,
+            _ => {}
+        }
+    }
+
+    match (has_query, has_action) {
+        (true, false) => Ok(OutletKind::Query),
+        (false, true) => Ok(OutletKind::Action),
+        // Mixed-family token: ambiguous origin_kind, rejected unconditionally
+        // (mirrors the mint's origin-kind-mixed-stem-root guard). A forged /
+        // self-signed depth-1 outlet token whose attestations span both
+        // families is rejected here even when it declares no nb.origin_kind.
+        (true, true) => Err(UcanError::CaveatAttenuationViolation(
+            crate::trust::caveats::AttenuationViolation::OriginKindMixedStem,
+        )),
+        // Classifier said outlet edge but neither family found: impossible
+        // given `att_set_has_outlet_stem` returned true. Fail closed.
+        (false, false) => Err(UcanError::MalformedToken(
+            "outlet-edge classifier/stem-family disagreement".to_owned(),
+        )),
+    }
 }
 
 /// Defense-in-depth (§7.3.8 "`origin_kind` bound end-to-end"): when the child
@@ -1447,56 +1534,69 @@ fn verify_origin_kind_matches_stem_family(
     child_is_outlet_edge: bool,
     child: &UcanToken,
 ) -> Result<(), UcanError> {
-    use crate::context::outlets::OutletKind;
-
     if !child_is_outlet_edge {
         return Ok(());
     }
+
+    // Classify the stem family first — this rejects a mixed-stem token
+    // UNCONDITIONALLY (even with no declared origin_kind), mirroring the mint.
+    let inferred = classify_outlet_stem_family(child)?;
+
     let Some(declared) = child_caveats.origin_kind else {
         // Outlet edge with no declared origin_kind: the narrow() path already
-        // rejected this via OriginKindUnspecified for non-root edges. Nothing
-        // further to assert here.
+        // rejected this via OriginKindUnspecified for non-root edges. The
+        // mixed-stem case is handled above, so nothing further to assert here.
         return Ok(());
     };
 
-    // Determine the stem family of the child's own attestations.
-    let mut has_query = false;
-    let mut has_action = false;
-    for a in &child.payload.att {
-        let uri: CapabilityUri = a.with.parse().map_err(|e: UcanError| {
-            UcanError::MalformedToken(format!(
-                "unparseable capability URI '{}' while cross-checking origin_kind: {e}",
-                a.with
-            ))
-        })?;
-        match uri.resource() {
-            "outlet_query" => has_query = true,
-            "outlet_call" => has_action = true,
-            _ => {}
-        }
+    if declared != inferred {
+        return Err(UcanError::CaveatAttenuationViolation(
+            crate::trust::caveats::AttenuationViolation::OriginKindMismatch {
+                parent: inferred,
+                child: declared,
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Leaf/terminus stem-consistency gate (§7.3.8) — mirrors the mint guard on the
+/// PRESENTING token itself, independent of the chain walk.
+///
+/// The per-edge attenuation checks ([`verify_edge_attenuation`]) only run on
+/// edges, so a FORGED depth-1 (no-proof) outlet token presented directly is
+/// never stem-checked by the chain walk. This gate closes that hole: it runs on
+/// the presenting (leaf/terminus) token in [`validate_ucan`] regardless of
+/// whether the token carries proofs, and rejects:
+///
+/// - a mixed-family outlet token (attestations span both `outlet_query` and
+///   `outlet_call`) — UNCONDITIONALLY, mirroring the mint's
+///   `origin-kind-mixed-stem-root` rejection; and
+/// - an `nb.origin_kind` that contradicts the token's own single stem family.
+///
+/// An honest mint never produces either shape (the mint's `build_root_caveats`
+/// / `build_delegated_caveats` guarantee single-family stems and a stem-agreeing
+/// `origin_kind`), so this gate never rejects a legitimately-minted token — it
+/// only catches self-signed/forged tokens. For a non-outlet presenting token
+/// there is no stem family to pin against, so this is a no-op.
+fn verify_leaf_outlet_stem_consistency(
+    token: &UcanToken,
+    caveat_resolver: &dyn CaveatResolver,
+) -> Result<(), UcanError> {
+    let is_outlet = crate::crypto::ucan::capability::att_set_has_outlet_stem(&token.payload.att)?;
+    if !is_outlet {
+        return Ok(());
     }
 
-    let inferred = match (has_query, has_action) {
-        (true, false) => OutletKind::Query,
-        (false, true) => OutletKind::Action,
-        (true, true) => {
-            return Err(UcanError::CaveatAttenuationViolation(
-                crate::trust::caveats::AttenuationViolation::OriginKindMismatch {
-                    parent: declared,
-                    child: declared,
-                },
-            ));
-        }
-        // Classifier said outlet edge but neither family found: impossible
-        // given `att_set_has_outlet_stem` returned true. Fail closed.
-        (false, false) => {
-            return Err(UcanError::MalformedToken(
-                "outlet-edge classifier/stem-family disagreement".to_owned(),
-            ));
-        }
-    };
+    // Reject mixed-family stems unconditionally (mirrors the mint guard).
+    let inferred = classify_outlet_stem_family(token)?;
 
-    if declared != inferred {
+    // If the presenting token declares an nb.origin_kind, it must agree with
+    // its own single stem family.
+    if let Some(caveats) = caveat_resolver.resolve_caveats(token)
+        && let Some(declared) = caveats.origin_kind
+        && declared != inferred
+    {
         return Err(UcanError::CaveatAttenuationViolation(
             crate::trust::caveats::AttenuationViolation::OriginKindMismatch {
                 parent: inferred,
@@ -1678,19 +1778,23 @@ mod tests {
     }
 
     /// Sanity: verify_attenuation with NoCaveatResolver still applies the
-    /// pre-existing capability-subset check (no regression for legacy
-    /// tokens).
+    /// pre-existing capability-subset check (no regression for genuinely
+    /// caveat-free tokens). Uses a NON-outlet capability (`messages:write`):
+    /// the `(None, None)` arm is admissible for a non-outlet child (invocation
+    /// caveats are outlet-scoped, §7.3.8), so this isolates the capability-only
+    /// path. An all-`nb=None` OUTLET child instead trips the (None, None)
+    /// rule-4 guard (see `depth3_all_nb_none_outlet_chain_rejects`).
     #[test]
     fn step_7b_no_caveats_preserves_legacy_capability_check() {
-        let parent = synthetic_token("PARENT", &["scp:ctx:abc/outlet_call:assistant"], &[]);
-        let child = synthetic_token("CHILD", &["scp:ctx:abc/outlet_call:assistant"], &["PARENT"]);
+        let parent = synthetic_token("PARENT", &["scp:ctx:abc/messages:write"], &[]);
+        let child = synthetic_token("CHILD", &["scp:ctx:abc/messages:write"], &["PARENT"]);
 
         let mut proof_resolver = InMemoryProofResolver::new();
         proof_resolver.proofs.insert("PARENT".to_owned(), parent);
 
-        // No caveats anywhere — legacy capability-only path.
+        // No caveats anywhere — capability-only path on a non-outlet capability.
         verify_attenuation(&child, &proof_resolver, &NoCaveatResolver)
-            .expect("matching capabilities pass under NoCaveatResolver");
+            .expect("matching non-outlet capabilities pass under NoCaveatResolver");
     }
 
     // -----------------------------------------------------------------------
@@ -2167,6 +2271,102 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // MEDIUM-1 (validator side): leaf/terminus stem-consistency gate
+    // (`verify_leaf_outlet_stem_consistency`). The per-edge checks only fire on
+    // edges (which need a parent), so a FORGED depth-1 (no-proof) outlet token
+    // presented directly is never stem-checked by the chain walk. This gate
+    // mirrors the mint guard on the presenting token regardless of proofs.
+    // -----------------------------------------------------------------------
+
+    /// MEDIUM-1: a self-signed depth-1 (no-proof) OUTLET token whose
+    /// attestations span BOTH families (outlet_query AND outlet_call) is
+    /// REJECTED even with no proofs and even when it declares no
+    /// `nb.origin_kind` — mirroring the mint's unconditional mixed-family
+    /// rejection.
+    #[test]
+    fn leaf_terminus_forged_mixed_stem_outlet_token_rejects() {
+        let token = synthetic_token_with_nb(
+            "FORGED",
+            &[
+                "scp:ctx:abc/outlet_query:price",
+                "scp:ctx:abc/outlet_call:assistant",
+            ],
+            &[],  // depth-1: no proofs
+            None, // no declared origin_kind — must still reject
+        );
+        let err = verify_leaf_outlet_stem_consistency(&token, &TokenNbCaveatResolver).expect_err(
+            "forged mixed-family depth-1 outlet token must reject at the leaf/terminus gate",
+        );
+        assert!(
+            matches!(
+                err,
+                UcanError::CaveatAttenuationViolation(AttenuationViolation::OriginKindMixedStem)
+            ),
+            "expected OriginKindMixedStem from the leaf/terminus gate, got {err:?}"
+        );
+    }
+
+    /// MEDIUM-1: a self-signed depth-1 OUTLET token whose `nb.origin_kind`
+    /// CONTRADICTS its single stem family (declares Query while carrying an
+    /// outlet_call = Action stem) is REJECTED even with no proofs.
+    #[test]
+    fn leaf_terminus_forged_origin_kind_contradicts_stem_rejects() {
+        let token = synthetic_token_with_nb(
+            "FORGED",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &[], // depth-1: no proofs
+            Some(InvocationCaveats {
+                max_calls: Some(5),
+                // Query contradicts the outlet_call (Action) stem.
+                origin_kind: Some(crate::context::outlets::OutletKind::Query),
+                ..InvocationCaveats::empty()
+            }),
+        );
+        let err = verify_leaf_outlet_stem_consistency(&token, &TokenNbCaveatResolver).expect_err(
+            "forged depth-1 outlet token whose origin_kind contradicts its stem must reject",
+        );
+        match err {
+            UcanError::CaveatAttenuationViolation(AttenuationViolation::OriginKindMismatch {
+                parent,
+                child,
+            }) => {
+                assert_eq!(parent, crate::context::outlets::OutletKind::Action);
+                assert_eq!(child, crate::context::outlets::OutletKind::Query);
+            }
+            other => panic!("expected OriginKindMismatch (Action vs Query), got {other:?}"),
+        }
+    }
+
+    /// MEDIUM-1 negative: a single-family depth-1 OUTLET token whose
+    /// `nb.origin_kind` AGREES with its stem (Action for outlet_call) passes the
+    /// leaf/terminus gate — an honestly-minted leaf is never rejected.
+    #[test]
+    fn leaf_terminus_single_family_agreeing_origin_kind_passes() {
+        let token = synthetic_token_with_nb(
+            "HONEST",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &[],
+            Some(InvocationCaveats {
+                max_calls: Some(5),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        );
+        verify_leaf_outlet_stem_consistency(&token, &TokenNbCaveatResolver)
+            .expect("a single-family outlet leaf with an agreeing origin_kind must pass");
+    }
+
+    /// MEDIUM-1 negative: a NON-outlet depth-1 token (messages:write) is a
+    /// no-op for the leaf/terminus gate — there is no stem family to pin
+    /// against — and passes regardless of `nb`.
+    #[test]
+    fn leaf_terminus_non_outlet_token_is_noop() {
+        let token = synthetic_token_with_nb("MSG", &["scp:ctx:abc/messages:write"], &[], None);
+        verify_leaf_outlet_stem_consistency(&token, &TokenNbCaveatResolver)
+            .expect("a non-outlet presenting token must pass the leaf/terminus gate (no-op)");
+    }
+
     /// AC: an expired leaf (Step 11b time-box) is rejected when the leaf's
     /// own `nb` carries a `valid_until` in the past. Exercises the full
     /// `validate_ucan` path with `TokenNbCaveatResolver` so Step 11b reads
@@ -2425,15 +2625,20 @@ mod tests {
     }
 
     /// (1) Capability widened at the interior edge (in-ceiling) must reject.
-    /// mid grants a broader stem than root delegated.
+    /// mid grants a broader stem than root delegated. Uses NON-outlet
+    /// `messages` capabilities with all-`nb=None`: the capability-subset check
+    /// (Step 7) is what must reject here, and a non-outlet child legitimately
+    /// carries `nb=None` (so the (None, None) rule-4 outlet guard does not
+    /// pre-empt the capability check). The outlet rule-4 path is covered by
+    /// `depth3_all_nb_none_outlet_chain_rejects`.
     #[test]
     fn interior_edge_rejects_widened_capability() {
-        // root delegates only outlet_call:assistant; mid widens to the
-        // wildcard outlet_call:* (broader — not granted by root).
+        // root delegates only messages:read; mid widens to the wildcard
+        // messages:* (broader — not granted by root).
         let chain = build_depth3(
-            &[CAP],
-            &["scp:ctx:abc/outlet_call:*"],
-            &["scp:ctx:abc/outlet_call:*"],
+            &["scp:ctx:abc/messages:read"],
+            &["scp:ctx:abc/messages:*"],
+            &["scp:ctx:abc/messages:*"],
             None,
             None,
             None,
@@ -2757,5 +2962,71 @@ mod tests {
                 panic!("expected OriginKindUnspecified or FieldRemoved(MaxCalls), got {other:?}")
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // MEDIUM-2: the (None, None) edge arm enforces §7.3.8 rule-4 for OUTLET
+    // edges. An all-`nb=None` OUTLET delegation chain materializes no explicit
+    // `origin_kind` at any non-root edge — a rule-4 violation. A NON-outlet
+    // all-`nb=None` chain stays admissible (outlet-scoped caveats do not apply
+    // to a non-outlet capability).
+    // -----------------------------------------------------------------------
+
+    /// (13) MEDIUM-2: a depth-3 OUTLET chain where EVERY token carries
+    /// `nb=None` (root[outlet_call] -> mid[outlet_call] -> leaf[outlet_call])
+    /// is REJECTED at the first (None, None) outlet edge. Without the rule-4
+    /// guard in the (None, None) arm this chain would slip through with no
+    /// `origin_kind` ever materialized — laundering rule-4.
+    #[test]
+    fn depth3_all_nb_none_outlet_chain_rejects() {
+        let chain = build_depth3(&[CAP], &[CAP], &[CAP], None, None, None);
+        let err = run_chain(&chain, &TokenNbCaveatResolver)
+            .expect_err("all-nb=None outlet delegation chain must reject (rule-4)");
+        assert!(
+            matches!(
+                err,
+                UcanError::CaveatAttenuationViolation(
+                    AttenuationViolation::OriginKindUnspecified { parent: None }
+                )
+            ),
+            "expected OriginKindUnspecified {{ parent: None }} from the (None, None) outlet \
+             rule-4 guard, got {err:?}"
+        );
+    }
+
+    /// (14) MEDIUM-2 negative: a depth-3 NON-outlet chain where every token
+    /// carries `nb=None` (messages:write at every level) is ACCEPTED. Outlet-
+    /// scoped invocation caveats do not apply to a non-outlet capability, so
+    /// `nb=None` is legitimate and the (None, None) arm must not fire rule-4.
+    #[test]
+    fn depth3_all_nb_none_non_outlet_chain_accepts() {
+        const MSG_CAP: &str = "scp:ctx:abc/messages:write";
+        let chain = build_depth3(&[MSG_CAP], &[MSG_CAP], &[MSG_CAP], None, None, None);
+        run_chain(&chain, &TokenNbCaveatResolver).expect(
+            "an all-nb=None NON-outlet delegation chain is genuinely caveat-free and must pass",
+        );
+    }
+
+    /// (15) MEDIUM-2 honest-chain regression: an honestly-minted depth-3 OUTLET
+    /// chain materializes an explicit `origin_kind` (Action) on every token, so
+    /// the (None, None) arm is never reached and the chain PASSES. Guards
+    /// against the rule-4 guard over-rejecting a legitimate outlet chain.
+    #[test]
+    fn depth3_outlet_chain_with_materialized_origin_kind_passes() {
+        let action_nb = || InvocationCaveats {
+            max_calls: Some(10),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let chain = build_depth3(
+            &[CAP],
+            &[CAP],
+            &[CAP],
+            Some(action_nb()),
+            Some(action_nb()),
+            Some(action_nb()),
+        );
+        run_chain(&chain, &TokenNbCaveatResolver)
+            .expect("an honest outlet chain with origin_kind materialized at every edge must pass");
     }
 }

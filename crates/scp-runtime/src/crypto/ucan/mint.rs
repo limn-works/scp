@@ -363,6 +363,24 @@ fn build_delegated_caveats(
 /// agreement gate into the mint path so a root can never be signed with an
 /// `origin_kind` disagreeing with its stems.
 ///
+/// # Mixed-family rejection is UNCONDITIONAL (§7.3.8:868)
+///
+/// The mixed-family stem check runs for EVERY outlet root regardless of whether
+/// the caller supplied `caveats`. The mint is the single point where root-signer
+/// intent is verified: a root whose capability stems span BOTH the
+/// `outlet_query` and `outlet_call` families has an ambiguous `origin_kind` and
+/// is rejected (`SCP-TOOL-6114` / `origin-kind-mixed-stem-root`), even when
+/// `caveats == None`. Previously the `None` and `Some(_)`-without-outlet-stem
+/// arms short-circuited to `Ok(None)` BEFORE this check, so a mixed-family root
+/// with `caveats == None` could be signed — that hole is now closed by running
+/// `try_new_for_root` (over [`InvocationCaveats::empty()`](scp_protocol::trust::caveats::InvocationCaveats::empty)
+/// when no caveats were supplied) purely for its mixed-family / stem-agreement
+/// gate, then returning `None` so a single-family root with no caveats still
+/// carries `nb = None`.
+///
+/// A non-outlet root (no outlet stems) carries `nb = None` regardless of any
+/// supplied (and inapplicable) outlet-scoped caveats.
+///
 /// # Errors
 ///
 /// Returns [`UcanError::MalformedToken`] when `try_new_for_root` rejects the
@@ -373,6 +391,7 @@ fn build_root_caveats(
     parsed_stems: &[scp_protocol::context::roles::Capability],
 ) -> Result<Option<scp_protocol::trust::caveats::InvocationCaveats>, UcanError> {
     use scp_protocol::context::roles::Capability;
+    use scp_protocol::trust::caveats::InvocationCaveats;
 
     let root_has_outlet_stem = parsed_stems.iter().any(|cap| {
         matches!(
@@ -384,17 +403,30 @@ fn build_root_caveats(
         )
     });
 
-    match caveats {
-        None => Ok(None),
-        Some(_) if !root_has_outlet_stem => Ok(None),
-        Some(caveats) => Ok(Some(
-            scp_protocol::trust::caveats::InvocationCaveats::try_new_for_root(
-                caveats,
-                parsed_stems,
-            )
-            .map_err(|e| UcanError::MalformedToken(format!("caveat-mint-limit-exceeded: {e}")))?,
-        )),
+    // Non-outlet root: invocation caveats are outlet-scoped (§7.3.8), so any
+    // supplied caveats are inapplicable and `nb` is `None`. There is no stem
+    // family to mix, so the mixed-family gate does not apply.
+    if !root_has_outlet_stem {
+        return Ok(None);
     }
+
+    // Outlet root: ALWAYS run the root stem/kind agreement gate, regardless of
+    // whether caveats were supplied. `try_new_for_root` performs the
+    // UNCONDITIONAL mixed-family rejection (§7.3.8:868) plus the stem/origin_kind
+    // agreement and mint-limit checks. When no caveats were supplied we route
+    // `empty()` purely for that gate, then drop the validated `empty()` back to
+    // `None` so a single-family root with no caveats still carries `nb = None`.
+    let had_caveats = caveats.is_some();
+    let validated = InvocationCaveats::try_new_for_root(
+        caveats.unwrap_or_else(InvocationCaveats::empty),
+        parsed_stems,
+    )
+    .map_err(|e| UcanError::MalformedToken(format!("caveat-mint-limit-exceeded: {e}")))?;
+
+    // A single-family outlet root with no supplied caveats passes the gate but
+    // still carries `nb = None` (the validated `empty()` is not a real caveat
+    // set — it existed only to run the mixed-family / stem-agreement check).
+    Ok(had_caveats.then_some(validated))
 }
 
 /// Builds the `fct` (facts) section, merging `scp_key_scope` when present.
@@ -4082,13 +4114,18 @@ mod tests {
         }
     }
 
-    /// MINT-SIDE REJECT: delegating a mixed-stem set (`outlet_query` AND
-    /// `outlet_call`) off an unconstrained root has no unambiguous
-    /// `origin_kind` and is rejected at mint.
+    /// MINT-SIDE REJECT: a mixed-stem ROOT (`outlet_query` AND `outlet_call`)
+    /// has no unambiguous `origin_kind` and is rejected UNCONDITIONALLY at the
+    /// ROOT mint (§7.3.8:868) — even with `caveats = None`. The mint is the
+    /// single point where root-signer intent is verified, so the mixed-stem
+    /// set never produces a signed root that a later delegation could fold over.
+    /// (Previously the mixed-stem root with `caveats = None` minted
+    /// successfully and the ambiguity was only caught at the delegation fold;
+    /// the guard now fires at the root mint, which is strictly stronger.)
     #[tokio::test]
     async fn delegate_rejects_mixed_stem_origin_kind_at_mint() {
         let (root_custody, root_key, root_did) = setup_custody().await;
-        let (mid_custody, mid_key, mid_did) = setup_custody().await;
+        let (_mid_custody, _mid_key, mid_did) = setup_custody().await;
 
         // Root grants both stems (unconstrained, no caveats).
         let caps = vec![
@@ -4117,50 +4154,20 @@ mod tests {
             ),
             caveats: None,
         };
-        let root = mint_ucan(&root_params, &root_custody, &scp_primitives::SystemClock)
+        // The mixed-stem root mint itself rejects — there is no signed root to
+        // delegate from.
+        let err = mint_ucan(&root_params, &root_custody, &scp_primitives::SystemClock)
             .await
-            .unwrap();
-
-        // Delegate BOTH stems while introducing a caveat (so the fold runs
-        // origin_kind inference over a mixed set).
-        let attenuated = vec![
-            Attenuation {
-                with: "scp:ctx:ctx-caveat/outlet_query:search".to_owned(),
-                can: "*".to_owned(),
-            },
-            Attenuation {
-                with: "scp:ctx:ctx-caveat/outlet_call:assistant".to_owned(),
-                can: "*".to_owned(),
-            },
-        ];
-        let params = DelegateParams {
-            parent_token: &root,
-            delegator_did: &mid_did,
-            delegator_key: &mid_key,
-            delegatee_did: "did:dht:z6MkLeaf",
-            attenuated_capabilities: &attenuated,
-            lifetime_secs: 1800,
-            facts: None,
-            key_scope: None,
-            signing_key_id: None,
-            ceiling: Some(
-                [
-                    "outlet_query:search".to_owned(),
-                    "outlet_call:assistant".to_owned(),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            caveats: Some(InvocationCaveats {
-                max_calls: Some(5),
-                ..InvocationCaveats::empty()
-            }),
-        };
-        let result = delegate_ucan(&params, &mid_custody, &scp_primitives::SystemClock).await;
-        assert!(
-            matches!(result, Err(UcanError::AttenuationViolation(_))),
-            "mixed-stem origin_kind inference must reject at mint: {result:?}"
-        );
+            .expect_err("mixed-stem root must reject unconditionally at the root mint");
+        match err {
+            UcanError::MalformedToken(msg) => {
+                assert!(
+                    msg.contains("origin-kind-mixed-stem-root"),
+                    "expected origin-kind-mixed-stem-root slug, got: {msg}"
+                );
+            }
+            other => panic!("expected MalformedToken(origin-kind-mixed-stem-root), got {other:?}"),
+        }
     }
 
     // -------------------------------------------------------------------
@@ -4390,6 +4397,143 @@ mod tests {
         assert!(
             matches!(err, UcanError::MalformedToken(_)),
             "root origin_kind contradicting its outlet stem must reject at mint: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // MEDIUM-1: mixed-family root rejection must be UNCONDITIONAL at mint
+    // (§7.3.8:868). The mint is the single point where root-signer intent is
+    // verified; a root whose capability stems span BOTH outlet families has an
+    // ambiguous origin_kind and is rejected REGARDLESS of whether caveats were
+    // supplied. The prior short-circuit (`None => Ok(None)` /
+    // `Some(_) if !root_has_outlet_stem => Ok(None)`) let a mixed-family root
+    // with `caveats = None` mint successfully.
+    // -------------------------------------------------------------------
+
+    /// Builds `MintParams` for a root carrying both outlet families
+    /// (`outlet_query:price`, `outlet_call:assistant`).
+    fn mixed_family_root_caps() -> Vec<String> {
+        vec![
+            "outlet_query:price".to_owned(),
+            "outlet_call:assistant".to_owned(),
+        ]
+    }
+
+    /// Ceiling matching [`mixed_family_root_caps`].
+    fn mixed_family_root_ceiling() -> HashSet<String> {
+        [
+            "outlet_query:price".to_owned(),
+            "outlet_call:assistant".to_owned(),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// MEDIUM-1 (a): a mixed-family root with `caveats = None` must REJECT at
+    /// mint (`SCP-TOOL-6114` / `origin-kind-mixed-stem-root`). This is the hole
+    /// the fix closes: previously the `None` arm short-circuited to `Ok(None)`
+    /// before the mixed-family check ever ran.
+    #[tokio::test]
+    async fn mint_mixed_family_root_with_no_caveats_rejects() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = mixed_family_root_caps();
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-caveat",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(mixed_family_root_ceiling()),
+            caveats: None,
+        };
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .expect_err("mixed-family root with caveats=None must reject unconditionally at mint");
+        match err {
+            UcanError::MalformedToken(msg) => {
+                assert!(
+                    msg.contains("origin-kind-mixed-stem-root"),
+                    "expected origin-kind-mixed-stem-root slug, got: {msg}"
+                );
+            }
+            other => panic!("expected MalformedToken(origin-kind-mixed-stem-root), got {other:?}"),
+        }
+    }
+
+    /// MEDIUM-1 (b): the SAME mixed-family root with `caveats = Some(_)` also
+    /// rejects (it always did via `try_new_for_root`). Pins that the fix did
+    /// not regress the already-covered path.
+    #[tokio::test]
+    async fn mint_mixed_family_root_with_caveats_rejects() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = mixed_family_root_caps();
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-caveat",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(mixed_family_root_ceiling()),
+            caveats: Some(InvocationCaveats {
+                max_calls: Some(10),
+                ..InvocationCaveats::empty()
+            }),
+        };
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .expect_err("mixed-family root with caveats=Some must reject at mint");
+        match err {
+            UcanError::MalformedToken(msg) => {
+                assert!(
+                    msg.contains("origin-kind-mixed-stem-root"),
+                    "expected origin-kind-mixed-stem-root slug, got: {msg}"
+                );
+            }
+            other => panic!("expected MalformedToken(origin-kind-mixed-stem-root), got {other:?}"),
+        }
+    }
+
+    /// MEDIUM-1 (c): a SINGLE-family outlet root with `caveats = None` still
+    /// mints successfully and carries `nb = None`. The mixed-family gate runs
+    /// (over `empty()`) but passes for a single-family set, so the legitimate
+    /// no-caveat outlet root is not over-rejected.
+    #[tokio::test]
+    async fn mint_single_family_outlet_root_with_no_caveats_is_nb_none() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["outlet_call:assistant".to_owned()];
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-caveat",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(std::iter::once("outlet_call:assistant".to_owned()).collect()),
+            caveats: None,
+        };
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .expect("single-family outlet root with caveats=None must mint");
+        assert_eq!(
+            token.payload.nb, None,
+            "single-family outlet root with no caveats carries nb = None"
         );
     }
 }

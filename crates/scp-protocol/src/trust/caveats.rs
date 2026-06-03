@@ -1979,6 +1979,18 @@ pub enum AttenuationViolation {
         parent: Option<OutletKind>,
     },
 
+    /// A token's capability set carries BOTH the `outlet_query` and
+    /// `outlet_call` stem families, making its `origin_kind` ambiguous.
+    /// §7.3.8 forbids mixed-family outlet tokens UNCONDITIONALLY — this is the
+    /// validator's analogue of the mint-side
+    /// [`CaveatMintError::OriginKindMixedStemRoot`] guard. A self-signed /
+    /// forged depth-1 outlet token whose attestations span both families is
+    /// rejected with this variant even when it declares no `nb.origin_kind`.
+    #[error(
+        "origin_kind mixed stem: token capability set carries both outlet_query and outlet_call stems"
+    )]
+    OriginKindMixedStem,
+
     /// One of the parent or child caveat sets carries a malformed mask.
     /// Surfaced from [`assert_mask_widths`] when invoked at the narrow
     /// entry point.
@@ -2196,6 +2208,7 @@ impl AttenuationViolation {
         match self {
             Self::OriginKindMismatch { .. } => "origin-kind-mismatch",
             Self::OriginKindUnspecified { .. } => "origin-kind-unspecified",
+            Self::OriginKindMixedStem => "origin-kind-mixed-stem",
             Self::MaskWidth(_) => "mask-width-violation",
             Self::FieldRemoved { .. } => "field-removed",
             Self::AmountWidened { .. } => "amount-widened",
