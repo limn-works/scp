@@ -17036,4 +17036,63 @@ mod tests {
         assert!(scp.petname_did_count(String::new()).is_err());
         assert!(scp.petname_context_count(String::new()).is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint sender_did ↔ signing-identity binding
+    //
+    // The UniFFI bridge has no DID-keyed identity registry, so the recorded
+    // `sender_did` is bound to the signing `Identity` explicitly inside
+    // `event_log_checkpoint_by_did_impl` (the `did != identity.did` guard).
+    // Without it a caller could record a checkpoint as signed by an arbitrary
+    // DID while signing with an unrelated identity's key — a provenance
+    // forgery. These tests pin that guard so a future re-order or removal of
+    // the binding check breaks here rather than at the Swift/Kotlin boundary.
+    // -----------------------------------------------------------------------
+
+    /// A `did` that differs from the signing identity's own DID must be
+    /// rejected with `SCP-VALID-7000`, and the matching `did` must succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn checkpoint_by_did_binds_recorded_sender_to_signing_identity() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = test_handle_for(&scp);
+
+        // Mismatch: a different, syntactically valid DID is rejected because it
+        // does not match the signing identity's DID.
+        let foreign_did = "did:dht:z6MkForeignSignerThatIsNotTheIdentity".to_owned();
+        assert_ne!(foreign_did, identity.did);
+        let mismatch = scp
+            .event_log_checkpoint_by_did(Arc::clone(&handle), Arc::clone(&identity), foreign_did, 0)
+            .await;
+        match mismatch {
+            Err(ScpError::Validation { code, .. }) => {
+                assert_eq!(
+                    code,
+                    codes::VALID_7000,
+                    "sender_did != identity.did must surface SCP-VALID-7000"
+                );
+            }
+            other => panic!("expected ScpError::Validation (VALID_7000), got {other:?}"),
+        }
+
+        // Happy path: did == identity.did succeeds and the produced checkpoint
+        // is attributed to (and signed by) that same identity.
+        let own_did = identity.did();
+        let checkpoint = scp
+            .event_log_checkpoint_by_did(handle, Arc::clone(&identity), own_did.clone(), 0)
+            .await
+            .expect("checkpoint with matching did must succeed");
+        assert_eq!(
+            checkpoint.sender_did, own_did,
+            "the checkpoint must be attributed to the signing identity's DID"
+        );
+        assert!(
+            !checkpoint.signature.is_empty(),
+            "a successful checkpoint must carry a signature"
+        );
+    }
 }

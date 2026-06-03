@@ -1123,12 +1123,17 @@ export function createNativeBridge(scp: SCP): Bridge {
           merkleRoot: string;
           eventCount: number;
           timestamp: number;
+          signature: string;
         }>
       )(handle, identityDid, epoch);
       return {
         root: raw.merkleRoot,
         eventCount: raw.eventCount,
         timestamp: raw.timestamp,
+        // Native bridges sign the checkpoint in-process; surface the Ed25519
+        // signature (hex). The WASM backend has no `signature` and returns
+        // `signingPayloadHash` instead (see `Checkpoint` type doc).
+        signature: raw.signature,
       };
     },
 
