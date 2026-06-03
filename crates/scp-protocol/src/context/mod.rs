@@ -408,6 +408,23 @@ pub enum ContextError {
         /// Human-readable explanation of why the import was rejected.
         reason: String,
     },
+    /// The Ed25519 signature over an exported context snapshot failed
+    /// verification against the exporter DID's resolved verification-method
+    /// key (spec §23.16.4).
+    ///
+    /// Distinct from the event-log Merkle-chain failure (surfaced as
+    /// [`Self::EventLogFailed`]) and from the version gate: a `version` error
+    /// means the export predates snapshot signing (v1) and was rejected before
+    /// any signature was checked, whereas this error means the signature was
+    /// present but did not authenticate the embedded snapshot — i.e. the
+    /// membership, role, params, or tool state was forged or the exporter key
+    /// could not be resolved. Mapped to canonical code `SCP-CTX-2093` through
+    /// every FFI bridge translator so callers can switch on `.code`.
+    #[error("SCP-CTX-2093: snapshot signature invalid: {reason}")]
+    SnapshotSignatureInvalid {
+        /// Human-readable explanation of why signature verification failed.
+        reason: String,
+    },
     /// A previously broadcasted MLS Commit (`RemoveMember`, `RotateContentKeys`,
     /// `ResetMember`, or `LeaveContext`) exceeded the persistent retry budget
     /// and the context is in fail-close state (PR #1606 C6).

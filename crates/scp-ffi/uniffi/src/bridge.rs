@@ -4636,6 +4636,39 @@ async fn resolve_uniffi_signing_key(
     })
 }
 
+/// Resolves the exporter DID's Ed25519 verification key for snapshot-signature
+/// verification on context import (§23.16.4, ADR-039).
+///
+/// Tries `#active` then `#agent` (ADR-039 shared-DID model). Fails closed with
+/// [`codes::CTX_2093`] if no resolver is configured or neither key resolves —
+/// an unverifiable export is never imported.
+fn resolve_uniffi_exporter_verifying_key(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    exporter_did: &str,
+) -> Result<ed25519_dalek::VerifyingKey, ScpError> {
+    use scp_core::crypto::ucan::validate::DidResolver;
+
+    let resolver = bi.did_resolver().ok_or_else(|| ScpError::Context {
+        msg: "no DID resolver configured — cannot verify exporter snapshot signature".to_owned(),
+        code: codes::CTX_2093.to_owned(),
+    })?;
+
+    let key_bytes = resolver
+        .resolve_public_key_by_kid(exporter_did, "active")
+        .or_else(|_| resolver.resolve_public_key_by_kid(exporter_did, "agent"))
+        .map_err(|e| ScpError::Context {
+            msg: format!(
+                "failed to resolve exporter '{exporter_did}' verification key (#active/#agent): {e}"
+            ),
+            code: codes::CTX_2093.to_owned(),
+        })?;
+
+    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| ScpError::Context {
+        msg: format!("exporter '{exporter_did}' verification key is not valid Ed25519: {e}"),
+        code: codes::CTX_2093.to_owned(),
+    })
+}
+
 /// Parses a hex-encoded proposal ID into a 32-byte array.
 fn parse_uniffi_proposal_id(hex_str: &str) -> Result<[u8; 32], ScpError> {
     let bytes = hex::decode(hex_str).map_err(|e| ScpError::Validation {
@@ -14703,12 +14736,26 @@ impl Scp {
             .map_err(ScpError::from)?;
         let ctx_id = handle.context_id.clone();
         let creator_did = handle.creator_did.clone();
+        let handle = Arc::clone(&handle);
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 let manager = bi.context_manager_or_error()?;
+                // Resolve the exporter's custody signing key (callback or
+                // in-memory custody) to sign the snapshot (§23.16.4). The
+                // runtime holds no key material — signing happens here.
+                let signing_key = resolve_uniffi_signing_key(&handle).await?;
                 let export = manager
-                    .export_context(&ctx_id, scp_identity::DID::from(creator_did))
+                    .export_context(
+                        &ctx_id,
+                        scp_identity::DID::from(creator_did),
+                        |hash: &[u8; 32]| {
+                            use ed25519_dalek::Signer;
+                            Ok::<[u8; 64], std::convert::Infallible>(
+                                signing_key.sign(hash).to_bytes(),
+                            )
+                        },
+                    )
                     .await
                     .map_err(ScpError::from)?;
                 scp_core::context::export_import::serialize_export(&export).map_err(|e| {
@@ -14747,9 +14794,14 @@ impl Scp {
                 validate_did(&export.exporter_did.0)?;
                 bi.init_context_manager_with_did(&export.exporter_did.0);
 
+                // Resolve the exporter's verification key to verify the snapshot
+                // signature (§23.16.4). Fail-closed: never import unverified.
+                let verifying_key =
+                    resolve_uniffi_exporter_verifying_key(&bi, &export.exporter_did.0)?;
+
                 let manager = bi.context_manager_or_error()?;
                 manager
-                    .import_context(export)
+                    .import_context(export, &verifying_key)
                     .await
                     .map_err(ScpError::from)?;
                 Ok(context_id)

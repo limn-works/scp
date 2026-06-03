@@ -16969,7 +16969,12 @@ async fn h10_import_context_resets_next_proposal_seq() {
 
     // The exporter is untrusted at the import boundary; build the export
     // by hand so we can sneak the tampered field in past `create_export`.
-    let export = crate::context::export_import::ContextExport {
+    // The snapshot signature must still verify — the C3 wipe is a defense
+    // applied AFTER signature verification, against a validly-signed but
+    // adversarial exporter (the exporter signs its own forged state).
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let mut export = crate::context::export_import::ContextExport {
         snapshot,
         event_log_data: Vec::new(),
         mls_state: Vec::new(),
@@ -16978,7 +16983,14 @@ async fn h10_import_context_resets_next_proposal_seq() {
         exporter_did: "did:key:malicious-exporter".into(),
         merkle_root: [0u8; 32],
         scope: crate::context::export_import::ExportScope::Full,
+        snapshot_signature: [0u8; 64],
     };
+    {
+        use ed25519_dalek::Signer;
+        export.snapshot_signature = signing_key
+            .sign(&export.canonical_snapshot_hash().unwrap())
+            .to_bytes();
+    }
 
     // Import into a fresh manager so we can observe the post-import state.
     let importer = super::ContextManager::new(
@@ -16988,7 +17000,7 @@ async fn h10_import_context_resets_next_proposal_seq() {
         noop_key_resolver(),
     );
     importer
-        .import_context(export)
+        .import_context(export, &verifying_key)
         .await
         .expect("import must succeed");
 

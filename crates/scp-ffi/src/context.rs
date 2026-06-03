@@ -1218,6 +1218,47 @@ fn resolve_signing_key(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+/// Resolves the exporter DID's Ed25519 verification key for snapshot-signature
+/// verification on context import (spec §23.16.4, ADR-039).
+///
+/// Tries the `#active` (operational) verification method first, then falls back
+/// to `#agent` (shared-DID agent key) per ADR-039 — either is a valid signer of
+/// an export. Fails closed: if no resolver is configured or neither key
+/// resolves, the import is rejected with [`error_codes::CTX_2093`] rather than
+/// proceeding with an unverifiable snapshot.
+fn resolve_exporter_verifying_key(
+    bi: &crate::runtime::PyBridgeInstance,
+    exporter_did: &str,
+) -> PyResult<ed25519_dalek::VerifyingKey> {
+    use scp_core::crypto::ucan::validate::DidResolver;
+
+    let resolver = crate::runtime::did_resolver(bi).ok_or_else(|| {
+        PyRuntimeError::new_err(format!(
+            "{}: no DID resolver configured — cannot verify exporter snapshot signature",
+            scp_ffi_common::error_codes::CTX_2093
+        ))
+    })?;
+
+    // Try #active, then #agent (ADR-039 shared-DID model).
+    let key_bytes = resolver
+        .resolve_public_key_by_kid(exporter_did, "active")
+        .or_else(|_| resolver.resolve_public_key_by_kid(exporter_did, "agent"))
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "{}: failed to resolve exporter '{exporter_did}' verification key \
+                 (#active/#agent): {e}",
+                scp_ffi_common::error_codes::CTX_2093
+            ))
+        })?;
+
+    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| {
+        PyRuntimeError::new_err(format!(
+            "{}: exporter '{exporter_did}' verification key is not a valid Ed25519 key: {e}",
+            scp_ffi_common::error_codes::CTX_2093
+        ))
+    })
+}
+
 /// Validates all user-controlled string fields on a governance action.
 #[cfg(test)]
 fn validate_governance_action_strings(
@@ -2382,8 +2423,19 @@ impl crate::scp::PyScp {
                 scp_identity::DID::from,
             );
 
+        // Resolve the exporter's custody signing key up front (§23.16.4). The
+        // runtime holds no key material — signing happens here at the bridge,
+        // mirroring the governance signing path. The closure produces an
+        // Ed25519 signature over the canonical snapshot hash.
+        let signing_key = resolve_signing_key(bi, &exporter_did.0)?;
+
         let export = rt
-            .block_on(mgr.export_context(&ctx_id, exporter_did))
+            .block_on(
+                mgr.export_context(&ctx_id, exporter_did, |hash: &[u8; 32]| {
+                    use ed25519_dalek::Signer;
+                    Ok::<[u8; 64], std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+                }),
+            )
             .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))?;
 
         scp_core::context::export_import::serialize_export(&export)
@@ -2434,7 +2486,12 @@ impl crate::scp::PyScp {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mgr = mgr.clone();
 
-        rt.block_on(mgr.import_context(export))
+        // Resolve the exporter DID's verification-method key to verify the
+        // snapshot signature (§23.16.4). Fail-closed: if no key resolves, the
+        // import is rejected — never imported unverified.
+        let verifying_key = resolve_exporter_verifying_key(bi, &export.exporter_did.0)?;
+
+        rt.block_on(mgr.import_context(export, &verifying_key))
             .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
 
         Ok(context_id)

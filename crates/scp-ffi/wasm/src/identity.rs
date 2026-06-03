@@ -694,6 +694,18 @@ pub(crate) fn resolve_verification_method_key(did: &str, kid: &str) -> Result<[u
     })
 }
 
+/// Returns `true` if the local identity registry holds signing-key material
+/// for `did` (a `Local` record).
+///
+/// Used by context import to decide whether the symmetric export HMAC can be
+/// verified: HMAC verification requires the creator's key, which is only
+/// present for self-imports. Cross-party imports rely on the Ed25519 snapshot
+/// signature instead.
+pub(crate) fn creator_key_available(did: &str) -> bool {
+    IDENTITY_REGISTRY
+        .with(|reg| matches!(reg.borrow().get(did), Some(IdentityRecord::Local { .. })))
+}
+
 /// Verifies an HMAC-SHA256 tag over `data` using a key derived from the
 /// signing key of the identity identified by `did`.
 ///

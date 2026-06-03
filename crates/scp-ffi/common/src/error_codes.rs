@@ -314,6 +314,8 @@ pub const CTX_2075: &str = "SCP-CTX-2075";
 pub const CTX_2091: &str = "SCP-CTX-2091";
 /// Context economy spending error.
 pub const CTX_2092: &str = "SCP-CTX-2092";
+/// Context export snapshot signature verification failed (spec §23.16.4).
+pub const CTX_2093: &str = "SCP-CTX-2093";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.

@@ -3144,10 +3144,29 @@ fn c3_test_snapshot(context_id: &str) -> super::ContextSnapshot {
     }
 }
 
+/// Deterministic test signing key for export snapshot signatures (§23.16.4).
+fn test_export_signing_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+}
+
+/// Signing closure pairing with [`test_export_signing_key`].
+// Result is mandated by the `create_export` sign-closure contract; the test
+// signer is infallible.
+#[allow(clippy::unnecessary_wraps)]
+fn sign_export(hash: &[u8; 32]) -> Result<[u8; 64], std::convert::Infallible> {
+    use ed25519_dalek::Signer;
+    Ok(test_export_signing_key().sign(hash).to_bytes())
+}
+
+/// Verifying key pairing with [`test_export_signing_key`], for `import_context`.
+fn test_export_verifying_key() -> ed25519_dalek::VerifyingKey {
+    test_export_signing_key().verifying_key()
+}
+
 /// Wraps a snapshot in a `ContextExport` for importing via
 /// `manager.import_context`. Uses the canonical `create_export` factory so
-/// the Merkle root and version fields stay consistent with the production
-/// path.
+/// the Merkle root, version, and signature fields stay consistent with the
+/// production path.
 fn c3_export_from_snapshot(
     snapshot: super::ContextSnapshot,
 ) -> crate::context::export_import::ContextExport {
@@ -3158,6 +3177,7 @@ fn c3_export_from_snapshot(
         DID::from("did:key:c3-exporter"),
         crate::context::export_import::ExportScope::Full,
         &scp_primitives::SystemClock,
+        sign_export,
     )
     .unwrap()
 }
@@ -3207,7 +3227,10 @@ async fn import_context_rejects_forged_approved_proposals() {
         .insert(forged_id, (forged_proposal, 0, 0));
 
     let export = c3_export_from_snapshot(snapshot);
-    let _handle = manager.import_context(export).await.unwrap();
+    let _handle = manager
+        .import_context(export, &test_export_verifying_key())
+        .await
+        .unwrap();
 
     // After import the per-context governance state must NOT contain
     // the forged approval — wipe-on-import is the entire fix for C3.
@@ -3257,7 +3280,10 @@ async fn import_context_wipes_budget_tracker() {
     );
 
     let export = c3_export_from_snapshot(snapshot);
-    manager.import_context(export).await.unwrap();
+    manager
+        .import_context(export, &test_export_verifying_key())
+        .await
+        .unwrap();
 
     let arc = manager
         .contexts
@@ -3325,7 +3351,10 @@ async fn import_context_wipes_participation_cache() {
         .insert(victim.to_owned(), victim_record);
 
     let export = c3_export_from_snapshot(snapshot);
-    manager.import_context(export).await.unwrap();
+    manager
+        .import_context(export, &test_export_verifying_key())
+        .await
+        .unwrap();
 
     let arc = manager
         .contexts
@@ -3362,7 +3391,9 @@ async fn import_context_rejects_threshold_zero_in_rules() {
     });
 
     let export = c3_export_from_snapshot(snapshot);
-    let result = manager.import_context(export).await;
+    let result = manager
+        .import_context(export, &test_export_verifying_key())
+        .await;
     let err = result.expect_err("import must reject threshold == 0");
     match err {
         ContextError::ImportRejected { reason } => {
@@ -3409,7 +3440,9 @@ async fn import_context_rejects_revokeaccess_without_config_opt_in() {
     });
 
     let export = c3_export_from_snapshot(snapshot);
-    let result = manager.import_context(export).await;
+    let result = manager
+        .import_context(export, &test_export_verifying_key())
+        .await;
     let err = result.expect_err("import must reject RevokeAccess without opt-in");
     match err {
         ContextError::ImportRejected { reason } => {
@@ -3447,7 +3480,10 @@ async fn import_context_clamps_cooldown_until() {
 
     let now_before = scp_primitives::SystemClock.now_secs();
     let export = c3_export_from_snapshot(snapshot);
-    manager.import_context(export).await.unwrap();
+    manager
+        .import_context(export, &test_export_verifying_key())
+        .await
+        .unwrap();
 
     let arc = manager
         .contexts
@@ -3708,7 +3744,7 @@ fn make_epoch_test_export(context_id: &str) -> crate::context::export_import::Co
         pseudonym_registry: std::collections::HashMap::new(),
     };
 
-    crate::context::export_import::ContextExport {
+    let mut export = crate::context::export_import::ContextExport {
         snapshot,
         event_log_data: Vec::new(),
         // Non-empty so the lifecycle code enters the restore_crypto_state path
@@ -3719,7 +3755,12 @@ fn make_epoch_test_export(context_id: &str) -> crate::context::export_import::Co
         exporter_did: DID::from("did:key:test-exporter"),
         merkle_root: [0u8; 32], // valid for empty event log
         scope: crate::context::export_import::ExportScope::Full,
-    }
+        snapshot_signature: [0u8; 64],
+    };
+    // Sign so the snapshot signature verifies and validation reaches the
+    // §23.17 epoch-floor checks these tests exercise.
+    export.snapshot_signature = sign_export(&export.canonical_snapshot_hash().unwrap()).unwrap();
+    export
 }
 
 /// §23.17 Invariant 3: `import_context` rejects a snapshot that lowers a
@@ -3772,7 +3813,9 @@ async fn import_context_rejects_epoch_floor_regression() {
         .expect("transition to Closing should succeed");
 
     let export = make_epoch_test_export(ctx_id);
-    let result = manager.import_context(export).await;
+    let result = manager
+        .import_context(export, &test_export_verifying_key())
+        .await;
 
     assert!(
         result.is_err(),
@@ -3831,7 +3874,9 @@ async fn import_context_accepts_epoch_advance_within_ceiling() {
         .expect("transition to Closing should succeed");
 
     let export = make_epoch_test_export(ctx_id);
-    let result = manager.import_context(export).await;
+    let result = manager
+        .import_context(export, &test_export_verifying_key())
+        .await;
 
     assert!(
         result.is_ok(),
@@ -3884,7 +3929,9 @@ async fn import_context_rejects_epoch_advance_beyond_ceiling() {
         .expect("transition to Closing should succeed");
 
     let export = make_epoch_test_export(ctx_id);
-    let result = manager.import_context(export).await;
+    let result = manager
+        .import_context(export, &test_export_verifying_key())
+        .await;
 
     assert!(
         result.is_err(),
@@ -3924,7 +3971,9 @@ async fn import_context_fresh_context_accepts_any_epoch_within_ceiling() {
 
     // No create_context_bare call — fresh slot (no prior context).
     let export = make_epoch_test_export(ctx_id);
-    let result = manager.import_context(export).await;
+    let result = manager
+        .import_context(export, &test_export_verifying_key())
+        .await;
 
     assert!(
         result.is_ok(),

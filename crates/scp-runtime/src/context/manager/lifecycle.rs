@@ -894,12 +894,27 @@ impl ContextManager {
     ///
     /// Returns [`ContextError`] if the context does not exist or event log
     /// export fails.
+    /// # Snapshot signing
+    ///
+    /// The exported snapshot is integrity-protected by an Ed25519 signature
+    /// over [`ContextExport::canonical_snapshot_hash`](crate::context::export_import::ContextExport::canonical_snapshot_hash)
+    /// (spec §23.16.4). The runtime holds no custody/signing key — only a
+    /// `KeyResolver` (which is `None` under FFI) — so the caller supplies a
+    /// `sign` closure that produces the signature using the exporter's custody
+    /// key. The FFI bridge implements this via `resolve_signing_key`, mirroring
+    /// the governance signing path. The closure receives the canonical hash
+    /// computed over the final (post–public-stripping) export contents.
     #[instrument(skip_all, fields(context_id))]
-    pub async fn export_context(
+    pub async fn export_context<F, E>(
         &self,
         context_id: &str,
         exporter_did: DID,
-    ) -> Result<crate::context::export_import::ContextExport, ContextError> {
+        sign: F,
+    ) -> Result<crate::context::export_import::ContextExport, ContextError>
+    where
+        F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
+        E: std::fmt::Display,
+    {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
         let snapshot = {
@@ -928,6 +943,7 @@ impl ContextManager {
             exporter_did,
             crate::context::export_import::ExportScope::Full,
             &*self.clock,
+            sign,
         )
     }
 
@@ -980,14 +996,25 @@ impl ContextManager {
     /// rules`, `consequence_config`, `cooldown_until`. The latter is
     /// clamped to a bounded horizon and out-of-bound rule indices are
     /// dropped.
+    /// # Snapshot signature verification
+    ///
+    /// Imports come from an UNTRUSTED source. Before any state is restored, the
+    /// embedded snapshot's Ed25519 signature is verified against
+    /// `verifying_key` — the exporter DID's resolved `#active`/`#agent`
+    /// verification-method key (spec §23.16.4, ADR-039). The FFI bridge resolves
+    /// this key from `export.exporter_did` via `IdentityBackedDidResolver`. A
+    /// signature failure rejects the import with
+    /// [`ContextError::SnapshotSignatureInvalid`], distinct from the event-log
+    /// Merkle failure and from the version gate.
     #[instrument(skip_all)]
     #[allow(clippy::too_many_lines)] // Reimport guard adds 10 lines to an already-100-line function.
     pub async fn import_context(
         &self,
         export: crate::context::export_import::ContextExport,
+        verifying_key: &ed25519_dalek::VerifyingKey,
     ) -> Result<ContextHandle, ContextError> {
-        // 1. Validate export.
-        crate::context::export_import::validate_export_for_import(&export)?;
+        // 1. Validate export (version gate, snapshot signature, Merkle chain).
+        crate::context::export_import::validate_export_for_import(&export, verifying_key)?;
         // C3: Validate consequence rules on import. Uses
         // validate_against_config to enforce the opt-in gate for
         // RevokeAccess even on imported snapshots and rejects with the

@@ -2177,6 +2177,49 @@ async fn resolve_napi_signing_key(
         })
 }
 
+/// Resolves the exporter DID's Ed25519 verification key for snapshot-signature
+/// verification on context import (§23.16.4, ADR-039).
+///
+/// Tries `#active` then `#agent` (ADR-039 shared-DID model). Fails closed with
+/// [`codes::CTX_2093`] if no resolver is configured or neither key resolves —
+/// an unverifiable export is never imported.
+fn resolve_napi_exporter_verifying_key(
+    bi: &NapiBridgeInstance,
+    exporter_did: &str,
+) -> napi::Result<ed25519_dalek::VerifyingKey> {
+    use scp_core::crypto::ucan::validate::DidResolver;
+
+    let resolver = crate::runtime::did_resolver(bi).ok_or_else(|| {
+        NapiError::from(ScpNapiError::Context {
+            message: "no DID resolver configured — cannot verify exporter snapshot signature"
+                .to_owned(),
+            code: codes::CTX_2093.to_owned(),
+        })
+    })?;
+
+    let key_bytes = resolver
+        .resolve_public_key_by_kid(exporter_did, "active")
+        .or_else(|_| resolver.resolve_public_key_by_kid(exporter_did, "agent"))
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!(
+                    "failed to resolve exporter '{exporter_did}' verification key \
+                     (#active/#agent): {e}"
+                ),
+                code: codes::CTX_2093.to_owned(),
+            })
+        })?;
+
+    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!(
+                "exporter '{exporter_did}' verification key is not valid Ed25519: {e}"
+            ),
+            code: codes::CTX_2093.to_owned(),
+        })
+    })
+}
+
 /// Parses a hex-encoded proposal ID into a 32-byte array.
 fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
     let bytes = hex::decode(hex_str).map_err(|e| {
@@ -2825,6 +2868,12 @@ pub(crate) async fn context_reset_ttl_timer_on(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`context_export`].
+///
+/// Signs the exported snapshot with the exporter's custody key (§23.16.4),
+/// mirroring the governance signing path: signing requires key custody and is
+/// therefore only available under `allow_in_memory_custody`; without it the
+/// export is rejected fail-closed rather than emitting an unsigned (and thus
+/// unverifiable) export.
 pub(crate) async fn context_export_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -2832,16 +2881,38 @@ pub(crate) async fn context_export_on(
     crate::napi_check_handle!(&bi.core, handle);
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
     let manager = context_manager(bi)?;
-    let export = manager
-        .export_context(&handle.context_id, exporter_did)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-    scp_core::context::export_import::serialize_export(&export).map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("export serialization failed: {e}"),
-            code: codes::CTX_2030.to_owned(),
-        })
-    })
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        let signing_key = resolve_napi_signing_key(handle).await?;
+        let export = manager
+            .export_context(&handle.context_id, exporter_did, |hash: &[u8; 32]| {
+                use ed25519_dalek::Signer;
+                Ok::<[u8; 64], std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+            })
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        return scp_core::context::export_import::serialize_export(&export).map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("export serialization failed: {e}"),
+                code: codes::CTX_2030.to_owned(),
+            })
+        });
+    }
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (manager, exporter_did);
+        return Err(NapiError::from(ScpNapiError::Permission {
+            message: "context export requires key custody to sign the snapshot \
+                      (§23.16.4) — in_memory custody feature is not enabled"
+                .to_owned(),
+            code: codes::CTX_2093.to_owned(),
+        }));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(Vec::new())
 }
 
 /// Per-bridge-instance implementation of [`context_import`].
@@ -2866,9 +2937,13 @@ pub(crate) async fn context_import_on(
     // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1294).
     crate::runtime::init_context_manager(bi, &export.exporter_did.0);
 
+    // Resolve the exporter's verification key to verify the snapshot signature
+    // (§23.16.4). Fail-closed: an unverifiable export is never imported.
+    let verifying_key = resolve_napi_exporter_verifying_key(bi, &export.exporter_did.0)?;
+
     let manager = context_manager(bi)?;
     manager
-        .import_context(export)
+        .import_context(export, &verifying_key)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(context_id)

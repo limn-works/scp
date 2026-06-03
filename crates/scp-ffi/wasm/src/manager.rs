@@ -5161,8 +5161,24 @@ impl WasmContextManager {
 
         // Compute HMAC-SHA256 over the snapshot JSON using the creator's
         // signing key (via HKDF domain separation). The creator DID is in the
-        // snapshot — look up their identity in the registry.
+        // snapshot — look up their identity in the registry. Retained as
+        // defense-in-depth for self-imports.
         let integrity_mac = crate::identity::compute_export_hmac(&ctx.creator_did, &snapshot_json)?;
+
+        // Ed25519 signature over SHA-256(domain || snapshot_jcs) by the
+        // creator's #active key (§23.16.4, ADR-034). This is the cross-party
+        // integrity proof — verifiable by anyone resolving the exporter's key.
+        let snapshot_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(WASM_SNAPSHOT_SIGN_DOMAIN);
+            hasher.update(&snapshot_json);
+            let digest: [u8; 32] = hasher.finalize().into();
+            digest
+        };
+        let signature =
+            crate::identity::sign_with_identity(&ctx.creator_did, "#active", &snapshot_hash)?;
+        let snapshot_signature = hex::encode(signature);
 
         let now_ms = crate::time::now_ms();
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -5173,6 +5189,7 @@ impl WasmContextManager {
             exported_at,
             exporter_did: exporter_did.to_owned(),
             integrity_mac,
+            snapshot_signature,
             snapshot,
         };
 
@@ -5206,10 +5223,25 @@ impl WasmContextManager {
             });
         }
 
-        // Re-serialize the snapshot to RFC 8785 JCS canonical JSON and verify
-        // the HMAC tag using the creator's signing key. This MUST happen
-        // before any state reconstruction to prevent an attacker from crafting
-        // payloads that grant them admin of a context.
+        // Fail closed on pre-signature (unsigned) envelopes. Versions below 4
+        // carried no Ed25519 snapshot signature, so the embedded snapshot was
+        // not cross-party verifiable — refuse rather than import unverifiable
+        // membership/role/governance state (§23.16.4). Distinct from a
+        // signature failure: this is a version error.
+        if envelope.version < WASM_EXPORT_VERSION {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "unsupported export version: {} predates snapshot signing — \
+                     required version is {WASM_EXPORT_VERSION} (refusing unverifiable import)",
+                    envelope.version
+                ),
+                code: codes::CTX_2032.to_owned(),
+            });
+        }
+
+        // Re-serialize the snapshot to RFC 8785 JCS canonical JSON. This MUST
+        // happen before any state reconstruction to prevent an attacker from
+        // crafting payloads that grant them admin of a context.
         let snapshot_json = serde_json_canonicalizer::to_vec(&envelope.snapshot).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("snapshot re-serialization failed: {e}"),
@@ -5217,21 +5249,98 @@ impl WasmContextManager {
             }
         })?;
 
-        if envelope.integrity_mac.is_empty() {
+        // 1. Ed25519 snapshot signature (§23.16.4). The exporter signs
+        // SHA-256(domain || snapshot_jcs) with its #active key; verify against
+        // the creator DID's resolved #active (then #agent) verification key.
+        // Fail closed: an empty or invalid signature rejects the import.
+        if envelope.snapshot_signature.is_empty() {
             return Err(ScpWasmError::Context {
-                message: "export integrity_mac is missing — refusing to import unsigned export"
+                message: "export snapshot_signature is missing — refusing to import \
+                          unsigned export (§23.16.4)"
                     .to_owned(),
-                code: codes::CTX_2020.to_owned(),
+                code: codes::CTX_2093.to_owned(),
             });
         }
-
-        crate::identity::verify_export_hmac(
+        Self::verify_snapshot_signature(
             &envelope.snapshot.creator_did,
             &snapshot_json,
-            &envelope.integrity_mac,
+            &envelope.snapshot_signature,
         )?;
 
+        // 2. HMAC integrity tag (defense-in-depth for self-imports). Verifiable
+        // only by a holder of the creator's key; skipped if the creator's key
+        // is not in the local registry (cross-party import), since the Ed25519
+        // signature already provides cross-party integrity.
+        if !envelope.integrity_mac.is_empty()
+            && crate::identity::creator_key_available(&envelope.snapshot.creator_did)
+        {
+            crate::identity::verify_export_hmac(
+                &envelope.snapshot.creator_did,
+                &snapshot_json,
+                &envelope.integrity_mac,
+            )?;
+        }
+
         Ok(envelope)
+    }
+
+    /// Verifies the Ed25519 snapshot signature against the creator DID's
+    /// resolved verification-method key (§23.16.4, ADR-039).
+    ///
+    /// Recomputes `SHA-256(SCP-CONTEXT-SNAPSHOT-V1: || snapshot_jcs)` and
+    /// verifies the signature with `verify_strict` against the `#active` key,
+    /// falling back to `#agent`. Fails closed on any resolution or verification
+    /// error.
+    fn verify_snapshot_signature(
+        creator_did: &str,
+        snapshot_json: &[u8],
+        signature_hex: &str,
+    ) -> Result<(), ScpWasmError> {
+        let sig_bytes: [u8; 64] = hex::decode(signature_hex)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| ScpWasmError::Context {
+                message: "snapshot_signature is not a valid 64-byte hex Ed25519 signature"
+                    .to_owned(),
+                code: codes::CTX_2093.to_owned(),
+            })?;
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+        let snapshot_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(WASM_SNAPSHOT_SIGN_DOMAIN);
+            hasher.update(snapshot_json);
+            let digest: [u8; 32] = hasher.finalize().into();
+            digest
+        };
+
+        // Resolve #active, then #agent (ADR-039 shared-DID model).
+        let key_bytes = crate::identity::resolve_verification_method_key(creator_did, "#active")
+            .or_else(|_| crate::identity::resolve_verification_method_key(creator_did, "#agent"))
+            .map_err(|e| ScpWasmError::Context {
+                message: format!(
+                    "failed to resolve exporter '{creator_did}' verification key \
+                     (#active/#agent): {e}"
+                ),
+                code: codes::CTX_2093.to_owned(),
+            })?;
+
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| {
+            ScpWasmError::Context {
+                message: format!("exporter '{creator_did}' key is not valid Ed25519: {e}"),
+                code: codes::CTX_2093.to_owned(),
+            }
+        })?;
+
+        verifying_key
+            .verify_strict(&snapshot_hash, &signature)
+            .map_err(|e| ScpWasmError::Context {
+                message: format!(
+                    "snapshot signature did not verify for exporter '{creator_did}': {e}"
+                ),
+                code: codes::CTX_2093.to_owned(),
+            })
     }
 
     /// Imports a context from serialized JSON bytes produced by `export_context`.
@@ -5653,7 +5762,11 @@ pub struct ContextMetadata {
 ///   v3 exports are NOT importable by v2 binaries because the version
 ///   check below rejects exports with `version > WASM_EXPORT_VERSION`,
 ///   which prevents silent loss of the new lossless state.
-const WASM_EXPORT_VERSION: u32 = 3;
+const WASM_EXPORT_VERSION: u32 = 4;
+
+/// Domain separator for the WASM context-export snapshot signature, matching
+/// the cross-bridge canonical hash (spec §23.16.4, §9.18.2).
+const WASM_SNAPSHOT_SIGN_DOMAIN: &[u8] = b"SCP-CONTEXT-SNAPSHOT-V1:";
 
 /// Versioned envelope for context exports.
 ///
@@ -5678,6 +5791,19 @@ struct WasmContextExportEnvelope {
     /// info="scp-context-export-integrity-v1")`. Verified on import to prevent
     /// tampering with membership, roles, or governance state.
     integrity_mac: String,
+    /// Ed25519 signature (hex-encoded, 64 bytes) by the creator's `#active`
+    /// signing key over `SHA-256(SCP-CONTEXT-SNAPSHOT-V1: || snapshot_jcs)`
+    /// (spec §23.16.4, adapted to the WASM JSON snapshot shape per ADR-034).
+    ///
+    /// Unlike `integrity_mac` (a symmetric HMAC verifiable only by a holder of
+    /// the creator's key), this is an asymmetric signature: any importer that
+    /// can resolve the exporter DID's `#active`/`#agent` verification key can
+    /// verify the embedded snapshot was not tampered with — matching the
+    /// cross-bridge Ed25519 `snapshot_signature` contract. Introduced in
+    /// `WASM_EXPORT_VERSION = 4`; imports of earlier (unsigned) envelopes are
+    /// rejected fail-closed.
+    #[serde(default)]
+    snapshot_signature: String,
     /// The context state snapshot.
     snapshot: WasmContextExportSnapshot,
 }

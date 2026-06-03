@@ -18,6 +18,7 @@ use super::manager::ContextSnapshot;
 use crate::store::StoredValue;
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -27,7 +28,23 @@ use scp_protocol::context::ContextError;
 ///
 /// Incremented when the export format changes in a backward-incompatible way.
 /// Import rejects exports with `version > CURRENT_EXPORT_VERSION`.
-pub const CURRENT_EXPORT_VERSION: u32 = 1;
+///
+/// # Version history
+///
+/// - `1`: unsigned export (event-log Merkle chain only). **Rejected on import**
+///   — the embedded snapshot was not integrity-protected, so a tampered export
+///   could forge membership/roles/params. Distinguished from a signature
+///   failure by a dedicated `version` error.
+/// - `2`: signed export. The embedded snapshot is covered by
+///   `snapshot_signature` (Ed25519 over [`ContextExport::canonical_snapshot_hash`],
+///   domain `SCP-CONTEXT-SNAPSHOT-V1:` per spec §23.16.4), produced by the
+///   exporter's custody key and verified on import against the exporter DID's
+///   resolved verification-method key (`#active`/`#agent`, ADR-039).
+pub const CURRENT_EXPORT_VERSION: u32 = 2;
+
+/// Domain separator for the signed `ContextExport` snapshot hash (spec §23.16.4,
+/// §9.18.2). Shared with [`super::super::sync::days_offline`].
+pub const CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-SNAPSHOT-V1:";
 
 // ---------------------------------------------------------------------------
 // ContextExport
@@ -80,6 +97,19 @@ pub struct ContextExport {
     pub merkle_root: [u8; 32],
     /// The scope of data included in this export.
     pub scope: ExportScope,
+    /// Ed25519 signature over [`ContextExport::canonical_snapshot_hash`],
+    /// produced by the exporter's custody key (spec §23.16.4).
+    ///
+    /// Binds the embedded [`ContextSnapshot`] (membership, roles, params, tool
+    /// set) together with the event-log Merkle root, exporter DID, and export
+    /// version, so a tampered export is rejected on import. Verified against the
+    /// exporter DID's resolved `#active`/`#agent` verification-method key.
+    ///
+    /// For [`ExportScope::Public`] exports the signature is computed over the
+    /// stripped snapshot (after [`strip_snapshot_for_public`]); a verifier must
+    /// recompute the hash over the bytes it actually received.
+    #[serde(with = "serde_bytes")]
+    pub snapshot_signature: [u8; 64],
 }
 
 /// Controls what data is included in a [`ContextExport`].
@@ -92,6 +122,171 @@ pub enum ExportScope {
     /// (spec §5.7). Strips sensitive data. Intended for sharing context
     /// summaries.
     Public,
+}
+
+// ---------------------------------------------------------------------------
+// Canonical snapshot hash (spec §23.16.4)
+// ---------------------------------------------------------------------------
+
+impl ContextExport {
+    /// Computes the canonical hash signed by the exporter and verified on
+    /// import (spec §23.16.4).
+    ///
+    /// Domain separator `SCP-CONTEXT-SNAPSHOT-V1:`. The hash binds the embedded
+    /// snapshot's integrity-relevant state together with the export envelope:
+    ///
+    /// `members_hash || role_definitions_hash || params_hash || tool_names_hash
+    ///  || merkle_root || BE32(len(exporter_did)) || exporter_did || version`
+    ///
+    /// Composite fields are first reduced to a deterministic 32-byte digest
+    /// (key-ordered, length-prefixed) following the §23.16.4 recipe, then folded
+    /// into the canonical hash as fixed-32 fields. Because the hash is computed
+    /// over the *current* contents of `self.snapshot`, a `Public` export (whose
+    /// snapshot has already been stripped) is signed and verified over the
+    /// stripped bytes — the verifier sees exactly what was transmitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scp_protocol::crypto::canonical::CanonicalError`] if a
+    /// variable-length field exceeds `u32::MAX` bytes (unreachable in practice).
+    pub fn canonical_snapshot_hash(
+        &self,
+    ) -> Result<[u8; 32], scp_protocol::crypto::canonical::CanonicalError> {
+        let members_hash = self.hash_members();
+        let role_defs_hash = self.hash_role_definitions();
+        let params_hash = self.hash_params();
+        let tool_names_hash = self.hash_tool_names();
+
+        let exporter_did = self.exporter_did.as_ref().as_bytes();
+
+        let fields = [
+            CanonicalField::Fixed32(&members_hash),
+            CanonicalField::Fixed32(&role_defs_hash),
+            CanonicalField::Fixed32(&params_hash),
+            CanonicalField::Fixed32(&tool_names_hash),
+            CanonicalField::Fixed32(&self.merkle_root),
+            CanonicalField::VarBytes(exporter_did),
+            CanonicalField::U32(self.version),
+        ];
+
+        canonical_hash(CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR, &fields)
+    }
+
+    /// Deterministic hash of the snapshot membership roster (§23.16.4 recipe).
+    ///
+    /// Members are emitted in DID key order: for each `(did, info)`,
+    /// `BE32(len(did)) || did || BE32(len(role_name)) || role_name
+    ///  || sequence_number (8-byte BE u64)`.
+    fn hash_members(&self) -> [u8; 32] {
+        // BTreeMap gives deterministic key ordering regardless of the source
+        // HashMap's iteration order.
+        let ordered: std::collections::BTreeMap<
+            &str,
+            &scp_protocol::context::membership::MemberInfo,
+        > = self
+            .snapshot
+            .membership
+            .members()
+            .map(|info| (info.did.as_ref(), info))
+            .collect();
+
+        let mut hasher = Sha256::new();
+        for (did, info) in ordered {
+            let did_len = u32::try_from(did.len()).unwrap_or(u32::MAX);
+            hasher.update(did_len.to_be_bytes());
+            hasher.update(did.as_bytes());
+            let role_len = u32::try_from(info.role_name.len()).unwrap_or(u32::MAX);
+            hasher.update(role_len.to_be_bytes());
+            hasher.update(info.role_name.as_bytes());
+            hasher.update(info.sequence_number.to_be_bytes());
+        }
+        hasher.finalize().into()
+    }
+
+    /// Deterministic hash of the snapshot role definitions (§23.16.4 recipe).
+    ///
+    /// Roles are emitted in role-name key order. Each role's capabilities are
+    /// reduced to their UCAN capability-name strings, sorted, then emitted:
+    /// `BE32(len(role)) || role || BE32(count) || [BE32(len(cap)) || cap ...]`.
+    fn hash_role_definitions(&self) -> [u8; 32] {
+        let ordered: std::collections::BTreeMap<&str, Vec<String>> = self
+            .snapshot
+            .role_state
+            .role_definitions
+            .iter()
+            .map(|(name, def)| {
+                let mut caps: Vec<String> = def
+                    .capabilities
+                    .iter()
+                    .map(scp_protocol::context::roles::Capability::ucan_capability_name)
+                    .collect();
+                caps.sort();
+                (name.as_str(), caps)
+            })
+            .collect();
+
+        let mut hasher = Sha256::new();
+        for (role, caps) in ordered {
+            let role_len = u32::try_from(role.len()).unwrap_or(u32::MAX);
+            hasher.update(role_len.to_be_bytes());
+            hasher.update(role.as_bytes());
+            let count = u32::try_from(caps.len()).unwrap_or(u32::MAX);
+            hasher.update(count.to_be_bytes());
+            for cap in &caps {
+                let cap_len = u32::try_from(cap.len()).unwrap_or(u32::MAX);
+                hasher.update(cap_len.to_be_bytes());
+                hasher.update(cap.as_bytes());
+            }
+        }
+        hasher.finalize().into()
+    }
+
+    /// SHA-256 over the canonical (RFC 8785 JCS) encoding of the snapshot's
+    /// context parameters (§23.16.4 `params_hash`).
+    ///
+    /// Uses JSON canonicalization (the project-wide canonical hashing format)
+    /// so the digest is stable across implementations. Falls back to a fixed
+    /// sentinel only if canonicalization fails, which cannot occur for a
+    /// well-formed `ContextParams`.
+    fn hash_params(&self) -> [u8; 32] {
+        let canonical =
+            scp_protocol::jcs::to_vec(&self.snapshot.context_params).unwrap_or_default();
+        Sha256::digest(&canonical).into()
+    }
+
+    /// Deterministic hash of the registered tool-name set (§23.16.4 recipe).
+    ///
+    /// Tool identifiers are gathered from both the immutable
+    /// `context_params.tools` and the dynamically `registered_tools`, then
+    /// deduplicated and sorted for order-independence:
+    /// `BE32(count) || [BE32(len(name)) || name ...]`.
+    fn hash_tool_names(&self) -> [u8; 32] {
+        let mut names: Vec<&str> = self
+            .snapshot
+            .context_params
+            .tools
+            .iter()
+            .map(|t| t.tool_id.as_str())
+            .chain(
+                self.snapshot
+                    .registered_tools
+                    .iter()
+                    .map(|t| t.tool_id.as_str()),
+            )
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+
+        let mut hasher = Sha256::new();
+        let count = u32::try_from(names.len()).unwrap_or(u32::MAX);
+        hasher.update(count.to_be_bytes());
+        for name in names {
+            let name_len = u32::try_from(name.len()).unwrap_or(u32::MAX);
+            hasher.update(name_len.to_be_bytes());
+            hasher.update(name.as_bytes());
+        }
+        hasher.finalize().into()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,30 +439,71 @@ fn compute_entry_hash(
     hash
 }
 
-/// Validates a [`ContextExport`] for import readiness.
+/// Validates a [`ContextExport`] for import readiness, including snapshot
+/// signature verification (spec §23.16.4).
 ///
-/// Checks:
-/// 1. Export version is supported (`<= CURRENT_EXPORT_VERSION`).
-/// 2. Merkle chain integrity of event log entries.
-/// 3. Merkle root matches the stored root hash.
+/// Checks, in order:
+/// 1. Export version is **exactly** supported. Versions above
+///    [`CURRENT_EXPORT_VERSION`] are rejected as unsupported; the pre-signing
+///    version (`1`) is rejected with a distinct *version* error because such
+///    exports carry no integrity-protected snapshot and MUST NOT be trusted.
+/// 2. Snapshot signature: the exporter's Ed25519 signature over
+///    [`ContextExport::canonical_snapshot_hash`] must verify (`verify_strict`)
+///    against `verifying_key` (the exporter DID's resolved
+///    `#active`/`#agent` key). Failure yields the distinct
+///    [`ContextError::SnapshotSignatureInvalid`].
+/// 3. Merkle chain integrity of event log entries.
+/// 4. Merkle root matches the stored root hash.
+///
+/// The signature is checked before the Merkle chain so that an export with a
+/// forged snapshot is rejected with the signature error regardless of whether
+/// its event log happens to be internally consistent.
 ///
 /// # Errors
 ///
-/// Returns [`ContextError::EventLogFailed`] with a descriptive message
-/// if any validation check fails.
-pub fn validate_export_for_import(export: &ContextExport) -> Result<(), ContextError> {
-    // 1. Version check.
-    if export.version > CURRENT_EXPORT_VERSION {
+/// - [`ContextError::EventLogFailed`] — unsupported/legacy version, broken
+///   Merkle chain, or Merkle root mismatch.
+/// - [`ContextError::SnapshotSignatureInvalid`] — the snapshot signature does
+///   not authenticate the embedded snapshot under `verifying_key`.
+pub fn validate_export_for_import(
+    export: &ContextExport,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<(), ContextError> {
+    // 1. Version check. Reject anything that is not the current signed format.
+    // Legacy v1 exports (unsigned) and future versions are both rejected here
+    // — distinct from a signature failure so callers can tell "too old / too
+    // new" apart from "signature forged".
+    if export.version != CURRENT_EXPORT_VERSION {
         return Err(ContextError::EventLogFailed(format!(
-            "unsupported export version: {}, maximum supported: {CURRENT_EXPORT_VERSION}",
+            "unsupported export version: {}, required: {CURRENT_EXPORT_VERSION} \
+             (versions below {CURRENT_EXPORT_VERSION} predate snapshot signing and \
+             are rejected as unverifiable)",
             export.version
         )));
     }
 
-    // 2. Merkle chain verification.
+    // 2. Snapshot signature verification (§23.16.4). Recompute the canonical
+    // hash over the received bytes and verify against the exporter's key.
+    let hash =
+        export
+            .canonical_snapshot_hash()
+            .map_err(|e| ContextError::SnapshotSignatureInvalid {
+                reason: format!("canonical snapshot hash construction failed: {e}"),
+            })?;
+    let signature = ed25519_dalek::Signature::from_bytes(&export.snapshot_signature);
+    verifying_key
+        .verify_strict(&hash, &signature)
+        .map_err(|e| ContextError::SnapshotSignatureInvalid {
+            reason: format!(
+                "exporter signature over snapshot did not verify (exporter_did={}): {e}",
+                export.exporter_did
+            ),
+        })?;
+
+    // 3. Merkle chain verification.
     let computed_root = verify_merkle_chain(&export.event_log_data)?;
 
-    // 3. Root hash comparison (constant-time to avoid timing side-channels).
+    // 4. Root hash comparison (constant-time to avoid timing side-channels).
     if !bool::from(computed_root.ct_eq(&export.merkle_root)) {
         return Err(ContextError::EventLogFailed(
             "Merkle root mismatch: computed root does not match exported root — \
@@ -380,52 +616,72 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
     }
 }
 
-/// Creates a [`ContextExport`] from a snapshot and event log data.
+/// Creates a signed [`ContextExport`] from a snapshot and event log data.
 ///
 /// For [`ExportScope::Full`], includes all data. For [`ExportScope::Public`],
 /// strips sensitive data from the snapshot and omits event log entries.
 ///
+/// The export's [`ContextExport::canonical_snapshot_hash`] is computed over the
+/// **final** export contents (after public stripping, with the resolved Merkle
+/// root and `version`) and passed to `sign`, which must return an Ed25519
+/// signature produced by the exporter's custody key (spec §23.16.4). Signing
+/// happens at the FFI boundary because the runtime holds no custody key — see
+/// the module-level architecture note.
+///
 /// # Errors
 ///
-/// Returns [`ContextError`] if Merkle root computation fails.
-pub fn create_export(
+/// Returns [`ContextError`] if Merkle root computation fails, if canonical hash
+/// construction fails, or if `sign` returns an error.
+pub fn create_export<F, E>(
     snapshot: ContextSnapshot,
     event_log_data: Vec<u8>,
     mls_state: Vec<u8>,
     exporter_did: DID,
     scope: ExportScope,
     clock: &dyn Clock,
-) -> Result<ContextExport, ContextError> {
+    sign: F,
+) -> Result<ContextExport, ContextError>
+where
+    F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
+    E: std::fmt::Display,
+{
     let exported_at = clock.now_secs();
 
-    match scope {
+    let (final_snapshot, event_log_data, mls_state, merkle_root) = match scope {
         ExportScope::Full => {
             let merkle_root = verify_merkle_chain(&event_log_data)?;
-            Ok(ContextExport {
-                snapshot,
-                event_log_data,
-                mls_state,
-                version: CURRENT_EXPORT_VERSION,
-                exported_at,
-                exporter_did,
-                merkle_root,
-                scope,
-            })
+            (snapshot, event_log_data, mls_state, merkle_root)
         }
         ExportScope::Public => {
             let stripped = strip_snapshot_for_public(&snapshot);
-            Ok(ContextExport {
-                snapshot: stripped,
-                event_log_data: Vec::new(),
-                mls_state: Vec::new(),
-                version: CURRENT_EXPORT_VERSION,
-                exported_at,
-                exporter_did,
-                merkle_root: [0u8; 32],
-                scope,
-            })
+            (stripped, Vec::new(), Vec::new(), [0u8; 32])
         }
-    }
+    };
+
+    // Build the export with a placeholder signature so the canonical hash can
+    // be computed over the exact bytes a verifier will recompute. The signature
+    // field itself is NOT part of the hash (see `canonical_snapshot_hash`).
+    let mut export = ContextExport {
+        snapshot: final_snapshot,
+        event_log_data,
+        mls_state,
+        version: CURRENT_EXPORT_VERSION,
+        exported_at,
+        exporter_did,
+        merkle_root,
+        scope,
+        snapshot_signature: [0u8; 64],
+    };
+
+    let hash = export.canonical_snapshot_hash().map_err(|e| {
+        ContextError::EventLogFailed(format!("export snapshot hash construction failed: {e}"))
+    })?;
+
+    export.snapshot_signature = sign(&hash).map_err(|e| {
+        ContextError::EventLogFailed(format!("export snapshot signing failed: {e}"))
+    })?;
+
+    Ok(export)
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +699,26 @@ mod tests {
     use scp_protocol::context::params::ContextParams;
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
     use std::collections::{HashMap, HashSet};
+
+    /// Deterministic test signing key (seed of all 7s).
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// Signing closure that signs the canonical hash with [`test_signing_key`].
+    // Result is mandated by the `create_export` sign-closure contract
+    // (`FnOnce(&[u8; 32]) -> Result<[u8; 64], E>`); the test signer is
+    // infallible.
+    #[allow(clippy::unnecessary_wraps)]
+    fn sign_with_test_key(hash: &[u8; 32]) -> Result<[u8; 64], std::convert::Infallible> {
+        use ed25519_dalek::Signer;
+        Ok(test_signing_key().sign(hash).to_bytes())
+    }
+
+    /// Verifying key paired with [`test_signing_key`].
+    fn test_verifying_key() -> ed25519_dalek::VerifyingKey {
+        test_signing_key().verifying_key()
+    }
 
     /// Helper to build a test snapshot.
     fn test_snapshot(context_id: &str) -> ContextSnapshot {
@@ -531,6 +807,7 @@ mod tests {
             DID::from("did:key:exporter-1"),
             ExportScope::Full,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
 
@@ -561,6 +838,7 @@ mod tests {
             DID::from("did:key:exporter-2"),
             ExportScope::Full,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
 
@@ -572,7 +850,7 @@ mod tests {
         assert_eq!(decoded.snapshot.context_id, "ctx-roundtrip-2");
         assert_eq!(decoded.merkle_root, export.merkle_root);
         assert_eq!(decoded.mls_state, vec![0xDE, 0xAD]);
-        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.version, CURRENT_EXPORT_VERSION);
         assert!(!decoded.event_log_data.is_empty());
     }
 
@@ -592,6 +870,7 @@ mod tests {
             DID::from("did:key:exporter-3"),
             ExportScope::Full,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
 
@@ -691,10 +970,11 @@ mod tests {
             DID::from("did:key:validator-1"),
             ExportScope::Full,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
 
-        validate_export_for_import(&export).unwrap();
+        validate_export_for_import(&export, &test_verifying_key()).unwrap();
     }
 
     #[test]
@@ -709,9 +989,10 @@ mod tests {
             exporter_did: DID::from("did:key:validator-2"),
             merkle_root: [0u8; 32],
             scope: ExportScope::Full,
+            snapshot_signature: [0u8; 64],
         };
 
-        let result = validate_export_for_import(&export);
+        let result = validate_export_for_import(&export, &test_verifying_key());
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("unsupported export version"));
@@ -731,13 +1012,18 @@ mod tests {
             DID::from("did:key:validator-3"),
             ExportScope::Full,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
 
-        // Tamper with the Merkle root.
+        // Tamper with the Merkle root, then re-sign so the snapshot signature
+        // is valid for the tampered contents — this isolates the Merkle root
+        // comparison (step 4) from the signature check (step 2).
         export.merkle_root = [0xAB; 32];
+        export.snapshot_signature =
+            sign_with_test_key(&export.canonical_snapshot_hash().unwrap()).unwrap();
 
-        let result = validate_export_for_import(&export);
+        let result = validate_export_for_import(&export, &test_verifying_key());
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("Merkle root mismatch"));
@@ -776,10 +1062,25 @@ mod tests {
             exporter_did: DID::from("did:key:validator-4"),
             merkle_root,
             scope: ExportScope::Full,
+            // Sign over the tampered contents so the signature check (step 2)
+            // passes and validation reaches the Merkle chain check (step 3).
+            snapshot_signature: [0u8; 64],
+        };
+        let signed = {
+            let mut e = export;
+            e.snapshot_signature =
+                sign_with_test_key(&e.canonical_snapshot_hash().unwrap()).unwrap();
+            e
         };
 
-        let result = validate_export_for_import(&export);
+        let result = validate_export_for_import(&signed, &test_verifying_key());
         assert!(result.is_err());
+        // The failure is the Merkle chain / root mismatch, NOT the signature.
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Merkle") || err_msg.contains("chain"),
+            "expected Merkle failure, got: {err_msg}"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -796,6 +1097,7 @@ mod tests {
             DID::from("did:key:public-1"),
             ExportScope::Public,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
 
@@ -821,6 +1123,7 @@ mod tests {
             DID::from("did:key:full-1"),
             ExportScope::Full,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
 
@@ -856,6 +1159,7 @@ mod tests {
             DID::from("did:key:pipeline-1"),
             ExportScope::Full,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
 
@@ -867,7 +1171,7 @@ mod tests {
         let decoded = deserialize_export(&bytes).unwrap();
 
         // Validate for import (Merkle verification).
-        validate_export_for_import(&decoded).unwrap();
+        validate_export_for_import(&decoded, &test_verifying_key()).unwrap();
 
         // All fields should match.
         assert_eq!(decoded.snapshot.context_id, "ctx-pipeline-1");
@@ -876,32 +1180,44 @@ mod tests {
     }
 
     #[test]
-    fn export_version_1_import_succeeds_version_99_fails() {
+    fn current_version_import_succeeds_legacy_and_future_versions_fail() {
         let snapshot = test_snapshot("ctx-version-test");
-        let export_v1 = create_export(
-            snapshot.clone(),
+        let export_current = create_export(
+            snapshot,
             Vec::new(),
             Vec::new(),
             DID::from("did:key:version-test"),
             ExportScope::Full,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
-        assert_eq!(export_v1.version, 1);
-        validate_export_for_import(&export_v1).unwrap();
+        assert_eq!(export_current.version, CURRENT_EXPORT_VERSION);
+        validate_export_for_import(&export_current, &test_verifying_key()).unwrap();
 
-        let export_v99 = ContextExport {
-            snapshot,
-            event_log_data: Vec::new(),
-            mls_state: Vec::new(),
-            version: 99,
-            exported_at: 1_000_000,
-            exporter_did: DID::from("did:key:version-test"),
-            merkle_root: [0u8; 32],
-            scope: ExportScope::Full,
-        };
-        let result = validate_export_for_import(&export_v99);
-        assert!(result.is_err());
+        // Legacy v1 exports (unsigned) are rejected with a DISTINCT version
+        // error — never reaching the signature check — because they carry no
+        // integrity-protected snapshot.
+        let mut export_v1 = export_current.clone();
+        export_v1.version = 1;
+        let v1_err = validate_export_for_import(&export_v1, &test_verifying_key())
+            .expect_err("v1 export must be rejected");
+        let v1_msg = format!("{v1_err}");
+        assert!(
+            v1_msg.contains("unsupported export version"),
+            "v1 must fail at version gate, got: {v1_msg}"
+        );
+        assert!(
+            !matches!(v1_err, ContextError::SnapshotSignatureInvalid { .. }),
+            "v1 rejection must be a version error, not a signature error"
+        );
+
+        // Future versions are likewise rejected at the version gate.
+        let mut export_v99 = export_current;
+        export_v99.version = 99;
+        let v99_err = validate_export_for_import(&export_v99, &test_verifying_key())
+            .expect_err("v99 export must be rejected");
+        assert!(format!("{v99_err}").contains("unsupported export version"));
     }
 
     // -------------------------------------------------------------------
@@ -993,12 +1309,13 @@ mod tests {
             DID::from("did:key:prune-test"),
             ExportScope::Full,
             &scp_primitives::SystemClock,
+            sign_with_test_key,
         )
         .unwrap();
 
         let bytes = serialize_export(&export).unwrap();
         let decoded = deserialize_export(&bytes).unwrap();
-        validate_export_for_import(&decoded).unwrap();
+        validate_export_for_import(&decoded, &test_verifying_key()).unwrap();
 
         // Import into a fresh provider and verify chain integrity.
         let new_provider = MerkleEventLogProvider::new();
