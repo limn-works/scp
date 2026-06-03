@@ -15,6 +15,12 @@ resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-t
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
 testing = ["resolvers"]
+# Shared callback-custody byte/string parsing helpers (custody_parse module).
+# Requires only scp-platform for the typed return values (KeyHandle,
+# PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into
+# `resolvers`: these are pure byte/string ops far lighter than the resolver
+# stack, and WASM does not use the callback-custody path (ADR-034).
+custody = ["dep:scp-platform"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform
 # (in-memory testing backends), and tokio. Not available for WASM (ADR-034).

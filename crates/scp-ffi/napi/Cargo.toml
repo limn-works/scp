@@ -42,7 +42,7 @@ scp-media = { path = "../../scp-media" }
 scp-primitives = { path = "../../scp-primitives" }
 scp-identity = { path = "../../scp-identity" }
 scp-event-log = { path = "../../scp-event-log" }
-scp-ffi-common = { path = "../common" }
+scp-ffi-common = { path = "../common", features = ["custody"] }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
 scp-platform = { path = "../../scp-platform", features = ["encrypting", "filesystem", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
@@ -53,7 +53,7 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-scp-ffi-common = { path = "../common", features = ["testing"] }
+scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
 tempfile = "3"
 # Provides weak C stubs for napi runtime symbols so the test binary
 # can link without a Node.js runtime. Kept as a dev-dependency so

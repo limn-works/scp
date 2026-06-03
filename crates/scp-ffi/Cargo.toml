@@ -43,7 +43,7 @@ scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
 scp-primitives = { path = "../scp-primitives" }
 scp-event-log = { path = "../scp-event-log" }
-scp-ffi-common = { path = "common" }
+scp-ffi-common = { path = "common", features = ["custody"] }
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"], optional = true }
 scp-mcp = { path = "../scp-mcp" }
 scp-platform = { path = "../scp-platform", features = ["software_platform", "file", "testing", "encrypting", "filesystem", "sqlite"] }
@@ -68,7 +68,7 @@ zeroize = { workspace = true }
 [dev-dependencies]
 pyo3 = { version = "0.24.1", features = ["auto-initialize", "multiple-pymethods"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-scp-ffi-common = { path = "common", features = ["testing"] }
+scp-ffi-common = { path = "common", features = ["testing", "custody"] }
 # Tests need InMemoryKeyCustody.
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 tempfile = "3"
