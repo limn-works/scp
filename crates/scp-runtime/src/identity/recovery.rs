@@ -708,33 +708,46 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32]) -> Option<Vec<u8>> 
 // ProductionRecoveryBackend — real implementation of RecoveryBackend
 // ---------------------------------------------------------------------------
 
-/// Production implementation of [`RecoveryBackend`] that delegates to the
-/// `ContextManager` for MLS, UCAN, `KeyPackage`, notification, and PSK
-/// operations.
+/// Production implementation of [`RecoveryBackend`] that dispatches MLS,
+/// UCAN, `KeyPackage`, notification, and PSK operations through the
+/// supervisor's trust-recovery actor mailbox.
 ///
-/// This struct bridges the synchronous [`RecoveryBackend`] trait to the async
-/// `ContextManager` API using `tokio::task::block_in_place` +
+/// This struct bridges the synchronous [`RecoveryBackend`] trait to the
+/// async supervisor mailbox using `tokio::task::block_in_place` +
 /// `Handle::current().block_on()` — the same pattern used by
 /// `ContextPersistenceBridge` in `store/context.rs`.
+///
+/// # ADR-049 Phase 2B — mailbox dispatch
+///
+/// Each per-context step builds a
+/// [`TrustRecoveryCommand`](crate::context::actor::commands::TrustRecoveryCommand)
+/// and routes it through
+/// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command).
+/// When the target context has a registered actor the command runs in
+/// that actor's mailbox turn against owned `&mut PerContextState`; the
+/// backend never reaches the supervisor's per-context state map directly.
+/// This replaced the earlier direct calls into
+/// `trust_recovery_helpers_legacy::*_legacy(&self.manager, …)` that read
+/// the `contexts` `DashMap` outside the actor mailbox.
 ///
 /// # Construction
 ///
 /// ```rust,ignore
 /// let backend = ProductionRecoveryBackend::new(
-///     context_manager.clone(),
+///     supervisor.clone(),
 ///     post_rotation_signing_key,
 /// );
 /// ```
 ///
 /// # Step mapping
 ///
-/// | Trait method        | `ContextManager` delegation                    |
-/// |---------------------|----------------------------------------------|
-/// | `mls_update`        | `recovery_advance_epoch` — epoch advancement |
-/// | `revoke_ucans`      | Marks tokens revoked per key scope           |
-/// | `rotate_key_packages`| Regenerates key packages via crypto provider |
-/// | `notify_contacts`   | Sends key-change alerts via transport        |
-/// | `rotate_psk`        | Generates new PSK, wraps for enrolled devices|
+/// | Trait method         | Mailbox command                                          |
+/// |----------------------|----------------------------------------------------------|
+/// | `mls_update`         | `RecoveryAdvanceEpoch` + `RecoverySendNotification` (seq 0) |
+/// | `revoke_ucans`       | `RecoverySendNotification` (seq 1)                       |
+/// | `rotate_key_packages`| `RecoverySendNotification` (seq 2)                       |
+/// | `notify_contacts`    | `RecoveryNotifyContact` (cross-context fan-out)          |
+/// | `rotate_psk`         | `RecoverySendNotification` (seq 3)                       |
 ///
 /// See spec §9.12 and the [`CompromiseRecoveryOrchestrator`] for step
 /// ordering and failure isolation semantics.
@@ -771,7 +784,7 @@ impl ProductionRecoveryBackend {
         }
     }
 
-    /// Bridges a synchronous trait method call to an async `ContextManager`
+    /// Bridges a synchronous trait method call to an async supervisor
     /// operation.
     ///
     /// Uses `tokio::task::block_in_place` to avoid blocking the async runtime's
@@ -791,6 +804,84 @@ impl ProductionRecoveryBackend {
             })
         })
     }
+
+    /// Dispatches a [`TrustRecoveryCommand`] through the supervisor's
+    /// trust-recovery mailbox (ADR-049 Phase 2B) and awaits the typed
+    /// reply that the command carries on its embedded oneshot.
+    ///
+    /// `build_cmd` receives the freshly-created reply sender and returns
+    /// the fully-constructed command. Routing decision lives entirely in
+    /// [`Supervisor::dispatch_trust_recovery_command`]: when a context
+    /// actor is registered the command runs against that actor's owned
+    /// `&mut PerContextState` (no `get_context_arc`); otherwise it falls
+    /// through to the supervisor-scoped direct path. Either way the typed
+    /// result returns on `reply`.
+    ///
+    /// This replaces the previous direct calls into
+    /// `trust_recovery_helpers_legacy::*_legacy(&self.manager, …)` that
+    /// read the supervisor's per-context `Mutex<PerContextState>` map
+    /// outside the actor mailbox.
+    ///
+    /// The dispatch error (the `Outcome` channel) and the command's own
+    /// typed reply are folded into a single `Result`: a closed reply
+    /// channel surfaces as a [`ContextError::TransportFailed`] so the
+    /// caller's `block_on_async` maps it to a [`RecoveryStepError`].
+    async fn dispatch_trust_recovery<F, T>(
+        &self,
+        build_cmd: F,
+    ) -> Result<T, scp_protocol::context::ContextError>
+    where
+        F: FnOnce(
+            tokio::sync::oneshot::Sender<Result<T, scp_protocol::context::ContextError>>,
+        ) -> crate::context::actor::commands::TrustRecoveryCommand,
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = build_cmd(reply_tx);
+        // The dispatch-level `Outcome` only reports the mailbox/timeout
+        // envelope; the operation's typed result rides the command's own
+        // oneshot. Propagate a dispatch-level error first (e.g. no
+        // supervisor attached) before awaiting the reply.
+        self.manager.dispatch_trust_recovery_command(cmd).await?;
+        reply_rx.await.map_err(|_| {
+            scp_protocol::context::ContextError::TransportFailed(
+                "trust-recovery reply channel closed before a result was sent".to_owned(),
+            )
+        })?
+    }
+
+    /// Dispatches a `RecoverySendNotification` for a named context
+    /// through the trust-recovery mailbox and awaits its reply.
+    ///
+    /// Wraps the shared payload construction (context, sender DID,
+    /// sequence, signing key) used by every recovery step that sends a
+    /// notification to an already-known context (spec §9.12 steps 2–4,
+    /// 6). The signing key is copied into the boxed payload via
+    /// [`SigningKeyBytes::from_signing_key`] so it zeroizes on drop while
+    /// the command is in flight.
+    async fn dispatch_recovery_send_notification(
+        &self,
+        context_id: &str,
+        sender_did: &str,
+        payload: &[u8],
+        sequence: u64,
+    ) -> Result<(), scp_protocol::context::ContextError> {
+        use crate::context::actor::commands::{
+            RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
+        };
+
+        let send_payload = Box::new(RecoverySendNotificationPayload {
+            context_id: context_id.to_owned(),
+            sender_did: sender_did.to_owned(),
+            payload: payload.to_vec(),
+            sequence,
+            signing_key: SigningKeyBytes::from_signing_key(&self.signing_key),
+        });
+        self.dispatch_trust_recovery(|reply| TrustRecoveryCommand::RecoverySendNotification {
+            payload: send_payload,
+            reply,
+        })
+        .await
+    }
 }
 
 impl RecoveryBackend for ProductionRecoveryBackend {
@@ -802,12 +893,13 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Step 2: Advance the MLS epoch for post-compromise security.
         // The ContextManager increments the epoch counter, places the old
         // epoch into the grace window, and emits an event log entry.
-        let result = Self::block_on_async(
-            crate::context::trust_recovery_helpers_legacy::recovery_advance_epoch_legacy(
-                &self.manager,
-                context_id,
-            ),
-        );
+        use crate::context::actor::commands::TrustRecoveryCommand;
+        let result = Self::block_on_async(self.dispatch_trust_recovery(|reply| {
+            TrustRecoveryCommand::RecoveryAdvanceEpoch {
+                context_id: context_id.to_owned(),
+                reply,
+            }
+        }));
         match result {
             Ok(_epoch) => {
                 // Send a scoped epoch-advance notification including the
@@ -821,16 +913,13 @@ impl RecoveryBackend for ProductionRecoveryBackend {
                 });
                 match serde_json::to_vec(&scoped_payload) {
                     Ok(payload_bytes) => {
-                        let notify_result = Self::block_on_async(
-                            crate::context::trust_recovery_helpers_legacy::recovery_send_notification_legacy(
-                                &self.manager,
+                        let notify_result =
+                            Self::block_on_async(self.dispatch_recovery_send_notification(
                                 context_id,
                                 key_rotation.did_after.as_ref(),
                                 &payload_bytes,
                                 0, // sequence 0: MLS epoch-advance notification
-                                &self.signing_key,
-                            ),
-                        );
+                            ));
                         // Notification failure is non-fatal — the epoch was
                         // already advanced, which is the critical security step.
                         if let Err(e) = notify_result {
@@ -900,16 +989,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Distribute the revocation via the context manager's recovery
         // notification channel so all members receive and merge it.
-        let result = Self::block_on_async(
-            crate::context::trust_recovery_helpers_legacy::recovery_send_notification_legacy(
-                &self.manager,
-                context_id,
-                key_rotation.did_after.as_ref(),
-                &revocation_payload,
-                1, // sequence 1: UCAN revocation notification
-                &self.signing_key,
-            ),
-        );
+        let result = Self::block_on_async(self.dispatch_recovery_send_notification(
+            context_id,
+            key_rotation.did_after.as_ref(),
+            &revocation_payload,
+            1, // sequence 1: UCAN revocation notification
+        ));
         match result {
             Ok(()) => Ok(()),
             Err(mut e) => {
@@ -951,16 +1036,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Send the key-package-rotation notification via the recovery
         // notification channel. This records the event and alerts members.
-        let result = Self::block_on_async(
-            crate::context::trust_recovery_helpers_legacy::recovery_send_notification_legacy(
-                &self.manager,
-                context_id,
-                sender_did,
-                payload.as_bytes(),
-                2, // sequence 2: key-package rotation notification
-                &self.signing_key,
-            ),
-        );
+        let result = Self::block_on_async(self.dispatch_recovery_send_notification(
+            context_id,
+            sender_did,
+            payload.as_bytes(),
+            2, // sequence 2: key-package rotation notification
+        ));
         match result {
             Ok(()) => Ok(()),
             Err(mut e) => {
@@ -1025,19 +1106,24 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             let did_str = did.as_ref();
 
             // Try sending to a shared context where both the recovering DID
-            // and the contact DID are members. The manager's
-            // `recovery_notify_contact` searches registered contexts to find
-            // a suitable channel, then sends the notification through it.
-            let send_result = Self::block_on_async(async {
-                crate::context::trust_recovery_helpers_legacy::recovery_notify_contact_legacy(
-                    &self.manager,
-                    did_str,
-                    contact_did_str,
-                    &payload,
-                    &self.signing_key,
-                )
-                .await
-            });
+            // and the contact DID are members. The supervisor's
+            // `RecoveryNotifyContact` mailbox command searches registered
+            // contexts to find a suitable channel, then dispatches a
+            // `RecoverySendNotification` through it.
+            let send_result = Self::block_on_async(self.dispatch_trust_recovery(|reply| {
+                use crate::context::actor::commands::{
+                    RecoveryNotifyContactPayload, SigningKeyBytes, TrustRecoveryCommand,
+                };
+                TrustRecoveryCommand::RecoveryNotifyContact {
+                    payload: Box::new(RecoveryNotifyContactPayload {
+                        recovering_did: did_str.to_owned(),
+                        contact_did: contact_did_str.to_owned(),
+                        payload: payload.clone(),
+                        signing_key: SigningKeyBytes::from_signing_key(&self.signing_key),
+                    }),
+                    reply,
+                }
+            }));
 
             if send_result.is_ok() {
                 any_sent = true;
@@ -1129,16 +1215,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Send via recovery notification. We use a synthetic context ID
         // derived from "identity-private-state" since PSK rotation is
         // identity-scoped, not context-scoped.
-        let result = Self::block_on_async(
-            crate::context::trust_recovery_helpers_legacy::recovery_send_notification_legacy(
-                &self.manager,
-                "identity-private-state",
-                "system",
-                &payload,
-                3, // sequence 3: PSK rotation notification
-                &self.signing_key,
-            ),
-        );
+        let result = Self::block_on_async(self.dispatch_recovery_send_notification(
+            "identity-private-state",
+            "system",
+            &payload,
+            3, // sequence 3: PSK rotation notification
+        ));
 
         result.is_ok()
     }
