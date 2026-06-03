@@ -228,10 +228,10 @@ pub struct NapiBridgeInstance {
     /// (ADR-048 §1 multi-instance neutrality). The store is thread-safe via
     /// its internal `tokio::sync::RwLock`. Production deployments should
     /// replace this with a `Storage`-backed implementation when it lands
-    /// (spec §12.11.2). Cleared by
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`] — dropping the
-    /// `Arc` zeroizes any retained bridge credential keys via the store's
-    /// `Zeroizing` fields on `Drop`.
+    /// (spec §12.11.2). Dropping the `Arc` on shutdown zeroizes any retained
+    /// bridge credential keys via the store's `Zeroizing` fields — there is no
+    /// explicit clear step in `bridge_specific_shutdown`, so the store lives
+    /// exactly as long as its last `Arc` reference.
     pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
 }
 

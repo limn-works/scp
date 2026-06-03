@@ -1502,10 +1502,15 @@ export function createWasmBridge(): Bridge {
     ): Promise<Checkpoint> {
       const wasm = getWasm();
       const result = await wasm.event_log_checkpoint(handle, identityDid, epoch);
+      // WASM cannot sign in-process (ADR-006/ADR-034); it returns the unsigned
+      // signable payload hash for a JS SDK to sign. Surface it so the capability
+      // is actually usable (ADR-048 §7b semantic divergence — see the
+      // `signingPayloadHash` doc on the `Checkpoint` type).
       return {
         root: result.merkleRoot,
         eventCount: result.eventCount,
         timestamp: result.timestamp,
+        signingPayloadHash: result.signingPayloadHash,
       };
     },
 

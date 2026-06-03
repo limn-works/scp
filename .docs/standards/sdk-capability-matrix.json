@@ -911,7 +911,8 @@
           "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "notes": "Runtime-dependent on TypeScript: the NAPI-backed (Node/Bun) TS runtime signs the canonical checkpoint payload in-process and returns a signed checkpoint, so typescript:true holds for the default runtime. The WASM/browser-TS fallback CANNOT sign in-process (ADR-006/ADR-034 — signing is a JS-side WebCrypto responsibility); its eventLogCheckpoint returns the unsigned signable payload via Checkpoint.signingPayloadHash, and SubtleCrypto Ed25519 signing is a separate not-yet-implemented TS-SDK story. This WASM-vs-native difference is recorded as an ADR-048 §7b cross-bridge semantic divergence for event_log_checkpoint*; the row stays true because the primary NAPI-backed runtime is signed, but the WASM fallback is explicitly NOT a signed checkpoint."
         },
         {
           "name": "checkpoint_by_did",

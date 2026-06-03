@@ -1,4 +1,4 @@
-"""Integration test for ``SCP.identity_create_with_custody`` (SCP-214, ADR-006).
+"""Integration test for ``SCP.identity_create_with_custody`` (ADR-006).
 
 Exercises the caller-provided :class:`~scp_sdk.scp.KeyCustodyProvider` path
 end-to-end: a Python custody object generates a real Ed25519 keypair, the

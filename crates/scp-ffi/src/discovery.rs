@@ -684,13 +684,7 @@ impl crate::scp::PyScp {
     #[pyo3(name = "petname_apply_event")]
     pub fn petname_apply_event(&self, owner_did: &str, event_json: &str) -> PyResult<()> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let event: PetnameEvent =
             serde_json::from_str(event_json).map_err(|e| ScpPyError::ValidationError {
                 message: format!("invalid petname event JSON: {e}"),
@@ -724,13 +718,7 @@ impl crate::scp::PyScp {
     #[pyo3(name = "petname_did_count")]
     pub fn petname_did_count(&self, owner_did: &str) -> PyResult<u32> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()
@@ -767,13 +755,7 @@ impl crate::scp::PyScp {
     #[pyo3(name = "petname_context_count")]
     pub fn petname_context_count(&self, owner_did: &str) -> PyResult<u32> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()

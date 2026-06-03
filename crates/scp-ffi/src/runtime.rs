@@ -411,6 +411,10 @@ pub struct PyBridgeInstance {
     /// Migrated from a process-global `OnceLock<InMemoryCredentialStore>`
     /// singleton in commit 5. Production deployments should replace this with
     /// a `Storage`-backed implementation when it lands (spec §12.11.2).
+    /// Dropping the `Arc` on shutdown zeroizes any retained bridge credential
+    /// keys via the store's `Zeroizing` fields — there is no explicit clear
+    /// step in `bridge_specific_shutdown`, so the store lives exactly as long
+    /// as its last `Arc` reference.
     pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
 
     /// Most recently connected relay URL (replaces `CONNECTED_RELAY_URL` in

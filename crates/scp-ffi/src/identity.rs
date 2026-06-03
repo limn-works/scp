@@ -1005,7 +1005,7 @@ impl crate::scp::PyScp {
     /// custody methods. Raises `IdentityError` if key generation, signing, or
     /// DID creation fails inside the provider.
     ///
-    /// See SCP-214 acceptance criteria 2-3 and ADR-006.
+    /// See ADR-006 for the private-key-never-crosses-FFI custody contract.
     pub fn identity_create_with_custody(
         &self,
         py: Python<'_>,
@@ -1032,7 +1032,7 @@ impl crate::scp::PyScp {
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
-        // (idempotent). #311.
+        // (idempotent).
         ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
 
         // CRITICAL: a single top-level `py.allow_threads` releases the GIL for
@@ -1083,7 +1083,7 @@ impl crate::scp::PyScp {
                     },
                 );
 
-                // Persist identity state if storage is initialized (SCP-217).
+                // Persist identity state if storage is initialized.
                 if let Ok(storage) = crate::runtime::get_storage(&bi_arc) {
                     let key = identity_state_key(&did);
                     let data = serialize_identity_state(&did, &custody_str);

@@ -1,5 +1,5 @@
 /**
- * Integration test for `SCP.identityCreateWithCustody` (SCP-214, ADR-006).
+ * Integration test for `SCP.identityCreateWithCustody` (ADR-006).
  *
  * Exercises the caller-provided {@link KeyCustodyProvider} path end-to-end on
  * the NAPI backend: a JS custody object backed by Node/Bun's built-in Ed25519

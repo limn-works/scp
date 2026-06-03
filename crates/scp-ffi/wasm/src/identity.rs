@@ -3703,7 +3703,7 @@ pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> 
 /// semantics (where a single registry entry bundles key material and
 /// attestations).
 ///
-/// See spec §3.5.1 (link attestations) and SCP-214 (identity registry).
+/// See spec §3.5.1 (link attestations).
 #[wasm_bindgen]
 pub fn identity_remove(did: String) {
     IDENTITY_REGISTRY.with(|reg| {
@@ -3723,7 +3723,7 @@ pub fn identity_remove(did: String) {
 /// (which is unconditional), matching the NAPI bridge's
 /// `identity_remove_if_present` semantics.
 ///
-/// See spec §3.5.1 (link attestations) and SCP-214 (identity registry).
+/// See spec §3.5.1 (link attestations).
 #[must_use]
 #[wasm_bindgen]
 pub fn identity_remove_if_present(did: String) -> bool {

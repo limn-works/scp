@@ -4475,8 +4475,17 @@ async fn event_log_checkpoint_impl(
 /// explicit `did` string that is recorded as the checkpoint's `sender_did`.
 /// This honours the per-SDK idiom (ADR-048 §7): the no-registry constraint of
 /// the `UniFFI` object model is respected rather than forcing a registry into
-/// existence. The `did` lets the caller checkpoint on behalf of a specific
-/// member DID (e.g. an agent key) while signing with the held identity.
+/// existence.
+///
+/// The `did` is validated for syntactic well-formedness (matching the `PyO3`
+/// bridge) AND must equal the supplied `identity`'s own DID. The other bridges
+/// bind the signing key to the recorded `sender_did` implicitly via the
+/// DID-keyed registry lookup; this bridge has no registry, so the binding is
+/// enforced here explicitly. Without it, a caller could record a checkpoint as
+/// having been signed by an arbitrary `sender_did` while signing with an
+/// unrelated identity's key — a provenance forgery. The argument is retained
+/// (rather than dropped in favour of `identity.did`) so the call site reads
+/// symmetrically with the other bridges' `*_by_did` signatures.
 #[cfg(feature = "allow_in_memory_custody")]
 async fn event_log_checkpoint_by_did_impl(
     bi: Arc<crate::runtime::UniffiBridgeInstance>,
@@ -4485,6 +4494,22 @@ async fn event_log_checkpoint_by_did_impl(
     did: String,
     epoch: u64,
 ) -> Result<Checkpoint, ScpError> {
+    validate_did(&did)?;
+    // Bind the recorded sender_did to the signing identity. The key material
+    // comes from `identity`; recording any other DID as the signer would be a
+    // provenance forgery (the registry-backed bridges get this binding for
+    // free via DID-keyed lookup).
+    if did != identity.did {
+        return Err(ScpError::Validation {
+            msg: format!(
+                "checkpoint sender_did '{did}' does not match the signing identity's \
+                 DID '{}' — the checkpoint must be attributed to the identity that \
+                 signs it",
+                identity.did
+            ),
+            code: codes::VALID_7000.to_owned(),
+        });
+    }
     runtime()
         .spawn(async move {
             let custody =
@@ -11740,7 +11765,9 @@ impl Scp {
     /// the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
     /// `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
     /// handle is passed explicitly for key material while `did` names the
-    /// member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom).
+    /// member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom). The
+    /// `did` is validated for well-formedness and MUST equal the supplied
+    /// identity's own DID — the recorded signer is always the actual signer.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -14096,12 +14123,7 @@ impl Scp {
     ) -> Result<(), ScpError> {
         use scp_core::discovery::petnames::PetnameEvent;
 
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let event: PetnameEvent =
             serde_json::from_str(&event_json).map_err(|e| ScpError::Validation {
                 msg: format!("invalid petname event JSON: {e}"),
@@ -14125,12 +14147,7 @@ impl Scp {
     ///
     /// Mirrors `PetnameMap::did_petname_count`.
     pub fn petname_did_count(&self, owner_did: String) -> Result<u32, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core
@@ -14154,12 +14171,7 @@ impl Scp {
     ///
     /// Mirrors `PetnameMap::context_petname_count`.
     pub fn petname_context_count(&self, owner_did: String) -> Result<u32, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core

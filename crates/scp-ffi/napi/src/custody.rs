@@ -7,7 +7,7 @@
 //! method to the active variant.
 //!
 //! Mirrors the `PyO3` bridge's `FfiKeyCustody` and the `UniFFI` bridge's
-//! `CallbackKeyCustody` split. See ADR-006 and SCP-214.
+//! `CallbackKeyCustody` split. See ADR-006.
 //!
 //! # Variants
 //!
@@ -321,6 +321,19 @@ impl KeyCustody for NapiCallbackKeyCustody {
         // the big-endian epoch and the v2 domain separator, then delegating to
         // the single `derive_pseudonym` callback (matches the UniFFI/PyO3
         // CallbackKeyCustody contract — keeps the JS surface to one method).
+        //
+        // Layout: `context_id || epoch_BE(8) || "scp-pseudonym-v2"`. This is the
+        // canonical recipe defined in `scp-platform` `KeyCustody::derive_rotatable_pseudonym`
+        // (traits.rs) — "all implementations MUST produce identical output" — so
+        // the byte ordering is fixed by the protocol, not by this bridge. There is
+        // deliberately NO length separator between `context_id` and the epoch: the
+        // epoch is always exactly 8 big-endian bytes appended directly after the
+        // caller-supplied `context_id`, and the trailing domain separator is a
+        // fixed 16-byte literal. A length prefix would change the produced bytes
+        // and is therefore a wire-format change that must originate upstream in the
+        // spec/ADR and `scp-platform` (and be applied identically across all four
+        // bridges and the native custody backends) — it cannot be introduced here
+        // without breaking cross-bridge and over-time pseudonym derivation parity.
         let mut extended = context_id.to_vec();
         extended.extend_from_slice(&pseudonym_epoch.to_be_bytes());
         extended.extend_from_slice(b"scp-pseudonym-v2");

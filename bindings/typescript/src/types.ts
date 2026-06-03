@@ -733,6 +733,20 @@ export interface Checkpoint {
   readonly eventCount: number;
   /** Timestamp of the checkpoint (seconds since epoch). */
   readonly timestamp: number;
+  /**
+   * SHA-256 hash of the canonical signing payload (hex), present only on the
+   * WASM/browser backend.
+   *
+   * On the WASM runtime, the Rust bridge cannot access the identity's private
+   * key (ADR-006/ADR-034: signing is a JS-side responsibility), so it returns
+   * the unsigned signable payload hash here instead of a finished signature. A
+   * JS SDK is expected to sign this hash via WebCrypto/SubtleCrypto to produce
+   * a signed checkpoint; that signing step is not yet implemented in the TS
+   * SDK. This is the ADR-048 §7b cross-bridge semantic divergence for
+   * `event_log_checkpoint*`: native bridges (PyO3/NAPI/UniFFI) sign in-process
+   * and never populate this field; WASM populates it and produces no signature.
+   */
+  readonly signingPayloadHash?: string;
 }
 
 /** Filter parameters for event log queries. */

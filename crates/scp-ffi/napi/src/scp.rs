@@ -595,8 +595,7 @@ impl Scp {
     /// hardware token, or HSM wrapper.
     ///
     /// The callbacks run on the JS thread; the pre-rotation seed is generated
-    /// locally (it never traverses the consumer callbacks). See SCP-214
-    /// acceptance criteria 2-3 and ADR-006.
+    /// locally (it never traverses the consumer callbacks), per ADR-006.
     #[napi(
         js_name = "identityCreateWithCustody",
         ts_return_type = "Promise<NapiIdentity>"
@@ -1654,12 +1653,8 @@ impl Scp {
     pub fn petname_apply_event(&self, owner_did: String, event_json: String) -> napi::Result<()> {
         use scp_core::discovery::petnames::PetnameEvent;
 
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let event: PetnameEvent = serde_json::from_str(&event_json).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("invalid petname event JSON: {e}"),
@@ -1682,12 +1677,8 @@ impl Scp {
     /// Mirrors `PetnameMap::did_petname_count`.
     #[napi(js_name = "petnameDidCount")]
     pub fn petname_did_count(&self, owner_did: String) -> napi::Result<u32> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1711,12 +1702,8 @@ impl Scp {
     /// Mirrors `PetnameMap::context_petname_count`.
     #[napi(js_name = "petnameContextCount")]
     pub fn petname_context_count(&self, owner_did: String) -> napi::Result<u32> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),

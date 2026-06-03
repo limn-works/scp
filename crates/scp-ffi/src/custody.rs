@@ -44,7 +44,7 @@ pub enum FfiKeyCustody {
     /// `KeyCustodyProvider` protocol. Used by `identity_create_with_custody`
     /// to inject platform-specific key management (e.g. an OS keychain, a
     /// hardware token wrapper) without the private key material ever crossing
-    /// the FFI boundary into Rust ownership (ADR-006). See SCP-214.
+    /// the FFI boundary into Rust ownership (ADR-006).
     Callback(PyCallbackKeyCustody),
 }
 
@@ -198,7 +198,7 @@ impl KeyCustody for FfiKeyCustody {
 // and the concrete `PyCallbackKeyCustody` below adapts those into the typed
 // `KeyCustody` surface. Mirrors the UniFFI bridge's
 // `KeyCustodyProvider` (object-safe, `#[async_trait]`) + `CallbackKeyCustody`
-// (concrete `impl KeyCustody`) split. See ADR-006 and SCP-214.
+// (concrete `impl KeyCustody`) split. See ADR-006.
 //
 // Private key material never crosses into Rust ownership: every method
 // re-acquires the GIL, calls the Python object, and translates the returned
@@ -371,7 +371,7 @@ impl FfiKeyCustody {
 // object-safe) and the object-safe `PyKeyCustodyProvider`. Mirrors the UniFFI
 // bridge's `CallbackKeyCustody`. Translates the typed scp-platform API
 // (KeyHandle / Signature / PublicKey / SharedSecret) to/from the provider's
-// raw byte and opaque-string protocol. See ADR-006 and SCP-214.
+// raw byte and opaque-string protocol. See ADR-006.
 // ---------------------------------------------------------------------------
 
 /// Concrete [`KeyCustody`] adapter delegating to a [`PyKeyCustodyProvider`].
@@ -534,6 +534,19 @@ impl KeyCustody for PyCallbackKeyCustody {
         // is synthesized by extending the context_id with the big-endian epoch
         // and the v2 domain separator, then delegating to derive_pseudonym.
         // Keeps the Python protocol surface to a single pseudonym method.
+        //
+        // Layout: `context_id || epoch_BE(8) || "scp-pseudonym-v2"`. This is the
+        // canonical recipe defined in `scp-platform` `KeyCustody::derive_rotatable_pseudonym`
+        // (traits.rs) — "all implementations MUST produce identical output" — so
+        // the byte ordering is fixed by the protocol, not by this bridge. There is
+        // deliberately NO length separator between `context_id` and the epoch: the
+        // epoch is always exactly 8 big-endian bytes appended directly after the
+        // caller-supplied `context_id`, and the trailing domain separator is a
+        // fixed 16-byte literal. A length prefix would change the produced bytes
+        // and is therefore a wire-format change that must originate upstream in the
+        // spec/ADR and `scp-platform` (and be applied identically across all four
+        // bridges and the native custody backends) — it cannot be introduced here
+        // without breaking cross-bridge and over-time pseudonym derivation parity.
         let mut extended = context_id.to_vec();
         extended.extend_from_slice(&pseudonym_epoch.to_be_bytes());
         extended.extend_from_slice(b"scp-pseudonym-v2");

@@ -81,9 +81,16 @@ impl WasmProof {
 
 /// An unsigned consistency checkpoint from the context event log.
 ///
-/// The `signing_payload_hash` field contains the SHA-256 hash of the
-/// canonical signing payload. The TypeScript SDK wrapper must sign this
-/// hash via `SubtleCrypto` to produce the final signed checkpoint.
+/// The `signing_payload_hash` field contains the SHA-256 hash of the canonical
+/// signing payload. On the WASM/browser runtime the Rust bridge cannot access
+/// the identity's private key (ADR-006/ADR-034: signing is a JS-side
+/// responsibility), so this checkpoint is the *unsigned signable payload*, not
+/// a finished signed checkpoint. A JS SDK is expected to sign
+/// `signing_payload_hash` via `SubtleCrypto`/`WebCrypto` to produce a signed
+/// checkpoint; that signing step is not yet implemented in the TS SDK. The
+/// native bridges (PyO3/NAPI/UniFFI) sign in-process and return a signed
+/// checkpoint instead — this WASM vs. native difference is recorded as an
+/// ADR-048 §7b cross-bridge semantic divergence for `event_log_checkpoint*`.
 ///
 /// See ADR-011 acceptance criterion 8 and ADR-030.
 #[wasm_bindgen]
@@ -144,8 +151,9 @@ impl WasmCheckpoint {
 
     /// Returns the SHA-256 hash of the canonical signing payload (hex).
     ///
-    /// The TypeScript SDK must sign this hash via `SubtleCrypto` to produce
-    /// the final signed checkpoint.
+    /// This is the signable payload; WASM does not sign it (ADR-006/ADR-034).
+    /// A JS SDK is expected to sign this hash via `SubtleCrypto`/`WebCrypto` to
+    /// produce a signed checkpoint (not yet implemented in the TS SDK).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "signingPayloadHash")]
     pub fn signing_payload_hash(&self) -> String {
@@ -368,8 +376,12 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
 /// Generates a consistency checkpoint from the current event log state.
 ///
 /// Retrieves the event log's Merkle root and event count, then returns an
-/// unsigned checkpoint. Signing requires JS-side key custody (`WebCrypto`);
-/// the TypeScript SDK wrapper signs the checkpoint data.
+/// *unsigned* checkpoint. WASM cannot sign in-process (ADR-006/ADR-034): the
+/// returned `WasmCheckpoint` carries `signing_payload_hash`, the SHA-256 of the
+/// canonical signing payload, which a JS SDK is expected to sign via
+/// `WebCrypto`/`SubtleCrypto` to produce a signed checkpoint (not yet
+/// implemented in the TS SDK). The native bridges sign in-process and return a
+/// signed checkpoint — recorded as an ADR-048 §7b semantic divergence.
 ///
 /// # Arguments
 ///
@@ -379,9 +391,9 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
 ///
 /// # Returns
 ///
-/// A `Promise<WasmCheckpoint>` with the checkpoint data. The `signature`
-/// field contains the hex-encoded canonical checkpoint payload that must be
-/// signed by the TypeScript SDK via `SubtleCrypto.sign`.
+/// A `Promise<WasmCheckpoint>` whose `signingPayloadHash` field is the
+/// hex-encoded SHA-256 of the canonical checkpoint payload to be signed JS-side
+/// via `SubtleCrypto.sign`.
 ///
 /// See ADR-011 acceptance criterion 8 and ADR-030.
 #[wasm_bindgen]
@@ -412,8 +424,9 @@ pub fn event_log_checkpoint(
 ///
 /// # Returns
 ///
-/// A `Promise<WasmCheckpoint>` whose `signingPayloadHash` field must be signed
-/// by the TypeScript SDK via `SubtleCrypto.sign`.
+/// A `Promise<WasmCheckpoint>` whose `signingPayloadHash` field is the
+/// hex-encoded SHA-256 of the canonical checkpoint payload to be signed JS-side
+/// via `SubtleCrypto.sign`.
 ///
 /// See ADR-011 acceptance criterion 8 and ADR-030.
 #[wasm_bindgen]
