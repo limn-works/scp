@@ -284,6 +284,11 @@ public extension SCP {
         try await inner.broadcastUnsubscribe(handle: handle, subscriberDid: subscriberDid, rotateKeys: rotateKeys)
     }
 
+    /// Forwards to ``Scp/configureLocalTransport`` on ``inner``.
+    func configureLocalTransport(localDid: String) throws {
+        try inner.configureLocalTransport(localDid: localDid)
+    }
+
     /// Forwards to ``Scp/configureRelayTransport`` on ``inner``.
     func configureRelayTransport(relayUrl: String, localDid: String) async throws {
         try await inner.configureRelayTransport(relayUrl: relayUrl, localDid: localDid)

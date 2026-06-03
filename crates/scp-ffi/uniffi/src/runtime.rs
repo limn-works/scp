@@ -681,6 +681,34 @@ impl UniffiBridgeInstance {
         self.core.set_context_manager(cm_arc);
     }
 
+    /// Per-instance initializer that installs an `MlsCryptoProvider(local_did)`
+    /// and an in-process loopback `LocalTransportProvider` on this instance.
+    ///
+    /// Mirrors [`UniffiBridgeInstance::init_context_manager_with_relay_transport`]
+    /// except the transport silently succeeds on all send/publish calls instead
+    /// of routing through a real relay. Used by `Scp::configure_local_transport`
+    /// so that E2E tests can exercise `context_send` / `broadcast_publish`
+    /// (encryption included) without a real relay server. No-op if a
+    /// `ContextManager` is already attached.
+    #[allow(dead_code)]
+    pub fn init_context_manager_with_local_transport(&self, local_did: &str) {
+        if self.core.has_context_manager() {
+            tracing::warn!(
+                requested_did = %local_did,
+                "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
+            );
+            return;
+        }
+        let did = local_did.to_owned();
+        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let transport = Box::new(scp_core::context::LocalTransportProvider);
+        let event_log = self.protocol_repository.event_log_provider();
+        let persistence = self.core.persistence_arc_clone();
+        let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+
+        self.core.set_context_manager(cm_arc);
+    }
+
     /// Per-instance equivalent of the module-level
     /// `sync_role_state_from_manager` free function.
     ///

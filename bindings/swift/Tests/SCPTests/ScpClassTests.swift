@@ -51,6 +51,26 @@ final class ScpClassTests: XCTestCase {
         try await scp.resume()
     }
 
+    /// `configureLocalTransport(localDid:)` with a valid DID must succeed,
+    /// wiring an in-process loopback transport for E2E flows without a relay.
+    func testConfigureLocalTransportSucceedsForValidDid() throws {
+        try scp.configureLocalTransport(localDid: "did:key:z6MkfreshLocalTransportTest")
+    }
+
+    /// `configureLocalTransport(localDid:)` must reject a malformed DID with a
+    /// validation error.
+    func testConfigureLocalTransportRejectsInvalidDid() throws {
+        XCTAssertThrowsError(
+            try scp.configureLocalTransport(localDid: "not-a-valid-did"),
+            "malformed DID must be rejected"
+        ) { error in
+            guard case ScpError.Validation = error else {
+                XCTFail("expected ScpError.Validation, got \(error)")
+                return
+            }
+        }
+    }
+
     /// `shutdown(timeout:)` must complete within the deadline and
     /// be idempotent on subsequent calls.
     func testShutdownIsIdempotent() async throws {

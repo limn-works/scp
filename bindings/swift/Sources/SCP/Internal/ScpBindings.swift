@@ -2189,6 +2189,21 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool) async throws 
     
     /**
+     * Per-instance equivalent of the free-function `configure_local_transport`.
+     *
+     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+     * an in-process loopback `LocalTransportProvider` on this instance's
+     * `ContextManager`. Unlike `configure_relay_transport`, this performs no
+     * network I/O — it wires test infrastructure so `context_send` and
+     * `broadcast_publish` succeed (encryption included) without a real relay.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if `local_did` fails DID validation.
+     */
+    func configureLocalTransport(localDid: String) throws 
+    
+    /**
      * Per-instance equivalent of the free-function `configure_relay_transport`.
      *
      * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
@@ -3790,6 +3805,26 @@ open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rot
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `configure_local_transport`.
+     *
+     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+     * an in-process loopback `LocalTransportProvider` on this instance's
+     * `ContextManager`. Unlike `configure_relay_transport`, this performs no
+     * network I/O — it wires test infrastructure so `context_send` and
+     * `broadcast_publish` succeed (encryption included) without a real relay.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if `local_did` fails DID validation.
+     */
+open func configureLocalTransport(localDid: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_configure_local_transport(self.uniffiClonePointer(),
+        FfiConverterString.lower(localDid),$0
+    )
+}
 }
     
     /**
@@ -14696,6 +14731,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 48267) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 42668) {

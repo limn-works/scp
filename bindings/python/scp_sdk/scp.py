@@ -1420,6 +1420,10 @@ class SCP:
         """Delegate to ``_scp_core.SCP.configure_relay_transport``."""
         return await asyncio.to_thread(self._native.configure_relay_transport, relay_url, local_did)
 
+    async def configure_local_transport(self, local_did: str) -> Any:
+        """Delegate to ``_scp_core.SCP.configure_local_transport``."""
+        return await asyncio.to_thread(self._native.configure_local_transport, local_did)
+
     async def transport_adapter_count(self) -> Any:
         """Delegate to ``_scp_core.SCP.transport_adapter_count``."""
         return await asyncio.to_thread(self._native.transport_adapter_count)

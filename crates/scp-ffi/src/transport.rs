@@ -7,6 +7,8 @@
 //! - `PyScp::transport_status` -- Query transport connection status.
 //! - `PyScp::configure_relay_transport` -- Pre-configure `ContextManager`
 //!   with `RelayTransportProvider`.
+//! - `PyScp::configure_local_transport` -- Pre-configure `ContextManager`
+//!   with an in-process loopback `LocalTransportProvider` (test infra).
 //! - `PyScp::transport_add_relay` -- Register an additional relay adapter.
 //! - `PyScp::transport_assign_relay_set` -- Assign a relay set for a context.
 //! - `PyScp::transport_adapter_count` -- Number of registered adapters.
@@ -343,6 +345,37 @@ impl crate::scp::PyScp {
             bi, local_did, crypto, transport, event_log, None,
         );
 
+        Ok(())
+    }
+
+    /// Pre-configures the `ContextManager` with an in-process loopback
+    /// `LocalTransportProvider`.
+    ///
+    /// **Must be called before any `identity_create` → `context_create`
+    /// sequence.** Once the `ContextManager` is initialized (by whichever call
+    /// arrives first), the transport provider is locked in for the lifetime of
+    /// the instance.
+    ///
+    /// Unlike the default transport (`NotConfiguredTransportProvider`, which
+    /// rejects every send/publish), `LocalTransportProvider` silently succeeds
+    /// on all transport calls. A real `MlsCryptoProvider` bound to `local_did`
+    /// is still installed, so `context_send` and `broadcast_publish` can be
+    /// exercised end to end (encryption included) without a real relay server.
+    /// This is test infrastructure for E2E flows that do not need network I/O.
+    ///
+    /// # Arguments
+    ///
+    /// * `local_did` -- The DID for MLS credential identity (typically the
+    ///   first identity).
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if `local_did` fails DID validation.
+    #[pyo3(name = "configure_local_transport")]
+    pub fn configure_local_transport(&self, local_did: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_did(local_did)?;
+        crate::runtime::init_context_manager_with_local_transport(bi, local_did);
         Ok(())
     }
 
@@ -689,6 +722,33 @@ mod tests {
         let result =
             default_scp().transport_connect("wss://relay.example.com/scp/v1", "invalid_source");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn configure_local_transport_attaches_manager_for_valid_did() {
+        let scp = default_scp();
+        assert!(
+            !scp.inner.core.has_context_manager(),
+            "fresh instance must not have a ContextManager attached"
+        );
+        let result = scp.configure_local_transport("did:key:z6MkfreshLocalTransportTest");
+        assert!(result.is_ok(), "valid DID should configure local transport");
+        assert!(
+            scp.inner.core.has_context_manager(),
+            "configure_local_transport must attach a ContextManager"
+        );
+    }
+
+    #[test]
+    fn configure_local_transport_rejects_invalid_did() {
+        let scp = default_scp();
+        // Missing the `did:` prefix — fails DID validation at the FFI boundary.
+        let result = scp.configure_local_transport("not-a-valid-did");
+        assert!(result.is_err(), "invalid DID must be rejected");
+        assert!(
+            !scp.inner.core.has_context_manager(),
+            "a rejected DID must not leave a ContextManager attached"
+        );
     }
 
     // -----------------------------------------------------------------------

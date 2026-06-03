@@ -3145,6 +3145,21 @@
       "wasm": []
     },
     {
+      "canonical": "configure_local_transport",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "configure_local_transport"
+      ],
+      "uniffi": [
+        "configure_local_transport"
+      ],
+      "napi": [
+        "configure_local_transport"
+      ],
+      "wasm": []
+    },
+    {
       "canonical": "identity_verify_link_attestation",
       "category": "identity",
       "wasm_required": true,
@@ -3267,6 +3282,10 @@
       {
         "canonical": "configure_relay_transport",
         "reason": "WASM has no scp-platform / no transport per ADR-034."
+      },
+      {
+        "canonical": "configure_local_transport",
+        "reason": "No transport layer on wasm32 per ADR-034; the in-process loopback transport requires scp-runtime's LocalTransportProvider / ContextManager, which wasm cannot link (scp-runtime pulls tokio multi-thread)."
       },
       {
         "canonical": "bridge_credential_provision",

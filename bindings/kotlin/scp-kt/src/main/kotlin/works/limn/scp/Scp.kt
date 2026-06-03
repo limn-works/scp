@@ -526,6 +526,9 @@ class SCP internal constructor(
         rotateKeys = rotateKeys,
     )
 
+    /** Forwards to [NativeScp.configureLocalTransport] on [inner]. */
+    fun configureLocalTransport(localDid: String) = inner.configureLocalTransport(localDid = localDid)
+
     /** Forwards to [NativeScp.configureRelayTransport] on [inner]. */
     suspend fun configureRelayTransport(
         relayUrl: String,

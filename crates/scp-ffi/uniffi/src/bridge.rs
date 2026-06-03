@@ -12147,6 +12147,24 @@ impl Scp {
         Ok(())
     }
 
+    /// Per-instance equivalent of the free-function `configure_local_transport`.
+    ///
+    /// Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+    /// an in-process loopback `LocalTransportProvider` on this instance's
+    /// `ContextManager`. Unlike `configure_relay_transport`, this performs no
+    /// network I/O — it wires test infrastructure so `context_send` and
+    /// `broadcast_publish` succeed (encryption included) without a real relay.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Validation` if `local_did` fails DID validation.
+    pub fn configure_local_transport(&self, local_did: String) -> Result<(), ScpError> {
+        validate_did(&local_did)?;
+        self.inner
+            .init_context_manager_with_local_transport(&local_did);
+        Ok(())
+    }
+
     /// Per-instance equivalent of the free-function `mcp_server_create`.
     ///
     /// Routes through `&*self.inner`. The MCP server registry is
@@ -14715,6 +14733,41 @@ mod tests {
         // Policy should remain None.
         let result = scp.get_economic_policy(handle).unwrap();
         assert!(result.is_none());
+    }
+
+    /// `configure_local_transport` with a valid DID attaches a
+    /// `ContextManager` to this instance (loopback transport, no network I/O).
+    #[test]
+    fn configure_local_transport_attaches_manager_for_valid_did() {
+        let scp = scp_test();
+        assert!(
+            !scp.inner.core.has_context_manager(),
+            "fresh instance must not have a ContextManager attached"
+        );
+        let result =
+            scp.configure_local_transport("did:key:z6MkfreshLocalTransportTest".to_owned());
+        assert!(result.is_ok(), "valid DID should configure local transport");
+        assert!(
+            scp.inner.core.has_context_manager(),
+            "configure_local_transport must attach a ContextManager"
+        );
+    }
+
+    /// `configure_local_transport` rejects a malformed DID at the FFI boundary
+    /// with `ScpError::Validation` and leaves no `ContextManager` attached.
+    #[test]
+    fn configure_local_transport_rejects_invalid_did() {
+        let scp = scp_test();
+        let result = scp.configure_local_transport("not-a-valid-did".to_owned());
+        let err = result.expect_err("invalid DID must be rejected");
+        assert!(
+            matches!(err, ScpError::Validation { .. }),
+            "expected ScpError::Validation, got {err:?}"
+        );
+        assert!(
+            !scp.inner.core.has_context_manager(),
+            "a rejected DID must not leave a ContextManager attached"
+        );
     }
 
     #[test]

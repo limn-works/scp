@@ -117,6 +117,30 @@ def test_with_storage_rejects_unknown_type() -> None:
         SCP.with_storage({"type": "bogus"})
 
 
+def test_configure_local_transport_succeeds_for_valid_did() -> None:
+    """`configure_local_transport(did)` wires the loopback transport.
+
+    Installs an in-process `LocalTransportProvider` (test infra) so
+    `context_send` / `broadcast_publish` succeed without a real relay.
+    Idempotent OnceLock semantics mean a fresh instance is used here so
+    the wiring is unambiguous.
+    """
+    scp = SCP()
+    # Must not raise — a valid DID configures the loopback transport.
+    scp.configure_local_transport("did:key:z6MkfreshLocalTransportTest")
+
+
+def test_configure_local_transport_rejects_invalid_did() -> None:
+    """`configure_local_transport` rejects a malformed DID at the boundary.
+
+    The PyO3 validator raises the native `_scp_core.ValidationError`
+    before any `ContextManager` is attached.
+    """
+    scp = SCP()
+    with pytest.raises(_scp_core.ValidationError):
+        scp.configure_local_transport("not-a-valid-did")
+
+
 def test_repr_contains_instance_id() -> None:
     """`repr(SCP())` must contain the instance_id for debugging."""
     scp = SCP()
