@@ -469,9 +469,30 @@ export class SCP {
    *   IdentityError if key/DID creation fails inside the provider.
    */
   async identityCreateWithCustody(provider: KeyCustodyProvider): Promise<Identity> {
+    // NAPI marshals each provider method as a ThreadsafeFunction WITHOUT
+    // preserving `this`, and Rust `Vec<u8>` crosses the wire as a JS
+    // `Array<number>` (not `Uint8Array`). The adapter below (a) closes over
+    // `provider` in each arrow so `this` is bound, and (b) converts byte args
+    // inbound (`Array<number>` → `Uint8Array`) and byte returns outbound
+    // (`Uint8Array` → `Array<number>`). Methods with no byte payload
+    // (`generateKeypair`, `destroyKey`, `custodyType`) pass through unchanged.
+    const adapter = {
+      generateKeypair: (keyType: string): string => provider.generateKeypair(keyType),
+      sign: (keyId: string, message: number[]): number[] =>
+        Array.from(provider.sign(keyId, Uint8Array.from(message))),
+      getPublicKey: (keyId: string): number[] => Array.from(provider.getPublicKey(keyId)),
+      destroyKey: (keyId: string): void => provider.destroyKey(keyId),
+      dhAgree: (keyId: string, peerPublic: number[]): number[] =>
+        Array.from(provider.dhAgree(keyId, Uint8Array.from(peerPublic))),
+      derivePseudonym: (keyId: string, contextId: number[]): number[] =>
+        Array.from(provider.derivePseudonym(keyId, Uint8Array.from(contextId))),
+      exportSigningKeyBytes: (keyId: string): number[] =>
+        Array.from(provider.exportSigningKeyBytes(keyId)),
+      custodyType: (keyId: string): string => provider.custodyType(keyId),
+    };
     const raw = await (
-      this.#native.identityCreateWithCustody as (p: KeyCustodyProvider) => Promise<unknown>
-    )(provider);
+      this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>
+    )(adapter);
     const { Identity: IdentityCls } = await import("./identity");
     return IdentityCls._fromHandle(this, raw);
   }
@@ -2197,45 +2218,67 @@ export class SCP {
   bridgeCredentialProvision(
     bridgeId: string,
     credentialType: string,
-    plaintext: Uint8Array,
-    bridgeCredentialKey: Uint8Array,
+    plaintext: Uint8Array | readonly number[],
+    bridgeCredentialKey: Uint8Array | readonly number[],
   ): BridgeCredential {
+    // NAPI marshals Rust `Vec<u8>` as a JS `Array<number>`, not `Uint8Array`;
+    // convert byte inputs before crossing the boundary (cf. `broadcastPublish`).
+    const plaintextArray = ArrayBuffer.isView(plaintext)
+      ? Array.from(plaintext as Uint8Array)
+      : (plaintext as readonly number[]);
+    const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
+      ? Array.from(bridgeCredentialKey as Uint8Array)
+      : (bridgeCredentialKey as readonly number[]);
     return (
       this.#native.bridgeCredentialProvision as (
         b: string,
         t: string,
-        p: Uint8Array,
-        k: Uint8Array,
+        p: readonly number[],
+        k: readonly number[],
       ) => BridgeCredential
-    )(bridgeId, credentialType, plaintext, bridgeCredentialKey);
+    )(bridgeId, credentialType, plaintextArray, keyArray);
   }
 
   /** Retrieves and decrypts a credential for a bridge instance. */
   bridgeCredentialRetrieve(
     bridgeId: string,
     credentialType: string,
-    bridgeCredentialKey: Uint8Array,
+    bridgeCredentialKey: Uint8Array | readonly number[],
   ): Uint8Array {
-    return (
-      this.#native.bridgeCredentialRetrieve as (b: string, t: string, k: Uint8Array) => Uint8Array
-    )(bridgeId, credentialType, bridgeCredentialKey);
+    const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
+      ? Array.from(bridgeCredentialKey as Uint8Array)
+      : (bridgeCredentialKey as readonly number[]);
+    const raw = (
+      this.#native.bridgeCredentialRetrieve as (
+        b: string,
+        t: string,
+        k: readonly number[],
+      ) => number[]
+    )(bridgeId, credentialType, keyArray);
+    return Uint8Array.from(raw as readonly number[]);
   }
 
   /** Rotates (replaces) a credential for a bridge instance. */
   bridgeCredentialRotate(
     bridgeId: string,
     credentialType: string,
-    newPlaintext: Uint8Array,
-    bridgeCredentialKey: Uint8Array,
+    newPlaintext: Uint8Array | readonly number[],
+    bridgeCredentialKey: Uint8Array | readonly number[],
   ): BridgeCredential {
+    const newPlaintextArray = ArrayBuffer.isView(newPlaintext)
+      ? Array.from(newPlaintext as Uint8Array)
+      : (newPlaintext as readonly number[]);
+    const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
+      ? Array.from(bridgeCredentialKey as Uint8Array)
+      : (bridgeCredentialKey as readonly number[]);
     return (
       this.#native.bridgeCredentialRotate as (
         b: string,
         t: string,
-        p: Uint8Array,
-        k: Uint8Array,
+        p: readonly number[],
+        k: readonly number[],
       ) => BridgeCredential
-    )(bridgeId, credentialType, newPlaintext, bridgeCredentialKey);
+    )(bridgeId, credentialType, newPlaintextArray, keyArray);
   }
 
   /** Revokes all credentials for a bridge instance. */
@@ -2249,13 +2292,20 @@ export class SCP {
   }
 
   /** Stores a bridge credential key in the custody boundary. */
-  bridgeCredentialStoreKey(bridgeId: string, key: Uint8Array): void {
-    (this.#native.bridgeCredentialStoreKey as (b: string, k: Uint8Array) => void)(bridgeId, key);
+  bridgeCredentialStoreKey(bridgeId: string, key: Uint8Array | readonly number[]): void {
+    const keyArray = ArrayBuffer.isView(key)
+      ? Array.from(key as Uint8Array)
+      : (key as readonly number[]);
+    (this.#native.bridgeCredentialStoreKey as (b: string, k: readonly number[]) => void)(
+      bridgeId,
+      keyArray,
+    );
   }
 
   /** Retrieves a bridge credential key from the custody boundary. */
   bridgeCredentialGetKey(bridgeId: string): Uint8Array {
-    return (this.#native.bridgeCredentialGetKey as (b: string) => Uint8Array)(bridgeId);
+    const raw = (this.#native.bridgeCredentialGetKey as (b: string) => number[])(bridgeId);
+    return Uint8Array.from(raw as readonly number[]);
   }
 
   /** Deletes and zeroizes a bridge credential key. */
