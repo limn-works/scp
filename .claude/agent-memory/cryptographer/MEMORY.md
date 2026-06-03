@@ -2,6 +2,14 @@
 
 ## Project: SCP Protocol Core
 
+### UCAN A+A delegation fix (see ucan-aa-delegation-fix.md)
+- delegate_ucan now emits NESTED prf (direct parent CID only) -- was flattened, broke depth>=3 chains
+- Mint folds parent.nb into child = COMPLETE self-contained effective set (build_delegated_caveats)
+- Validator verify_edge_attenuation: parent Some + child None => REJECT (was skip). Per-edge stateless.
+- §7.3.8 amended: non-root carries complete re-materialized set; validator rejects absent-on-non-root
+- origin_kind materialized at mint (inherit parent Some, or infer from outlet stems on root-None)
+- branch remediation/ucan-core-impl off remediation/r3-integration (caf098986)
+
 ### Merkle Tree (event_log/)
 - RFC 6962 domain separation: leaf=SHA-256(0x00||data), interior=SHA-256(0x01||left||right)
 - Consistent across tree.rs, proof.rs, checkpoint.rs, metrics.rs, phase2_integration.rs

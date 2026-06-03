@@ -96,29 +96,217 @@ fn verify_attestation_ceiling_compliance(
     verify_ceiling_compliance(&cap_uris, ceiling)
 }
 
-/// SCP-OUT-023 helper: validates child caveats and runs §7.3.8 narrow
-/// against the parent token's `nb` field. Returns the validated child
-/// caveats (or `None` when the caller didn't supply any). Splitting this
-/// out keeps `delegate_ucan` under the workspace `too_many_lines` cap and
-/// gives the mint-side narrow path a single implementation.
+/// Infers the [`OutletKind`] of a delegation from the stem family of its
+/// delegated capability URIs, mirroring the root-mint inference in
+/// [`scp_protocol::trust::caveats::InvocationCaveats::try_new_for_root`].
+///
+/// Used by [`build_delegated_caveats`] to materialize an explicit
+/// `origin_kind` on the FIRST non-root delegation, where the parent (root)
+/// token may legitimately carry `origin_kind = None` (§7.3.8 rule 3): the
+/// root's single-kind stem set is unambiguous, and the first delegation
+/// pins the inferred value into the child's signed caveats so every
+/// downstream hop sees an explicit, equality-checked value.
+///
+/// - `outlet_query:*` / `outlet_query:{id}` ⇒ [`OutletKind::Query`].
+/// - `outlet_call:*` / `outlet_call:{id}` ⇒ [`OutletKind::Action`].
+/// - Non-outlet stems contribute nothing (returns `None` when no outlet
+///   stems are present — there is no outlet kind to materialize).
 ///
 /// # Errors
 ///
-/// Returns [`UcanError::MalformedToken`] when the child caveats fail
+/// Returns [`UcanError::AttenuationViolation`] when the delegated set is
+/// mixed-kind (carries BOTH `outlet_query:*` and `outlet_call:*` stems):
+/// such a set has no single unambiguous `origin_kind` and is rejected at
+/// mint, matching [`scp_protocol::trust::caveats::CaveatMintError::OriginKindMixedStemRoot`].
+/// Returns [`UcanError::AttenuationViolation`] when any attestation URI is
+/// unparseable (fail-closed).
+fn infer_origin_kind_from_capabilities(
+    attenuated_capabilities: &[Attenuation],
+) -> Result<Option<scp_protocol::context::outlets::OutletKind>, UcanError> {
+    use scp_protocol::context::outlets::OutletKind;
+
+    let mut has_query = false;
+    let mut has_action = false;
+    for att in attenuated_capabilities {
+        let uri: CapabilityUri = att.with.parse().map_err(|e: UcanError| {
+            UcanError::AttenuationViolation(format!(
+                "invalid capability URI '{}' while inferring origin_kind: {e}",
+                att.with
+            ))
+        })?;
+        match uri.resource() {
+            "outlet_query" => has_query = true,
+            "outlet_call" => has_action = true,
+            _ => {}
+        }
+    }
+
+    match (has_query, has_action) {
+        (true, true) => Err(UcanError::AttenuationViolation(
+            "origin-kind-mixed-stem: delegated set carries both outlet_query and \
+             outlet_call stems; origin_kind is ambiguous"
+                .to_owned(),
+        )),
+        (true, false) => Ok(Some(OutletKind::Query)),
+        (false, true) => Ok(Some(OutletKind::Action)),
+        (false, false) => Ok(None),
+    }
+}
+
+/// SCP-OUT-023 / A+A caveat re-materialization: builds the delegated
+/// child's COMPLETE, self-contained `nb` (effective caveat set) per the
+/// §7.3.8 canonical model.
+///
+/// The canonical model requires that EVERY non-root token's `nb` carry the
+/// complete narrowed effective set — never a partial that relies on the
+/// validator inferring inherited bounds. The mint folds the parent's
+/// effective caveats into the child so the leaf `nb` IS the
+/// validated-narrowed `effective_caveats` (§5.4.5) with no SDK-side fold,
+/// and the validator can enforce per-edge narrowing statelessly while
+/// rejecting any non-root child that omits a field its parent bound.
+///
+/// Construction:
+///
+/// 1. **Caller supplies `None`** — the child inherits the parent's `nb`
+///    verbatim (the full effective set). A root parent with no caveats
+///    (`nb = None`) yields a child with no caveats EXCEPT that an
+///    `origin_kind` is still materialized from the delegated capability
+///    stems when those stems are outlet stems (so the first delegation off
+///    an unconstrained root pins the kind).
+///
+/// 2. **Caller supplies `Some(child)`** — every field the caller omitted
+///    (`None`) is filled from the parent's value (inherit), and every field
+///    the caller set is taken as-is (tighten). `origin_kind` is materialized
+///    explicitly: inherited from the parent when the parent has a value, or
+///    inferred from the delegated capability stems when the parent (root) is
+///    `None`.
+///
+/// After materialization the function runs `parent.narrow(&materialized)`
+/// (the per-field §7.3.8 attenuation gate — rejects any widening, removal,
+/// or `origin_kind` change) and then [`InvocationCaveats::try_new`] (the
+/// mint-limit gate). The result is a child `nb` that is provably `<=` the
+/// parent on every field and is structurally complete.
+///
+/// # Errors
+///
+/// Returns [`UcanError::MalformedToken`] when the materialized child fails
 /// [`scp_protocol::trust::caveats::InvocationCaveats::try_new`] (mint-limit
 /// overflow, mask-width violation). Returns
 /// [`UcanError::AttenuationViolation`] when the parent's caveats reject the
-/// child via [`scp_protocol::trust::caveats::InvocationCaveats::narrow`].
+/// materialized child via
+/// [`scp_protocol::trust::caveats::InvocationCaveats::narrow`], or when
+/// `origin_kind` inference fails (mixed-stem set / unparseable URI).
 fn build_delegated_caveats(
     params: &DelegateParams<'_>,
 ) -> Result<Option<scp_protocol::trust::caveats::InvocationCaveats>, UcanError> {
-    let Some(child_caveats) = params.caveats.clone() else {
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    let parent_nb = params.parent_token.payload.nb.as_ref();
+
+    // The child's effective set is the parent's effective set overlaid with
+    // the caller-supplied fields. When the caller supplies nothing, the
+    // overlay is empty and the child inherits the parent verbatim (modulo
+    // origin_kind materialization below).
+    let child_caveats = params
+        .caveats
+        .clone()
+        .unwrap_or_else(InvocationCaveats::empty);
+    let caller_supplied_caveats = params.caveats.is_some();
+
+    // The parent's effective set: a root with no nb contributes no field
+    // bounds (empty). A non-root parent (or a root minted WITH caveats)
+    // already carries its complete validated set.
+    let parent_effective = parent_nb.map_or_else(InvocationCaveats::empty, Clone::clone);
+
+    // Infer the origin_kind implied by the delegated capability stems.
+    // Always computed (even when the parent pins a value) so a caller's
+    // explicit origin_kind can be cross-checked against the stem family —
+    // closing the gap where a root with NO caveats (parent_nb = None) never
+    // ran the root-mint stem/kind agreement check (`try_new_for_root`).
+    let inferred_origin_kind = infer_origin_kind_from_capabilities(params.attenuated_capabilities)?;
+
+    // Materialize an explicit origin_kind for the child. Inherit the
+    // parent's value when present; otherwise — the parent is a root with
+    // origin_kind = None (permitted by §7.3.8 rule 3) — use the inferred
+    // stem kind. This is the point at which the chain's origin_kind becomes
+    // a signed, explicit, equality-checked value for every hop below the
+    // root (rule 4 materialization).
+    let inherited_origin_kind = parent_effective.origin_kind.or(inferred_origin_kind);
+
+    // When the parent pins NO origin_kind (root-None) and the caller
+    // supplied an explicit origin_kind, that value MUST agree with the stem
+    // family. The downstream narrow() against an empty parent cannot catch
+    // this (parent None vs child Some is admissible there), so enforce the
+    // stem/kind agreement here — the same invariant the root mint enforces
+    // via `try_new_for_root` when the root DOES carry caveats.
+    if parent_effective.origin_kind.is_none()
+        && let Some(caller_kind) = child_caveats.origin_kind
+        && let Some(inferred) = inferred_origin_kind
+        && caller_kind != inferred
+    {
+        return Err(UcanError::AttenuationViolation(format!(
+            "origin-kind-stem-mismatch: declared origin_kind {caller_kind:?} \
+             disagrees with delegated stem family {inferred:?}"
+        )));
+    }
+
+    // Fast path: caller supplied nothing AND there is nothing to
+    // materialize (no parent bounds, no inferable origin_kind). The child is
+    // genuinely caveat-free — e.g. a non-outlet delegation off an
+    // unconstrained root. Emitting `None` keeps such tokens identical to
+    // the pre-caveat baseline.
+    if !caller_supplied_caveats && parent_nb.is_none() && inherited_origin_kind.is_none() {
         return Ok(None);
+    }
+
+    let materialized = InvocationCaveats {
+        amount_max_per_call: child_caveats
+            .amount_max_per_call
+            .or(parent_effective.amount_max_per_call),
+        amount_max_cumulative: child_caveats
+            .amount_max_cumulative
+            .or(parent_effective.amount_max_cumulative),
+        valid_from: child_caveats.valid_from.or(parent_effective.valid_from),
+        valid_until: child_caveats.valid_until.or(parent_effective.valid_until),
+        hours_of_day: child_caveats.hours_of_day.or(parent_effective.hours_of_day),
+        days_of_week: child_caveats.days_of_week.or(parent_effective.days_of_week),
+        max_calls: child_caveats.max_calls.or(parent_effective.max_calls),
+        rate_window: child_caveats.rate_window.or(parent_effective.rate_window),
+        input_schema: child_caveats
+            .input_schema
+            .clone()
+            .or_else(|| parent_effective.input_schema.clone()),
+        allowed_adapters: child_caveats
+            .allowed_adapters
+            .clone()
+            .or_else(|| parent_effective.allowed_adapters.clone()),
+        allowed_target_dids: child_caveats
+            .allowed_target_dids
+            .clone()
+            .or_else(|| parent_effective.allowed_target_dids.clone()),
+        // origin_kind: a caller-supplied value must agree with the inherited
+        // value (narrow() enforces equality below); when the caller omits
+        // it, materialize the inherited/inferred value so the child is never
+        // origin_kind = None on a non-root.
+        origin_kind: child_caveats.origin_kind.or(inherited_origin_kind),
     };
-    let validated = scp_protocol::trust::caveats::InvocationCaveats::try_new(child_caveats)
+
+    // Final gates: per-field attenuation against the parent, then mint
+    // limits. narrow() rejects any widening / field removal / origin_kind
+    // change and rejects a still-absent origin_kind (OriginKindUnspecified).
+    let validated = InvocationCaveats::try_new(materialized)
         .map_err(|e| UcanError::MalformedToken(format!("caveat-mint-limit-exceeded: {e}")))?;
-    if let Some(parent_caveats) = params.parent_token.payload.nb.as_ref() {
+    if let Some(parent_caveats) = parent_nb {
         parent_caveats.narrow(&validated).map_err(|e| {
+            UcanError::AttenuationViolation(format!("caveat narrow violation: {e}"))
+        })?;
+    } else {
+        // Root parent (no nb): there is no parent bound to narrow against,
+        // but a non-root child still MUST carry an explicit origin_kind.
+        // narrow() against an empty parent enforces exactly this
+        // (OriginKindUnspecified when child.origin_kind is None) without
+        // imposing any field bound the root never had.
+        InvocationCaveats::empty().narrow(&validated).map_err(|e| {
             UcanError::AttenuationViolation(format!("caveat narrow violation: {e}"))
         })?;
     }
@@ -621,9 +809,20 @@ pub async fn delegate_ucan(
     // Step 4: Compute the parent token's CID for the proof chain.
     let parent_cid = compute_cid(params.parent_token);
 
-    // Collect parent proofs and append the parent's own CID.
-    let mut proofs = params.parent_token.payload.prf.clone();
-    proofs.push(parent_cid);
+    // NESTED proof chain (canonical model): the child references ONLY its
+    // direct parent. The delegation chain is a linked list — each token's
+    // `prf` holds the single CID of the token one hop up, and the validator
+    // walks parent -> grandparent -> ... -> root by resolving each token's
+    // own `prf` recursively (see `verify_chain_recursive`). We do NOT flatten
+    // the parent's ancestors into the child's `prf`: a flattened leaf would
+    // list `[root_cid, mid_cid]`, and the validator — which treats every
+    // `prf` entry as a DIRECT parent and checks `parent.aud == child.iss` —
+    // would reject the flattened grandparent (whose `aud` is the mid agent,
+    // not the leaf issuer). The proof resolver is CID-keyed, so the full
+    // chain is still resolvable: every token in the chain is inserted into
+    // the resolver by CID, and the walk follows each token's direct-parent
+    // pointer. No proofs are transported inline through the leaf's `prf`.
+    let proofs = vec![parent_cid];
 
     // Build header — include kid when signing_key_id or key_scope is present
     // (ADR-039). signing_key_id takes precedence.
@@ -1573,8 +1772,15 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[tokio::test]
-    async fn delegate_ucan_chained_delegation_accumulates_proof_chain() {
-        // Alice -> Bob -> Carol: verify the proof chain grows.
+    async fn delegate_ucan_chained_delegation_nests_proof_chain() {
+        // Alice -> Bob -> Carol -> Dave: verify the proof chain is NESTED,
+        // not flattened. Each delegated token references ONLY its direct
+        // parent's CID (a linked list), so the validator can walk
+        // child -> parent -> grandparent -> root recursively via each token's
+        // own `prf`. A flattened chain (every ancestor CID in the leaf's
+        // `prf`) breaks the walk's `parent.aud == child.iss` linkage check
+        // for the flattened grandparents and rejects all depth>=3 honest
+        // delegation.
         let (alice_custody, alice_key, alice_did) = setup_custody().await;
         let (bob_custody, bob_key, bob_did) = setup_custody().await;
         let (carol_custody, carol_key, carol_did) = setup_custody().await;
@@ -1661,10 +1867,25 @@ mod tests {
         .await
         .unwrap();
 
-        // Carol's delegated token should have root CID AND Bob-to-Carol CID.
-        assert_eq!(carol_to_dave.payload.prf.len(), 2);
-        assert!(carol_to_dave.payload.prf.contains(&root_cid));
-        assert!(carol_to_dave.payload.prf.contains(&bob_to_carol_cid));
+        // Carol's delegated token references ONLY its direct parent
+        // (bob_to_carol), NOT the flattened ancestor (root). The chain is a
+        // linked list: carol_to_dave.prf = [bob_to_carol_cid];
+        // bob_to_carol.prf = [root_cid]; root.prf = []. The walk resolves
+        // each hop via the proof resolver and recurses into the parent's own
+        // `prf`.
+        assert_eq!(
+            carol_to_dave.payload.prf.len(),
+            1,
+            "nested chain: child references only its direct parent"
+        );
+        assert!(
+            carol_to_dave.payload.prf.contains(&bob_to_carol_cid),
+            "child prf must contain the direct parent's CID"
+        );
+        assert!(
+            !carol_to_dave.payload.prf.contains(&root_cid),
+            "child prf must NOT contain the flattened grandparent (root) CID"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -3344,6 +3565,517 @@ mod tests {
         assert!(
             matches!(err, UcanError::CapabilityOutsideCeiling(_)),
             "outlet:call:* must be rejected when not in ceiling: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // A+A caveat re-materialization: mint-side fold + mint-side reject matrix
+    // -------------------------------------------------------------------
+
+    use scp_protocol::context::outlets::OutletKind;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::{DaysOfWeekMask, HoursOfDayMask};
+    use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
+
+    const OUTLET_CAP_URI: &str = "scp:ctx:ctx-caveat/outlet_call:assistant";
+
+    /// Mints a root token (Action grant) carrying the given caveats, audienced
+    /// to `aud`. Capabilities use the `outlet_call:assistant` stem so the
+    /// default ceiling admits it.
+    async fn mint_root_with_caveats(
+        custody: &InMemoryKeyCustody,
+        issuer_key: &KeyHandle,
+        issuer_did: &str,
+        aud: &str,
+        caveats: Option<InvocationCaveats>,
+    ) -> UcanToken {
+        let caps = vec!["outlet_call:assistant".to_owned()];
+        let params = MintParams {
+            issuer_did,
+            issuer_key,
+            audience_did: aud,
+            context_id: "ctx-caveat",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+            caveats,
+        };
+        mint_ucan(&params, custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap()
+    }
+
+    /// Delegates `parent` to `delegatee_did` with the given child caveats,
+    /// returning the `delegate_ucan` result (Ok or Err) for assertion.
+    async fn try_delegate_with_caveats(
+        parent: &UcanToken,
+        delegator_custody: &InMemoryKeyCustody,
+        delegator_key: &KeyHandle,
+        delegator_did: &str,
+        delegatee_did: &str,
+        caveats: Option<InvocationCaveats>,
+    ) -> Result<UcanToken, UcanError> {
+        let attenuated = vec![Attenuation {
+            with: OUTLET_CAP_URI.to_owned(),
+            can: "*".to_owned(),
+        }];
+        let params = DelegateParams {
+            parent_token: parent,
+            delegator_did,
+            delegator_key,
+            delegatee_did,
+            attenuated_capabilities: &attenuated,
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+            caveats,
+        };
+        delegate_ucan(&params, delegator_custody, &scp_primitives::SystemClock).await
+    }
+
+    /// MINT-SIDE FOLD: a child that omits a field the parent bound INHERITS
+    /// the parent's value (the child `nb` is the COMPLETE self-contained
+    /// effective set, not a partial). Confirms the re-materialization.
+    #[tokio::test]
+    async fn delegate_fold_inherits_omitted_parent_fields() {
+        let (root_custody, root_key, root_did) = setup_custody().await;
+        let (mid_custody, mid_key, mid_did) = setup_custody().await;
+
+        let root_caveats = InvocationCaveats {
+            amount_max_per_call: Some(Amount::new(500)),
+            amount_max_cumulative: Some(Amount::new(5000)),
+            max_calls: Some(100),
+            origin_kind: Some(OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let root = mint_root_with_caveats(
+            &root_custody,
+            &root_key,
+            &root_did,
+            &mid_did,
+            Some(root_caveats),
+        )
+        .await;
+
+        // Child tightens ONLY max_calls; omits the two amount fields and
+        // origin_kind. The fold must inherit amount_* from the parent and
+        // materialize origin_kind = Action.
+        let child = try_delegate_with_caveats(
+            &root,
+            &mid_custody,
+            &mid_key,
+            &mid_did,
+            "did:dht:z6MkLeaf",
+            Some(InvocationCaveats {
+                max_calls: Some(10),
+                ..InvocationCaveats::empty()
+            }),
+        )
+        .await
+        .expect("honest narrowing must mint");
+
+        let nb = child.payload.nb.expect("child carries complete nb");
+        assert_eq!(nb.max_calls, Some(10), "tightened field");
+        assert_eq!(
+            nb.amount_max_per_call,
+            Some(Amount::new(500)),
+            "omitted field inherited from parent"
+        );
+        assert_eq!(
+            nb.amount_max_cumulative,
+            Some(Amount::new(5000)),
+            "omitted field inherited from parent"
+        );
+        assert_eq!(
+            nb.origin_kind,
+            Some(OutletKind::Action),
+            "origin_kind materialized explicitly"
+        );
+    }
+
+    /// MINT-SIDE FOLD: a caller supplying `None` caveats inherits the
+    /// parent's COMPLETE effective set verbatim.
+    #[tokio::test]
+    async fn delegate_fold_none_inherits_parent_verbatim() {
+        let (root_custody, root_key, root_did) = setup_custody().await;
+        let (mid_custody, mid_key, mid_did) = setup_custody().await;
+
+        let root_caveats = InvocationCaveats {
+            amount_max_per_call: Some(Amount::new(500)),
+            max_calls: Some(100),
+            origin_kind: Some(OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let root = mint_root_with_caveats(
+            &root_custody,
+            &root_key,
+            &root_did,
+            &mid_did,
+            Some(root_caveats.clone()),
+        )
+        .await;
+
+        let child = try_delegate_with_caveats(
+            &root,
+            &mid_custody,
+            &mid_key,
+            &mid_did,
+            "did:dht:z6MkLeaf",
+            None,
+        )
+        .await
+        .expect("None caveats inherit parent verbatim");
+
+        assert_eq!(
+            child.payload.nb,
+            Some(root_caveats),
+            "None caveats produce the parent's complete set verbatim"
+        );
+    }
+
+    /// MINT-SIDE FOLD: a root with `origin_kind` = None (permitted) — the
+    /// first delegation materializes `origin_kind` inferred from the outlet
+    /// stem.
+    #[tokio::test]
+    async fn delegate_fold_materializes_origin_kind_from_root_none() {
+        let (root_custody, root_key, root_did) = setup_custody().await;
+        let (mid_custody, mid_key, mid_did) = setup_custody().await;
+
+        // Root carries caveats but NO origin_kind (allowed: single-kind stem
+        // set means inference is unambiguous).
+        let root_caveats = InvocationCaveats {
+            max_calls: Some(100),
+            ..InvocationCaveats::empty()
+        };
+        let root = mint_root_with_caveats(
+            &root_custody,
+            &root_key,
+            &root_did,
+            &mid_did,
+            Some(root_caveats),
+        )
+        .await;
+        assert_eq!(root.payload.nb.as_ref().unwrap().origin_kind, None);
+
+        let child = try_delegate_with_caveats(
+            &root,
+            &mid_custody,
+            &mid_key,
+            &mid_did,
+            "did:dht:z6MkLeaf",
+            Some(InvocationCaveats {
+                max_calls: Some(10),
+                ..InvocationCaveats::empty()
+            }),
+        )
+        .await
+        .expect("first delegation materializes inferred origin_kind");
+
+        assert_eq!(
+            child.payload.nb.unwrap().origin_kind,
+            Some(OutletKind::Action),
+            "origin_kind inferred from outlet_call stem on first delegation"
+        );
+    }
+
+    /// Widening matrix data: each tuple is `(label, minimal root caveat with
+    /// the single bound under test, child override that WIDENS that field
+    /// beyond the parent)`. Extracted from the test body so the test stays
+    /// within the `too_many_lines` cap. This builder is itself a flat data
+    /// table (one entry per §7.3.8 caveat field) with no decomposable logic,
+    /// so the line-count lint does not apply.
+    #[allow(clippy::too_many_lines)]
+    fn widening_reject_cases() -> Vec<(&'static str, InvocationCaveats, InvocationCaveats)> {
+        let action = || InvocationCaveats {
+            origin_kind: Some(OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        vec![
+            (
+                "amount_max_per_call",
+                InvocationCaveats {
+                    amount_max_per_call: Some(Amount::new(100)),
+                    ..action()
+                },
+                InvocationCaveats {
+                    amount_max_per_call: Some(Amount::new(1_000)),
+                    ..action()
+                },
+            ),
+            (
+                "amount_max_cumulative",
+                InvocationCaveats {
+                    amount_max_cumulative: Some(Amount::new(1_000)),
+                    ..action()
+                },
+                InvocationCaveats {
+                    amount_max_cumulative: Some(Amount::new(100_000)),
+                    ..action()
+                },
+            ),
+            (
+                "max_calls",
+                InvocationCaveats {
+                    max_calls: Some(10),
+                    ..action()
+                },
+                InvocationCaveats {
+                    max_calls: Some(1_000),
+                    ..action()
+                },
+            ),
+            (
+                "valid_from_earlier",
+                InvocationCaveats {
+                    valid_from: Some(1_000),
+                    ..action()
+                },
+                InvocationCaveats {
+                    valid_from: Some(0),
+                    ..action()
+                },
+            ),
+            (
+                "valid_until_later",
+                InvocationCaveats {
+                    valid_until: Some(10_000),
+                    ..action()
+                },
+                InvocationCaveats {
+                    valid_until: Some(1_000_000),
+                    ..action()
+                },
+            ),
+            (
+                "hours_of_day_superset",
+                InvocationCaveats {
+                    hours_of_day: Some(HoursOfDayMask::from_bits(0b0000_1100).unwrap()),
+                    ..action()
+                },
+                InvocationCaveats {
+                    hours_of_day: Some(HoursOfDayMask::from_bits(0b0011_1100).unwrap()),
+                    ..action()
+                },
+            ),
+            (
+                "days_of_week_superset",
+                InvocationCaveats {
+                    days_of_week: Some(DaysOfWeekMask::from_bits(0b0001_1110).unwrap()),
+                    ..action()
+                },
+                InvocationCaveats {
+                    days_of_week: Some(DaysOfWeekMask::from_bits(0b0111_1111).unwrap()),
+                    ..action()
+                },
+            ),
+            (
+                "rate_window_max",
+                InvocationCaveats {
+                    rate_window: Some(RateWindow {
+                        max: 5,
+                        window_secs: 60,
+                    }),
+                    ..action()
+                },
+                InvocationCaveats {
+                    rate_window: Some(RateWindow {
+                        max: 50,
+                        window_secs: 60,
+                    }),
+                    ..action()
+                },
+            ),
+            (
+                "rate_window_secs",
+                InvocationCaveats {
+                    rate_window: Some(RateWindow {
+                        max: 5,
+                        window_secs: 60,
+                    }),
+                    ..action()
+                },
+                InvocationCaveats {
+                    rate_window: Some(RateWindow {
+                        max: 5,
+                        window_secs: 600,
+                    }),
+                    ..action()
+                },
+            ),
+            (
+                "allowed_adapters_superset",
+                InvocationCaveats {
+                    allowed_adapters: Some(vec!["stripe".to_owned()]),
+                    ..action()
+                },
+                InvocationCaveats {
+                    allowed_adapters: Some(vec!["stripe".to_owned(), "paypal".to_owned()]),
+                    ..action()
+                },
+            ),
+            (
+                "allowed_target_dids_superset",
+                InvocationCaveats {
+                    allowed_target_dids: Some(vec![scp_primitives::DID("did:dht:zA".to_owned())]),
+                    ..action()
+                },
+                InvocationCaveats {
+                    allowed_target_dids: Some(vec![
+                        scp_primitives::DID("did:dht:zA".to_owned()),
+                        scp_primitives::DID("did:dht:zB".to_owned()),
+                    ]),
+                    ..action()
+                },
+            ),
+            (
+                "input_schema_maximum",
+                InvocationCaveats {
+                    input_schema: Some(serde_json::json!({ "maximum": 10.0 })),
+                    ..action()
+                },
+                InvocationCaveats {
+                    input_schema: Some(serde_json::json!({ "maximum": 1000.0 })),
+                    ..action()
+                },
+            ),
+            (
+                "origin_kind_mismatch",
+                InvocationCaveats {
+                    max_calls: Some(10),
+                    ..action()
+                },
+                // Child flips origin_kind to Query — disagrees with the
+                // parent's Action (and with the outlet_call stem family).
+                InvocationCaveats {
+                    max_calls: Some(5),
+                    origin_kind: Some(OutletKind::Query),
+                    ..InvocationCaveats::empty()
+                },
+            ),
+        ]
+    }
+
+    /// MINT-SIDE REJECT MATRIX: a child that WIDENS any field beyond the
+    /// parent is rejected at MINT (`delegate_ucan` returns Err). One case per
+    /// caveat field family. Each case uses a minimal root carrying ONLY the
+    /// field under test (plus `origin_kind`) so we stay within the §7.3.8
+    /// `MAX_POPULATED_CAVEATS` = 8 mint-limit while still exercising every
+    /// narrowing direction independently.
+    #[tokio::test]
+    async fn delegate_rejects_widening_at_mint_matrix() {
+        let (root_custody, root_key, root_did) = setup_custody().await;
+        let (mid_custody, mid_key, mid_did) = setup_custody().await;
+
+        for (label, root_caveats, widening) in widening_reject_cases() {
+            let root = mint_root_with_caveats(
+                &root_custody,
+                &root_key,
+                &root_did,
+                &mid_did,
+                Some(root_caveats),
+            )
+            .await;
+            let result = try_delegate_with_caveats(
+                &root,
+                &mid_custody,
+                &mid_key,
+                &mid_did,
+                "did:dht:z6MkLeaf",
+                Some(widening),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(UcanError::AttenuationViolation(_))),
+                "widening '{label}' must be rejected at mint, got: {result:?}"
+            );
+        }
+    }
+
+    /// MINT-SIDE REJECT: delegating a mixed-stem set (`outlet_query` AND
+    /// `outlet_call`) off an unconstrained root has no unambiguous
+    /// `origin_kind` and is rejected at mint.
+    #[tokio::test]
+    async fn delegate_rejects_mixed_stem_origin_kind_at_mint() {
+        let (root_custody, root_key, root_did) = setup_custody().await;
+        let (mid_custody, mid_key, mid_did) = setup_custody().await;
+
+        // Root grants both stems (unconstrained, no caveats).
+        let caps = vec![
+            "outlet_query:search".to_owned(),
+            "outlet_call:assistant".to_owned(),
+        ];
+        let root_params = MintParams {
+            issuer_did: &root_did,
+            issuer_key: &root_key,
+            audience_did: &mid_did,
+            context_id: "ctx-caveat",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(
+                [
+                    "outlet_query:search".to_owned(),
+                    "outlet_call:assistant".to_owned(),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            caveats: None,
+        };
+        let root = mint_ucan(&root_params, &root_custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
+
+        // Delegate BOTH stems while introducing a caveat (so the fold runs
+        // origin_kind inference over a mixed set).
+        let attenuated = vec![
+            Attenuation {
+                with: "scp:ctx:ctx-caveat/outlet_query:search".to_owned(),
+                can: "*".to_owned(),
+            },
+            Attenuation {
+                with: "scp:ctx:ctx-caveat/outlet_call:assistant".to_owned(),
+                can: "*".to_owned(),
+            },
+        ];
+        let params = DelegateParams {
+            parent_token: &root,
+            delegator_did: &mid_did,
+            delegator_key: &mid_key,
+            delegatee_did: "did:dht:z6MkLeaf",
+            attenuated_capabilities: &attenuated,
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(
+                [
+                    "outlet_query:search".to_owned(),
+                    "outlet_call:assistant".to_owned(),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            caveats: Some(InvocationCaveats {
+                max_calls: Some(5),
+                ..InvocationCaveats::empty()
+            }),
+        };
+        let result = delegate_ucan(&params, &mid_custody, &scp_primitives::SystemClock).await;
+        assert!(
+            matches!(result, Err(UcanError::AttenuationViolation(_))),
+            "mixed-stem origin_kind inference must reject at mint: {result:?}"
         );
     }
 }

@@ -393,16 +393,17 @@ impl ProofResolver for InMemoryProofResolver {
 // keyed by the encoded JWT — a token-side handle the resolver implementation
 // chooses how to interpret (CID lookup, in-memory map, etc.).
 //
-// `verify_attenuation` calls `parent.caveats.narrow(&child.caveats)?` at
-// every delegation edge where BOTH parent and child carry caveats. When
-// either side returns `None`, the narrow rule degenerates to the legacy
-// behaviour (capability-only attenuation): `None` parent means the parent
-// imposed no caveat-level constraint, and `None` child means the child
-// inherits the parent's constraint by reference (the existing protocol
-// behaviour for tokens that pre-date OUT-018/019). A `None`-parent with a
-// `Some`-child IS still subject to `narrow()` because narrow itself
-// enforces the §7.3.8 "child may introduce a bound where parent had none"
-// rule with `parent.caveats == InvocationCaveats::empty()` semantically.
+// `verify_edge_attenuation` applies the §7.3.8 per-edge caveat rule on the
+// resolved `(parent, child)` caveats at every delegation edge (canonical
+// model). Because the mint materializes the COMPLETE effective set into
+// every non-root token's `nb`, the validator is per-edge and stateless and
+// rejects a non-root child that drops a bound its parent carried:
+//   - parent `Some`, child `None`  → REJECT (the child must re-materialize
+//     the parent's set; an absent child laundered the bound).
+//   - parent `Some`, child `Some`  → `parent.narrow(child)`.
+//   - parent `None`, child `Some`  → `empty().narrow(child)` (no field bound
+//     imposed, but rule-4 explicit-`origin_kind` still enforced).
+//   - parent `None`, child `None`  → admissible.
 
 /// Resolves the [`InvocationCaveats`] (§7.3.8) carried by a UCAN token.
 ///
@@ -414,9 +415,15 @@ impl ProofResolver for InMemoryProofResolver {
 /// minted caveat-bearing delegations.
 ///
 /// Returning `Some(_)` opts the token into Step 7b (attenuation) and Step
-/// 11b (time-box) caveat enforcement. Returning `None` skips both steps
-/// for that token specifically; tokens in the same chain that DO carry
-/// caveats are still checked.
+/// 11b (time-box) caveat enforcement. Returning `None` means the token
+/// carries no caveat-level constraint. Under the §7.3.8 canonical model the
+/// mint materializes the complete effective set into every non-root token's
+/// `nb`, so a faithfully-delegated non-root token never resolves to `None`
+/// on a constrained edge: if the resolver returns `None` for a child whose
+/// direct parent resolved `Some`, the edge is REJECTED (the absent child
+/// laundered the parent's bound). A `None` on both sides of an edge is the
+/// genuinely caveat-free case (e.g. a non-outlet delegation off an
+/// unconstrained root).
 ///
 /// **`Send + Sync` bound.** The resolver is held inside
 /// [`ValidationContext`] as `&dyn CaveatResolver`. Several FFI bridges
@@ -466,10 +473,11 @@ impl CaveatResolver for NoCaveatResolver {
 /// `&dyn CaveatResolver` across the open path and any spawned validation
 /// task without an adapter.
 ///
-/// Tokens with no `nb` field resolve to `None` (caveat-free), preserving
-/// the [`CaveatResolver`] `None`-handling contract: such tokens skip Step
-/// 7b / 11b for themselves while caveat-bearing siblings in the same chain
-/// are still checked.
+/// Tokens with no `nb` field resolve to `None` (caveat-free). Under the
+/// §7.3.8 canonical model the mint materializes the complete effective set
+/// into every non-root token's `nb`, so a `None` here on a child whose
+/// direct parent resolved `Some` is rejected at the edge (Step 7b) — a
+/// non-root token cannot drop a bound its parent carried.
 ///
 /// Call-site note: switching the runtime / bridge validation call sites
 /// from [`NoCaveatResolver`] to this resolver is a separate wiring step.
@@ -1223,16 +1231,15 @@ fn verify_chain_recursive(
 /// For root tokens (empty `prf`), Step 7 is a no-op and Step 7b is
 /// unreachable (the caller skips this function for empty `prf`).
 ///
-/// **Step 7b (caveat narrow).** Whenever the resolver returns
-/// `Some(caveats)` for BOTH the parent and the child, the function calls
-/// `parent_caveats.narrow(&child_caveats)`. Any
-/// [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation)
-/// is wrapped into [`UcanError::CaveatAttenuationViolation`] so SDK
-/// callers can pattern-match the structured violation. When the resolver
-/// returns `None` for either side, only Step 7 runs at that edge — this
-/// preserves backward compatibility for tokens that pre-date OUT-018/019
-/// (no caveat-bearing `nb` field) and is the documented contract of
-/// [`CaveatResolver`].
+/// **Step 7b (caveat narrow).** Applies the §7.3.8 per-edge caveat rule on
+/// the resolved `(parent, child)` caveats (see [`verify_edge_attenuation`]
+/// for the full case table). A non-root child that resolves to `None` while
+/// its parent resolved `Some` is REJECTED — under the canonical model the
+/// mint materializes the complete effective set into every non-root token,
+/// so an absent child on a constrained edge laundered its parent's bound.
+/// Any [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation)
+/// is wrapped into [`UcanError::CaveatAttenuationViolation`] so SDK callers
+/// can pattern-match the structured violation.
 ///
 /// # Errors
 ///
@@ -1278,14 +1285,24 @@ fn verify_attenuation(
 /// **Step 7 (capability subset).** Every `child` capability MUST be
 /// granted by some `parent` capability (`parent.matches(child)`).
 ///
-/// **Step 7b (caveat narrow).** When the resolver returns `Some(_)` for
-/// BOTH `parent` and `child`, the function calls
-/// `parent_caveats.narrow(&child_caveats)`. Any
-/// [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation)
-/// is wrapped into [`UcanError::CaveatAttenuationViolation`]. When either
-/// side resolves to `None`, only Step 7 runs at that edge — preserving the
-/// documented [`CaveatResolver`] `None`-handling contract (a token with no
-/// `nb` skips its own caveat narrow and the ancestor's bound stands).
+/// **Step 7b (caveat narrow).** Applies the §7.3.8 per-edge caveat rule on
+/// the resolved `(parent, child)` caveats (canonical model — the mint
+/// materializes the complete effective set into every non-root token's
+/// `nb`, so validation is per-edge and stateless):
+///
+///   - parent `Some`, child `None`  → REJECT: a non-root child whose parent
+///     bound caveats MUST re-materialize the full set; an absent child
+///     laundered the bound. The precise [`AttenuationViolation`] is
+///     surfaced by narrowing the parent against an all-absent child.
+///   - parent `Some`, child `Some`  → `parent_caveats.narrow(child)`.
+///   - parent `None`, child `Some`  → `empty().narrow(child)` (no field
+///     bound imposed, but the rule-4 explicit-`origin_kind` requirement is
+///     still enforced).
+///   - parent `None`, child `None`  → admissible (genuinely caveat-free
+///     edge).
+///
+/// Any [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation)
+/// is wrapped into [`UcanError::CaveatAttenuationViolation`].
 ///
 /// # Errors
 ///
@@ -1329,16 +1346,62 @@ fn verify_edge_attenuation(
         }
     }
 
-    // SCP-OUT-021 Step 7b: caveat narrow at this edge. Run only when both
-    // parent and child carry caveats — see [`CaveatResolver`] module docs
-    // for the `None`-handling contract.
-    if let (Some(parent_caveats), Some(child_caveats)) = (
-        caveat_resolver.resolve_caveats(parent),
-        caveat_resolver.resolve_caveats(child),
-    ) {
-        parent_caveats
-            .narrow(&child_caveats)
-            .map_err(UcanError::CaveatAttenuationViolation)?;
+    // Step 7b: caveat narrow at this edge (§7.3.8 canonical model).
+    //
+    // The canonical model materializes the COMPLETE narrowed effective
+    // caveat set into every non-root token's `nb` at MINT time
+    // (`build_delegated_caveats`). Validation is therefore per-edge and
+    // STATELESS — it never folds ancestor bounds — but it MUST reject a
+    // non-root child that drops a bound its parent carried. Inheritance is
+    // materialized at mint, never inferred at validate.
+    //
+    // Per-edge rule on the resolved caveats:
+    //   - parent Some, child None  → REJECT. A non-root token whose direct
+    //     parent bound caveats but which carries none is laundering the
+    //     ancestor's bound (the leaf could then widen). The mint guarantees
+    //     a faithfully-delegated child re-materializes the full set, so an
+    //     absent child here is an attack, not a legacy token.
+    //   - parent Some, child Some  → `parent.narrow(child)` (per-field
+    //     attenuation; rejects widening / field removal / origin_kind change).
+    //   - parent None,  child Some → `parent.narrow(child)` over an empty
+    //     parent: imposes no field bound the parent never had, but still
+    //     enforces the §7.3.8 rule-4 requirement that a non-root child carry
+    //     an explicit `origin_kind` (`OriginKindUnspecified` otherwise).
+    //   - parent None,  child None → OK (no caveat constraint anywhere on
+    //     this edge — e.g. a non-outlet delegation off an unconstrained root).
+    let parent_caveats = caveat_resolver.resolve_caveats(parent);
+    let child_caveats = caveat_resolver.resolve_caveats(child);
+    match (parent_caveats, child_caveats) {
+        (Some(parent_caveats), None) => {
+            // Reject. Narrowing the parent against an all-absent child
+            // surfaces the precise violation the dropped set caused — a
+            // `FieldRemoved { field }` for whichever bound the parent
+            // carried, or `OriginKindUnspecified` when the parent's only
+            // constraint was its origin_kind. This is guaranteed to be an
+            // `Err` (an absent child cannot faithfully carry a non-empty
+            // parent's effective set), so the per-edge check fails closed.
+            return Err(UcanError::CaveatAttenuationViolation(
+                parent_caveats
+                    .narrow(&crate::trust::caveats::InvocationCaveats::empty())
+                    .err()
+                    .unwrap_or(
+                        crate::trust::caveats::AttenuationViolation::OriginKindUnspecified {
+                            parent: parent_caveats.origin_kind,
+                        },
+                    ),
+            ));
+        }
+        (Some(parent_caveats), Some(child_caveats)) => {
+            parent_caveats
+                .narrow(&child_caveats)
+                .map_err(UcanError::CaveatAttenuationViolation)?;
+        }
+        (None, Some(child_caveats)) => {
+            crate::trust::caveats::InvocationCaveats::empty()
+                .narrow(&child_caveats)
+                .map_err(UcanError::CaveatAttenuationViolation)?;
+        }
+        (None, None) => {}
     }
     Ok(())
 }
@@ -1750,14 +1813,15 @@ mod tests {
             .expect("correctly-narrowed max_calls must be accepted");
     }
 
-    /// AC: a child token with NO `nb` field at all inherits its parent's
-    /// caveats by reference — the resolver returns `None` for the child, so
-    /// the per-edge `narrow()` is skipped and the parent's bound stands as
-    /// the effective ceiling (the §5.4.5 / §7.3.8 "absent = parent applies"
-    /// contract). This is distinct from a child that PRESENTS an `nb` with
-    /// `max_calls = None`, which would widen and reject via `FieldRemoved`.
+    /// AC (canonical model — absent-nb launder REJECT): a non-root child
+    /// token with NO `nb` field whose direct parent DID bind caveats is
+    /// REJECTED. The old "absent = parent applies (skip the edge)" inheritance
+    /// is gone: the mint materializes the complete effective set into every
+    /// non-root token's `nb`, so a child that carries no `nb` on a
+    /// constrained edge has laundered its parent's bound (the leaf could then
+    /// widen freely). The validator MUST fail the edge closed.
     #[test]
-    fn token_nb_chain_absent_child_nb_inherits_parent() {
+    fn token_nb_chain_absent_child_nb_on_constrained_edge_rejects() {
         let parent = synthetic_token_with_nb(
             "PARENT",
             &["scp:ctx:abc/outlet_call:assistant"],
@@ -1768,8 +1832,9 @@ mod tests {
                 ..InvocationCaveats::empty()
             }),
         );
-        // Child carries NO nb field — resolver returns None for it, so the
-        // narrow edge is skipped and the child inherits the parent's ceiling.
+        // Child carries NO nb field — resolver returns None for it. Because
+        // the parent bound caveats, this absent child laundered the bound and
+        // MUST be rejected at the edge (no skip-and-inherit).
         let child = synthetic_token_with_nb(
             "CHILD",
             &["scp:ctx:abc/outlet_call:assistant"],
@@ -1780,8 +1845,104 @@ mod tests {
         let mut proof_resolver = InMemoryProofResolver::new();
         proof_resolver.proofs.insert("PARENT".to_owned(), parent);
 
+        let err = verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver)
+            .expect_err("absent child nb on a constrained edge MUST reject (launder)");
+        // The absent child is structurally `InvocationCaveats::empty()`; the
+        // parent narrows against it and reports the FIRST violated field.
+        // `narrow()` checks origin_kind before the numeric fields, so the
+        // surfaced variant is `OriginKindUnspecified` (the parent's
+        // origin_kind = Some(Action), child None) — both that AND the dropped
+        // max_calls bound are violations; either is a correct fail-closed
+        // signal. The key property is REJECTION, not the specific variant.
+        match err {
+            UcanError::CaveatAttenuationViolation(
+                AttenuationViolation::OriginKindUnspecified { .. }
+                | AttenuationViolation::FieldRemoved {
+                    field: crate::trust::caveats::CaveatField::MaxCalls,
+                },
+            ) => {}
+            other => {
+                panic!("expected OriginKindUnspecified or FieldRemoved(MaxCalls), got {other:?}")
+            }
+        }
+    }
+
+    /// AC (canonical model — both-absent edge OK): when NEITHER the parent
+    /// nor the child carries an `nb`, the edge is genuinely caveat-free and
+    /// admissible (e.g. a non-outlet delegation off an unconstrained root).
+    #[test]
+    fn token_nb_chain_both_absent_nb_is_accepted() {
+        let parent = synthetic_token_with_nb("PARENT", &["scp:ctx:abc/messages:write"], &[], None);
+        let child =
+            synthetic_token_with_nb("CHILD", &["scp:ctx:abc/messages:write"], &["PARENT"], None);
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
         verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver)
-            .expect("absent child nb inherits parent — narrow edge skipped");
+            .expect("both-absent nb edge is genuinely caveat-free and admissible");
+    }
+
+    /// AC (canonical model — parent-None child-Some edge): a root parent
+    /// with no `nb` and a child that introduces a complete bound (with an
+    /// explicit `origin_kind`) is accepted; the root imposes no field bound,
+    /// but rule-4 still requires the non-root child to carry an explicit
+    /// `origin_kind`.
+    #[test]
+    fn token_nb_chain_root_none_child_some_accepted() {
+        let parent =
+            synthetic_token_with_nb("PARENT", &["scp:ctx:abc/outlet_call:assistant"], &[], None);
+        let child = synthetic_token_with_nb(
+            "CHILD",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &["PARENT"],
+            Some(InvocationCaveats {
+                max_calls: Some(5),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        );
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver)
+            .expect("root-None parent with a complete child bound is admissible");
+    }
+
+    /// AC (canonical model — parent-None child-Some missing origin_kind):
+    /// a child off a root-None parent that introduces a bound but omits the
+    /// mandatory explicit `origin_kind` is REJECTED (rule-4
+    /// `OriginKindUnspecified`).
+    #[test]
+    fn token_nb_chain_root_none_child_missing_origin_kind_rejects() {
+        let parent =
+            synthetic_token_with_nb("PARENT", &["scp:ctx:abc/outlet_call:assistant"], &[], None);
+        let child = synthetic_token_with_nb(
+            "CHILD",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &["PARENT"],
+            Some(InvocationCaveats {
+                max_calls: Some(5),
+                // origin_kind omitted — a non-root MUST materialize it.
+                ..InvocationCaveats::empty()
+            }),
+        );
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        let err = verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver)
+            .expect_err("non-root child without explicit origin_kind must reject");
+        assert!(
+            matches!(
+                err,
+                UcanError::CaveatAttenuationViolation(
+                    AttenuationViolation::OriginKindUnspecified { .. }
+                )
+            ),
+            "expected OriginKindUnspecified, got {err:?}"
+        );
     }
 
     /// AC: an expired leaf (Step 11b time-box) is rejected when the leaf's
@@ -2331,30 +2492,48 @@ mod tests {
             .expect("a correctly-narrowed depth-3 chain must pass at every edge");
     }
 
-    /// (12) mid omits its `nb` entirely (inherit-on-absent at the interior
-    /// edge): the mid -> root caveat narrow is skipped, root's bound stands,
-    /// and a leaf that narrows relative to root still passes.
+    /// (12) Canonical model — interior absent-nb launder REJECT: a mid that
+    /// omits its `nb` entirely while its parent (root) bound caveats is
+    /// REJECTED at the interior mid -> root edge. The old "inherit-on-absent
+    /// (skip the edge), root's bound stands" contract is gone: under the
+    /// §7.3.8 canonical model the mint materializes the complete effective
+    /// set into every non-root token, so an absent mid laundered the root's
+    /// bound (the leaf could then widen relative to the unconstrained mid).
+    /// The walk MUST fail the mid -> root edge closed.
     #[test]
-    fn depth3_interior_absent_nb_inherits_and_passes() {
+    fn depth3_interior_absent_nb_launders_and_rejects() {
         let root = InvocationCaveats {
             max_calls: Some(100),
             origin_kind: Some(crate::context::outlets::OutletKind::Action),
             ..InvocationCaveats::empty()
         };
-        // mid carries NO nb -> resolver returns None for mid. Both edges
-        // that touch mid (leaf->mid and mid->root) skip their caveat narrow
-        // because narrow runs only when BOTH sides resolve to Some. This is
-        // the documented inherit-on-absent contract at token granularity:
-        // a token with no nb breaks the caveat chain for the edges adjacent
-        // to it, and the more-distant ancestor's bound stands. The chain
-        // must still PASS — absence is not a violation.
+        // mid carries NO nb -> resolver returns None for mid. The mid -> root
+        // edge (parent root resolves Some, child mid resolves None) is a
+        // launder and MUST reject.
         let leaf = InvocationCaveats {
             max_calls: Some(10),
             origin_kind: Some(crate::context::outlets::OutletKind::Action),
             ..InvocationCaveats::empty()
         };
         let chain = build_depth3(&[CAP], &[CAP], &[CAP], Some(root), None, Some(leaf));
-        run_chain(&chain, &TokenNbCaveatResolver)
-            .expect("interior absent-nb inherits parent bound; narrowed leaf passes");
+        let err = run_chain(&chain, &TokenNbCaveatResolver)
+            .expect_err("interior absent-nb launders the root bound and MUST reject");
+        // The absent mid is structurally `empty()`; root narrows against it
+        // and reports the first violated field. `narrow()` checks origin_kind
+        // first, so `OriginKindUnspecified` surfaces (root origin_kind =
+        // Some(Action), mid None); the dropped max_calls is also a violation.
+        // Either is a correct fail-closed signal — the property under test is
+        // REJECTION at the interior mid -> root edge.
+        match err {
+            UcanError::CaveatAttenuationViolation(
+                AttenuationViolation::OriginKindUnspecified { .. }
+                | AttenuationViolation::FieldRemoved {
+                    field: CaveatField::MaxCalls,
+                },
+            ) => {}
+            other => {
+                panic!("expected OriginKindUnspecified or FieldRemoved(MaxCalls), got {other:?}")
+            }
+        }
     }
 }

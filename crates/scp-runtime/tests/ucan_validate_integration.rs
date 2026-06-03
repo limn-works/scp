@@ -1968,25 +1968,25 @@ async fn validate_ucan_real_minted_depth3_narrowed_chain_passes_with_token_nb_re
 
     // leaf narrows mid further: 200 -> 100, 2000 -> 1000, 50 -> 10.
     //
-    // We mint the leaf via `mint_ucan` with `proofs: vec![mid_cid]` rather
-    // than `delegate_ucan`. `delegate_ucan` FLATTENS the proof chain
-    // (`leaf.prf = mid.prf + [mid_cid]` = `[root_cid, mid_cid]`), and the
-    // chain walk treats every `prf` entry as a DIRECT parent and checks
-    // `parent.aud == token.iss` for each — which holds for the direct parent
-    // (mid) but not for the flattened grandparent (root). Minting with a
-    // single direct-parent proof produces the canonical non-flattened
-    // structure the walk follows recursively (leaf -> mid -> root). The leaf
-    // caveats are already narrowed relative to mid by construction.
-    let leaf_token = mint_ucan(
-        &MintParams {
-            issuer_did: &leaf_delegator_did,
-            issuer_key: &key_leaf_delegator,
-            audience_did: &final_agent_did,
-            context_id: "ctx-r4",
-            capabilities: &caps,
+    // The leaf is minted via the REAL `delegate_ucan` from the mid token —
+    // NOT via `mint_ucan(proofs: vec![mid_cid])`. With the canonical NESTED
+    // proof chain (`delegate_ucan` sets `leaf.prf = [mid_cid]`, the direct
+    // parent ONLY), the chain walk resolves leaf -> mid -> root recursively
+    // via each token's own `prf`, so an honestly-delegated depth-3 chain
+    // validates end-to-end. The mint-side fold re-materializes the complete
+    // narrowed effective caveat set into the leaf `nb`, and the per-edge
+    // Step 7b narrow runs at every real edge of this chain.
+    let leaf_token = scp_runtime::crypto::ucan::mint::delegate_ucan(
+        &DelegateParams {
+            parent_token: &mid_token,
+            delegator_did: &leaf_delegator_did,
+            delegator_key: &key_leaf_delegator,
+            delegatee_did: &final_agent_did,
+            attenuated_capabilities: &[Attenuation {
+                with: cap_uri.clone(),
+                can: "*".to_owned(),
+            }],
             lifetime_secs: 900,
-            not_before: None,
-            proofs: vec![mid_cid.clone()],
             facts: None,
             key_scope: None,
             signing_key_id: None,
