@@ -78,6 +78,17 @@
         "SCP-285",
         "SCP-286"
       ]
+    },
+    {
+      "id": "gate-transport-7",
+      "name": "Native QUIC Transport Selection and Discovery",
+      "priority": "P1",
+      "status": "done",
+      "stories": [
+        "SCP-299",
+        "SCP-300",
+        "SCP-301"
+      ]
     }
   ],
   "stories": [
@@ -360,7 +371,7 @@
     },
     {
       "id": "SCP-256",
-      "title": "Implement QUIC connection lifecycle (0-RTT, migration, reconnect)",
+      "title": "Implement QUIC connection lifecycle (session resumption, migration, reconnect)",
       "gate": "gate-transport-2",
       "priority": "P1",
       "severity": "major",
@@ -369,9 +380,9 @@
         "crates/scp-transport/src/quic/adapter.rs",
         "crates/scp-transport/src/quic/lifecycle.rs"
       ],
-      "description": "Implement QUIC connection lifecycle per \u00a710.14.2. 0-RTT connection resumption via session tickets stored across sessions. Connection migration when IP changes (quinn QUIC migration). Profile-aware reconnect backoff from TransportProfile. No PING/PONG \u2014 rely on QUIC native keepalive (PATH_CHALLENGE/PATH_RESPONSE).",
+      "description": "Implement QUIC connection lifecycle per \u00a710.14.2. TLS 1.3 session resumption (1-RTT) via session tickets persisted across adapter restarts (SessionTicketStore), abbreviating the handshake on reconnection. 0-RTT early data is deliberately NOT enabled: \u00a710.14.2's 0-RTT safety classification forbids non-idempotent operations (PUBLISH, DELETE, UNSUBSCRIBE) from riding 0-RTT to avoid replay, and the adapter establishes connections with the full 1-RTT handshake (never calling Connecting::into_0rtt), so no SCP operation is ever sent as 0-RTT early data. Connection migration when the client IP changes (quinn QUIC migration, RFC 9000 \u00a79 \u2014 PATH_CHALLENGE/PATH_RESPONSE). Profile-aware reconnect backoff from TransportProfile. No application PING/PONG \u2014 rely on QUIC native PING-frame keepalive (RFC 9000 \u00a719.2).",
       "acceptanceCriteria": [
-        "0-RTT connection resumption uses stored session tickets from prior connections",
+        "TLS 1.3 session resumption (1-RTT) uses stored session tickets from prior connections via a SessionTicketStore wired into the quinn/rustls client config (rustls::client::Resumption::store); 0-RTT early data is intentionally NOT enabled so non-idempotent operations (PUBLISH, DELETE, UNSUBSCRIBE) cannot ride 0-RTT and be replayed, per the 0-RTT safety classification in spec \u00a710.14.2",
         "Connection migration handles IP change without dropping active streams",
         "Reconnect backoff interval derived from TransportProfile (aggressive for server/desktop, conservative for mobile)",
         "No PING/PONG frames sent \u2014 QUIC native keepalive used instead",
@@ -379,12 +390,12 @@
         "Unit test: reconnect backoff follows profile-specified range"
       ],
       "actionItems": [
-        "Create connection.rs with QUIC connection state management",
-        "Implement session ticket storage and 0-RTT resumption",
+        "Create lifecycle.rs with QUIC connection lifecycle state (SessionTicketStore, QuicKeepaliveConfig, ReconnectBackoff, migration events)",
+        "Implement session ticket storage with export/import for persistence across restarts and wire it as the rustls Resumption::store (1-RTT resumption; 0-RTT early data NOT enabled per \u00a710.14.2)",
         "Wire quinn connection migration support",
         "Implement profile-aware reconnect backoff",
-        "Configure QUIC native keepalive instead of application PING/PONG",
-        "Write tests for reconnect backoff and session ticket persistence"
+        "Configure QUIC native PING-frame keepalive instead of application PING/PONG",
+        "Write tests for reconnect backoff range, session ticket export/import roundtrip, and connection-migration survival"
       ],
       "blockedBy": [
         "SCP-255"
@@ -1319,6 +1330,151 @@
       "details": {
         "phase": 2,
         "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-299",
+      "title": "Implement native QUIC probe-and-fallback transport selection",
+      "gate": "gate-transport-7",
+      "priority": "P1",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "crates/scp-transport/src/selection.rs",
+        "crates/scp-transport/src/quic/adapter.rs",
+        "crates/scp-transport/src/lib.rs"
+      ],
+      "description": "Add a TransportSelector that transparently prefers QUIC over WebSocket on native (non-browser) clients when the relay advertises QUIC, per \u00a710.5.1 (\"Clients SHOULD prefer QUIC over WebSocket when both are available\") and \u00a710.14.3 item 4 (probe-and-fallback). On each connect the selector inspects the relay's advertised transports: when the list contains \"quic\" (case-insensitive), the quic feature is enabled, and the relay URL is a TLS scheme (wss:///https://), it probes QUIC with a bounded timeout via QuicAdapter::connect_url; on probe success it returns the QUIC adapter, otherwise it falls back to WebSocket and suppresses further QUIC probes for that relay until the next .well-known/scp refresh (\u00a710.14.3 item 4: \"without further QUIC attempts for that relay until the next .well-known/scp refresh\"). The selector is instance-scoped (no singletons or mutable module globals) and holds its own per-relay suppression set. QUIC client TLS uses a non-permissive verifier (own root store from Mozilla Web PKI trust anchors via webpki-roots; no accept-all/empty verifier) so an untrusted server certificate fails the handshake closed. Plaintext relays (ws://, http://, loopback) stay on WebSocket and are never probed. Wire is shared by all three connect-capable bridges (PyO3, napi, uniffi); cross-bridge parity is SCP-301, not this story.",
+      "acceptanceCriteria": [
+        "crates/scp-transport/src/selection.rs defines TransportSelector with a per-connect select_and_connect / select_and_connect_with_suppression API that returns a Box<dyn TransportAdapter>",
+        "QUIC is preferred only when advertised_transports contains \"quic\" (case-insensitive), the quic feature is enabled, and the URL is a TLS scheme: tests no_advertised_transports_means_no_quic, advertised_without_quic_means_no_quic, advertised_with_quic_on_tls_url_tries_quic, advertised_quic_case_insensitive, and quic_advertised_but_plaintext_url_stays_websocket pass",
+        "QUIC probe uses a 3-second timeout (QUIC_PROBE_TIMEOUT = Duration::from_secs(3)) per \u00a710.14.3 item 4",
+        "On probe failure the selector falls back to WebSocket and suppresses QUIC for that relay (is_quic_suppressed returns true; cleared by clear_suppression): test quic_probe_dead_port_falls_back_and_suppresses passes",
+        "QUIC client TLS supplies its own webpki-roots root store and never wires an accept-all/empty/permissive verifier (QuicAdapter::connect_url): the connect path builds a root store from webpki-roots and no DangerousClientConfig accept-all verifier appears in crates/scp-transport/src/quic/adapter.rs",
+        "TransportSelector is exported from crates/scp-transport/src/lib.rs (pub use selection::TransportSelector) and selection.rs declares no module-level static mut / lazy_static / static Mutex|RwLock|OnceLock (check-no-mutable-globals.sh passes for crates/scp-transport)"
+      ],
+      "actionItems": [
+        "Create selection.rs with TransportSelector, per-relay suppression set, and the 3-second QUIC probe constant",
+        "Implement should_try_quic (advertised + feature + TLS scheme) and the QUIC probe-and-fallback connect path",
+        "Wire QuicAdapter::connect_url with a webpki-roots-backed non-permissive rustls client config",
+        "Export TransportSelector from lib.rs",
+        "Write unit/integration tests covering advertisement gating, case-insensitivity, plaintext skip, probe timeout fallback, and suppression"
+      ],
+      "blockedBy": [
+        "SCP-257"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.5.1 Adapter Tiers"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.14.3 Relay QUIC Support"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-037: Alternative Transport Bindings (QUIC, WebTransport, UDP/DTLS)"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-300",
+      "title": "Implement connect-time relay transport discovery",
+      "gate": "gate-transport-7",
+      "priority": "P1",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "crates/scp-transport/src/discovery.rs",
+        "crates/scp-transport/src/selection.rs"
+      ],
+      "description": "Add a RelayTransportDiscovery cache that fetches and parses a relay's advertised transports from .well-known/scp (relay_config.transports) at connect time, feeding the TransportSelector (SCP-299) so QUIC selection works even when the caller has no pre-fetched advertised-transports list. Per \u00a710.5.1 (transport advertisement in .well-known/scp) and \u00a710.14.3 item 4 (refresh-bounded probing). The fetch is hardened: https-only (https_only(true)), no redirect following (reqwest::redirect::Policy::none() so a wss://user:pw@evil.com authority cannot redirect the discovery fetch off-host), a bounded timeout, and a bounded response body (oversized bodies rejected). All failure modes fail-open to the WebSocket baseline \u2014 a relay that serves no .well-known/scp, times out, 404s, redirects, returns an oversized/garbled body, or is plaintext resolves to \"no QUIC\" without erroring the connect. Results are cached per relay in a bounded LRU (MAX_CACHED_RELAYS) so repeated connects do not re-fetch; resolved entries are cached for the full TTL while transient failures are cached only briefly, and a fresh fetch is flagged so the selector can clear QUIC suppression only on a genuine .well-known/scp refresh. Connectivity into the selector is via select_and_connect_discovering*; the selection logic itself is SCP-299, not this story.",
+      "acceptanceCriteria": [
+        "crates/scp-transport/src/discovery.rs defines RelayTransportDiscovery that fetches and parses relay_config.transports from .well-known/scp at connect time: test fetches_and_parses_advertised_transports_over_https passes",
+        "Discovery fetch is https-only and refuses redirects: tests https_only_rejects_cleartext_target and redirect_is_refused_and_issues_no_second_request pass; the client is built with https_only(true) and reqwest::redirect::Policy::none()",
+        "Response body is bounded; an oversized body is rejected fail-open: test oversized_body_is_rejected_fail_open passes",
+        "Every fetch failure (timeout/404/redirect/parse/oversize/plaintext relay) fails open to the WebSocket baseline (resolves to no advertised QUIC, no error): tests fetch_failure_resolves_to_none_fail_open and plaintext_relay_resolves_to_none_without_fetch pass",
+        "Results are cached per relay in a bounded LRU (MAX_CACHED_RELAYS) that evicts the oldest beyond capacity, fetching once per relay: tests caches_per_relay_fetches_once and cache_evicts_oldest_beyond_capacity pass",
+        "Resolved entries are served for the full TTL and transient failures only briefly; an expired entry refreshes: tests resolved_none_caches_for_full_ttl, transient_failure_caches_briefly, and expired_entry_refreshes pass",
+        "RelayTransportDiscovery declares no module-level static mut / lazy_static / static Mutex|RwLock|OnceLock \u2014 its per-relay LRU cache is instance-owned (check-no-mutable-globals.sh passes for crates/scp-transport)"
+      ],
+      "actionItems": [
+        "Create discovery.rs with RelayTransportDiscovery, a bounded LRU keyed by relay URL, and DEFAULT/transient TTLs",
+        "Implement the hardened https-only, no-redirect, bounded-timeout, bounded-body .well-known/scp fetch and parse",
+        "Map wss://host:pw@.../https://... authorities to https://authority/.well-known/scp and skip plaintext relays",
+        "Fail open to WebSocket on every error path and flag fresh fetches for suppression-clear",
+        "Wire select_and_connect_discovering* in selection.rs to consult the cache",
+        "Write tests covering parse, https-only, redirect refusal, oversize rejection, fail-open, caching, eviction, and TTL behavior"
+      ],
+      "blockedBy": [
+        "SCP-299"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.5.1 Adapter Tiers"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.14.3 Relay QUIC Support"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-037: Alternative Transport Bindings (QUIC, WebTransport, UDP/DTLS)"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-301",
+      "title": "Route napi and uniffi connect sites through the QUIC transport selector",
+      "gate": "gate-transport-7",
+      "priority": "P1",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "crates/scp-ffi/napi/src/transport.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs"
+      ],
+      "description": "Bring the napi (Node/Bun TypeScript) and uniffi (Swift, Kotlin) bridges to parity with the PyO3 reference bridge for native QUIC transport selection. The PyO3 bridge (crates/scp-ffi/src/transport.rs) already routes its relay connect sites through the instance-scoped selector via bi.core.transport_selector().select_and_connect_discovering_with_suppression(...). This story routes the napi and uniffi connect sites through the same instance-scoped TransportSelector (SCP-299) and RelayTransportDiscovery (SCP-300) so Swift, Kotlin, and TypeScript native clients transparently prefer QUIC when a relay advertises it and fall back to WebSocket otherwise \u2014 with no SDK-surface API change. The selector is owned by the bridge instance (bi.core.transport_selector(), defined on the shared BridgeInstance in crates/scp-ffi/common/src/bridge_instance.rs), so QUIC suppression and discovery caches are per-instance, never singletons. WASM is browser-only and uses WebTransport (\u00a710.15), not native QUIC, so it is out of scope for this parity story.",
+      "acceptanceCriteria": [
+        "napi connect site routes through the instance selector: crates/scp-ffi/napi/src/transport.rs calls bi.core.transport_selector() and selector.select_and_connect_discovering_with_suppression(...) (grep returns >0 matches)",
+        "uniffi connect site routes through the instance selector: crates/scp-ffi/uniffi/src/bridge.rs calls bi.core.transport_selector() and selector.select_and_connect_discovering_with_suppression(...) (grep returns >0 matches)",
+        "Both bridges obtain the selector from the shared per-instance accessor BridgeInstance::transport_selector (crates/scp-ffi/common/src/bridge_instance.rs), not a freshly constructed or static selector \u2014 matching the PyO3 reference path in crates/scp-ffi/src/transport.rs",
+        "No SDK-facing connect API signature changes (selection is transparent): the napi/uniffi connect entry points keep their existing parameters",
+        "cargo build for the napi and uniffi bridges with the quic feature compiles without error"
+      ],
+      "actionItems": [
+        "Route the napi connect site in transport.rs through bi.core.transport_selector().select_and_connect_discovering_with_suppression(...)",
+        "Route the uniffi connect site in bridge.rs through bi.core.transport_selector().select_and_connect_discovering_with_suppression(...)",
+        "Drain and wire the selector's suppression receiver the same way the PyO3 reference bridge does",
+        "Verify napi and uniffi bridges compile with the quic feature"
+      ],
+      "blockedBy": [
+        "SCP-299",
+        "SCP-300"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.5.1 Adapter Tiers"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-037: Alternative Transport Bindings (QUIC, WebTransport, UDP/DTLS)"
+        }
+      ],
+      "details": {
+        "phase": 2,
+        "crate": "scp-ffi"
       }
     }
   ]
