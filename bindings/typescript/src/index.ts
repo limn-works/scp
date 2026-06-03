@@ -113,7 +113,13 @@ export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle
 // Bridge Connector — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type { BridgeMode, BridgeRegistration, ShadowIdentity, ShadowStatus } from "./bridge";
+export type {
+  BridgeCredential,
+  BridgeMode,
+  BridgeRegistration,
+  ShadowIdentity,
+  ShadowStatus,
+} from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Discovery — types + pure helpers (entry points for stateful ops moved to SCP)

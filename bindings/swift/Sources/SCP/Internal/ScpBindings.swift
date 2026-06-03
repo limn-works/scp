@@ -2052,6 +2052,48 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String) throws  -> ShadowIdentityResult
     
     /**
+     * Deletes and zeroizes a bridge credential key (spec §12.11).
+     */
+    func bridgeCredentialDeleteKey(bridgeId: String) throws 
+    
+    /**
+     * Retrieves a bridge credential key from the custody boundary (spec §12.11).
+     */
+    func bridgeCredentialGetKey(bridgeId: String) throws  -> Data
+    
+    /**
+     * Lists all credential types stored for a bridge instance (spec §12.11).
+     */
+    func bridgeCredentialList(bridgeId: String) throws  -> [String]
+    
+    /**
+     * Provisions (stores) an encrypted credential for a bridge instance
+     * (spec §12.11). Routes through `&self.inner` — credentials live in
+     * THIS instance's credential store (ADR-048 §1).
+     */
+    func bridgeCredentialProvision(bridgeId: String, credentialType: String, plaintext: Data, bridgeCredentialKey: Data) throws  -> BridgeCredentialResult
+    
+    /**
+     * Retrieves and decrypts a credential for a bridge instance (spec §12.11).
+     */
+    func bridgeCredentialRetrieve(bridgeId: String, credentialType: String, bridgeCredentialKey: Data) throws  -> Data
+    
+    /**
+     * Revokes all credentials for a bridge instance (spec §12.11).
+     */
+    func bridgeCredentialRevoke(bridgeId: String) throws 
+    
+    /**
+     * Rotates (replaces) a credential for a bridge instance (spec §12.11).
+     */
+    func bridgeCredentialRotate(bridgeId: String, credentialType: String, newPlaintext: Data, bridgeCredentialKey: Data) throws  -> BridgeCredentialResult
+    
+    /**
+     * Stores a bridge credential key in the custody boundary (spec §12.11).
+     */
+    func bridgeCredentialStoreKey(bridgeId: String, key: Data) throws 
+    
+    /**
      * Per-instance equivalent of the free-function `broadcast_admission`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
@@ -3389,6 +3431,102 @@ open func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMod
         FfiConverterString.lower(contextId),$0
     )
 })
+}
+    
+    /**
+     * Deletes and zeroizes a bridge credential key (spec §12.11).
+     */
+open func bridgeCredentialDeleteKey(bridgeId: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_delete_key(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),$0
+    )
+}
+}
+    
+    /**
+     * Retrieves a bridge credential key from the custody boundary (spec §12.11).
+     */
+open func bridgeCredentialGetKey(bridgeId: String)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_get_key(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),$0
+    )
+})
+}
+    
+    /**
+     * Lists all credential types stored for a bridge instance (spec §12.11).
+     */
+open func bridgeCredentialList(bridgeId: String)throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_list(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),$0
+    )
+})
+}
+    
+    /**
+     * Provisions (stores) an encrypted credential for a bridge instance
+     * (spec §12.11). Routes through `&self.inner` — credentials live in
+     * THIS instance's credential store (ADR-048 §1).
+     */
+open func bridgeCredentialProvision(bridgeId: String, credentialType: String, plaintext: Data, bridgeCredentialKey: Data)throws  -> BridgeCredentialResult  {
+    return try  FfiConverterTypeBridgeCredentialResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_provision(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterString.lower(credentialType),
+        FfiConverterData.lower(plaintext),
+        FfiConverterData.lower(bridgeCredentialKey),$0
+    )
+})
+}
+    
+    /**
+     * Retrieves and decrypts a credential for a bridge instance (spec §12.11).
+     */
+open func bridgeCredentialRetrieve(bridgeId: String, credentialType: String, bridgeCredentialKey: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_retrieve(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterString.lower(credentialType),
+        FfiConverterData.lower(bridgeCredentialKey),$0
+    )
+})
+}
+    
+    /**
+     * Revokes all credentials for a bridge instance (spec §12.11).
+     */
+open func bridgeCredentialRevoke(bridgeId: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_revoke(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),$0
+    )
+}
+}
+    
+    /**
+     * Rotates (replaces) a credential for a bridge instance (spec §12.11).
+     */
+open func bridgeCredentialRotate(bridgeId: String, credentialType: String, newPlaintext: Data, bridgeCredentialKey: Data)throws  -> BridgeCredentialResult  {
+    return try  FfiConverterTypeBridgeCredentialResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_rotate(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterString.lower(credentialType),
+        FfiConverterData.lower(newPlaintext),
+        FfiConverterData.lower(bridgeCredentialKey),$0
+    )
+})
+}
+    
+    /**
+     * Stores a bridge credential key in the custody boundary (spec §12.11).
+     */
+open func bridgeCredentialStoreKey(bridgeId: String, key: Data)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_store_key(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterData.lower(key),$0
+    )
+}
 }
     
     /**
@@ -6908,6 +7046,114 @@ public func FfiConverterTypeBatchPublishResult_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeBatchPublishResult_lower(_ value: BatchPublishResult) -> RustBuffer {
     return FfiConverterTypeBatchPublishResult.lower(value)
+}
+
+
+/**
+ * Bridge credential metadata result.
+ *
+ * Returned by `bridge_credential_provision` and `bridge_credential_rotate`.
+ * Mirrors the PyO3 dict (`bridge_id`, `credential_type`, `created_at`).
+ * The encrypted credential bytes never cross the FFI boundary — only
+ * non-secret metadata.
+ *
+ * See spec section 12.11 (Credential Lifecycle) and ADR-023.
+ */
+public struct BridgeCredentialResult {
+    /**
+     * The bridge instance this credential belongs to.
+     */
+    public var bridgeId: String
+    /**
+     * The credential type string (e.g. `"ApiKey"`, `"OAuthAccessToken"`,
+     * `"Custom:<name>"`).
+     */
+    public var credentialType: String
+    /**
+     * Unix timestamp (seconds) when the credential was created.
+     */
+    public var createdAt: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The bridge instance this credential belongs to.
+         */bridgeId: String, 
+        /**
+         * The credential type string (e.g. `"ApiKey"`, `"OAuthAccessToken"`,
+         * `"Custom:<name>"`).
+         */credentialType: String, 
+        /**
+         * Unix timestamp (seconds) when the credential was created.
+         */createdAt: UInt64) {
+        self.bridgeId = bridgeId
+        self.credentialType = credentialType
+        self.createdAt = createdAt
+    }
+}
+
+#if compiler(>=6)
+extension BridgeCredentialResult: Sendable {}
+#endif
+
+
+extension BridgeCredentialResult: Equatable, Hashable {
+    public static func ==(lhs: BridgeCredentialResult, rhs: BridgeCredentialResult) -> Bool {
+        if lhs.bridgeId != rhs.bridgeId {
+            return false
+        }
+        if lhs.credentialType != rhs.credentialType {
+            return false
+        }
+        if lhs.createdAt != rhs.createdAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(bridgeId)
+        hasher.combine(credentialType)
+        hasher.combine(createdAt)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBridgeCredentialResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BridgeCredentialResult {
+        return
+            try BridgeCredentialResult(
+                bridgeId: FfiConverterString.read(from: &buf), 
+                credentialType: FfiConverterString.read(from: &buf), 
+                createdAt: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BridgeCredentialResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.bridgeId, into: &buf)
+        FfiConverterString.write(value.credentialType, into: &buf)
+        FfiConverterUInt64.write(value.createdAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBridgeCredentialResult_lift(_ buf: RustBuffer) throws -> BridgeCredentialResult {
+    return try FfiConverterTypeBridgeCredentialResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBridgeCredentialResult_lower(_ value: BridgeCredentialResult) -> RustBuffer {
+    return FfiConverterTypeBridgeCredentialResult.lower(value)
 }
 
 
@@ -14393,6 +14639,30 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_create_shadow() != 8590) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_delete_key() != 40862) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_get_key() != 4810) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_list() != 16239) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_provision() != 36927) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_retrieve() != 15897) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_revoke() != 22652) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_rotate() != 19177) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_store_key() != 48091) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_admission() != 47745) {

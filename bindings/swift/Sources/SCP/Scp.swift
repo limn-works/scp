@@ -763,6 +763,90 @@ public extension SCP {
         try inner.scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
     }
 
+    // MARK: - Bridge credential store (spec §12.11)
+
+    //
+    // Per-instance credential store ops. Each forwards to ``inner`` — the
+    // credentials live in THIS instance's store (ADR-048 §1). The encrypted
+    // credential bytes never cross the FFI boundary; only metadata is
+    // returned for provision/rotate.
+
+    /// Provisions (stores) an encrypted credential for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialProvision`` on ``inner``.
+    func bridgeCredentialProvision(
+        bridgeId: String,
+        credentialType: String,
+        plaintext: Data,
+        bridgeCredentialKey: Data
+    ) throws -> BridgeCredentialResult {
+        try inner.bridgeCredentialProvision(
+            bridgeId: bridgeId,
+            credentialType: credentialType,
+            plaintext: plaintext,
+            bridgeCredentialKey: bridgeCredentialKey
+        )
+    }
+
+    /// Retrieves and decrypts a credential for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialRetrieve`` on ``inner``.
+    func bridgeCredentialRetrieve(
+        bridgeId: String,
+        credentialType: String,
+        bridgeCredentialKey: Data
+    ) throws -> Data {
+        try inner.bridgeCredentialRetrieve(
+            bridgeId: bridgeId,
+            credentialType: credentialType,
+            bridgeCredentialKey: bridgeCredentialKey
+        )
+    }
+
+    /// Rotates (replaces) a credential for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialRotate`` on ``inner``.
+    func bridgeCredentialRotate(
+        bridgeId: String,
+        credentialType: String,
+        newPlaintext: Data,
+        bridgeCredentialKey: Data
+    ) throws -> BridgeCredentialResult {
+        try inner.bridgeCredentialRotate(
+            bridgeId: bridgeId,
+            credentialType: credentialType,
+            newPlaintext: newPlaintext,
+            bridgeCredentialKey: bridgeCredentialKey
+        )
+    }
+
+    /// Revokes all credentials for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialRevoke`` on ``inner``.
+    func bridgeCredentialRevoke(bridgeId: String) throws {
+        try inner.bridgeCredentialRevoke(bridgeId: bridgeId)
+    }
+
+    /// Lists all credential types stored for a bridge instance.
+    /// Forwards to ``Scp/bridgeCredentialList`` on ``inner``.
+    func bridgeCredentialList(bridgeId: String) throws -> [String] {
+        try inner.bridgeCredentialList(bridgeId: bridgeId)
+    }
+
+    /// Stores a bridge credential key in the custody boundary.
+    /// Forwards to ``Scp/bridgeCredentialStoreKey`` on ``inner``.
+    func bridgeCredentialStoreKey(bridgeId: String, key: Data) throws {
+        try inner.bridgeCredentialStoreKey(bridgeId: bridgeId, key: key)
+    }
+
+    /// Retrieves a bridge credential key from the custody boundary.
+    /// Forwards to ``Scp/bridgeCredentialGetKey`` on ``inner``.
+    func bridgeCredentialGetKey(bridgeId: String) throws -> Data {
+        try inner.bridgeCredentialGetKey(bridgeId: bridgeId)
+    }
+
+    /// Deletes and zeroizes a bridge credential key.
+    /// Forwards to ``Scp/bridgeCredentialDeleteKey`` on ``inner``.
+    func bridgeCredentialDeleteKey(bridgeId: String) throws {
+        try inner.bridgeCredentialDeleteKey(bridgeId: bridgeId)
+    }
+
     /// Forwards to ``Scp/setEconomicPolicy`` on ``inner``.
     func setEconomicPolicy(handle: ContextHandle, policyJson: String) throws {
         try inner.setEconomicPolicy(handle: handle, policyJson: policyJson)

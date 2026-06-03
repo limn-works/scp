@@ -3855,6 +3855,97 @@ impl Scp {
     }
 
     // -------------------------------------------------------------------
+    // Bridge credential store (§12.11)
+    //
+    // Per-instance equivalents of the PyO3 `bridge_credential_*` methods.
+    // Each routes through `&*self.inner` — credentials live in THIS
+    // instance's `InMemoryCredentialStore`, isolated from every other `Scp`
+    // in the process (ADR-048 §1).
+    // -------------------------------------------------------------------
+
+    /// Provisions (stores) an encrypted credential for a bridge instance.
+    #[napi(js_name = "bridgeCredentialProvision")]
+    pub fn bridge_credential_provision(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> napi::Result<crate::bridge_connector::NapiBridgeCredential> {
+        crate::bridge_connector::bridge_credential_provision_on(
+            &self.inner,
+            bridge_id,
+            credential_type,
+            plaintext,
+            bridge_credential_key,
+        )
+    }
+
+    /// Retrieves and decrypts a credential for a bridge instance.
+    #[napi(js_name = "bridgeCredentialRetrieve")]
+    pub fn bridge_credential_retrieve(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        bridge_credential_key: Vec<u8>,
+    ) -> napi::Result<Vec<u8>> {
+        crate::bridge_connector::bridge_credential_retrieve_on(
+            &self.inner,
+            bridge_id,
+            credential_type,
+            bridge_credential_key,
+        )
+    }
+
+    /// Rotates (replaces) a credential for a bridge instance.
+    #[napi(js_name = "bridgeCredentialRotate")]
+    pub fn bridge_credential_rotate(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        new_plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> napi::Result<crate::bridge_connector::NapiBridgeCredential> {
+        crate::bridge_connector::bridge_credential_rotate_on(
+            &self.inner,
+            bridge_id,
+            credential_type,
+            new_plaintext,
+            bridge_credential_key,
+        )
+    }
+
+    /// Revokes all credentials for a bridge instance.
+    #[napi(js_name = "bridgeCredentialRevoke")]
+    pub fn bridge_credential_revoke(&self, bridge_id: String) -> napi::Result<()> {
+        crate::bridge_connector::bridge_credential_revoke_on(&self.inner, bridge_id)
+    }
+
+    /// Lists all credential types stored for a bridge instance.
+    #[napi(js_name = "bridgeCredentialList")]
+    pub fn bridge_credential_list(&self, bridge_id: String) -> napi::Result<Vec<String>> {
+        crate::bridge_connector::bridge_credential_list_on(&self.inner, bridge_id)
+    }
+
+    /// Stores a bridge credential key in the custody boundary.
+    #[napi(js_name = "bridgeCredentialStoreKey")]
+    pub fn bridge_credential_store_key(&self, bridge_id: String, key: Vec<u8>) -> napi::Result<()> {
+        crate::bridge_connector::bridge_credential_store_key_on(&self.inner, bridge_id, key)
+    }
+
+    /// Retrieves a bridge credential key from the custody boundary.
+    #[napi(js_name = "bridgeCredentialGetKey")]
+    pub fn bridge_credential_get_key(&self, bridge_id: String) -> napi::Result<Vec<u8>> {
+        crate::bridge_connector::bridge_credential_get_key_on(&self.inner, bridge_id)
+    }
+
+    /// Deletes and zeroizes a bridge credential key.
+    #[napi(js_name = "bridgeCredentialDeleteKey")]
+    pub fn bridge_credential_delete_key(&self, bridge_id: String) -> napi::Result<()> {
+        crate::bridge_connector::bridge_credential_delete_key_on(&self.inner, bridge_id)
+    }
+
+    // -------------------------------------------------------------------
     // SCPID authentication (§3.11)
     // -------------------------------------------------------------------
 

@@ -34,6 +34,7 @@
 // standalone at runtime — the handle-wrapping helpers call
 // `_fromHandle` statics which are resolved lazily inside the SCP
 // methods via dynamic `import()` calls.
+import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
 import { ValidationError } from "./errors";
 import type { Identity } from "./identity";
@@ -2168,6 +2169,86 @@ export class SCP {
         c: string | undefined,
       ) => unknown
     )(bridgeId, platformHandle, bridgeMode, contextId);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Bridge credentials (spec §12.11)
+  //
+  // Per-instance credential store ops. Each routes through `this.#native`
+  // (the NAPI SCP handle) — credentials are isolated to THIS instance's
+  // store (ADR-048 §1). The SCP class is native-only by construction (the
+  // WASM build throws at `new SCP(...)`), so there is no WASM path here;
+  // the credential store lives only in scp-runtime (ADR-034).
+  // ───────────────────────────────────────────────────────────────────────
+
+  /** Provisions (stores) an encrypted credential for a bridge instance. */
+  bridgeCredentialProvision(
+    bridgeId: string,
+    credentialType: string,
+    plaintext: Uint8Array,
+    bridgeCredentialKey: Uint8Array,
+  ): BridgeCredential {
+    return (
+      this.#native.bridgeCredentialProvision as (
+        b: string,
+        t: string,
+        p: Uint8Array,
+        k: Uint8Array,
+      ) => BridgeCredential
+    )(bridgeId, credentialType, plaintext, bridgeCredentialKey);
+  }
+
+  /** Retrieves and decrypts a credential for a bridge instance. */
+  bridgeCredentialRetrieve(
+    bridgeId: string,
+    credentialType: string,
+    bridgeCredentialKey: Uint8Array,
+  ): Uint8Array {
+    return (
+      this.#native.bridgeCredentialRetrieve as (b: string, t: string, k: Uint8Array) => Uint8Array
+    )(bridgeId, credentialType, bridgeCredentialKey);
+  }
+
+  /** Rotates (replaces) a credential for a bridge instance. */
+  bridgeCredentialRotate(
+    bridgeId: string,
+    credentialType: string,
+    newPlaintext: Uint8Array,
+    bridgeCredentialKey: Uint8Array,
+  ): BridgeCredential {
+    return (
+      this.#native.bridgeCredentialRotate as (
+        b: string,
+        t: string,
+        p: Uint8Array,
+        k: Uint8Array,
+      ) => BridgeCredential
+    )(bridgeId, credentialType, newPlaintext, bridgeCredentialKey);
+  }
+
+  /** Revokes all credentials for a bridge instance. */
+  bridgeCredentialRevoke(bridgeId: string): void {
+    (this.#native.bridgeCredentialRevoke as (b: string) => void)(bridgeId);
+  }
+
+  /** Lists all credential types stored for a bridge instance. */
+  bridgeCredentialList(bridgeId: string): string[] {
+    return (this.#native.bridgeCredentialList as (b: string) => string[])(bridgeId);
+  }
+
+  /** Stores a bridge credential key in the custody boundary. */
+  bridgeCredentialStoreKey(bridgeId: string, key: Uint8Array): void {
+    (this.#native.bridgeCredentialStoreKey as (b: string, k: Uint8Array) => void)(bridgeId, key);
+  }
+
+  /** Retrieves a bridge credential key from the custody boundary. */
+  bridgeCredentialGetKey(bridgeId: string): Uint8Array {
+    return (this.#native.bridgeCredentialGetKey as (b: string) => Uint8Array)(bridgeId);
+  }
+
+  /** Deletes and zeroizes a bridge credential key. */
+  bridgeCredentialDeleteKey(bridgeId: string): void {
+    (this.#native.bridgeCredentialDeleteKey as (b: string) => void)(bridgeId);
   }
 
   // ───────────────────────────────────────────────────────────────────────

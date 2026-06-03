@@ -95,4 +95,90 @@ final class ScpClassTests: XCTestCase {
         XCTAssertGreaterThan(instance.instanceId, 0)
         try await instance.shutdown(timeoutMillis: 1000)
     }
+
+    // MARK: - Bridge credential store (spec §12.11)
+
+    /// Full credential lifecycle: provision -> retrieve -> rotate ->
+    /// list -> revoke, scoped to this instance's store.
+    func testBridgeCredentialLifecycle() throws {
+        let bridgeId = "bridge-cred-swift-001"
+        let key = Data(repeating: 9, count: 32)
+
+        let provisioned = try scp.bridgeCredentialProvision(
+            bridgeId: bridgeId,
+            credentialType: "ApiKey",
+            plaintext: Data("first-secret".utf8),
+            bridgeCredentialKey: key
+        )
+        XCTAssertEqual(provisioned.bridgeId, bridgeId)
+        XCTAssertEqual(provisioned.credentialType, "ApiKey")
+
+        let retrieved = try scp.bridgeCredentialRetrieve(
+            bridgeId: bridgeId,
+            credentialType: "ApiKey",
+            bridgeCredentialKey: key
+        )
+        XCTAssertEqual(String(bytes: retrieved, encoding: .utf8), "first-secret")
+
+        _ = try scp.bridgeCredentialRotate(
+            bridgeId: bridgeId,
+            credentialType: "ApiKey",
+            newPlaintext: Data("second-secret".utf8),
+            bridgeCredentialKey: key
+        )
+        let rotated = try scp.bridgeCredentialRetrieve(
+            bridgeId: bridgeId,
+            credentialType: "ApiKey",
+            bridgeCredentialKey: key
+        )
+        XCTAssertEqual(String(bytes: rotated, encoding: .utf8), "second-secret")
+
+        XCTAssertEqual(try scp.bridgeCredentialList(bridgeId: bridgeId), ["ApiKey"])
+
+        try scp.bridgeCredentialRevoke(bridgeId: bridgeId)
+        XCTAssertThrowsError(
+            try scp.bridgeCredentialRetrieve(
+                bridgeId: bridgeId,
+                credentialType: "ApiKey",
+                bridgeCredentialKey: key
+            )
+        )
+    }
+
+    /// Credential key custody: store -> get -> delete.
+    func testBridgeCredentialKeyCustodyLifecycle() throws {
+        let bridgeId = "bridge-cred-swift-002"
+        let key = Data(repeating: 3, count: 32)
+
+        try scp.bridgeCredentialStoreKey(bridgeId: bridgeId, key: key)
+        XCTAssertEqual(try scp.bridgeCredentialGetKey(bridgeId: bridgeId), key)
+
+        try scp.bridgeCredentialDeleteKey(bridgeId: bridgeId)
+        XCTAssertThrowsError(try scp.bridgeCredentialGetKey(bridgeId: bridgeId))
+    }
+
+    /// A credential provisioned on one instance must not be visible on
+    /// another (ADR-048 §1 per-instance isolation).
+    func testBridgeCredentialStoreIsPerInstance() throws {
+        let bridgeId = "bridge-cred-swift-003"
+        let key = Data(repeating: 1, count: 32)
+
+        _ = try scp.bridgeCredentialProvision(
+            bridgeId: bridgeId,
+            credentialType: "ApiKey",
+            plaintext: Data("only-in-a".utf8),
+            bridgeCredentialKey: key
+        )
+
+        let other = SCP()
+        defer { Task { try? await other.shutdown(timeoutMillis: 1000) } }
+        XCTAssertThrowsError(
+            try other.bridgeCredentialRetrieve(
+                bridgeId: bridgeId,
+                credentialType: "ApiKey",
+                bridgeCredentialKey: key
+            ),
+            "credential provisioned on instance A must not leak into instance B"
+        )
+    }
 }

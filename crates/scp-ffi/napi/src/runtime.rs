@@ -218,6 +218,21 @@ pub struct NapiBridgeInstance {
     ///
     /// Closes RED-PR5-002 / BLACK-PR5-002 (#1549).
     pub(crate) recovery_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// Per-instance bridge credential store (spec §12.11).
+    ///
+    /// Mirrors `PyBridgeInstance::credential_store` — each `Scp` instance
+    /// owns its own `InMemoryCredentialStore` so that OAuth tokens, API
+    /// keys, and bridge credential keys provisioned through one bridge
+    /// instance are isolated from every other instance in the same process
+    /// (ADR-048 §1 multi-instance neutrality). The store is thread-safe via
+    /// its internal `tokio::sync::RwLock`. Production deployments should
+    /// replace this with a `Storage`-backed implementation when it lands
+    /// (spec §12.11.2). Cleared by
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] — dropping the
+    /// `Arc` zeroizes any retained bridge credential keys via the store's
+    /// `Zeroizing` fields on `Drop`.
+    pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
 }
 
 /// Permit cap for [`NapiBridgeInstance::recovery_semaphore`].
@@ -253,6 +268,9 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -277,6 +295,9 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -370,6 +391,9 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -397,6 +421,19 @@ impl NapiBridgeInstance {
         &self,
     ) -> &Arc<DashMap<String, crate::mcp::McpClientEntry>> {
         &self.mcp_client_registry
+    }
+
+    /// Returns a reference to this instance's bridge credential store.
+    ///
+    /// Mirrors `PyBridgeInstance::credential_store`. The returned
+    /// `Arc<InMemoryCredentialStore>` is the same instance the
+    /// `NapiBridgeInstance` holds — thread-safe via internal
+    /// `tokio::sync::RwLock`.
+    #[must_use]
+    pub const fn credential_store(
+        &self,
+    ) -> &Arc<scp_core::bridge::credentials::InMemoryCredentialStore> {
+        &self.credential_store
     }
 
     /// Returns a reference to the shared full-stack test network slot.

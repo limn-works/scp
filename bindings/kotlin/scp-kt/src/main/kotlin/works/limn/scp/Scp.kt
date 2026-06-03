@@ -27,6 +27,7 @@ package works.limn.scp
 import uniffi.scp.AssetEntry
 import uniffi.scp.AttestationVerificationResult
 import uniffi.scp.BatchPublishResult
+import uniffi.scp.BridgeCredentialResult
 import uniffi.scp.ChallengeResult
 import uniffi.scp.Checkpoint
 import uniffi.scp.ContextHandle
@@ -271,6 +272,69 @@ class SCP internal constructor(
         memberDid = memberDid,
         callerDid = callerDid,
     )
+
+    // Bridge credential store (spec §12.11). Per-instance credential store
+    // ops; each forwards to [inner]. Credentials live in THIS instance's
+    // store (ADR-048 §1). The encrypted bytes never cross the FFI boundary;
+    // only metadata is returned for provision/rotate.
+
+    /** Forwards to [NativeScp.bridgeCredentialProvision] on [inner]. */
+    suspend fun bridgeCredentialProvision(
+        bridgeId: String,
+        credentialType: String,
+        plaintext: ByteArray,
+        bridgeCredentialKey: ByteArray,
+    ): BridgeCredentialResult =
+        inner.bridgeCredentialProvision(
+            bridgeId = bridgeId,
+            credentialType = credentialType,
+            plaintext = plaintext,
+            bridgeCredentialKey = bridgeCredentialKey,
+        )
+
+    /** Forwards to [NativeScp.bridgeCredentialRetrieve] on [inner]. */
+    suspend fun bridgeCredentialRetrieve(
+        bridgeId: String,
+        credentialType: String,
+        bridgeCredentialKey: ByteArray,
+    ): ByteArray =
+        inner.bridgeCredentialRetrieve(
+            bridgeId = bridgeId,
+            credentialType = credentialType,
+            bridgeCredentialKey = bridgeCredentialKey,
+        )
+
+    /** Forwards to [NativeScp.bridgeCredentialRotate] on [inner]. */
+    suspend fun bridgeCredentialRotate(
+        bridgeId: String,
+        credentialType: String,
+        newPlaintext: ByteArray,
+        bridgeCredentialKey: ByteArray,
+    ): BridgeCredentialResult =
+        inner.bridgeCredentialRotate(
+            bridgeId = bridgeId,
+            credentialType = credentialType,
+            newPlaintext = newPlaintext,
+            bridgeCredentialKey = bridgeCredentialKey,
+        )
+
+    /** Forwards to [NativeScp.bridgeCredentialRevoke] on [inner]. */
+    suspend fun bridgeCredentialRevoke(bridgeId: String) = inner.bridgeCredentialRevoke(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.bridgeCredentialList] on [inner]. */
+    suspend fun bridgeCredentialList(bridgeId: String): List<String> = inner.bridgeCredentialList(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.bridgeCredentialStoreKey] on [inner]. */
+    suspend fun bridgeCredentialStoreKey(
+        bridgeId: String,
+        key: ByteArray,
+    ) = inner.bridgeCredentialStoreKey(bridgeId = bridgeId, key = key)
+
+    /** Forwards to [NativeScp.bridgeCredentialGetKey] on [inner]. */
+    suspend fun bridgeCredentialGetKey(bridgeId: String): ByteArray = inner.bridgeCredentialGetKey(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.bridgeCredentialDeleteKey] on [inner]. */
+    suspend fun bridgeCredentialDeleteKey(bridgeId: String) = inner.bridgeCredentialDeleteKey(bridgeId = bridgeId)
 
     /** Forwards to [NativeScp.addCheckpointCosignature] on [inner]. */
     suspend fun addCheckpointCosignature(

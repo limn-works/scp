@@ -965,6 +965,67 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   });
 
   // ---------------------------------------------------------------------------
+  // 9b. Bridge credential store (spec §12.11) — per-instance SCP methods
+  // ---------------------------------------------------------------------------
+
+  describe("Bridge credentials (real NAPI)", () => {
+    const key = new Uint8Array(32).fill(7);
+
+    test("provision -> retrieve -> rotate -> revoke lifecycle", () => {
+      const bridgeId = "bridge-cred-ts-001";
+
+      const provisioned = scpInstance.bridgeCredentialProvision(
+        bridgeId,
+        "ApiKey",
+        new TextEncoder().encode("first-secret"),
+        key,
+      );
+      expect(provisioned.bridgeId).toBe(bridgeId);
+      expect(provisioned.credentialType).toBe("ApiKey");
+      expect(typeof provisioned.createdAt).toBe("number");
+
+      const retrieved = scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key);
+      expect(new TextDecoder().decode(retrieved)).toBe("first-secret");
+
+      scpInstance.bridgeCredentialRotate(
+        bridgeId,
+        "ApiKey",
+        new TextEncoder().encode("second-secret"),
+        key,
+      );
+      const rotated = scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key);
+      expect(new TextDecoder().decode(rotated)).toBe("second-secret");
+
+      expect(scpInstance.bridgeCredentialList(bridgeId)).toEqual(["ApiKey"]);
+
+      scpInstance.bridgeCredentialRevoke(bridgeId);
+      expect(() => scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key)).toThrow();
+    });
+
+    test("credential key store -> get -> delete lifecycle", () => {
+      const bridgeId = "bridge-cred-ts-002";
+
+      scpInstance.bridgeCredentialStoreKey(bridgeId, key);
+      const got = scpInstance.bridgeCredentialGetKey(bridgeId);
+      expect(Array.from(got)).toEqual(Array.from(key));
+
+      scpInstance.bridgeCredentialDeleteKey(bridgeId);
+      expect(() => scpInstance.bridgeCredentialGetKey(bridgeId)).toThrow();
+    });
+
+    test("rejects a non-32-byte credential key", () => {
+      expect(() =>
+        scpInstance.bridgeCredentialProvision(
+          "bridge-cred-ts-003",
+          "ApiKey",
+          new TextEncoder().encode("secret"),
+          new Uint8Array(16),
+        ),
+      ).toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // 10. Sync / offline classification
   // ---------------------------------------------------------------------------
 

@@ -231,6 +231,20 @@ pub struct UniffiBridgeInstance {
     /// `OnceLock<DashMap<String, McpClientEntry>>` singleton in commit 4.
     /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) mcp_client_registry: Arc<DashMap<String, crate::bridge::McpClientEntry>>,
+
+    /// Per-instance bridge credential store (spec §12.11).
+    ///
+    /// Mirrors `PyBridgeInstance::credential_store` and
+    /// `NapiBridgeInstance::credential_store` — each `Scp` instance owns its
+    /// own `InMemoryCredentialStore` so OAuth tokens, API keys, and bridge
+    /// credential keys provisioned through one instance are isolated from
+    /// every other instance in the same process (ADR-048 §1 multi-instance
+    /// neutrality). Thread-safe via the store's internal
+    /// `tokio::sync::RwLock`. Production deployments should replace this with
+    /// a `Storage`-backed implementation when it lands (spec §12.11.2).
+    /// Dropping the `Arc` on shutdown zeroizes any retained bridge
+    /// credential keys via the store's `Zeroizing` fields.
+    pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
 }
 
 impl UniffiBridgeInstance {
@@ -254,6 +268,9 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -280,6 +297,9 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -400,6 +420,9 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -407,6 +430,20 @@ impl UniffiBridgeInstance {
     #[must_use]
     pub const fn instance_id(&self) -> u64 {
         self.core.instance_id()
+    }
+
+    /// Returns a reference to this instance's bridge credential store.
+    ///
+    /// Mirrors `PyBridgeInstance::credential_store` /
+    /// `NapiBridgeInstance::credential_store`. The returned
+    /// `Arc<InMemoryCredentialStore>` is the same instance the
+    /// `UniffiBridgeInstance` holds — thread-safe via internal
+    /// `tokio::sync::RwLock`.
+    #[must_use]
+    pub const fn credential_store(
+        &self,
+    ) -> &Arc<scp_core::bridge::credentials::InMemoryCredentialStore> {
+        &self.credential_store
     }
 
     /// Returns a reference to the typed UCAN registry.

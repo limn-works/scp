@@ -1635,6 +1635,62 @@
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "credential_provision",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_retrieve",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_rotate",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_revoke",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_list",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_store_key",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_get_key",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_delete_key",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
         }
       ]
     },

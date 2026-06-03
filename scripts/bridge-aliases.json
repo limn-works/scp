@@ -1054,6 +1054,126 @@
       ]
     },
     {
+      "canonical": "bridge_credential_provision",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "bridge_credential_provision"
+      ],
+      "uniffi": [
+        "bridge_credential_provision"
+      ],
+      "napi": [
+        "bridge_credential_provision"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "bridge_credential_retrieve",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "bridge_credential_retrieve"
+      ],
+      "uniffi": [
+        "bridge_credential_retrieve"
+      ],
+      "napi": [
+        "bridge_credential_retrieve"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "bridge_credential_rotate",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "bridge_credential_rotate"
+      ],
+      "uniffi": [
+        "bridge_credential_rotate"
+      ],
+      "napi": [
+        "bridge_credential_rotate"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "bridge_credential_revoke",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "bridge_credential_revoke"
+      ],
+      "uniffi": [
+        "bridge_credential_revoke"
+      ],
+      "napi": [
+        "bridge_credential_revoke"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "bridge_credential_list",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "bridge_credential_list"
+      ],
+      "uniffi": [
+        "bridge_credential_list"
+      ],
+      "napi": [
+        "bridge_credential_list"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "bridge_credential_store_key",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "bridge_credential_store_key"
+      ],
+      "uniffi": [
+        "bridge_credential_store_key"
+      ],
+      "napi": [
+        "bridge_credential_store_key"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "bridge_credential_get_key",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "bridge_credential_get_key"
+      ],
+      "uniffi": [
+        "bridge_credential_get_key"
+      ],
+      "napi": [
+        "bridge_credential_get_key"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "bridge_credential_delete_key",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "bridge_credential_delete_key"
+      ],
+      "uniffi": [
+        "bridge_credential_delete_key"
+      ],
+      "napi": [
+        "bridge_credential_delete_key"
+      ],
+      "wasm": []
+    },
+    {
       "canonical": "economy_estimate_cost",
       "category": "economy",
       "wasm_required": false,
@@ -3147,6 +3267,38 @@
       {
         "canonical": "configure_relay_transport",
         "reason": "WASM has no scp-platform / no transport per ADR-034."
+      },
+      {
+        "canonical": "bridge_credential_provision",
+        "reason": "Bridge credential store (InMemoryCredentialStore, CredentialType, BridgeCredential) lives only in scp-runtime (tokio::sync::RwLock async store); wasm32 cannot depend on scp-runtime's multi-thread tokio per ADR-034. Credential crypto was never migrated to scp-protocol (spec §12.11.2 leaves it to a Storage-backed impl)."
+      },
+      {
+        "canonical": "bridge_credential_retrieve",
+        "reason": "Bridge credential store lives only in scp-runtime (tokio async store); wasm32 cannot depend on scp-runtime per ADR-034 (spec §12.11.2)."
+      },
+      {
+        "canonical": "bridge_credential_rotate",
+        "reason": "Bridge credential store lives only in scp-runtime (tokio async store); wasm32 cannot depend on scp-runtime per ADR-034 (spec §12.11.2)."
+      },
+      {
+        "canonical": "bridge_credential_revoke",
+        "reason": "Bridge credential store lives only in scp-runtime (tokio async store); wasm32 cannot depend on scp-runtime per ADR-034 (spec §12.11.2)."
+      },
+      {
+        "canonical": "bridge_credential_list",
+        "reason": "Bridge credential store lives only in scp-runtime (tokio async store); wasm32 cannot depend on scp-runtime per ADR-034 (spec §12.11.2)."
+      },
+      {
+        "canonical": "bridge_credential_store_key",
+        "reason": "Bridge credential key custody lives only in scp-runtime (tokio async store); wasm32 cannot depend on scp-runtime per ADR-034 (spec §12.11.2)."
+      },
+      {
+        "canonical": "bridge_credential_get_key",
+        "reason": "Bridge credential key custody lives only in scp-runtime (tokio async store); wasm32 cannot depend on scp-runtime per ADR-034 (spec §12.11.2)."
+      },
+      {
+        "canonical": "bridge_credential_delete_key",
+        "reason": "Bridge credential key custody lives only in scp-runtime (tokio async store); wasm32 cannot depend on scp-runtime per ADR-034 (spec §12.11.2)."
       }
     ]
   }

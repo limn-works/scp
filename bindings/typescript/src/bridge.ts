@@ -38,3 +38,17 @@ export interface ShadowIdentity {
   readonly attributedRole: string;
   readonly provenanceStatus: ShadowStatus;
 }
+
+/**
+ * Bridge credential metadata (spec §12.11).
+ *
+ * Returned by `SCP.bridgeCredentialProvision` and
+ * `SCP.bridgeCredentialRotate`. The encrypted credential bytes never cross
+ * the FFI boundary — only this non-secret metadata.
+ */
+export interface BridgeCredential {
+  readonly bridgeId: string;
+  readonly credentialType: string;
+  /** Unix timestamp (seconds) when the credential was created. */
+  readonly createdAt: number;
+}

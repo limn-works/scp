@@ -5986,6 +5986,25 @@ pub struct ShadowIdentityResult {
     pub provenance_status: String,
 }
 
+/// Bridge credential metadata result.
+///
+/// Returned by `bridge_credential_provision` and `bridge_credential_rotate`.
+/// Mirrors the `PyO3` dict (`bridge_id`, `credential_type`, `created_at`).
+/// The encrypted credential bytes never cross the FFI boundary — only
+/// non-secret metadata.
+///
+/// See spec section 12.11 (Credential Lifecycle) and ADR-023.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BridgeCredentialResult {
+    /// The bridge instance this credential belongs to.
+    pub bridge_id: String,
+    /// The credential type string (e.g. `"ApiKey"`, `"OAuthAccessToken"`,
+    /// `"Custom:<name>"`).
+    pub credential_type: String,
+    /// Unix timestamp (seconds) when the credential was created.
+    pub created_at: u64,
+}
+
 /// Registers a new bridge connector with a context.
 ///
 /// Creates a bridge registration, submits a registration request, and
@@ -6208,6 +6227,223 @@ fn bridge_create_shadow_on(
         attributed_role: shadow.attributed_role,
         provenance_status: format!("{:?}", shadow.provenance_status),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Bridge credential store operations (§12.11)
+//
+// Per-bridge-instance helpers mirroring the PyO3 `*_impl` functions in
+// `crates/scp-ffi/src/bridge_connector.rs`. Each resolves the credential
+// store from `bi.credential_store()` and drives the async
+// `BridgeCredentialStore` trait via the shared tokio runtime
+// (`crate::runtime().block_on(...)`). UniFFI bridge methods are sync; the
+// shared runtime supplies the async context.
+// ---------------------------------------------------------------------------
+
+use scp_core::bridge::credentials::{BridgeCredentialStore, CredentialType};
+
+/// Parses a credential type string into a [`CredentialType`].
+///
+/// Accepts the four standard variants plus the `Custom:<name>` prefix form,
+/// mirroring the `PyO3` `parse_credential_type` helper.
+fn parse_credential_type(s: &str) -> Result<CredentialType, ScpError> {
+    match s {
+        "OAuthAccessToken" => Ok(CredentialType::OAuthAccessToken),
+        "OAuthRefreshToken" => Ok(CredentialType::OAuthRefreshToken),
+        "ApiKey" => Ok(CredentialType::ApiKey),
+        "WebhookSecret" => Ok(CredentialType::WebhookSecret),
+        other => other.strip_prefix("Custom:").map_or_else(
+            || {
+                Err(ScpError::Validation {
+                    msg: format!(
+                        "invalid credential type '{other}': expected 'OAuthAccessToken', \
+                         'OAuthRefreshToken', 'ApiKey', 'WebhookSecret', or 'Custom:<name>'"
+                    ),
+                    code: codes::VALID_7058.to_owned(),
+                })
+            },
+            |name| Ok(CredentialType::Custom(name.to_owned())),
+        ),
+    }
+}
+
+/// Validates that a credential key is exactly 32 bytes, returning it
+/// wrapped in [`Zeroizing`] so the copy is zeroed on drop.
+fn parse_credential_key_bytes(key: &[u8]) -> Result<Zeroizing<[u8; 32]>, ScpError> {
+    <[u8; 32]>::try_from(key)
+        .map(Zeroizing::new)
+        .map_err(|_| ScpError::Validation {
+            msg: format!(
+                "bridge_credential_key must be exactly 32 bytes, got {}",
+                key.len()
+            ),
+            code: codes::VALID_7057.to_owned(),
+        })
+}
+
+/// Maps a `scp-core` `BridgeCredential` to the FFI metadata result. The
+/// encrypted bytes are intentionally dropped — only non-secret metadata
+/// crosses the boundary.
+fn credential_to_result(
+    credential: &scp_core::bridge::credentials::BridgeCredential,
+) -> BridgeCredentialResult {
+    BridgeCredentialResult {
+        bridge_id: credential.bridge_id.clone(),
+        credential_type: credential.credential_type.to_string(),
+        created_at: credential.created_at,
+    }
+}
+
+/// Per-instance implementation of `bridge_credential_provision`.
+fn bridge_credential_provision_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+    credential_type: &str,
+    plaintext: &[u8],
+    bridge_credential_key: &[u8],
+) -> Result<BridgeCredentialResult, ScpError> {
+    let ct = parse_credential_type(credential_type)?;
+    let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
+    let store = bi.credential_store();
+
+    let credential = crate::runtime()
+        .block_on(store.provision(bridge_id, ct, plaintext, &key_bytes))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential provision failed: {e}"),
+            code: codes::CTX_2105.to_owned(),
+        })?;
+
+    Ok(credential_to_result(&credential))
+}
+
+/// Per-instance implementation of `bridge_credential_retrieve`.
+fn bridge_credential_retrieve_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+    credential_type: &str,
+    bridge_credential_key: &[u8],
+) -> Result<Vec<u8>, ScpError> {
+    let ct = parse_credential_type(credential_type)?;
+    let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
+    let store = bi.credential_store();
+
+    let plaintext = crate::runtime()
+        .block_on(store.retrieve(bridge_id, &ct, &key_bytes))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential retrieve failed: {e}"),
+            code: codes::CTX_2106.to_owned(),
+        })?;
+
+    Ok(plaintext.to_vec())
+}
+
+/// Per-instance implementation of `bridge_credential_rotate`.
+fn bridge_credential_rotate_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+    credential_type: &str,
+    new_plaintext: &[u8],
+    bridge_credential_key: &[u8],
+) -> Result<BridgeCredentialResult, ScpError> {
+    let ct = parse_credential_type(credential_type)?;
+    let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
+    let store = bi.credential_store();
+
+    let credential = crate::runtime()
+        .block_on(store.rotate(bridge_id, &ct, new_plaintext, &key_bytes))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential rotate failed: {e}"),
+            code: codes::CTX_2107.to_owned(),
+        })?;
+
+    Ok(credential_to_result(&credential))
+}
+
+/// Per-instance implementation of `bridge_credential_revoke`.
+fn bridge_credential_revoke_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+) -> Result<(), ScpError> {
+    let store = bi.credential_store();
+
+    crate::runtime()
+        .block_on(store.revoke(bridge_id))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential revoke failed: {e}"),
+            code: codes::CTX_2108.to_owned(),
+        })?;
+
+    Ok(())
+}
+
+/// Per-instance implementation of `bridge_credential_list`.
+fn bridge_credential_list_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+) -> Result<Vec<String>, ScpError> {
+    let store = bi.credential_store();
+
+    let types = crate::runtime()
+        .block_on(store.list(bridge_id))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential list failed: {e}"),
+            code: codes::CTX_2109.to_owned(),
+        })?;
+
+    Ok(types.iter().map(std::string::ToString::to_string).collect())
+}
+
+/// Per-instance implementation of `bridge_credential_store_key`.
+fn bridge_credential_store_key_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+    key: &[u8],
+) -> Result<(), ScpError> {
+    let key_bytes = parse_credential_key_bytes(key)?;
+    let store = bi.credential_store();
+
+    crate::runtime()
+        .block_on(store.store_bridge_credential_key(bridge_id, key_bytes))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential key store failed: {e}"),
+            code: codes::CTX_2111.to_owned(),
+        })?;
+
+    Ok(())
+}
+
+/// Per-instance implementation of `bridge_credential_get_key`.
+fn bridge_credential_get_key_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+) -> Result<Vec<u8>, ScpError> {
+    let store = bi.credential_store();
+
+    let key = crate::runtime()
+        .block_on(store.get_bridge_credential_key(bridge_id))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential key retrieval failed: {e}"),
+            code: codes::CTX_2112.to_owned(),
+        })?;
+
+    Ok(key.to_vec())
+}
+
+/// Per-instance implementation of `bridge_credential_delete_key`.
+fn bridge_credential_delete_key_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    bridge_id: &str,
+) -> Result<(), ScpError> {
+    let store = bi.credential_store();
+
+    crate::runtime()
+        .block_on(store.delete_bridge_credential_key(bridge_id))
+        .map_err(|e| ScpError::Context {
+            msg: format!("credential key deletion failed: {e}"),
+            code: codes::CTX_2113.to_owned(),
+        })?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -12351,6 +12587,86 @@ impl Scp {
         )
     }
 
+    /// Provisions (stores) an encrypted credential for a bridge instance
+    /// (spec §12.11). Routes through `&self.inner` — credentials live in
+    /// THIS instance's credential store (ADR-048 §1).
+    pub fn bridge_credential_provision(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> Result<BridgeCredentialResult, ScpError> {
+        bridge_credential_provision_on(
+            &self.inner,
+            &bridge_id,
+            &credential_type,
+            &plaintext,
+            &bridge_credential_key,
+        )
+    }
+
+    /// Retrieves and decrypts a credential for a bridge instance (spec §12.11).
+    pub fn bridge_credential_retrieve(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        bridge_credential_key: Vec<u8>,
+    ) -> Result<Vec<u8>, ScpError> {
+        bridge_credential_retrieve_on(
+            &self.inner,
+            &bridge_id,
+            &credential_type,
+            &bridge_credential_key,
+        )
+    }
+
+    /// Rotates (replaces) a credential for a bridge instance (spec §12.11).
+    pub fn bridge_credential_rotate(
+        &self,
+        bridge_id: String,
+        credential_type: String,
+        new_plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> Result<BridgeCredentialResult, ScpError> {
+        bridge_credential_rotate_on(
+            &self.inner,
+            &bridge_id,
+            &credential_type,
+            &new_plaintext,
+            &bridge_credential_key,
+        )
+    }
+
+    /// Revokes all credentials for a bridge instance (spec §12.11).
+    pub fn bridge_credential_revoke(&self, bridge_id: String) -> Result<(), ScpError> {
+        bridge_credential_revoke_on(&self.inner, &bridge_id)
+    }
+
+    /// Lists all credential types stored for a bridge instance (spec §12.11).
+    pub fn bridge_credential_list(&self, bridge_id: String) -> Result<Vec<String>, ScpError> {
+        bridge_credential_list_on(&self.inner, &bridge_id)
+    }
+
+    /// Stores a bridge credential key in the custody boundary (spec §12.11).
+    pub fn bridge_credential_store_key(
+        &self,
+        bridge_id: String,
+        key: Vec<u8>,
+    ) -> Result<(), ScpError> {
+        bridge_credential_store_key_on(&self.inner, &bridge_id, &key)
+    }
+
+    /// Retrieves a bridge credential key from the custody boundary (spec §12.11).
+    pub fn bridge_credential_get_key(&self, bridge_id: String) -> Result<Vec<u8>, ScpError> {
+        bridge_credential_get_key_on(&self.inner, &bridge_id)
+    }
+
+    /// Deletes and zeroizes a bridge credential key (spec §12.11).
+    pub fn bridge_credential_delete_key(&self, bridge_id: String) -> Result<(), ScpError> {
+        bridge_credential_delete_key_on(&self.inner, &bridge_id)
+    }
+
     /// Per-instance equivalent of the free-function `scpid_sign`.
     ///
     /// Signs an SCPID challenge with the identity's requested key. Rejects
@@ -16258,5 +16574,111 @@ mod tests {
         );
 
         relay.shutdown();
+    }
+
+    // -------------------------------------------------------------------
+    // Bridge credential store lifecycle (§12.11)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_credential_type_variants() {
+        assert!(matches!(
+            parse_credential_type("ApiKey").unwrap(),
+            CredentialType::ApiKey
+        ));
+        assert_eq!(
+            parse_credential_type("Custom:discord").unwrap(),
+            CredentialType::Custom("discord".to_owned())
+        );
+        assert!(parse_credential_type("Nope").is_err());
+    }
+
+    #[test]
+    fn parse_credential_key_bytes_rejects_wrong_length() {
+        assert!(parse_credential_key_bytes(&[0u8; 16]).is_err());
+        assert!(parse_credential_key_bytes(&[0u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn credential_provision_retrieve_rotate_revoke_lifecycle() {
+        let scp = scp_test();
+        let bridge_id = "bridge-cred-uniffi-001".to_owned();
+        let key = vec![9u8; 32];
+
+        let provisioned = scp
+            .bridge_credential_provision(
+                bridge_id.clone(),
+                "ApiKey".to_owned(),
+                b"first-secret".to_vec(),
+                key.clone(),
+            )
+            .unwrap();
+        assert_eq!(provisioned.bridge_id, bridge_id);
+        assert_eq!(provisioned.credential_type, "ApiKey");
+
+        let retrieved = scp
+            .bridge_credential_retrieve(bridge_id.clone(), "ApiKey".to_owned(), key.clone())
+            .unwrap();
+        assert_eq!(retrieved, b"first-secret");
+
+        scp.bridge_credential_rotate(
+            bridge_id.clone(),
+            "ApiKey".to_owned(),
+            b"second-secret".to_vec(),
+            key.clone(),
+        )
+        .unwrap();
+        let rotated = scp
+            .bridge_credential_retrieve(bridge_id.clone(), "ApiKey".to_owned(), key.clone())
+            .unwrap();
+        assert_eq!(rotated, b"second-secret");
+
+        let types = scp.bridge_credential_list(bridge_id.clone()).unwrap();
+        assert_eq!(types, vec!["ApiKey".to_owned()]);
+
+        scp.bridge_credential_revoke(bridge_id.clone()).unwrap();
+        assert!(
+            scp.bridge_credential_retrieve(bridge_id, "ApiKey".to_owned(), key)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn credential_key_store_get_delete_lifecycle() {
+        let scp = scp_test();
+        let bridge_id = "bridge-cred-uniffi-002".to_owned();
+        let key = vec![3u8; 32];
+
+        scp.bridge_credential_store_key(bridge_id.clone(), key.clone())
+            .unwrap();
+        let got = scp.bridge_credential_get_key(bridge_id.clone()).unwrap();
+        assert_eq!(got, key);
+
+        scp.bridge_credential_delete_key(bridge_id.clone()).unwrap();
+        assert!(scp.bridge_credential_get_key(bridge_id).is_err());
+    }
+
+    #[test]
+    fn credential_store_is_per_instance() {
+        let scp_a = scp_test();
+        let scp_b = scp_test();
+        let bridge_id = "bridge-cred-uniffi-003".to_owned();
+        let key = vec![1u8; 32];
+
+        scp_a
+            .bridge_credential_provision(
+                bridge_id.clone(),
+                "ApiKey".to_owned(),
+                b"only-in-a".to_vec(),
+                key.clone(),
+            )
+            .unwrap();
+
+        assert!(
+            scp_b
+                .bridge_credential_retrieve(bridge_id, "ApiKey".to_owned(), key)
+                .is_err(),
+            "credential provisioned on instance A must not be visible on instance B"
+        );
     }
 }
