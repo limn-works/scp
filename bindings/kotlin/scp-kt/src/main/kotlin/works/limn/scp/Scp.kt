@@ -788,6 +788,27 @@ class SCP internal constructor(
             epoch = epoch,
         )
 
+    /**
+     * Forwards to [NativeScp.eventLogCheckpointByDid] on [inner].
+     *
+     * Signs with [identity]'s key material and records [did] as the
+     * checkpoint sender. The UniFFI bridge has no DID-keyed identity
+     * registry, so [identity] supplies the key material while [did] names
+     * the member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom).
+     */
+    suspend fun eventLogCheckpointByDid(
+        handle: ContextHandle,
+        identity: Identity,
+        did: String,
+        epoch: ULong,
+    ): Checkpoint =
+        inner.eventLogCheckpointByDid(
+            handle = handle,
+            identity = identity,
+            did = did,
+            epoch = epoch,
+        )
+
     /** Forwards to [NativeScp.eventLogQuery] on [inner]. */
     suspend fun eventLogQuery(
         handle: ContextHandle,

@@ -594,6 +594,74 @@ fn event_log_query_invalid_context_fails() {
     });
 }
 
+#[test]
+fn event_log_checkpoint_by_did_generates_signed_checkpoint() {
+    Python::with_gil(|_py| {
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+
+        // Append an unsigned event so the log is non-empty.
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            let event = scp_event_log::Event {
+                event_type: scp_event_log::EventType::ContextCreated,
+                actor_did: scp_identity::DID(did.clone()),
+                timestamp: 1_700_000_000,
+                sequence: 0,
+                payload: scp_event_log::EventPayload { data: vec![] },
+                prev_hash: [0u8; 32],
+                signature: vec![],
+            };
+            scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event).unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let checkpoint = scp.event_log_checkpoint_by_did(&ctx_id, &did, 7).unwrap();
+        assert_eq!(checkpoint.context_id, ctx_id);
+        assert_eq!(checkpoint.sender_did, did);
+        assert_eq!(checkpoint.event_count, 1);
+        assert_eq!(checkpoint.epoch, Some(7));
+        // Ed25519 signature is 64 bytes -> 128 hex chars.
+        assert_eq!(checkpoint.signature.len(), 128);
+        assert_eq!(checkpoint.merkle_root.len(), 64);
+    });
+}
+
+#[test]
+fn event_log_checkpoint_by_did_unregistered_did_errors() {
+    Python::with_gil(|_py| {
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+
+        // A syntactically valid DID that was never registered in this instance.
+        let result = scp.event_log_checkpoint_by_did(&ctx_id, "did:dht:zUnregisteredMember", 0);
+        assert!(
+            result.is_err(),
+            "checkpoint for an unregistered DID must error"
+        );
+    });
+}
+
+#[test]
+fn event_log_checkpoint_by_did_invalid_context_errors() {
+    Python::with_gil(|_py| {
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+
+        // DID is registered, but the context does not exist.
+        let result = scp.event_log_checkpoint_by_did("nonexistent-context", &did, 0);
+        assert!(
+            result.is_err(),
+            "checkpoint for a nonexistent context must error"
+        );
+    });
+}
+
 // ============================================================================
 // Discovery
 // ============================================================================

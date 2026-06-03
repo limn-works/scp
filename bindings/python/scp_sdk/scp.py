@@ -1484,6 +1484,30 @@ class SCP:
             signature=raw.signature,
         )
 
+    async def event_log_checkpoint_by_did(self, context_id: str, did: str, epoch: int) -> Any:
+        """Delegate to ``_scp_core.SCP.event_log_checkpoint_by_did``.
+
+        Generates a signed consistency checkpoint scoped to a member ``did``.
+        The DID is looked up in this instance's identity registry for signing
+        key material and recorded as the checkpoint's ``sender_did``. Returns a
+        :class:`~scp_sdk.event_log.SignedCheckpoint` with an Ed25519 signature
+        over the canonical checkpoint fields.
+        """
+        from scp_sdk.event_log import SignedCheckpoint
+
+        raw = await asyncio.to_thread(
+            self._native.event_log_checkpoint_by_did, context_id, did, epoch
+        )
+        return SignedCheckpoint(
+            context_id=raw.context_id,
+            sender_did=raw.sender_did,
+            event_count=raw.event_count,
+            merkle_root=raw.merkle_root,
+            epoch=raw.epoch,
+            timestamp=raw.timestamp,
+            signature=raw.signature,
+        )
+
     async def event_log_query(
         self, context_id: str, filter: dict[str, Any] | None = None
     ) -> list[Any]:

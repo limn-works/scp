@@ -653,6 +653,26 @@
       ]
     },
     {
+      "canonical": "event_log_checkpoint_by_did",
+      "category": "event_log",
+      "wasm_required": true,
+      "pyo3": [
+        "event_log_checkpoint_by_did_impl",
+        "event_log_checkpoint_by_did"
+      ],
+      "uniffi": [
+        "event_log_checkpoint_by_did_impl",
+        "event_log_checkpoint_by_did"
+      ],
+      "napi": [
+        "event_log_checkpoint_by_did_on",
+        "event_log_checkpoint_by_did"
+      ],
+      "wasm": [
+        "event_log_checkpoint_by_did"
+      ]
+    },
+    {
       "canonical": "transport_connect",
       "category": "transport",
       "wasm_required": false,

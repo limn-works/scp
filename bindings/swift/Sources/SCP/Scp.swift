@@ -419,6 +419,11 @@ public extension SCP {
         try await inner.eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
     }
 
+    /// Forwards to ``Scp/eventLogCheckpointByDid`` on ``inner``.
+    func eventLogCheckpointByDid(handle: ContextHandle, identity: Identity, did: String, epoch: UInt64) async throws -> Checkpoint {
+        try await inner.eventLogCheckpointByDid(handle: handle, identity: identity, did: did, epoch: epoch)
+    }
+
     /// Forwards to ``Scp/eventLogQuery`` on ``inner``.
     func eventLogQuery(handle: ContextHandle, filterJson: String?) async throws -> [Event] {
         try await inner.eventLogQuery(handle: handle, filterJson: filterJson)

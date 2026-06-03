@@ -912,6 +912,13 @@
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "checkpoint_by_did",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
         }
       ]
     },

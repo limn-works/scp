@@ -707,6 +707,67 @@ fn event_log_checkpoint_impl(
     })
 }
 
+/// Generates a signed consistency checkpoint, looking the signing identity up
+/// from this bridge instance's identity registry by DID string.
+///
+/// Distinct from [`event_log_checkpoint_impl`] only in intent: this variant is
+/// the canonical "checkpoint scoped to a member DID" entry point — the DID
+/// drives both the registry lookup (for key material) and the recorded
+/// `sender_did`. It mirrors the NAPI bridge's `event_log_checkpoint_by_did`,
+/// which accepts a DID string rather than an `Identity` handle so it can be
+/// called without threading the identity object through the event-log API.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if `did` is not present in this instance's identity
+/// registry, or `ContextError` if the context is not registered or signing
+/// fails.
+fn event_log_checkpoint_by_did_impl(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    did: &str,
+    epoch: u64,
+) -> PyResult<PyCheckpoint> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(did)?;
+    let rt = crate::runtime()?;
+
+    let context_id_owned = context_id.to_owned();
+    let did_owned = did.to_owned();
+
+    let sender_did = scp_identity::DID(did_owned.clone());
+
+    let checkpoint = crate::runtime::with_identity(bi, &did_owned, |entry| {
+        crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {
+            let result = rt.block_on(async {
+                let signer = scp_core::event_log::KeyCustodySigner {
+                    custody: entry.custody.as_ref(),
+                    key: &entry.identity.active_signing_key,
+                };
+                scp_event_log::checkpoint::generate_checkpoint(
+                    &ctx_rt.event_log,
+                    &sender_did,
+                    epoch,
+                    &signer,
+                )
+                .await
+            });
+
+            result.map_err(|e| ScpPyError::context(format!("checkpoint generation failed: {e}")))
+        })
+    })?;
+
+    Ok(PyCheckpoint {
+        context_id: checkpoint.context_id,
+        sender_did: checkpoint.sender_did.0,
+        event_count: checkpoint.event_count,
+        merkle_root: encode_hex(&checkpoint.merkle_root),
+        epoch: checkpoint.epoch,
+        timestamp: checkpoint.timestamp,
+        signature: encode_hex(&checkpoint.signature),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -836,6 +897,42 @@ impl crate::scp::PyScp {
     ) -> PyResult<PyCheckpoint> {
         let bi = &*self.inner;
         event_log_checkpoint_impl(bi, context_id, identity_did, epoch)
+    }
+
+    /// Generates a signed consistency checkpoint scoped to a member DID.
+    ///
+    /// Looks the signing identity up from this instance's identity registry by
+    /// DID string, then signs a snapshot of the context event log's Merkle root
+    /// and event count. The DID drives both the key-material lookup and the
+    /// recorded `sender_did`. This is the canonical "checkpoint by DID" entry
+    /// point, mirroring the NAPI bridge's `event_log_checkpoint_by_did`.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The ID of the context whose event log to checkpoint.
+    /// * `did` -- The DID of the member generating the checkpoint. Must be
+    ///   present in this instance's identity registry.
+    /// * `epoch` -- The current MLS epoch (pass 0 for Broadcast contexts).
+    ///
+    /// # Returns
+    ///
+    /// A [`PyCheckpoint`] containing the signed checkpoint data.
+    ///
+    /// # Errors
+    ///
+    /// Raises `IdentityError` if `did` is not in the identity registry, or
+    /// `ContextError` if the context is not registered or signing fails.
+    ///
+    /// See ADR-011 acceptance criterion 8 and ADR-030.
+    #[pyo3(name = "event_log_checkpoint_by_did")]
+    pub fn event_log_checkpoint_by_did(
+        &self,
+        context_id: &str,
+        did: &str,
+        epoch: u64,
+    ) -> PyResult<PyCheckpoint> {
+        let bi = &*self.inner;
+        event_log_checkpoint_by_did_impl(bi, context_id, did, epoch)
     }
 }
 

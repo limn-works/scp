@@ -1591,6 +1591,7 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "event_log_query",
     "event_log_verify",
     "event_log_checkpoint",
+    "event_log_checkpoint_by_did",
     // Broadcast
     "broadcast_subscribe",
     "broadcast_unsubscribe",

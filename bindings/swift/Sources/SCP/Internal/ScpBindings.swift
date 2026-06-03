@@ -2411,6 +2411,20 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: UInt64) async throws  -> Checkpoint
     
     /**
+     * Generates a signed consistency checkpoint scoped to a member DID.
+     *
+     * Signs with the supplied `identity`'s key material and records `did` as
+     * the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
+     * `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
+     * handle is passed explicitly for key material while `did` names the
+     * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom).
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func eventLogCheckpointByDid(handle: ContextHandle, identity: Identity, did: String, epoch: UInt64) async throws  -> Checkpoint
+    
+    /**
      * Per-instance equivalent of the free-function `event_log_query`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
@@ -4374,6 +4388,35 @@ open func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: U
                 uniffi_scp_ffi_uniffi_fn_method_scp_event_log_checkpoint(
                     self.uniffiClonePointer(),
                     FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterUInt64.lower(epoch)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCheckpoint_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Generates a signed consistency checkpoint scoped to a member DID.
+     *
+     * Signs with the supplied `identity`'s key material and records `did` as
+     * the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
+     * `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
+     * handle is passed explicitly for key material while `did` names the
+     * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom).
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func eventLogCheckpointByDid(handle: ContextHandle, identity: Identity, did: String, epoch: UInt64)async throws  -> Checkpoint  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_event_log_checkpoint_by_did(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(did),FfiConverterUInt64.lower(epoch)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -14812,6 +14855,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint() != 31004) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint_by_did() != 53804) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 26119) {

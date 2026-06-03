@@ -4466,6 +4466,125 @@ async fn event_log_checkpoint_impl(
     })
 }
 
+/// Generates a signed consistency checkpoint scoped to a member DID.
+///
+/// The `UniFFI` bridge holds no DID-keyed identity registry — identities are
+/// opaque `Arc<Identity>` handles, not entries looked up by string. So unlike
+/// the PyO3/NAPI/WASM bridges (which resolve key material from a registry keyed
+/// by DID), this variant takes the `Identity` handle for key material AND an
+/// explicit `did` string that is recorded as the checkpoint's `sender_did`.
+/// This honours the per-SDK idiom (ADR-048 §7): the no-registry constraint of
+/// the `UniFFI` object model is respected rather than forcing a registry into
+/// existence. The `did` lets the caller checkpoint on behalf of a specific
+/// member DID (e.g. an agent key) while signing with the held identity.
+#[cfg(feature = "allow_in_memory_custody")]
+async fn event_log_checkpoint_by_did_impl(
+    bi: Arc<crate::runtime::UniffiBridgeInstance>,
+    handle: Arc<ContextHandle>,
+    identity: Arc<Identity>,
+    did: String,
+    epoch: u64,
+) -> Result<Checkpoint, ScpError> {
+    runtime()
+        .spawn(async move {
+            let custody =
+                identity
+                    .in_memory_custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        msg: "event log checkpoint requires key custody — create the identity \
+                              with in_memory custody (identity_create(\"in_memory\"))"
+                            .to_owned(),
+                        code: codes::PERM_3008.to_owned(),
+                    })?;
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: "event log checkpoint requires retained identity state — the identity \
+                          was externally loaded"
+                        .to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
+                })?;
+
+            // Ensure UCAN state (which contains the event log) is registered
+            // on this bridge instance.
+            bi.ensure_ucan_registered(
+                &handle.context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
+
+            let sender_did = scp_identity::DID(did);
+            let context_id = handle.context_id.clone();
+
+            let checkpoint = bi
+                .with_ucan_state(&context_id, |ucan_state| {
+                    let signer = scp_core::event_log::KeyCustodySigner {
+                        custody: &custody.0,
+                        key: &core_id.active_signing_key,
+                    };
+                    // generate_checkpoint is async — use block_in_place to allow
+                    // blocking inside this spawned async task. block_in_place moves
+                    // the worker thread to blocking mode (requires multi-thread runtime).
+                    let handle = tokio::runtime::Handle::current();
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async {
+                            scp_event_log::checkpoint::generate_checkpoint(
+                                &ucan_state.event_log,
+                                &sender_did,
+                                epoch,
+                                &signer,
+                            )
+                            .await
+                            .map_err(|e| ScpError::Context {
+                                msg: format!("checkpoint generation failed: {e}"),
+                                code: codes::CTX_2027.to_owned(),
+                            })
+                        })
+                    })
+                })
+                .ok_or_else(|| ScpError::Context {
+                    msg: format!("context '{context_id}' not found in UCAN registry"),
+                    code: codes::CTX_2027.to_owned(),
+                })??;
+
+            Ok(Checkpoint {
+                context_id: checkpoint.context_id,
+                sender_did: checkpoint.sender_did.0,
+                event_count: checkpoint.event_count,
+                merkle_root: hex::encode(checkpoint.merkle_root),
+                epoch: checkpoint.epoch,
+                timestamp: checkpoint.timestamp,
+                signature: hex::encode(checkpoint.signature),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("tokio task join error during event log checkpoint: {e}"),
+            code: codes::CTX_2028.to_owned(),
+        })?
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)]
+async fn event_log_checkpoint_by_did_impl(
+    _bi: Arc<crate::runtime::UniffiBridgeInstance>,
+    _handle: Arc<ContextHandle>,
+    _identity: Arc<Identity>,
+    _did: String,
+    _epoch: u64,
+) -> Result<Checkpoint, ScpError> {
+    Err(ScpError::Permission {
+        msg: "event log checkpoint requires key custody — the in_memory custody path \
+                  is not available in this build. Enable the \
+                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
+                  a KeyCustodyProvider for production."
+            .to_owned(),
+        code: codes::PERM_3008.to_owned(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Free functions — governance operations (#387)
 //
@@ -11613,6 +11732,35 @@ impl Scp {
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
         event_log_checkpoint_impl(Arc::clone(&self.inner), handle, identity, epoch).await
+    }
+
+    /// Generates a signed consistency checkpoint scoped to a member DID.
+    ///
+    /// Signs with the supplied `identity`'s key material and records `did` as
+    /// the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
+    /// `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
+    /// handle is passed explicitly for key material while `did` names the
+    /// member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom).
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    pub async fn event_log_checkpoint_by_did(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+        did: String,
+        epoch: u64,
+    ) -> Result<Checkpoint, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        event_log_checkpoint_by_did_impl(Arc::clone(&self.inner), handle, identity, did, epoch)
+            .await
     }
 
     /// Per-instance equivalent of the free-function `ucan_validate`.
