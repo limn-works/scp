@@ -1244,6 +1244,24 @@ fn wasm_bridge_covers_core_operations() {
         required_missing.len(),
         required_missing
     );
+
+    // Stale-exemptions guard (parity with uniffi/napi covers-core tests):
+    // an exemption for an operation that IS implemented is stale and should
+    // be removed from the JSON. WASM lacked this check, so a WASM op could be
+    // wired up while its exemption silently lingered, masking future drift.
+    let exempt = exemptions_for("wasm");
+    let missing_ops: BTreeSet<&str> = coverage.missing.iter().map(|(_, op)| *op).collect();
+    let stale_exemptions: Vec<&str> = exempt
+        .iter()
+        .copied()
+        .filter(|e| !missing_ops.contains(e))
+        .collect();
+    assert!(
+        stale_exemptions.is_empty(),
+        "WASM has stale exemption(s) in bridge-aliases.json (operation is \
+         implemented but still listed as exempt): {stale_exemptions:?}. \
+         Remove them from exemptions.wasm."
+    );
 }
 
 /// Cross-bridge parity matrix: builds and prints a matrix of all operations
