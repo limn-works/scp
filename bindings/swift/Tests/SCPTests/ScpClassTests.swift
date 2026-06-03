@@ -256,6 +256,30 @@ final class ScpClassTests: XCTestCase {
         }
     }
 
+    /// A non-empty but syntactically invalid `ownerDid` is rejected by the
+    /// pre-existing petname ops, matching the strict DID validation the WASM
+    /// bridge and the §4.7 ops already enforce. All four bridges treat the
+    /// per-identity petname partition key uniformly as a DID.
+    func testPetnameRejectsMalformedOwner() {
+        let bad = "not-a-did"
+        func assertValidation(_ body: () throws -> Void) {
+            XCTAssertThrowsError(try body()) { error in
+                guard case ScpError.Validation = error else {
+                    XCTFail("expected ScpError.Validation, got \(error)")
+                    return
+                }
+            }
+        }
+        assertValidation { try self.scp.petnameSet(ownerDid: bad, targetDid: "did:dht:z1", name: "test") }
+        assertValidation { try self.scp.petnameRemove(ownerDid: bad, targetDid: "did:dht:z1") }
+        assertValidation { try self.scp.petnameSetContext(ownerDid: bad, contextId: "ctx-1", name: "work") }
+        assertValidation { try self.scp.petnameRemoveContext(ownerDid: bad, contextId: "ctx-1") }
+        assertValidation { _ = try self.scp.petnameResolveDid(ownerDid: bad, name: "alice") }
+        assertValidation { _ = try self.scp.petnameResolveContext(ownerDid: bad, name: "work") }
+        assertValidation { _ = try self.scp.petnameGetForDid(ownerDid: bad, targetDid: "did:dht:z1") }
+        assertValidation { _ = try self.scp.petnameGetForContext(ownerDid: bad, contextId: "ctx-1") }
+    }
+
     /// A petname applied on one instance must not leak into another
     /// (ADR-048 §1 per-instance isolation).
     func testPetnameMapsArePerInstance() throws {

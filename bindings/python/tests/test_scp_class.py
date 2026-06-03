@@ -212,6 +212,33 @@ def test_petname_counts_reject_empty_owner() -> None:
         scp.petname_context_count("")
 
 
+def test_petname_rejects_malformed_owner() -> None:
+    """A non-empty but syntactically invalid `owner_did` is rejected.
+
+    The pre-existing petname ops now enforce the same strict `validate_did`
+    gate as the WASM bridge and the §4.7 ops, so all four bridges treat the
+    per-identity petname partition key uniformly as a DID.
+    """
+    scp = SCP()
+    bad = "not-a-did"
+    with pytest.raises(NativeValidationError):
+        scp.petname_set(bad, "did:dht:z1", "test")
+    with pytest.raises(NativeValidationError):
+        scp.petname_remove(bad, "did:dht:z1")
+    with pytest.raises(NativeValidationError):
+        scp.petname_set_context(bad, "ctx-1", "work")
+    with pytest.raises(NativeValidationError):
+        scp.petname_remove_context(bad, "ctx-1")
+    with pytest.raises(NativeValidationError):
+        scp.petname_resolve_did(bad, "alice")
+    with pytest.raises(NativeValidationError):
+        scp.petname_resolve_context(bad, "work")
+    with pytest.raises(NativeValidationError):
+        scp.petname_get_for_did(bad, "did:dht:z1")
+    with pytest.raises(NativeValidationError):
+        scp.petname_get_for_context(bad, "ctx-1")
+
+
 def test_petname_maps_are_per_instance() -> None:
     """A petname applied on one instance must not leak into another.
 

@@ -13887,12 +13887,7 @@ impl Scp {
         target_did: String,
         name: String,
     ) -> Result<(), ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         if target_did.is_empty() {
             return Err(ScpError::Validation {
                 msg: "target_did must not be empty".to_owned(),
@@ -13915,12 +13910,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `petname_remove`.
     pub fn petname_remove(&self, owner_did: String, target_did: String) -> Result<(), ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let mut guard =
             self.inner
                 .core
@@ -13943,12 +13933,7 @@ impl Scp {
         context_id: String,
         name: String,
     ) -> Result<(), ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         if context_id.is_empty() {
             return Err(ScpError::Validation {
                 msg: "context_id must not be empty".to_owned(),
@@ -13975,12 +13960,7 @@ impl Scp {
         owner_did: String,
         context_id: String,
     ) -> Result<(), ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let mut guard =
             self.inner
                 .core
@@ -13998,12 +13978,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `petname_resolve_did`.
     pub fn petname_resolve_did(&self, owner_did: String, name: String) -> Result<String, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core
@@ -14034,12 +14009,7 @@ impl Scp {
         owner_did: String,
         name: String,
     ) -> Result<String, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core
@@ -14065,12 +14035,7 @@ impl Scp {
         owner_did: String,
         target_did: String,
     ) -> Result<Option<String>, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core
@@ -14092,12 +14057,7 @@ impl Scp {
         owner_did: String,
         context_id: String,
     ) -> Result<Option<String>, ScpError> {
-        if owner_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            });
-        }
+        validate_did(&owner_did)?;
         let guard = self
             .inner
             .core
@@ -17035,6 +16995,47 @@ mod tests {
         let scp = scp_test();
         assert!(scp.petname_did_count(String::new()).is_err());
         assert!(scp.petname_context_count(String::new()).is_err());
+    }
+
+    #[test]
+    fn petname_malformed_owner_rejected_uniffi() {
+        // Non-empty but syntactically invalid owner DIDs must be rejected by
+        // the pre-existing petname ops, matching the strict `validate_did`
+        // gate already enforced by the WASM bridge and the §4.7 ops.
+        let scp = scp_test();
+        let bad = "not-a-did".to_owned();
+        assert!(
+            scp.petname_set(bad.clone(), "did:dht:z1".to_owned(), "test".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_remove(bad.clone(), "did:dht:z1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_set_context(bad.clone(), "ctx-1".to_owned(), "work".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_remove_context(bad.clone(), "ctx-1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_resolve_did(bad.clone(), "alice".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_resolve_context(bad.clone(), "work".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_get_for_did(bad.clone(), "did:dht:z1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_get_for_context(bad, "ctx-1".to_owned())
+                .is_err()
+        );
     }
 
     // -----------------------------------------------------------------------

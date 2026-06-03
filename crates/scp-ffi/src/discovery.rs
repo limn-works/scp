@@ -343,17 +343,12 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID or target DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID,
+    /// or if the target DID is empty.
     #[pyo3(name = "petname_set")]
     pub fn petname_set(&self, owner_did: &str, target_did: &str, name: &str) -> PyResult<()> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         if target_did.is_empty() {
             return Err(ScpPyError::ValidationError {
                 message: "target_did must not be empty".to_owned(),
@@ -383,17 +378,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID or target DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_remove")]
     pub fn petname_remove(&self, owner_did: &str, target_did: &str) -> PyResult<()> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let mut guard = bi
             .core
             .petname_maps()
@@ -418,7 +407,8 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID or context ID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID,
+    /// or if the context ID is empty.
     #[pyo3(name = "petname_set_context")]
     pub fn petname_set_context(
         &self,
@@ -427,13 +417,7 @@ impl crate::scp::PyScp {
         name: &str,
     ) -> PyResult<()> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         if context_id.is_empty() {
             return Err(ScpPyError::ValidationError {
                 message: "context_id must not be empty".to_owned(),
@@ -463,17 +447,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_remove_context")]
     pub fn petname_remove_context(&self, owner_did: &str, context_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let mut guard = bi
             .core
             .petname_maps()
@@ -504,17 +482,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_resolve_did")]
     pub fn petname_resolve_did(&self, owner_did: &str, name: &str) -> PyResult<Vec<String>> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()
@@ -550,17 +522,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_resolve_context")]
     pub fn petname_resolve_context(&self, owner_did: &str, name: &str) -> PyResult<Vec<String>> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()
@@ -589,7 +555,7 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_get_for_did")]
     pub fn petname_get_for_did(
         &self,
@@ -597,13 +563,7 @@ impl crate::scp::PyScp {
         target_did: &str,
     ) -> PyResult<Option<String>> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()
@@ -632,7 +592,7 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ValidationError` if the owner DID is empty.
+    /// Raises `ValidationError` if the owner DID is empty or not a valid DID.
     #[pyo3(name = "petname_get_for_context")]
     pub fn petname_get_for_context(
         &self,
@@ -640,13 +600,7 @@ impl crate::scp::PyScp {
         context_id: &str,
     ) -> PyResult<Option<String>> {
         let bi = &*self.inner;
-        if owner_did.is_empty() {
-            return Err(ScpPyError::ValidationError {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }
-            .into());
-        }
+        crate::validate::validate_did(owner_did)?;
         let guard = bi
             .core
             .petname_maps()
@@ -1605,6 +1559,23 @@ mod tests {
         let scp = default_scp();
         assert!(scp.petname_set("", "did:dht:z1", "test").is_err());
         assert!(scp.petname_resolve_did("", "test").is_err());
+    }
+
+    #[test]
+    fn petname_malformed_owner_rejected() {
+        // A non-empty owner that is not a syntactically valid DID must be
+        // rejected by the pre-existing petname ops, matching the strict
+        // `validate_did` gate the WASM bridge and the §4.7 ops already enforce.
+        let scp = default_scp();
+        let bad = "not-a-did";
+        assert!(scp.petname_set(bad, "did:dht:z1", "test").is_err());
+        assert!(scp.petname_remove(bad, "did:dht:z1").is_err());
+        assert!(scp.petname_set_context(bad, "ctx-1", "work").is_err());
+        assert!(scp.petname_remove_context(bad, "ctx-1").is_err());
+        assert!(scp.petname_resolve_did(bad, "alice").is_err());
+        assert!(scp.petname_resolve_context(bad, "work").is_err());
+        assert!(scp.petname_get_for_did(bad, "did:dht:z1").is_err());
+        assert!(scp.petname_get_for_context(bad, "ctx-1").is_err());
     }
 
     // -- Handle registry bridge tests ----------------------------------------

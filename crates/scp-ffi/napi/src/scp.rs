@@ -1433,12 +1433,8 @@ impl Scp {
     ) -> napi::Result<()> {
         use scp_identity::DID;
 
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         if target_did.is_empty() {
             return Err(NapiError::from(ScpNapiError::Validation {
                 message: "target_did must not be empty".to_owned(),
@@ -1461,12 +1457,8 @@ impl Scp {
     pub fn petname_remove(&self, owner_did: String, target_did: String) -> napi::Result<()> {
         use scp_identity::DID;
 
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let mut guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1487,12 +1479,8 @@ impl Scp {
         context_id: String,
         name: String,
     ) -> napi::Result<()> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         if context_id.is_empty() {
             return Err(NapiError::from(ScpNapiError::Validation {
                 message: "context_id must not be empty".to_owned(),
@@ -1517,12 +1505,8 @@ impl Scp {
         owner_did: String,
         context_id: String,
     ) -> napi::Result<()> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let mut guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1538,12 +1522,8 @@ impl Scp {
     /// Per-instance equivalent of `petname_resolve_did`.
     #[napi(js_name = "petnameResolveDid")]
     pub fn petname_resolve_did(&self, owner_did: String, name: String) -> napi::Result<String> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1570,12 +1550,8 @@ impl Scp {
     /// Per-instance equivalent of `petname_resolve_context`.
     #[napi(js_name = "petnameResolveContext")]
     pub fn petname_resolve_context(&self, owner_did: String, name: String) -> napi::Result<String> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1603,12 +1579,8 @@ impl Scp {
     ) -> napi::Result<Option<String>> {
         use scp_identity::DID;
 
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -1628,12 +1600,8 @@ impl Scp {
         owner_did: String,
         context_id: String,
     ) -> napi::Result<Option<String>> {
-        if owner_did.is_empty() {
-            return Err(NapiError::from(ScpNapiError::Validation {
-                message: "owner_did must not be empty".to_owned(),
-                code: codes::VALID_7110.to_owned(),
-            }));
-        }
+        scp_ffi_common::validate::validate_did(&owner_did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let guard = self.inner.core.petname_maps().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
@@ -4309,6 +4277,54 @@ mod concurrency_cap_tests {
             scp_arc.inner.recovery_semaphore.available_permits(),
             RECOVERY_CONCURRENCY_CAP,
             "pool must return to full capacity once permits are dropped"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod petname_validation_tests {
+    use super::*;
+
+    /// Non-empty but syntactically invalid owner DIDs must be rejected by the
+    /// pre-existing petname ops, matching the strict `validate_did` gate the
+    /// WASM bridge and the §4.7 ops already enforce. Without this the native
+    /// bridges would be looser than WASM on the same operation.
+    #[test]
+    fn petname_malformed_owner_rejected() {
+        let scp = Scp::new().unwrap();
+        let bad = "not-a-did".to_owned();
+        assert!(
+            scp.petname_set(bad.clone(), "did:dht:z1".to_owned(), "test".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_remove(bad.clone(), "did:dht:z1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_set_context(bad.clone(), "ctx-1".to_owned(), "work".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_remove_context(bad.clone(), "ctx-1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_resolve_did(bad.clone(), "alice".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_resolve_context(bad.clone(), "work".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_get_for_did(bad.clone(), "did:dht:z1".to_owned())
+                .is_err()
+        );
+        assert!(
+            scp.petname_get_for_context(bad, "ctx-1".to_owned())
+                .is_err()
         );
     }
 }
