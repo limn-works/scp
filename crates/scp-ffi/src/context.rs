@@ -1221,25 +1221,37 @@ fn resolve_signing_key(
 /// Resolves the exporter DID's Ed25519 verification key for snapshot-signature
 /// verification on context import (spec §23.16.4, ADR-039).
 ///
-/// Tries the `#active` (operational) verification method first, then falls back
-/// to `#agent` (shared-DID agent key) per ADR-039 — either is a valid signer of
-/// an export. Fails closed: if no resolver is configured or neither key
-/// resolves, the import is rejected with [`error_codes::CTX_2093`] rather than
-/// proceeding with an unverifiable snapshot.
+/// Resolution order:
+/// 1. **Local identity custody** — if the exporter is a local identity (the
+///    common self-export case: a device importing a context it exported), the
+///    verifying key is derived directly from its `#active` custody signing key.
+///    This works even when the DID document has not been published to the DHT
+///    (in-memory identities are not auto-published).
+/// 2. **DID resolver** — otherwise resolve the exporter DID's `#active` (then
+///    `#agent`, ADR-039 shared-DID model) verification-method key.
+///
+/// Fails closed: if the exporter is neither local nor resolvable, the import is
+/// rejected with [`error_codes::CTX_2093`] rather than proceeding unverified.
 fn resolve_exporter_verifying_key(
     bi: &crate::runtime::PyBridgeInstance,
     exporter_did: &str,
 ) -> PyResult<ed25519_dalek::VerifyingKey> {
     use scp_core::crypto::ucan::validate::DidResolver;
 
+    // 1. Local identity: derive the verifying key from the custody signing key.
+    if let Ok(signing_key) = resolve_signing_key(bi, exporter_did) {
+        return Ok(signing_key.verifying_key());
+    }
+
+    // 2. Remote exporter: resolve via the DID resolver (#active then #agent).
     let resolver = crate::runtime::did_resolver(bi).ok_or_else(|| {
         PyRuntimeError::new_err(format!(
-            "{}: no DID resolver configured — cannot verify exporter snapshot signature",
+            "{}: exporter '{exporter_did}' is not a local identity and no DID resolver \
+             is configured — cannot verify exporter snapshot signature",
             scp_ffi_common::error_codes::CTX_2093
         ))
     })?;
 
-    // Try #active, then #agent (ADR-039 shared-DID model).
     let key_bytes = resolver
         .resolve_public_key_by_kid(exporter_did, "active")
         .or_else(|_| resolver.resolve_public_key_by_kid(exporter_did, "agent"))
