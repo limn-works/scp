@@ -120,6 +120,25 @@ impl CapabilityUri {
         &self.action
     }
 
+    /// Returns `true` if this capability's resource is an outlet stem
+    /// (`outlet_query` or `outlet_call`).
+    ///
+    /// Outlet stems are the ONLY capabilities that the §7.3.8 invocation
+    /// caveats (`max_calls`, `amount_max_*`, `rate_window`, `origin_kind`,
+    /// `valid_*`, `hours_of_day`, `days_of_week`, `allowed_adapters`,
+    /// `allowed_target_dids`, `input_schema`) scope to: those caveats bound
+    /// outlet *invocation* and are meaningless on a non-outlet capability
+    /// (e.g. `messages:write`). A token whose capability set contains NO
+    /// outlet stem therefore carries NO invocation caveats — its `nb` MUST be
+    /// `None`. This classifier is the single shared predicate used by both the
+    /// delegation mint (`build_delegated_caveats`) and the per-edge validator
+    /// (`verify_edge_attenuation`) to decide whether an edge is "outlet
+    /// scoped" so the two stay symmetric.
+    #[must_use]
+    pub fn is_outlet_stem(&self) -> bool {
+        matches!(self.resource.as_str(), "outlet_query" | "outlet_call")
+    }
+
     /// Returns `true` if this is a wildcard URI (`scp:ctx:*/{capability}`).
     #[must_use]
     pub const fn is_wildcard(&self) -> bool {
@@ -201,6 +220,37 @@ impl CapabilityUri {
         // Check for wildcard: {resource}:* covers all actions on this resource.
         ceiling.contains(&format!("{}:*", self.resource))
     }
+}
+
+/// Returns `true` if ANY attestation in `att` carries an outlet stem
+/// (`outlet_query:*` / `outlet_call:*`) resource.
+///
+/// This is the §7.3.8 "outlet-scoped" classifier for a whole capability set,
+/// shared verbatim by the delegation mint and the per-edge validator so the
+/// two never diverge. Invocation caveats are outlet-scoped: a token whose
+/// capability set contains no outlet stem carries no invocation caveats and
+/// MUST have `nb = None`. A token that DOES carry an outlet stem is on an
+/// "outlet edge" and its `nb` participates in the full §7.3.8 narrowing /
+/// `origin_kind`-materialization gate.
+///
+/// # Errors
+///
+/// Fail-closed: returns [`UcanError::MalformedToken`] if any attestation URI
+/// is unparseable, so a corrupted/forged attestation can never be silently
+/// treated as "non-outlet" (which would let it launder an ancestor's caveats).
+pub fn att_set_has_outlet_stem(att: &[super::Attenuation]) -> Result<bool, UcanError> {
+    for a in att {
+        let uri: CapabilityUri = a.with.parse().map_err(|e: UcanError| {
+            UcanError::MalformedToken(format!(
+                "unparseable capability URI '{}' while classifying outlet scope: {e}",
+                a.with
+            ))
+        })?;
+        if uri.is_outlet_stem() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl FromStr for CapabilityUri {

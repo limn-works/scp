@@ -203,6 +203,36 @@ fn build_delegated_caveats(
 
     let parent_nb = params.parent_token.payload.nb.as_ref();
 
+    // §7.3.8 outlet-scoping: invocation caveats (max_calls / amount_max_* /
+    // rate_window / origin_kind / valid_* / hours_of_day / days_of_week /
+    // allowed_adapters / allowed_target_dids / input_schema) bind outlet
+    // *invocation* and are meaningless on a non-outlet capability. A delegated
+    // capability set that contains NO outlet stem (outlet_query:* /
+    // outlet_call:*) therefore carries NO invocation caveats — its `nb` MUST
+    // be `None`. We must NOT fold an ancestor's outlet-scoped caveats onto a
+    // legitimately-narrowed non-outlet child: doing so would (a) attach
+    // nonsensical bounds to e.g. `messages:write`, and (b) wrongly reject the
+    // honest delegation when origin_kind cannot be materialized for a
+    // non-outlet stem (no stem family to infer). This is the symmetric mirror
+    // of the validator's outlet-edge gate in `verify_edge_attenuation`. Uses
+    // the SHARED stem classifier so mint and validator never diverge.
+    let child_is_outlet_edge = scp_protocol::crypto::ucan::capability::att_set_has_outlet_stem(
+        params.attenuated_capabilities,
+    )
+    .map_err(|e| {
+        UcanError::AttenuationViolation(format!("outlet-scope classification failed: {e}"))
+    })?;
+    if !child_is_outlet_edge {
+        // Non-outlet child: drop any inherited outlet-scoped caveats entirely.
+        // Do not materialize origin_kind, do not narrow. The child is
+        // genuinely caveat-free — identical to the pre-caveat baseline. A
+        // caller that supplied non-`None` caveats on a non-outlet delegation
+        // is supplying outlet-scoped fields that cannot apply; the strongest
+        // safe action is to drop them (the validator likewise ignores them on
+        // a non-outlet edge), keeping the child attenuated and well-formed.
+        return Ok(None);
+    }
+
     // The child's effective set is the parent's effective set overlaid with
     // the caller-supplied fields. When the caller supplies nothing, the
     // overlay is empty and the child inherits the parent verbatim (modulo
@@ -211,7 +241,6 @@ fn build_delegated_caveats(
         .caveats
         .clone()
         .unwrap_or_else(InvocationCaveats::empty);
-    let caller_supplied_caveats = params.caveats.is_some();
 
     // The parent's effective set: a root with no nb contributes no field
     // bounds (empty). A non-root parent (or a root minted WITH caveats)
@@ -250,14 +279,12 @@ fn build_delegated_caveats(
         )));
     }
 
-    // Fast path: caller supplied nothing AND there is nothing to
-    // materialize (no parent bounds, no inferable origin_kind). The child is
-    // genuinely caveat-free — e.g. a non-outlet delegation off an
-    // unconstrained root. Emitting `None` keeps such tokens identical to
-    // the pre-caveat baseline.
-    if !caller_supplied_caveats && parent_nb.is_none() && inherited_origin_kind.is_none() {
-        return Ok(None);
-    }
+    // At this point the delegated set is guaranteed to contain at least one
+    // outlet stem (the non-outlet edge returned `None` above), so
+    // `infer_origin_kind_from_capabilities` resolved to `Some` (a single-
+    // family outlet set) or already errored (mixed-stem). Therefore
+    // `inherited_origin_kind` is always `Some` here and the child's `nb` is
+    // always materialized — an outlet edge can never be silently caveat-free.
 
     let materialized = InvocationCaveats {
         amount_max_per_call: child_caveats
@@ -311,6 +338,63 @@ fn build_delegated_caveats(
         })?;
     }
     Ok(Some(validated))
+}
+
+/// Builds the ROOT token's `nb` (invocation caveats) per §7.3.8 outlet-scoping
+/// and the root stem/`origin_kind` agreement gate.
+///
+/// `None` preserves legacy caveat-free behaviour. Limit violations are mapped
+/// to [`UcanError::MalformedToken`] carrying the spec slug, which the bridge
+/// layer surfaces as `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`).
+///
+/// §7.3.8 outlet-scoping (consistent with [`build_delegated_caveats`]):
+/// invocation caveats are meaningful ONLY for outlet stems (`outlet_query:*` /
+/// `outlet_call:*`). A root whose capability set contains NO outlet stem
+/// carries NO invocation caveats — its `nb` is `None` even when the caller
+/// supplied a `caveats` value (those outlet-scoped fields cannot apply to a
+/// non-outlet capability such as `messages:write`).
+///
+/// When the root DOES carry outlet stems, the caveats are routed through
+/// [`scp_protocol::trust::caveats::InvocationCaveats::try_new_for_root`], which
+/// (1) rejects a mixed outlet-stem root (both `outlet_query` and `outlet_call`
+/// present — ambiguous `origin_kind`), (2) rejects an explicit `origin_kind`
+/// that contradicts the single stem family, and (3) runs the full
+/// `try_new` mint-limit check. This wires the previously-unused root stem/kind
+/// agreement gate into the mint path so a root can never be signed with an
+/// `origin_kind` disagreeing with its stems.
+///
+/// # Errors
+///
+/// Returns [`UcanError::MalformedToken`] when `try_new_for_root` rejects the
+/// caveats (mint-limit overflow, mixed-stem root, or stem/`origin_kind`
+/// mismatch).
+fn build_root_caveats(
+    caveats: Option<scp_protocol::trust::caveats::InvocationCaveats>,
+    parsed_stems: &[scp_protocol::context::roles::Capability],
+) -> Result<Option<scp_protocol::trust::caveats::InvocationCaveats>, UcanError> {
+    use scp_protocol::context::roles::Capability;
+
+    let root_has_outlet_stem = parsed_stems.iter().any(|cap| {
+        matches!(
+            cap,
+            Capability::OutletQuery(_)
+                | Capability::OutletQueryAll
+                | Capability::OutletCall(_)
+                | Capability::OutletCallAll
+        )
+    });
+
+    match caveats {
+        None => Ok(None),
+        Some(_) if !root_has_outlet_stem => Ok(None),
+        Some(caveats) => Ok(Some(
+            scp_protocol::trust::caveats::InvocationCaveats::try_new_for_root(
+                caveats,
+                parsed_stems,
+            )
+            .map_err(|e| UcanError::MalformedToken(format!("caveat-mint-limit-exceeded: {e}")))?,
+        )),
+    }
 }
 
 /// Builds the `fct` (facts) section, merging `scp_key_scope` when present.
@@ -481,6 +565,14 @@ pub async fn mint_ucan(
     // the canonical user-facing colon format (e.g. "outlet:call:*") to the
     // UCAN underscore format (e.g. resource="outlet_call", action="*") by
     // parsing through the Capability enum. See #1293.
+    //
+    // The parsed `Capability` enum values are also retained so the root-mint
+    // stem/origin_kind agreement check (`try_new_for_root`) can classify the
+    // outlet stem family below — the same single source of truth the
+    // delegation path uses, so a root can never be minted with an
+    // origin_kind that contradicts its stems or with mixed outlet stems.
+    let mut parsed_stems: Vec<scp_protocol::context::roles::Capability> =
+        Vec::with_capacity(params.capabilities.len());
     let parsed_caps: Vec<(String, String)> = params
         .capabilities
         .iter()
@@ -498,7 +590,9 @@ pub async fn mint_ucan(
                     ))
                 })?;
             let (resource, action) = capability.ucan_resource_action();
-            Ok::<(String, String), UcanError>((resource.into_owned(), action.into_owned()))
+            let owned = (resource.into_owned(), action.into_owned());
+            parsed_stems.push(capability);
+            Ok::<(String, String), UcanError>(owned)
         })
         .collect::<Result<Vec<_>, UcanError>>()?;
 
@@ -553,19 +647,9 @@ pub async fn mint_ucan(
     // is present (ADR-039 acceptance criterion 6).
     let fct = build_facts_with_key_scope(params.facts.as_ref(), params.key_scope.as_ref())?;
 
-    // SCP-OUT-023: validate caveats at mint time (§7.3.8 mint-limits) and
-    // route them into the payload's `nb` field. `None` preserves legacy
-    // caveat-free behaviour. Limit violations are mapped to
-    // `UcanError::MalformedToken` carrying the spec slug, which the bridge
-    // layer surfaces as `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`).
-    let nb = match params.caveats.clone() {
-        None => None,
-        Some(caveats) => Some(
-            scp_protocol::trust::caveats::InvocationCaveats::try_new(caveats).map_err(|e| {
-                UcanError::MalformedToken(format!("caveat-mint-limit-exceeded: {e}"))
-            })?,
-        ),
-    };
+    // SCP-OUT-023: validate caveats at mint time and route them into the
+    // payload's `nb` field (§7.3.8 outlet-scoping + root stem/kind agreement).
+    let nb = build_root_caveats(params.caveats.clone(), &parsed_stems)?;
 
     let payload = UcanPayload {
         iss: params.issuer_did.to_owned(),
@@ -4076,6 +4160,236 @@ mod tests {
         assert!(
             matches!(result, Err(UcanError::AttenuationViolation(_))),
             "mixed-stem origin_kind inference must reject at mint: {result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // §7.3.8 outlet-scoping: invocation caveats are OUTLET-scoped. A
+    // non-outlet delegation off an outlet-caveat root must NOT inherit the
+    // outlet caveats and must mint with child nb = None.
+    // -------------------------------------------------------------------
+
+    /// Mints a root carrying BOTH an outlet capability and a non-outlet
+    /// capability (`messages:write`) plus invocation caveats. The caveat
+    /// fields are outlet-scoped, so a later delegation of ONLY the non-outlet
+    /// capability must drop them.
+    async fn mint_mixed_cap_root_with_caveats(
+        custody: &InMemoryKeyCustody,
+        issuer_key: &KeyHandle,
+        issuer_did: &str,
+        aud: &str,
+        caveats: Option<InvocationCaveats>,
+    ) -> UcanToken {
+        let caps = vec![
+            "outlet_call:assistant".to_owned(),
+            "messages:write".to_owned(),
+        ];
+        let ceiling: HashSet<String> = [
+            "outlet_call:assistant".to_owned(),
+            "messages:write".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let params = MintParams {
+            issuer_did,
+            issuer_key,
+            audience_did: aud,
+            context_id: "ctx-caveat",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(ceiling),
+            caveats,
+        };
+        mint_ucan(&params, custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap()
+    }
+
+    /// HIGH (a): mixed-cap root `[outlet_call:assistant, messages:write]` with
+    /// outlet-scoped caveats. Delegating ONLY the non-outlet `messages:write`
+    /// (legit subset) with `caveats = None` must PASS and produce a child with
+    /// `nb = None` — the outlet-scoped caveats do not apply to a non-outlet
+    /// capability and MUST NOT be folded in (which would otherwise reject the
+    /// honest delegation on `OriginKindUnspecified`).
+    #[tokio::test]
+    async fn delegate_non_outlet_subset_off_outlet_caveat_root_drops_caveats() {
+        let (root_custody, root_key, root_did) = setup_custody().await;
+        let (mid_custody, mid_key, mid_did) = setup_custody().await;
+
+        let root_caveats = InvocationCaveats {
+            max_calls: Some(50),
+            origin_kind: Some(OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let root = mint_mixed_cap_root_with_caveats(
+            &root_custody,
+            &root_key,
+            &root_did,
+            &mid_did,
+            Some(root_caveats),
+        )
+        .await;
+        assert!(
+            root.payload.nb.is_some(),
+            "root carries outlet stem so its caveats are retained"
+        );
+
+        // Delegate ONLY messages:write (non-outlet).
+        let attenuated = vec![Attenuation {
+            with: "scp:ctx:ctx-caveat/messages:write".to_owned(),
+            can: "write".to_owned(),
+        }];
+        let params = DelegateParams {
+            parent_token: &root,
+            delegator_did: &mid_did,
+            delegator_key: &mid_key,
+            delegatee_did: "did:dht:z6MkLeaf",
+            attenuated_capabilities: &attenuated,
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(std::iter::once("messages:write".to_owned()).collect()),
+            caveats: None,
+        };
+        let child = delegate_ucan(&params, &mid_custody, &scp_primitives::SystemClock)
+            .await
+            .expect("honest non-outlet subset delegation must mint");
+        assert_eq!(
+            child.payload.nb, None,
+            "non-outlet child carries no invocation caveats (nb = None)"
+        );
+    }
+
+    /// HIGH (b): the SAME mixed-cap outlet-caveat root, delegating the OUTLET
+    /// capability `outlet_call:assistant`, still narrows and materializes
+    /// `origin_kind` (rule-4 holds for outlet edges). The child nb is present
+    /// and carries the inherited outlet-scoped bounds.
+    #[tokio::test]
+    async fn delegate_outlet_cap_off_outlet_caveat_root_still_narrows() {
+        let (root_custody, root_key, root_did) = setup_custody().await;
+        let (mid_custody, mid_key, mid_did) = setup_custody().await;
+
+        let root_caveats = InvocationCaveats {
+            max_calls: Some(50),
+            origin_kind: Some(OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let root = mint_mixed_cap_root_with_caveats(
+            &root_custody,
+            &root_key,
+            &root_did,
+            &mid_did,
+            Some(root_caveats),
+        )
+        .await;
+
+        let attenuated = vec![Attenuation {
+            with: "scp:ctx:ctx-caveat/outlet_call:assistant".to_owned(),
+            can: "*".to_owned(),
+        }];
+        let params = DelegateParams {
+            parent_token: &root,
+            delegator_did: &mid_did,
+            delegator_key: &mid_key,
+            delegatee_did: "did:dht:z6MkLeaf",
+            attenuated_capabilities: &attenuated,
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(std::iter::once("outlet_call:assistant".to_owned()).collect()),
+            caveats: None,
+        };
+        let child = delegate_ucan(&params, &mid_custody, &scp_primitives::SystemClock)
+            .await
+            .expect("outlet-cap delegation must mint");
+        let nb = child
+            .payload
+            .nb
+            .expect("outlet edge child carries complete nb");
+        assert_eq!(nb.max_calls, Some(50), "outlet caveat inherited");
+        assert_eq!(
+            nb.origin_kind,
+            Some(OutletKind::Action),
+            "origin_kind materialized on outlet edge"
+        );
+    }
+
+    /// MEDIUM: a root minted with ONLY non-outlet caps + caveats produces
+    /// `nb = None` (outlet-scoping: there is no outlet stem to which the
+    /// invocation caveats could apply). This is the chosen behavior consistent
+    /// with the HIGH fix.
+    #[tokio::test]
+    async fn mint_non_outlet_root_with_caveats_drops_to_none() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-caveat",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(std::iter::once("messages:write".to_owned()).collect()),
+            caveats: Some(InvocationCaveats {
+                max_calls: Some(50),
+                ..InvocationCaveats::empty()
+            }),
+        };
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .expect("non-outlet root with caveats mints with nb = None");
+        assert_eq!(
+            token.payload.nb, None,
+            "non-outlet root carries no invocation caveats"
+        );
+    }
+
+    /// MEDIUM: a root minted with an outlet stem and an explicit `origin_kind`
+    /// that CONTRADICTS the stem family is now REJECTED at mint via
+    /// `try_new_for_root` (previously unwired — the plain `try_new` path never
+    /// ran the stem/kind agreement check).
+    #[tokio::test]
+    async fn mint_outlet_root_with_contradicting_origin_kind_rejected() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["outlet_call:assistant".to_owned()];
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-caveat",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(std::iter::once("outlet_call:assistant".to_owned()).collect()),
+            // origin_kind = Query contradicts the outlet_call (Action) stem.
+            caveats: Some(InvocationCaveats {
+                max_calls: Some(50),
+                origin_kind: Some(OutletKind::Query),
+                ..InvocationCaveats::empty()
+            }),
+        };
+        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UcanError::MalformedToken(_)),
+            "root origin_kind contradicting its outlet stem must reject at mint: {err:?}"
         );
     }
 }

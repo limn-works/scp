@@ -1371,37 +1371,138 @@ fn verify_edge_attenuation(
     //     this edge — e.g. a non-outlet delegation off an unconstrained root).
     let parent_caveats = caveat_resolver.resolve_caveats(parent);
     let child_caveats = caveat_resolver.resolve_caveats(child);
+
+    // Invocation caveats are OUTLET-SCOPED (§7.3.8): they bound outlet
+    // invocation and are meaningless on a non-outlet capability. The "edge is
+    // outlet scoped" predicate is derived from the CHILD token's own
+    // attestations — the same classifier the delegation mint uses to decide
+    // whether to materialize/fold caveats. A child whose capability set
+    // carries NO outlet stem legitimately carries `nb = None` even if an
+    // ancestor bound outlet caveats: those caveats simply do not apply to the
+    // narrowed (non-outlet) capability set. This keeps mint and validator
+    // symmetric. Fail-closed on unparseable attestations.
+    let child_is_outlet_edge =
+        crate::crypto::ucan::capability::att_set_has_outlet_stem(&child.payload.att)?;
+
     match (parent_caveats, child_caveats) {
         (Some(parent_caveats), None) => {
-            // Reject. Narrowing the parent against an all-absent child
-            // surfaces the precise violation the dropped set caused — a
-            // `FieldRemoved { field }` for whichever bound the parent
-            // carried, or `OriginKindUnspecified` when the parent's only
-            // constraint was its origin_kind. This is guaranteed to be an
-            // `Err` (an absent child cannot faithfully carry a non-empty
-            // parent's effective set), so the per-edge check fails closed.
-            return Err(UcanError::CaveatAttenuationViolation(
-                parent_caveats
-                    .narrow(&crate::trust::caveats::InvocationCaveats::empty())
-                    .err()
-                    .unwrap_or(
-                        crate::trust::caveats::AttenuationViolation::OriginKindUnspecified {
-                            parent: parent_caveats.origin_kind,
-                        },
-                    ),
-            ));
+            if child_is_outlet_edge {
+                // Reject. The child carries outlet stems, so it IS an outlet
+                // edge and MUST re-materialize the parent's bound invocation
+                // caveats. An absent child here is laundering the ancestor's
+                // bound (the leaf could then widen). Narrowing the parent
+                // against an all-absent child surfaces the precise violation
+                // (a `FieldRemoved { field }` for whichever bound the parent
+                // carried, or `OriginKindUnspecified` when the parent's only
+                // constraint was its origin_kind). This is guaranteed to be an
+                // `Err`, so the per-edge check fails closed — the absent-nb
+                // launder stays closed for outlet edges.
+                return Err(UcanError::CaveatAttenuationViolation(
+                    parent_caveats
+                        .narrow(&crate::trust::caveats::InvocationCaveats::empty())
+                        .err()
+                        .unwrap_or(
+                            crate::trust::caveats::AttenuationViolation::OriginKindUnspecified {
+                                parent: parent_caveats.origin_kind,
+                            },
+                        ),
+                ));
+            }
+            // Non-outlet child off an outlet-caveat ancestor: `nb = None` is
+            // LEGITIMATE. The outlet-scoped caveats do not bind the narrowed
+            // non-outlet capability set, so there is nothing to re-materialize
+            // and nothing to launder. Accept.
         }
         (Some(parent_caveats), Some(child_caveats)) => {
             parent_caveats
                 .narrow(&child_caveats)
                 .map_err(UcanError::CaveatAttenuationViolation)?;
+            verify_origin_kind_matches_stem_family(&child_caveats, child_is_outlet_edge, child)?;
         }
         (None, Some(child_caveats)) => {
             crate::trust::caveats::InvocationCaveats::empty()
                 .narrow(&child_caveats)
                 .map_err(UcanError::CaveatAttenuationViolation)?;
+            verify_origin_kind_matches_stem_family(&child_caveats, child_is_outlet_edge, child)?;
         }
         (None, None) => {}
+    }
+    Ok(())
+}
+
+/// Defense-in-depth (§7.3.8 "`origin_kind` bound end-to-end"): when the child
+/// token is an outlet edge (its capability set carries outlet stems), assert
+/// that any `nb.origin_kind` it declares agrees with the stem family of its
+/// own attestations — `Action` for `outlet_call`, `Query` for `outlet_query`.
+/// A mixed-stem child (carries BOTH families) or a kind that contradicts its
+/// stem is rejected fail-closed.
+///
+/// This makes the §7.3.8 invariant true even against a self-signed token whose
+/// `nb.origin_kind` was hand-crafted to contradict its stem: no consumer
+/// trusts `nb.origin_kind` over the stem today (so this is currently inert in
+/// the happy path), but defense-in-depth closes the gap. For non-outlet edges
+/// there is no stem family to pin against, so this is a no-op.
+fn verify_origin_kind_matches_stem_family(
+    child_caveats: &crate::trust::caveats::InvocationCaveats,
+    child_is_outlet_edge: bool,
+    child: &UcanToken,
+) -> Result<(), UcanError> {
+    use crate::context::outlets::OutletKind;
+
+    if !child_is_outlet_edge {
+        return Ok(());
+    }
+    let Some(declared) = child_caveats.origin_kind else {
+        // Outlet edge with no declared origin_kind: the narrow() path already
+        // rejected this via OriginKindUnspecified for non-root edges. Nothing
+        // further to assert here.
+        return Ok(());
+    };
+
+    // Determine the stem family of the child's own attestations.
+    let mut has_query = false;
+    let mut has_action = false;
+    for a in &child.payload.att {
+        let uri: CapabilityUri = a.with.parse().map_err(|e: UcanError| {
+            UcanError::MalformedToken(format!(
+                "unparseable capability URI '{}' while cross-checking origin_kind: {e}",
+                a.with
+            ))
+        })?;
+        match uri.resource() {
+            "outlet_query" => has_query = true,
+            "outlet_call" => has_action = true,
+            _ => {}
+        }
+    }
+
+    let inferred = match (has_query, has_action) {
+        (true, false) => OutletKind::Query,
+        (false, true) => OutletKind::Action,
+        (true, true) => {
+            return Err(UcanError::CaveatAttenuationViolation(
+                crate::trust::caveats::AttenuationViolation::OriginKindMismatch {
+                    parent: declared,
+                    child: declared,
+                },
+            ));
+        }
+        // Classifier said outlet edge but neither family found: impossible
+        // given `att_set_has_outlet_stem` returned true. Fail closed.
+        (false, false) => {
+            return Err(UcanError::MalformedToken(
+                "outlet-edge classifier/stem-family disagreement".to_owned(),
+            ));
+        }
+    };
+
+    if declared != inferred {
+        return Err(UcanError::CaveatAttenuationViolation(
+            crate::trust::caveats::AttenuationViolation::OriginKindMismatch {
+                parent: inferred,
+                child: declared,
+            },
+        ));
     }
     Ok(())
 }
@@ -1942,6 +2043,127 @@ mod tests {
                 )
             ),
             "expected OriginKindUnspecified, got {err:?}"
+        );
+    }
+
+    /// HIGH (d-accept): §7.3.8 outlet-scoping at the validator. A child whose
+    /// capability set carries NO outlet stem (`messages:write`) legitimately
+    /// carries `nb = None` even when its parent bound outlet-scoped caveats:
+    /// those caveats do not apply to a non-outlet capability, so there is
+    /// nothing to re-materialize and nothing to launder. The edge is ACCEPTED.
+    #[test]
+    fn token_nb_chain_non_outlet_child_none_off_outlet_caveat_parent_accepts() {
+        let parent = synthetic_token_with_nb(
+            "PARENT",
+            &[
+                "scp:ctx:abc/outlet_call:assistant",
+                "scp:ctx:abc/messages:write",
+            ],
+            &[],
+            Some(InvocationCaveats {
+                max_calls: Some(10),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        );
+        // Child narrows to ONLY the non-outlet capability and carries no nb.
+        let child =
+            synthetic_token_with_nb("CHILD", &["scp:ctx:abc/messages:write"], &["PARENT"], None);
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver).expect(
+            "non-outlet child with nb=None off an outlet-caveat parent is a legitimate \
+             attenuation and must be accepted",
+        );
+    }
+
+    /// HIGH (d-reject): the launder stays CLOSED for outlet edges. A child
+    /// that DOES carry an outlet stem (`outlet_call:assistant`) but omits `nb`
+    /// while its parent bound outlet caveats is laundering the bound and MUST
+    /// be rejected — the outlet-scoping accept rule fires ONLY for non-outlet
+    /// children.
+    #[test]
+    fn token_nb_chain_outlet_child_none_off_outlet_caveat_parent_rejects() {
+        let parent = synthetic_token_with_nb(
+            "PARENT",
+            &[
+                "scp:ctx:abc/outlet_call:assistant",
+                "scp:ctx:abc/messages:write",
+            ],
+            &[],
+            Some(InvocationCaveats {
+                max_calls: Some(10),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        );
+        // Child retains the OUTLET capability but drops nb — launder attempt.
+        let child = synthetic_token_with_nb(
+            "CHILD",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &["PARENT"],
+            None,
+        );
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        let err = verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver)
+            .expect_err("outlet child dropping nb on a constrained edge MUST reject (launder)");
+        match err {
+            UcanError::CaveatAttenuationViolation(
+                AttenuationViolation::OriginKindUnspecified { .. }
+                | AttenuationViolation::FieldRemoved {
+                    field: crate::trust::caveats::CaveatField::MaxCalls,
+                },
+            ) => {}
+            other => {
+                panic!("expected OriginKindUnspecified or FieldRemoved(MaxCalls), got {other:?}")
+            }
+        }
+    }
+
+    /// LOW (defense-in-depth): a self-signed outlet-stem child whose
+    /// `nb.origin_kind` CONTRADICTS its own stem family (declares `Query` while
+    /// carrying an `outlet_call` = Action stem) is REJECTED at validate, even
+    /// when the parent imposes no origin_kind. This makes §7.3.8's "origin_kind
+    /// bound end-to-end" true against a hand-crafted token whose nb the
+    /// narrow() equality rule alone would not catch (parent None vs child Some
+    /// is admissible there).
+    #[test]
+    fn token_nb_chain_outlet_child_origin_kind_contradicts_stem_rejects() {
+        // Parent (root) carries no nb — narrow() cannot catch the stem/kind
+        // disagreement on its own.
+        let parent =
+            synthetic_token_with_nb("PARENT", &["scp:ctx:abc/outlet_call:assistant"], &[], None);
+        let child = synthetic_token_with_nb(
+            "CHILD",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &["PARENT"],
+            Some(InvocationCaveats {
+                max_calls: Some(5),
+                // origin_kind = Query contradicts the outlet_call (Action) stem.
+                origin_kind: Some(crate::context::outlets::OutletKind::Query),
+                ..InvocationCaveats::empty()
+            }),
+        );
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        let err = verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver).expect_err(
+            "outlet child whose origin_kind contradicts its stem family must reject at validate",
+        );
+        assert!(
+            matches!(
+                err,
+                UcanError::CaveatAttenuationViolation(
+                    AttenuationViolation::OriginKindMismatch { .. }
+                )
+            ),
+            "expected OriginKindMismatch from the stem/kind cross-check, got {err:?}"
         );
     }
 
