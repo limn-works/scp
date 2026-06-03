@@ -2417,7 +2417,9 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
      * `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
      * handle is passed explicitly for key material while `did` names the
-     * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom).
+     * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom). The
+     * `did` is validated for well-formedness and MUST equal the supplied
+     * identity's own DID — the recorded signer is always the actual signer.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2640,8 +2642,13 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * The DID document published to the DHT is unaffected; this only
      * releases the bridge's in-memory state.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically
+     * valid DID, mirroring the PyO3 reference bridge's `identity_remove`.
      */
-    func identityRemove(did: String) 
+    func identityRemove(did: String) throws 
     
     /**
      * Removes a DID from this instance's SCP-side identity registry if
@@ -2652,8 +2659,14 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * for the DID are dropped alongside the identity. Companion to
      * [`Scp::identity_remove`] (which is unconditional), matching the NAPI
      * bridge's `identity_remove_if_present` semantics.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically
+     * valid DID, mirroring the PyO3 reference bridge's
+     * `identity_remove_if_present`.
      */
-    func identityRemoveIfPresent(did: String)  -> Bool
+    func identityRemoveIfPresent(did: String) throws  -> Bool
     
     /**
      * Per-instance equivalent of the free-function
@@ -4427,7 +4440,9 @@ open func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: U
      * the checkpoint's `sender_did`. Unlike the PyO3/NAPI/WASM bridges, the
      * `UniFFI` bridge has no DID-keyed identity registry, so the `Identity`
      * handle is passed explicitly for key material while `did` names the
-     * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom).
+     * member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom). The
+     * `did` is validated for well-formedness and MUST equal the supplied
+     * identity's own DID — the recorded signer is always the actual signer.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -4975,8 +4990,13 @@ open func identityMigrate(identity: Identity)async throws  -> Identity  {
      *
      * The DID document published to the DHT is unaffected; this only
      * releases the bridge's in-memory state.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically
+     * valid DID, mirroring the PyO3 reference bridge's `identity_remove`.
      */
-open func identityRemove(did: String)  {try! rustCall() {
+open func identityRemove(did: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_identity_remove(self.uniffiClonePointer(),
         FfiConverterString.lower(did),$0
     )
@@ -4992,9 +5012,15 @@ open func identityRemove(did: String)  {try! rustCall() {
      * for the DID are dropped alongside the identity. Companion to
      * [`Scp::identity_remove`] (which is unconditional), matching the NAPI
      * bridge's `identity_remove_if_present` semantics.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` when `did` is not a syntactically
+     * valid DID, mirroring the PyO3 reference bridge's
+     * `identity_remove_if_present`.
      */
-open func identityRemoveIfPresent(did: String) -> Bool  {
-    return try!  FfiConverterBool.lift(try! rustCall() {
+open func identityRemoveIfPresent(did: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_identity_remove_if_present(self.uniffiClonePointer(),
         FfiConverterString.lower(did),$0
     )
@@ -14919,7 +14945,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint() != 31004) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint_by_did() != 53804) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint_by_did() != 25225) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 26119) {
@@ -14994,10 +15020,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove() != 3517) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove() != 10016) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_if_present() != 9273) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_if_present() != 7918) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 51771) {

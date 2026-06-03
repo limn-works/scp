@@ -559,17 +559,24 @@ public extension SCP {
     /// Forwards to ``Scp/identityRemove`` on ``inner``.
     ///
     /// Removes the DID from this instance's SCP-side identity registry.
-    /// Idempotent — succeeds silently when the DID is not present.
-    func identityRemove(did: String) {
-        inner.identityRemove(did: did)
+    /// Idempotent — succeeds silently when the DID is a syntactically valid
+    /// DID not present in the registry.
+    ///
+    /// - Throws: ``ScpError`` when `did` is not a syntactically valid DID,
+    ///   mirroring the PyO3 reference bridge's `identity_remove`.
+    func identityRemove(did: String) throws {
+        try inner.identityRemove(did: did)
     }
 
     /// Forwards to ``Scp/identityRemoveIfPresent`` on ``inner``.
     ///
     /// Returns `true` if the identity was found and removed, `false` if the
     /// DID was not in the registry.
-    func identityRemoveIfPresent(did: String) -> Bool {
-        inner.identityRemoveIfPresent(did: did)
+    ///
+    /// - Throws: ``ScpError`` when `did` is not a syntactically valid DID,
+    ///   mirroring the PyO3 reference bridge's `identity_remove_if_present`.
+    func identityRemoveIfPresent(did: String) throws -> Bool {
+        try inner.identityRemoveIfPresent(did: did)
     }
 
     // `identityResolve`, `identityVerifyDeviceAttestation`, and

@@ -842,21 +842,40 @@ impl Scp {
     /// Per-instance equivalent of `identity_remove`.
     ///
     /// Drops retained key material for the DID. Idempotent — succeeds
-    /// silently when the DID is not in the registry.
+    /// silently when the DID is a syntactically valid DID not present in
+    /// the registry.
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error when `did` is not a syntactically valid
+    /// DID, mirroring the `PyO3` reference bridge's `identity_remove`.
     #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "identityRemove")]
-    pub fn identity_remove(&self, did: String) {
+    pub fn identity_remove(&self, did: String) -> napi::Result<()> {
+        scp_ffi_common::validate::validate_did(&did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         crate::runtime::remove_identity(&self.inner, &did);
+        Ok(())
     }
 
     /// Per-instance equivalent of `identity_remove_if_present`.
     ///
     /// Returns `true` if the identity was present and removed.
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error when `did` is not a syntactically valid
+    /// DID, mirroring the `PyO3` reference bridge's
+    /// `identity_remove_if_present`.
     #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "identityRemoveIfPresent")]
-    #[must_use]
-    pub fn identity_remove_if_present(&self, did: String) -> bool {
-        crate::runtime::remove_identity_if_present(&self.inner, &did)
+    pub fn identity_remove_if_present(&self, did: String) -> napi::Result<bool> {
+        scp_ffi_common::validate::validate_did(&did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        Ok(crate::runtime::remove_identity_if_present(
+            &self.inner,
+            &did,
+        ))
     }
 
     /// Per-instance equivalent of `identity_attest_device`.
@@ -4325,6 +4344,48 @@ mod petname_validation_tests {
         assert!(
             scp.petname_get_for_context(bad, "ctx-1".to_owned())
                 .is_err()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "allow_in_memory_custody"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod identity_remove_validation_tests {
+    use super::*;
+
+    /// `identity_remove` and `identity_remove_if_present` must reject a
+    /// non-empty but syntactically invalid DID via the shared `validate_did`
+    /// gate — matching the `PyO3` reference bridge — before touching the
+    /// registry. Without this the NAPI bridge would be looser than `PyO3` and
+    /// WASM on the same operation. Mirrors `petname_malformed_owner_rejected`.
+    #[test]
+    fn identity_remove_malformed_did_rejected() {
+        let scp = Scp::new().unwrap();
+        let bad = "not-a-did".to_owned();
+        assert!(
+            scp.identity_remove(bad.clone()).is_err(),
+            "identity_remove must reject a malformed DID"
+        );
+        assert!(
+            scp.identity_remove_if_present(bad).is_err(),
+            "identity_remove_if_present must reject a malformed DID"
+        );
+    }
+
+    /// A syntactically valid DID that is not registered is accepted: the
+    /// validation gate passes and the op is a no-op (idempotent removal).
+    /// `identity_remove` returns `Ok(())`; `identity_remove_if_present`
+    /// returns `Ok(false)`.
+    #[test]
+    fn identity_remove_valid_absent_did_is_ok_noop() {
+        let scp = Scp::new().unwrap();
+        let valid_absent = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest".to_owned();
+        scp.identity_remove(valid_absent.clone())
+            .expect("valid DID must not be rejected by identity_remove");
+        assert!(
+            !scp.identity_remove_if_present(valid_absent)
+                .expect("valid DID must not be rejected by identity_remove_if_present"),
+            "removing an unregistered DID must report false"
         );
     }
 }

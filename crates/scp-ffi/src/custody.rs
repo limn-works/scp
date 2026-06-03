@@ -507,9 +507,13 @@ impl KeyCustody for PyCallbackKeyCustody {
         key: &KeyHandle,
         peer_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
-        let shared: Vec<u8> =
+        // Wrap the raw shared secret in `Zeroizing` so the intermediate heap
+        // buffer is wiped on drop once it has been copied into `SharedSecret`
+        // (defense-in-depth, matching `export_ed25519_signing_key`; ADR-006).
+        let shared: zeroize::Zeroizing<Vec<u8>> = zeroize::Zeroizing::new(
             self.provider
-                .call_str_bytes("dh_agree", &key.id().to_string(), peer_public)?;
+                .call_str_bytes("dh_agree", &key.id().to_string(), peer_public)?,
+        );
         Ok(SharedSecret::new(Self::expect_32("dh_agree", &shared)?))
     }
 
@@ -564,11 +568,15 @@ impl KeyCustody for PyCallbackKeyCustody {
         // The Python callback protocol does not expose a distinct birational
         // conversion; the provider manages key types internally, so delegate
         // to dh_agree (mirrors the UniFFI CallbackKeyCustody contract).
-        let shared: Vec<u8> = self.provider.call_str_bytes(
-            "dh_agree",
-            &ed25519_handle.id().to_string(),
-            peer_x25519_public,
-        )?;
+        // Wrap the raw shared secret in `Zeroizing` so the intermediate heap
+        // buffer is wiped on drop once it has been copied into `SharedSecret`
+        // (defense-in-depth, matching `export_ed25519_signing_key`; ADR-006).
+        let shared: zeroize::Zeroizing<Vec<u8>> =
+            zeroize::Zeroizing::new(self.provider.call_str_bytes(
+                "dh_agree",
+                &ed25519_handle.id().to_string(),
+                peer_x25519_public,
+            )?);
         Ok(SharedSecret::new(Self::expect_32(
             "ed25519_to_x25519_agree",
             &shared,

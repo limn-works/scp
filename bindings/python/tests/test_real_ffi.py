@@ -204,12 +204,24 @@ class TestIdentity:
         assert await scp.identity_remove_if_present(identity.did) is False
 
     async def test_remove_nonexistent_is_silent(self, scp: SCP):
-        # Removing a DID that was never registered is a silent no-op,
-        # matching the cross-bridge `identity_remove` contract.
+        # Removing a DID that was never registered is a silent no-op (for a
+        # syntactically valid DID), matching the cross-bridge `identity_remove`
+        # contract.
         missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest"
         result = await scp.identity_remove(missing)
         assert result is None
         assert await scp.identity_remove_if_present(missing) is False
+
+    async def test_remove_rejects_malformed_did(self, scp: SCP):
+        # Both removal ops gate on the shared `validate_did` validator (the
+        # PyO3 reference bridge) before touching the registry. A non-empty but
+        # syntactically invalid DID raises the native ValidationError rather
+        # than silently no-op'ing. Mirrors the petname malformed-owner tests.
+        bad = "not-a-did"
+        with pytest.raises(_scp_core.ValidationError):
+            await scp.identity_remove(bad)
+        with pytest.raises(_scp_core.ValidationError):
+            await scp.identity_remove_if_present(bad)
 
     async def test_create_with_agent_key(self, scp: SCP):
         identity = await scp.identity_create_with_agent_key(CustodyType.IN_MEMORY)

@@ -7872,10 +7872,17 @@ impl Scp {
     ///
     /// The DID document published to the DHT is unaffected; this only
     /// releases the bridge's in-memory state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Validation` when `did` is not a syntactically
+    /// valid DID, mirroring the `PyO3` reference bridge's `identity_remove`.
     #[cfg(feature = "allow_in_memory_custody")]
-    pub fn identity_remove(&self, did: String) {
+    pub fn identity_remove(&self, did: String) -> Result<(), ScpError> {
+        validate_did(&did)?;
         identity_custody_registry(&self.inner).remove(&did);
         identity_link_attestation_registry(&self.inner).remove(&did);
+        Ok(())
     }
 
     /// Removes a DID from this instance's SCP-side identity registry if
@@ -7886,14 +7893,20 @@ impl Scp {
     /// for the DID are dropped alongside the identity. Companion to
     /// [`Scp::identity_remove`] (which is unconditional), matching the NAPI
     /// bridge's `identity_remove_if_present` semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Validation` when `did` is not a syntactically
+    /// valid DID, mirroring the `PyO3` reference bridge's
+    /// `identity_remove_if_present`.
     #[cfg(feature = "allow_in_memory_custody")]
-    #[must_use]
-    pub fn identity_remove_if_present(&self, did: String) -> bool {
+    pub fn identity_remove_if_present(&self, did: String) -> Result<bool, ScpError> {
+        validate_did(&did)?;
         let removed = identity_custody_registry(&self.inner)
             .remove(&did)
             .is_some();
         identity_link_attestation_registry(&self.inner).remove(&did);
-        removed
+        Ok(removed)
     }
 
     // ===== Context lifecycle — per-instance methods on `Scp` =====
@@ -17035,6 +17048,36 @@ mod tests {
         assert!(
             scp.petname_get_for_context(bad, "ctx-1".to_owned())
                 .is_err()
+        );
+    }
+
+    /// `identity_remove` / `identity_remove_if_present` must reject a
+    /// non-empty but syntactically invalid DID via the shared `validate_did`
+    /// gate — matching the `PyO3` reference bridge — before touching the
+    /// registry. A syntactically valid but absent DID is accepted as an
+    /// idempotent no-op. Mirrors `petname_malformed_owner_rejected_uniffi`.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[test]
+    fn identity_remove_malformed_did_rejected_uniffi() {
+        let scp = scp_test();
+        let bad = "not-a-did".to_owned();
+        assert!(
+            scp.identity_remove(bad.clone()).is_err(),
+            "identity_remove must reject a malformed DID"
+        );
+        assert!(
+            scp.identity_remove_if_present(bad).is_err(),
+            "identity_remove_if_present must reject a malformed DID"
+        );
+
+        // Accept side: a valid but unregistered DID is a no-op success.
+        let valid_absent = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest".to_owned();
+        scp.identity_remove(valid_absent.clone())
+            .expect("valid DID must not be rejected by identity_remove");
+        assert!(
+            !scp.identity_remove_if_present(valid_absent)
+                .expect("valid DID must not be rejected by identity_remove_if_present"),
+            "removing an unregistered DID must report false"
         );
     }
 

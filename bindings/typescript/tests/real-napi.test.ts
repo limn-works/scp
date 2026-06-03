@@ -291,6 +291,15 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(napi.identityRemoveIfPresent(missing)).toBe(false);
     });
 
+    test("removing a malformed DID is rejected", () => {
+      // Both removal ops gate on the shared `validate_did` validator before
+      // touching the registry, matching the PyO3 reference bridge. A
+      // syntactically invalid DID throws rather than silently no-op'ing.
+      const bad = "not-a-did";
+      expect(() => napi.identityRemove(bad)).toThrow();
+      expect(() => napi.identityRemoveIfPresent(bad)).toThrow();
+    });
+
     test("generates and verifies a device attestation", async () => {
       const handle = await napi.identityCreate("in_memory");
       const token = await napi.identityAttestDevice(handle.did);

@@ -72,6 +72,22 @@
           "swift": true
         },
         {
+          "name": "identity_remove",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Per-instance removal of retained SCP-side identity state for a DID. Surfaced in all four SDKs (scp.identityRemove / identity_remove). Validates the DID via the shared validate_did gate on every bridge (pyo3/napi/uniffi/wasm). Exported by all four bridges; see scripts/bridge-aliases.json (wasm_required true)."
+        },
+        {
+          "name": "identity_remove_if_present",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Conditional companion to identity_remove reporting whether the DID was present. Surfaced in all four SDKs. Validates the DID via the shared validate_did gate on every bridge. Exported by all four bridges; see scripts/bridge-aliases.json (wasm_required true)."
+        },
+        {
           "name": "migrate",
           "python": true,
           "typescript": true,
@@ -950,6 +966,14 @@
             "python": "no explicit disconnect wrapper exposed",
             "typescript": "no explicit disconnect wrapper exposed"
           }
+        },
+        {
+          "name": "configure_local_transport",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Attaches the in-process loopback transport for a local DID. Surfaced in all four SDKs (scp.configureLocalTransport / configure_local_transport) and validates the DID at the boundary. Exported by the pyo3/napi/uniffi bridges; the wasm bridge is exempt (no scp-runtime LocalTransportProvider / ContextManager on wasm32 per ADR-034). See the wasm exemption in scripts/bridge-aliases.json."
         }
       ]
     },

@@ -288,12 +288,16 @@ impl KeyCustody for NapiCallbackKeyCustody {
         key: &KeyHandle,
         peer_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
-        let shared = self
-            .tsfns
-            .dh_agree
-            .call_async((key.id().to_string(), peer_public.to_vec()))
-            .await
-            .map_err(|e| Self::map_call_err("dh_agree", &e))?;
+        // Wrap the raw shared secret in `Zeroizing` so the intermediate heap
+        // buffer is wiped on drop once it has been copied into `SharedSecret`
+        // (defense-in-depth, matching `export_ed25519_signing_key`; ADR-006).
+        let shared = zeroize::Zeroizing::new(
+            self.tsfns
+                .dh_agree
+                .call_async((key.id().to_string(), peer_public.to_vec()))
+                .await
+                .map_err(|e| Self::map_call_err("dh_agree", &e))?,
+        );
         Ok(SharedSecret::new(Self::expect_32("dh_agree", &shared)?))
     }
 
@@ -354,12 +358,16 @@ impl KeyCustody for NapiCallbackKeyCustody {
         // The JS callback protocol does not expose a distinct birational
         // conversion; the provider manages key types internally, so delegate
         // to dh_agree (matches the UniFFI/PyO3 contract).
-        let shared = self
-            .tsfns
-            .dh_agree
-            .call_async((ed25519_handle.id().to_string(), peer_x25519_public.to_vec()))
-            .await
-            .map_err(|e| Self::map_call_err("dh_agree", &e))?;
+        // Wrap the raw shared secret in `Zeroizing` so the intermediate heap
+        // buffer is wiped on drop once it has been copied into `SharedSecret`
+        // (defense-in-depth, matching `export_ed25519_signing_key`; ADR-006).
+        let shared = zeroize::Zeroizing::new(
+            self.tsfns
+                .dh_agree
+                .call_async((ed25519_handle.id().to_string(), peer_x25519_public.to_vec()))
+                .await
+                .map_err(|e| Self::map_call_err("dh_agree", &e))?,
+        );
         Ok(SharedSecret::new(Self::expect_32(
             "ed25519_to_x25519_agree",
             &shared,

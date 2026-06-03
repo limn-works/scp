@@ -31,9 +31,9 @@ final class IdentityTests: XCTestCase {
         let identity = try await scp.identityCreate(custody: "in_memory")
         let did = identity.did()
 
-        scp.identityRemove(did: did)
+        try scp.identityRemove(did: did)
         XCTAssertFalse(
-            scp.identityRemoveIfPresent(did: did),
+            try scp.identityRemoveIfPresent(did: did),
             "DID must be absent after identityRemove"
         )
     }
@@ -45,23 +45,41 @@ final class IdentityTests: XCTestCase {
         let did = identity.did()
 
         XCTAssertTrue(
-            scp.identityRemoveIfPresent(did: did),
+            try scp.identityRemoveIfPresent(did: did),
             "first removal must report the identity was present"
         )
         XCTAssertFalse(
-            scp.identityRemoveIfPresent(did: did),
+            try scp.identityRemoveIfPresent(did: did),
             "second removal must report the identity was already gone"
         )
     }
 
-    /// Removing a DID that was never registered is a silent no-op, matching
-    /// the cross-bridge `identity_remove` contract.
-    func testRemoveNonexistentIsSilent() {
+    /// Removing a DID that was never registered is a silent no-op (for a
+    /// syntactically valid DID), matching the cross-bridge `identity_remove`
+    /// contract.
+    func testRemoveNonexistentIsSilent() throws {
         let missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest"
-        scp.identityRemove(did: missing)
+        try scp.identityRemove(did: missing)
         XCTAssertFalse(
-            scp.identityRemoveIfPresent(did: missing),
+            try scp.identityRemoveIfPresent(did: missing),
             "removing an unregistered DID must report false, not throw"
         )
+    }
+
+    /// A non-empty but syntactically invalid DID is rejected by both removal
+    /// ops via the shared `validate_did` gate, matching the PyO3 reference
+    /// bridge and the petname `*RejectsMalformedOwner` parity tests.
+    func testRemoveRejectsMalformedDid() {
+        let bad = "not-a-did"
+        func assertValidation(_ body: () throws -> Void) {
+            XCTAssertThrowsError(try body()) { error in
+                guard case ScpError.Validation = error else {
+                    XCTFail("expected ScpError.Validation, got \(error)")
+                    return
+                }
+            }
+        }
+        assertValidation { try self.scp.identityRemove(did: bad) }
+        assertValidation { _ = try self.scp.identityRemoveIfPresent(did: bad) }
     }
 }

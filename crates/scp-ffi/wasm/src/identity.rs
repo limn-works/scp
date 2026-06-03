@@ -568,6 +568,31 @@ fn pre_rotation_destroy_after_migration(
     })
 }
 
+/// Removes the pre-rotation entry under `handle`, zeroizing its private
+/// bytes. Unlike [`pre_rotation_destroy_after_migration`], this does NOT
+/// return the private key — it is the plain-removal counterpart used when
+/// an identity is dropped from the registry (`identity_remove` /
+/// `identity_remove_if_present`) before it ever migrates.
+///
+/// The `PreRotationKeyEntry` implements `ZeroizeOnDrop`, so the removed
+/// entry's Ed25519 private seed is wiped from WASM linear memory when it
+/// drops at end-of-scope. This mirrors the native bridges, where the
+/// pre-rotation custody provider is an `Arc` field on the registry entry:
+/// dropping the entry drops the custody and zeroizes its keys.
+///
+/// Idempotent — a no-op when `handle` is not present (e.g. an identity
+/// removed twice, or a record whose handle was already consumed by a
+/// migration). No error is returned: removal is a best-effort cleanup,
+/// not a fallible operation gated on the key still existing.
+fn pre_rotation_destroy(handle: u64) {
+    PRE_ROTATION_REGISTRY.with(|reg| {
+        // `HashMap::remove` returns the entry by value; it drops at the
+        // end of this statement, and `ZeroizeOnDrop` wipes both key
+        // halves. Binding to `_` would drop immediately all the same.
+        let _zeroized_on_drop = reg.borrow_mut().remove(&handle);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // HMAC helpers (pub(crate) — used by manager.rs for export/import integrity)
 // ---------------------------------------------------------------------------
@@ -3697,21 +3722,55 @@ pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> 
 
 /// Removes a DID from the WASM-local SCP-side identity registry.
 ///
-/// Drops the retained identity record (key material, pre-rotation handle)
-/// and any link attestations for `did`. Idempotent — does nothing when the
-/// DID is not in the registry, matching the NAPI bridge's `identity_remove`
-/// semantics (where a single registry entry bundles key material and
-/// attestations).
+/// Validates `did` for the registry-removal ops, returning a `JsError`
+/// (constructible off-wasm, unlike `JsValue`) so the rejection path is
+/// host-testable. Delegates to the shared `validate_did` validator — the
+/// same one the `PyO3` reference bridge's `identity_remove` op uses — so all
+/// four bridges enforce identical DID syntax before mutating state.
+///
+/// # Errors
+///
+/// Returns a `Validation` error when `did` is not a syntactically valid
+/// DID (`did:{method}:{id}`, lowercase method, no control characters,
+/// within length bounds).
+fn validate_remove_did(did: &str) -> Result<(), JsError> {
+    scp_ffi_common::validate::validate_did(did).map_err(|e| ScpWasmError::from(e).into_js())
+}
+
+/// Drops the retained identity record and link attestations for `did`.
+///
+/// Idempotent — does nothing when the DID is not in the registry, matching
+/// the NAPI bridge's `identity_remove` semantics (where a single registry
+/// entry bundles key material and attestations).
+///
+/// When the record is an [`IdentityRecord::Local`], its pre-rotation key
+/// (the recovery seed referenced by `pre_rotation_handle`) is destroyed
+/// from `PRE_ROTATION_REGISTRY` and any `MIGRATION_LINKS` forward-link for
+/// the DID is removed, so a removed identity leaves no private key material
+/// resident in WASM linear memory. The native bridges hold pre-rotation
+/// custody as an `Arc` field on the registry entry, so their `remove`
+/// already zeroizes it; this replicates that contract on WASM.
+///
+/// # Errors
+///
+/// Returns a `Validation` error when `did` is not a syntactically valid
+/// DID, mirroring the `PyO3` reference bridge's `identity_remove`.
 ///
 /// See spec §3.5.1 (link attestations).
 #[wasm_bindgen]
-pub fn identity_remove(did: String) {
+pub fn identity_remove(did: String) -> Result<(), JsError> {
+    validate_remove_did(&did)?;
+    destroy_pre_rotation_for_did(&did);
     IDENTITY_REGISTRY.with(|reg| {
         reg.borrow_mut().remove(&did);
     });
     LINK_ATTESTATIONS.with(|reg| {
         reg.borrow_mut().remove(&did);
     });
+    MIGRATION_LINKS.with(|links| {
+        links.borrow_mut().remove(&did);
+    });
+    Ok(())
 }
 
 /// Removes a DID from the WASM-local SCP-side identity registry if present,
@@ -3719,19 +3778,50 @@ pub fn identity_remove(did: String) {
 ///
 /// Returns `true` if the identity was found in the registry and removed,
 /// `false` if the DID was not present. Any link attestations for the DID
-/// are dropped alongside the identity. Companion to [`identity_remove`]
-/// (which is unconditional), matching the NAPI bridge's
-/// `identity_remove_if_present` semantics.
+/// are dropped alongside the identity, and — when the record is an
+/// [`IdentityRecord::Local`] — its pre-rotation recovery seed is destroyed
+/// from `PRE_ROTATION_REGISTRY` and any `MIGRATION_LINKS` forward-link is
+/// removed, exactly as [`identity_remove`] does. Companion to
+/// [`identity_remove`] (which is unconditional), matching the NAPI bridge's
+/// `identity_remove_if_present` semantics. Stays a no-op (returning
+/// `false`) when the DID is absent.
+///
+/// # Errors
+///
+/// Returns a `Validation` error when `did` is not a syntactically valid
+/// DID, mirroring the `PyO3` reference bridge's `identity_remove_if_present`.
 ///
 /// See spec §3.5.1 (link attestations).
-#[must_use]
 #[wasm_bindgen]
-pub fn identity_remove_if_present(did: String) -> bool {
+pub fn identity_remove_if_present(did: String) -> Result<bool, JsError> {
+    validate_remove_did(&did)?;
+    destroy_pre_rotation_for_did(&did);
     let removed = IDENTITY_REGISTRY.with(|reg| reg.borrow_mut().remove(&did).is_some());
     LINK_ATTESTATIONS.with(|reg| {
         reg.borrow_mut().remove(&did);
     });
-    removed
+    MIGRATION_LINKS.with(|links| {
+        links.borrow_mut().remove(&did);
+    });
+    Ok(removed)
+}
+
+/// If `did` maps to an [`IdentityRecord::Local`], destroys the pre-rotation
+/// key it references (zeroizing the recovery seed). No-op for
+/// [`IdentityRecord::Resolved`] records (which carry no private material)
+/// and for absent DIDs. Shared by [`identity_remove`] and
+/// [`identity_remove_if_present`].
+fn destroy_pre_rotation_for_did(did: &str) {
+    let handle = IDENTITY_REGISTRY.with(|reg| match reg.borrow().get(did) {
+        Some(IdentityRecord::Local {
+            pre_rotation_handle,
+            ..
+        }) => Some(*pre_rotation_handle),
+        _ => None,
+    });
+    if let Some(handle) = handle {
+        pre_rotation_destroy(handle);
+    }
 }
 
 /// Extracts a required string field from an attestation JSON value, returning
@@ -4188,7 +4278,7 @@ mod tests {
             "identity must be registered before removal"
         );
 
-        identity_remove(did.clone());
+        identity_remove(did.clone()).expect("valid DID must not be rejected");
 
         assert!(
             !IDENTITY_REGISTRY.with(|reg| reg.borrow().contains_key(&did)),
@@ -4202,6 +4292,96 @@ mod tests {
         cleanup_registries();
     }
 
+    /// Regression: `identity_remove` MUST destroy the pre-rotation
+    /// recovery seed held in `PRE_ROTATION_REGISTRY`, not just the
+    /// `IDENTITY_REGISTRY` record. Previously the pre-rotation private
+    /// seed (the recovery key) was orphaned in WASM linear memory —
+    /// same-origin-JS readable for the module lifetime — because
+    /// `identity_remove` only touched `IDENTITY_REGISTRY` and
+    /// `LINK_ATTESTATIONS`. The native bridges hold pre-rotation custody
+    /// as an `Arc` field on the registry entry, so their `remove`
+    /// drops + zeroizes it; this test pins the WASM parity.
+    #[test]
+    fn test_identity_remove_destroys_pre_rotation_entry() {
+        cleanup_registries();
+
+        let before = pre_rotation_registry_len();
+        let (did, _pub_bytes, _active_pub_bytes) = register_identity();
+        // `register_identity` stores exactly one pre-rotation entry.
+        assert_eq!(
+            pre_rotation_registry_len(),
+            before + 1,
+            "register_identity must store one pre-rotation entry"
+        );
+        // Capture the handle so we can prove the slot is vacated.
+        let handle = IDENTITY_REGISTRY.with(|reg| match reg.borrow().get(&did) {
+            Some(IdentityRecord::Local {
+                pre_rotation_handle,
+                ..
+            }) => *pre_rotation_handle,
+            other => panic!("expected Local record, got {other:?}"),
+        });
+        assert!(
+            PRE_ROTATION_REGISTRY.with(|reg| reg.borrow().contains_key(&handle)),
+            "pre-rotation entry must exist before removal"
+        );
+
+        identity_remove(did).expect("valid DID must not be rejected");
+
+        assert!(
+            !PRE_ROTATION_REGISTRY.with(|reg| reg.borrow().contains_key(&handle)),
+            "pre-rotation entry (recovery seed) must be destroyed by identity_remove"
+        );
+        assert_eq!(
+            pre_rotation_registry_len(),
+            before,
+            "pre-rotation registry count must return to its pre-create baseline"
+        );
+
+        cleanup_registries();
+    }
+
+    /// `identity_remove_if_present` must destroy the pre-rotation entry
+    /// and remove the `MIGRATION_LINKS` forward-link on the present
+    /// branch, exactly as `identity_remove` does. Mirrors
+    /// `test_identity_remove_destroys_pre_rotation_entry` for the
+    /// conditional companion.
+    #[test]
+    fn test_identity_remove_if_present_destroys_pre_rotation_and_migration_link() {
+        cleanup_registries();
+
+        let (did, _pub_bytes, _active_pub_bytes) = register_identity();
+        // Seed a migration forward-link to confirm it is dropped too.
+        MIGRATION_LINKS.with(|links| {
+            links.borrow_mut().insert(
+                did.clone(),
+                "did:dht:zMigratedSuccessorForRemoveTest".to_owned(),
+            );
+        });
+        let handle = IDENTITY_REGISTRY.with(|reg| match reg.borrow().get(&did) {
+            Some(IdentityRecord::Local {
+                pre_rotation_handle,
+                ..
+            }) => *pre_rotation_handle,
+            other => panic!("expected Local record, got {other:?}"),
+        });
+
+        assert!(
+            identity_remove_if_present(did.clone()).expect("valid DID must not be rejected"),
+            "first removal must report the identity was present"
+        );
+        assert!(
+            !PRE_ROTATION_REGISTRY.with(|reg| reg.borrow().contains_key(&handle)),
+            "pre-rotation entry must be destroyed by identity_remove_if_present"
+        );
+        assert!(
+            !MIGRATION_LINKS.with(|links| links.borrow().contains_key(&did)),
+            "migration forward-link must be dropped alongside the identity"
+        );
+
+        cleanup_registries();
+    }
+
     #[test]
     fn test_identity_remove_if_present_true_then_false() {
         cleanup_registries();
@@ -4209,11 +4389,11 @@ mod tests {
         let (did, _pub_bytes, _active_pub_bytes) = register_identity();
 
         assert!(
-            identity_remove_if_present(did.clone()),
+            identity_remove_if_present(did.clone()).expect("valid DID must not be rejected"),
             "first removal must report the identity was present"
         );
         assert!(
-            !identity_remove_if_present(did),
+            !identity_remove_if_present(did).expect("valid DID must not be rejected"),
             "second removal must report the identity was already gone"
         );
 
@@ -4225,12 +4405,53 @@ mod tests {
         cleanup_registries();
 
         let missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest".to_owned();
-        // Unconditional remove on a missing DID is a no-op (no panic).
-        identity_remove(missing.clone());
+        // Unconditional remove on a missing (but valid) DID is a no-op.
+        identity_remove(missing.clone()).expect("valid DID must not be rejected");
         assert!(
-            !identity_remove_if_present(missing),
+            !identity_remove_if_present(missing).expect("valid DID must not be rejected"),
             "removing an unregistered DID must report false"
         );
+
+        cleanup_registries();
+    }
+
+    /// `identity_remove` and `identity_remove_if_present` must reject a
+    /// malformed (syntactically invalid) DID before touching any
+    /// registry, mirroring the `PyO3` reference bridge's `validate_did`
+    /// gate and the petname `*_rejects_malformed_owner` parity tests.
+    ///
+    /// Both ops gate on `validate_remove_did`, which delegates to the
+    /// shared `validate_did` validator. The `#[wasm_bindgen]` wrappers
+    /// cannot have their error arm exercised off-wasm (materializing a
+    /// `JsError` calls a wasm-bindgen import that panics on the host
+    /// target), so this test asserts the rejection at the same validator
+    /// the ops delegate to — the actual gate — plus confirms a real
+    /// registered identity's DID passes. This pins both the reject and
+    /// accept sides of the new symmetry without a browser harness.
+    #[test]
+    fn test_identity_remove_rejects_malformed_did() {
+        cleanup_registries();
+
+        // Not a `did:method:id` string — the shared validator (the exact
+        // gate `identity_remove` / `identity_remove_if_present` apply via
+        // `validate_remove_did`) must reject it before any registry mutation.
+        assert!(
+            scp_ffi_common::validate::validate_did("not-a-did").is_err(),
+            "the removal DID gate must reject a malformed DID"
+        );
+        assert!(
+            scp_ffi_common::validate::validate_did("").is_err(),
+            "the removal DID gate must reject an empty DID"
+        );
+
+        // Accept side: a real registered identity's DID is syntactically
+        // valid, so the gate passes and the op removes it (returns Ok).
+        let (did, _pub_bytes, _active_pub_bytes) = register_identity();
+        assert!(
+            scp_ffi_common::validate::validate_did(&did).is_ok(),
+            "a registered identity's DID must pass the removal gate"
+        );
+        identity_remove(did).expect("valid DID must not be rejected by identity_remove");
 
         cleanup_registries();
     }
