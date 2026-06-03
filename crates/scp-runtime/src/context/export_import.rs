@@ -1221,6 +1221,113 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Snapshot signature tampering (spec §23.16.4)
+    // -------------------------------------------------------------------
+
+    /// Core security property: mutating the embedded snapshot's membership
+    /// after signing causes import to be rejected with the *signature* error,
+    /// distinct from the Merkle-chain error. This is the gap the signature
+    /// closes — `validate_export_for_import` previously verified only the
+    /// event-log Merkle chain, leaving membership/roles/params forgeable.
+    #[test]
+    fn tampered_membership_rejected_with_signature_error() {
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-tamper-membership");
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+
+        let mut snapshot = test_snapshot("ctx-tamper-membership");
+        // Legitimate membership at export time: a single member.
+        snapshot.membership.add_member(
+            DID::from("did:key:legit-member"),
+            "member".to_owned(),
+            Vec::new(),
+        );
+
+        let mut export = create_export(
+            snapshot,
+            event_log_data,
+            Vec::new(),
+            DID::from("did:key:tamper-exporter"),
+            ExportScope::Full,
+            &scp_primitives::SystemClock,
+            sign_with_test_key,
+        )
+        .unwrap();
+
+        // A valid export imports cleanly.
+        validate_export_for_import(&export, &test_verifying_key()).unwrap();
+
+        // Attacker forges an extra admin member into the signed snapshot
+        // WITHOUT re-signing (they have no exporter key).
+        export.snapshot.membership.add_member(
+            DID::from("did:key:forged-admin"),
+            "admin".to_owned(),
+            Vec::new(),
+        );
+
+        let err = validate_export_for_import(&export, &test_verifying_key())
+            .expect_err("tampered membership must be rejected");
+        assert!(
+            matches!(err, ContextError::SnapshotSignatureInvalid { .. }),
+            "tampered membership must fail with SnapshotSignatureInvalid, got: {err:?}"
+        );
+        // The failure is NOT a Merkle error — the event log is untouched.
+        assert!(!format!("{err}").contains("Merkle root mismatch"));
+    }
+
+    /// Round-trip: a signed export survives serialize -> deserialize ->
+    /// validate with the embedded snapshot signature intact, for both Full and
+    /// Public scope.
+    #[test]
+    fn signed_export_round_trips_full_and_public() {
+        for scope in [ExportScope::Full, ExportScope::Public] {
+            let mut snapshot = test_snapshot("ctx-signed-roundtrip");
+            snapshot.membership.add_member(
+                DID::from("did:key:rt-member"),
+                "member".to_owned(),
+                Vec::new(),
+            );
+            let export = create_export(
+                snapshot,
+                Vec::new(),
+                Vec::new(),
+                DID::from("did:key:rt-exporter"),
+                scope,
+                &scp_primitives::SystemClock,
+                sign_with_test_key,
+            )
+            .unwrap();
+
+            let bytes = serialize_export(&export).unwrap();
+            let decoded = deserialize_export(&bytes).unwrap();
+            assert_eq!(decoded.snapshot_signature, export.snapshot_signature);
+            validate_export_for_import(&decoded, &test_verifying_key()).unwrap();
+        }
+    }
+
+    /// A signature that does not match the verifying key (wrong signer) is
+    /// rejected.
+    #[test]
+    fn wrong_signer_rejected() {
+        let snapshot = test_snapshot("ctx-wrong-signer");
+        let export = create_export(
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+            DID::from("did:key:ws-exporter"),
+            ExportScope::Full,
+            &scp_primitives::SystemClock,
+            sign_with_test_key,
+        )
+        .unwrap();
+
+        // Verify with a DIFFERENT key than the one that signed.
+        let wrong_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let err = validate_export_for_import(&export, &wrong_key)
+            .expect_err("wrong signer must be rejected");
+        assert!(matches!(err, ContextError::SnapshotSignatureInvalid { .. }));
+    }
+
+    // -------------------------------------------------------------------
     // Event log provider round-trip
     // -------------------------------------------------------------------
 

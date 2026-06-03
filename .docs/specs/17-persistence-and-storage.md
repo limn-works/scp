@@ -332,6 +332,13 @@ pub struct StoredValue<T> {
 
 Every value written by `ProtocolRepository` is wrapped in `StoredValue`. On read, `version` is checked before deserializing `data`. This enables lazy migration (section 17.10) without requiring schema-level versioning in the storage backend.
 
+**Context export integrity (signed snapshot).** A portable `ContextExport` (the serialized form produced for backup, migration, or device transfer) carries TWO independent integrity protections, both verified on import before any state is restored:
+
+1. **Event-log Merkle chain** — the serialized event-log entries are hash-chained and the export records the Merkle root; import recomputes and compares it (tamper detection on the event history).
+2. **Signed snapshot** — the embedded context snapshot (membership, role definitions, parameters, registered tools) is bound by an Ed25519 `snapshot_signature` over the canonical snapshot hash, **exactly as specified in §23.16.4** (domain separator `"SCP-CONTEXT-SNAPSHOT-V1:"`). The signature is produced by the exporter's `#active`/`#agent` custody key (ADR-039) and verified on import against the exporter DID's resolved verification-method key. Without it, a tampered export could forge membership or governance state that the Merkle chain alone does not cover.
+
+The export format `version` is incremented when this integrity envelope changes; imports reject versions that predate snapshot signing with a distinct *version* error (separate from a signature-verification failure, surfaced as `SCP-CTX-2093`). See §23.16.4 for the canonical hash construction and §23.17 for the sequence-floor invariants that imports must additionally enforce.
+
 **Encryption at rest** is a platform concern enforced at compile time by the sealed `EncryptedStorage` marker trait.
 
 ### EncryptedStorage — Compile-Time Encryption Enforcement

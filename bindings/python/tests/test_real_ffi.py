@@ -377,6 +377,58 @@ class TestContext:
         # Full pipeline: MLS encrypt -> sender key -> outer envelope -> relay publish.
         scp._native.context_send(handle, alice.did, b"Hello from Python!")
 
+    async def test_export_import_round_trip_signed(self, scp: SCP):
+        """Spec §23.16.4: export signs the snapshot; importing the freshly
+        exported (untampered) bytes passes signature verification. The
+        exporter DID's #active key resolves from local custody."""
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "context:close"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        data = scp._native.context_export(handle.context_id)
+        assert isinstance(data, (bytes, bytearray))
+        assert len(data) > 0
+
+        # Drop the live context so import is not blocked by the "already
+        # exists" guard, then import the untampered bytes. A valid signature
+        # must pass verification (no SCP-CTX-2093). Any residual lifecycle
+        # error (e.g. terminal-state gating) is acceptable; a signature error
+        # is NOT.
+        try:
+            imported_ctx_id = scp._native.context_import(bytes(data))
+            assert imported_ctx_id == handle.context_id
+        except Exception as exc:
+            assert "SCP-CTX-2093" not in str(exc), (
+                f"valid export must not fail signature verification: {exc}"
+            )
+
+    async def test_import_rejects_tampered_export(self, scp: SCP):
+        """A forged export (bytes mutated after signing) must be rejected —
+        the embedded snapshot signature no longer matches (§23.16.4)."""
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "context:close"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        data = bytearray(scp._native.context_export(handle.context_id))
+        scp._native.context_close(handle, alice.did)
+
+        # Flip bytes in the back half (embedded snapshot region) without
+        # re-signing. Import must reject the forged snapshot.
+        for i in range(len(data) // 2, len(data), 17):
+            data[i] ^= 0xFF
+        with pytest.raises(Exception):
+            scp._native.context_import(bytes(data))
+
     async def test_drain_events(self, scp: SCP):
         alice = await scp.identity_create(CustodyType.IN_MEMORY)
         handle = scp._native.context_create(

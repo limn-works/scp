@@ -1632,6 +1632,34 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const invalidData = new Uint8Array([0, 1, 2, 3]);
       await expect(napi.contextImport(invalidData)).rejects.toThrow();
     });
+
+    // Spec §23.16.4: the exported snapshot is Ed25519-signed by the exporter.
+    // Tampering with the exported bytes after signing must cause import to be
+    // rejected — a forged snapshot cannot be imported.
+    test("import rejects a tampered export (snapshot signature, §23.16.4)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read", "context:close"],
+          memoryScope: "ephemeral",
+        }),
+      );
+
+      const data = await napi.contextExport(ctx);
+      expect(data.length).toBeGreaterThan(0);
+      await napi.contextClose(ctx, identity.did);
+
+      // Flip bytes in the back half of the export (the embedded snapshot
+      // region) to forge state without re-signing. The signed snapshot hash
+      // no longer matches, so import must reject.
+      const tampered = new Uint8Array(data);
+      const start = Math.floor(tampered.length / 2);
+      for (let i = start; i < tampered.length; i += 17) {
+        tampered[i] = (tampered[i] ?? 0) ^ 0xff;
+      }
+      await expect(napi.contextImport(tampered)).rejects.toThrow();
+    });
   });
 
   // ---------------------------------------------------------------------------
