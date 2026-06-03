@@ -8,6 +8,8 @@ Notes:
 
 ## SCP Project Knowledge
 
+- [UniFFI Swift checksum staleness](uniffi_checksum_staleness.md) — CRITICAL recurring: hand-edited throwing sig + stale checksum int → Swift SDK fatalError on init; detect by regen+diff. Found in 8bcd520c2 (#1543).
+
 ### Key Files
 - `/Users/alec/Developer/limn/scp/.docs/specs/` — Full protocol specs.
 - `/Users/alec/Developer/limn/scp/.docs/architecture.md` — Build document (~1024 lines).
