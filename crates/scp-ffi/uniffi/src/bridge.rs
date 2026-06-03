@@ -2831,6 +2831,55 @@ pub(crate) fn identity_custody_registry(
     bi.identity_custody_registry.as_ref()
 }
 
+/// Registers an in-memory identity's custody + active signing key in the
+/// per-instance identity custody registry, keyed by `did`.
+///
+/// Shared by `identity_create` (so a freshly created in-memory identity is
+/// immediately present in the registry, matching the NAPI bridge whose
+/// `identity_create` registers a bundled entry) and the link-attestation
+/// path (which needs the custody retained for later re-signing). Centralizing
+/// the entry/cap logic keeps the two call sites in sync and avoids duplicating
+/// the TOCTOU-safe capacity check.
+///
+/// Uses the `entry()` API to avoid a TOCTOU window between `contains_key` and
+/// `insert`:
+/// - Occupied: always updates to the caller's current key. The `UniFFI`
+///   `Identity` is an immutable `Arc` snapshot — the held key is the one the
+///   caller signs with; after a legitimate rotation the stale handle is
+///   replaced.
+/// - Vacant: enforces `UNIFFI_CUSTODY_REGISTRY_CAP` before inserting,
+///   surfacing `SCP-VALID-7403` on overflow.
+#[cfg(feature = "allow_in_memory_custody")]
+fn register_identity_custody(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    did: &str,
+    custody: &Arc<OpaqueInMemoryKeyCustody>,
+    active_key: scp_platform::KeyHandle,
+) -> Result<(), ScpError> {
+    use scp_ffi_common::error_codes as codes;
+
+    let registry = identity_custody_registry(bi);
+    let len = registry.len();
+    match registry.entry(did.to_owned()) {
+        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+            occ.insert((Arc::clone(custody), active_key));
+        }
+        dashmap::mapref::entry::Entry::Vacant(vac) => {
+            if len >= UNIFFI_CUSTODY_REGISTRY_CAP {
+                return Err(ScpError::Identity {
+                    msg: format!(
+                        "custody registry has reached capacity \
+                         ({UNIFFI_CUSTODY_REGISTRY_CAP}) — cannot store additional entries"
+                    ),
+                    code: codes::VALID_7403.to_owned(),
+                });
+            }
+            vac.insert((Arc::clone(custody), active_key));
+        }
+    }
+    Ok(())
+}
+
 /// Creates an identity link attestation for an external platform identity.
 ///
 /// See spec §3.5.1, §3.5.2.
@@ -2910,34 +2959,9 @@ async fn identity_create_link_attestation_impl(
         })?;
     attestation.signature = sig.as_bytes().to_vec();
 
-    // Store custody for later verification lookups.
-    // Use entry() API to avoid TOCTOU between contains_key and insert.
-    {
-        let registry = identity_custody_registry(bi);
-        let len = registry.len();
-        match registry.entry(identity.did.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                // Always update to the caller's current key. The UniFFI
-                // `Identity` is an immutable Arc snapshot — if the caller
-                // holds an Identity with key N, that is the key they used to
-                // sign.  After a legitimate key rotation the old key handle
-                // sits in the registry and the new one should replace it.
-                occ.insert((Arc::clone(custody), active_key));
-            }
-            dashmap::mapref::entry::Entry::Vacant(vac) => {
-                if len >= UNIFFI_CUSTODY_REGISTRY_CAP {
-                    return Err(ScpError::Identity {
-                        msg: format!(
-                            "custody registry has reached capacity \
-                             ({UNIFFI_CUSTODY_REGISTRY_CAP}) — cannot store additional entries"
-                        ),
-                        code: codes::VALID_7403.to_owned(),
-                    });
-                }
-                vac.insert((Arc::clone(custody), active_key));
-            }
-        }
-    }
+    // Store custody for later verification lookups. Shared with
+    // `identity_create` so the registry contract stays in sync.
+    register_identity_custody(bi, &identity.did, custody, active_key)?;
 
     // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
@@ -7588,6 +7612,21 @@ impl Scp {
                             ensure_did_resolver_initialized_on(
                                 &bi,
                                 tokio::runtime::Handle::current(),
+                            )?;
+
+                            // Register the freshly created in-memory identity
+                            // in the per-instance custody registry, keyed by DID,
+                            // so `identity_remove_if_present` reports presence —
+                            // matching the NAPI bridge whose identity creation
+                            // paths register a bundled entry. Shares the
+                            // entry/cap logic with the link-attestation path.
+                            // Done before `identity` is moved into the handle so
+                            // the DID and active signing key are still available.
+                            register_identity_custody(
+                                &bi,
+                                &identity.did,
+                                &key_custody,
+                                identity.active_signing_key,
                             )?;
 
                             let handle = Arc::new(Identity {
@@ -13513,6 +13552,21 @@ impl Scp {
                                 tokio::runtime::Handle::current(),
                             )?;
 
+                            // Register the freshly created in-memory identity
+                            // in the per-instance custody registry, keyed by DID,
+                            // so `identity_remove_if_present` reports presence —
+                            // matching the NAPI bridge whose identity creation
+                            // paths register a bundled entry. Shares the
+                            // entry/cap logic with the link-attestation path.
+                            // Done before `identity` is moved into the handle so
+                            // the DID and active signing key are still available.
+                            register_identity_custody(
+                                &bi,
+                                &identity.did,
+                                &key_custody,
+                                identity.active_signing_key,
+                            )?;
+
                             let handle = Arc::new(Identity {
                                 did: identity.did.clone(),
                                 custody_type: CustodyMethod::InMemory,
@@ -17079,6 +17133,49 @@ mod tests {
                 .expect("valid DID must not be rejected by identity_remove_if_present"),
             "removing an unregistered DID must report false"
         );
+    }
+
+    /// A freshly created in-memory identity must be present in the custody
+    /// registry so `identity_remove_if_present` reports `true` on first
+    /// removal and `false` on the second — matching the NAPI bridge whose
+    /// `identity_create` registers a bundled entry. Pins the §4.1 port-gap
+    /// fix: before it, `identity_create` never populated the registry, so a
+    /// created identity reported `false`. Also exercises the unconditional
+    /// `identity_remove` on a separately created identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn identity_remove_if_present_reports_presence() {
+        let scp = scp_test();
+
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let did = identity.did();
+
+        // First removal of a freshly created identity must report presence.
+        assert!(
+            scp.identity_remove_if_present(did.clone())
+                .expect("identity_remove_if_present must accept a valid DID"),
+            "a freshly created in-memory identity must be present in the \
+             custody registry and report true on first removal"
+        );
+
+        // Second removal must report absence (idempotent).
+        assert!(
+            !scp.identity_remove_if_present(did)
+                .expect("identity_remove_if_present must accept a valid DID"),
+            "removing an already-removed identity must report false"
+        );
+
+        // The unconditional `identity_remove` must succeed on a fresh,
+        // separately created identity.
+        let other = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (second identity)");
+        scp.identity_remove(other.did())
+            .expect("identity_remove must succeed on a registered identity");
     }
 
     // -----------------------------------------------------------------------
