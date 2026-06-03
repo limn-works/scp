@@ -56,11 +56,15 @@ class CryptoKeychain implements KeyCustodyProvider {
   #keyObject(keyId: string): crypto.KeyObject {
     const seed = this.#seeds.get(keyId);
     if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    // Reconstruct an Ed25519 private key from the raw 32-byte seed.
-    const priv = crypto.createPrivateKey({
-      key: { kty: "OKP", crv: "Ed25519", d: Buffer.from(seed).toString("base64url") },
-      format: "jwk",
-    });
+    // Reconstruct an Ed25519 private key from the raw 32-byte seed via the
+    // standard PKCS8 DER encoding. Node's OKP JWK import requires the public
+    // `x` too; the PKCS8 form needs only the seed.
+    const der = Buffer.concat([
+      // 16-byte Ed25519 PKCS8 prefix + 32-byte seed = valid PKCS8 DER.
+      Buffer.from("302e020100300506032b657004220420", "hex"),
+      Buffer.from(seed),
+    ]);
+    const priv = crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
     return priv;
   }
 
@@ -94,10 +98,14 @@ class CryptoKeychain implements KeyCustodyProvider {
     h.update(Buffer.from(seed));
     h.update(Buffer.from(contextId));
     const pseudoSeed = h.digest(); // 32 bytes
-    const priv = crypto.createPrivateKey({
-      key: { kty: "OKP", crv: "Ed25519", d: pseudoSeed.toString("base64url") },
-      format: "jwk",
-    });
+    // Reconstruct the derived Ed25519 key from the seed via PKCS8 DER (the OKP
+    // JWK import path requires the public `x`; PKCS8 needs only the seed).
+    const der = Buffer.concat([
+      // 16-byte Ed25519 PKCS8 prefix + 32-byte seed = valid PKCS8 DER.
+      Buffer.from("302e020100300506032b657004220420", "hex"),
+      Buffer.from(pseudoSeed),
+    ]);
+    const priv = crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
     const pubJwk = crypto.createPublicKey(priv).export({ format: "jwk" }) as { x: string };
     const pub = Buffer.from(pubJwk.x, "base64url");
     const kid = String(this.#next++);

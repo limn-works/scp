@@ -469,6 +469,29 @@ export class SCP {
    *   IdentityError if key/DID creation fails inside the provider.
    */
   async identityCreateWithCustody(provider: KeyCustodyProvider): Promise<Identity> {
+    // Validate provider completeness up front. The byte-converting adapter
+    // below always supplies all eight closures, so a provider missing a method
+    // would otherwise surface only later as a cryptic native "oneshot canceled"
+    // failure. Checking here makes the returned promise reject early with a
+    // clear, actionable error. Mirrors the eight methods on KeyCustodyProvider.
+    const REQUIRED = [
+      "generateKeypair",
+      "sign",
+      "getPublicKey",
+      "destroyKey",
+      "dhAgree",
+      "derivePseudonym",
+      "exportSigningKeyBytes",
+      "custodyType",
+    ] as const;
+    for (const method of REQUIRED) {
+      if (typeof (provider as unknown as Record<string, unknown>)[method] !== "function") {
+        throw new ValidationError(
+          `KeyCustodyProvider is missing required method: ${method}`,
+          "SCP-VALID-7005",
+        );
+      }
+    }
     // NAPI marshals each provider method as a ThreadsafeFunction WITHOUT
     // preserving `this`, and Rust `Vec<u8>` crosses the wire as a JS
     // `Array<number>` (not `Uint8Array`). The adapter below (a) closes over
@@ -476,15 +499,22 @@ export class SCP {
     // inbound (`Array<number>` → `Uint8Array`) and byte returns outbound
     // (`Uint8Array` → `Array<number>`). Methods with no byte payload
     // (`generateKeypair`, `destroyKey`, `custodyType`) pass through unchanged.
+    // Additionally, napi-rs delivers a multi-element Rust tuple
+    // (`(String, Vec<u8>)`) to the JS callback as a SINGLE `[keyId, bytes]`
+    // array argument — not as two positional args — so the tuple callbacks
+    // (`sign`, `dhAgree`, `derivePseudonym`) accept one array and destructure
+    // it. Single-value callbacks receive their positional argument normally.
     const adapter = {
       generateKeypair: (keyType: string): string => provider.generateKeypair(keyType),
-      sign: (keyId: string, message: number[]): number[] =>
+      // napi-rs delivers a `(String, Vec<u8>)` tuple as a single `[keyId, bytes]`
+      // array arg (not positional), so the two-value callbacks destructure it.
+      sign: ([keyId, message]: [string, number[]]): number[] =>
         Array.from(provider.sign(keyId, Uint8Array.from(message))),
       getPublicKey: (keyId: string): number[] => Array.from(provider.getPublicKey(keyId)),
       destroyKey: (keyId: string): void => provider.destroyKey(keyId),
-      dhAgree: (keyId: string, peerPublic: number[]): number[] =>
+      dhAgree: ([keyId, peerPublic]: [string, number[]]): number[] =>
         Array.from(provider.dhAgree(keyId, Uint8Array.from(peerPublic))),
-      derivePseudonym: (keyId: string, contextId: number[]): number[] =>
+      derivePseudonym: ([keyId, contextId]: [string, number[]]): number[] =>
         Array.from(provider.derivePseudonym(keyId, Uint8Array.from(contextId))),
       exportSigningKeyBytes: (keyId: string): number[] =>
         Array.from(provider.exportSigningKeyBytes(keyId)),
