@@ -3065,7 +3065,7 @@ mod tests {
         assert!(!instance.is_suspended());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_fails_after_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
@@ -3866,7 +3866,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconnect_transport_if_pending_rejects_after_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance.add_relay_url("wss://relay.example.com".to_owned());
@@ -3933,7 +3933,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_in_flight_reconnect_dial() {
         // #1696: `shutdown()` must also cancel a pending reconnect.
         // Same dynamics as the suspend variant — uses the same TEST-NET-1
@@ -4519,7 +4519,7 @@ mod tests {
         assert_eq!(err, ShutdownError::AlreadyShutDown);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_core_async_after_sync_shutdown_errors() {
         // The sync `shutdown()` path also flips the idempotent flag, so the
         // async variant must report AlreadyShutDown afterwards — callers
