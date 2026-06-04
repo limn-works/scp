@@ -462,7 +462,13 @@ impl CallbackKeyCustody {
             .export_signing_key_bytes(handle.id().to_string())
             .await
             .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-        let arr = scp_ffi_common::custody_parse::expect_32("export_signing_key_bytes", &key_bytes)?;
+        // Private seed material: wrap the parsed 32-byte array in `Zeroizing`
+        // so the intermediate seed buffer is wiped on drop, matching the PyO3
+        // and NAPI callback custody paths (ADR-006).
+        let arr = zeroize::Zeroizing::new(scp_ffi_common::custody_parse::expect_32(
+            "export_signing_key_bytes",
+            &key_bytes,
+        )?);
         Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
     }
 }
