@@ -148,11 +148,13 @@ class InMemoryStorage(TypedDict):
 
 
 class SqliteStorage(TypedDict):
-    """Storage config selecting `SQLCipher`-encrypted on-disk storage.
+    """Storage config selecting `SQLCipher`-encrypted on-disk storage (raw key).
 
     ``path`` is the directory the bridge opens ``scp.db`` inside;
     ``key`` is raw encryption key material (32 bytes recommended) that
-    the Rust side zeroizes after `SQLCipher` has consumed it. See
+    the Rust side zeroizes after `SQLCipher` has consumed it. For the
+    passphrase-derived variant, use :class:`SqlitePassphraseStorage`
+    instead — supply exactly one of ``key`` or ``passphrase``. See
     :func:`SCP.with_storage`.
     """
 
@@ -161,10 +163,29 @@ class SqliteStorage(TypedDict):
     key: bytes
 
 
+class SqlitePassphraseStorage(TypedDict):
+    """Storage config selecting `SQLCipher`-encrypted on-disk storage (passphrase).
+
+    ``path`` is the directory the bridge opens ``scp.db`` inside;
+    ``passphrase`` is a human-chosen secret from which the `SQLCipher`
+    key is derived via Argon2id (spec §17.6) with a persisted per-database
+    salt sidecar. The passphrase is held in zeroizing memory on the Rust
+    side. For the raw-key variant, use :class:`SqliteStorage` instead —
+    supply exactly one of ``key`` or ``passphrase``. See
+    :func:`SCP.with_storage`.
+    """
+
+    type: Literal["sqlite"]
+    path: str
+    passphrase: str
+
+
 # Discriminated union of supported storage configurations. The PyO3
-# bridge's `SCP.with_storage` constructor dispatches on ``type``; adding
-# a new variant here requires a matching arm in `PyBridgeInstance::with_storage_py`.
-StorageConfig = InMemoryStorage | SqliteStorage
+# bridge's `SCP.with_storage` constructor dispatches on ``type`` and, for
+# the ``sqlite`` type, on the presence of ``key`` vs ``passphrase`` (exactly
+# one required); adding a new variant here requires a matching arm in
+# `PyBridgeInstance::with_storage_py`.
+StorageConfig = InMemoryStorage | SqliteStorage | SqlitePassphraseStorage
 
 
 def _native_mod() -> Any:

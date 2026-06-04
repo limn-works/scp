@@ -117,7 +117,7 @@ pub enum StorageConfig {
 /// `SQLCipher` has consumed them. Callers cannot zero their own copy across
 /// the boundary, so they should overwrite their source buffer after the call
 /// returns.
-#[derive(Debug, Clone, uniffi::Enum)]
+#[derive(Clone, uniffi::Enum)]
 pub enum SqliteKeyMaterial {
     /// Raw encryption key material (32 bytes recommended).
     Raw {
@@ -129,6 +129,20 @@ pub enum SqliteKeyMaterial {
         /// The passphrase. Moved into `Zeroizing` at the bridge boundary.
         passphrase: String,
     },
+}
+
+impl std::fmt::Debug for SqliteKeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the key or passphrase bytes — only the variant and a
+        // length hint for the raw case (defense in depth). Mirrors the PyO3 /
+        // NAPI redacting impl.
+        match self {
+            Self::Raw { key } => {
+                write!(f, "SqliteKeyMaterial::Raw(<redacted {} bytes>)", key.len())
+            }
+            Self::Passphrase { .. } => write!(f, "SqliteKeyMaterial::Passphrase(<redacted>)"),
+        }
+    }
 }
 
 /// Bridge-internal error returned by

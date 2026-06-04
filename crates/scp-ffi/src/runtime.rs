@@ -193,14 +193,56 @@ pub fn supervisor(
 // PyBridgeInstance (per-bridge concrete struct wrapping CoreFields — #1549 Phase 4)
 // ---------------------------------------------------------------------------
 
+/// `SQLCipher` key-material selector for [`StorageConfig::Sqlite`] (spec §17.6).
+///
+/// The caller supplies EITHER raw key material OR a passphrase — never both,
+/// never neither. The sum type makes that mutual exclusion unrepresentable as
+/// an invalid state: there is exactly one happy path per variant. Both forms
+/// are wrapped in [`Zeroizing`] so they are wiped from memory on drop. This
+/// mirrors the `NAPI` and `UniFFI` bridges' `SqliteKeyMaterial`.
+///
+/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+///   mode; the existing, unchanged path).
+/// - [`SqliteKeyMaterial::Passphrase`] feeds
+///   [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+///   key from the passphrase via the shared Argon2id parameterization with a
+///   persisted per-database salt sidecar.
+///
+/// Does NOT derive `Debug`: a custom redacting [`std::fmt::Debug`] impl keeps
+/// the key/passphrase bytes out of logs and panic messages (defense in depth).
+#[derive(Clone)]
+pub enum SqliteKeyMaterial {
+    /// Raw encryption key material (32 bytes recommended).
+    Raw(Zeroizing<Vec<u8>>),
+    /// Human-chosen passphrase; the `SQLCipher` key is derived via Argon2id.
+    Passphrase(Zeroizing<String>),
+}
+
+impl std::fmt::Debug for SqliteKeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the key or passphrase bytes — only the variant and a
+        // length hint for the raw case. Mirrors the NAPI/UniFFI redacting impl.
+        match self {
+            Self::Raw(bytes) => {
+                write!(
+                    f,
+                    "SqliteKeyMaterial::Raw(<redacted {} bytes>)",
+                    bytes.len()
+                )
+            }
+            Self::Passphrase(_) => write!(f, "SqliteKeyMaterial::Passphrase(<redacted>)"),
+        }
+    }
+}
+
 /// Storage configuration selector for [`PyBridgeInstance::with_storage_py`].
 ///
 /// Two variants are supported:
 /// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
 /// - [`StorageConfig::Sqlite`] — persistent SQLCipher-encrypted storage on
-///   disk. The `key` is the raw encryption key material held in
-///   [`Zeroizing`] so it is wiped from memory as soon as the config is
-///   consumed.
+///   disk. The key material is a [`SqliteKeyMaterial`]: EITHER raw key bytes
+///   (`key`) OR a passphrase (`passphrase`), each held in [`Zeroizing`] so it
+///   is wiped from memory as soon as the config is consumed.
 ///
 /// Keeping this as an enum (instead of a string parameter) means adding future
 /// variants is an additional arm, not a breaking API change.
@@ -211,13 +253,15 @@ pub enum StorageConfig {
     /// SQLCipher-encrypted storage at `{path}/scp.db`.
     ///
     /// Wraps [`scp_platform::sqlite::SqliteStorage`]. Persists across
-    /// process restarts. The `key` is raw encryption key material wrapped in
-    /// [`Zeroizing`] so the caller's copy is wiped after construction.
+    /// process restarts. The `key` selects raw-key vs. passphrase derivation
+    /// via [`SqliteKeyMaterial`]; both forms are wrapped in [`Zeroizing`] so
+    /// the caller's copy is wiped after construction.
     Sqlite {
         /// Directory the database file is created in.
         path: PathBuf,
-        /// Raw encryption key material (32 bytes recommended).
-        key: Zeroizing<Vec<u8>>,
+        /// Raw key material or passphrase (exactly one — see
+        /// [`SqliteKeyMaterial`]).
+        key: SqliteKeyMaterial,
     },
 }
 
@@ -526,11 +570,25 @@ impl PyBridgeInstance {
                 // draft called `SqliteStorage::new` twice (once for the
                 // provider, once for the persistence bridge) and hit
                 // `SQLITE_BUSY` the moment both tried to write.
-                let storage = SqliteStorage::new(&path, &key).map_err(|e| {
+                //
+                // Raw-key mode feeds `SqliteStorage::new`; passphrase mode feeds
+                // `SqliteStorage::with_passphrase` (Argon2id key derivation with
+                // a persisted per-database salt sidecar). Both share the same
+                // single-open / shared-`Arc` / fail-closed contract below.
+                let open_result = match &key {
+                    SqliteKeyMaterial::Raw(bytes) => SqliteStorage::new(&path, bytes),
+                    SqliteKeyMaterial::Passphrase(pass) => {
+                        SqliteStorage::with_passphrase(&path, pass.as_bytes())
+                    }
+                };
+                let storage = open_result.map_err(|e| {
+                    // FAIL CLOSED (spec §17.6): surface the error rather than
+                    // degrading to in-memory. No silent fallback. The error
+                    // message never carries key or passphrase bytes.
                     tracing::error!(
                         error = %e,
                         path = %path.display(),
-                        "with_storage_py: SqliteStorage::new failed — returning error to caller"
+                        "with_storage_py: SQLCipher open failed — returning error to caller, no in-memory fallback"
                     );
                     StorageInitError::SqliteOpen {
                         path: path.display().to_string(),
@@ -560,10 +618,10 @@ impl PyBridgeInstance {
                 let _ = instance
                     .storage_provider
                     .set(StorageProvider::Sqlite(arc_storage));
-                // `key` is `Zeroizing<Vec<u8>>`, zeroed on drop here.
-                // SQLCipher has already retained its derived key
-                // internally, so the caller's key material is safe
-                // to wipe at this point.
+                // `key` is a `SqliteKeyMaterial` wrapping `Zeroizing` raw
+                // bytes or passphrase, zeroed on drop here. SQLCipher has
+                // already retained its derived key internally, so the caller's
+                // key material is safe to wipe at this point.
                 drop(key);
                 Ok(instance)
             }
@@ -876,6 +934,17 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
             "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
         );
         return;
+    }
+    // The supervisor's `mls_storage` consumer requires a single Storage
+    // handle (storage-before-supervisor precondition, spec §17.6). Test
+    // instances built via `new_py()` carry no storage, so the bridge layer
+    // makes the explicit in-memory dev-affordance selection here when none
+    // was set. The runtime core itself never defaults storage — this is a
+    // bridge-layer choice. A no-op if a provider is already set (`OnceLock`).
+    if bi.storage_provider().is_none() {
+        let _ = bi
+            .storage_provider
+            .set(StorageProvider::new_in_memory_encrypted());
     }
     let did = local_did.to_owned();
     let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
@@ -2518,6 +2587,133 @@ mod tests {
         assert!(
             bi.storage_provider().is_some(),
             "with_storage_py(InMemory) must initialize the storage provider"
+        );
+    }
+
+    /// Build a dedicated current-thread tokio runtime so the async `Storage`
+    /// trait methods can be driven from a sync `#[test]` without depending on
+    /// the bridge's shared global runtime (which may not be initialized in a
+    /// unit-test process).
+    fn test_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread tokio runtime")
+    }
+
+    /// Parity with the NAPI bridge `test_sqlite_passphrase_round_trip`: data
+    /// written under a passphrase-derived `SQLCipher` key must survive a reopen
+    /// with the SAME passphrase (the persisted salt sidecar re-derives the
+    /// same key). Exercises the `with_storage_py` `Passphrase` arm.
+    #[test]
+    fn test_with_storage_py_sqlite_passphrase_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: dir.clone(),
+            key: SqliteKeyMaterial::Passphrase(Zeroizing::new(
+                "correct horse battery staple".to_owned(),
+            )),
+        })
+        .expect("passphrase sqlite open must succeed");
+        let provider = bi
+            .storage_provider()
+            .cloned()
+            .expect("passphrase path must populate the storage provider");
+        let rt = test_rt();
+        rt.block_on(async {
+            provider
+                .store("scp-test/persist", b"durable-value")
+                .await
+                .expect("store via storage provider");
+        });
+        drop(provider);
+        drop(bi);
+
+        // Reopen with the SAME passphrase.
+        let bi2 = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: dir,
+            key: SqliteKeyMaterial::Passphrase(Zeroizing::new(
+                "correct horse battery staple".to_owned(),
+            )),
+        })
+        .expect("reopen with same passphrase must succeed");
+        let provider2 = bi2
+            .storage_provider()
+            .cloned()
+            .expect("reopened passphrase path must populate the storage provider");
+        let read_back = rt.block_on(async {
+            provider2
+                .retrieve("scp-test/persist")
+                .await
+                .expect("retrieve via reopened provider")
+        });
+        assert_eq!(
+            read_back.as_deref(),
+            Some(b"durable-value".as_slice()),
+            "data written under the passphrase must survive a reopen with the same passphrase"
+        );
+    }
+
+    /// Parity with the NAPI bridge `test_sqlite_wrong_passphrase_fails_closed`:
+    /// reopening an existing DB with the WRONG passphrase must FAIL CLOSED
+    /// (spec §17.6) — never silently open a fresh, empty database.
+    #[test]
+    fn test_with_storage_py_sqlite_wrong_passphrase_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: dir.clone(),
+            key: SqliteKeyMaterial::Passphrase(Zeroizing::new("the-right-passphrase".to_owned())),
+        })
+        .expect("initial passphrase open must succeed");
+        let provider = bi
+            .storage_provider()
+            .cloned()
+            .expect("storage provider present");
+        test_rt().block_on(async {
+            provider
+                .store("scp-test/secret", b"top-secret")
+                .await
+                .expect("store secret");
+        });
+        drop(provider);
+        drop(bi);
+
+        // Reopen with the WRONG passphrase: must fail closed, no in-memory
+        // fallback, no fresh empty DB.
+        let result = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: dir,
+            key: SqliteKeyMaterial::Passphrase(Zeroizing::new("the-wrong-passphrase".to_owned())),
+        });
+        assert!(
+            matches!(result, Err(StorageInitError::SqliteOpen { .. })),
+            "reopening with the wrong passphrase must fail closed with SqliteOpen"
+        );
+    }
+
+    /// `SqliteKeyMaterial`'s custom `Debug` impl must NOT leak the key or
+    /// passphrase bytes (defense in depth). Mirrors the NAPI/UniFFI redacting
+    /// impls.
+    #[test]
+    fn test_sqlite_key_material_debug_redacts_secrets() {
+        let raw = SqliteKeyMaterial::Raw(Zeroizing::new(vec![0xAB_u8; 32]));
+        let raw_dbg = format!("{raw:?}");
+        assert_eq!(raw_dbg, "SqliteKeyMaterial::Raw(<redacted 32 bytes>)");
+        assert!(
+            !raw_dbg.contains("ab") && !raw_dbg.contains("171"),
+            "raw Debug must not contain key bytes: {raw_dbg}"
+        );
+
+        let secret = "super-secret-passphrase";
+        let pass = SqliteKeyMaterial::Passphrase(Zeroizing::new(secret.to_owned()));
+        let pass_dbg = format!("{pass:?}");
+        assert_eq!(pass_dbg, "SqliteKeyMaterial::Passphrase(<redacted>)");
+        assert!(
+            !pass_dbg.contains(secret),
+            "passphrase Debug must not contain the passphrase: {pass_dbg}"
         );
     }
 

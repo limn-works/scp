@@ -729,13 +729,13 @@ mod tests {
         let scp = default_scp();
         assert!(
             !scp.inner.core.has_supervisor(),
-            "fresh instance must not have a ContextManager attached"
+            "fresh instance must not have a Supervisor attached"
         );
         let result = scp.configure_local_transport("did:key:z6MkfreshLocalTransportTest");
         assert!(result.is_ok(), "valid DID should configure local transport");
         assert!(
             scp.inner.core.has_supervisor(),
-            "configure_local_transport must attach a ContextManager"
+            "configure_local_transport must attach a Supervisor"
         );
     }
 
@@ -747,7 +747,7 @@ mod tests {
         assert!(result.is_err(), "invalid DID must be rejected");
         assert!(
             !scp.inner.core.has_supervisor(),
-            "a rejected DID must not leave a ContextManager attached"
+            "a rejected DID must not leave a Supervisor attached"
         );
     }
 

@@ -93,12 +93,30 @@ pub enum StorageConfig {
 ///   [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
 ///   key from the passphrase via the shared Argon2id parameterization with a
 ///   persisted per-database salt sidecar.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SqliteKeyMaterial {
     /// Raw encryption key material (32 bytes recommended).
     Raw(zeroize::Zeroizing<Vec<u8>>),
     /// Human-chosen passphrase; the `SQLCipher` key is derived via Argon2id.
     Passphrase(zeroize::Zeroizing<String>),
+}
+
+impl std::fmt::Debug for SqliteKeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the key or passphrase bytes — only the variant and a
+        // length hint for the raw case (defense in depth). Mirrors the PyO3 /
+        // UniFFI redacting impl.
+        match self {
+            Self::Raw(bytes) => {
+                write!(
+                    f,
+                    "SqliteKeyMaterial::Raw(<redacted {} bytes>)",
+                    bytes.len()
+                )
+            }
+            Self::Passphrase(_) => write!(f, "SqliteKeyMaterial::Passphrase(<redacted>)"),
+        }
+    }
 }
 
 /// Bridge-internal error returned by

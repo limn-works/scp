@@ -25,7 +25,7 @@ use pyo3::types::PyDict;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 
 use crate::error::ScpPyError;
-use crate::runtime::{PyBridgeInstance, StorageConfig};
+use crate::runtime::{PyBridgeInstance, SqliteKeyMaterial, StorageConfig};
 
 /// Python-facing `SCP` instance.
 ///
@@ -66,6 +66,13 @@ impl PyScp {
     ///   — SQLCipher-encrypted storage at `{path}/scp.db`. `key` must be a
     ///   `bytes` object holding raw encryption key material (32 bytes
     ///   recommended).
+    /// - `{"type": "sqlite", "path": "/path/to/dir", "passphrase": "..."}`
+    ///   — SQLCipher-encrypted storage whose key is derived from a passphrase
+    ///   via Argon2id (with a persisted per-database salt sidecar). `passphrase`
+    ///   must be a `str`.
+    ///
+    /// For the `sqlite` type, exactly ONE of `key` or `passphrase` must be
+    /// supplied — both-present or neither raises `ValidationError`.
     ///
     /// Unknown types or malformed shapes raise `ValidationError`.
     ///
@@ -73,7 +80,8 @@ impl PyScp {
     ///
     /// Raises `ValidationError` if `config["type"]` is missing or not a
     /// recognised storage variant, or if required fields for the selected
-    /// variant are missing or wrongly typed.
+    /// variant are missing or wrongly typed (including supplying both or
+    /// neither of `key`/`passphrase` for `sqlite`).
     #[staticmethod]
     pub fn with_storage(_py: Python<'_>, config: &Bound<'_, PyDict>) -> PyResult<Self> {
         let storage_type: String = match config.get_item("type")? {
@@ -110,23 +118,49 @@ impl PyScp {
                         e.message
                     ))
                 })?;
-                let key_bytes: Vec<u8> = match config.get_item("key")? {
-                    Some(v) => v.extract().map_err(|e| {
-                        ScpPyError::validation(format!(
-                            "SCP.with_storage(sqlite): 'key' must be bytes — {e}"
-                        ))
-                    })?,
-                    None => {
+                // Exactly ONE of `key` (raw bytes) or `passphrase` (str) must
+                // be supplied — the `SqliteKeyMaterial` sum type enforces mutual
+                // exclusion at the type level; here we enforce it at the dict
+                // boundary (spec §17.6). The passphrase is moved into
+                // `Zeroizing` immediately so it never lingers in an un-wiped
+                // `String`.
+                let key_item = config.get_item("key")?;
+                let passphrase_item = config.get_item("passphrase")?;
+                let key_material = match (key_item, passphrase_item) {
+                    (Some(_), Some(_)) => {
                         return Err(ScpPyError::validation(
-                            "SCP.with_storage(sqlite): missing required key 'key' (raw encryption key bytes)"
+                            "SCP.with_storage(sqlite): supply exactly one of 'key' or 'passphrase', not both"
                                 .to_owned(),
                         )
                         .into());
                     }
+                    (None, None) => {
+                        return Err(ScpPyError::validation(
+                            "SCP.with_storage(sqlite): missing key material — supply either 'key' (raw encryption key bytes) or 'passphrase' (str)"
+                                .to_owned(),
+                        )
+                        .into());
+                    }
+                    (Some(key_val), None) => {
+                        let key_bytes: Vec<u8> = key_val.extract().map_err(|e| {
+                            ScpPyError::validation(format!(
+                                "SCP.with_storage(sqlite): 'key' must be bytes — {e}"
+                            ))
+                        })?;
+                        SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(key_bytes))
+                    }
+                    (None, Some(pass_val)) => {
+                        let passphrase: String = pass_val.extract().map_err(|e| {
+                            ScpPyError::validation(format!(
+                                "SCP.with_storage(sqlite): 'passphrase' must be a str — {e}"
+                            ))
+                        })?;
+                        SqliteKeyMaterial::Passphrase(zeroize::Zeroizing::new(passphrase))
+                    }
                 };
                 StorageConfig::Sqlite {
                     path: std::path::PathBuf::from(path_str),
-                    key: zeroize::Zeroizing::new(key_bytes),
+                    key: key_material,
                 }
             }
             other => {
@@ -293,5 +327,106 @@ impl PyScp {
     #[must_use]
     pub const fn from_bridge_instance(inner: Arc<PyBridgeInstance>) -> Self {
         Self { inner }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+
+    use crate::scp::PyScp;
+
+    /// Build the `{"type": "sqlite", "path": dir}` dict shared by the parse
+    /// tests; the caller adds `key`/`passphrase` as needed.
+    fn sqlite_dict<'py>(py: Python<'py>, dir: &str) -> Bound<'py, PyDict> {
+        let dict = PyDict::new(py);
+        dict.set_item("type", "sqlite").expect("set type");
+        dict.set_item("path", dir).expect("set path");
+        dict
+    }
+
+    /// Parity with the NAPI passphrase parse: a `sqlite` config carrying a
+    /// `passphrase` (and no `key`) constructs successfully — the dict path
+    /// wires the passphrase through to `SqliteStorage::with_passphrase`.
+    #[test]
+    fn with_storage_sqlite_passphrase_constructs() {
+        pyo3::prepare_freethreaded_python();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_str().expect("utf8 path").to_owned();
+        Python::with_gil(|py| {
+            let dict = sqlite_dict(py, &dir);
+            dict.set_item("passphrase", "correct horse battery staple")
+                .expect("set passphrase");
+            let result = PyScp::with_storage(py, &dict);
+            assert!(
+                result.is_ok(),
+                "sqlite + passphrase must construct: {:?}",
+                result.err()
+            );
+        });
+    }
+
+    /// Parity with the NAPI raw-key parse: a `sqlite` config carrying `key`
+    /// bytes (and no `passphrase`) constructs successfully.
+    #[test]
+    fn with_storage_sqlite_raw_key_constructs() {
+        pyo3::prepare_freethreaded_python();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_str().expect("utf8 path").to_owned();
+        Python::with_gil(|py| {
+            let dict = sqlite_dict(py, &dir);
+            dict.set_item("key", vec![0x11_u8; 32]).expect("set key");
+            let result = PyScp::with_storage(py, &dict);
+            assert!(
+                result.is_ok(),
+                "sqlite + raw key must construct: {:?}",
+                result.err()
+            );
+        });
+    }
+
+    /// Supplying BOTH `key` and `passphrase` for `sqlite` is a `ValidationError`
+    /// (exactly-one-of enforcement at the dict boundary, spec §17.6).
+    #[test]
+    fn with_storage_sqlite_both_key_and_passphrase_rejected() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = sqlite_dict(py, "/tmp/scp-test-both");
+            dict.set_item("key", vec![0x22_u8; 32]).expect("set key");
+            dict.set_item("passphrase", "also-a-passphrase")
+                .expect("set passphrase");
+            // `PyScp` does not implement `Debug`, so match on the `Result`
+            // rather than using `expect_err`.
+            let msg = match PyScp::with_storage(py, &dict) {
+                Ok(_) => panic!("both key and passphrase must be rejected"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                msg.contains("exactly one of 'key' or 'passphrase'"),
+                "error must explain the exactly-one constraint: {msg}"
+            );
+        });
+    }
+
+    /// Supplying NEITHER `key` nor `passphrase` for `sqlite` is a
+    /// `ValidationError`.
+    #[test]
+    fn with_storage_sqlite_neither_key_nor_passphrase_rejected() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = sqlite_dict(py, "/tmp/scp-test-neither");
+            // `PyScp` does not implement `Debug`, so match on the `Result`
+            // rather than using `expect_err`.
+            let msg = match PyScp::with_storage(py, &dict) {
+                Ok(_) => panic!("missing key material must be rejected"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                msg.contains("missing key material"),
+                "error must explain the missing key material: {msg}"
+            );
+        });
     }
 }
