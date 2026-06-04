@@ -404,48 +404,6 @@ impl PyCallbackKeyCustody {
         Self { provider }
     }
 
-    /// Parses a numeric key-id string into a [`KeyHandle`].
-    fn parse_handle(method: &str, key_id: &str) -> Result<KeyHandle, PlatformError> {
-        key_id.parse::<u64>().map(KeyHandle::new).map_err(|_| {
-            PlatformError::CustodyError(format!(
-                "KeyCustodyProvider.{method} returned a non-numeric key_id: {key_id}"
-            ))
-        })
-    }
-
-    /// Coerces a 32-byte custody return into a fixed array.
-    fn expect_32(method: &str, bytes: &[u8]) -> Result<[u8; 32], PlatformError> {
-        bytes.try_into().map_err(|_| {
-            PlatformError::CustodyError(format!(
-                "KeyCustodyProvider.{method} returned {} bytes, expected 32",
-                bytes.len()
-            ))
-        })
-    }
-
-    /// Unpacks a `derive_pseudonym`-style return (`[pubkey(32) || key_id_utf8]`)
-    /// into a [`PseudonymKeypair`].
-    fn unpack_pseudonym(method: &str, bytes: &[u8]) -> Result<PseudonymKeypair, PlatformError> {
-        if bytes.len() < 33 {
-            return Err(PlatformError::CustodyError(format!(
-                "KeyCustodyProvider.{method} returned {} bytes, expected at least 33 \
-                 (32 public key + key_id)",
-                bytes.len()
-            )));
-        }
-        let public_key_bytes = &bytes[..32];
-        let key_id_str = std::str::from_utf8(&bytes[32..]).map_err(|_| {
-            PlatformError::CustodyError(format!(
-                "KeyCustodyProvider.{method} key_id portion is not valid UTF-8"
-            ))
-        })?;
-        let key_id = Self::parse_handle(method, key_id_str)?;
-        Ok(PseudonymKeypair {
-            public_key: PublicKey::new(public_key_bytes.to_vec()),
-            key_handle: key_id,
-        })
-    }
-
     /// Exports the raw Ed25519 signing key via the provider's
     /// `export_signing_key_bytes`.
     ///
@@ -468,7 +426,10 @@ impl PyCallbackKeyCustody {
             self.provider
                 .call_str("export_signing_key_bytes", &handle.id().to_string())?,
         );
-        let arr = zeroize::Zeroizing::new(Self::expect_32("export_signing_key_bytes", &bytes)?);
+        let arr = zeroize::Zeroizing::new(scp_ffi_common::custody_parse::expect_32(
+            "export_signing_key_bytes",
+            &bytes,
+        )?);
         Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
     }
 }
@@ -480,7 +441,7 @@ impl KeyCustody for PyCallbackKeyCustody {
             KeyType::X25519 => "x25519".to_owned(),
         };
         let key_id: String = self.provider.call_str("generate_keypair", &type_str)?;
-        Self::parse_handle("generate_keypair", &key_id)
+        scp_ffi_common::custody_parse::parse_handle("generate_keypair", &key_id)
     }
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
@@ -514,7 +475,9 @@ impl KeyCustody for PyCallbackKeyCustody {
             self.provider
                 .call_str_bytes("dh_agree", &key.id().to_string(), peer_public)?,
         );
-        Ok(SharedSecret::new(Self::expect_32("dh_agree", &shared)?))
+        Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
+            "dh_agree", &shared,
+        )?))
     }
 
     async fn derive_pseudonym(
@@ -525,7 +488,7 @@ impl KeyCustody for PyCallbackKeyCustody {
         let bytes: Vec<u8> =
             self.provider
                 .call_str_bytes("derive_pseudonym", &key.id().to_string(), context_id)?;
-        Self::unpack_pseudonym("derive_pseudonym", &bytes)
+        scp_ffi_common::custody_parse::unpack_pseudonym("derive_pseudonym", &bytes)
     }
 
     async fn derive_rotatable_pseudonym(
@@ -537,27 +500,18 @@ impl KeyCustody for PyCallbackKeyCustody {
         // Match the UniFFI CallbackKeyCustody contract: the rotatable variant
         // is synthesized by extending the context_id with the big-endian epoch
         // and the v2 domain separator, then delegating to derive_pseudonym.
-        // Keeps the Python protocol surface to a single pseudonym method.
-        //
-        // Layout: `context_id || epoch_BE(8) || "scp-pseudonym-v2"`. This is the
-        // canonical recipe defined in `scp-platform` `KeyCustody::derive_rotatable_pseudonym`
-        // (traits.rs) — "all implementations MUST produce identical output" — so
-        // the byte ordering is fixed by the protocol, not by this bridge. There is
-        // deliberately NO length separator between `context_id` and the epoch: the
-        // epoch is always exactly 8 big-endian bytes appended directly after the
-        // caller-supplied `context_id`, and the trailing domain separator is a
-        // fixed 16-byte literal. A length prefix would change the produced bytes
-        // and is therefore a wire-format change that must originate upstream in the
-        // spec/ADR and `scp-platform` (and be applied identically across all four
-        // bridges and the native custody backends) — it cannot be introduced here
-        // without breaking cross-bridge and over-time pseudonym derivation parity.
-        let mut extended = context_id.to_vec();
-        extended.extend_from_slice(&pseudonym_epoch.to_be_bytes());
-        extended.extend_from_slice(b"scp-pseudonym-v2");
+        // Keeps the Python protocol surface to a single pseudonym method. The
+        // canonical byte layout (`context_id || epoch_BE(8) || "scp-pseudonym-v2"`)
+        // lives in `scp_ffi_common::custody_parse::extend_context_id_for_rotation`,
+        // shared across all callback bridges so the wire format cannot drift.
+        let extended = scp_ffi_common::custody_parse::extend_context_id_for_rotation(
+            context_id,
+            pseudonym_epoch,
+        );
         let bytes: Vec<u8> =
             self.provider
                 .call_str_bytes("derive_pseudonym", &key.id().to_string(), &extended)?;
-        Self::unpack_pseudonym("derive_rotatable_pseudonym", &bytes)
+        scp_ffi_common::custody_parse::unpack_pseudonym("derive_rotatable_pseudonym", &bytes)
     }
 
     async fn ed25519_to_x25519_agree(
@@ -577,7 +531,7 @@ impl KeyCustody for PyCallbackKeyCustody {
                 &ed25519_handle.id().to_string(),
                 peer_x25519_public,
             )?);
-        Ok(SharedSecret::new(Self::expect_32(
+        Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
             "ed25519_to_x25519_agree",
             &shared,
         )?))

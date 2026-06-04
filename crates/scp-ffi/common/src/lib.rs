@@ -96,6 +96,14 @@ pub fn html_escape_json(json: &str) -> String {
         .replace('\'', "\\u0027")
 }
 
+// Shared callback-custody byte/string parsing helpers (behind the `custody`
+// feature). Requires scp-platform for the typed return values. Used by the
+// PyO3, napi-rs, and UniFFI CallbackKeyCustody adapters; NOT folded into
+// `resolvers` because these are pure byte/string ops far lighter than the
+// resolver stack, and WASM does not use callback custody (ADR-034). See ADR-006.
+#[cfg(feature = "custody")]
+pub mod custody_parse;
+
 // Shared attestation construction pipeline for all non-WASM bridges.
 // Requires scp-core + scp-identity (behind `resolvers` feature). Not available for WASM.
 #[cfg(feature = "resolvers")]
