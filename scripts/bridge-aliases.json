@@ -3246,6 +3246,113 @@
       "wasm": [
         "identity_verify_link_attestation"
       ]
+    },
+    {
+      "canonical": "metadata_record_to_json",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "py_metadata_record_to_json"
+      ],
+      "uniffi": [
+        "metadata_record_to_json"
+      ],
+      "napi": [
+        "metadata_record_to_json"
+      ],
+      "wasm": [
+        "metadata_record_to_json"
+      ]
+    },
+    {
+      "canonical": "commit_deploy",
+      "category": "server",
+      "wasm_required": false,
+      "pyo3": [
+        "commit_deploy"
+      ],
+      "uniffi": [
+        "commit_deploy"
+      ],
+      "napi": [
+        "commit_deploy"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "rollback_deploy",
+      "category": "server",
+      "wasm_required": false,
+      "pyo3": [
+        "rollback_deploy"
+      ],
+      "uniffi": [
+        "rollback_deploy"
+      ],
+      "napi": [
+        "rollback_deploy"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "transport_add_relay",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "transport_add_relay"
+      ],
+      "uniffi": [
+        "add_relay"
+      ],
+      "napi": [
+        "transport_add_relay"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "transport_assign_relay_set",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "transport_assign_relay_set"
+      ],
+      "uniffi": [
+        "assign_relay_set"
+      ],
+      "napi": [
+        "transport_assign_relay_set"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "transport_adapter_count",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "transport_adapter_count"
+      ],
+      "uniffi": [
+        "adapter_count"
+      ],
+      "napi": [
+        "transport_adapter_count"
+      ],
+      "wasm": []
+    },
+    {
+      "canonical": "transport_reliability",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "transport_reliability"
+      ],
+      "uniffi": [
+        "reliability_score"
+      ],
+      "napi": [
+        "transport_reliability"
+      ],
+      "wasm": []
     }
   ],
   "exemptions": {
@@ -3389,6 +3496,30 @@
       {
         "canonical": "bridge_credential_delete_key",
         "reason": "Bridge credential key custody lives only in scp-runtime (tokio async store); wasm32 cannot depend on scp-runtime per ADR-034 (spec §12.11.2)."
+      },
+      {
+        "canonical": "commit_deploy",
+        "reason": "Site-projection deploy is a server-side scp-platform operation; WASM cannot host an HTTP server / deploy pipeline per ADR-034."
+      },
+      {
+        "canonical": "rollback_deploy",
+        "reason": "Site-projection deploy rollback is a server-side scp-platform operation; WASM cannot host an HTTP server / deploy pipeline per ADR-034."
+      },
+      {
+        "canonical": "transport_add_relay",
+        "reason": "WASM has no scp-platform / no transport adapter set per ADR-034."
+      },
+      {
+        "canonical": "transport_assign_relay_set",
+        "reason": "WASM has no scp-platform / no transport adapter set per ADR-034."
+      },
+      {
+        "canonical": "transport_adapter_count",
+        "reason": "WASM has no scp-platform / no transport adapter set per ADR-034."
+      },
+      {
+        "canonical": "transport_reliability",
+        "reason": "WASM has no scp-platform / no transport adapter set per ADR-034."
       }
     ]
   }
