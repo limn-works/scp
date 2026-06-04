@@ -1559,7 +1559,19 @@ fn discovery_and_provenance_coverage() {
 // paths, so no new parity operation was added in its place. This is a
 // legitimate removal; the ratchet is reset to the new floor. See commit
 // 2291102.
-const MIN_PARITY_OPERATIONS: usize = 97;
+//
+// Subsequently RAISED 97 -> 104 by the reverse-coverage gate: seven operations
+// were exported across bridges but absent from the alias table (the
+// hide-by-omission class). They are now registered, expanding coverage. The
+// seven: `metadata_record_to_json` (spec §5.7.2, the to_json counterpart of
+// the already-registered `metadata_record_from_json`); `commit_deploy` /
+// `rollback_deploy` (ADR-037; spec §10.14.3 site-projection deploy, wasm-exempt
+// server ops); and the four transport relay-management ops
+// `transport_add_relay` / `transport_assign_relay_set` /
+// `transport_adapter_count` / `transport_reliability` (ADR-013 transport
+// adapter set, wasm-exempt — WASM has no scp-platform per ADR-034). This is a
+// pure coverage expansion, not a swap for the removed `economy_adjust_relay_price`.
+const MIN_PARITY_OPERATIONS: usize = 104;
 
 /// Named set of operations that must have `wasm_required=true`.
 /// This is a named set, not a count — swapping one operation for another is
@@ -3044,4 +3056,322 @@ fn pure_helpers_detector_accepts_self_type_references() {
             "detector failed to recognize Self-type reference in: {src}"
         );
     }
+}
+
+// ===========================================================================
+// F2: Reverse-coverage — every exported FFI fn is registered or allowlisted
+//
+// The forward tests (`*_bridge_covers_core_operations`) ask: "is every
+// canonical operation in bridge-aliases.json backed by a real exported fn?"
+// They are blind in the OTHER direction: a bridge can export a function that
+// no canonical operation references at all. If that function is genuinely a
+// cross-bridge parity op (it exists in the other bridges too) but simply
+// never got an alias entry, the forward tests stay green while the operation
+// silently lacks parity tracking. That is exactly how an unregistered op can
+// hide — e.g. an op exported in all four bridges but absent from the alias
+// table is invisible to every forward gate.
+//
+// This reverse gate enumerates EVERY exported fn under each bridge crate's
+// `src/` (via a real filesystem walk + the strict `syn` scanner — NOT the
+// curated `*_sources()` include lists, which are themselves incomplete) and
+// requires each name to be either:
+//   • registered  — appears as a Rust name for some canonical op in
+//     bridge-aliases.json under that bridge, OR
+//   • allowed      — listed in scripts/ffi-export-allowlist.json as a
+//     legitimately-non-parity export (getter, lifecycle, dunder, etc.), OR
+//   • pending      — listed in the allowlist's pending_registration block as
+//     a known-unregistered cross-bridge parity op awaiting an alias entry.
+//
+// `leaked = exported − registered − allowed − pending`. A non-empty `leaked`
+// set is a finding: a brand-new export that is neither tracked for parity nor
+// justified as non-parity.
+// ===========================================================================
+
+const FFI_EXPORT_ALLOWLIST_JSON: &str =
+    include_str!("../../../../scripts/ffi-export-allowlist.json");
+
+#[derive(Debug, Deserialize)]
+struct FfiExportAllowlistFile {
+    #[serde(default)]
+    pyo3: Vec<AllowlistEntry>,
+    #[serde(default)]
+    uniffi: Vec<AllowlistEntry>,
+    #[serde(default)]
+    napi: Vec<AllowlistEntry>,
+    #[serde(default)]
+    wasm: Vec<AllowlistEntry>,
+    #[serde(default)]
+    pending_registration: PendingRegistration,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PendingRegistration {
+    #[serde(default)]
+    pyo3: Vec<AllowlistEntry>,
+    #[serde(default)]
+    uniffi: Vec<AllowlistEntry>,
+    #[serde(default)]
+    napi: Vec<AllowlistEntry>,
+    #[serde(default)]
+    wasm: Vec<AllowlistEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AllowlistEntry {
+    name: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    reason: String,
+}
+
+fn ffi_export_allowlist() -> &'static FfiExportAllowlistFile {
+    static CELL: OnceLock<FfiExportAllowlistFile> = OnceLock::new();
+    CELL.get_or_init(|| {
+        serde_json::from_str(FFI_EXPORT_ALLOWLIST_JSON)
+            .expect("scripts/ffi-export-allowlist.json is valid JSON")
+    })
+}
+
+/// The four bridges, paired with the `src/` root each one's exports live under
+/// and the closure that selects that bridge's Rust names from an alias op.
+/// Order mirrors `ffi_bridge_roots()`.
+fn bridge_export_targets() -> Vec<(&'static str, PathBuf)> {
+    let root = workspace_root();
+    vec![
+        ("pyo3", root.join("crates/scp-ffi/src")),
+        ("uniffi", root.join("crates/scp-ffi/uniffi/src")),
+        ("napi", root.join("crates/scp-ffi/napi/src")),
+        ("wasm", root.join("crates/scp-ffi/wasm/src")),
+    ]
+}
+
+/// The set of Rust fn names a given bridge is expected to export because a
+/// canonical operation in `bridge-aliases.json` names them. This is the
+/// "registered" set the reverse gate measures exported fns against.
+fn registered_names_for(bridge: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (_, canonical, _) in parity_operations() {
+        let names: &[String] = match bridge {
+            "pyo3" => pyo3_names(canonical),
+            "uniffi" => uniffi_names(canonical),
+            "napi" => napi_names(canonical),
+            "wasm" => wasm_names(canonical),
+            other => panic!("registered_names_for: unknown bridge '{other}'"),
+        };
+        for n in names {
+            out.insert(n.clone());
+        }
+    }
+    out
+}
+
+/// Allowlist names (the legitimately-non-parity exports) for a bridge.
+fn allowed_names_for(bridge: &str) -> BTreeSet<String> {
+    let file = ffi_export_allowlist();
+    let entries: &[AllowlistEntry] = match bridge {
+        "pyo3" => &file.pyo3,
+        "uniffi" => &file.uniffi,
+        "napi" => &file.napi,
+        "wasm" => &file.wasm,
+        other => panic!("allowed_names_for: unknown bridge '{other}'"),
+    };
+    entries.iter().map(|e| e.name.clone()).collect()
+}
+
+/// Pending-registration names (known-unregistered cross-bridge parity ops
+/// awaiting an alias entry) for a bridge.
+fn pending_names_for(bridge: &str) -> BTreeSet<String> {
+    let file = ffi_export_allowlist();
+    let entries: &[AllowlistEntry] = match bridge {
+        "pyo3" => &file.pending_registration.pyo3,
+        "uniffi" => &file.pending_registration.uniffi,
+        "napi" => &file.pending_registration.napi,
+        "wasm" => &file.pending_registration.wasm,
+        other => panic!("pending_names_for: unknown bridge '{other}'"),
+    };
+    entries.iter().map(|e| e.name.clone()).collect()
+}
+
+/// Every exported fn name under a bridge crate's `src/`, via a filesystem walk
+/// and the strict `syn` scanner. Reads each `*.rs` file fresh (these are NOT
+/// the `include_str!`-interned `*_sources()` lists, which are incomplete — the
+/// walk is authoritative).
+fn exported_names_under(root: &Path) -> BTreeSet<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    let mut out = BTreeSet::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for name in collect_ffi_exported_fns(&text) {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// Reverse-coverage gate. See the section header above for the full rationale.
+#[test]
+fn every_exported_ffi_fn_is_registered_or_allowlisted() {
+    let mut all_leaks: Vec<String> = Vec::new();
+    for (bridge, root) in bridge_export_targets() {
+        let exported = exported_names_under(&root);
+        let registered = registered_names_for(bridge);
+        let allowed = allowed_names_for(bridge);
+        let pending = pending_names_for(bridge);
+
+        let leaked: Vec<&String> = exported
+            .iter()
+            .filter(|n| !registered.contains(*n) && !allowed.contains(*n) && !pending.contains(*n))
+            .collect();
+
+        if !leaked.is_empty() {
+            eprintln!("{bridge}: {} leaked export(s): {leaked:?}", leaked.len());
+            for n in leaked {
+                all_leaks.push(format!("{bridge}::{n}"));
+            }
+        }
+    }
+
+    assert!(
+        all_leaks.is_empty(),
+        "{} FFI export(s) are neither registered as a parity operation in \
+         scripts/bridge-aliases.json nor justified in \
+         scripts/ffi-export-allowlist.json:\n  {}\n\
+         Each leaked name is either (a) a legitimately-non-parity export — add \
+         it to the bridge's array in ffi-export-allowlist.json with the right \
+         `kind` + `reason`; or (b) a genuine cross-bridge parity operation that \
+         lacks an alias entry — add it to the pending_registration block (with \
+         cross-bridge evidence) and register it in bridge-aliases.json.",
+        all_leaks.len(),
+        all_leaks.join("\n  ")
+    );
+}
+
+/// Guard (a): no dead allowlist entries. Every name listed in
+/// ffi-export-allowlist.json (both the per-bridge arrays AND the
+/// pending_registration block) must correspond to an actually-exported fn in
+/// that bridge — otherwise the allowlist accumulates stale entries that hide
+/// nothing and rot silently.
+#[test]
+fn ffi_export_allowlist_has_no_stale_entries() {
+    let file = ffi_export_allowlist();
+    let mut stale: Vec<String> = Vec::new();
+    for (bridge, root) in bridge_export_targets() {
+        let exported = exported_names_under(&root);
+        let entries: Vec<&AllowlistEntry> = match bridge {
+            "pyo3" => file
+                .pyo3
+                .iter()
+                .chain(&file.pending_registration.pyo3)
+                .collect(),
+            "uniffi" => file
+                .uniffi
+                .iter()
+                .chain(&file.pending_registration.uniffi)
+                .collect(),
+            "napi" => file
+                .napi
+                .iter()
+                .chain(&file.pending_registration.napi)
+                .collect(),
+            "wasm" => file
+                .wasm
+                .iter()
+                .chain(&file.pending_registration.wasm)
+                .collect(),
+            other => panic!("unknown bridge '{other}'"),
+        };
+        for entry in entries {
+            if !exported.contains(&entry.name) {
+                stale.push(format!("{bridge}::{}", entry.name));
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "ffi-export-allowlist.json has {} stale entry(ies) (name is not an \
+         exported fn in that bridge): {stale:?}. Remove them.",
+        stale.len()
+    );
+}
+
+/// Guard (b): every allowlist entry's `kind` is valid and its `reason` is
+/// non-empty; `wasm-only` and `pending-registration` kinds additionally
+/// require the reason to cite a DURABLE provenance artifact (ADR / §spec /
+/// SCP story) — reusing the same `cites_durable_provenance` gate the exemption
+/// reasons use. A `wasm-only` op (e.g. one ADR-034 mandates WASM implement
+/// locally) and a `pending-registration` op (a known parity gap) are both
+/// permanent statements that must trace to an artifact, not a hand-wave.
+#[test]
+fn ffi_export_allowlist_reasons_are_justified() {
+    const VALID_KINDS: &[&str] = &[
+        "getter",
+        "lifecycle",
+        "dunder",
+        "wasm-only",
+        "test-fixture",
+        "introspection",
+        "constructor",
+        "bridge-specific",
+        "pending-registration",
+    ];
+    let file = ffi_export_allowlist();
+    let mut offenders: Vec<String> = Vec::new();
+
+    let mut check = |bridge: &str, entry: &AllowlistEntry, force_provenance: bool| {
+        if !VALID_KINDS.contains(&entry.kind.as_str()) {
+            offenders.push(format!(
+                "{bridge}::{} has invalid kind '{}' (valid: {VALID_KINDS:?})",
+                entry.name, entry.kind
+            ));
+            return;
+        }
+        if entry.reason.trim().is_empty() {
+            offenders.push(format!("{bridge}::{} has an empty reason", entry.name));
+            return;
+        }
+        let needs_provenance =
+            force_provenance || entry.kind == "wasm-only" || entry.kind == "pending-registration";
+        if needs_provenance && !cites_durable_provenance(&entry.reason) {
+            offenders.push(format!(
+                "{bridge}::{} (kind '{}') must cite a durable artifact \
+                 (ADR-NNN / §N / SCP-NNN) in its reason; got: {:?}",
+                entry.name, entry.kind, entry.reason
+            ));
+        }
+    };
+
+    for (bridge, entries) in [
+        ("pyo3", &file.pyo3),
+        ("uniffi", &file.uniffi),
+        ("napi", &file.napi),
+        ("wasm", &file.wasm),
+    ] {
+        for entry in entries {
+            check(bridge, entry, false);
+        }
+    }
+    // pending_registration entries always require durable provenance: they are
+    // assertions that a real parity op exists across bridges but is not yet
+    // registered, so the evidence must be auditable.
+    for (bridge, entries) in [
+        ("pyo3", &file.pending_registration.pyo3),
+        ("uniffi", &file.pending_registration.uniffi),
+        ("napi", &file.pending_registration.napi),
+        ("wasm", &file.pending_registration.wasm),
+    ] {
+        for entry in entries {
+            check(bridge, entry, true);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "ffi-export-allowlist.json has {} unjustified entry(ies):\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
+    );
 }
