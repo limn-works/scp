@@ -49,7 +49,7 @@
       "name": "py_bridge_derive_credential_key",
       "path": "crates/scp-ffi/src/bridge_connector.rs",
       "kind": "bridge-specific",
-      "reason": "Derives a per-bridge credential encryption key (ADR-023; spec §12.11.2). PyO3-only crypto helper in bridge_connector.rs; the cross-bridge credential ops (provision/retrieve/rotate/revoke/list/store_key/get_key/delete_key) are registered separately. Not a parity gap."
+      "reason": "Derives a per-bridge credential encryption key (ADR-023; spec §12.11.2). PyO3-only crypto helper in bridge_connector.rs; the cross-bridge credential ops (bridge_credential_provision, bridge_credential_retrieve, bridge_credential_rotate, bridge_credential_revoke, bridge_credential_list, bridge_credential_store_key, bridge_credential_get_key, bridge_credential_delete_key) are registered separately. Not a parity gap."
     },
     {
       "name": "py_bridge_generate_credential_key",

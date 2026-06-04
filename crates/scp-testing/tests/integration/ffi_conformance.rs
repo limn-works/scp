@@ -3459,6 +3459,42 @@ fn ffi_export_allowlist_has_no_stale_entries() {
 const CAPABILITY_MATRIX_REF: &str = "sdk-capability-matrix.json";
 
 // ---------------------------------------------------------------------------
+// Known residual limitations of the `bridge-specific` reverse-coverage gate
+//
+// These are recorded honestly rather than fixed: each is either contrived,
+// structural, or already backstopped by the forward-coverage gates (the
+// registration/pending checks that require a real op to exist). They are LOW
+// severity and listed so they are not silently ignored.
+//
+//   • Intra-file same-name shadowing. A rogue exported fn sharing a
+//     registered/getter name IN THE SAME FILE as the canonical export is
+//     deduped by the per-file symbol set — path-qualification distinguishes
+//     same-name fns ACROSS files but cannot see intra-file name reuse.
+//     Mitigation: forward coverage + code review; low likelihood, since it
+//     requires editing the canonical export's own file to add the shadow.
+//
+//   • `#[cfg(test)]`-gated canonical. If a canonical export is `#[cfg(test)]`
+//     and thus dropped from the scan, a rogue same-name export could become the
+//     sole surviving path. Self-limiting: a `#[cfg(test)]` canonical does not
+//     ship, so the forward-coverage tests catch the missing real op. NOTE: only
+//     `#[cfg(test)]` drops fns from the scan — `#[cfg(feature = "...")]` does
+//     NOT, so feature-gated canonicals are unaffected.
+//
+//   • Near-name dodge. The matrix-op matcher (`matrix_ops_named_in`) is
+//     whole-word, so `createX` does NOT match the op `create`. A reason that
+//     paraphrases the op name evades the matrix-contradiction check.
+//     Mitigation: the registration/forward gates still require the genuine op
+//     to exist, so a paraphrase cannot conjure coverage it doesn't have.
+//
+//   • napi/wasm SDK-column collapse. `bridge_to_sdks` maps BOTH `napi` and
+//     `wasm` to `typescript`, so a genuine napi+wasm two-bridge op declared
+//     `bridge-specific` on only one of them is not flagged by the matrix check
+//     alone (the other TS bridge looks "inside" the same SDK set). Backstopped
+//     by the OTHER bridge's own reverse gate: the second bridge's export must
+//     still be registered or carry its own justified allowlist entry.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // RESIDUAL-C remediation: the capability matrix is PARSED, not substring-matched
 //
 // A `bridge-specific` allowlist reason that cites the capability matrix asserts
@@ -3725,16 +3761,28 @@ fn ffi_export_allowlist_reasons_are_justified() {
                     entry.name
                 ));
             }
-            // RESIDUAL-C: if the reason cites the matrix, the matrix is PARSED —
-            // any matrix op it names must be available ONLY on this bridge's
-            // SDK(s). A reason naming a 4-SDK (cross-bridge) op exposes a FALSE
-            // `bridge-specific` classification. (Reasons that cite the matrix
-            // only to say an export is "not among" the tracked ops name no
-            // matrix op and are backstopped by the ADR/§/SCP existence check
-            // above.)
-            if cites_matrix
-                && let Some(violation) =
-                    bridge_specific_matrix_violation(bridge, &entry.name, &entry.reason)
+            // RESIDUAL-C / NEW-C1: the matrix-vs-claim check runs UNCONDITIONALLY,
+            // decoupled from which justification path the entry took above. The
+            // matrix is PARSED and any matrix op NAMED in the reason — whether or
+            // not the reason also contains the literal `sdk-capability-matrix.json`
+            // string — must be available ONLY on this bridge's SDK(s). A reason
+            // naming a multi-SDK (cross-bridge) op exposes a FALSE `bridge-specific`
+            // classification regardless of how it dressed up its justification.
+            //
+            // The earlier gate ran this only when `cites_matrix` was true, so an
+            // entry that justified itself via a real ADR/§/SCP (the alternative
+            // path) while naming a cross-bridge matrix op — e.g. "Per ADR-023 the
+            // create operation is implemented only on PyO3 here" — skipped the
+            // contradiction check entirely and buried a 4-SDK op as one-bridge.
+            // "Is this entry justified at all" (cites matrix OR real ADR/§/SCP,
+            // checked above) is now independent of "does the reason name a matrix
+            // op that contradicts the bridge-specific claim" (checked here, always).
+            //
+            // Reasons that name no matrix op (e.g. they cite the matrix only to
+            // say an export is "not among" the tracked ops) produce no violation
+            // and are backstopped by the ADR/§/SCP existence check above.
+            if let Some(violation) =
+                bridge_specific_matrix_violation(bridge, &entry.name, &entry.reason)
             {
                 offenders.push(violation);
             }
