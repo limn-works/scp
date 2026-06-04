@@ -508,7 +508,20 @@ pub async fn close_context_with_key(
         deps.event_tx.as_ref(),
     );
 
-    deps.supervisor.update_context_gauges().await;
+    // Metrics gauge refresh is a Supervisor-wide operation: it round-trips a
+    // mailbox query to EVERY registered context actor -- including this one,
+    // which is still executing inside its own close handler. Awaiting it here
+    // self-deadlocks: the query parks in our own mailbox behind the command we
+    // are still processing, so it cannot be answered until close returns, but
+    // close cannot return until the query is answered -- it unwinds only when
+    // the 30s send timeout fires (surfacing as `close_context exceeded 30s
+    // budget`). Detach it: the close handler returns, this actor's command loop
+    // frees, and the refresh then observes up-to-date state. Gauges are
+    // eventually-consistent metrics, so fire-and-forget is the correct coupling.
+    let supervisor = deps.supervisor.clone();
+    tokio::spawn(async move {
+        supervisor.update_context_gauges().await;
+    });
 
     // Persist context state after close (best-effort).
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
