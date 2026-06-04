@@ -3119,10 +3119,26 @@ struct PendingRegistration {
 #[derive(Debug, Deserialize)]
 struct AllowlistEntry {
     name: String,
+    /// Workspace-relative path of the source file that defines this exported
+    /// fn, e.g. `crates/scp-ffi/src/identity.rs`. The qualified key
+    /// `<path>::<name>` is what the reverse gate matches on — mirroring the
+    /// `path::fn` discipline of `scripts/pure-helpers-allowlist.txt`. A bare
+    /// `name` match would silently exempt ANY future export sharing the name
+    /// (e.g. a genuine op named `tools`, which collides with the `tools`
+    /// getter), recreating the hide-by-omission class this gate exists to kill.
+    path: String,
     #[serde(default)]
     kind: String,
     #[serde(default)]
     reason: String,
+}
+
+impl AllowlistEntry {
+    /// The `<workspace-relative-path>::<name>` qualified key, matching the
+    /// convention in `scripts/pure-helpers-allowlist.txt`.
+    fn qualified_key(&self) -> String {
+        format!("{}::{}", self.path, self.name)
+    }
 }
 
 fn ffi_export_allowlist() -> &'static FfiExportAllowlistFile {
@@ -3166,38 +3182,63 @@ fn registered_names_for(bridge: &str) -> BTreeSet<String> {
     out
 }
 
-/// Allowlist names (the legitimately-non-parity exports) for a bridge.
-fn allowed_names_for(bridge: &str) -> BTreeSet<String> {
+/// Per-bridge entries from the allowlist's per-bridge arrays.
+fn per_bridge_entries(bridge: &str) -> &'static [AllowlistEntry] {
     let file = ffi_export_allowlist();
-    let entries: &[AllowlistEntry] = match bridge {
+    match bridge {
         "pyo3" => &file.pyo3,
         "uniffi" => &file.uniffi,
         "napi" => &file.napi,
         "wasm" => &file.wasm,
-        other => panic!("allowed_names_for: unknown bridge '{other}'"),
-    };
-    entries.iter().map(|e| e.name.clone()).collect()
+        other => panic!("per_bridge_entries: unknown bridge '{other}'"),
+    }
 }
 
-/// Pending-registration names (known-unregistered cross-bridge parity ops
-/// awaiting an alias entry) for a bridge.
-fn pending_names_for(bridge: &str) -> BTreeSet<String> {
+/// Per-bridge entries from the allowlist's `pending_registration` block.
+fn pending_entries(bridge: &str) -> &'static [AllowlistEntry] {
     let file = ffi_export_allowlist();
-    let entries: &[AllowlistEntry] = match bridge {
+    match bridge {
         "pyo3" => &file.pending_registration.pyo3,
         "uniffi" => &file.pending_registration.uniffi,
         "napi" => &file.pending_registration.napi,
         "wasm" => &file.pending_registration.wasm,
-        other => panic!("pending_names_for: unknown bridge '{other}'"),
-    };
-    entries.iter().map(|e| e.name.clone()).collect()
+        other => panic!("pending_entries: unknown bridge '{other}'"),
+    }
 }
 
-/// Every exported fn name under a bridge crate's `src/`, via a filesystem walk
-/// and the strict `syn` scanner. Reads each `*.rs` file fresh (these are NOT
-/// the `include_str!`-interned `*_sources()` lists, which are incomplete — the
-/// walk is authoritative).
-fn exported_names_under(root: &Path) -> BTreeSet<String> {
+/// Allowlist QUALIFIED keys (`<path>::<name>`, the legitimately-non-parity
+/// exports) for a bridge. Path-qualified per Finding 1: an entry exempts only
+/// the specific fn in the specific file it was written for.
+fn allowed_keys_for(bridge: &str) -> BTreeSet<String> {
+    per_bridge_entries(bridge)
+        .iter()
+        .map(AllowlistEntry::qualified_key)
+        .collect()
+}
+
+/// Pending-registration QUALIFIED keys (known-unregistered cross-bridge parity
+/// ops awaiting an alias entry) for a bridge.
+fn pending_keys_for(bridge: &str) -> BTreeSet<String> {
+    pending_entries(bridge)
+        .iter()
+        .map(AllowlistEntry::qualified_key)
+        .collect()
+}
+
+/// Every exported fn under a bridge crate's `src/`, as `<path>::<name>`
+/// qualified keys, via a filesystem walk and the strict `syn` scanner. `path`
+/// is workspace-relative (e.g. `crates/scp-ffi/src/identity.rs`) so the key
+/// matches the `path::fn` discipline of `scripts/pure-helpers-allowlist.txt`
+/// and the `path`+`name` pair an allowlist entry carries. Reads each `*.rs`
+/// file fresh (these are NOT the `include_str!`-interned `*_sources()` lists,
+/// which are incomplete — the walk is authoritative).
+///
+/// Qualification is what closes the bypass a reviewer proved: a bare-name
+/// allowlist (`tools` as a getter) would silently swallow a genuinely-new op
+/// that happens to share the name but lives in a different file. Keyed on the
+/// full path, an entry exempts ONLY the specific fn it was written for.
+fn exported_qualified_under(root: &Path) -> BTreeSet<String> {
+    let ws = workspace_root();
     let mut files = Vec::new();
     collect_rs_files(root, &mut files);
     let mut out = BTreeSet::new();
@@ -3205,8 +3246,13 @@ fn exported_names_under(root: &Path) -> BTreeSet<String> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
+        let rel = path
+            .strip_prefix(&ws)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
         for name in collect_ffi_exported_fns(&text) {
-            out.insert(name);
+            out.insert(format!("{rel}::{name}"));
         }
     }
     out
@@ -3217,20 +3263,32 @@ fn exported_names_under(root: &Path) -> BTreeSet<String> {
 fn every_exported_ffi_fn_is_registered_or_allowlisted() {
     let mut all_leaks: Vec<String> = Vec::new();
     for (bridge, root) in bridge_export_targets() {
-        let exported = exported_names_under(&root);
+        let exported = exported_qualified_under(&root);
+        // `registered` is keyed on the BARE Rust name a canonical op resolves
+        // to (alias entries are path-agnostic): an op registered in
+        // bridge-aliases.json is covered wherever the bridge defines it.
         let registered = registered_names_for(bridge);
-        let allowed = allowed_names_for(bridge);
-        let pending = pending_names_for(bridge);
+        // `allowed` / `pending` are keyed on the QUALIFIED `<path>::<name>` key
+        // so an allowlist entry exempts ONLY the specific fn in its file.
+        let allowed = allowed_keys_for(bridge);
+        let pending = pending_keys_for(bridge);
 
         let leaked: Vec<&String> = exported
             .iter()
-            .filter(|n| !registered.contains(*n) && !allowed.contains(*n) && !pending.contains(*n))
+            .filter(|qualified| {
+                let name = qualified
+                    .rsplit_once("::")
+                    .map_or(qualified.as_str(), |(_, n)| n);
+                !registered.contains(name)
+                    && !allowed.contains(*qualified)
+                    && !pending.contains(*qualified)
+            })
             .collect();
 
         if !leaked.is_empty() {
             eprintln!("{bridge}: {} leaked export(s): {leaked:?}", leaked.len());
-            for n in leaked {
-                all_leaks.push(format!("{bridge}::{n}"));
+            for q in leaked {
+                all_leaks.push(format!("{bridge}::{q}"));
             }
         }
     }
@@ -3257,54 +3315,71 @@ fn every_exported_ffi_fn_is_registered_or_allowlisted() {
 /// nothing and rot silently.
 #[test]
 fn ffi_export_allowlist_has_no_stale_entries() {
-    let file = ffi_export_allowlist();
     let mut stale: Vec<String> = Vec::new();
     for (bridge, root) in bridge_export_targets() {
-        let exported = exported_names_under(&root);
-        let entries: Vec<&AllowlistEntry> = match bridge {
-            "pyo3" => file
-                .pyo3
-                .iter()
-                .chain(&file.pending_registration.pyo3)
-                .collect(),
-            "uniffi" => file
-                .uniffi
-                .iter()
-                .chain(&file.pending_registration.uniffi)
-                .collect(),
-            "napi" => file
-                .napi
-                .iter()
-                .chain(&file.pending_registration.napi)
-                .collect(),
-            "wasm" => file
-                .wasm
-                .iter()
-                .chain(&file.pending_registration.wasm)
-                .collect(),
-            other => panic!("unknown bridge '{other}'"),
-        };
+        // QUALIFIED keys: an entry is stale unless its EXACT `<path>::<name>`
+        // is an actual export. This also catches a `path` that drifted (file
+        // renamed/moved) — the bare name might still exist elsewhere, but the
+        // entry no longer describes a real export and must be corrected.
+        let exported = exported_qualified_under(&root);
+        let entries = per_bridge_entries(bridge)
+            .iter()
+            .chain(pending_entries(bridge));
         for entry in entries {
-            if !exported.contains(&entry.name) {
-                stale.push(format!("{bridge}::{}", entry.name));
+            if !exported.contains(&entry.qualified_key()) {
+                stale.push(format!("{bridge}::{}", entry.qualified_key()));
             }
         }
     }
     assert!(
         stale.is_empty(),
-        "ffi-export-allowlist.json has {} stale entry(ies) (name is not an \
-         exported fn in that bridge): {stale:?}. Remove them.",
+        "ffi-export-allowlist.json has {} stale entry(ies) (the qualified \
+         <path>::<name> is not an exported fn in that bridge): {stale:?}. \
+         Remove them or correct the `path`.",
         stale.len()
     );
 }
 
+/// The capability-matrix artifact a `bridge-specific` allowlist reason must
+/// reference: it asserts an export is one-bridge BY DESIGN, so the matrix that
+/// records which bridges implement which op is the auditable justification.
+const CAPABILITY_MATRIX_REF: &str = "sdk-capability-matrix.json";
+
+/// Records any ADR-/SCP- token in `reason` that does NOT exist in its
+/// corpus. Shape (`cites_durable_provenance`) is necessary but not sufficient:
+/// this is the SAME existence check `every_exemption_reason_cites_durable_provenance`
+/// runs, so a fabricated `ADR-999` / `SCP-9999` cannot substantiate an
+/// allowlist entry. Spec `§` sections stay shape-only (section numbers are not
+/// single greppable tokens against the multi-file spec).
+fn fabricated_provenance_in(reason: &str) -> Vec<String> {
+    let mut bad: Vec<String> = cited_tokens(reason, "ADR-")
+        .into_iter()
+        .filter(|t| !adrs_in_repo().contains(t))
+        .collect();
+    bad.extend(
+        cited_tokens(reason, "SCP-")
+            .into_iter()
+            .filter(|t| !scp_stories_in_repo().contains(t)),
+    );
+    bad
+}
+
 /// Guard (b): every allowlist entry's `kind` is valid and its `reason` is
-/// non-empty; `wasm-only` and `pending-registration` kinds additionally
-/// require the reason to cite a DURABLE provenance artifact (ADR / §spec /
-/// SCP story) — reusing the same `cites_durable_provenance` gate the exemption
-/// reasons use. A `wasm-only` op (e.g. one ADR-034 mandates WASM implement
-/// locally) and a `pending-registration` op (a known parity gap) are both
-/// permanent statements that must trace to an artifact, not a hand-wave.
+/// non-empty.
+///
+/// Per Finding 2 the reason is EXISTENCE-checked, not merely shape-checked:
+///   • `wasm-only` and `pending-registration` must cite a durable artifact
+///     (ADR / §spec / SCP story) AND every cited ADR/SCP token must actually
+///     EXIST in the repo corpus — a fabricated `ADR-999` no longer passes.
+///   • `bridge-specific` must reference the capability-matrix justification
+///     (`sdk-capability-matrix.json`) OR an existing ADR/§/SCP that explains
+///     the one-bridge status — its prose justification is now ENFORCED, not
+///     optional. This is the artifact that records which bridges implement an
+///     op; a `bridge-specific` claim ("one-bridge by design, not a gap") is
+///     only auditable against it.
+///   • getter / lifecycle / dunder / constructor / test-fixture /
+///     introspection remain kind-tag-only (a non-empty reason suffices): the
+///     kind tag itself is the justification.
 #[test]
 fn ffi_export_allowlist_reasons_are_justified() {
     const VALID_KINDS: &[&str] = &[
@@ -3333,14 +3408,50 @@ fn ffi_export_allowlist_reasons_are_justified() {
             offenders.push(format!("{bridge}::{} has an empty reason", entry.name));
             return;
         }
+        // `bridge-specific` requires the capability-matrix justification OR a
+        // durable ADR/§/SCP artifact explaining the one-bridge status.
+        if entry.kind == "bridge-specific" {
+            let cites_matrix = entry.reason.contains(CAPABILITY_MATRIX_REF);
+            if !cites_matrix && !cites_durable_provenance(&entry.reason) {
+                offenders.push(format!(
+                    "{bridge}::{} (kind 'bridge-specific') must reference the \
+                     capability-matrix justification ('{CAPABILITY_MATRIX_REF}') \
+                     or an existing ADR-NNN / §N / SCP-NNN explaining the \
+                     one-bridge status; got: {:?}",
+                    entry.name, entry.reason
+                ));
+            }
+            // Whatever ADR/SCP it DOES cite must exist.
+            let fabricated = fabricated_provenance_in(&entry.reason);
+            if !fabricated.is_empty() {
+                offenders.push(format!(
+                    "{bridge}::{} (kind 'bridge-specific') cites non-existent \
+                     artifact(s) {fabricated:?}",
+                    entry.name
+                ));
+            }
+            return;
+        }
         let needs_provenance =
             force_provenance || entry.kind == "wasm-only" || entry.kind == "pending-registration";
-        if needs_provenance && !cites_durable_provenance(&entry.reason) {
-            offenders.push(format!(
-                "{bridge}::{} (kind '{}') must cite a durable artifact \
-                 (ADR-NNN / §N / SCP-NNN) in its reason; got: {:?}",
-                entry.name, entry.kind, entry.reason
-            ));
+        if needs_provenance {
+            if !cites_durable_provenance(&entry.reason) {
+                offenders.push(format!(
+                    "{bridge}::{} (kind '{}') must cite a durable artifact \
+                     (ADR-NNN / §N / SCP-NNN) in its reason; got: {:?}",
+                    entry.name, entry.kind, entry.reason
+                ));
+                return;
+            }
+            // Shape is not enough: the cited ADR/SCP must EXIST in the corpus.
+            let fabricated = fabricated_provenance_in(&entry.reason);
+            if !fabricated.is_empty() {
+                offenders.push(format!(
+                    "{bridge}::{} (kind '{}') cites non-existent artifact(s) \
+                     {fabricated:?} (no matching file/heading under .docs/)",
+                    entry.name, entry.kind
+                ));
+            }
         }
     };
 
