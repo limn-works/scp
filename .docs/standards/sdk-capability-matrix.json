@@ -1892,8 +1892,8 @@
       "evidence": {
         "pipeline_wiring_test": "governance_enforces_economic_policy",
         "code_sites": [
-          "crates/scp-runtime/src/context/manager/messaging.rs:49 enforce_send_economy \u2192 super::economy::enforce_economy",
-          "crates/scp-runtime/src/context/manager/economy.rs:300 enforce_economy definition"
+          "crates/scp-runtime/src/context/messaging_helpers.rs:211 enforce_send_economy \u2192 economy_logic::enforce_economy",
+          "crates/scp-runtime/src/context/economy_logic.rs:313 enforce_economy definition"
         ]
       }
     },
@@ -1911,7 +1911,7 @@
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-runtime/src/context/manager/lifecycle.rs:983 import_context \u2192 validate_export_for_import"
+          "crates/scp-runtime/src/context/lifecycle_helpers.rs:1257 import_context \u2192 validate_export_for_import"
         ]
       }
     },
