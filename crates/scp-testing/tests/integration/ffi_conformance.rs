@@ -3258,30 +3258,127 @@ fn exported_qualified_under(root: &Path) -> BTreeSet<String> {
     out
 }
 
+/// RESIDUAL-B remediation: registered-name multi-path allowlist.
+///
+/// The reverse gate qualifies the "registered" match by PATH (below). The
+/// canonical export path of a registered name is DERIVED from the scan — there
+/// is intentionally no `path` field in bridge-aliases.json (aliases are
+/// path-agnostic), so the only ground truth for "where is this op actually
+/// exported?" is the syn scan itself. A registered name that the scan finds at
+/// EXACTLY ONE path is unambiguous: that path is its canonical export site, and
+/// an export of that name at any OTHER path is a rogue duplicate (the proven
+/// RESIDUAL-B exploit: a `#[pyfunction] fn context_close` planted in a second
+/// file rides the registered name to stay green).
+///
+/// A registered name found at >1 path cannot have its canonical site derived
+/// unambiguously. STEP-1 empirical scan of all four bridges found ZERO such
+/// names (every registered name maps to exactly one export path), so this
+/// allowlist starts EMPTY. It exists so that IF a legitimate multi-path
+/// registered name ever appears (e.g. a getter name that genuinely collides
+/// with a registered op across two files, or a macro that emits the same export
+/// name from sibling modules), it can be acknowledged explicitly — keyed on the
+/// exact `<workspace-relative-path>::<name>` and accompanied by a reason — WITHOUT
+/// blanket-accepting all duplicates of that name. Each entry exempts ONLY the
+/// one `(path, name)` it names; the sibling path must ALSO be listed (or it
+/// leaks). Do NOT add an entry to silence a real rogue export — that is the
+/// exact class this gate exists to catch.
+const REGISTERED_NAME_MULTIPATH_ALLOWLIST: &[(&str, &str)] = &[
+    // (qualified "<path>::<name>" key, reason). EMPTY by STEP-1 evidence:
+    // no registered name currently maps to more than one export path in any
+    // bridge. Add ONLY genuine, reviewed collisions here — never a rogue export.
+];
+
+/// Path-qualify the registered set for one bridge.
+///
+/// Derives, from the export scan, the set of QUALIFIED `<path>::<name>` keys
+/// that count as "covered by registration", plus any registered names that
+/// resolve to MORE than one export path (the RESIDUAL-B condition).
+///
+/// Returns `(covered_qualified, multipath_leaks)`:
+///   • `covered_qualified` — for each registered name that the scan finds at
+///     exactly one path, the single `<path>::<name>` key. An export NOT in this
+///     set (because it carries a registered name at a DIFFERENT path) is no
+///     longer silently masked — it falls through to the allowlist/pending/leak
+///     logic exactly like any unregistered export.
+///   • `multipath_leaks` — `<path>::<name>` keys for registered names found at
+///     >1 path that are NOT in `REGISTERED_NAME_MULTIPATH_ALLOWLIST`. These are
+///     hard leaks: a registered name has been duplicated across files and its
+///     canonical site can no longer be derived, so every occurrence is reported
+///     until the duplication is resolved (or each occurrence is explicitly
+///     allowlisted with a reason).
+fn registered_qualified_for(
+    bridge: &str,
+    exported: &BTreeSet<String>,
+) -> (BTreeSet<String>, Vec<String>) {
+    use std::collections::BTreeMap;
+    let registered = registered_names_for(bridge);
+
+    // name -> the export paths the scan finds it at (restricted to registered
+    // names — unregistered exports are handled by the allowlist/pending logic).
+    let mut name_to_paths: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for qualified in exported {
+        if let Some((path, name)) = qualified.rsplit_once("::")
+            && registered.contains(name)
+        {
+            name_to_paths.entry(name).or_default().push(path);
+        }
+    }
+
+    let multipath_allow: BTreeSet<&str> = REGISTERED_NAME_MULTIPATH_ALLOWLIST
+        .iter()
+        .map(|(key, _)| *key)
+        .collect();
+
+    let mut covered = BTreeSet::new();
+    let mut multipath_leaks = Vec::new();
+    for (name, paths) in name_to_paths {
+        if paths.len() == 1 {
+            // Unambiguous canonical site: this exact (path, name) is covered.
+            covered.insert(format!("{}::{name}", paths[0]));
+        } else {
+            // Registered name duplicated across files. Canonical site is no
+            // longer derivable — every occurrence leaks unless explicitly
+            // acknowledged in the multi-path allowlist.
+            for path in paths {
+                let key = format!("{path}::{name}");
+                if multipath_allow.contains(key.as_str()) {
+                    covered.insert(key);
+                } else {
+                    multipath_leaks.push(key);
+                }
+            }
+        }
+    }
+    (covered, multipath_leaks)
+}
+
 /// Reverse-coverage gate. See the section header above for the full rationale.
 #[test]
 fn every_exported_ffi_fn_is_registered_or_allowlisted() {
     let mut all_leaks: Vec<String> = Vec::new();
     for (bridge, root) in bridge_export_targets() {
         let exported = exported_qualified_under(&root);
-        // `registered` is keyed on the BARE Rust name a canonical op resolves
-        // to (alias entries are path-agnostic): an op registered in
-        // bridge-aliases.json is covered wherever the bridge defines it.
-        let registered = registered_names_for(bridge);
+        // `registered_qualified` is keyed on the QUALIFIED `<path>::<name>`,
+        // with the canonical path DERIVED from the scan (RESIDUAL-B fix). A
+        // registered op is covered ONLY at the file the bridge actually defines
+        // it in — a second export reusing a registered NAME at a different path
+        // no longer rides the bare name to stay green.
+        let (registered_qualified, multipath_leaks) = registered_qualified_for(bridge, &exported);
         // `allowed` / `pending` are keyed on the QUALIFIED `<path>::<name>` key
         // so an allowlist entry exempts ONLY the specific fn in its file.
         let allowed = allowed_keys_for(bridge);
         let pending = pending_keys_for(bridge);
+        // Multi-path duplicates are reported separately (with a clearer
+        // message) — exclude them here so each is named exactly once.
+        let multipath_set: BTreeSet<&String> = multipath_leaks.iter().collect();
 
         let leaked: Vec<&String> = exported
             .iter()
             .filter(|qualified| {
-                let name = qualified
-                    .rsplit_once("::")
-                    .map_or(qualified.as_str(), |(_, n)| n);
-                !registered.contains(name)
+                !registered_qualified.contains(*qualified)
                     && !allowed.contains(*qualified)
                     && !pending.contains(*qualified)
+                    && !multipath_set.contains(*qualified)
             })
             .collect();
 
@@ -3291,18 +3388,34 @@ fn every_exported_ffi_fn_is_registered_or_allowlisted() {
                 all_leaks.push(format!("{bridge}::{q}"));
             }
         }
+        if !multipath_leaks.is_empty() {
+            eprintln!(
+                "{bridge}: {} registered-name multi-path duplicate(s): {multipath_leaks:?}",
+                multipath_leaks.len()
+            );
+            for q in multipath_leaks {
+                all_leaks.push(format!(
+                    "{bridge}::{q} (registered-name duplicated across files)"
+                ));
+            }
+        }
     }
 
     assert!(
         all_leaks.is_empty(),
-        "{} FFI export(s) are neither registered as a parity operation in \
-         scripts/bridge-aliases.json nor justified in \
-         scripts/ffi-export-allowlist.json:\n  {}\n\
+        "{} FFI export(s) are neither registered as a parity operation (at \
+         their derived canonical path) in scripts/bridge-aliases.json nor \
+         justified in scripts/ffi-export-allowlist.json:\n  {}\n\
          Each leaked name is either (a) a legitimately-non-parity export — add \
          it to the bridge's array in ffi-export-allowlist.json with the right \
          `kind` + `reason`; or (b) a genuine cross-bridge parity operation that \
          lacks an alias entry — add it to the pending_registration block (with \
-         cross-bridge evidence) and register it in bridge-aliases.json.",
+         cross-bridge evidence) and register it in bridge-aliases.json. An entry \
+         tagged `(registered-name duplicated across files)` means a registered \
+         op name now appears in more than one source file: resolve the \
+         duplication (the rogue export is almost certainly the bug) or, if both \
+         are legitimate, list each `<path>::<name>` in \
+         REGISTERED_NAME_MULTIPATH_ALLOWLIST with a reason.",
         all_leaks.len(),
         all_leaks.join("\n  ")
     );
@@ -3344,6 +3457,188 @@ fn ffi_export_allowlist_has_no_stale_entries() {
 /// reference: it asserts an export is one-bridge BY DESIGN, so the matrix that
 /// records which bridges implement which op is the auditable justification.
 const CAPABILITY_MATRIX_REF: &str = "sdk-capability-matrix.json";
+
+// ---------------------------------------------------------------------------
+// RESIDUAL-C remediation: the capability matrix is PARSED, not substring-matched
+//
+// A `bridge-specific` allowlist reason that cites the capability matrix asserts
+// "this export is one-bridge BY DESIGN, not a parity gap." The previous guard
+// only checked that the reason CONTAINED the string `sdk-capability-matrix.json`
+// — zero verification that the named op is actually in the matrix as one-bridge.
+// A fabricated `bridge-specific` entry for a real cross-bridge (4-SDK) op slid
+// through. Now: when a `bridge-specific` reason names a matrix op, we parse the
+// matrix and ASSERT that op is available ONLY on the claiming bridge's SDK(s).
+// If the matrix shows it on any SDK OUTSIDE the claiming bridge's set, the
+// op is genuinely multi-bridge → the `bridge-specific` classification is FALSE
+// (it must be registered or pending-registration instead) → fail.
+// ---------------------------------------------------------------------------
+
+const CAPABILITY_MATRIX_JSON: &str =
+    include_str!("../../../../.docs/standards/sdk-capability-matrix.json");
+
+#[derive(Debug, Deserialize)]
+struct CapabilityMatrixFile {
+    capabilities: Vec<CapabilityDomain>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityDomain {
+    operations: Vec<RawCapabilityOp>,
+}
+
+/// Raw per-op row as it appears in the matrix JSON. The per-SDK availability
+/// flags (`python` / `typescript` / `kotlin` / `swift`, plus any future SDK
+/// columns) are captured via `#[serde(flatten)]` into a map rather than four
+/// named `bool` fields — both to avoid a long-lived 4-bool struct and so a new
+/// SDK column added to the matrix is picked up without editing this test. Only
+/// the four SDK identifiers the gate knows how to map to a bridge
+/// (`bridge_to_sdks`) are consulted; other flattened keys (e.g. `name` is the
+/// only non-flattened field) are ignored when collapsing to the SDK set.
+#[derive(Debug, Deserialize)]
+struct RawCapabilityOp {
+    name: String,
+    #[serde(flatten)]
+    flags: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// SDK identifiers the matrix-vs-bridge check understands, matching the keys
+/// produced by `bridge_to_sdks`.
+const MATRIX_SDK_KEYS: &[&str] = &["python", "typescript", "kotlin", "swift"];
+
+impl RawCapabilityOp {
+    /// The SDK identifiers (matching `bridge_to_sdks`) this op is available on:
+    /// every known SDK key whose flattened flag is JSON `true`.
+    fn available_sdks(&self) -> BTreeSet<&'static str> {
+        MATRIX_SDK_KEYS
+            .iter()
+            .filter(|sdk| self.flags.get(**sdk).and_then(serde_json::Value::as_bool) == Some(true))
+            .copied()
+            .collect()
+    }
+}
+
+/// `op-name -> set of SDKs the op is available on`. If the same op name appears
+/// under more than one domain (it does not today, but defensively), the UNION
+/// of availability is taken so a multi-SDK op is never under-reported as
+/// one-bridge.
+fn capability_matrix_ops() -> &'static std::collections::BTreeMap<String, BTreeSet<&'static str>> {
+    static CELL: OnceLock<std::collections::BTreeMap<String, BTreeSet<&'static str>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| {
+        let file: CapabilityMatrixFile = serde_json::from_str(CAPABILITY_MATRIX_JSON)
+            .expect(".docs/standards/sdk-capability-matrix.json is valid JSON");
+        let mut map: std::collections::BTreeMap<String, BTreeSet<&'static str>> =
+            std::collections::BTreeMap::new();
+        for domain in file.capabilities {
+            for op in domain.operations {
+                map.entry(op.name.clone())
+                    .or_default()
+                    .extend(op.available_sdks());
+            }
+        }
+        assert!(
+            !map.is_empty(),
+            "capability matrix parsed to zero ops — the bridge-specific matrix \
+             check cannot function; has the schema changed?"
+        );
+        map
+    })
+}
+
+/// Maps an FFI bridge to the developer-facing SDK identifier(s) it powers, in
+/// the same vocabulary the capability matrix uses (`python` / `typescript` /
+/// `kotlin` / `swift`). A `bridge-specific` export is "one-bridge" iff the
+/// matrix op it names is available ONLY within this set.
+///   • pyo3   → python
+///   • napi   → typescript (the Node/Bun NAPI path)
+///   • wasm   → typescript (the browser WASM path; shares the TS SDK with napi)
+///   • uniffi → kotlin + swift
+fn bridge_to_sdks(bridge: &str) -> BTreeSet<&'static str> {
+    let mut s = BTreeSet::new();
+    match bridge {
+        "pyo3" => {
+            s.insert("python");
+        }
+        "napi" | "wasm" => {
+            s.insert("typescript");
+        }
+        "uniffi" => {
+            s.insert("kotlin");
+            s.insert("swift");
+        }
+        other => panic!("bridge_to_sdks: unknown bridge '{other}'"),
+    }
+    s
+}
+
+/// Returns true if `ch` can appear inside a matrix op identifier (snake_case).
+const fn is_op_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+/// Every capability-matrix op name that appears in `reason` as a WHOLE-WORD
+/// token (not as a substring of a longer identifier). E.g. a reason naming
+/// `register_tool_handler` matches that op, but a reason naming
+/// `mcp_register_tool_handler` (a different, longer identifier) does NOT match
+/// the bare `register` op. This is what lets a `bridge-specific` reason name
+/// the precise matrix op it relies on for its one-bridge claim.
+fn matrix_ops_named_in(reason: &str) -> Vec<&'static str> {
+    let ops = capability_matrix_ops();
+    let bytes = reason.as_bytes();
+    let mut out = Vec::new();
+    for name in ops.keys() {
+        let mut start = 0;
+        while let Some(rel) = reason[start..].find(name.as_str()) {
+            let i = start + rel;
+            let before_ok = i == 0
+                || !reason[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_op_ident_char);
+            let after_idx = i + name.len();
+            let after_ok = after_idx >= bytes.len()
+                || !reason[after_idx..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_op_ident_char);
+            if before_ok && after_ok {
+                // Leak the &'static str borrowed from the OnceLock-backed map.
+                let key: &'static str = capability_matrix_ops()
+                    .get_key_value(name)
+                    .map(|(k, _)| k.as_str())
+                    .expect("op name is a key of the matrix map");
+                out.push(key);
+                break;
+            }
+            start = i + name.len();
+        }
+    }
+    out
+}
+
+/// For a `bridge-specific` entry on `bridge` whose `reason` cites the matrix:
+/// returns a non-empty error string if any matrix op named in the reason is
+/// available on an SDK OUTSIDE the claiming bridge's SDK set (i.e. it is a
+/// genuine multi-bridge op and `bridge-specific` is a FALSE classification).
+fn bridge_specific_matrix_violation(bridge: &str, name: &str, reason: &str) -> Option<String> {
+    let claim = bridge_to_sdks(bridge);
+    let ops = capability_matrix_ops();
+    for op_name in matrix_ops_named_in(reason) {
+        let avail = ops.get(op_name).expect("named op is in the matrix map");
+        let outside: Vec<&str> = avail.difference(&claim).copied().collect();
+        if !outside.is_empty() {
+            return Some(format!(
+                "{bridge}::{name} (kind 'bridge-specific') cites capability-matrix \
+                 op '{op_name}', but the matrix shows it available on SDK(s) \
+                 {outside:?} OUTSIDE this bridge's SDK set {claim:?} — it is a \
+                 genuine multi-bridge parity op, not one-bridge. Register it in \
+                 bridge-aliases.json (or add to pending_registration) instead of \
+                 classifying it 'bridge-specific'."
+            ));
+        }
+    }
+    None
+}
 
 /// Records any ADR-/SCP- token in `reason` that does NOT exist in its
 /// corpus. Shape (`cites_durable_provenance`) is necessary but not sufficient:
@@ -3429,6 +3724,19 @@ fn ffi_export_allowlist_reasons_are_justified() {
                      artifact(s) {fabricated:?}",
                     entry.name
                 ));
+            }
+            // RESIDUAL-C: if the reason cites the matrix, the matrix is PARSED —
+            // any matrix op it names must be available ONLY on this bridge's
+            // SDK(s). A reason naming a 4-SDK (cross-bridge) op exposes a FALSE
+            // `bridge-specific` classification. (Reasons that cite the matrix
+            // only to say an export is "not among" the tracked ops name no
+            // matrix op and are backstopped by the ADR/§/SCP existence check
+            // above.)
+            if cites_matrix
+                && let Some(violation) =
+                    bridge_specific_matrix_violation(bridge, &entry.name, &entry.reason)
+            {
+                offenders.push(violation);
             }
             return;
         }
