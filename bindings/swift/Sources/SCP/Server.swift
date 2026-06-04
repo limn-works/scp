@@ -10,148 +10,33 @@ import Foundation
 //                 rollbackDeploy(contextId:deployId:)
 //                 disableSiteProjection(contextId:)
 //
-// Standalone UniFFI functions:
-//   - relayStartInMemory() async throws -> RelayHandle
-//   - relayStartLocal(dataDir: String) async throws -> RelayHandle
-//   - nodeStartInMemory(identity: Identity?) async throws -> NodeHandle
-//   - nodeStartLocal(dataDir: String, identity: Identity?) async throws -> NodeHandle
-
-// MARK: - ServerBridge
-
-/// Namespace for UniFFI bridge function references used by server operations.
-/// Each typealias maps 1:1 to a UniFFI-generated async function. Closures are
-/// injected for testability; defaults call through to ScpBindings.
-///
-/// See ADR-026 for the flat delegation pattern.
-public enum ServerBridge {
-    /// Start a relay with in-memory blob storage.
-    public typealias RelayStartInMemoryFn = @Sendable () async throws -> RelayHandle
-
-    /// Start a relay with redb-backed blob storage.
-    public typealias RelayStartLocalFn = @Sendable (_ dataDir: String) async throws -> RelayHandle
-
-    /// Start a full application node with in-memory storage.
-    public typealias NodeStartInMemoryFn = @Sendable (_ identity: Identity?) async throws -> NodeHandle
-
-    /// Start a full application node with file-backed storage.
-    public typealias NodeStartLocalFn = @Sendable (_ dataDir: String, _ identity: Identity?, _ passphrase: String?) async throws -> NodeHandle
-
-    /// Start the HTTP server in the background.
-    public typealias ServeFn = @Sendable (
-        _ handle: NodeHandle,
-        _ bindAddr: String?
-    ) async throws -> String
-
-    /// Returns the HTTP URL of the background server, or nil.
-    public typealias HttpUrlFn = @Sendable (
-        _ handle: NodeHandle
-    ) async -> String?
-
-    /// Default serve -- delegates to UniFFI ``NodeHandle.serve()``.
-    public static let defaultServe: ServeFn = { handle, bindAddr in
-        try await handle.serve(bindAddr: bindAddr)
-    }
-
-    /// Default http_url -- delegates to UniFFI ``NodeHandle.httpUrl()``.
-    public static let defaultHttpUrl: HttpUrlFn = { handle in
-        await handle.httpUrl()
-    }
-
-    // MARK: Node lifecycle (SCP-296, spec section 18.11.8)
-
-    /// Enable HTTP broadcast projection for a context.
-    public typealias EnableSiteProjectionFn = @Sendable (
-        _ handle: NodeHandle,
-        _ contextId: String,
-        _ admission: String,
-        _ hostname: String,
-        _ broadcastKeyHex: String?,
-        _ authorDid: String?,
-        _ indexPath: String?,
-        _ maxAssetsPerDeploy: UInt32?,
-        _ maxDeploySizeBytes: UInt64?,
-        _ deployRetentionCount: UInt32?,
-        _ cspOverride: String?
-    ) async throws -> Void
-
-    /// Commit a deploy for a projected context.
-    public typealias CommitDeployFn = @Sendable (
-        _ handle: NodeHandle,
-        _ contextId: String,
-        _ deployId: String
-    ) async throws -> UInt32
-
-    /// Roll back to a previous deploy for a projected context.
-    public typealias RollbackDeployFn = @Sendable (
-        _ handle: NodeHandle,
-        _ contextId: String,
-        _ deployId: String
-    ) async throws -> Void
-
-    /// Deactivate HTTP broadcast projection for a context.
-    public typealias DisableSiteProjectionFn = @Sendable (
-        _ handle: NodeHandle,
-        _ contextId: String
-    ) async throws -> Void
-
-    /// Default relay in-memory startup -- delegates to UniFFI ``relayStartInMemory()``.
-    public static let defaultRelayStartInMemory: RelayStartInMemoryFn = {
-        try await relayStartInMemory()
-    }
-
-    /// Default relay local startup -- delegates to UniFFI ``relayStartLocal(dataDir:)``.
-    public static let defaultRelayStartLocal: RelayStartLocalFn = { dataDir in
-        try await relayStartLocal(dataDir: dataDir)
-    }
-
-    /// Default node in-memory startup -- delegates to UniFFI ``nodeStartInMemory(identity:)``.
-    public static let defaultNodeStartInMemory: NodeStartInMemoryFn = { identity in
-        try await nodeStartInMemory(identity: identity)
-    }
-
-    /// Default node local startup -- delegates to UniFFI ``nodeStartLocal(dataDir:identity:passphrase:)``.
-    public static let defaultNodeStartLocal: NodeStartLocalFn = { dataDir, identity, passphrase in
-        try await nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
-    }
-
-    /// Default enable site projection -- delegates to UniFFI ``NodeHandle.enableSiteProjection()``.
-    public static let defaultEnableSiteProjection: EnableSiteProjectionFn = { hdl, ctx, adm, host, key, auth, idx, maxA, maxS, ret, csp in // swiftlint:disable:this line_length
-        try await hdl.enableSiteProjection(
-            contextId: ctx, admission: adm, hostname: host,
-            broadcastKeyHex: key, authorDid: auth, indexPath: idx,
-            maxAssetsPerDeploy: maxA, maxDeploySizeBytes: maxS,
-            deployRetentionCount: ret, cspOverride: csp
-        )
-    }
-
-    /// Default commit deploy -- delegates to UniFFI ``NodeHandle.commitDeploy()``.
-    public static let defaultCommitDeploy: CommitDeployFn = { handle, contextId, deployId in
-        try await handle.commitDeploy(contextId: contextId, deployId: deployId)
-    }
-
-    /// Default rollback deploy -- delegates to UniFFI ``NodeHandle.rollbackDeploy()``.
-    public static let defaultRollbackDeploy: RollbackDeployFn = { handle, contextId, deployId in
-        try await handle.rollbackDeploy(contextId: contextId, deployId: deployId)
-    }
-
-    /// Default disable site projection -- delegates to UniFFI ``NodeHandle.disableSiteProjection()``.
-    public static let defaultDisableSiteProjection: DisableSiteProjectionFn = { handle, contextId in
-        try await handle.disableSiteProjection(contextId: contextId)
-    }
-}
+// Phase 4 PR 4 (ADR-048 demolition, #1549) moved relay/node startup from the
+// former free UniFFI functions (`relayStartInMemory`, `relayStartLocal`,
+// `nodeStartInMemory`, `nodeStartLocal`) onto the UniFFI `Scp` opaque class.
+// The SDK-level `SCP` wrapper forwards them as instance methods:
+//
+//   scp.relayStartInMemory()
+//   scp.relayStartLocal(dataDir:)
+//   scp.nodeStartInMemory(identity:)
+//   scp.nodeStartLocal(dataDir:identity:passphrase:)
+//
+// Factories therefore accept an `SCP` parameter so handles are stamped with
+// the caller's bridge instance, and the `ServerBridge` injectable-closure
+// namespace has been deleted along with the process-wide default.
 
 // MARK: - Relay
 
 /// Ergonomic wrapper around a running SCP relay server.
 ///
-/// Use the static factory methods ``startInMemory(startFn:)`` or
-/// ``startLocal(dataDir:startFn:)`` to create an instance. Call ``shutdown()``
+/// Use the static factory methods ``startInMemory(scp:)`` or
+/// ``startLocal(scp:dataDir:)`` to create an instance. Call ``shutdown()``
 /// to stop the relay.
 ///
 /// ## Provenance
 ///
 /// - Shared server startup module in `crates/scp-ffi-common/src/server.rs`
 /// - UniFFI bridge in `crates/scp-ffi/uniffi/src/server.rs`
+/// - ADR-048 (Multi-instance SCP) — factories take an ``SCP`` explicitly
 public struct Relay: Sendable {
     /// The underlying UniFFI handle.
     public let handle: RelayHandle
@@ -173,13 +58,12 @@ public struct Relay: Sendable {
 
     /// Starts a relay with in-memory blob storage on an OS-assigned port.
     ///
-    /// - Parameter startFn: Bridge function override for testing.
+    /// - Parameter scp: The SDK-level ``SCP`` instance that will own the
+    ///   minted ``RelayHandle``.
     /// - Returns: A ``Relay`` whose ``relayUrl`` property contains the WebSocket URL.
     /// - Throws: ``ScpError`` if startup fails.
-    public static func startInMemory(
-        startFn: ServerBridge.RelayStartInMemoryFn = ServerBridge.defaultRelayStartInMemory
-    ) async throws -> Relay {
-        let handle = try await startFn()
+    public static func startInMemory(scp: SCP) async throws -> Relay {
+        let handle = try await scp.relayStartInMemory()
         return Relay(handle: handle)
     }
 
@@ -188,15 +72,15 @@ public struct Relay: Sendable {
     /// Opens (or creates) a redb database at `<dataDir>/blobs.redb`.
     ///
     /// - Parameters:
+    ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
     ///   - dataDir: Directory for persistent blob storage.
-    ///   - startFn: Bridge function override for testing.
     /// - Returns: A ``Relay`` whose ``relayUrl`` property contains the WebSocket URL.
     /// - Throws: ``ScpError`` if startup fails.
     public static func startLocal(
-        dataDir: String,
-        startFn: ServerBridge.RelayStartLocalFn = ServerBridge.defaultRelayStartLocal
+        scp: SCP,
+        dataDir: String
     ) async throws -> Relay {
-        let handle = try await startFn(dataDir)
+        let handle = try await scp.relayStartLocal(dataDir: dataDir)
         return Relay(handle: handle)
     }
 
@@ -214,8 +98,8 @@ public struct Relay: Sendable {
 ///
 /// An application node includes a running relay server, a generated DID
 /// identity, and (optionally) persistent storage. Use the static factory
-/// methods ``startInMemory(startFn:)`` or ``startLocal(dataDir:startFn:)``
-/// to create an instance.
+/// methods ``startInMemory(scp:identity:)`` or
+/// ``startLocal(scp:dataDir:identity:passphrase:)`` to create an instance.
 ///
 /// Broadcast deployment lifecycle methods (SCP-296, spec section 18.11.8):
 /// ``enableSiteProjection``, ``commitDeploy``, ``rollbackDeploy``,
@@ -225,6 +109,7 @@ public struct Relay: Sendable {
 ///
 /// - Shared server startup module in `crates/scp-ffi-common/src/server.rs`
 /// - UniFFI bridge in `crates/scp-ffi/uniffi/src/server.rs`
+/// - ADR-048 (Multi-instance SCP)
 public struct Node: Sendable {
     /// The underlying UniFFI handle.
     public let handle: NodeHandle
@@ -259,15 +144,15 @@ public struct Node: Sendable {
     /// client, self-signed TLS, and a relay on an OS-assigned port.
     ///
     /// - Parameters:
+    ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
     ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
-    ///   - startFn: Bridge function override for testing.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
     /// - Throws: ``ScpError`` if startup fails.
     public static func startInMemory(
-        identity: Identity? = nil,
-        startFn: ServerBridge.NodeStartInMemoryFn = ServerBridge.defaultNodeStartInMemory
+        scp: SCP,
+        identity: Identity? = nil
     ) async throws -> Node {
-        let handle = try await startFn(identity)
+        let handle = try await scp.nodeStartInMemory(identity: identity)
         return Node(handle: handle)
     }
 
@@ -283,20 +168,22 @@ public struct Node: Sendable {
     /// redb blob database at `<dataDir>/blobs.redb`.
     ///
     /// - Parameters:
+    ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
     ///   - dataDir: Directory for persistent storage.
     ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
     ///   - passphrase: Passphrase for Argon2id key derivation. Required when
     ///     `identity` is `nil`.
-    ///   - startFn: Bridge function override for testing.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
     /// - Throws: ``ScpError`` if startup fails.
     public static func startLocal(
+        scp: SCP,
         dataDir: String,
         identity: Identity? = nil,
-        passphrase: String? = nil,
-        startFn: ServerBridge.NodeStartLocalFn = ServerBridge.defaultNodeStartLocal
+        passphrase: String? = nil
     ) async throws -> Node {
-        let handle = try await startFn(dataDir, identity, passphrase)
+        let handle = try await scp.nodeStartLocal(
+            dataDir: dataDir, identity: identity, passphrase: passphrase
+        )
         return Node(handle: handle)
     }
 
@@ -318,27 +205,21 @@ public struct Node: Sendable {
     /// plaintext. For production deployments requiring encryption, use the node
     /// binary's `serve()` with TLS configuration.
     ///
-    /// - Parameters:
-    ///   - bindAddr: Socket address to bind (e.g. `"127.0.0.1:8080"`).
-    ///   - serveFn: Bridge function override for testing.
+    /// - Parameter bindAddr: Socket address to bind (e.g. `"127.0.0.1:8080"`).
     /// - Returns: The actual bound address as a string.
     /// - Throws: ``ScpError`` if the server is already running or binding fails.
     @discardableResult
     public func serve(
-        bindAddr: String? = nil,
-        serveFn: ServerBridge.ServeFn = ServerBridge.defaultServe
+        bindAddr: String? = nil
     ) async throws -> String {
-        try await serveFn(handle, bindAddr)
+        try await handle.serve(bindAddr: bindAddr)
     }
 
     /// The HTTP URL of the background server, or `nil` if not serving.
     ///
-    /// - Parameter httpUrlFn: Bridge function override for testing.
     /// - Returns: The HTTP URL or `nil`.
-    public func httpUrl(
-        httpUrlFn: ServerBridge.HttpUrlFn = ServerBridge.defaultHttpUrl
-    ) async -> String? {
-        await httpUrlFn(handle)
+    public func httpUrl() async -> String? {
+        await handle.httpUrl()
     }
 
     // MARK: - Broadcast deployment lifecycle (SCP-296, spec section 18.11.8)
@@ -361,15 +242,13 @@ public struct Node: Sendable {
     ///   - config: ``SiteConfig`` with hostname, index path, and deploy limits.
     ///   - broadcastKeyHex: 32-byte AES-256 broadcast key as a 64-char hex string, or `nil` for auto-lookup.
     ///   - authorDid: DID of the broadcast key owner, or `nil` for auto-lookup.
-    ///   - enableFn: Bridge function override for testing.
     /// - Throws: ``ScpError`` if parameters are invalid or operation fails.
     public func enableSiteProjection(
         contextId: String,
         admission: String,
         config: SiteConfig,
         broadcastKeyHex: String? = nil,
-        authorDid: String? = nil,
-        enableFn: ServerBridge.EnableSiteProjectionFn = ServerBridge.defaultEnableSiteProjection
+        authorDid: String? = nil
     ) async throws {
         try validateAdmission(admission)
         if broadcastKeyHex != nil, authorDid == nil {
@@ -381,18 +260,17 @@ public struct Node: Sendable {
         if let key = broadcastKeyHex {
             try validateBroadcastKeyHex(key)
         }
-        try await enableFn(
-            handle,
-            contextId,
-            admission,
-            config.hostname,
-            broadcastKeyHex,
-            authorDid,
-            config.indexPath == "/index.html" ? nil : config.indexPath,
-            config.maxAssetsPerDeploy == 10000 ? nil : UInt32(config.maxAssetsPerDeploy),
-            config.maxDeploySizeBytes == 536_870_912 ? nil : UInt64(config.maxDeploySizeBytes),
-            config.deployRetentionCount == 2 ? nil : UInt32(config.deployRetentionCount),
-            config.cspOverride
+        try await handle.enableSiteProjection(
+            contextId: contextId,
+            admission: admission,
+            hostname: config.hostname,
+            broadcastKeyHex: broadcastKeyHex,
+            authorDid: authorDid,
+            indexPath: config.indexPath == "/index.html" ? nil : config.indexPath,
+            maxAssetsPerDeploy: config.maxAssetsPerDeploy == 10000 ? nil : UInt32(config.maxAssetsPerDeploy),
+            maxDeploySizeBytes: config.maxDeploySizeBytes == 536_870_912 ? nil : UInt64(config.maxDeploySizeBytes),
+            deployRetentionCount: config.deployRetentionCount == 2 ? nil : UInt32(config.deployRetentionCount),
+            cspOverride: config.cspOverride
         )
     }
 
@@ -404,15 +282,13 @@ public struct Node: Sendable {
     /// - Parameters:
     ///   - contextId: The projected context ID.
     ///   - deployId: The deploy identifier (hex, from publish).
-    ///   - commitFn: Bridge function override for testing.
     /// - Returns: The number of assets in the committed deploy.
     /// - Throws: ``ScpError`` if the context is not projected or commit fails.
     public func commitDeploy(
         contextId: String,
-        deployId: String,
-        commitFn: ServerBridge.CommitDeployFn = ServerBridge.defaultCommitDeploy
+        deployId: String
     ) async throws -> Int {
-        let count = try await commitFn(handle, contextId, deployId)
+        let count = try await handle.commitDeploy(contextId: contextId, deployId: deployId)
         return Int(count)
     }
 
@@ -423,14 +299,12 @@ public struct Node: Sendable {
     /// - Parameters:
     ///   - contextId: The projected context ID.
     ///   - deployId: The deploy identifier to roll back to.
-    ///   - rollbackFn: Bridge function override for testing.
     /// - Throws: ``ScpError`` if the context is not projected or deploy not found.
     public func rollbackDeploy(
         contextId: String,
-        deployId: String,
-        rollbackFn: ServerBridge.RollbackDeployFn = ServerBridge.defaultRollbackDeploy
+        deployId: String
     ) async throws {
-        try await rollbackFn(handle, contextId, deployId)
+        try await handle.rollbackDeploy(contextId: contextId, deployId: deployId)
     }
 
     /// Deactivates HTTP broadcast projection for a context.
@@ -438,14 +312,11 @@ public struct Node: Sendable {
     /// Removes the projected context from the registry and drops all retained
     /// epoch keys. Idempotent -- calling on a non-projected context is a no-op.
     ///
-    /// - Parameters:
-    ///   - contextId: The context ID to stop projecting.
-    ///   - disableFn: Bridge function override for testing.
+    /// - Parameter contextId: The context ID to stop projecting.
     /// - Throws: ``ScpError`` if the operation fails.
     public func disableSiteProjection(
-        contextId: String,
-        disableFn: ServerBridge.DisableSiteProjectionFn = ServerBridge.defaultDisableSiteProjection
+        contextId: String
     ) async throws {
-        try await disableFn(handle, contextId)
+        try await handle.disableSiteProjection(contextId: contextId)
     }
 }

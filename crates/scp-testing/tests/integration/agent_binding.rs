@@ -35,7 +35,11 @@ async fn create_identity_with_agent_key(
     custody: &InMemoryKeyCustody,
 ) -> (ScpIdentity, scp_identity::document::DidDocument) {
     let did_dht = DidDht::new();
-    let (mut identity, mut doc) = did_dht.create(custody).await.expect("create identity");
+    let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+    let (mut identity, mut doc, _pre_rotation_handle) = did_dht
+        .create(custody, &pre_rotation_custody)
+        .await
+        .expect("create identity");
 
     // Generate agent key.
     let agent_key = custody

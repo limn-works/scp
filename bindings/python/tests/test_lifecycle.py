@@ -1,12 +1,16 @@
-"""Tests for the bridge lifecycle controls (suspend / resume).
+"""Tests for the bridge lifecycle controls (SCP.suspend / SCP.resume).
 
-Exercises scp_sdk.suspend() and scp_sdk.resume() against the PyO3 FFI
-layer.  Each test verifies:
+Exercises :meth:`scp_sdk.SCP.suspend` and :meth:`scp_sdk.SCP.resume`
+against the PyO3 FFI layer.  Each test verifies:
 
-1. suspend before any bridge init is a no-op.
-2. resume before any bridge init is a no-op.
-3. suspend after Identity.create() (which initializes the bridge) succeeds.
+1. suspend before any context work is a no-op (fresh instance).
+2. resume before any context work is a no-op (fresh instance).
+3. suspend after Identity.create() (which exercises bridge state) succeeds.
 4. resume after suspend succeeds.
+
+Phase 4 PR 4 (#1549) deleted the free-function ``suspend(scp)`` /
+``resume(scp)`` delegates; the class methods are now the only entry
+point (one happy path — CLAUDE.md architecture tenet).
 
 Requires the native _scp_core extension built via maturin.
 """
@@ -23,46 +27,42 @@ except (ImportError, AttributeError):
         allow_module_level=True,
     )
 
-from scp_sdk import resume, suspend
+from scp_sdk import SCP
 
 
-def test_suspend_before_init_is_noop() -> None:
-    """suspend() with no prior bridge init must succeed (no-op branch).
-
-    BRIDGE_INSTANCE is a process-wide OnceLock — another test in the
-    same session may have already initialized the bridge — but suspend
-    must succeed in both states.
-    """
-    suspend()
+def test_suspend_before_init_is_noop(scp: SCP) -> None:
+    """suspend() on a fresh instance must succeed (no context state)."""
+    scp.suspend()
 
 
-def test_resume_before_init_is_noop() -> None:
-    """resume() with no prior bridge init must succeed (no-op branch)."""
-    resume()
+@pytest.mark.asyncio
+async def test_resume_before_init_is_noop(scp: SCP) -> None:
+    """resume() on a fresh (not-suspended) instance must succeed."""
+    await scp.resume()
 
 
-def test_suspend_and_resume_roundtrip_after_init() -> None:
+@pytest.mark.asyncio
+async def test_suspend_and_resume_roundtrip_after_init(scp: SCP) -> None:
     """suspend / resume after an Identity.create succeed roundtrip.
 
-    Identity.create triggers ensure_bridge_instance inside the PyO3
-    bridge, so this exercises the "real BridgeInstance" code path
-    rather than the None-fallback.
+    Identity.create exercises the bridge's ContextManager, so this
+    triggers the "real BridgeInstance" code path rather than an
+    entirely-inert instance.
     """
-    from scp_sdk.identity import Identity
     from scp_sdk.types import CustodyType
 
-    _identity = Identity.create(custody=CustodyType.IN_MEMORY)
-    suspend()
-    resume()
+    _identity = await scp.identity_create(CustodyType.IN_MEMORY)
+    scp.suspend()
+    await scp.resume()
 
 
-def test_multiple_suspend_resume_cycles_are_idempotent() -> None:
+@pytest.mark.asyncio
+async def test_multiple_suspend_resume_cycles_are_idempotent(scp: SCP) -> None:
     """Multiple suspend/resume cycles are safe; neither raises."""
-    from scp_sdk.identity import Identity
     from scp_sdk.types import CustodyType
 
-    _identity = Identity.create(custody=CustodyType.IN_MEMORY)
-    suspend()
-    suspend()
-    resume()
-    resume()
+    _identity = await scp.identity_create(CustodyType.IN_MEMORY)
+    scp.suspend()
+    scp.suspend()
+    await scp.resume()
+    await scp.resume()

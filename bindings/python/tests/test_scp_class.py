@@ -1,11 +1,12 @@
-"""Tests for the SCP #[pyclass] exposed by the PyO3 bridge (#1549 Phase 4 PR 1 + PR 3).
+"""Tests for the SCP #[pyclass] exposed by the PyO3 bridge (#1549 Phase 4 PR 1 + PR 3 + PR 4).
 
 The SCP class wraps `PyBridgeInstance` and is the Python-facing entry
 point for the multi-instance refactor.  Each test verifies:
 
 1. `SCP()` constructs successfully (fresh instance).
-2. `SCP.default_instance()` returns the process-global default,
-   stable across calls.
+2. Phase 4 PR 4 (#1549) removed `SCP.default_instance()`; every
+   `SCP()` call must produce a distinct instance with a distinct id
+   (inverse invariant — no process-global default survives).
 3. `SCP.instance_id` is monotonic across new instances.
 4. Native `SCP.suspend()` / `.resume()` / `.shutdown(timeout)` drive
    the lifecycle without errors. (Native `.resume()` is sync-callable;
@@ -39,6 +40,7 @@ except (ImportError, AttributeError):
 from scp_sdk.scp import SCP as WrapperSCP
 
 SCP = _scp_core.SCP
+NativeValidationError = _scp_core.ValidationError
 
 
 def test_scp_constructs_successfully() -> None:
@@ -47,16 +49,18 @@ def test_scp_constructs_successfully() -> None:
     assert scp.instance_id > 0, "new SCP instance must have a monotonic nonzero id"
 
 
-def test_default_instance_returns_stable_id() -> None:
-    """Two calls to `SCP.default_instance()` must share the same instance_id.
+def test_default_instance_is_absent() -> None:
+    """Phase 4 PR 4 (#1549) deleted the process-global default bridge.
 
-    The wrapper objects are distinct Python objects, but they wrap the
-    same `Arc<PyBridgeInstance>` so `instance_id` is identical.
+    The inverted invariant: ``SCP`` must expose no ``default_instance``
+    factory at all. Asserting absence keeps us from silently re-adding
+    a process-global singleton in a future refactor.
     """
-    a = SCP.default_instance()
-    b = SCP.default_instance()
-    assert a.instance_id == b.instance_id
-    assert a.instance_id > 0
+    assert not hasattr(SCP, "default_instance"), (
+        "SCP.default_instance was removed in Phase 4 PR 4 (#1549) — "
+        "re-introducing a process-global default violates ADR-048 "
+        "multi-instance architecture"
+    )
 
 
 def test_instance_id_is_monotonic_across_new_instances() -> None:
@@ -66,13 +70,17 @@ def test_instance_id_is_monotonic_across_new_instances() -> None:
         assert later > earlier, f"expected monotonic ids, got {ids}"
 
 
-def test_new_instances_have_distinct_id_from_default() -> None:
-    """Fresh `SCP()` instances must NOT share the default's id."""
-    fresh = SCP()
-    default = SCP.default_instance()
-    assert fresh.instance_id != default.instance_id, (
-        "SCP() must allocate a fresh instance, not reuse the default"
-    )
+def test_fresh_instances_have_distinct_ids() -> None:
+    """Every ``SCP()`` call must allocate a fresh, unique instance_id.
+
+    With no process-global default to reuse, the only way two bridges
+    share an id is a monotonic-counter bug. Asserting distinctness
+    keeps the allocator honest.
+    """
+    a = SCP()
+    b = SCP()
+    assert a.instance_id != b.instance_id, "two SCP() calls must produce distinct instance_ids"
+    assert a.instance_id > 0 and b.instance_id > 0
 
 
 def test_suspend_resume_shutdown_lifecycle() -> None:
@@ -110,6 +118,145 @@ def test_with_storage_rejects_unknown_type() -> None:
         SCP.with_storage({"type": "bogus"})
 
 
+def test_configure_local_transport_succeeds_for_valid_did() -> None:
+    """`configure_local_transport(did)` wires the loopback transport.
+
+    Installs an in-process `LocalTransportProvider` (test infra) so
+    `context_send` / `broadcast_publish` succeed without a real relay.
+    Idempotent OnceLock semantics mean a fresh instance is used here so
+    the wiring is unambiguous.
+    """
+    scp = SCP()
+    # Must not raise — a valid DID configures the loopback transport.
+    scp.configure_local_transport("did:key:z6MkfreshLocalTransportTest")
+
+
+def test_configure_local_transport_rejects_invalid_did() -> None:
+    """`configure_local_transport` rejects a malformed DID at the boundary.
+
+    The PyO3 validator raises the native `_scp_core.ValidationError`
+    before any `ContextManager` is attached.
+    """
+    scp = SCP()
+    with pytest.raises(_scp_core.ValidationError):
+        scp.configure_local_transport("not-a-valid-did")
+
+
+def test_petname_apply_event_and_counts() -> None:
+    """`petname_apply_event` replays a serialized event into the owner's map.
+
+    Mirrors the WASM `petname_apply_event` / `petname_did_count` /
+    `petname_context_count` surface promoted to cross-bridge parity. The
+    DID and context petname maps are per-owner and per-instance, so a
+    fresh `SCP()` starts empty.
+    """
+    scp = SCP()
+    owner = "did:dht:zPyPetnameApply"
+
+    assert scp.petname_did_count(owner) == 0
+    assert scp.petname_context_count(owner) == 0
+
+    scp.petname_apply_event(
+        owner,
+        '{"SetPetname": {"did": "did:dht:zAlice", "name": "alice"}}',
+    )
+    assert scp.petname_did_count(owner) == 1
+
+    scp.petname_apply_event(
+        owner,
+        '{"SetContextPetname": {"context_id": "ctx-1", "name": "work"}}',
+    )
+    assert scp.petname_context_count(owner) == 1
+
+    scp.petname_apply_event(
+        owner,
+        '{"RemovePetname": {"did": "did:dht:zAlice"}}',
+    )
+    assert scp.petname_did_count(owner) == 0
+    # Context petname is untouched by the DID removal.
+    assert scp.petname_context_count(owner) == 1
+
+
+def test_petname_apply_event_matches_set_petname() -> None:
+    """An applied `SetPetname` event resolves identically to `petname_set`.
+
+    The event-replay path and the convenience setter share the same
+    backing `PetnameMap`, so the resolved DID list must match.
+    """
+    scp = SCP()
+    owner = "did:dht:zPyPetnameParity"
+
+    scp.petname_apply_event(
+        owner,
+        '{"SetPetname": {"did": "did:dht:zBob", "name": "bob"}}',
+    )
+    # The PyO3 bridge returns a native ``list[str]`` (per-SDK idiom — it does
+    # not JSON-encode the resolution like the WASM/NAPI string surfaces).
+    resolved = scp.petname_resolve_did(owner, "bob")
+    assert resolved == ["did:dht:zBob"]
+
+
+def test_petname_apply_event_rejects_malformed_json() -> None:
+    """A malformed event JSON raises the native `_scp_core.ValidationError`."""
+    scp = SCP()
+    with pytest.raises(NativeValidationError):
+        scp.petname_apply_event("did:dht:zPyOwner", "not-valid-event-json")
+
+
+def test_petname_counts_reject_empty_owner() -> None:
+    """Empty `owner_did` is rejected at the boundary for count queries."""
+    scp = SCP()
+    with pytest.raises(NativeValidationError):
+        scp.petname_did_count("")
+    with pytest.raises(NativeValidationError):
+        scp.petname_context_count("")
+
+
+def test_petname_rejects_malformed_owner() -> None:
+    """A non-empty but syntactically invalid `owner_did` is rejected.
+
+    The pre-existing petname ops now enforce the same strict `validate_did`
+    gate as the WASM bridge and the §4.7 ops, so all four bridges treat the
+    per-identity petname partition key uniformly as a DID.
+    """
+    scp = SCP()
+    bad = "not-a-did"
+    with pytest.raises(NativeValidationError):
+        scp.petname_set(bad, "did:dht:z1", "test")
+    with pytest.raises(NativeValidationError):
+        scp.petname_remove(bad, "did:dht:z1")
+    with pytest.raises(NativeValidationError):
+        scp.petname_set_context(bad, "ctx-1", "work")
+    with pytest.raises(NativeValidationError):
+        scp.petname_remove_context(bad, "ctx-1")
+    with pytest.raises(NativeValidationError):
+        scp.petname_resolve_did(bad, "alice")
+    with pytest.raises(NativeValidationError):
+        scp.petname_resolve_context(bad, "work")
+    with pytest.raises(NativeValidationError):
+        scp.petname_get_for_did(bad, "did:dht:z1")
+    with pytest.raises(NativeValidationError):
+        scp.petname_get_for_context(bad, "ctx-1")
+
+
+def test_petname_maps_are_per_instance() -> None:
+    """A petname applied on one instance must not leak into another.
+
+    The petname maps live in the per-instance `BridgeInstance` (ADR-048
+    §1 per-instance isolation), keyed by owner DID.
+    """
+    owner = "did:dht:zPyPetnameIsolation"
+    a = SCP()
+    a.petname_apply_event(
+        owner,
+        '{"SetPetname": {"did": "did:dht:zCarol", "name": "carol"}}',
+    )
+    assert a.petname_did_count(owner) == 1
+
+    b = SCP()
+    assert b.petname_did_count(owner) == 0
+
+
 def test_repr_contains_instance_id() -> None:
     """`repr(SCP())` must contain the instance_id for debugging."""
     scp = SCP()
@@ -130,7 +277,8 @@ def _make_wrapper_with_mock() -> tuple[WrapperSCP, Any]:
     return wrapper, mock_native
 
 
-def test_shutdown_infinity_maps_to_max_millis() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_infinity_maps_to_max_millis() -> None:
     """`math.inf` must clamp to u64::MAX — "wait forever" — not abort.
 
     Regression test for round 5 RED-2001: the previous clamp ordering
@@ -140,11 +288,12 @@ def test_shutdown_infinity_maps_to_max_millis() -> None:
     promises the opposite.
     """
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=math.inf)
+    await wrapper.shutdown(timeout=math.inf)
     mock_native.shutdown.assert_called_once_with(0xFFFFFFFF_FFFFFFFF)
 
 
-def test_shutdown_negative_infinity_maps_to_abort() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_negative_infinity_maps_to_abort() -> None:
     """`-math.inf` must NOT be treated as wait-forever.
 
     The Infinity-is-wait-forever exemption is deliberately asymmetric:
@@ -152,44 +301,49 @@ def test_shutdown_negative_infinity_maps_to_abort() -> None:
     nonsensical timeout and falls through to the abort branch.
     """
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=-math.inf)
+    await wrapper.shutdown(timeout=-math.inf)
     mock_native.shutdown.assert_called_once_with(0)
 
 
-def test_shutdown_nan_maps_to_abort() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_nan_maps_to_abort() -> None:
     """`math.nan` must clamp to 0 (abort) — NaN is not orderable.
 
     Ordered comparisons against NaN always return False, so `nan <= 0`
     is False. `math.isfinite(nan)` is also False — that is how we trap it.
     """
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=math.nan)
+    await wrapper.shutdown(timeout=math.nan)
     mock_native.shutdown.assert_called_once_with(0)
 
 
-def test_shutdown_negative_maps_to_abort() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_negative_maps_to_abort() -> None:
     """Negative timeouts collapse to 0 (abort immediately)."""
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=-1.5)
+    await wrapper.shutdown(timeout=-1.5)
     mock_native.shutdown.assert_called_once_with(0)
 
 
-def test_shutdown_zero_maps_to_abort() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_zero_maps_to_abort() -> None:
     """A zero-second timeout maps to 0 millis — an explicit abort."""
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=0.0)
+    await wrapper.shutdown(timeout=0.0)
     mock_native.shutdown.assert_called_once_with(0)
 
 
-def test_shutdown_overflow_clamps_to_max_millis() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_overflow_clamps_to_max_millis() -> None:
     """Values that would overflow u64::MAX milliseconds clamp cleanly."""
     wrapper, mock_native = _make_wrapper_with_mock()
     # 1e18 seconds → 1e21 ms, well past u64::MAX (~1.8e19).
-    wrapper.shutdown(timeout=1.0e18)
+    await wrapper.shutdown(timeout=1.0e18)
     mock_native.shutdown.assert_called_once_with(0xFFFFFFFF_FFFFFFFF)
 
 
-def test_shutdown_finite_value_rounds_to_nearest_ms() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_finite_value_rounds_to_nearest_ms() -> None:
     """Fractional seconds preserve ms resolution via `round()`.
 
     Regression guard for the round 2 fix (floor → round): 0.2505 s =
@@ -197,8 +351,25 @@ def test_shutdown_finite_value_rounds_to_nearest_ms() -> None:
     exact halves, but this value rounds deterministically).
     """
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=0.2505)
+    await wrapper.shutdown(timeout=0.2505)
     mock_native.shutdown.assert_called_once_with(250)
+
+
+def test_shutdown_sync_exit_uses_clamping_logic() -> None:
+    """`__exit__` (synchronous `with`) must still clamp + dispatch.
+
+    The retro (PR #1690 Fix 6) made `shutdown` async, but the `with`
+    context-manager path stayed synchronous: `__exit__` calls the PyO3
+    `_native.shutdown` directly and reuses the shared `_shutdown_millis`
+    clamping helper. This guards against a regression that would either
+    (a) leave `__exit__` calling a now-coroutine `shutdown()` without
+    awaiting, or (b) duplicate the clamp logic and let the two paths
+    drift.
+    """
+    wrapper, mock_native = _make_wrapper_with_mock()
+    wrapper.__exit__(None, None, None)
+    # Default sync-exit timeout is 5.0 s → 5000 ms.
+    mock_native.shutdown.assert_called_once_with(5000)
 
 
 @pytest.mark.asyncio

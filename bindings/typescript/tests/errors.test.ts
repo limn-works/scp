@@ -294,3 +294,74 @@ context 'ctx-paid' has an economic policy requiring payment",
     expect(err.code).toBe("SCP-UNKNOWN-0000");
   });
 });
+
+// ---------------------------------------------------------------------------
+// PreRotationCustodyError typed-code round-trip
+//
+// SDK-layer contract: when the NAPI / WASM bridge emits a typed
+// IDENT_1047, IDENT_1048, IDENT_1049, IDENT_1050, IDENT_1051, or
+// IDENT_1052 code for a PreRotationCustodyError variant, the TS SDK's
+// `mapBridgeError` and the `IdentityError` class MUST preserve the code
+// verbatim. The Rust bridge has its own co-located regression tests
+// pinning the variant-to-code mapping; this suite pins the SDK-layer
+// fall-through so a TypeScript wrapper change can't silently strip or
+// rewrite the code.
+//
+// Literal codes also appear here as string constants — they trip a diff
+// reviewer if the bridge ever re-numbers a variant without updating the
+// SDK in lockstep.
+// ---------------------------------------------------------------------------
+
+const PRE_ROTATION_HANDLE_NOT_FOUND_CODE = "SCP-IDENT-1047";
+const PRE_ROTATION_UNAVAILABLE_CODE = "SCP-IDENT-1048";
+const PRE_ROTATION_USER_DECLINED_CODE = "SCP-IDENT-1049";
+const PRE_ROTATION_STORAGE_CODE = "SCP-IDENT-1050";
+const PRE_ROTATION_INVALID_CALLBACK_CODE = "SCP-IDENT-1051";
+const PRE_ROTATION_COMMITMENT_MISMATCH_CODE = "SCP-IDENT-1052";
+
+describe("PreRotationCustodyError typed codes round-trip", () => {
+  it.each([
+    PRE_ROTATION_HANDLE_NOT_FOUND_CODE,
+    PRE_ROTATION_UNAVAILABLE_CODE,
+    PRE_ROTATION_USER_DECLINED_CODE,
+    PRE_ROTATION_STORAGE_CODE,
+    PRE_ROTATION_INVALID_CALLBACK_CODE,
+    PRE_ROTATION_COMMITMENT_MISMATCH_CODE,
+  ])("IdentityError preserves typed code %s", (code) => {
+    // SDK-layer construction — pins that the IdentityError class itself
+    // does not strip, rewrite, or normalize the code.
+    const err = new IdentityError("pre-rotation failure", code);
+    expect(err).toBeInstanceOf(IdentityError);
+    expect(err).toBeInstanceOf(ScpError);
+    expect(err.code).toBe(code);
+    expect(err.message).toBe("pre-rotation failure");
+  });
+
+  it.each([
+    PRE_ROTATION_HANDLE_NOT_FOUND_CODE,
+    PRE_ROTATION_UNAVAILABLE_CODE,
+    PRE_ROTATION_USER_DECLINED_CODE,
+    PRE_ROTATION_STORAGE_CODE,
+    PRE_ROTATION_INVALID_CALLBACK_CODE,
+    PRE_ROTATION_COMMITMENT_MISMATCH_CODE,
+  ])("mapBridgeError routes %s to IdentityError with preserved code", (code) => {
+    // Bridge-emitted format: "[{code}] identity error: {message}".
+    // The TS SDK's parser must extract the code, route to IdentityError,
+    // and surface the same code on `.code` — never rewrite it to a
+    // generic SCP-IDENT-1001 fallback.
+    const bridgeError = new Error(`[${code}] identity error: pre-rotation failure`);
+    const mapped = mapBridgeError(bridgeError);
+    expect(mapped).toBeInstanceOf(IdentityError);
+    expect(mapped.code).toBe(code);
+  });
+
+  it("non-pre-rotation identity errors retain SCP-IDENT-1001 fallback", () => {
+    // Defense-in-depth: pin the generic-envelope fallback so a future
+    // refactor that accidentally promotes SCP-IDENT-1001 to one of the
+    // typed pre-rotation codes is caught at test time.
+    const bridgeError = new Error("[SCP-IDENT-1001] identity error: invalid DID format");
+    const mapped = mapBridgeError(bridgeError);
+    expect(mapped).toBeInstanceOf(IdentityError);
+    expect(mapped.code).toBe("SCP-IDENT-1001");
+  });
+});

@@ -39,17 +39,6 @@ ignore = [
     # instant: unmaintained, transitive dep via openmls -> fluvio-wasm-timer.
     # No alternative available; openmls uses it for WASM time abstraction.
     "RUSTSEC-2024-0384",
-    # aws-lc-sys: X.509 CN wildcard/unicode bypass, CRL distribution point logic errors.
-    # Transitive dep via rustls/aws-sdk. Awaiting upstream aws-lc-sys patch release.
-    "RUSTSEC-2026-0044",
-    "RUSTSEC-2026-0048",
-    # rustls-webpki CRL distribution point logic — transitive dep via aws-smithy-http-client
-    # -> rustls 0.21 -> rustls-webpki 0.101.7. Fix requires >=0.103.10 but AWS SDK pins 0.101.x.
-    "RUSTSEC-2026-0049",
-    # rustls-webpki: name constraints accepted for wildcard certs. Transitive
-    # dep via aws-sdk -> rustls -> rustls-webpki. Awaiting upstream patch.
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
     # libcrux-ed25519: all-zero key on catastrophic RNG failure. Transitive via
     # openmls -> openmls_libcrux_crypto. Awaiting openmls upgrade.
     "RUSTSEC-2026-0075",
@@ -57,20 +46,34 @@ ignore = [
     # openmls_libcrux_crypto -> libcrux-aead. Standalone MAC not used by SCP;
     # OpenMLS uses AEAD path which is unaffected. Awaiting openmls upgrade.
     "RUSTSEC-2026-0073",
+    # libcrux-chacha20poly1305: panic when caller supplies a ciphertext buffer
+    # longer than `ptxt.len() + TAG_LEN`. Transitive via openmls ->
+    # openmls_libcrux_crypto -> libcrux-aead. SCP never sizes the ciphertext
+    # buffer from attacker-controlled input — buffer length is always
+    # `ptxt.len() + TAG_LEN` per the AEAD trait contract OpenMLS implements.
+    # Awaiting openmls / libcrux upstream patch.
+    "RUSTSEC-2026-0124",
     # libcrux-sha3: incorrect incremental SHAKE XOF output. Transitive via
     # openmls -> openmls_libcrux_crypto. Awaiting openmls upgrade.
     "RUSTSEC-2026-0074",
-    # rand 0.8.5 unsound: aliased mutable reference when custom logger calls
-    # rand::rng() during ThreadRng reseed. Transitive via hpke-rs-rust-crypto
-    # 0.6.0 -> openmls_rust_crypto. Cannot upgrade: hpke-rs pins rand ^0.8,
-    # fix requires rand >= 0.9.3. SCP uses tracing (not log) and no logging
-    # callback generates random data. Awaiting hpke-rs upstream upgrade.
+    # rand 0.8.5 unsound: aliased mutable reference when a custom logger
+    # calls `rand::rng()` during ThreadRng reseed. Transitive via
+    # hpke-rs-rust-crypto -> openmls_rust_crypto. Cannot upgrade: hpke-rs
+    # pins rand ^0.8; fix requires rand >= 0.9.3. SCP uses tracing (not
+    # log) and no logging callback generates random data, so the specific
+    # soundness violation is unreachable in our code path. Awaiting
+    # hpke-rs upstream upgrade.
     "RUSTSEC-2026-0097",
     # rustls-webpki: URI name constraints incorrectly accepted + wildcard
     # name constraints accepted. Transitive via rustls -> webpki. Awaiting
     # upstream rustls-webpki patch.
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
+    # rustls-webpki: reachable panic in certificate revocation list parsing
+    # (0.103.10). Transitive via rustls -> webpki. Awaiting upstream
+    # rustls-webpki patch. Panic is reachable only when parsing attacker-
+    # controlled CRLs; SCP does not consume external CRLs today.
+    "RUSTSEC-2026-0104",
 ]
 
 # ── Bans ────────────────────────────────────────────────────────────────────

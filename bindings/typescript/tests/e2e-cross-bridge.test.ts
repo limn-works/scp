@@ -21,6 +21,8 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { SCP } from "../src/scp";
+import type { Node } from "../src/server";
 
 // ---------------------------------------------------------------------------
 // Guard: load both NAPI and WASM bridges, skip if either is unavailable
@@ -28,46 +30,21 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").getBridge>>;
 
-interface ServerAddon {
-  nodeStartInMemory(): Promise<{
-    readonly relayUrl: string;
-    readonly relayPort: number;
-    readonly did: string;
-    readonly isShutdown: boolean;
-    shutdown(): void;
-  }>;
-  transportConnect(relayUrl: string): Promise<unknown>;
-}
-
 // biome-ignore lint/suspicious/noExplicitAny: raw WASM module has dynamic shape
 let wasmModule: any = null;
 let napiBridge: NativeBridge | null = null;
-let serverAddon: ServerAddon | null = null;
+let scp: SCP | null = null;
 let skipReason = "";
 
 try {
   // Load NAPI bridge
   const { createNativeBridge } = await import("../src/internal/native.js");
-  napiBridge = createNativeBridge();
+  scp = new SCP();
+  napiBridge = createNativeBridge(scp);
 
-  // Load NAPI server addon
-  const { createRequire } = await import("node:module");
-  const req = createRequire(import.meta.url);
-  const platform = process.platform;
-  const arch = process.arch;
-  const platformMap: Record<string, string> = {
-    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
-    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
-    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
-    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
-    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
-  };
-  const pkg = platformMap[`${platform}-${arch}`];
-  if (pkg) {
-    serverAddon = req(pkg) as ServerAddon;
-  } else {
-    throw new Error(`No native addon for ${platform}-${arch}`);
-  }
+  // Node startup is now a per-instance `SCP.nodeStartInMemory()`
+  // method (post-ADR-048 / #1549 Phase 4 PR 4), so we no longer need
+  // to load the raw napi addon here — the SDK's `SCP` class wraps it.
 
   // Load WASM bridge
   const { initWasm } = await import("../src/internal/wasm");
@@ -78,30 +55,31 @@ try {
   skipReason = `Bridge(s) not available: ${msg}`;
 }
 
-if (napiBridge === null || serverAddon === null || wasmModule === null) {
+if (napiBridge === null || scp === null || wasmModule === null) {
   describe("Cross-bridge E2E: NAPI Node + WASM (SKIPPED)", () => {
     test.skip(`all tests skipped: ${skipReason}`, () => {});
   });
 } else {
   // Capture for type narrowing.
   const napi = napiBridge;
-  const addon = serverAddon;
+  const scpInstance = scp;
   const wasm = wasmModule;
 
   // -------------------------------------------------------------------------
   // Node lifecycle state
   // -------------------------------------------------------------------------
 
-  let nodeHandle: Awaited<ReturnType<typeof addon.nodeStartInMemory>> | null = null;
+  let nodeHandle: Node | null = null;
 
   beforeAll(async () => {
-    nodeHandle = await addon.nodeStartInMemory();
+    nodeHandle = await scpInstance.nodeStartInMemory();
   });
 
   afterAll(async () => {
     if (nodeHandle && !nodeHandle.isShutdown) {
-      nodeHandle.shutdown();
+      await nodeHandle.shutdown();
     }
+    await scpInstance.shutdown(1);
   });
 
   // -------------------------------------------------------------------------
@@ -161,6 +139,25 @@ if (napiBridge === null || serverAddon === null || wasmModule === null) {
       const a = await wasm.identity_create("in_memory");
       const b = await wasm.identity_create("in_memory");
       expect(a.did).not.toBe(b.did);
+    });
+
+    test("WASM removes an existing identity from the registry", async () => {
+      const identity = await wasm.identity_create("in_memory");
+      // `identity_remove` is void and idempotent; afterward the DID is gone.
+      wasm.identity_remove(identity.did);
+      expect(wasm.identity_remove_if_present(identity.did)).toBe(false);
+    });
+
+    test("WASM identity_remove_if_present reports true then false", async () => {
+      const identity = await wasm.identity_create("in_memory");
+      expect(wasm.identity_remove_if_present(identity.did)).toBe(true);
+      expect(wasm.identity_remove_if_present(identity.did)).toBe(false);
+    });
+
+    test("WASM removing a non-existent identity is silent", () => {
+      const missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest";
+      expect(() => wasm.identity_remove(missing)).not.toThrow();
+      expect(wasm.identity_remove_if_present(missing)).toBe(false);
     });
   });
 
@@ -222,7 +219,6 @@ if (napiBridge === null || serverAddon === null || wasmModule === null) {
 
   describe("Cross-bridge identity creation", () => {
     test("NAPI and WASM both create valid did:dht identities", async () => {
-      // SCP-DEFAULT-INSTANCE-OK: raw NAPI/WASM bridge test; bypasses SDK facade by design
       const napiIdentity = await napi.identityCreate("in_memory");
       const wasmIdentity = await wasm.identity_create("in_memory");
 
@@ -236,7 +232,6 @@ if (napiBridge === null || serverAddon === null || wasmModule === null) {
 
     test("Node DID, NAPI-created DID, and WASM-created DID are all distinct", async () => {
       const nodeDid = nodeHandle?.did ?? "";
-      // SCP-DEFAULT-INSTANCE-OK: raw NAPI/WASM bridge test; bypasses SDK facade by design
       const napiDid = (await napi.identityCreate("in_memory")).did;
       const wasmDid = (await wasm.identity_create("in_memory")).did;
 

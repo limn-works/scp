@@ -88,6 +88,14 @@ pub const MAX_RELAY_URL_LEN: usize = 2048;
 /// Maximum length for a transport mode string.
 pub const MAX_TRANSPORT_MODE_LEN: usize = 64;
 
+/// Maximum length for a storage path (filesystem directory for `SQLite`, etc.).
+///
+/// 4 KiB is comfortably above POSIX `PATH_MAX` (4096) and Windows
+/// `MAX_PATH` (260) in their long-path forms. Defends against accidental
+/// or malicious oversized inputs without rejecting legitimate deeply
+/// nested project paths.
+pub const MAX_STORAGE_PATH_LEN: usize = 4096;
+
 /// Maximum length for a deploy ID (matches `scp-core::context::broadcast_content::MAX_DEPLOY_ID_BYTES`).
 pub const MAX_DEPLOY_ID_LEN: usize = 128;
 
@@ -472,6 +480,45 @@ pub fn validate_relay_url(url: &str) -> Result<(), ValidationError> {
 }
 
 // ---------------------------------------------------------------------------
+// Storage path validation (#1543 PR-C security follow-up)
+// ---------------------------------------------------------------------------
+
+/// Validates a filesystem path string supplied as caller input to a
+/// storage backend (e.g., the `SQLite` directory passed to
+/// `SCP.with_storage({"type": "sqlite", "path": ...})`).
+///
+/// Defense-in-depth at the FFI boundary, mirroring the project's
+/// pattern for every other caller-supplied string (DID, relay URL,
+/// tool name, etc.). The caller is in-process trusted code, but
+/// the consistency matters: error and tracing paths may otherwise
+/// surface unsanitized control characters from this single un-validated
+/// string into logs (log injection via embedded ANSI / CRLF).
+///
+/// Checks:
+/// - Non-empty.
+/// - Length <= [`MAX_STORAGE_PATH_LEN`] (4 KiB).
+/// - No control characters (U+0000–U+001F, U+007F–U+009F) — covers NUL,
+///   CRLF, ANSI escape sequences, etc.
+///
+/// Does NOT enforce any specific filesystem semantics:
+/// - Relative vs. absolute is the caller's choice.
+/// - `..` traversal is allowed — paths are resolved by the OS, and the
+///   caller is in-process trusted code that already has whatever
+///   filesystem privileges the process has.
+/// - Path existence / writability is checked by the storage backend
+///   (`SqliteStorage::new`) at open time, not here.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] if the path is empty, exceeds
+/// [`MAX_STORAGE_PATH_LEN`], or contains a control character.
+pub fn validate_storage_path(path: &str) -> Result<(), ValidationError> {
+    validate_non_empty(path, "storage path", MAX_STORAGE_PATH_LEN)?;
+    reject_control_chars(path, "storage path")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Transport mode validation
 // ---------------------------------------------------------------------------
 
@@ -766,6 +813,48 @@ pub fn validate_attestation_fields(
     validate_non_empty(proof, "proof", MAX_ATTESTATION_PROOF_LEN)?;
     reject_control_chars(proof, "proof")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-length byte narrowing
+// ---------------------------------------------------------------------------
+
+/// Narrows a byte slice to a fixed-length `[u8; N]` array, returning a
+/// human-readable message on length mismatch.
+///
+/// All four FFI bridges narrow caller-supplied `Vec<u8>` / `Buffer` /
+/// `Uint8Array` parameters to fixed-length arrays (most commonly the
+/// 32-byte `testing_seed`). This helper centralizes the `TryFrom` +
+/// length-mismatch-message pattern so bridges agree on wording — each
+/// bridge wraps the returned `String` in its own error type with the
+/// appropriate `SCP-VALID-XXXX` code.
+///
+/// # Errors
+///
+/// Returns `Err` with a message of the form `"{field} must be exactly
+/// {N} bytes, got {actual}"` when `bytes.len() != N`.
+pub fn expect_fixed_bytes<const N: usize>(bytes: &[u8], field: &str) -> Result<[u8; N], String> {
+    <[u8; N]>::try_from(bytes)
+        .map_err(|_| format!("{field} must be exactly {N} bytes, got {}", bytes.len()))
+}
+
+/// Narrows a byte slice to a zeroize-wrapped `Zeroizing<[u8; N]>`.
+///
+/// Same contract as [`expect_fixed_bytes`], but the returned array is
+/// wrapped in `zeroize::Zeroizing` so it is overwritten when dropped.
+/// Use for private-key material (sender keys, bridge credential keys,
+/// any 32-byte Ed25519/X25519 seed): the common shape is `raw Vec<u8>
+/// → narrow → Zeroizing<[u8; 32]>` and this helper eliminates the
+/// repeated `Zeroizing::new(expect_fixed_bytes::<32>(...))` dance.
+///
+/// # Errors
+///
+/// Same as [`expect_fixed_bytes`] — length-mismatch string.
+pub fn expect_fixed_bytes_zeroized<const N: usize>(
+    bytes: &[u8],
+    field: &str,
+) -> Result<zeroize::Zeroizing<[u8; N]>, String> {
+    expect_fixed_bytes::<N>(bytes, field).map(zeroize::Zeroizing::new)
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,6 +1197,43 @@ mod tests {
     fn empty_transport_mode_rejected() {
         let err = validate_transport_mode("").unwrap_err();
         assert!(err.message.contains("must not be empty"));
+    }
+
+    // -- Storage path --
+
+    #[test]
+    fn valid_storage_paths() {
+        assert!(validate_storage_path("/tmp/scp-test").is_ok());
+        assert!(validate_storage_path("./relative/path").is_ok());
+        assert!(validate_storage_path("/absolute/path/to/db").is_ok());
+        // `..` traversal is allowed (caller is in-process trusted).
+        assert!(validate_storage_path("../parent/dir").is_ok());
+    }
+
+    #[test]
+    fn empty_storage_path_rejected() {
+        let err = validate_storage_path("").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn storage_path_too_long_rejected() {
+        let long = "a".repeat(MAX_STORAGE_PATH_LEN + 1);
+        let err = validate_storage_path(&long).unwrap_err();
+        assert!(err.message.contains("exceeds max"));
+    }
+
+    #[test]
+    fn storage_path_with_control_chars_rejected() {
+        // CRLF (log injection vector)
+        let err = validate_storage_path("/tmp/db\r\nHEADER: evil").unwrap_err();
+        assert!(err.message.contains("control character"));
+        // NUL
+        let err = validate_storage_path("/tmp/db\0xyz").unwrap_err();
+        assert!(err.message.contains("control character"));
+        // ANSI escape
+        let err = validate_storage_path("/tmp/db\x1b[31mred\x1b[0m").unwrap_err();
+        assert!(err.message.contains("control character"));
     }
 
     // -- Attestation fields --
@@ -1537,5 +1663,71 @@ mod tests {
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
         assert!(err.message.contains("HTML-special character"));
+    }
+
+    // -- Fixed-length byte narrowing --
+
+    #[test]
+    fn expect_fixed_bytes_accepts_exact_length() {
+        let bytes = [0_u8; 32];
+        let arr: [u8; 32] = expect_fixed_bytes(&bytes, "testing_seed").unwrap();
+        assert_eq!(arr, [0_u8; 32]);
+    }
+
+    #[test]
+    fn expect_fixed_bytes_rejects_short_slice() {
+        let bytes = [0_u8; 31];
+        let err = expect_fixed_bytes::<32>(&bytes, "testing_seed").unwrap_err();
+        assert_eq!(err, "testing_seed must be exactly 32 bytes, got 31");
+    }
+
+    #[test]
+    fn expect_fixed_bytes_rejects_long_slice() {
+        let bytes = [0_u8; 33];
+        let err = expect_fixed_bytes::<32>(&bytes, "testing_seed").unwrap_err();
+        assert_eq!(err, "testing_seed must be exactly 32 bytes, got 33");
+    }
+
+    #[test]
+    fn expect_fixed_bytes_rejects_empty_slice() {
+        let bytes: [u8; 0] = [];
+        let err = expect_fixed_bytes::<32>(&bytes, "testing_seed").unwrap_err();
+        assert_eq!(err, "testing_seed must be exactly 32 bytes, got 0");
+    }
+
+    #[test]
+    fn expect_fixed_bytes_uses_provided_field_name() {
+        let bytes = [0_u8; 10];
+        let err = expect_fixed_bytes::<32>(&bytes, "session_key").unwrap_err();
+        assert!(err.starts_with("session_key must be exactly 32 bytes"));
+    }
+
+    // -- Zeroize-wrapped narrowing --
+
+    #[test]
+    fn expect_fixed_bytes_zeroized_accepts_exact_length() {
+        let bytes = [7_u8; 32];
+        let wrapped: zeroize::Zeroizing<[u8; 32]> =
+            expect_fixed_bytes_zeroized(&bytes, "sender_key").unwrap();
+        // Deref through Zeroizing to compare array contents.
+        assert_eq!(*wrapped, [7_u8; 32]);
+    }
+
+    #[test]
+    fn expect_fixed_bytes_zeroized_rejects_wrong_length() {
+        let bytes = [0_u8; 31];
+        let err = expect_fixed_bytes_zeroized::<32>(&bytes, "sender_key").unwrap_err();
+        assert_eq!(err, "sender_key must be exactly 32 bytes, got 31");
+    }
+
+    /// Confirms that `Zeroizing<[u8; N]>` carries the `ZeroizeOnDrop`
+    /// marker trait — this is the whole point of the helper. If the
+    /// zeroize crate ever drops this impl, the helper loses its
+    /// security guarantee and the migration sites should be revisited.
+    #[test]
+    fn zeroizing_fixed_array_is_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 32]>>();
+        assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 64]>>();
     }
 }

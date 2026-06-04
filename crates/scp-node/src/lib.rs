@@ -2760,6 +2760,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
         let connection_tracker = relay_server.connection_tracker();
         let subscription_registry = relay_server.subscriptions();
+        // Shared PUBLISH rate limiter — the QUIC listener reuses it so PUBLISH
+        // budgets are enforced uniformly across WebSocket and QUIC (ADR-037 AC3).
+        #[cfg(feature = "quic")]
+        let publish_rate_limiter = relay_server.publish_rate_limiter();
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
         let dev_token = self.local_api_addr.map(generate_dev_token);
         let http_bind_addr = self.http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
@@ -2798,6 +2802,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     cert_data,
                     connection_tracker.clone(),
                     subscription_registry.clone(),
+                    #[cfg(feature = "quic")]
+                    publish_rate_limiter.clone(),
                     acme_challenges,
                     #[cfg(feature = "http3")]
                     self.http3_config,
@@ -2835,6 +2841,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     self.network_detector,
                     connection_tracker,
                     subscription_registry,
+                    #[cfg(feature = "quic")]
+                    publish_rate_limiter,
                 )
                 .await
             }
@@ -2856,7 +2864,29 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             key_custody,
             did_method,
         } => {
-            let (identity, document) = did_method.create(&*key_custody).await?;
+            // KNOWN LIMITATION: this path drops the `PreRotationKeyHandle`
+            // because `ApplicationNode<K, D, S, Dom, Id>`'s generic
+            // parameter list does not yet carry a `P: PreRotationCustody`
+            // slot. As a consequence, identities produced by this code
+            // path CANNOT be migrated later — the migrate flow needs both
+            // the handle and the custody instance to call
+            // `dht::migrate_identity`. The current shipped backend is
+            // `InMemoryPreRotationCustody` which is process-local
+            // anyway, so the migration capability would be lost on
+            // process restart even if we persisted the handle. Widening
+            // the builder to accept a real `PreRotationCustody` is
+            // tracked alongside the production custody backends.
+            let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+            let (identity, document, _pre_rotation_handle) = did_method
+                .create(&*key_custody, &pre_rotation_custody)
+                .await?;
+            tracing::warn!(
+                did = %identity.did,
+                "identity created without a persistent PreRotationCustody — migration \
+                 (Layer-2 DID rotation) will be impossible until the builder API is \
+                 widened to accept a real backend. Recovery from `#0` compromise via \
+                 spec §9.7.4.1 is unreachable for this identity."
+            );
             Ok((identity, document, did_method))
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
@@ -3006,7 +3036,26 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                 Ok((persisted.identity, persisted.document, did_method))
             } else {
                 // 3. Generate a new identity and persist it.
-                let (identity, document) = did_method.create(&*key_custody).await?;
+                //
+                // Same KNOWN LIMITATION as `resolve_identity` above: the
+                // `PreRotationKeyHandle` is dropped because the builder
+                // does not yet carry a `P: PreRotationCustody` generic
+                // slot. Identities produced via this persistent path
+                // cannot migrate. With `InMemoryPreRotationCustody` as
+                // the only shipped backend, the handle would be
+                // process-local anyway and lost on restart.
+                let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+                let (identity, document, _pre_rotation_handle) = did_method
+                    .create(&*key_custody, &pre_rotation_custody)
+                    .await?;
+                tracing::warn!(
+                    did = %identity.did,
+                    "persisted identity created without a persistent PreRotationCustody — \
+                     migration (Layer-2 DID rotation) will be impossible after process \
+                     restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
+                     for this identity until the builder API is widened to accept a real \
+                     backend."
+                );
                 let persisted = PersistedIdentity {
                     identity: identity.clone(),
                     document: document.clone(),
@@ -3269,6 +3318,8 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     cert_data: tls::CertificateData,
     connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
+    #[cfg(feature = "quic")]
+    publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
     acme_challenges: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
@@ -3281,6 +3332,29 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     // without restarting the server (spec section 18.6.3).
     let (tls_server_config, cert_resolver) =
         tls::build_reloadable_tls_config(&cert_data).map_err(NodeError::Tls)?;
+
+    // Build the QUIC server config from the SAME provisioned certificate so the
+    // relay cert covers both WebSocket (TCP) and QUIC (UDP) on the public TLS
+    // port (spec §10.14.3 item 1). The listener itself is started lazily in
+    // `serve()`; here we only prepare the config so `serve()` has everything it
+    // needs without re-parsing the certificate.
+    #[cfg(feature = "quic")]
+    let quic_server_config = {
+        let cert_chain = cert_data.certificate_chain_der().map_err(NodeError::Tls)?;
+        let private_key = cert_data.private_key_der().map_err(NodeError::Tls)?;
+        match scp_transport::quic::listener::build_server_config(cert_chain, private_key) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                // A malformed cert should not prevent the node from serving
+                // WebSocket; degrade to WebSocket-only and log loudly.
+                tracing::error!(
+                    domain = %domain, error = %e,
+                    "failed to build QUIC server config — serving WebSocket only"
+                );
+                None
+            }
+        }
+    };
 
     tracing::info!(
         domain = %domain, relay_url = %relay_url,
@@ -3327,6 +3401,13 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
+        #[cfg(feature = "quic")]
+        publish_rate_limiter,
+        #[cfg(feature = "quic")]
+        quic_server_config,
+        // Set to `true` by `serve()` once the QUIC listener binds (§10.14.3).
+        #[cfg(feature = "quic")]
+        quic_listening: std::sync::atomic::AtomicBool::new(false),
     });
 
     Ok(ApplicationNode {
@@ -3352,6 +3433,23 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
 // Shared no-domain build logic (used by HasNoDomain::build and domain fallthrough)
 // ---------------------------------------------------------------------------
 
+/// Appends an `SCPRelay` service entry to the DID document for `relay_url`.
+///
+/// The service id is suffixed with the next sequential index so multiple relays
+/// can coexist on one document (`<did>#scp-relay-<n>`).
+fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
+    let relay_count = document
+        .service
+        .iter()
+        .filter(|s| s.service_type == "SCPRelay")
+        .count();
+    document.service.push(scp_identity::document::Service {
+        id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
+        service_type: "SCPRelay".to_owned(),
+        service_endpoint: relay_url.to_owned(),
+    });
+}
+
 // Node builder internal: all parameters are required for server construction.
 #[allow(clippy::too_many_arguments)]
 async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
@@ -3373,6 +3471,8 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
+    #[cfg(feature = "quic")]
+    publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
 ) -> Result<ApplicationNode<S>, NodeError> {
     // NAT strategy needs the public HTTP port, not the internal relay port (#641).
     let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
@@ -3386,17 +3486,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         ReachabilityTier::Bridge { bridge_url } => bridge_url.clone(),
     };
 
-    let relay_count = document
-        .service
-        .iter()
-        .filter(|s| s.service_type == "SCPRelay")
-        .count();
-
-    document.service.push(scp_identity::document::Service {
-        id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
-        service_type: "SCPRelay".to_owned(),
-        service_endpoint: relay_url.clone(),
-    });
+    push_relay_service(&mut document, &relay_url);
 
     // 4. Publish DID document.
     did_method.publish(&identity, &document).await?;
@@ -3463,6 +3553,14 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
+        // No-domain mode is plaintext `ws://` (no cert), so QUIC is not served (§10.14.3).
+        #[cfg(feature = "quic")]
+        publish_rate_limiter,
+        #[cfg(feature = "quic")]
+        quic_server_config: None,
+        // No QUIC config means `serve()` never sets this; stays `false`.
+        #[cfg(feature = "quic")]
+        quic_listening: std::sync::atomic::AtomicBool::new(false),
     });
 
     Ok(ApplicationNode {
@@ -3566,6 +3664,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
         let connection_tracker = relay_server.connection_tracker();
         let subscription_registry = relay_server.subscriptions();
+        // Shared PUBLISH rate limiter (unused in no-domain mode because QUIC is
+        // not served without TLS, but kept on NodeState for a uniform struct).
+        #[cfg(feature = "quic")]
+        let publish_rate_limiter = relay_server.publish_rate_limiter();
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 4. Generate dev API token if local_api was configured.
@@ -3600,6 +3702,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             self.network_detector,
             connection_tracker,
             subscription_registry,
+            #[cfg(feature = "quic")]
+            publish_rate_limiter,
         )
         .await
     }
@@ -3724,8 +3828,13 @@ impl DidMethod for NoOpDidMethod {
     fn create(
         &self,
         _key_custody: &impl KeyCustody,
-    ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
-    {
+        _pre_rotation_custody: &impl scp_platform::PreRotationCustody,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+            IdentityError,
+        >,
+    > + Send {
         std::future::ready(Err(IdentityError::DhtPublishFailed(
             "NoOpDidMethod: not configured".to_owned(),
         )))
@@ -3912,8 +4021,12 @@ mod tests {
     /// Helper: creates an identity and document for explicit identity tests.
     async fn create_test_identity() -> (ScpIdentity, DidDocument, Arc<InMemoryKeyCustody>) {
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
         let did_dht = make_test_dht(&custody);
-        let (identity, document) = did_dht.create(&*custody).await.unwrap();
+        let (identity, document, _pre_rotation_handle) = did_dht
+            .create(&*custody, &pre_rotation_custody)
+            .await
+            .unwrap();
         (identity, document, custody)
     }
 
@@ -4038,10 +4151,14 @@ mod tests {
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
+                pre_rotation_custody: &impl scp_platform::PreRotationCustody,
             ) -> impl std::future::Future<
-                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+                Output = Result<
+                    (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                    IdentityError,
+                >,
             > + Send {
-                self.inner.create(key_custody)
+                self.inner.create(key_custody, pre_rotation_custody)
             }
 
             fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
@@ -4168,10 +4285,14 @@ mod tests {
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
+                pre_rotation_custody: &impl scp_platform::PreRotationCustody,
             ) -> impl std::future::Future<
-                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+                Output = Result<
+                    (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                    IdentityError,
+                >,
             > + Send {
-                self.inner.create(key_custody)
+                self.inner.create(key_custody, pre_rotation_custody)
             }
 
             fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
@@ -4648,10 +4769,14 @@ mod tests {
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
+                pre_rotation_custody: &impl scp_platform::PreRotationCustody,
             ) -> impl std::future::Future<
-                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+                Output = Result<
+                    (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                    IdentityError,
+                >,
             > + Send {
-                self.inner.create(key_custody)
+                self.inner.create(key_custody, pre_rotation_custody)
             }
 
             fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
@@ -5911,6 +6036,74 @@ mod tests {
             msg.contains("not found in custody"),
             "expected custody validation error, got: {msg}"
         );
+    }
+
+    /// Regression: persisted `ScpIdentity` blobs from interim builds
+    /// (where `pre_rotation_key: KeyHandle` was briefly a field on the
+    /// struct) MUST deserialize cleanly into the post-revert struct,
+    /// since msgpack-named ignores unknown fields and the
+    /// `PreRotationCustody` workstream replaced that field with a
+    /// separate cold-storage substrate. Without this regression test,
+    /// a future change adding `#[serde(deny_unknown_fields)]` would
+    /// silently break upgrades from interim builds.
+    #[tokio::test]
+    async fn identity_with_storage_deserialises_blob_with_extra_pre_rotation_key_field() {
+        use scp_platform::traits::KeyHandle;
+
+        // Synthesize a `PersistedIdentity` shape that mirrors the
+        // interim-build serialization: same fields plus an extra
+        // `pre_rotation_key` slot.
+        #[derive(serde::Serialize)]
+        struct InterimIdentity {
+            identity_key: KeyHandle,
+            active_signing_key: KeyHandle,
+            agent_signing_key: Option<KeyHandle>,
+            pre_rotation_commitment: [u8; 32],
+            // The extra field that should be silently ignored on read.
+            pre_rotation_key: KeyHandle,
+            did: String,
+        }
+
+        #[derive(serde::Serialize)]
+        struct InterimPersistedIdentity {
+            identity: InterimIdentity,
+            document: DidDocument,
+        }
+
+        let interim = InterimPersistedIdentity {
+            identity: InterimIdentity {
+                identity_key: KeyHandle::new(1),
+                active_signing_key: KeyHandle::new(2),
+                agent_signing_key: None,
+                pre_rotation_commitment: [7u8; 32],
+                pre_rotation_key: KeyHandle::new(3),
+                did: "did:dht:zinterim".to_owned(),
+            },
+            document: DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: "did:dht:zinterim".to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+        };
+
+        let envelope = StoredValue {
+            version: CURRENT_STORE_VERSION,
+            data: &interim,
+        };
+        let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+
+        // The post-revert struct (no `pre_rotation_key` field) MUST
+        // deserialize successfully — the extra field is silently
+        // dropped.
+        let decoded: StoredValue<PersistedIdentity> = rmp_serde::from_slice(&bytes)
+            .expect("interim-build blob with extra pre_rotation_key field MUST deserialize");
+        assert_eq!(decoded.version, CURRENT_STORE_VERSION);
+        assert_eq!(decoded.data.identity.did, "did:dht:zinterim");
+        assert_eq!(decoded.data.identity.pre_rotation_commitment, [7u8; 32]);
     }
 
     #[tokio::test]

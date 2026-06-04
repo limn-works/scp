@@ -1,589 +1,85 @@
 @testable import SCP
-import Testing
+import XCTest
 
-// MARK: - Identity Tests
-
-// Tests for the Identity type verifying Sendable conformance, public API
-// shape, DID format validation, and CheckedContinuation-based async bridging.
+// Tests for the SDK-level `SCP` identity-registry surface (Batch 4 §4.1).
 //
-// UniFFI generates Identity as an open class with methods:
-//   - did() -> String
-//   - custodyType() -> String
-//   - rotateKey() async throws -> Identity
-//
-// Tests that need mock Identity instances use subclasses with `noPointer:`.
-// Tests that exercise factory methods (create/load/rotateKey) verify bridge
-// stub error propagation through CheckedContinuation.
-//
-// See ADR-026 (Swift SDK) and story SCP-102.
+// `identityRemove(did:)` and `identityRemoveIfPresent(did:)` forward to the
+// UniFFI bridge, dropping the retained in-memory identity state for a DID.
+// These exercise the full create -> remove lifecycle against a real
+// `SCP()` instance (the test suite links the Rust binary built with
+// `allow_in_memory_custody`).
+final class IdentityTests: XCTestCase {
+    // Implicitly unwrapped because XCTest `setUp` initializes it before any
+    // test method runs — the XCTest lifecycle guarantees non-nil.
+    // swiftlint:disable:next implicitly_unwrapped_optional
+    var scp: SCP!
 
-// swiftlint:disable:next type_body_length
-struct IdentityTests {
-    // MARK: - Mock Identity subclass
-
-    /// Mock subclass of the UniFFI-generated `Identity` class for testing.
-    ///
-    /// UniFFI `Identity` is an open class. In tests we create instances with
-    /// `noPointer:` and override methods to return test values. Methods that
-    /// call into FFI (via `self.pointer`) will crash when pointer is nil, so
-    /// we override all methods we test against.
-    private final class MockIdentity: Identity, @unchecked Sendable {
-        let mockDid: String
-        let mockCustodyType: String
-
-        init(did: String, custodyType: String) {
-            mockDid = did
-            mockCustodyType = custodyType
-            super.init(noPointer: .init())
-        }
-
-        required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-            mockDid = ""
-            mockCustodyType = ""
-            super.init(unsafeFromRawPointer: pointer)
-        }
-
-        override func did() -> String {
-            mockDid
-        }
-
-        override func custodyType() -> String {
-            mockCustodyType
-        }
+    override func setUp() {
+        super.setUp()
+        scp = SCP()
     }
 
-    // MARK: - Type Shape
-
-    @Test("Identity conforms to Sendable")
-    func identityIsSendable() {
-        // Verify that Identity conforms to Sendable by assigning to a
-        // Sendable-constrained binding. This is a compile-time check --
-        // if Identity is not Sendable, this file will not compile.
-        let identity: any Sendable = MockIdentity(did: "did:dht:z6MkTest123", custodyType: "in_memory")
-        #expect(identity is Identity)
+    override func tearDown() async throws {
+        try await scp.shutdown(timeoutMillis: 1000)
+        scp = nil
+        try await super.tearDown()
     }
 
-    @Test("Identity DID returns correct string")
-    func identityDidReturnsString() {
-        let identity = MockIdentity(did: "did:dht:z6MkTestDid", custodyType: "platform")
-        #expect(identity.did() == "did:dht:z6MkTestDid")
-    }
+    /// Removing an existing identity drops it from the registry; a follow-up
+    /// `identityRemoveIfPresent` then reports the DID is gone.
+    func testRemoveExistingIdentity() async throws {
+        let identity = try await scp.identityCreate(custody: "in_memory")
+        let did = identity.did()
 
-    @Test("Identity custody type returns correct string")
-    func identityCustodyTypeReturnsString() {
-        let identity = MockIdentity(did: "did:dht:z6MkTestDid", custodyType: "platform")
-        #expect(identity.custodyType() == "platform")
-    }
-
-    @Test("Identity preserves in_memory custody type")
-    func identityPreservesInMemoryCustodyType() {
-        let identity = MockIdentity(did: "did:dht:z6MkTestDid2", custodyType: "in_memory")
-        #expect(identity.custodyType() == "in_memory")
-    }
-
-    // MARK: - Sendable Crossing
-
-    @Test("Identity can cross task boundary")
-    func identityCanCrossTaskBoundary() async {
-        // Verify that Identity can be sent across task boundaries.
-        // This is a compile-time + runtime check for Sendable conformance.
-        let identity = MockIdentity(did: "did:dht:z6MkCrossTask", custodyType: "in_memory")
-
-        let receivedDid = await Task {
-            identity.did()
-        }.value
-
-        #expect(receivedDid == "did:dht:z6MkCrossTask")
-    }
-
-    // MARK: - DID Format Validation
-
-    @Test("DID format uses did:dht: prefix")
-    func didFormatHasDhtPrefix() {
-        let identity = MockIdentity(did: "did:dht:z6MkValidDid", custodyType: "in_memory")
-        #expect(identity.did().hasPrefix("did:dht:"))
-    }
-
-    @Test("DID format contains z6Mk multibase prefix")
-    func didFormatContainsMultibasePrefix() {
-        // SCP uses Ed25519 keys encoded with z-base58 multibase prefix (z6Mk).
-        let identity = MockIdentity(did: "did:dht:z6MkSomeKey123", custodyType: "in_memory")
-        #expect(identity.did().contains("z6Mk"))
-    }
-
-    @Test("DID format rejects invalid prefix")
-    func didFormatRejectsInvalidPrefix() {
-        // Identity preserves whatever DID string the bridge returns.
-        // This test verifies that a non-standard DID is stored as-is.
-        let identity = MockIdentity(did: "invalid:prefix:test", custodyType: "in_memory")
-        #expect(!identity.did().hasPrefix("did:dht:"))
-        #expect(identity.did() == "invalid:prefix:test")
-    }
-
-    // MARK: - No Force Unwraps Verification
-
-    @Test("Identity handles empty DID without crashing")
-    func identityHandlesEmptyDid() {
-        // Verify that Identity handles edge cases without force unwrapping.
-        let identity = MockIdentity(did: "", custodyType: "")
-        #expect(identity.did() == "")
-        #expect(identity.custodyType() == "")
-    }
-
-    // MARK: - Device Attestation
-
-    @Test("identityAttestDevice calls bridge and returns token")
-    func identityAttestDeviceRoundtrip() async throws {
-        let identity = MockIdentity(did: "did:dht:z6MkAttest", custodyType: "in_memory")
-
-        var receivedIdentity: Identity?
-        let mockAttest: IdentityBridge.AttestDeviceFn = { identity in
-            receivedIdentity = identity
-            return "dGVzdC1hdHRlc3RhdGlvbi10b2tlbg=="
-        }
-
-        let token = try await identityAttestDevice(identity, attestDeviceFn: mockAttest)
-        #expect(token == "dGVzdC1hdHRlc3RhdGlvbi10b2tlbg==")
-        #expect(receivedIdentity?.did() == "did:dht:z6MkAttest")
-    }
-
-    @Test("identityAttestDevice propagates bridge errors")
-    func identityAttestDevicePropagatesBridgeErrors() async throws {
-        let identity = MockIdentity(did: "did:dht:z6MkFail", custodyType: "external")
-
-        let mockAttest: IdentityBridge.AttestDeviceFn = { _ in
-            throw ScpError.Identity(
-                msg: "device attestation requires retained identity state",
-                code: "SCP-IDENT-1007"
-            )
-        }
-
-        do {
-            _ = try await identityAttestDevice(identity, attestDeviceFn: mockAttest)
-            Issue.record("Expected identityAttestDevice to throw")
-        } catch let error as ScpError {
-            if case let .Identity(message, code) = error {
-                #expect(code == "SCP-IDENT-1007")
-                #expect(message.contains("retained identity state"))
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
-
-    @Test("identityVerifyDeviceAttestation calls bridge and returns result")
-    func identityVerifyDeviceAttestationRoundtrip() async throws {
-        var receivedDid: String?
-        var receivedToken: String?
-        let mockVerify: IdentityBridge.VerifyDeviceAttestationFn = { did, tokenBase64 in
-            receivedDid = did
-            receivedToken = tokenBase64
-            return true
-        }
-
-        let result = try await identityVerifyDeviceAttestation(
-            did: "did:dht:z6MkVerify",
-            tokenBase64: "dGVzdA==",
-            verifyDeviceAttestationFn: mockVerify
+        try scp.identityRemove(did: did)
+        XCTAssertFalse(
+            try scp.identityRemoveIfPresent(did: did),
+            "DID must be absent after identityRemove"
         )
-        #expect(result == true)
-        #expect(receivedDid == "did:dht:z6MkVerify")
-        #expect(receivedToken == "dGVzdA==")
     }
 
-    @Test("identityVerifyDeviceAttestation returns false for invalid token")
-    func identityVerifyDeviceAttestationReturnsFalse() async throws {
-        let mockVerify: IdentityBridge.VerifyDeviceAttestationFn = { _, _ in
-            false
-        }
+    /// `identityRemoveIfPresent` returns `true` for a present DID, then
+    /// `false` on the second call once the identity has been removed.
+    func testRemoveIfPresentTrueThenFalse() async throws {
+        let identity = try await scp.identityCreate(custody: "in_memory")
+        let did = identity.did()
 
-        let result = try await identityVerifyDeviceAttestation(
-            did: "did:dht:z6MkVerify",
-            tokenBase64: "aW52YWxpZA==",
-            verifyDeviceAttestationFn: mockVerify
+        XCTAssertTrue(
+            try scp.identityRemoveIfPresent(did: did),
+            "first removal must report the identity was present"
         )
-        #expect(result == false)
-    }
-
-    @Test("identityVerifyDeviceAttestation propagates bridge errors")
-    func identityVerifyDeviceAttestationPropagatesBridgeErrors() async throws {
-        let mockVerify: IdentityBridge.VerifyDeviceAttestationFn = { _, _ in
-            throw ScpError.Identity(
-                msg: "invalid base64 attestation token",
-                code: "SCP-IDENT-1011"
-            )
-        }
-
-        do {
-            _ = try await identityVerifyDeviceAttestation(
-                did: "did:dht:z6MkVerify",
-                tokenBase64: "not-base64",
-                verifyDeviceAttestationFn: mockVerify
-            )
-            Issue.record("Expected error to propagate")
-        } catch let error as ScpError {
-            if case let .Identity(_, code) = error {
-                #expect(code == "SCP-IDENT-1011")
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
-
-    // MARK: - Create Identity
-
-    @Test("createIdentity calls bridge and returns identity")
-    func createIdentityRoundtrip() async throws {
-        let mockIdentity = MockIdentity(did: "did:dht:z6MkCreated", custodyType: "in_memory")
-        var receivedCustody: String?
-
-        let mockCreate: IdentityBridge.CreateFn = { custody in
-            receivedCustody = custody
-            return mockIdentity
-        }
-
-        let result = try await createIdentity(custody: "in_memory", createFn: mockCreate)
-        #expect(result.did() == "did:dht:z6MkCreated")
-        #expect(receivedCustody == "in_memory")
-    }
-
-    @Test("createIdentity propagates bridge errors")
-    func createIdentityPropagatesErrors() async throws {
-        let mockCreate: IdentityBridge.CreateFn = { _ in
-            throw ScpError.Identity(
-                msg: "in_memory custody not available",
-                code: "SCP-IDENT-1008"
-            )
-        }
-
-        do {
-            _ = try await createIdentity(custody: "in_memory", createFn: mockCreate)
-            Issue.record("Expected createIdentity to throw")
-        } catch let error as ScpError {
-            if case let .Identity(_, code) = error {
-                #expect(code == "SCP-IDENT-1008")
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
-
-    // MARK: - Load Identity
-
-    @Test("loadIdentity calls bridge and returns identity")
-    func loadIdentityRoundtrip() async throws {
-        let mockIdentity = MockIdentity(did: "did:dht:z6MkLoaded", custodyType: "external")
-        var receivedDid: String?
-
-        let mockLoad: IdentityBridge.LoadFn = { did in
-            receivedDid = did
-            return mockIdentity
-        }
-
-        let result = try await loadIdentity(did: "did:dht:z6MkLoaded", loadFn: mockLoad)
-        #expect(result.did() == "did:dht:z6MkLoaded")
-        #expect(receivedDid == "did:dht:z6MkLoaded")
-    }
-
-    @Test("loadIdentity propagates bridge errors for unsupported DID method")
-    func loadIdentityPropagatesErrors() async throws {
-        let mockLoad: IdentityBridge.LoadFn = { _ in
-            throw ScpError.Identity(
-                msg: "unsupported DID method",
-                code: "SCP-IDENT-1004"
-            )
-        }
-
-        do {
-            _ = try await loadIdentity(did: "did:web:example.com", loadFn: mockLoad)
-            Issue.record("Expected loadIdentity to throw")
-        } catch let error as ScpError {
-            if case let .Identity(_, code) = error {
-                #expect(code == "SCP-IDENT-1004")
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
-
-    // MARK: - Resolve Identity
-
-    @Test("resolveIdentity calls bridge and returns DidDocument")
-    func resolveIdentityRoundtrip() async throws {
-        var receivedDid: String?
-
-        let mockResolve: IdentityBridge.ResolveFn = { did in
-            receivedDid = did
-            return DidDocument(
-                id: did,
-                authentication: ["#0"],
-                assertionMethods: ["#active"],
-                alsoKnownAs: [],
-                serviceEndpoints: ["https://relay.example.com"]
-            )
-        }
-
-        let doc = try await resolveIdentity(did: "did:dht:z6MkResolved", resolveFn: mockResolve)
-        #expect(doc.id == "did:dht:z6MkResolved")
-        #expect(doc.authentication == ["#0"])
-        #expect(doc.serviceEndpoints.count == 1)
-        #expect(receivedDid == "did:dht:z6MkResolved")
-    }
-
-    @Test("resolveIdentity propagates bridge errors")
-    func resolveIdentityPropagatesErrors() async throws {
-        let mockResolve: IdentityBridge.ResolveFn = { _ in
-            throw ScpError.Identity(
-                msg: "DID not found on DHT",
-                code: "SCP-IDENT-1006"
-            )
-        }
-
-        do {
-            _ = try await resolveIdentity(did: "did:dht:z6MkUnknown", resolveFn: mockResolve)
-            Issue.record("Expected resolveIdentity to throw")
-        } catch let error as ScpError {
-            if case let .Identity(_, code) = error {
-                #expect(code == "SCP-IDENT-1006")
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
-
-    // MARK: - Create Identity With Agent Key
-
-    @Test("createIdentityWithAgentKey calls bridge and returns identity")
-    func createIdentityWithAgentKeyRoundtrip() async throws {
-        let mockIdentity = MockIdentity(did: "did:dht:z6MkAgent", custodyType: "in_memory")
-        var receivedCustody: String?
-
-        let mockCreate: IdentityBridge.CreateWithAgentKeyFn = { custody in
-            receivedCustody = custody
-            return mockIdentity
-        }
-
-        let result = try await createIdentityWithAgentKey(
-            custody: "in_memory",
-            createWithAgentKeyFn: mockCreate
+        XCTAssertFalse(
+            try scp.identityRemoveIfPresent(did: did),
+            "second removal must report the identity was already gone"
         )
-        #expect(result.did() == "did:dht:z6MkAgent")
-        #expect(receivedCustody == "in_memory")
     }
 
-    @Test("createIdentityWithAgentKey propagates bridge errors")
-    func createIdentityWithAgentKeyPropagatesErrors() async throws {
-        let mockCreate: IdentityBridge.CreateWithAgentKeyFn = { _ in
-            throw ScpError.Identity(
-                msg: "agent key creation failed",
-                code: "SCP-IDENT-1020"
-            )
-        }
-
-        do {
-            _ = try await createIdentityWithAgentKey(custody: "in_memory", createWithAgentKeyFn: mockCreate)
-            Issue.record("Expected createIdentityWithAgentKey to throw")
-        } catch let error as ScpError {
-            if case let .Identity(_, code) = error {
-                #expect(code == "SCP-IDENT-1020")
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
-
-    // createIdentityWithAgentKey now delegates to the real UniFFI bridge
-    // (identityCreateWithAgentKey). The "default throws" test has been
-    // removed — the injected-mock roundtrip test above covers SDK logic.
-
-    // MARK: - Migrate Identity
-
-    @Test("migrateIdentity calls bridge and returns migrated identity")
-    func migrateIdentityRoundtrip() async throws {
-        let original = MockIdentity(did: "did:dht:z6MkOriginal", custodyType: "in_memory")
-        let migrated = MockIdentity(did: "did:dht:z6MkMigrated", custodyType: "in_memory")
-        var receivedIdentity: Identity?
-
-        let mockMigrate: IdentityBridge.MigrateFn = { identity in
-            receivedIdentity = identity
-            return migrated
-        }
-
-        let result = try await migrateIdentity(original, migrateFn: mockMigrate)
-        #expect(result.did() == "did:dht:z6MkMigrated")
-        #expect(receivedIdentity?.did() == "did:dht:z6MkOriginal")
-    }
-
-    @Test("migrateIdentity propagates bridge errors")
-    func migrateIdentityPropagatesErrors() async throws {
-        let identity = MockIdentity(did: "did:dht:z6MkFail", custodyType: "in_memory")
-
-        let mockMigrate: IdentityBridge.MigrateFn = { _ in
-            throw ScpError.Identity(
-                msg: "identity not in registry",
-                code: "SCP-IDENT-1021"
-            )
-        }
-
-        do {
-            _ = try await migrateIdentity(identity, migrateFn: mockMigrate)
-            Issue.record("Expected migrateIdentity to throw")
-        } catch let error as ScpError {
-            if case let .Identity(_, code) = error {
-                #expect(code == "SCP-IDENT-1021")
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
-
-    // migrateIdentity now delegates to the real UniFFI bridge
-    // (identityMigrate). The "default throws" test has been removed —
-    // the injected-mock roundtrip and error propagation tests above
-    // cover SDK logic.
-
-    // MARK: - Execute Custody Migration
-
-    @Test("executeCustodyMigration calls bridge and returns JSON result")
-    func executeCustodyMigrationRoundtrip() async throws {
-        var receivedDid: String?
-        var receivedTarget: String?
-        var receivedContextIds: [String]?
-
-        let mockMigrate: IdentityBridge.ExecuteCustodyMigrationFn = { did, target, contextIds in
-            receivedDid = did
-            receivedTarget = target
-            receivedContextIds = contextIds
-            return """
-            {"did":"\(did)","target":"\(target)","key_generated":true,"authorized":true}
-            """
-        }
-
-        let result = try await executeCustodyMigration(
-            did: "did:dht:z6MkMigrate",
-            target: "hardware",
-            contextIds: ["ctx-1", "ctx-2"],
-            executeCustodyMigrationFn: mockMigrate
+    /// Removing a DID that was never registered is a silent no-op (for a
+    /// syntactically valid DID), matching the cross-bridge `identity_remove`
+    /// contract.
+    func testRemoveNonexistentIsSilent() throws {
+        let missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest"
+        try scp.identityRemove(did: missing)
+        XCTAssertFalse(
+            try scp.identityRemoveIfPresent(did: missing),
+            "removing an unregistered DID must report false, not throw"
         )
-        #expect(result.contains("\"key_generated\":true"))
-        #expect(result.contains("\"target\":\"hardware\""))
-        #expect(receivedDid == "did:dht:z6MkMigrate")
-        #expect(receivedTarget == "hardware")
-        #expect(receivedContextIds == ["ctx-1", "ctx-2"])
     }
 
-    @Test("executeCustodyMigration propagates bridge errors")
-    func executeCustodyMigrationPropagatesErrors() async throws {
-        let mockMigrate: IdentityBridge.ExecuteCustodyMigrationFn = { _, _, _ in
-            throw ScpError.Identity(
-                msg: "custody migration backend not configured",
-                code: "SCP-IDENT-1025"
-            )
-        }
-
-        do {
-            _ = try await executeCustodyMigration(
-                did: "did:dht:z6MkFail",
-                target: "hardware",
-                executeCustodyMigrationFn: mockMigrate
-            )
-            Issue.record("Expected executeCustodyMigration to throw")
-        } catch let error as ScpError {
-            if case let .Identity(message, code) = error {
-                #expect(code == "SCP-IDENT-1025")
-                #expect(message.contains("custody migration backend not configured"))
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
+    /// A non-empty but syntactically invalid DID is rejected by both removal
+    /// ops via the shared `validate_did` gate, matching the PyO3 reference
+    /// bridge and the petname `*RejectsMalformedOwner` parity tests.
+    func testRemoveRejectsMalformedDid() {
+        let bad = "not-a-did"
+        func assertValidation(_ body: () throws -> Void) {
+            XCTAssertThrowsError(try body()) { error in
+                guard case ScpError.Validation = error else {
+                    XCTFail("expected ScpError.Validation, got \(error)")
+                    return
+                }
             }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
         }
+        assertValidation { try self.scp.identityRemove(did: bad) }
+        assertValidation { _ = try self.scp.identityRemoveIfPresent(did: bad) }
     }
-
-    @Test("executeCustodyMigration with empty context IDs")
-    func executeCustodyMigrationEmptyContextIds() async throws {
-        var receivedContextIds: [String]?
-
-        let mockMigrate: IdentityBridge.ExecuteCustodyMigrationFn = { did, target, contextIds in
-            receivedContextIds = contextIds
-            return "{\"did\":\"\(did)\",\"target\":\"\(target)\"}"
-        }
-
-        _ = try await executeCustodyMigration(
-            did: "did:dht:z6MkTest",
-            target: "software",
-            executeCustodyMigrationFn: mockMigrate
-        )
-        #expect(receivedContextIds == [])
-    }
-
-    // MARK: - Execute Recovery
-
-    @Test("executeRecovery calls bridge and returns JSON result")
-    func executeRecoveryRoundtrip() async throws {
-        var receivedDid: String?
-        var receivedTier: String?
-        var receivedContextIds: [String]?
-
-        let mockRecovery: IdentityBridge.ExecuteRecoveryFn = { did, tier, contextIds in
-            receivedDid = did
-            receivedTier = tier
-            receivedContextIds = contextIds
-            return """
-            {"did":"\(did)","tier":"\(tier)","key_rotation_completed":true}
-            """
-        }
-
-        let result = try await executeRecovery(
-            did: "did:dht:z6MkRecover",
-            tier: "agent",
-            contextIds: ["ctx-1"],
-            executeRecoveryFn: mockRecovery
-        )
-        #expect(result.contains("\"key_rotation_completed\":true"))
-        #expect(receivedDid == "did:dht:z6MkRecover")
-        #expect(receivedTier == "agent")
-        #expect(receivedContextIds == ["ctx-1"])
-    }
-
-    @Test("executeRecovery propagates bridge errors")
-    func executeRecoveryPropagatesErrors() async throws {
-        let mockRecovery: IdentityBridge.ExecuteRecoveryFn = { _, _, _ in
-            throw ScpError.Identity(
-                msg: "recovery failed: identity not found",
-                code: "SCP-IDENT-1030"
-            )
-        }
-
-        do {
-            _ = try await executeRecovery(
-                did: "did:dht:z6MkFail",
-                tier: "identity_key",
-                executeRecoveryFn: mockRecovery
-            )
-            Issue.record("Expected executeRecovery to throw")
-        } catch let error as ScpError {
-            if case let .Identity(_, code) = error {
-                #expect(code == "SCP-IDENT-1030")
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
-} // end IdentityTests
+}

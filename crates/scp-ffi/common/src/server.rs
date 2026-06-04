@@ -721,10 +721,11 @@ pub async fn resolve_broadcast_key(
         (Some(key_hex), Some(did)) => {
             let key_hex = Zeroizing::new(key_hex);
             let key_vec = Zeroizing::new(hex::decode(&*key_hex)?);
-            let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-                <[u8; 32]>::try_from(key_vec.as_slice())
-                    .map_err(|_| BroadcastKeyError::InvalidKeyLength)?,
-            );
+            let key_bytes = crate::validate::expect_fixed_bytes_zeroized::<32>(
+                key_vec.as_slice(),
+                "broadcast_key",
+            )
+            .map_err(|_| BroadcastKeyError::InvalidKeyLength)?;
             // Explicit key path always uses epoch 0. For rotated keys,
             // use auto-resolve (omit both params).
             Ok(ResolvedBroadcastKey {
@@ -1126,13 +1127,18 @@ mod tests {
         type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
         let cache = Arc::new(DidCache::new());
         let sign_fn = DevDidDht::make_sign_fn(Arc::clone(&custody));
         let did_method = Arc::new(DevDidDht::with_client_and_signer(
             dht_client, cache, sign_fn,
         ));
-        let (identity, document) = did_method.create(custody.as_ref()).await.unwrap();
+        let (identity, document, _pre_rotation_handle) = did_method
+            .create(custody.as_ref(), pre_rotation_custody.as_ref())
+            .await
+            .unwrap();
 
         NodeIdentity {
             identity,

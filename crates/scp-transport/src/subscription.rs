@@ -1,75 +1,87 @@
-//! Client-side subscription map for transport adapters.
+//! Subscription map for transport adapters.
 //!
 //! Unifies the ad-hoc `HashMap<[u8; 32], V>` pattern used across transport
-//! adapters (QUIC, `NativeRelayClient`, WebTransport). Each client adapter has at
-//! most one subscription per routing ID (1:1), unlike the server-side
-//! [`relay::subscription`](crate::relay::subscription) registry which is a
-//! fan-out (1-to-N) delivery map from a routing ID to multiple subscribers.
+//! adapters (QUIC, `NativeRelayClient`, WebTransport). Distinct from
+//! [`relay::SubscriptionRegistry`](crate::relay::subscription::SubscriptionRegistry),
+//! which is a 1:N fan-out registry; this one is a 1:1 keyed map.
 //!
-//! # When to use
+//! # Closure constraints for [`with`], [`with_mut`], [`for_each`]
 //!
-//! Use [`ClientSubscriptionMap`] in client-side transport adapters to track
-//! subscription state keyed by [`crate::traits::RoutingId`]. The value type is
-//! adapter-specific (e.g. a cancellation token, a channel sender, or a richer
-//! state struct).
+//! These methods invoke a caller-supplied closure while holding the inner
+//! `RwLock`. To stay safe, the closure must:
 //!
-//! # Why not reuse the server-side registry?
+//! * Run synchronously to completion. The closure is `FnOnce` / `FnMut`,
+//!   never `async`. A closure that calls `block_on` will stall the runtime
+//!   worker (and on WASM there is no runtime worker to stall it on).
+//! * Avoid acquiring any other lock that participates in a lock ordering
+//!   with this map -- otherwise the program may deadlock.
+//! * Avoid re-entering the same map (any of [`insert`], [`remove`],
+//!   [`with`], etc.) -- otherwise the program will deadlock or, on a
+//!   re-entrant write attempt, panic on poison.
 //!
-//! The server-side [`SubscriptionRegistry`](crate::relay::subscription::SubscriptionRegistry)
-//! is a fan-out map (`HashMap<[u8; 32], Vec<SubscriberEntry>>`) delivering
-//! blobs to every subscriber on a routing ID. A client has exactly one
-//! subscription per routing ID -- the two shapes are different. Unifying them
-//! would introduce fan-out machinery the client never uses.
+//! Keep closures short: clone out anything you need, drop the closure, and
+//! do further work on the cloned value.
 //!
-//! # Lock choice
-//!
-//! Uses [`std::sync::RwLock`] rather than `tokio::sync::RwLock` because:
-//!
-//! * Operations are fast [`HashMap`] reads/writes -- no `await` points.
-//! * `std::sync::RwLock` is available on `wasm32`, where
-//!   [`WebTransportAdapter`](crate::webtransport::client::WebTransportAdapter)
-//!   runs.
-//! * It avoids forcing every caller to be `async` just to look up a
-//!   subscription.
+//! [`with`]: TransportSubscriptionMap::with
+//! [`with_mut`]: TransportSubscriptionMap::with_mut
+//! [`for_each`]: TransportSubscriptionMap::for_each
+//! [`insert`]: TransportSubscriptionMap::insert
+//! [`remove`]: TransportSubscriptionMap::remove
 
 use std::collections::HashMap;
 use std::sync::RwLock;
 
 use thiserror::Error;
 
-/// Maximum concurrent subscriptions tracked per client adapter.
-///
-/// Mirrors the server-side SEC-006 per-routing-ID cap but applied at the
-/// client. Ten thousand entries is far beyond any realistic SCP client (a
-/// heavy participant might be in hundreds of contexts at once) while still
-/// bounding memory growth from pathological producers or bugs.
-pub const MAX_CLIENT_SUBSCRIPTIONS: usize = 10_000;
+use crate::traits::RoutingId;
 
-/// Errors returned by [`ClientSubscriptionMap`] mutation methods.
+/// Maximum concurrent subscriptions tracked per transport adapter.
+///
+/// Bounds memory growth from pathological producers or programming bugs
+/// (e.g., a runaway loop calling `subscribe`). 10,000 is well above the
+/// highest realistic SCP transport-adapter participant footprint (a heavy
+/// participant typically holds ~hundreds of context subscriptions; the cap
+/// leaves >100x headroom). Revisit this constant if real participant
+/// counts approach 1,000.
+///
+/// This cap is independent of the server-side relay caps in
+/// [`crate::relay::subscription`], which protect relay memory under a
+/// different shape (1:N fan-out, total + per-routing-id limits).
+///
+/// Adapters whose subscription lifecycle requires close-on-unsubscribe with
+/// network IO outside the lock (e.g., the WebTransport HTTP/3 bidi-stream
+/// path) must enforce this cap inline rather than going through the
+/// [`TransportSubscriptionMap`] storage primitive.
+pub const MAX_TRANSPORT_SUBSCRIPTIONS: usize = 10_000;
+
+/// Errors returned by [`TransportSubscriptionMap`] mutation methods.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum SubscriptionError {
     /// A subscription is already registered for this routing ID.
     ///
-    /// Callers that want "replace" semantics should [`remove`] the existing
-    /// entry first (and tear it down as appropriate for the adapter), then
-    /// [`insert`] the new value.
-    ///
-    /// [`remove`]: ClientSubscriptionMap::remove
-    /// [`insert`]: ClientSubscriptionMap::insert
+    /// Callers wanting replace semantics should use
+    /// [`insert_or_replace`](TransportSubscriptionMap::insert_or_replace)
+    /// or call [`remove`](TransportSubscriptionMap::remove) then
+    /// [`insert`](TransportSubscriptionMap::insert).
     #[error("subscription already exists for routing id")]
     Duplicate,
 
-    /// The map has reached [`MAX_CLIENT_SUBSCRIPTIONS`] entries and cannot
+    /// The map has reached [`MAX_TRANSPORT_SUBSCRIPTIONS`] entries and cannot
     /// accept another subscription until an existing one is removed.
-    #[error("subscription capacity exceeded: {0}/{0}", )]
+    #[error("subscription capacity exceeded: max {0}")]
     CapacityExceeded(usize),
 }
 
 /// A 1:1 map from SCP routing ID to adapter-specific subscription value.
 ///
-/// Used by client-side transport adapters (QUIC, `NativeRelayClient`,
-/// WebTransport) to track active subscriptions. See the [module-level
-/// documentation](self) for the design rationale.
+/// Used by transport adapters (QUIC, `NativeRelayClient`, WebTransport) to
+/// track active subscriptions. See the [module-level documentation](self) for
+/// closure-safety constraints on [`with`](Self::with),
+/// [`with_mut`](Self::with_mut), and [`for_each`](Self::for_each).
+///
+/// All methods recover from lock-poisoning automatically by extracting the
+/// inner state via [`std::sync::PoisonError::into_inner`]. They do not panic
+/// on poison.
 ///
 /// # Type parameter
 ///
@@ -84,33 +96,32 @@ pub enum SubscriptionError {
 /// # Concurrency
 ///
 /// The map is `Send + Sync` when `V: Send + Sync`. Internal synchronization
-/// uses [`std::sync::RwLock`] for the reasons described in the module docs.
+/// uses [`std::sync::RwLock`] (rather than `tokio::sync::RwLock`) so the map
+/// works on `wasm32` and avoids forcing callers to be `async`.
 #[derive(Debug)]
-pub struct ClientSubscriptionMap<V> {
-    inner: RwLock<HashMap<[u8; 32], V>>,
+pub struct TransportSubscriptionMap<V> {
+    inner: RwLock<HashMap<RoutingId, V>>,
     max: usize,
 }
 
-impl<V> Default for ClientSubscriptionMap<V> {
+impl<V> Default for TransportSubscriptionMap<V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V> ClientSubscriptionMap<V> {
+impl<V> TransportSubscriptionMap<V> {
     /// Creates an empty map with the default capacity
-    /// [`MAX_CLIENT_SUBSCRIPTIONS`].
+    /// [`MAX_TRANSPORT_SUBSCRIPTIONS`].
     #[must_use]
     pub fn new() -> Self {
-        Self::with_capacity(MAX_CLIENT_SUBSCRIPTIONS)
+        Self::with_capacity(MAX_TRANSPORT_SUBSCRIPTIONS)
     }
 
-    /// Creates an empty map with the given maximum entry count.
-    ///
-    /// The cap is a defense against buggy or malicious producers; a value of
-    /// zero is legal (rejects every insert) though not useful.
+    /// Creates an empty map with the given maximum entry count. For tests
+    /// and internal use; zero is legal (rejects every insert) but useless.
     #[must_use]
-    pub fn with_capacity(max: usize) -> Self {
+    pub(crate) fn with_capacity(max: usize) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
             max,
@@ -124,24 +135,22 @@ impl<V> ClientSubscriptionMap<V> {
     /// Returns [`SubscriptionError::Duplicate`] if an entry already exists
     /// for `routing_id`, or [`SubscriptionError::CapacityExceeded`] if the
     /// map has reached its configured maximum.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned, which would require a
-    /// previous panic while holding the lock -- a bug rather than a
-    /// recoverable condition.
-    pub fn insert(&self, routing_id: [u8; 32], value: V) -> Result<(), SubscriptionError> {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.contains_key(&routing_id) {
-            return Err(SubscriptionError::Duplicate);
+    pub fn insert(&self, routing_id: RoutingId, value: V) -> Result<(), SubscriptionError> {
+        {
+            // Hold the write lock across contains-then-insert to make the
+            // check-and-insert atomic.
+            let mut guard = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.contains_key(&routing_id) {
+                return Err(SubscriptionError::Duplicate);
+            }
+            if guard.len() >= self.max {
+                return Err(SubscriptionError::CapacityExceeded(self.max));
+            }
+            guard.insert(routing_id, value);
         }
-        if guard.len() >= self.max {
-            return Err(SubscriptionError::CapacityExceeded(self.max));
-        }
-        guard.insert(routing_id, value);
         Ok(())
     }
 
@@ -155,13 +164,9 @@ impl<V> ClientSubscriptionMap<V> {
     /// Returns [`SubscriptionError::CapacityExceeded`] if the map is at its
     /// maximum and the insert would grow it (i.e. the routing ID was not
     /// already present).
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned (see [`insert`](Self::insert)).
     pub fn insert_or_replace(
         &self,
-        routing_id: [u8; 32],
+        routing_id: RoutingId,
         value: V,
     ) -> Result<Option<V>, SubscriptionError> {
         let mut guard = self
@@ -176,11 +181,7 @@ impl<V> ClientSubscriptionMap<V> {
     }
 
     /// Removes and returns the value at `routing_id`, if any.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
-    pub fn remove(&self, routing_id: &[u8; 32]) -> Option<V> {
+    pub fn remove(&self, routing_id: &RoutingId) -> Option<V> {
         let mut guard = self
             .inner
             .write()
@@ -189,12 +190,8 @@ impl<V> ClientSubscriptionMap<V> {
     }
 
     /// Returns `true` if the map contains an entry for `routing_id`.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
     #[must_use]
-    pub fn contains(&self, routing_id: &[u8; 32]) -> bool {
+    pub fn contains(&self, routing_id: &RoutingId) -> bool {
         let guard = self
             .inner
             .read()
@@ -202,11 +199,13 @@ impl<V> ClientSubscriptionMap<V> {
         guard.contains_key(routing_id)
     }
 
-    /// Returns the number of active subscriptions.
+    /// Returns the count of currently registered subscriptions.
     ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
+    /// Useful for callers that want to pre-check capacity before doing
+    /// expensive work (e.g. opening a network stream) that would fail at
+    /// insert time. The post-insert capacity gate in
+    /// [`insert`](Self::insert) and [`insert_or_replace`](Self::insert_or_replace)
+    /// remains the authoritative bound; this is a fast-path optimization.
     #[must_use]
     pub fn len(&self) -> usize {
         let guard = self
@@ -216,48 +215,10 @@ impl<V> ClientSubscriptionMap<V> {
         guard.len()
     }
 
-    /// Returns `true` if the map is empty.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
+    /// Returns `true` if the map contains no subscriptions.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Returns a snapshot of all active routing IDs.
-    ///
-    /// Used by adapters during reconnection to re-issue SUBSCRIBE for each
-    /// tracked routing ID.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
-    #[must_use]
-    pub fn routing_ids(&self) -> Vec<[u8; 32]> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.keys().copied().collect()
-    }
-
-    /// Removes every entry and returns the removed `(routing_id, value)`
-    /// pairs.
-    ///
-    /// Used by adapters at shutdown to tear down every subscription in one
-    /// pass (e.g. cancelling every read loop).
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
-    pub fn clear(&self) -> Vec<([u8; 32], V)> {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.drain().collect()
     }
 
     /// Applies `f` to the value at `routing_id`, if present.
@@ -265,12 +226,9 @@ impl<V> ClientSubscriptionMap<V> {
     /// Acquires a read lock and calls `f` with a shared reference to the
     /// value. Returns `None` if the slot is empty; otherwise returns
     /// `Some(f(&V))`. Used by adapters that need to read a field of `V`
-    /// without cloning it.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
-    pub fn with<R>(&self, routing_id: &[u8; 32], f: impl FnOnce(&V) -> R) -> Option<R> {
+    /// without cloning it. The closure runs while the lock is held; see
+    /// [module docs](self) for constraints.
+    pub fn with<R>(&self, routing_id: &RoutingId, f: impl FnOnce(&V) -> R) -> Option<R> {
         let guard = self
             .inner
             .read()
@@ -283,12 +241,9 @@ impl<V> ClientSubscriptionMap<V> {
     ///
     /// Acquires a write lock and calls `f` with an exclusive reference to
     /// the value. Returns `None` if the slot is empty; otherwise returns
-    /// `Some(f(&mut V))`.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
-    pub fn with_mut<R>(&self, routing_id: &[u8; 32], f: impl FnOnce(&mut V) -> R) -> Option<R> {
+    /// `Some(f(&mut V))`. The closure runs while the lock is held; see
+    /// [module docs](self) for constraints.
+    pub fn with_mut<R>(&self, routing_id: &RoutingId, f: impl FnOnce(&mut V) -> R) -> Option<R> {
         let mut guard = self
             .inner
             .write()
@@ -298,14 +253,11 @@ impl<V> ClientSubscriptionMap<V> {
 
     /// Applies `f` to each value in the map.
     ///
-    /// Holds a read lock for the duration; `f` must not call back into this
-    /// map. Intended for simple fan-out operations (e.g. notifying every
-    /// subscription of a reconnect event).
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
-    pub fn for_each(&self, mut f: impl FnMut(&[u8; 32], &V)) {
+    /// Holds a read lock for the duration of iteration. Intended for simple
+    /// fan-out operations (e.g. notifying every subscription of a reconnect
+    /// event). The closure runs while the lock is held; see
+    /// [module docs](self) for constraints.
+    pub fn for_each(&self, mut f: impl FnMut(&RoutingId, &V)) {
         let guard = self
             .inner
             .read()
@@ -316,34 +268,13 @@ impl<V> ClientSubscriptionMap<V> {
     }
 }
 
-impl<V: Clone> ClientSubscriptionMap<V> {
-    /// Returns a clone of the value at `routing_id`, if present.
-    ///
-    /// Convenience for cases where `V: Clone` (e.g. a sender handle) and
-    /// the caller wants to drop the lock before using the value.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
-    #[must_use]
-    pub fn get_cloned(&self, routing_id: &[u8; 32]) -> Option<V> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get(routing_id).cloned()
-    }
-
+impl<V: Clone> TransportSubscriptionMap<V> {
     /// Returns a snapshot of every `(routing_id, value)` pair.
     ///
     /// Used by adapters during reconnection when both the routing ID and
     /// per-subscription state are needed to re-issue SUBSCRIBE.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
     #[must_use]
-    pub fn snapshot(&self) -> Vec<([u8; 32], V)> {
+    pub fn snapshot(&self) -> Vec<(RoutingId, V)> {
         let guard = self
             .inner
             .read()
@@ -364,36 +295,28 @@ mod tests {
 
     use super::*;
 
-    fn rid(byte: u8) -> [u8; 32] {
-        [byte; 32]
+    fn rid(byte: u8) -> RoutingId {
+        RoutingId::new([byte; 32])
     }
 
     #[test]
     fn new_is_empty() {
-        let map: ClientSubscriptionMap<u32> = ClientSubscriptionMap::new();
-        assert!(map.is_empty());
-        assert_eq!(map.len(), 0);
-        assert!(map.routing_ids().is_empty());
-    }
-
-    #[test]
-    fn default_matches_new() {
-        let a: ClientSubscriptionMap<u32> = ClientSubscriptionMap::default();
-        assert!(a.is_empty());
+        let map: TransportSubscriptionMap<u32> = TransportSubscriptionMap::new();
+        assert!(map.snapshot().is_empty());
     }
 
     #[test]
     fn insert_and_contains() {
-        let map = ClientSubscriptionMap::<u32>::new();
+        let map = TransportSubscriptionMap::<u32>::new();
         assert!(!map.contains(&rid(1)));
         map.insert(rid(1), 42).unwrap();
         assert!(map.contains(&rid(1)));
-        assert_eq!(map.len(), 1);
+        assert_eq!(map.snapshot().len(), 1);
     }
 
     #[test]
     fn insert_duplicate_is_rejected() {
-        let map = ClientSubscriptionMap::<u32>::new();
+        let map = TransportSubscriptionMap::<u32>::new();
         map.insert(rid(1), 42).unwrap();
         let err = map.insert(rid(1), 99).unwrap_err();
         assert_eq!(err, SubscriptionError::Duplicate);
@@ -403,7 +326,7 @@ mod tests {
 
     #[test]
     fn insert_or_replace_returns_previous() {
-        let map = ClientSubscriptionMap::<u32>::new();
+        let map = TransportSubscriptionMap::<u32>::new();
         assert_eq!(map.insert_or_replace(rid(1), 42).unwrap(), None);
         assert_eq!(map.insert_or_replace(rid(1), 99).unwrap(), Some(42));
         assert_eq!(map.with(&rid(1), |v| *v), Some(99));
@@ -411,7 +334,7 @@ mod tests {
 
     #[test]
     fn insert_or_replace_respects_capacity() {
-        let map = ClientSubscriptionMap::<u32>::with_capacity(2);
+        let map = TransportSubscriptionMap::<u32>::with_capacity(2);
         map.insert_or_replace(rid(1), 1).unwrap();
         map.insert_or_replace(rid(2), 2).unwrap();
         // Replacing an existing key never grows the map.
@@ -423,26 +346,26 @@ mod tests {
 
     #[test]
     fn remove_returns_value() {
-        let map = ClientSubscriptionMap::<u32>::new();
+        let map = TransportSubscriptionMap::<u32>::new();
         map.insert(rid(1), 42).unwrap();
         assert_eq!(map.remove(&rid(1)), Some(42));
         assert_eq!(map.remove(&rid(1)), None);
-        assert!(map.is_empty());
+        assert!(map.snapshot().is_empty());
     }
 
     #[test]
     fn capacity_limit_blocks_inserts() {
-        let map = ClientSubscriptionMap::<u32>::with_capacity(2);
+        let map = TransportSubscriptionMap::<u32>::with_capacity(2);
         map.insert(rid(1), 1).unwrap();
         map.insert(rid(2), 2).unwrap();
         let err = map.insert(rid(3), 3).unwrap_err();
         assert_eq!(err, SubscriptionError::CapacityExceeded(2));
-        assert_eq!(map.len(), 2);
+        assert_eq!(map.snapshot().len(), 2);
     }
 
     #[test]
     fn capacity_limit_recovers_after_remove() {
-        let map = ClientSubscriptionMap::<u32>::with_capacity(1);
+        let map = TransportSubscriptionMap::<u32>::with_capacity(1);
         map.insert(rid(1), 1).unwrap();
         assert!(map.insert(rid(2), 2).is_err());
         map.remove(&rid(1));
@@ -451,41 +374,30 @@ mod tests {
 
     #[test]
     fn zero_capacity_rejects_every_insert() {
-        let map = ClientSubscriptionMap::<u32>::with_capacity(0);
+        let map = TransportSubscriptionMap::<u32>::with_capacity(0);
         let err = map.insert(rid(1), 1).unwrap_err();
         assert_eq!(err, SubscriptionError::CapacityExceeded(0));
     }
 
     #[test]
-    fn clear_returns_all_entries() {
-        let map = ClientSubscriptionMap::<u32>::new();
-        map.insert(rid(1), 10).unwrap();
-        map.insert(rid(2), 20).unwrap();
-        let mut drained = map.clear();
-        drained.sort_by_key(|(k, _)| k[0]);
-        assert_eq!(drained, vec![(rid(1), 10), (rid(2), 20)]);
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn routing_ids_snapshot() {
-        let map = ClientSubscriptionMap::<u32>::new();
+    fn snapshot_contains_inserted_keys() {
+        let map = TransportSubscriptionMap::<u32>::new();
         map.insert(rid(1), 1).unwrap();
         map.insert(rid(2), 2).unwrap();
-        let mut ids = map.routing_ids();
-        ids.sort_by_key(|id| id[0]);
+        let mut ids: Vec<RoutingId> = map.snapshot().into_iter().map(|(k, _)| k).collect();
+        ids.sort_by_key(|id| id.as_bytes()[0]);
         assert_eq!(ids, vec![rid(1), rid(2)]);
     }
 
     #[test]
     fn with_returns_none_when_absent() {
-        let map = ClientSubscriptionMap::<u32>::new();
+        let map = TransportSubscriptionMap::<u32>::new();
         assert!(map.with(&rid(1), |_| ()).is_none());
     }
 
     #[test]
     fn with_mut_mutates_in_place() {
-        let map = ClientSubscriptionMap::<u32>::new();
+        let map = TransportSubscriptionMap::<u32>::new();
         map.insert(rid(1), 10).unwrap();
         map.with_mut(&rid(1), |v| *v += 5).unwrap();
         assert_eq!(map.with(&rid(1), |v| *v), Some(15));
@@ -493,7 +405,7 @@ mod tests {
 
     #[test]
     fn for_each_visits_every_entry() {
-        let map = ClientSubscriptionMap::<u32>::new();
+        let map = TransportSubscriptionMap::<u32>::new();
         map.insert(rid(1), 1).unwrap();
         map.insert(rid(2), 2).unwrap();
         map.insert(rid(3), 3).unwrap();
@@ -505,30 +417,22 @@ mod tests {
     }
 
     #[test]
-    fn get_cloned_returns_copy() {
-        let map = ClientSubscriptionMap::<String>::new();
-        map.insert(rid(1), "hello".to_string()).unwrap();
-        let v = map.get_cloned(&rid(1)).unwrap();
-        assert_eq!(v, "hello");
-        // Original still present.
-        assert!(map.contains(&rid(1)));
-    }
-
-    #[test]
     fn snapshot_returns_all_pairs() {
-        let map = ClientSubscriptionMap::<u32>::new();
+        let map = TransportSubscriptionMap::<u32>::new();
         map.insert(rid(1), 10).unwrap();
         map.insert(rid(2), 20).unwrap();
         let mut pairs = map.snapshot();
-        pairs.sort_by_key(|(k, _)| k[0]);
+        pairs.sort_by_key(|(k, _)| k.as_bytes()[0]);
         assert_eq!(pairs, vec![(rid(1), 10), (rid(2), 20)]);
         // Original still present.
-        assert_eq!(map.len(), 2);
+        assert_eq!(map.snapshot().len(), 2);
     }
 
     #[test]
-    fn concurrent_inserts_and_removes_preserve_invariants() {
-        let map = Arc::new(ClientSubscriptionMap::<u64>::new());
+    fn concurrent_inserts_and_removes_do_not_deadlock() {
+        // Smoke test: disjoint thread keyspaces ensure no insert/remove ever
+        // contends on the same routing ID. Verifies the lock plumbing alone.
+        let map = Arc::new(TransportSubscriptionMap::<u64>::new());
         let mut handles = Vec::new();
         for thread_idx in 0..8u8 {
             let map = Arc::clone(&map);
@@ -537,33 +441,123 @@ mod tests {
                     let mut id = [0u8; 32];
                     id[0] = thread_idx;
                     id[1] = i;
-                    // Ignore duplicate errors (they can't happen here since
-                    // each (thread_idx, i) is unique) but don't unwrap in
-                    // case of pathological scheduling.
-                    let _ = map.insert(id, u64::from(thread_idx) * 1000 + u64::from(i));
+                    let _ = map.insert(
+                        RoutingId::new(id),
+                        u64::from(thread_idx) * 1000 + u64::from(i),
+                    );
                 }
                 for i in 0..100u8 {
                     let mut id = [0u8; 32];
                     id[0] = thread_idx;
                     id[1] = i;
-                    let _ = map.remove(&id);
+                    let _ = map.remove(&RoutingId::new(id));
                 }
             }));
         }
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(map.len(), 0);
+        assert!(map.snapshot().is_empty());
+    }
+
+    #[test]
+    fn concurrent_inserts_and_removes_preserve_invariants() {
+        // Stress test: 4 threads each cycle through the SAME 16 routing IDs
+        // with random insert / insert_or_replace / remove operations. After
+        // joining we verify (a) no entry is torn (every present value is one
+        // we wrote), (b) `snapshot().len()` is at most 16, and (c)
+        // `insert_or_replace` against a present key never trips the capacity
+        // bound (capacity is bounded but greater than the keyspace).
+        const KEYSPACE: u8 = 16;
+        const THREADS: usize = 4;
+        const ITERATIONS: usize = 500;
+
+        // Capacity > keyspace so resize-by-replace never hits the cap.
+        let map = Arc::new(TransportSubscriptionMap::<u64>::with_capacity(
+            usize::from(KEYSPACE) + 4,
+        ));
+        let cap_violations = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for thread_idx in 0..THREADS {
+            let map = Arc::clone(&map);
+            let cap_violations = Arc::clone(&cap_violations);
+            handles.push(std::thread::spawn(move || {
+                // Cheap thread-distinct xorshift64* sequence.
+                let mut state: u64 = (thread_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                for iter in 0..ITERATIONS {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+
+                    // Low bits drive the key, high bits the op; sharing
+                    // bits would pin each key to a single operation.
+                    let key_byte =
+                        u8::try_from(state % u64::from(KEYSPACE)).expect("modulo fits in u8");
+                    let mut id = [0u8; 32];
+                    id[0] = key_byte;
+                    let rid = RoutingId::new(id);
+                    let value = (thread_idx as u64) << 32 | iter as u64;
+
+                    match (state >> 32) & 0x3 {
+                        0 => {
+                            // insert: may legitimately error with Duplicate.
+                            let _ = map.insert(rid, value);
+                        }
+                        1 => {
+                            // insert_or_replace: against any key, must not
+                            // trip CapacityExceeded with cap > keyspace.
+                            if let Err(SubscriptionError::CapacityExceeded(_)) =
+                                map.insert_or_replace(rid, value)
+                            {
+                                cap_violations.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        2 => {
+                            let _ = map.remove(&rid);
+                        }
+                        _ => {
+                            let _ = map.contains(&rid);
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            cap_violations.load(Ordering::Relaxed),
+            0,
+            "insert_or_replace must never report CapacityExceeded when capacity > keyspace"
+        );
+
+        // Final state is some valid subset of the keyspace -- no orphan or
+        // torn entries. Verify (a) keys live in the configured keyspace, and
+        // (b) every present value decodes back to a `(thread_idx, iter)` pair
+        // we actually wrote, with no torn or interleaved high/low halves.
+        let entries: Vec<(RoutingId, u64)> = map.snapshot();
+        assert!(entries.len() <= usize::from(KEYSPACE));
+        for (id, value) in &entries {
+            assert!(id.as_bytes()[0] < KEYSPACE);
+            let thread_idx = (value >> 32) as usize;
+            let iter = (value & 0xFFFF_FFFF) as usize;
+            assert!(
+                thread_idx < THREADS,
+                "torn entry: thread_idx {thread_idx} out of range"
+            );
+            assert!(iter < ITERATIONS, "torn entry: iter {iter} out of range");
+        }
     }
 
     #[test]
     fn concurrent_readers_do_not_block_each_other() {
         // Smoke test: many readers run concurrently without deadlock.
-        let map = Arc::new(ClientSubscriptionMap::<u32>::new());
+        let map = Arc::new(TransportSubscriptionMap::<u32>::new());
         for i in 0..10u8 {
             let mut id = [0u8; 32];
             id[0] = i;
-            map.insert(id, u32::from(i)).unwrap();
+            map.insert(RoutingId::new(id), u32::from(i)).unwrap();
         }
 
         let mut handles = Vec::new();
@@ -571,14 +565,13 @@ mod tests {
             let map = Arc::clone(&map);
             handles.push(std::thread::spawn(move || {
                 for _ in 0..100 {
-                    let _ = map.len();
-                    let _ = map.routing_ids();
+                    let _ = map.snapshot();
                 }
             }));
         }
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(map.len(), 10);
+        assert_eq!(map.snapshot().len(), 10);
     }
 }

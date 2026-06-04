@@ -63,8 +63,8 @@ impl KeyStore {
 ///
 /// # Deterministic Testing
 ///
-/// Use [`InMemoryKeyCustody::from_seed`] to create an instance with a seedable
-/// RNG for reproducible test scenarios.
+/// Use [`InMemoryKeyCustody::from_seed_bytes`] to create an instance with a
+/// seedable RNG for reproducible test scenarios.
 ///
 /// # Thread Safety
 ///
@@ -74,35 +74,26 @@ impl KeyStore {
 /// See ADR-006 in `.docs/adrs/phase-1.md`.
 pub struct InMemoryKeyCustody {
     store: Mutex<KeyStore>,
-    rng: Mutex<Box<dyn RngCore + Send>>,
+    // Trait-object RNG that preserves the `CryptoRng` marker across the
+    // `Box<dyn ...>` boundary. Both constructors (`new` from `OsRng`,
+    // `from_seed_bytes` from `StdRng::from_seed`) only accept RNGs that
+    // are `CryptoRng + RngCore + Send`, so the marker is upheld at
+    // every call site.
+    rng: Mutex<Box<dyn SecureRng>>,
     next_id: AtomicU64,
 }
 
-/// A type-erased RNG that is both `RngCore` and `CryptoRng`.
+/// Composite trait combining [`RngCore`], [`CryptoRng`], and [`Send`].
 ///
-/// Needed because `rand::rngs::StdRng` implements `CryptoRng` but we store
-/// a `Box<dyn RngCore + Send>` for flexibility. This wrapper preserves the
-/// `CryptoRng` marker for the seedable path while the non-seeded path uses
-/// `rand::rngs::OsRng` (which is also `CryptoRng`).
-struct CryptoRngWrapper<R: RngCore + CryptoRng + Send>(R);
+/// The `Box<dyn SecureRng>` held by [`InMemoryKeyCustody`] is a
+/// trait-object RNG. A bare `Box<dyn RngCore + Send>` would lose the
+/// [`CryptoRng`] marker at the trait-object boundary — consumers of
+/// the boxed RNG would see only [`RngCore`]. This composite trait
+/// keeps both markers observable through erasure, and the blanket
+/// impl covers every concrete RNG that already satisfies the bound.
+trait SecureRng: RngCore + CryptoRng + Send {}
 
-impl<R: RngCore + CryptoRng + Send> RngCore for CryptoRngWrapper<R> {
-    fn next_u32(&mut self) -> u32 {
-        self.0.next_u32()
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0.next_u64()
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.0.fill_bytes(dest);
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-        self.0.try_fill_bytes(dest)
-    }
-}
+impl<R: RngCore + CryptoRng + Send + ?Sized> SecureRng for R {}
 
 impl InMemoryKeyCustody {
     /// Creates a new in-memory key custody with a cryptographically secure RNG.
@@ -110,24 +101,37 @@ impl InMemoryKeyCustody {
     pub fn new() -> Self {
         Self {
             store: Mutex::new(KeyStore::new()),
-            rng: Mutex::new(Box::new(CryptoRngWrapper(rand::rngs::OsRng))),
+            rng: Mutex::new(Box::new(rand::rngs::OsRng)),
             next_id: AtomicU64::new(1),
         }
     }
 
     /// Creates a new in-memory key custody with a deterministic RNG seeded by
-    /// `seed`.
+    /// the full 32-byte `seed`.
     ///
-    /// Useful for reproducible test scenarios: the same seed always produces
-    /// the same sequence of keys.
+    /// This is the byte-level seed API used by cross-bridge parity testing
+    /// (ADR-046): bridges that accept a 32-byte seed from the harness feed it
+    /// directly into this constructor so that every bridge's
+    /// `generate_keypair` call sequence yields byte-identical Ed25519 signing
+    /// keys. Callers with a narrower source of entropy (e.g. a u64
+    /// determinism fixture) must zero-pad into a full `[u8; 32]` at the
+    /// call site — the library no longer does this implicitly.
+    ///
+    /// # Determinism contract
+    ///
+    /// Given a fixed `seed`, `rand::rngs::StdRng::from_seed(seed)` produces a
+    /// deterministic byte stream. `KeyCustody::generate_keypair` consumes
+    /// exactly 32 bytes from the RNG per call (via `fill_bytes`) and feeds
+    /// them into `ed25519_dalek::SigningKey::from_bytes`, so the first
+    /// Ed25519 handle has private key `seed_stream[0..32]`, the second has
+    /// `seed_stream[32..64]`, and so on. This contract is the basis of the
+    /// cross-bridge byte-exact identity parity test.
     #[must_use]
-    pub fn from_seed(seed: u64) -> Self {
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
-        let rng = rand::rngs::StdRng::from_seed(seed_bytes);
+    pub fn from_seed_bytes(seed: [u8; 32]) -> Self {
+        let rng = rand::rngs::StdRng::from_seed(seed);
         Self {
             store: Mutex::new(KeyStore::new()),
-            rng: Mutex::new(Box::new(CryptoRngWrapper(rng))),
+            rng: Mutex::new(Box::new(rng)),
             next_id: AtomicU64::new(1),
         }
     }
@@ -482,11 +486,64 @@ impl KeyCustody for InMemoryKeyCustody {
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::InMemory
     }
+
+    fn import_ed25519_signing_key(
+        &self,
+        seed: &Zeroizing<[u8; 32]>,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        // Wrap the local copy in `Zeroizing` immediately so the bytes
+        // are wiped when this function returns. `[u8; 32]` is `Copy`,
+        // so dereferencing the borrow performs a stack copy; capturing
+        // it directly into a `Zeroizing` ensures the wrapper owns the
+        // only stack residue (the original `seed` is owned by the
+        // caller and stays in their `Zeroizing`).
+        let seed_copy: Zeroizing<[u8; 32]> = Zeroizing::new(**seed);
+        async move {
+            let handle = self.next_handle();
+            let signing_key = SigningKey::from_bytes(&seed_copy);
+
+            let mut store = self.store.lock().await;
+            store.ed25519_keys.insert(handle.id(), signing_key);
+            store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
+            drop(store);
+
+            // `seed_copy: Zeroizing<[u8; 32]>` drops here → bytes wiped.
+            Ok(handle)
+        }
+    }
+
+    fn generate_ephemeral_ed25519_seed(
+        &self,
+    ) -> impl Future<Output = Result<Zeroizing<[u8; 32]>, PlatformError>> + Send {
+        async move {
+            // Draw 32 bytes from the SAME RNG used by `generate_keypair`. This
+            // preserves the ADR-046 byte-parity invariant: the seeded
+            // bridge-parity tests expect `seed[0..32]` → identity_key,
+            // `seed[32..64]` → active_signing_key, `seed[64..96]` →
+            // pre-rotation key. Calling this method between identity and
+            // active generations would break parity; the dht::create flow
+            // is responsible for the correct ordering.
+            let mut seed = Zeroizing::new([0u8; 32]);
+            self.rng.lock().await.fill_bytes(seed.as_mut());
+            Ok(seed)
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    /// Converts a `u64` into a 32-byte seed (low 8 bytes little-endian,
+    /// remaining 24 bytes zero) for determinism tests that only need a
+    /// small-integer handle. Callers that actually want full 32-byte
+    /// entropy should pass a `[u8; 32]` to `from_seed_bytes` directly.
+    #[must_use]
+    fn seed_from_u64(v: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[..8].copy_from_slice(&v.to_le_bytes());
+        out
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -598,7 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn derive_pseudonym_is_deterministic() {
-        let custody = InMemoryKeyCustody::from_seed(42);
+        let custody = InMemoryKeyCustody::from_seed_bytes(seed_from_u64(42));
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let context_id = b"test-context";
 
@@ -643,6 +700,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn from_seed_bytes_is_deterministic_across_instances() {
+        // Two custodies created with the same 32-byte seed must produce
+        // byte-identical Ed25519 key sequences. This is the invariant the
+        // cross-bridge parity harness relies on (ADR-046).
+        let seed = [0xA5u8; 32];
+        let c1 = InMemoryKeyCustody::from_seed_bytes(seed);
+        let c2 = InMemoryKeyCustody::from_seed_bytes(seed);
+
+        for _ in 0..3 {
+            let h1 = c1.generate_keypair(KeyType::Ed25519).await.unwrap();
+            let h2 = c2.generate_keypair(KeyType::Ed25519).await.unwrap();
+            let p1 = c1.public_key(&h1).await.unwrap();
+            let p2 = c2.public_key(&h2).await.unwrap();
+            assert_eq!(p1.as_bytes(), p2.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn from_seed_bytes_different_seeds_diverge() {
+        let c1 = InMemoryKeyCustody::from_seed_bytes([0u8; 32]);
+        let c2 = InMemoryKeyCustody::from_seed_bytes([1u8; 32]);
+        let h1 = c1.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let h2 = c2.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let p1 = c1.public_key(&h1).await.unwrap();
+        let p2 = c2.public_key(&h2).await.unwrap();
+        assert_ne!(p1.as_bytes(), p2.as_bytes());
+    }
+
+    #[tokio::test]
     async fn custody_type_always_returns_in_memory() {
         let custody = InMemoryKeyCustody::new();
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -672,8 +758,8 @@ mod tests {
 
     #[tokio::test]
     async fn seeded_custody_produces_deterministic_keys() {
-        let first = InMemoryKeyCustody::from_seed(12345);
-        let second = InMemoryKeyCustody::from_seed(12345);
+        let first = InMemoryKeyCustody::from_seed_bytes(seed_from_u64(12345));
+        let second = InMemoryKeyCustody::from_seed_bytes(seed_from_u64(12345));
 
         let handle_first = first.generate_keypair(KeyType::Ed25519).await.unwrap();
         let handle_second = second.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -743,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn derive_rotatable_pseudonym_is_deterministic() {
-        let custody = InMemoryKeyCustody::from_seed(42);
+        let custody = InMemoryKeyCustody::from_seed_bytes(seed_from_u64(42));
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let context_id = b"test-context";
 

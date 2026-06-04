@@ -1,19 +1,25 @@
 //! `PyO3` bridge functions for provenance operations.
 //!
 //! Exposes SCP provenance types, quality evaluation, and privacy operations
-//! to Python:
+//! to Python. Pure helpers are module-level `#[pyfunction]` exports
+//! (ADR-048 §1); stateful operations are methods on the `SCP` class:
 //!
-//! - [`py_evaluate_provenance_quality`] -- Evaluate the provenance quality tier
-//!   for a given provenance record and source context state.
-//! - [`py_provenance_attach`] -- Attach provenance metadata at cross-context
-//!   boundaries.
-//! - [`py_provenance_check_chain_depth`] -- Check whether a provenance chain
-//!   depth is within the allowed limit.
-//! - [`py_provenance_redact_counterparties`] -- Remove counterparty DIDs (§24.3.5).
-//! - [`py_provenance_pseudonymize_counterparties`] -- Replace DIDs with
-//!   pseudonyms (§24.3.5).
-//! - [`py_provenance_update_source_type`] -- Update source type for state
-//!   changes (ADR-019 AC5).
+//! - `evaluate_provenance_quality` -- Evaluate the provenance quality tier
+//!   for a given provenance record and source context state (free fn).
+//! - `PyScp::provenance_attach` -- Attach provenance metadata at
+//!   cross-context boundaries.
+//! - `provenance_check_chain_depth` -- Check whether a provenance chain
+//!   depth is within the allowed limit (free fn).
+//! - `provenance_redact_counterparties` -- Remove counterparty DIDs
+//!   (§24.3.5, free fn).
+//! - `provenance_pseudonymize_counterparties` -- Replace DIDs with
+//!   pseudonyms (§24.3.5, free fn).
+//! - `provenance_update_source_type` -- Update source type for state
+//!   changes (ADR-019 AC5, free fn).
+//!
+//! Originally migrated to `#[pymethods] impl PyScp` methods in Phase 4
+//! PR 4 sub-slice C; pure helpers were demoted back to free fns under
+//! ADR-048 §1.
 //!
 //! See spec section 24 (Provenance System) and ADR-019.
 
@@ -32,9 +38,10 @@ use scp_core::provenance::evaluate::{SourceContextState, evaluate_quality, updat
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 
 use crate::error::ScpPyError;
+use crate::runtime::PyBridgeInstance;
 
 // ---------------------------------------------------------------------------
-// Bridge functions
+// Pure helpers — module-level `#[pyfunction]` exports (ADR-048 §1).
 // ---------------------------------------------------------------------------
 
 /// Evaluates the provenance quality tier for a given data provenance record.
@@ -45,9 +52,8 @@ use crate::error::ScpPyError;
 ///
 /// Raises `ValidationError` if `source_type` or `context_state` are invalid.
 #[pyfunction]
-#[pyo3(name = "evaluate_provenance_quality")]
 #[pyo3(signature = (source_context=None, source_type="persistent", context_state="unknown", counterparties=None))]
-pub fn py_evaluate_provenance_quality(
+pub fn evaluate_provenance_quality(
     source_context: Option<String>,
     source_type: &str,
     context_state: &str,
@@ -80,116 +86,13 @@ pub fn py_evaluate_provenance_quality(
     Ok(quality as u8)
 }
 
-/// Attaches provenance metadata when data crosses a context boundary.
-///
-/// Records dual events in the event log: `ProvenanceAttached` in the source
-/// context and `ProvenanceReceived` in the target context (issue #586).
-///
-/// See ADR-019 acceptance criteria 2-3, 6.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if `source_type` or `memory_scope` are invalid.
-/// Raises `ContextError` if either context is not found in the runtime.
-#[pyfunction]
-#[pyo3(name = "provenance_attach")]
-#[pyo3(signature = (source_context_id, source_type, memory_scope, members, target_context_id, actor_did, existing_chain_depth=None))]
-#[allow(clippy::too_many_arguments)] // FFI bridge requires explicit params
-pub fn py_provenance_attach<'py>(
-    py: Python<'py>,
-    source_context_id: String,
-    source_type: &str,
-    memory_scope: &str,
-    members: Vec<String>,
-    target_context_id: String,
-    actor_did: String,
-    existing_chain_depth: Option<u8>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let st = parse_source_type(source_type)?;
-    let ms = parse_memory_scope(memory_scope)?;
-
-    let source_info = SourceContextInfo {
-        context_id: source_context_id.clone(),
-        source_type: st,
-        memory_scope: ms,
-        members: members.into_iter().map(scp_identity::DID::from).collect(),
-        discovery_method: DiscoveryMethod::OutOfBand,
-        data_age: std::time::Duration::from_secs(0),
-        purpose: None,
-        counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
-    };
-
-    let existing_prov = existing_chain_depth.map(|depth| DataProvenance {
-        source_context: String::new(),
-        source_type: SourceType::Persistent,
-        counterparties: vec![],
-        purpose: None,
-        discovery_method: DiscoveryMethod::OutOfBand,
-        age: std::time::Duration::from_secs(0),
-        memory_scope: MemoryScope::Full,
-        chain_depth: depth,
-        chain_path: None,
-        payment_amount: None,
-        payment_adapter: None,
-        payment_receipt_id: None,
-    });
-
-    let prov = attach_provenance(
-        &source_info,
-        &target_context_id,
-        existing_prov.as_ref(),
-        None,
-        None,
-    );
-
-    // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
-    let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| ScpPyError::ValidationError {
-        message: format!("failed to serialize provenance for hashing: {e}"),
-        code: codes::VALID_7053.to_string(),
-    })?;
-    let prov_hash: [u8; 32] = Sha256::digest(&prov_json_bytes).into();
-
-    // Record ProvenanceAttached in the source context event log.
-    // Best-effort: log warning if context not found (provenance_attach
-    // can be called without a runtime context, e.g. in unit tests).
-    if let Err(e) = append_provenance_event(
-        &source_context_id,
-        &actor_did,
-        scp_event_log::EventType::ProvenanceAttached,
-        &prov_hash,
-    ) {
-        tracing::warn!(
-            context = %source_context_id,
-            error = %e,
-            "failed to append ProvenanceAttached event to source context event log"
-        );
-    }
-
-    // Record ProvenanceReceived in the target context event log.
-    if let Err(e) = append_provenance_event(
-        &target_context_id,
-        &actor_did,
-        scp_event_log::EventType::ProvenanceReceived,
-        &prov_hash,
-    ) {
-        tracing::warn!(
-            context = %target_context_id,
-            error = %e,
-            "failed to append ProvenanceReceived event to target context event log"
-        );
-    }
-
-    provenance_to_dict(py, &prov)
-}
-
 /// Checks whether the provenance chain depth is within the allowed limit.
 ///
 /// Returns `True` if within limit, `False` otherwise.
 #[pyfunction]
-#[pyo3(name = "provenance_check_chain_depth")]
 #[pyo3(signature = (chain_depth, max_depth=None))]
 #[must_use]
-pub fn py_provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -> bool {
+pub fn provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -> bool {
     let max = max_depth.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH);
     let prov = DataProvenance {
         source_context: String::new(),
@@ -218,8 +121,7 @@ pub fn py_provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -
 /// Raises `ValidationError` if `provenance_json` is not valid JSON or cannot
 /// be deserialized as a `DataProvenance` record.
 #[pyfunction]
-#[pyo3(name = "provenance_redact_counterparties")]
-pub fn py_provenance_redact_counterparties(provenance_json: &str) -> PyResult<String> {
+pub fn provenance_redact_counterparties(provenance_json: &str) -> PyResult<String> {
     let mut prov: DataProvenance =
         serde_json::from_str(provenance_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid provenance JSON: {e}"),
@@ -250,8 +152,7 @@ pub fn py_provenance_redact_counterparties(provenance_json: &str) -> PyResult<St
 /// be deserialized as a `DataProvenance` record, or if `pseudonym_key_hex`
 /// is not valid hex.
 #[pyfunction]
-#[pyo3(name = "provenance_pseudonymize_counterparties")]
-pub fn py_provenance_pseudonymize_counterparties(
+pub fn provenance_pseudonymize_counterparties(
     provenance_json: &str,
     pseudonym_key_hex: &str,
 ) -> PyResult<String> {
@@ -292,11 +193,7 @@ pub fn py_provenance_pseudonymize_counterparties(
 /// be deserialized as a `DataProvenance` record, or if `new_state` is not
 /// a recognized context state value.
 #[pyfunction]
-#[pyo3(name = "provenance_update_source_type")]
-pub fn py_provenance_update_source_type(
-    provenance_json: &str,
-    new_state: &str,
-) -> PyResult<String> {
+pub fn provenance_update_source_type(provenance_json: &str, new_state: &str) -> PyResult<String> {
     let mut prov: DataProvenance =
         serde_json::from_str(provenance_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid provenance JSON: {e}"),
@@ -317,14 +214,127 @@ pub fn py_provenance_update_source_type(
 }
 
 // ---------------------------------------------------------------------------
+// PyScp methods — stateful provenance operations.
+// ---------------------------------------------------------------------------
+
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Attaches provenance metadata when data crosses a context boundary.
+    ///
+    /// Records dual events in the event log: `ProvenanceAttached` in the source
+    /// context and `ProvenanceReceived` in the target context (issue #586).
+    ///
+    /// See ADR-019 acceptance criteria 2-3, 6.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if `source_type` or `memory_scope` are invalid.
+    /// Raises `ContextError` if either context is not found in the runtime.
+    #[pyo3(signature = (source_context_id, source_type, memory_scope, members, target_context_id, actor_did, existing_chain_depth=None))]
+    #[allow(clippy::too_many_arguments)] // FFI bridge requires explicit params
+    pub fn provenance_attach<'py>(
+        &self,
+        py: Python<'py>,
+        source_context_id: String,
+        source_type: &str,
+        memory_scope: &str,
+        members: Vec<String>,
+        target_context_id: String,
+        actor_did: String,
+        existing_chain_depth: Option<u8>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let bi = &*self.inner;
+        let st = parse_source_type(source_type)?;
+        let ms = parse_memory_scope(memory_scope)?;
+
+        let source_info = SourceContextInfo {
+            context_id: source_context_id.clone(),
+            source_type: st,
+            memory_scope: ms,
+            members: members.into_iter().map(scp_identity::DID::from).collect(),
+            discovery_method: DiscoveryMethod::OutOfBand,
+            data_age: std::time::Duration::from_secs(0),
+            purpose: None,
+            counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
+        };
+
+        let existing_prov = existing_chain_depth.map(|depth| DataProvenance {
+            source_context: String::new(),
+            source_type: SourceType::Persistent,
+            counterparties: vec![],
+            purpose: None,
+            discovery_method: DiscoveryMethod::OutOfBand,
+            age: std::time::Duration::from_secs(0),
+            memory_scope: MemoryScope::Full,
+            chain_depth: depth,
+            chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
+        });
+
+        let prov = attach_provenance(
+            &source_info,
+            &target_context_id,
+            existing_prov.as_ref(),
+            None,
+            None,
+        );
+
+        // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
+        let prov_json_bytes =
+            serde_json::to_vec(&prov).map_err(|e| ScpPyError::ValidationError {
+                message: format!("failed to serialize provenance for hashing: {e}"),
+                code: codes::VALID_7053.to_string(),
+            })?;
+        let prov_hash: [u8; 32] = Sha256::digest(&prov_json_bytes).into();
+
+        // Record ProvenanceAttached in the source context event log.
+        // Best-effort: log warning if context not found (provenance_attach
+        // can be called without a runtime context, e.g. in unit tests).
+        if let Err(e) = append_provenance_event(
+            bi,
+            &source_context_id,
+            &actor_did,
+            scp_event_log::EventType::ProvenanceAttached,
+            &prov_hash,
+        ) {
+            tracing::warn!(
+                context = %source_context_id,
+                error = %e,
+                "failed to append ProvenanceAttached event to source context event log"
+            );
+        }
+
+        // Record ProvenanceReceived in the target context event log.
+        if let Err(e) = append_provenance_event(
+            bi,
+            &target_context_id,
+            &actor_did,
+            scp_event_log::EventType::ProvenanceReceived,
+            &prov_hash,
+        ) {
+            tracing::warn!(
+                context = %target_context_id,
+                error = %e,
+                "failed to append ProvenanceReceived event to target context event log"
+            );
+        }
+
+        provenance_to_dict(py, &prov)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 /// Appends a provenance event (`ProvenanceAttached` or `ProvenanceReceived`)
-/// to the event log for the given context.
+/// to the event log for the given context on the given bridge instance.
 ///
 /// Follows the unsigned-event pattern used by `ToolInvoked` in `mcp.rs`.
 fn append_provenance_event(
+    bi: &PyBridgeInstance,
     context_id: &str,
     actor_did: &str,
     event_type: scp_event_log::EventType,
@@ -335,7 +345,7 @@ fn append_provenance_event(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
-    crate::runtime::with_context(context_id, |rt| {
+    crate::runtime::with_context(bi, context_id, |rt| {
         let sequence = scp_event_log::tree::event_count(&rt.event_log);
         let prev_hash = if rt.event_log.leaves().is_empty() {
             scp_event_log::tree::GENESIS_PREV_HASH
@@ -439,21 +449,26 @@ fn parse_context_state(s: &str) -> PyResult<SourceContextState> {
 // Module registration
 // ---------------------------------------------------------------------------
 
-/// Registers provenance bridge functions on the `_scp_core` module.
+/// Registers provenance bridge helpers on the `_scp_core` module.
+///
+/// Stateful provenance operations (`provenance_attach`) are methods on the
+/// `SCP` class (see the `#[pymethods]` block above) and registered
+/// automatically with the class. Pure helpers
+/// (`evaluate_provenance_quality`, `provenance_check_chain_depth`,
+/// `provenance_redact_counterparties`,
+/// `provenance_pseudonymize_counterparties`,
+/// `provenance_update_source_type`) are module-level `#[pyfunction]`
+/// exports registered here per ADR-048 §1.
 ///
 /// # Errors
 ///
 /// Returns `PyErr` if registration fails.
 pub fn register_provenance(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(py_evaluate_provenance_quality, m)?)?;
-    m.add_function(wrap_pyfunction!(py_provenance_attach, m)?)?;
-    m.add_function(wrap_pyfunction!(py_provenance_check_chain_depth, m)?)?;
-    m.add_function(wrap_pyfunction!(py_provenance_redact_counterparties, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        py_provenance_pseudonymize_counterparties,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(py_provenance_update_source_type, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_provenance_quality, m)?)?;
+    m.add_function(wrap_pyfunction!(provenance_check_chain_depth, m)?)?;
+    m.add_function(wrap_pyfunction!(provenance_redact_counterparties, m)?)?;
+    m.add_function(wrap_pyfunction!(provenance_pseudonymize_counterparties, m)?)?;
+    m.add_function(wrap_pyfunction!(provenance_update_source_type, m)?)?;
     Ok(())
 }
 
@@ -534,18 +549,21 @@ mod tests {
 
     #[test]
     fn check_chain_depth_within_limit() {
-        assert!(py_provenance_check_chain_depth(0, None));
-        assert!(py_provenance_check_chain_depth(8, None)); // default is 8 (ADR-043)
+        pyo3::prepare_freethreaded_python();
+        assert!(provenance_check_chain_depth(0, None));
+        assert!(provenance_check_chain_depth(8, None)); // default is 8 (ADR-043)
     }
 
     #[test]
     fn check_chain_depth_exceeds_limit() {
-        assert!(!py_provenance_check_chain_depth(9, None)); // 9 > default 8
-        assert!(!py_provenance_check_chain_depth(2, Some(1)));
+        pyo3::prepare_freethreaded_python();
+        assert!(!provenance_check_chain_depth(9, None)); // 9 > default 8
+        assert!(!provenance_check_chain_depth(2, Some(1)));
     }
 
     #[test]
     fn redact_counterparties_removes_dids() {
+        pyo3::prepare_freethreaded_python();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -560,7 +578,7 @@ mod tests {
             "payment_adapter": null,
             "payment_receipt_id": null
         });
-        let result = py_provenance_redact_counterparties(&prov_json.to_string()).unwrap();
+        let result = provenance_redact_counterparties(&prov_json.to_string()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["counterparties"], serde_json::json!([]));
         assert_eq!(parsed["source_context"], "ctx-test");
@@ -568,6 +586,7 @@ mod tests {
 
     #[test]
     fn pseudonymize_counterparties_produces_deterministic_pseudonyms() {
+        pyo3::prepare_freethreaded_python();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -584,9 +603,9 @@ mod tests {
         });
         let key_hex = hex::encode(b"test-key");
         let result1 =
-            py_provenance_pseudonymize_counterparties(&prov_json.to_string(), &key_hex).unwrap();
+            provenance_pseudonymize_counterparties(&prov_json.to_string(), &key_hex).unwrap();
         let result2 =
-            py_provenance_pseudonymize_counterparties(&prov_json.to_string(), &key_hex).unwrap();
+            provenance_pseudonymize_counterparties(&prov_json.to_string(), &key_hex).unwrap();
 
         // Deterministic: same input → same output
         assert_eq!(result1, result2);
@@ -599,6 +618,7 @@ mod tests {
 
     #[test]
     fn update_source_type_changes_type() {
+        pyo3::prepare_freethreaded_python();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -614,13 +634,14 @@ mod tests {
             "payment_receipt_id": null
         });
         let result =
-            py_provenance_update_source_type(&prov_json.to_string(), "closed_ephemeral").unwrap();
+            provenance_update_source_type(&prov_json.to_string(), "closed_ephemeral").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["source_type"], "Ephemeral");
     }
 
     #[test]
     fn update_source_type_preserves_on_unknown() {
+        pyo3::prepare_freethreaded_python();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Summary",
@@ -635,18 +656,20 @@ mod tests {
             "payment_adapter": null,
             "payment_receipt_id": null
         });
-        let result = py_provenance_update_source_type(&prov_json.to_string(), "unknown").unwrap();
+        let result = provenance_update_source_type(&prov_json.to_string(), "unknown").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["source_type"], "Summary");
     }
 
     #[test]
     fn redact_counterparties_invalid_json_fails() {
-        assert!(py_provenance_redact_counterparties("not json").is_err());
+        pyo3::prepare_freethreaded_python();
+        assert!(provenance_redact_counterparties("not json").is_err());
     }
 
     #[test]
     fn pseudonymize_counterparties_invalid_hex_fails() {
+        pyo3::prepare_freethreaded_python();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -662,13 +685,13 @@ mod tests {
             "payment_receipt_id": null
         });
         assert!(
-            py_provenance_pseudonymize_counterparties(&prov_json.to_string(), "not-hex-zz")
-                .is_err()
+            provenance_pseudonymize_counterparties(&prov_json.to_string(), "not-hex-zz").is_err()
         );
     }
 
     #[test]
     fn update_source_type_invalid_state_fails() {
+        pyo3::prepare_freethreaded_python();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -683,6 +706,6 @@ mod tests {
             "payment_adapter": null,
             "payment_receipt_id": null
         });
-        assert!(py_provenance_update_source_type(&prov_json.to_string(), "invalid_state").is_err());
+        assert!(provenance_update_source_type(&prov_json.to_string(), "invalid_state").is_err());
     }
 }

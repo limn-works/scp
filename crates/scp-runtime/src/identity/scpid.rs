@@ -107,13 +107,24 @@ pub fn scpid_challenge(audience: &str, ttl: Duration) -> Result<ScpIdChallenge, 
 ///
 /// Constructs the canonical hash specified in §3.11.3 and signs it with the
 /// caller's Ed25519 key via [`KeyCustody`]. The `signed_at` timestamp is set
-/// to the current time in milliseconds.
+/// to the current time in milliseconds, unless `signed_at_override` is
+/// supplied (testing-only; see below).
+///
+/// # Arguments
+///
+/// * `signed_at_override` — When `Some(ts_ms)`, use the provided millisecond
+///   timestamp for `signed_at` instead of `SystemTime::now()`. Intended for
+///   the cross-bridge parity harness (ADR-046) so that two bridges signing
+///   the same challenge with the same seed produce byte-identical
+///   signatures. The override must still fall within the challenge window
+///   `[issued_at, expires_at]`. Pass `None` in production callers.
 ///
 /// # Errors
 ///
 /// Returns [`ScpIdError::ChallengeExpired`] if the challenge has already
 /// expired. Returns [`ScpIdError::InvalidInput`] if the protocol version
-/// is unsupported or the system clock is before the Unix epoch. Returns
+/// is unsupported, the system clock is before the Unix epoch, or the
+/// supplied `signed_at_override` is outside the challenge window. Returns
 /// [`ScpIdError::SigningFailed`] if the custody operation fails.
 pub async fn scpid_sign(
     custody: &impl KeyCustody,
@@ -121,13 +132,16 @@ pub async fn scpid_sign(
     did: &str,
     signing_key_id: SigningKeyId,
     challenge: &ScpIdChallenge,
+    signed_at_override: Option<u64>,
 ) -> Result<ScpIdResponse, ScpIdError> {
     // Reject empty DID (consistent with audience validation in scpid_challenge).
     if did.is_empty() {
         return Err(ScpIdError::InvalidInput("DID must not be empty".to_owned()));
     }
 
-    // Reject expired challenges (fail fast).
+    // Reject expired challenges (fail fast). Real wall-clock is used even
+    // when `signed_at_override` is supplied — we never allow the override
+    // to bypass the challenge-expiry check for wall-clock time.
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| ScpIdError::InvalidInput(format!("system clock error: {e}")))?
@@ -147,7 +161,39 @@ pub async fn scpid_sign(
         )));
     }
 
-    let signed_at = now_ms;
+    // Resolve `signed_at`: use the override if supplied, otherwise the
+    // current wall-clock time. The override must still fall within the
+    // challenge window `[issued_at, expires_at]` to produce a response a
+    // relying-party would accept.
+    //
+    // `signed_at_override` is a parity-harness affordance (ADR-046),
+    // gated behind `feature = "testing"` at the runtime layer so direct
+    // consumers (scp-mcp, scp-node, scp-media, scp-transport, rust-
+    // client scaffolds) cannot supply it in production builds. The FFI
+    // bridges layer their own rejection for defence-in-depth (see
+    // `scp-ffi/src/scpid.rs`, `scp-ffi/napi/src/scpid.rs`,
+    // `scp-ffi/uniffi/src/bridge.rs`, `scp-ffi/wasm/src/scpid.rs`).
+    #[cfg(not(feature = "testing"))]
+    if signed_at_override.is_some() {
+        return Err(ScpIdError::InvalidInput(
+            "signed_at_override requires the scp-runtime `testing` feature — \
+             not available in production builds"
+                .to_owned(),
+        ));
+    }
+    let signed_at = if let Some(override_ms) = signed_at_override {
+        if override_ms < challenge.issued_at || override_ms > challenge.expires_at {
+            return Err(ScpIdError::InvalidInput(format!(
+                "signed_at_override {override_ms} outside challenge window \
+                 [{issued_at}, {expires_at}]",
+                issued_at = challenge.issued_at,
+                expires_at = challenge.expires_at,
+            )));
+        }
+        override_ms
+    } else {
+        now_ms
+    };
 
     // Build canonical hash (§3.11.3):
     //   SHA-256(
@@ -613,6 +659,7 @@ mod tests {
             "did:dht:z6MkTest",
             SigningKeyId::Active,
             &challenge,
+            None,
         )
         .await
         .unwrap();
@@ -666,6 +713,7 @@ mod tests {
             "did:dht:z6MkAgent",
             SigningKeyId::Agent,
             &challenge,
+            None,
         )
         .await
         .unwrap();
@@ -714,12 +762,213 @@ mod tests {
             "did:dht:z6MkTest",
             SigningKeyId::Active,
             &challenge,
+            None,
         )
         .await;
 
         assert!(
             matches!(result, Err(ScpIdError::ChallengeExpired)),
             "expected ChallengeExpired, got: {result:?}"
+        );
+    }
+
+    /// Byte-exact signature determinism under the `signed_at_override`
+    /// testing affordance (ADR-046 parity harness). Two `scpid_sign`
+    /// calls with the same seeded
+    /// custody, same signing-key handle, same DID + challenge, and the
+    /// same override timestamp MUST produce byte-identical signatures.
+    /// Any drift (RNG/timestamp/canonical-hash) breaks cross-bridge
+    /// parity and this test catches it at the scp-runtime layer.
+    #[tokio::test]
+    async fn test_scpid_sign_override_is_byte_deterministic() {
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        // Two fresh custodies with the same seed so `generate_keypair`
+        // returns byte-identical handles + keys across both.
+        let seed = [0x7bu8; 32];
+        let custody_a = InMemoryKeyCustody::from_seed_bytes(seed);
+        let custody_b = InMemoryKeyCustody::from_seed_bytes(seed);
+
+        let _id_a = custody_a
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .unwrap();
+        let active_a = custody_a
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .unwrap();
+        let _id_b = custody_b
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .unwrap();
+        let active_b = custody_b
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .unwrap();
+
+        // Issue a fresh challenge so wall-clock expiry doesn't trip the
+        // expiry check — the `signed_at_override` deliberately does NOT
+        // bypass challenge expiry, only `signed_at` in the canonical
+        // hash. Use a fixed override timestamp inside the window so the
+        // output is still byte-deterministic across the two runs.
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let challenge = ScpIdChallenge {
+            protocol: SCPID_PROTOCOL_VERSION.to_owned(),
+            nonce: [0xAAu8; 32],
+            audience: "https://parity-test.example.com".to_owned(),
+            issued_at: now_ms,
+            expires_at: now_ms + 60_000,
+        };
+        // Pin the override to a stable value within the window so both
+        // sign calls produce byte-identical canonical hashes.
+        let override_ts: u64 = now_ms + 1_000;
+
+        let resp_a = scpid_sign(
+            &custody_a,
+            &active_a,
+            "did:dht:zparitytest",
+            SigningKeyId::Active,
+            &challenge,
+            Some(override_ts),
+        )
+        .await
+        .unwrap();
+
+        let resp_b = scpid_sign(
+            &custody_b,
+            &active_b,
+            "did:dht:zparitytest",
+            SigningKeyId::Active,
+            &challenge,
+            Some(override_ts),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resp_a.signature, resp_b.signature,
+            "scpid_sign must be deterministic under shared seed + override"
+        );
+        assert_eq!(
+            resp_a.signed_at, override_ts,
+            "signed_at must equal the override when supplied"
+        );
+    }
+
+    /// Prints the expected byte-exact SCPID signature for the cross-
+    /// bridge parity harness (ADR-046 op `sign_message`). Run with:
+    ///
+    /// ```sh
+    /// DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") \
+    ///     cargo test -p scp-runtime --lib \
+    ///     identity::scpid::tests::print_parity_sign_golden_value \
+    ///     -- --ignored --nocapture
+    /// ```
+    ///
+    /// The parity harness pins this exact signature — if you change the
+    /// seed, canonical-hash construction, or SCPID key sequence, this
+    /// test is the source of truth for the replacement golden value.
+    ///
+    /// Inputs: `seed = [0x7b; 32]`, DID = `did:dht:zjerxoow…` (derived
+    /// from `seed[0..32]`), `active_key` bytes = `seed[32..64]`,
+    /// `audience = "https://parity-test.example.com"`, `nonce = [0xAA; 32]`,
+    /// `signed_at = 1_700_000_000_000`. Challenge `issued_at` /
+    /// `expires_at` must straddle the override; the harness sets them
+    /// to `override_ts` and `override_ts + 60_000` respectively.
+    #[tokio::test]
+    #[ignore = "golden-value print — run with --ignored --nocapture"]
+    async fn print_parity_sign_golden_value() {
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let seed = [0x7bu8; 32];
+        let custody = InMemoryKeyCustody::from_seed_bytes(seed);
+        let _id = custody
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .unwrap();
+        let active = custody
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .unwrap();
+
+        // Derive the DID from the identity key — this matches the
+        // EXPECTED_SEEDED_DID the parity harness pins.
+        let did = "did:dht:zjerxoow7gsm8suaqfsc86txbreganh7chorzwwh4crbh7imbdhgy";
+        // Use a fixed override timestamp plus a far-future `expires_at`
+        // so (a) the override stays within the challenge window and
+        // (b) `now_ms > expires_at` never trips the expiry check.
+        // Both the parity harness AND this golden-value print must use
+        // identical values — drift between them would break the gate.
+        let override_ts: u64 = 1_700_000_000_000; // pinned SCPID signed_at
+        let challenge = ScpIdChallenge {
+            protocol: SCPID_PROTOCOL_VERSION.to_owned(),
+            nonce: [0xAAu8; 32],
+            audience: "https://parity-test.example.com".to_owned(),
+            issued_at: override_ts,
+            expires_at: 9_999_999_999_000, // year 2286 — effectively never expires
+        };
+        let resp = scpid_sign(
+            &custody,
+            &active,
+            did,
+            SigningKeyId::Active,
+            &challenge,
+            Some(override_ts),
+        )
+        .await
+        .unwrap();
+        println!(
+            "EXPECTED_SEEDED_SIGNATURE_HEX = \"{}\"",
+            hex::encode(resp.signature)
+        );
+    }
+
+    /// Override outside the challenge window is rejected to prevent the
+    /// parity affordance from being weaponised as a way to forge
+    /// out-of-window responses.
+    #[tokio::test]
+    async fn test_scpid_sign_override_rejects_out_of_window() {
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = InMemoryKeyCustody::new();
+        let handle = custody
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(1)).unwrap();
+
+        let too_early = scpid_sign(
+            &custody,
+            &handle,
+            "did:dht:zfoo",
+            SigningKeyId::Active,
+            &challenge,
+            Some(challenge.issued_at.saturating_sub(1)),
+        )
+        .await;
+        assert!(
+            matches!(too_early, Err(ScpIdError::InvalidInput(ref m)) if m.contains("outside challenge window")),
+            "override before issued_at must be rejected, got: {too_early:?}"
+        );
+
+        let too_late = scpid_sign(
+            &custody,
+            &handle,
+            "did:dht:zfoo",
+            SigningKeyId::Active,
+            &challenge,
+            Some(challenge.expires_at + 1),
+        )
+        .await;
+        assert!(
+            matches!(too_late, Err(ScpIdError::InvalidInput(ref m)) if m.contains("outside challenge window")),
+            "override after expires_at must be rejected, got: {too_late:?}"
         );
     }
 
@@ -732,7 +981,15 @@ mod tests {
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let challenge = scpid_challenge("https://example.com", Duration::from_mins(1)).unwrap();
 
-        let result = scpid_sign(&custody, &handle, "", SigningKeyId::Active, &challenge).await;
+        let result = scpid_sign(
+            &custody,
+            &handle,
+            "",
+            SigningKeyId::Active,
+            &challenge,
+            None,
+        )
+        .await;
         assert!(
             matches!(result, Err(ScpIdError::InvalidInput(ref msg)) if msg.contains("DID must not be empty")),
             "expected InvalidInput with empty DID message, got: {result:?}"
@@ -817,7 +1074,7 @@ mod tests {
         let pubkey = custody.public_key(&handle).await.unwrap();
         let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
 
-        let response = scpid_sign(&custody, &handle, did, signing_key_id, challenge)
+        let response = scpid_sign(&custody, &handle, did, signing_key_id, challenge, None)
             .await
             .unwrap();
 
@@ -992,11 +1249,21 @@ mod tests {
         let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (response, _doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
-        // Build a DID document with a different key in the #active slot.
+        // Build a DID document with a DIFFERENT but VALID Ed25519
+        // public key in the #active slot. `decode_multibase_key`
+        // enforces curve-point validity, so the wrong key must still
+        // decompress — otherwise the test trips that gate instead of
+        // exercising the signature-mismatch path it's named for.
+        let wrong_identity_pk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes();
+        let wrong_active_pk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes();
         let wrong_doc = scp_identity::document::DidDocument::new_with_agent_key(
             did,
-            &[0u8; 32],
-            &[99u8; 32], // different key — verification will fail
+            &wrong_identity_pk,
+            &wrong_active_pk,
             &[0u8; 32],
             None,
         );

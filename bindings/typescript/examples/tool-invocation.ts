@@ -1,32 +1,38 @@
 /**
  * Tool invocation demo.
  *
- * Starts an in-memory relay, creates an identity, creates a context
- * with tool capabilities, registers a tool with test vectors, mints a
- * UCAN token, invokes the tool with authorization, and verifies the
- * result.
+ * Starts an in-memory relay via the caller-owned `SCP`, creates an
+ * identity, creates a context with tool capabilities, registers a tool
+ * with test vectors, mints a UCAN token, invokes the tool with
+ * authorization, and reports the result.
+ *
+ * Post-Phase-4 (ADR-048): all bridge operations route through an
+ * explicit `SCP` instance. The free-function `mintUcan` and the static
+ * `Relay.startInMemory()` factory were removed — use
+ * `scp.relayStartInMemory()` and `scp.ucanMint(...)`.
  *
  * Run: bun run examples/tool-invocation.ts
  */
 
-import { connectLocalTransport, Context, Identity, Relay, mintUcan } from "@limn-works/scp-ts";
-import type { ToolDefinition } from "@limn-works/scp-ts";
+import { SCP, type ToolDefinition, type UcanToken, defineToolDefinition } from "../src/index";
 
 async function main(): Promise<void> {
-  // 1. Start an in-memory relay
-  const relay = await Relay.startInMemory();
+  const scp = new SCP();
+  let relay: Awaited<ReturnType<SCP["relayStartInMemory"]>> | null = null;
   try {
+    // 1. Start an in-memory relay.
+    relay = await scp.relayStartInMemory();
     console.log(`Relay listening at ${relay.relayUrl}`);
 
-    // 1b. Connect transport to the relay
-    await connectLocalTransport(relay.relayUrl);
-
-    // 2. Create an identity
-    const identity = await Identity.create({ custody: "in_memory" });
+    // 2. Create an identity.
+    const identity = await scp.identityCreate("in_memory");
     console.log(`Identity DID: ${identity.did}`);
 
-    // 3. Define a tool with test vectors
-    const weatherTool: ToolDefinition = {
+    // 3. Wire the bridge's transport to the relay.
+    await scp.configureRelayTransport(relay.relayUrl, identity.did);
+
+    // 4. Define a tool with test vectors.
+    const weatherTool: ToolDefinition = defineToolDefinition({
       name: "weather",
       description: "Get current weather for a city",
       inputSchema: {
@@ -49,49 +55,54 @@ async function main(): Promise<void> {
           description: "Berlin weather lookup",
         },
       ],
-    };
-
-    // 4. Create a context with tool capabilities
-    const ctx = await Context.create(identity, {
-      ceiling: [
-        "messages:read",
-        "messages:write",
-        "tool:invoke:*",
-        "tool:register",
-      ],
-      memoryScope: "ephemeral",
-      governance: "single_admin",
     });
+
+    // 5. Create a context with tool capabilities.
+    const ctx = await scp.contextCreate(
+      identity,
+      JSON.stringify({
+        ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
+        memoryScope: "ephemeral",
+        governance: "single_admin",
+      }),
+    );
     console.log(`Context created: ${ctx.contextId}`);
 
-    // 5. Register the tool
-    const toolId = await ctx.registerTool(weatherTool);
+    // 6. Register the tool.
+    const toolId = await scp.toolRegister(ctx._rawHandle, weatherTool);
     console.log(`Registered tool: ${toolId}`);
 
-    // 6. Mint a UCAN token for tool invocation
-    const ucan = await mintUcan(ctx, identity.did, ["tool_invoke:*"]);
+    // 7. Mint a UCAN token for tool invocation.
+    const ucan = (await scp.ucanMint(ctx._rawHandle, identity.did, ["tool_invoke:*"])) as UcanToken;
     console.log(`UCAN minted: ${ucan.id}`);
 
-    // 7. Invoke the tool with the UCAN token
+    // 8. Invoke the tool with the UCAN token.
     try {
-      const result = await ctx.invokeTool(
+      const result = await scp.toolInvoke(
+        ctx._rawHandle,
         "weather",
-        { city: "Berlin" },
-        identity,
-        ucan.id,
+        JSON.stringify({ city: "Berlin" }),
+        identity.did,
+        ucan.encoded,
       );
       console.log("Weather result:", result);
     } catch (err) {
       console.log("Tool invocation result:", err);
     }
 
-    // 8. Cleanup
-    await ctx.close();
+    // 9. Cleanup.
+    await scp.contextClose(ctx._rawHandle, identity.did);
     console.log("Context closed");
   } finally {
-    await relay.shutdown();
+    if (relay !== null) {
+      await relay.shutdown();
+    }
+    await scp.shutdown(5);
     console.log("Demo complete");
   }
 }
 
-main().catch(console.error);
+main().catch((error: unknown) => {
+  console.error("Demo failed:", error);
+  process.exit(1);
+});

@@ -1,0 +1,21 @@
+# scripts/pure-helpers-allowlist.txt
+#
+# ADR-048 §1 mechanization escape hatch — see PR-E #28
+# (`.claude/plans/cozy-fluttering-rose.md`) and the
+# `pure_helpers_stay_free_fns_at_ffi_layer` test in
+# `crates/scp-testing/tests/integration/ffi_conformance.rs`.
+#
+# One entry per line: workspace-relative file path, then `::`, then fn name.
+# E.g.:
+#
+#     crates/scp-ffi/napi/src/runtime.rs::with_state
+#
+# Blank lines and lines beginning with `#` are ignored. The path qualifier
+# is mandatory — a bare fn name would silently exempt same-named fns in
+# other bridges, which is exactly the cross-bridge confusion this gate is
+# meant to surface.
+#
+# Adding an entry requires a documented reason. The gate's default policy
+# is FAIL, not allow. Use this file only when the §1 rule does not fit
+# (e.g., a method that must satisfy a trait's `&self` signature for cross-
+# bridge composability but happens not to dereference `self`).

@@ -237,7 +237,7 @@ mod tests {
     use scp_identity::cache::{DidCache, SystemClock};
     use scp_identity::dht_client::InMemoryDhtClient;
 
-    use scp_platform::testing::InMemoryKeyCustody;
+    use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
     /// Helper: creates a `DidDht` instance with signing capability for tests.
     fn create_test_dht(custody: &Arc<InMemoryKeyCustody>) -> DidDht<InMemoryDhtClient> {
@@ -456,10 +456,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_contexts_from_did_finds_published_contexts() {
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let did_dht = create_test_dht(&custody);
 
         // Create identity.
-        let (identity, mut document) = did_dht.create(&*custody).await.unwrap();
+        let (identity, mut document, _pre_rotation_handle) = did_dht
+            .create(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
 
         // Publish a broadcast context.
         document.add_broadcast_context_service(
@@ -490,10 +494,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_contexts_from_did_no_broadcast_contexts() {
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let did_dht = create_test_dht(&custody);
 
         // Create identity without broadcast contexts.
-        let (identity, document) = did_dht.create(&*custody).await.unwrap();
+        let (identity, document, _pre_rotation_handle) = did_dht
+            .create(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
         did_dht.publish(&identity, &document).await.unwrap();
 
         let results = resolve_contexts_from_did(&identity.did, &did_dht)
@@ -517,9 +525,13 @@ mod tests {
     #[tokio::test]
     async fn resolve_contexts_from_did_multiple_contexts() {
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let did_dht = create_test_dht(&custody);
 
-        let (identity, mut document) = did_dht.create(&*custody).await.unwrap();
+        let (identity, mut document, _pre_rotation_handle) = did_dht
+            .create(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
 
         document.add_broadcast_context_service(
             "context1",

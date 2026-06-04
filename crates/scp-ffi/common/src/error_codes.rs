@@ -57,6 +57,28 @@ pub const IDENT_1011: &str = "SCP-IDENT-1011";
 pub const IDENT_1012: &str = "SCP-IDENT-1012";
 /// `UniFFI` identity passphrase error.
 pub const IDENT_1013: &str = "SCP-IDENT-1013";
+/// DID method or format invalid.
+///
+/// Distinct from `IDENT_1004` (key generation failure) which is a
+/// runtime / cryptographic error category. `IDENT_1014` is for
+/// input-validation failures: unsupported DID method prefix, invalid
+/// `z`-base-32 payload, non-canonical multibase encoding, payload
+/// length wrong for the declared key type, or decoded bytes that fail
+/// curve-point validation.
+pub const IDENT_1014: &str = "SCP-IDENT-1014";
+/// Device attestation feature unavailable.
+///
+/// Surfaced by the Python SDK shim when the `PyO3` extension was built
+/// without the `allow_in_memory_custody` feature: the `identity_attest_device`
+/// method is not exposed on the native bridge.
+pub const IDENT_1015: &str = "SCP-IDENT-1015";
+/// Device attestation verification feature unavailable.
+///
+/// Surfaced by the Python SDK shim when the `PyO3` extension was built
+/// without the `allow_in_memory_custody` feature: the
+/// `identity_verify_device_attestation` method is not exposed on the
+/// native bridge.
+pub const IDENT_1016: &str = "SCP-IDENT-1016";
 /// Identity agent key creation.
 pub const IDENT_1020: &str = "SCP-IDENT-1020";
 /// Identity DID document error.
@@ -103,6 +125,56 @@ pub const IDENT_1043: &str = "SCP-IDENT-1043";
 pub const IDENT_1044: &str = "SCP-IDENT-1044";
 /// Identity attestation list.
 pub const IDENT_1045: &str = "SCP-IDENT-1045";
+/// SCPID unbound closure invoked directly.
+///
+/// Construct an SCP-backed closure via `SCP.scpidSign` /
+/// `SCP.scpidChallenge` / `SCP.scpidVerify`. Only surfaced by the Swift
+/// SDK's `ScpId.unboundSign` / `unboundChallenge` / `unboundVerify`
+/// stubs when a caller invokes them directly instead of passing an
+/// `SCP`-bound closure.
+pub const IDENT_1046: &str = "SCP-IDENT-1046";
+
+// -----------------------------------------------------------------------
+// Pre-rotation custody errors (one code per PreRotationCustodyError variant)
+//
+// Surfaced when `IdentityError::PreRotation(_)` crosses the FFI boundary.
+// SDK consumers can match on `.code` to distinguish a missing handle from
+// a substrate-unavailable backend, a user-declined biometric, an internal
+// storage error, a callback malformation, or a commitment-integrity
+// failure — without string-matching the message body.
+// -----------------------------------------------------------------------
+
+/// Pre-rotation custody handle not found in the backing store.
+pub const IDENT_1047: &str = "SCP-IDENT-1047";
+/// Pre-rotation custody substrate temporarily unavailable
+/// (hardware not connected, network unreachable, etc.).
+pub const IDENT_1048: &str = "SCP-IDENT-1048";
+/// Pre-rotation custody operation declined by user (biometric refusal,
+/// passkey cancellation, etc.).
+pub const IDENT_1049: &str = "SCP-IDENT-1049";
+/// Pre-rotation custody internal storage error.
+pub const IDENT_1050: &str = "SCP-IDENT-1050";
+/// Pre-rotation custody callback returned an invalid response
+/// (malformed handle, length mismatch, schema violation, etc.).
+pub const IDENT_1051: &str = "SCP-IDENT-1051";
+/// Pre-rotation custody commitment-integrity failure: revealed public key
+/// did not match the stored commitment. Indicates a substrate-level
+/// tampering or corruption event.
+pub const IDENT_1052: &str = "SCP-IDENT-1052";
+
+/// `DidDht::migrate_identity` partial-publish failure.
+///
+/// Surfaced when one of `migrate_identity`'s two DHT publishes (step 7
+/// publish-new or step 8 republish-old-with-alsoKnownAs) fails AFTER the
+/// irreversible cold-custody mutation in step 5
+/// (`PreRotationCustody::destroy_after_migration`). The caller cannot
+/// recover by re-invoking `migrate_identity` — the OLD pre-rotation
+/// handle is gone. The Rust core returns
+/// `IdentityError::MigrationPublishFailed` carrying a typed
+/// `MigrationPartialState` recovery handle; the structured FFI surface
+/// for that handle is added in subsequent PRs (per ADR-048 §7 per-SDK
+/// idiom). Phase-1 surface is JUST this code + the error message body.
+pub const IDENT_1053: &str = "SCP-IDENT-1053";
 
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
@@ -504,7 +576,32 @@ pub const VALID_7005: &str = "SCP-VALID-7005";
 /// Validation type error.
 pub const VALID_7006: &str = "SCP-VALID-7006";
 /// Validation format error.
+///
+/// Used for malformed or wrong-shape byte input at the FFI boundary —
+/// e.g. a parity-harness `testing_seed` that is not exactly 32 bytes,
+/// or a `signed_at_override` `BigInt` that cannot be represented
+/// losslessly as a `u64`. Enum-like string mismatches (unknown custody
+/// type, unknown transport mode) use `VALID_7005` (invalid field
+/// value) instead.
 pub const VALID_7007: &str = "SCP-VALID-7007";
+/// Testing-only feature requires the `testing` feature flag.
+///
+/// Returned by FFI entry points when a caller supplies a parity-harness
+/// affordance (`testing_seed` on `identity_create`, `signed_at_override`
+/// on `scpid_sign`) in a build that was NOT compiled with the `testing`
+/// feature enabled. These are ADR-046 cross-bridge parity-harness
+/// inputs, not production APIs — production bundles reject them with
+/// this code.
+pub const VALID_7008: &str = "SCP-VALID-7008";
+/// Seed requires `InMemoryKeyCustody`.
+///
+/// Returned when a caller passes a deterministic parity-harness `seed`
+/// together with a custody type other than `"in_memory"`. Seeded
+/// determinism is only meaningful for the in-process `InMemoryKeyCustody`
+/// backend — platform/software/file custody all produce keys outside the
+/// seeded RNG, so accepting a seed with them would silently lie about
+/// reproducibility.
+pub const VALID_7009: &str = "SCP-VALID-7009";
 /// UCAN token validation error.
 pub const VALID_7010: &str = "SCP-VALID-7010";
 /// UCAN mint validation error.
@@ -623,6 +720,10 @@ pub const VALID_7112: &str = "SCP-VALID-7112";
 pub const VALID_7113: &str = "SCP-VALID-7113";
 /// Handle/petname address validation error.
 pub const VALID_7114: &str = "SCP-VALID-7114";
+/// Petname event JSON deserialization error (malformed `PetnameEvent`).
+pub const VALID_7115: &str = "SCP-VALID-7115";
+/// Petname count exceeds `u32::MAX` and cannot be represented at the FFI boundary.
+pub const VALID_7116: &str = "SCP-VALID-7116";
 /// Handle registry lock error.
 pub const VALID_7120: &str = "SCP-VALID-7120";
 /// Handle registry operation error.
@@ -647,6 +748,12 @@ pub const VALID_7133: &str = "SCP-VALID-7133";
 pub const VALID_7134: &str = "SCP-VALID-7134";
 /// Address resolution ambiguous error.
 pub const VALID_7135: &str = "SCP-VALID-7135";
+/// Recovery or custody-migration concurrency cap reached.
+///
+/// The NAPI bridge bounds concurrent `block_on` invocations to prevent libuv
+/// worker-pool exhaustion (RED-PR5-002 / BLACK-PR5-002). Caller should back
+/// off and retry.
+pub const VALID_7140: &str = "SCP-VALID-7140";
 /// Governance vote validation error.
 pub const VALID_7216: &str = "SCP-VALID-7216";
 /// Media validation error.

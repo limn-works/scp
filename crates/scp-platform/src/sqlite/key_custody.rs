@@ -502,6 +502,39 @@ impl KeyCustody for SqliteKeyCustody {
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::Software
     }
+
+    fn generate_ephemeral_ed25519_seed(
+        &self,
+    ) -> impl Future<Output = Result<Zeroizing<[u8; 32]>, PlatformError>> + Send {
+        async move {
+            // Software custody: draw 32 bytes from OsRng. The bytes are
+            // returned to the caller in a Zeroizing wrapper and never
+            // persisted in this custody — the caller hands them to a
+            // `PreRotationCustody` per spec §9.7.4.1 §1, §5(f).
+            let mut seed = Zeroizing::new([0u8; 32]);
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, seed.as_mut());
+            Ok(seed)
+        }
+    }
+
+    fn import_ed25519_signing_key(
+        &self,
+        seed: &Zeroizing<[u8; 32]>,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        async move {
+            let handle = self.next_handle().await?;
+            let key_bytes = Zeroizing::new(**seed);
+            self.persist_key(handle.id(), &key_bytes, KEY_TYPE_ED25519)
+                .await?;
+
+            let mut store = self.store.lock().await;
+            let signing_key = SigningKey::from_bytes(&key_bytes);
+            store.ed25519_keys.insert(handle.id(), signing_key);
+            store.key_types.insert(handle.id(), KEY_TYPE_ED25519);
+
+            Ok(handle)
+        }
+    }
 }
 
 #[cfg(test)]

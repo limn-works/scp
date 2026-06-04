@@ -8,48 +8,43 @@ import XCTest
 // 1. Accepts `SCP.withStorage(sqliteDir:key:)` and forwards to UniFFI
 //    `Scp.withStorage(config: .sqlite(path:, key:))` without raising.
 // 2. Creates the SQLCipher database file at `{sqliteDir}/scp.db` as
-//    a side effect of construction — see
-//    `crates/scp-ffi/uniffi/src/runtime.rs::with_storage_uniffi`.
+//    a side effect of construction.
 // 3. Drives the full `suspend() → async resume() → async shutdown()`
 //    lifecycle on a SQLite-backed instance without error.
 // 4. Is reconstructible against the SAME SQLite directory + key — the
 //    reopened instance must open the encrypted database again without
 //    re-deriving a fresh key.
 //
-// The wrapper surface is all this smoke test is responsible for. The
-// end-to-end `identity_create → context_create → context_send → suspend
-// → restore` path is exercised at the Rust integration layer
-// (`crates/scp-testing/tests/integration/persistence_sdk.rs`) because
-// the Swift `SCP` class does not yet surface context methods — the
-// free-function façade (`contextCreate`, etc.) routes to the
-// process-global default instance, not to a caller-owned `SCP` handle,
-// and that migration is in #1549 PR 4+.
+// Each test owns a fresh temporary directory via setUp/tearDown so the
+// suite is hermetic and can be run in parallel.
 
 final class PersistenceTests: XCTestCase {
-    /// Stable 32-byte SQLCipher key. The specific value does not matter;
-    /// only that the same key is reused across the two constructions
-    /// that simulate process restart.
+    /// Stable 32-byte SQLCipher key for this suite.
     private let sqliteKey = Data(repeating: 0x42, count: 32)
 
-    /// Allocates a fresh temporary directory for this test.
-    private func makeTempDir() throws -> URL {
-        let dir = FileManager.default
+    // Temp directory allocated fresh in `setUp`.
+    // swiftlint:disable:next implicitly_unwrapped_optional
+    private var dir: URL!
+
+    override func setUp() {
+        super.setUp()
+        dir = FileManager.default
             .temporaryDirectory
             .appendingPathComponent("scp-persistence-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
 
-    private func removeTempDir(_ dir: URL) {
-        try? FileManager.default.removeItem(at: dir)
+    override func tearDown() async throws {
+        if let dir {
+            try? FileManager.default.removeItem(at: dir)
+        }
+        dir = nil
+        try await super.tearDown()
     }
 
     /// `SCP.withStorage(sqliteDir:key:)` must open/create the SQLCipher
     /// database on disk.
     func testSqliteConstructionCreatesDatabaseFile() async throws {
-        let dir = try makeTempDir()
-        defer { removeTempDir(dir) }
-
         let dbPath = dir.appendingPathComponent("scp.db")
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: dbPath.path),
@@ -68,9 +63,6 @@ final class PersistenceTests: XCTestCase {
     /// suspend → async resume → async shutdown roundtrip on a SQLite-
     /// backed instance.
     func testSqliteLifecycleRoundtrip() async throws {
-        let dir = try makeTempDir()
-        defer { removeTempDir(dir) }
-
         let scp = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try scp.suspend()
         try await scp.resume()
@@ -78,12 +70,8 @@ final class PersistenceTests: XCTestCase {
     }
 
     /// A second `SCP.withStorage(sqliteDir:key:)` against the same path
-    /// + key must succeed — that is the restart property #1549 PR 3
-    /// delivers at the SDK surface.
+    /// + key must succeed — the restart property at the SDK surface.
     func testSqliteReopenWithSamePathAndKeySucceeds() async throws {
-        let dir = try makeTempDir()
-        defer { removeTempDir(dir) }
-
         let scp1 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         let id1 = scp1.instanceId
         try await scp1.shutdown(timeout: 1)
@@ -98,29 +86,31 @@ final class PersistenceTests: XCTestCase {
         try await scp2.shutdown(timeout: 1)
     }
 
-    /// FAIL CLOSED (spec §17.6): opening an existing encrypted DB with a
-    /// wrong key must throw — never silently fall back to a fresh in-memory
-    /// instance — and must not corrupt the original DB (a subsequent
-    /// correct-key open still works).
-    func testSqliteWrongKeyFailsClosedWithoutCorruption() async throws {
-        let dir = try makeTempDir()
-        defer { removeTempDir(dir) }
-
+    /// Construction with a wrong key must surface a validation error
+    /// (SCP-VALID-7005) rather than silently succeeding with an empty
+    /// in-memory instance — guards against silent downgrade where the
+    /// caller would lose access to persisted state. The `UniFFI` bridge
+    /// surfaces the `SQLCipher` key-mismatch as `ScpError` rather than
+    /// falling back to in-memory. The original encrypted DB must survive
+    /// the failed attempt so a subsequent correct-key open still works.
+    func testSqliteRejectsMismatchedKeyWithoutCorruption() async throws {
         // First open with the correct key — creates the encrypted DB.
         let scp1 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try await scp1.shutdown(timeout: 1)
 
-        // Second open with a wrong key must FAIL CLOSED (throw).
+        // Second open with a wrong key MUST throw — `SqliteStorage::new`
+        // fails at the `PRAGMA key` / WAL-mode step because `SQLCipher`
+        // rejects the key as "file is not a database". The `UniFFI`
+        // bridge propagates that through `ScpError::Validation`.
         let wrongKey = Data(repeating: 0x11, count: 32)
-        do {
-            let scp2 = try SCP.withStorage(sqliteDir: dir, key: wrongKey)
-            try await scp2.shutdown(timeout: 1)
-            XCTFail("wrong-key open must fail closed, not silently fall back")
-        } catch {
-            // Expected: fail closed.
-        }
+        XCTAssertThrowsError(
+            try SCP.withStorage(sqliteDir: dir, key: wrongKey),
+            "mismatched-key construction must throw, not silently fall back"
+        )
 
-        // Third open with the correct key — must still succeed (no corruption).
+        // Third open with the correct key — must still succeed, proving
+        // the failed mismatched-key attempt did not corrupt or truncate
+        // the encrypted database file.
         let scp3 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try await scp3.shutdown(timeout: 1)
     }
@@ -129,9 +119,6 @@ final class PersistenceTests: XCTestCase {
     /// database whose key is derived from a passphrase (Argon2id; spec §17.6),
     /// and reopen the SAME database with the same passphrase across restart.
     func testSqlitePassphraseRoundTrip() async throws {
-        let dir = try makeTempDir()
-        defer { removeTempDir(dir) }
-
         let dbPath = dir.appendingPathComponent("scp.db")
         let scp1 = try SCP.withStorage(
             sqliteDir: dir, passphrase: "correct horse battery staple"
@@ -154,9 +141,6 @@ final class PersistenceTests: XCTestCase {
     /// FAIL CLOSED (spec §17.6): reopening a passphrase-protected DB with the
     /// WRONG passphrase must throw — never silently open a fresh DB.
     func testSqliteWrongPassphraseFailsClosed() async throws {
-        let dir = try makeTempDir()
-        defer { removeTempDir(dir) }
-
         let scp1 = try SCP.withStorage(sqliteDir: dir, passphrase: "the-right-one")
         try await scp1.shutdown(timeout: 1)
 

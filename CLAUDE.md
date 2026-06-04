@@ -107,9 +107,17 @@ If any cell is empty, the plan is incomplete — expand scope or file dependent 
 **NEVER modify enforcement files to bypass failures.**
 Files: pipeline_wiring.rs, ffi_conformance.rs, sdk-capability-matrix.json,
 check-cross-layer.sh, check-protocol-deps.sh, check-protocol-sync.py,
-check-no-bridge-globals.sh, check-no-default-in-tests.sh,
-check-no-fallback-registry.sh, check-handle-affinity.sh,
+check-no-bridge-globals.sh, check-no-fallback-registry.sh,
+check-handle-affinity.sh, check_ready_coverage.rs (per-instance handle
+affinity enforcement), check-no-mutable-globals.sh,
+check-no-mutable-module-globals.py, check-no-ts-mutable-globals.sh,
+check-no-kotlin-mutable-globals.sh,
+bindings/swift/.swiftlint.yml (no_static_var / no_static_lazy_var rules),
+check-bridge-symmetry.sh, bridge-aliases.json, check-call-invariants.py,
+call-invariants-baseline.json,
+check-pure-helpers.sh, pure-helpers-allowlist.txt,
 bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
+pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 If a check fails, fix the code. The only legitimate modifications are:
 - Adding NEW assertions/operations (expanding coverage)

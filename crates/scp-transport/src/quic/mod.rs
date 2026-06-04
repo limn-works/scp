@@ -32,6 +32,15 @@ pub mod lifecycle;
 pub mod listener;
 pub mod streams;
 
+/// Reusable QUIC test harness (in-process listener + matching client).
+///
+/// `#[doc(hidden)]` test scaffolding shared between the in-crate adapter tests
+/// and the out-of-crate conformance/migration integration tests. Not part of
+/// the supported public API. See the module docs for the rationale on why it
+/// lives in `src/` rather than a `tests/` module.
+#[doc(hidden)]
+pub mod test_support;
+
 pub use adapter::QuicAdapter;
 pub use lifecycle::{
     ConnectionMigrationEvent, QuicKeepaliveConfig, QuicLifecycleManager, ReconnectBackoff,

@@ -53,10 +53,10 @@ CI build that fails if any Cat A / Cat B export lacks a gate pattern.
 | 35 | 6319 | `mcp_client_disconnect` | C | n/a |
 | 36 | 6351 | `mcp_client_list_tools` | C | n/a |
 | 37 | 6405 | `mcp_client_invoke` | C | n/a |
-| 38 | 6472 | `mcp_configure_stdio_allowlist` | C | n/a |
-| 39 | 6486 | `mcp_disable_stdio_allowlist` | C | n/a |
-| 40 | 6500 | `mcp_reset_stdio_allowlist` | C | n/a |
-| 41 | 6515 | `mcp_get_stdio_allowlist` | C | n/a |
+| 38 | — | `mcp_configure_stdio_allowlist` | impl method on `Scp` (was free fn — migrated to per-instance, see PR #1725) | B (touches `CoreFields::mcp_allowlist`) | no — allowlist mutation must work on suspended instances for operator pre-config |
+| 39 | — | `mcp_disable_stdio_allowlist` | impl method on `Scp` (was free fn — migrated, PR #1725) | B | no (same as above) |
+| 40 | — | `mcp_reset_stdio_allowlist` | impl method on `Scp` (was free fn — migrated, PR #1725) | B | no (same as above) |
+| 41 | — | `mcp_get_stdio_allowlist` | impl method on `Scp` (was free fn — migrated, PR #1725) | B (read-only on `CoreFields::mcp_allowlist`) | no |
 | 42 | 6553 | `ucan_validate` | C | n/a |
 | 43 | 6697 | `ucan_mint` | C | n/a |
 | 44 | 6839 | `ucan_revoke` | C | n/a |

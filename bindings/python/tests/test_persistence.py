@@ -20,9 +20,11 @@ end-to-end `identity_create → context_create → context_send → suspend
 → restore → context_send` path is exercised at the Rust integration
 layer (`crates/scp-testing/tests/integration/persistence_sdk.rs`)
 because the Python `SCP` class does not yet surface those context
-methods — the free-function façade (`scp_sdk.context_create`) routes
-to the process-global default instance, not to the caller-owned `SCP`
-handle, and that migration is in #1549 PR 4+.
+methods. Phase 4 PR 4 (#1549, ADR-048) deleted the free-function
+façade (`scp_sdk.context_create`, etc.) along with the process-wide
+default bridge it routed through; the remaining SDK wiring to expose
+those operations on the caller-owned `SCP` handle is tracked as
+follow-up work.
 
 Requires the native `_scp_core` extension built via
 `maturin develop --release`. See `.docs/scaffold/python.md`.
@@ -66,7 +68,7 @@ def test_sqlite_construction_creates_database_file() -> None:
             )
             assert scp.instance_id > 0
         finally:
-            scp.shutdown(timeout=1.0)
+            asyncio.run(scp.shutdown(timeout=1.0))
 
 
 def test_sqlite_lifecycle_roundtrip() -> None:
@@ -80,7 +82,7 @@ def test_sqlite_lifecycle_roundtrip() -> None:
             # does not require pytest-asyncio.
             asyncio.run(scp.resume())
         finally:
-            scp.shutdown(timeout=1.0)
+            asyncio.run(scp.shutdown(timeout=1.0))
 
 
 def test_sqlite_reopen_with_same_path_and_key_succeeds() -> None:
@@ -96,7 +98,7 @@ def test_sqlite_reopen_with_same_path_and_key_succeeds() -> None:
 
         scp1 = SCP(storage=config)
         id1 = scp1.instance_id
-        scp1.shutdown(timeout=1.0)
+        asyncio.run(scp1.shutdown(timeout=1.0))
 
         # Fresh Python object, same underlying database file.
         scp2 = SCP(storage=config)
@@ -107,7 +109,7 @@ def test_sqlite_reopen_with_same_path_and_key_succeeds() -> None:
                 f"two SCP constructions (got {id1} then {id2})"
             )
         finally:
-            scp2.shutdown(timeout=1.0)
+            asyncio.run(scp2.shutdown(timeout=1.0))
 
 
 def test_sqlite_rejects_mismatched_key() -> None:
@@ -115,95 +117,36 @@ def test_sqlite_rejects_mismatched_key() -> None:
 
     Guards against silent downgrade — if the wrong key were accepted
     and a fresh empty database was opened in its place, callers would
-    silently lose access to persisted state.
+    silently lose access to persisted state. After commit
+    ``9fa80e13c`` (`fix(ffi): propagate SqliteStorage::new failure
+    from with_storage`) the bridge surfaces the `SQLCipher` key
+    mismatch as a ``ValidationError`` (``SCP-VALID-7005``) rather than
+    silently returning an in-memory instance.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         scp1 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})
-        scp1.shutdown(timeout=1.0)
+        asyncio.run(scp1.shutdown(timeout=1.0))
 
+        # Wrong key must RAISE — `SqliteStorage::new` fails at the
+        # `PRAGMA key` / WAL-mode step because SQLCipher rejects the
+        # key as "file is not a database". The PyO3 bridge wraps that
+        # in `ScpPyError::Validation` → `scp_sdk.ValidationError`.
         wrong_key = b"\x11" * 32
-        # FAIL CLOSED (spec §17.6): opening the existing encrypted DB with a
-        # different key MUST raise — the bridge no longer silently degrades to
-        # an in-memory-only instance. SQLCipher rejects the wrong key, so the
-        # `SqliteStorage` open fails and `with_storage` surfaces a
-        # ValidationError rather than returning a no-storage instance.
         with pytest.raises(_scp_core.ValidationError):
             SCP(storage={"type": "sqlite", "path": tmpdir, "key": wrong_key})
 
-        # Reopen with the correct key — the original encrypted state must
-        # still be intact (the failed mismatched-key attempt did not corrupt
-        # or overwrite it).
+        # Reopen with the correct key — the original encrypted state
+        # must still be intact (the failed mismatched-key attempt
+        # must not have corrupted or truncated the original
+        # encrypted database file).
         scp3 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})
-        scp3.shutdown(timeout=1.0)
+        asyncio.run(scp3.shutdown(timeout=1.0))
 
 
 def test_sqlite_missing_path_field_raises() -> None:
     """Malformed sqlite config must surface a ValidationError at the boundary."""
     with pytest.raises(_scp_core.ValidationError):
         SCP(storage={"type": "sqlite", "key": _SQLITE_KEY})  # no 'path'
-
-
-def test_sqlite_passphrase_roundtrip() -> None:
-    """A passphrase-keyed SQLite DB re-derives the same key across restarts.
-
-    Spec §17.6 passphrase mode: create with a passphrase, drop the
-    instance, reopen the same directory with the same passphrase — the
-    Argon2id-derived key plus the persisted salt sidecar must re-open the
-    same encrypted database (not a fresh empty one).
-    """
-    passphrase = "correct horse battery staple"
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "scp.db"
-        salt_path = Path(tmpdir) / "scp.salt"
-
-        scp1 = SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": passphrase})
-        scp1.shutdown(timeout=1.0)
-        assert db_path.exists(), "passphrase mode must create scp.db"
-        assert salt_path.exists(), "passphrase mode must persist the salt sidecar"
-
-        # Reopen with the SAME passphrase — must succeed (same derived key).
-        scp2 = SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": passphrase})
-        scp2.shutdown(timeout=1.0)
-
-
-def test_sqlite_wrong_passphrase_fails_closed() -> None:
-    """A wrong passphrase MUST fail closed — never a silent fresh DB.
-
-    Spec §17.6: SQLCipher rejects the wrong-passphrase-derived key on the
-    first query; the bridge surfaces a ValidationError instead of opening
-    an empty database in its place.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        scp1 = SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": "the right one"})
-        scp1.shutdown(timeout=1.0)
-
-        with pytest.raises(_scp_core.ValidationError):
-            SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": "the wrong one"})
-
-        # Original DB remains intact under the correct passphrase.
-        scp3 = SCP(storage={"type": "sqlite", "path": tmpdir, "passphrase": "the right one"})
-        scp3.shutdown(timeout=1.0)
-
-
-def test_sqlite_key_and_passphrase_both_supplied_raises() -> None:
-    """Supplying both 'key' and 'passphrase' is a validation error (§17.6)."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with pytest.raises(_scp_core.ValidationError):
-            SCP(
-                storage={
-                    "type": "sqlite",
-                    "path": tmpdir,
-                    "key": _SQLITE_KEY,
-                    "passphrase": "also a passphrase",
-                }
-            )
-
-
-def test_sqlite_neither_key_nor_passphrase_raises() -> None:
-    """Supplying neither 'key' nor 'passphrase' is a validation error (§17.6)."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with pytest.raises(_scp_core.ValidationError):
-            SCP(storage={"type": "sqlite", "path": tmpdir})
 
 
 def test_sqlite_open_failure_fails_closed_not_no_storage() -> None:

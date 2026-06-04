@@ -640,12 +640,15 @@ fn subscription_message_to_event(msg: SubscriptionMessage) -> Option<TransportEv
 /// PONG, OK responses).
 fn relay_message_to_event(msg: RelayMessage) -> Option<TransportEvent> {
     match msg {
-        RelayMessage::Blob { blob, .. } => match OuterEnvelope::from_bytes(&blob) {
-            Ok(envelope) => Some(TransportEvent::Envelope(envelope)),
-            Err(e) => Some(TransportEvent::Error(TransportError::ProtocolError(
-                format!("failed to deserialize envelope from blob: {e}"),
-            ))),
-        },
+        RelayMessage::Blob { blob, .. } => Some(OuterEnvelope::from_bytes(&blob).map_or_else(
+            |_| {
+                tracing::warn!("envelope deserialization failed");
+                TransportEvent::Error(TransportError::ProtocolError(
+                    "failed to deserialize envelope from blob".to_owned(),
+                ))
+            },
+            TransportEvent::Envelope,
+        )),
         RelayMessage::Event { event_type, .. } => match event_type.as_str() {
             "backfill_complete" => Some(TransportEvent::BackfillComplete),
             _ => None,

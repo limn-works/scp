@@ -1,67 +1,93 @@
 /**
  * E2E encrypted messaging demo.
  *
- * Starts an in-memory relay, creates two identities, creates an encrypted
- * context, joins both participants, sends a message from Alice, receives
- * it as Bob, and shuts everything down cleanly.
+ * Starts an in-memory relay via the caller-owned `SCP`, creates two
+ * identities, creates an encrypted context, joins both participants,
+ * sends a message from Alice, receives it as Bob, and shuts everything
+ * down cleanly.
+ *
+ * Post-Phase-4 (ADR-048): every SDK call routes through an explicit
+ * `SCP` instance. The static `Relay.startInMemory()` factory was
+ * removed — construct via `scp.relayStartInMemory()`.
  *
  * Run: bun run examples/e2e-messaging.ts
  */
 
-import { connectLocalTransport, Context, Identity, Relay } from "@limn-works/scp-ts";
+import { SCP } from "../src/index";
 
 async function main(): Promise<void> {
-  // 1. Start an in-memory relay (zero external dependencies)
-  const relay = await Relay.startInMemory();
+  const scp = new SCP();
+  let relay: Awaited<ReturnType<SCP["relayStartInMemory"]>> | null = null;
   try {
+    // 1. Start an in-memory relay (zero external dependencies).
+    relay = await scp.relayStartInMemory();
     console.log(`Relay listening at ${relay.relayUrl}`);
 
-    // 1b. Connect transport to the relay
-    await connectLocalTransport(relay.relayUrl);
-
-    // 2. Create two identities
-    const alice = await Identity.create({ custody: "in_memory" });
-    const bob = await Identity.create({ custody: "in_memory" });
+    // 2. Create two identities.
+    const alice = await scp.identityCreate("in_memory");
+    const bob = await scp.identityCreate("in_memory");
     console.log(`Alice DID: ${alice.did}`);
     console.log(`Bob DID:   ${bob.did}`);
 
-    // 3. Alice creates an encrypted context on this relay
-    const ctx = await Context.create(alice, {
-      ceiling: ["messages:read", "messages:write", "member:invite"],
-      memoryScope: "ephemeral",
-      governance: "single_admin",
-      ttl: 300,
-    });
+    // 3. Wire the bridge's transport to the relay.
+    await scp.configureRelayTransport(relay.relayUrl, alice.did);
+
+    // 4. Alice creates an encrypted context on this relay.
+    const ctx = await scp.contextCreate(
+      alice,
+      JSON.stringify({
+        ceiling: ["messages:read", "messages:write", "member:invite"],
+        memoryScope: "ephemeral",
+        governance: "single_admin",
+        ttl: 300,
+      }),
+    );
     console.log(`Context created: ${ctx.contextId}`);
 
-    // 4. Bob joins the context
-    await ctx.join(bob);
+    // 5. Bob joins the context.
+    await scp.contextJoin(ctx._rawHandle, bob.did, null);
     console.log("Bob joined the context");
 
-    // 5. Alice sends a message
+    // 6. Subscribe Bob before Alice sends.
+    let received: { senderDid: string; payload: Uint8Array } | null = null;
+    await scp.contextSubscribe(ctx._rawHandle, bob.did, (raw) => {
+      const msg = raw as { senderDid?: string; payload?: number[] | Uint8Array };
+      if (msg?.senderDid !== undefined && msg.payload !== undefined) {
+        const bytes = msg.payload instanceof Uint8Array ? msg.payload : new Uint8Array(msg.payload);
+        received = { senderDid: msg.senderDid, payload: bytes };
+      }
+    });
+
+    // 7. Alice sends a message.
     const plaintext = new TextEncoder().encode(
       "Hello Bob, this message is E2E encrypted via MLS",
     );
-    await ctx.send(plaintext);
+    await scp.contextSend(ctx._rawHandle, alice.did, plaintext, null);
     console.log("Alice sent message");
 
-    // 6. Bob receives the message
-    for await (const msg of ctx.receive()) {
-      const text = new TextDecoder().decode(msg.content as Uint8Array);
-      console.log(`Bob received from ${msg.senderDid}: ${text}`);
-      break;
+    // 8. Give the subscription a chance to flush, then report.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (received !== null) {
+      const { senderDid, payload } = received as { senderDid: string; payload: Uint8Array };
+      console.log(`Bob received from ${senderDid}: ${new TextDecoder().decode(payload)}`);
     }
 
-    // 7. Cleanup
-    await ctx.leave();
+    // 9. Cleanup.
+    await scp.contextLeave(ctx._rawHandle, bob.did);
     console.log("Bob left the context");
 
-    await ctx.close();
+    await scp.contextClose(ctx._rawHandle, alice.did);
     console.log("Context closed");
   } finally {
-    await relay.shutdown();
+    if (relay !== null) {
+      await relay.shutdown();
+    }
+    await scp.shutdown(5);
     console.log("Relay shut down -- demo complete");
   }
 }
 
-main().catch(console.error);
+main().catch((error: unknown) => {
+  console.error("Demo failed:", error);
+  process.exit(1);
+});

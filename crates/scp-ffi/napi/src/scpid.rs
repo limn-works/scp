@@ -1,17 +1,14 @@
 //! napi-rs bridge for SCPID authentication (§3.11).
 //!
-//! Exposes SCPID challenge generation, signing, and verification to Node.js/Bun:
-//!
-//! - `scpid_challenge` — Generate an SCPID challenge for a relying party.
-//! - `scpid_sign` — Sign an SCPID challenge with a registered identity's key.
-//! - [`scpid_verify`] — Verify a signed SCPID response (relying-party side).
+//! Per-bridge-instance (`_on`) implementations consumed by the corresponding
+//! methods on [`crate::scp::Scp`]. Phase D (#1695) deleted the
+//! free-function wrappers that routed through the process-global default
+//! bridge instance.
 //!
 //! See spec §3.11 and the `scp-core` `scpid` module.
 
 use scp_ffi_common::error_codes as codes;
 use std::time::Duration;
-
-use napi_derive::napi;
 
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_core::identity::scpid_sign as core_sign;
@@ -22,25 +19,25 @@ use scp_core::identity::{
 use scp_identity::SigningKeyId;
 
 use crate::error::ScpNapiError;
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
-// Bridge functions
+// Per-bridge-instance implementations
 // ---------------------------------------------------------------------------
 
-/// Generates an SCPID challenge for the given audience (§3.11.8).
+/// Per-bridge-instance implementation of `scpid_challenge`.
 ///
-/// Returns the challenge as a JSON string containing `protocol`, `nonce`,
-/// `audience`, `issued_at`, and `expires_at` fields.
-///
-/// # JS usage
-///
-/// ```js
-/// const challengeJson = scpidChallenge("https://app.example.com", 120);
-/// ```
-#[napi]
-// ttl_seconds is u32 — idiomatic for JS platforms (max valid TTL is 300s).
-// PyO3/UniFFI bridges use u64 to match `Duration::from_secs` parameter type.
-pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> napi::Result<String> {
+/// SCPID challenge generation is a pure operation over the audience and TTL
+/// — it does not touch bridge-instance state today. The `bi` parameter is
+/// accepted to match the uniform `_on` pattern used elsewhere so callers in
+/// [`crate::scp::Scp`] can route through their own instance, in anticipation
+/// of per-instance challenge-tracking (replay windows, nonce registries).
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn scpid_challenge_on(
+    _bi: &NapiBridgeInstance,
+    audience: String,
+    ttl_seconds: u32,
+) -> napi::Result<String> {
     let challenge = core_challenge(&audience, Duration::from_secs(u64::from(ttl_seconds)))
         .map_err(|e| ScpNapiError::Validation {
             message: e.to_string(),
@@ -55,24 +52,56 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> napi::Result<Strin
     })
 }
 
+/// Per-bridge-instance implementation of `scpid_sign`.
+///
 /// Signs an SCPID challenge with a registered identity's key (§3.11.3).
+/// Looks up the identity by DID in this bridge's identity registry, selects
+/// the appropriate signing key (`#active` or `#agent`), and produces a
+/// signed SCPID response as a JSON string.
 ///
-/// Looks up the identity by DID in the global registry, selects the
-/// appropriate signing key (`#active` or `#agent`), and produces a signed
-/// SCPID response as a JSON string.
-///
-/// # JS usage
-///
-/// ```js
-/// const responseJson = await scpidSign(did, "#active", challengeJson);
-/// ```
-#[napi]
+/// The optional `signed_at_override` argument substitutes the Unix
+/// millisecond timestamp used for `signed_at` in the canonical hash.
+/// It is only accepted when scp-core is built with the `testing` feature
+/// (cross-bridge parity harness, ADR-046); production builds reject any
+/// non-`null` value.
 #[cfg(feature = "allow_in_memory_custody")]
-pub fn scpid_sign(
+pub(crate) fn scpid_sign_on(
+    bi: &NapiBridgeInstance,
     did: String,
     signing_key_id: String,
     challenge_json: String,
+    signed_at_override: Option<napi::bindgen_prelude::BigInt>,
 ) -> napi::Result<String> {
+    // Normalise `signed_at_override` from the JS-side BigInt/null to
+    // Option<u64>. `BigInt::get_u64` returns `(signed, value, lossless)`
+    // in napi-rs 3.x — reject if the input was negative (`signed`) or
+    // could not be represented losslessly in u64.
+    let signed_at_override_u64: Option<u64> = match signed_at_override {
+        None => None,
+        Some(bi) => {
+            let (signed, val, lossless) = bi.get_u64();
+            if signed || !lossless {
+                return Err(napi::Error::from(ScpNapiError::Validation {
+                    message:
+                        "signed_at_override must fit in an unsigned 64-bit integer (non-negative, no loss)"
+                            .to_owned(),
+                    code: codes::VALID_7007.to_owned(),
+                }));
+            }
+            Some(val)
+        }
+    };
+
+    #[cfg(not(feature = "testing"))]
+    if signed_at_override_u64.is_some() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message:
+                "signed_at_override requires the scp-core `testing` feature — not available in production builds"
+                    .to_owned(),
+            code: codes::VALID_7008.to_owned(),
+        }));
+    }
+
     let key_id = parse_signing_key_id(&signing_key_id)?;
 
     let challenge: ScpIdChallenge =
@@ -81,7 +110,7 @@ pub fn scpid_sign(
             code: codes::IDENT_1038.to_owned(),
         })?;
 
-    Ok(crate::runtime::with_identity(&did, |entry| {
+    Ok(crate::runtime::with_identity(bi, &did, |entry| {
         let key_handle = match key_id {
             SigningKeyId::Active => entry.identity.active_signing_key,
             SigningKeyId::Agent => {
@@ -100,11 +129,12 @@ pub fn scpid_sign(
 
         let rt = crate::runtime();
         let response = rt.block_on(core_sign(
-            &entry.custody.0,
+            entry.custody.as_ref(),
             &key_handle,
             &did,
             key_id,
             &challenge,
+            signed_at_override_u64,
         ));
 
         let response = response.map_err(|e| ScpNapiError::Identity {
@@ -119,20 +149,12 @@ pub fn scpid_sign(
     })?)
 }
 
-/// Verifies a signed SCPID response against the original challenge (§3.11.4).
-///
-/// Resolves the signer's DID document via the global production DID resolver
-/// (initialized during `identityCreate`), then runs the 11-step verification
-/// pipeline from `scp-core`. Returns the `ScpIdAuthentication` result as a
-/// JSON string on success.
-///
-/// # JS usage
-///
-/// ```js
-/// const authJson = scpidVerify(responseJson, challengeJson);
-/// ```
-#[napi]
-pub fn scpid_verify(response_json: String, challenge_json: String) -> napi::Result<String> {
+/// Per-bridge-instance implementation of `scpid_verify`.
+pub(crate) fn scpid_verify_on(
+    bi: &NapiBridgeInstance,
+    response_json: String,
+    challenge_json: String,
+) -> napi::Result<String> {
     let response: ScpIdResponse =
         serde_json::from_str(&response_json).map_err(|e| ScpNapiError::Validation {
             message: format!("invalid response JSON: {e}"),
@@ -145,7 +167,7 @@ pub fn scpid_verify(response_json: String, challenge_json: String) -> napi::Resu
             code: codes::IDENT_1038.to_owned(),
         })?;
 
-    let resolver = crate::runtime::did_resolver().ok_or_else(|| ScpNapiError::Identity {
+    let resolver = crate::runtime::did_resolver(bi).ok_or_else(|| ScpNapiError::Identity {
         message: "DID resolver not initialized — create an identity with \
                       identityCreate before calling scpidVerify"
             .to_owned(),
@@ -210,15 +232,21 @@ const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::runtime::NapiBridgeInstance;
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
 
     use scp_identity::resolver::DualLayerResolver;
     use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier};
 
+    fn test_bi() -> NapiBridgeInstance {
+        NapiBridgeInstance::new_napi()
+    }
+
     #[test]
     fn challenge_returns_valid_json() {
-        let json = scpid_challenge("https://example.com".to_owned(), 60).unwrap();
+        let bi = test_bi();
+        let json = scpid_challenge_on(&bi, "https://example.com".to_owned(), 60).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["protocol"], "scpid/1.0");
         assert_eq!(v["audience"], "https://example.com");
@@ -229,19 +257,22 @@ mod tests {
 
     #[test]
     fn challenge_rejects_zero_ttl() {
-        let result = scpid_challenge("https://example.com".to_owned(), 0);
+        let bi = test_bi();
+        let result = scpid_challenge_on(&bi, "https://example.com".to_owned(), 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn challenge_rejects_excessive_ttl() {
-        let result = scpid_challenge("https://example.com".to_owned(), 301);
+        let bi = test_bi();
+        let result = scpid_challenge_on(&bi, "https://example.com".to_owned(), 301);
         assert!(result.is_err());
     }
 
     #[test]
     fn challenge_rejects_empty_audience() {
-        let result = scpid_challenge(String::new(), 60);
+        let bi = test_bi();
+        let result = scpid_challenge_on(&bi, String::new(), 60);
         assert!(result.is_err());
     }
 
@@ -305,11 +336,12 @@ mod tests {
         );
     }
 
-    /// Bridge `scpid_verify` rejects malformed response JSON with the
+    /// Bridge `scpid_verify_on` rejects malformed response JSON with the
     /// correct error code before attempting DID resolution.
     #[test]
     fn scpid_verify_rejects_malformed_response_json() {
-        let result = scpid_verify("not valid json".to_owned(), "{}".to_owned());
+        let bi = test_bi();
+        let result = scpid_verify_on(&bi, "not valid json".to_owned(), "{}".to_owned());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
@@ -318,10 +350,11 @@ mod tests {
         );
     }
 
-    /// Bridge `scpid_verify` rejects malformed challenge JSON with the
+    /// Bridge `scpid_verify_on` rejects malformed challenge JSON with the
     /// correct error code (response JSON parses, challenge does not).
     #[test]
     fn scpid_verify_rejects_malformed_challenge_json() {
+        let bi = test_bi();
         let response_json = serde_json::json!({
             "protocol": "scpid/1.0",
             "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -332,7 +365,8 @@ mod tests {
             "issued_at": 1_000_000_000_u64,
             "expires_at": 2_000_000_000_u64,
         });
-        let result = scpid_verify(
+        let result = scpid_verify_on(
+            &bi,
             serde_json::to_string(&response_json).unwrap(),
             "not valid json".to_owned(),
         );
@@ -354,6 +388,8 @@ mod tests {
 
         let dht_client = Arc::new(InMemoryDhtClient::new());
         let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
 
         // Create a DidDht with a signer so we can publish the DID document.
         let sign_fn = scp_identity::DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(Arc::clone(&custody));
@@ -362,7 +398,10 @@ mod tests {
             Arc::new(DidCache::new()),
             sign_fn,
         );
-        let (identity, doc) = dht.create(custody.as_ref()).await.unwrap();
+        let (identity, doc, _pre_rotation_handle) = dht
+            .create(custody.as_ref(), pre_rotation_custody.as_ref())
+            .await
+            .unwrap();
 
         // Publish the document to the shared DHT so the resolver can find it.
         dht.publish(&identity, &doc).await.unwrap();
@@ -379,6 +418,7 @@ mod tests {
             &identity.did,
             SigningKeyId::Active,
             &challenge,
+            None,
         )
         .await
         .unwrap();

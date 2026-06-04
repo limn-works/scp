@@ -184,6 +184,9 @@ interface WasmModule {
   petname_resolve_context: (ownerDid: string, name: string) => string;
   petname_get_for_did: (ownerDid: string, targetDid: string) => unknown;
   petname_get_for_context: (ownerDid: string, contextId: string) => unknown;
+  petname_apply_event: (ownerDid: string, eventJson: string) => void;
+  petname_did_count: (ownerDid: string) => number;
+  petname_context_count: (ownerDid: string) => number;
   // Handle Registry (§22.3.1)
   handle_register: (
     discoveryContextId: string,
@@ -262,10 +265,10 @@ interface WasmModule {
     did: string;
     custodyType: string;
   };
-  identity_migrate: (identity: {
-    did: string;
-    custodyType: string;
-  }) => Promise<{ did: string; custodyType: string }>;
+  identity_migrate: (identity: { did: string; custodyType: string }) => Promise<{
+    identity: { did: string; custodyType: string };
+    rotationEventJson: string;
+  }>;
   identity_attest_device: (did: string) => Promise<string>;
   identity_verify_device_attestation: (did: string, tokenBase64: string) => Promise<boolean>;
   // Identity link attestation (§3.5.1)
@@ -279,7 +282,9 @@ interface WasmModule {
   ) => Promise<string>;
   identity_link_attestations: (did: string) => string;
   identity_remove_link_attestation: (did: string, attestationId: string) => boolean;
-  identity_verify_link_attestation_signature: (
+  identity_remove: (did: string) => void;
+  identity_remove_if_present: (did: string) => boolean;
+  identity_verify_link_attestation: (
     attestationJson: string,
     issuerPublicKeyHex: string,
   ) => Promise<boolean>;
@@ -1497,10 +1502,15 @@ export function createWasmBridge(): Bridge {
     ): Promise<Checkpoint> {
       const wasm = getWasm();
       const result = await wasm.event_log_checkpoint(handle, identityDid, epoch);
+      // WASM cannot sign in-process (ADR-006/ADR-034); it returns the unsigned
+      // signable payload hash for a JS SDK to sign. Surface it so the capability
+      // is actually usable (ADR-048 §7b semantic divergence — see the
+      // `signingPayloadHash` doc on the `Checkpoint` type).
       return {
         root: result.merkleRoot,
         eventCount: result.eventCount,
         timestamp: result.timestamp,
+        signingPayloadHash: result.signingPayloadHash,
       };
     },
 
@@ -1607,6 +1617,21 @@ export function createWasmBridge(): Bridge {
       const result = wasm.petname_get_for_context(ownerDid, contextId);
       if (result == null || result === undefined) return null;
       return result as string;
+    },
+
+    petnameApplyEvent(ownerDid: string, eventJson: string): void {
+      const wasm = getWasm();
+      wasm.petname_apply_event(ownerDid, eventJson);
+    },
+
+    petnameDidCount(ownerDid: string): number {
+      const wasm = getWasm();
+      return wasm.petname_did_count(ownerDid);
+    },
+
+    petnameContextCount(ownerDid: string): number {
+      const wasm = getWasm();
+      return wasm.petname_context_count(ownerDid);
     },
 
     // Handle Registry (§22.3.1)
@@ -1797,8 +1822,16 @@ export function createWasmBridge(): Bridge {
 
     async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
       const wasm = getWasm();
-      const updated = await wasm.identity_migrate(handle);
-      return { did: updated.did, custodyType: updated.custodyType };
+      const result = await wasm.identity_migrate(handle);
+      // The WASM bridge returns the migrated identity AND a JSON-
+      // serialized `DidRotationEvent` carrying the migration +
+      // pre-rotation proofs. The SDK layer distributes the event to
+      // active context members per spec §3.2.1 step 4b.
+      return {
+        did: result.identity.did,
+        custodyType: result.identity.custodyType,
+        rotationEventJson: result.rotationEventJson,
+      };
     },
 
     async identityAttestDevice(did: string): Promise<string> {
@@ -1841,15 +1874,22 @@ export function createWasmBridge(): Bridge {
       return wasm.identity_remove_link_attestation(did, attestationId);
     },
 
+    identityRemove(did: string): void {
+      const wasm = getWasm();
+      wasm.identity_remove(did);
+    },
+
+    identityRemoveIfPresent(did: string): boolean {
+      const wasm = getWasm();
+      return wasm.identity_remove_if_present(did);
+    },
+
     async identityVerifyLinkAttestation(
       attestationJson: string,
       issuerPublicKeyHex: string,
     ): Promise<boolean> {
       const wasm = getWasm();
-      return await wasm.identity_verify_link_attestation_signature(
-        attestationJson,
-        issuerPublicKeyHex,
-      );
+      return await wasm.identity_verify_link_attestation(attestationJson, issuerPublicKeyHex);
     },
 
     // Recovery and custody migration (#632, spec §9.12, §3.2.1)

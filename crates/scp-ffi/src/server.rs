@@ -1,14 +1,20 @@
 //! `PyO3` bridge for relay and application node server startup.
 //!
 //! Wraps the shared startup code in `scp-ffi-common::server` for consumption
-//! from Python via `PyO3` `#[pyfunction]` and `#[pyclass]` definitions.
+//! from Python via `PyO3` `#[pyclass]` definitions and methods on the `SCP`
+//! class.
 //!
 //! - [`PyRelayHandle`] -- opaque handle to a running relay server.
 //! - [`PyNodeHandle`] -- opaque handle to a running application node (wraps
 //!   both `InMemoryStorage` and `FilesystemStorage` variants via an internal
 //!   enum).
-//! - [`py_relay_start_in_memory`] / [`py_relay_start_local`] -- relay startup.
-//! - [`py_node_start_in_memory`] / [`py_node_start_local`] -- node startup.
+//! - `PyScp::relay_start_in_memory` / `PyScp::relay_start_local` -- relay
+//!   startup.
+//! - `PyScp::node_start_in_memory` / `PyScp::node_start_local` -- node
+//!   startup.
+//!
+//! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
+//! methods in Phase 4 PR 4 sub-slice D (#1549).
 //!
 //! Gated behind the `server` feature on `scp-ffi-common`. Not available for
 //! WASM (ADR-034).
@@ -23,7 +29,6 @@ use scp_ffi_common::server::{
 };
 use scp_identity::{DidCache, InMemoryDhtClient};
 use scp_node::NodeError;
-use scp_transport::native::NativeRelayAdapter;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 // ---------------------------------------------------------------------------
@@ -68,6 +73,7 @@ fn node_err(e: NodeError) -> PyErr {
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
 fn auto_wire_context_manager(
+    bi: &crate::runtime::PyBridgeInstance,
     py: Python<'_>,
     rt: &tokio::runtime::Runtime,
     did: &str,
@@ -81,8 +87,15 @@ fn auto_wire_context_manager(
     let did_owned = did.to_owned();
     let token2 = bridge_token.clone();
     let profile = scp_transport::profile::TransportProfile::platform_default();
+    // Route through the transport selector for a uniform connect surface (spec
+    // §10.14.3 item 4; ADR-037). Bearer-authenticated relays are WebSocket-only
+    // (QUIC has no bearer-upgrade surface), so the selector connects WebSocket
+    // here — but the routing keeps every connect site flowing through the same
+    // selection layer.
+    let selector = scp_transport::TransportSelector::new();
+    let selector2 = scp_transport::TransportSelector::new();
     match py.allow_threads(|| {
-        rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
+        rt.block_on(selector.select_and_connect_with_bearer(
             &sourced,
             Some(bridge_token),
             Some(&profile),
@@ -95,7 +108,9 @@ fn auto_wire_context_manager(
             let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
             let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
                 Box::new(crate::runtime::NoOpEventLogProvider);
-            crate::runtime::init_supervisor_with(&did_owned, crypto, transport, event_log, None);
+            crate::runtime::init_context_manager_with(
+                bi, &did_owned, crypto, transport, event_log, None,
+            );
 
             // Also populate the BridgeInstance transport manager so that
             // broadcast publish, context subscribe, and discovery probing
@@ -103,15 +118,15 @@ fn auto_wire_context_manager(
             // a second WebSocket connection because NativeRelayAdapter is not
             // Clone and the first was consumed by RelayTransportProvider.
             match py.allow_threads(|| {
-                rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
+                rt.block_on(selector2.select_and_connect_with_bearer(
                     &sourced,
                     Some(token2),
                     Some(&profile),
                 ))
             }) {
                 Ok(relay_adapter) => {
-                    let manager = scp_transport::TransportManager::new(Box::new(relay_adapter));
-                    let _ = crate::runtime::set_transport_manager(manager);
+                    let manager = scp_transport::TransportManager::new(relay_adapter);
+                    let _ = crate::runtime::set_transport_manager(bi, manager);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -133,7 +148,7 @@ fn auto_wire_context_manager(
             );
             // Fall back to initializing without transport so that at least
             // the Supervisor exists (with NotConfiguredTransportProvider).
-            crate::runtime::init_supervisor(&did_owned);
+            crate::runtime::init_context_manager(bi, &did_owned);
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
@@ -142,7 +157,7 @@ fn auto_wire_context_manager(
         // `NotInitialized` (no manager attached yet) — the caller
         // path above already attempted attach, and a duplicate
         // failure is non-fatal for defense-in-depth registration.
-        if let Ok(supervisor) = crate::runtime::supervisor()
+        if let Ok(supervisor) = crate::runtime::supervisor(bi)
             && let Err(e) = rt.block_on(supervisor.register_local_did(did_owned.into()))
         {
             tracing::debug!(
@@ -235,6 +250,11 @@ pub struct PyNodeHandle {
     /// `check_handle` at every entry point that accepts this handle.
     #[allow(dead_code)]
     pub(crate) instance_id: u64,
+    /// The bridge instance that owns this node's `ContextManager`. Stored
+    /// so methods on `PyNodeHandle` (e.g. `publish_broadcast`) can resolve
+    /// the manager without consulting any process-global default
+    /// (Phase D #1695).
+    pub(crate) bi: Arc<crate::runtime::PyBridgeInstance>,
 }
 
 // PyO3 `#[getter]` methods require `&self` and cannot be `const` or `#[must_use]`.
@@ -317,17 +337,19 @@ impl PyNodeHandle {
         let rt = crate::runtime()?;
 
         // Resolve broadcast key: explicit or auto-lookup via Supervisor.
-        let supervisor = crate::runtime::supervisor().map_err(|e| {
+        // `PyNodeHandle` carries a reference to the bridge instance that
+        // spawned it, so we resolve the supervisor from there.
+        let supervisor = Arc::clone(crate::runtime::supervisor(&self.bi).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "broadcast key auto-lookup failed: {e}"
             ))
-        })?;
+        })?);
         let resolved = py.allow_threads(|| {
             rt.block_on(server::resolve_broadcast_key(
                 broadcast_key_hex,
                 author_did,
                 self.inner.did(),
-                supervisor,
+                &supervisor,
                 &context_id,
             ))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
@@ -491,17 +513,18 @@ impl Drop for PyNodeHandle {
 // Identity portability helper
 // ---------------------------------------------------------------------------
 
-/// Constructs a [`NodeIdentity`] from the global identity registry.
+/// Constructs a [`NodeIdentity`] from the given bridge instance's identity
+/// registry.
 ///
 /// Looks up the given DID in the `PyO3` bridge identity registry (populated by
-/// `py_identity_create`) and builds a `NodeIdentity` with a configured DID
+/// `PyScp::identity_create`) and builds a `NodeIdentity` with a configured DID
 /// method instance that can sign on behalf of the identity's custody provider.
 ///
 /// # Errors
 ///
 /// Returns `PyErr` if the DID is not found in the identity registry.
-fn build_node_identity(did: &str) -> PyResult<NodeIdentity> {
-    crate::runtime::with_identity(did, |entry| {
+fn build_node_identity(bi: &crate::runtime::PyBridgeInstance, did: &str) -> PyResult<NodeIdentity> {
+    crate::runtime::with_identity(bi, did, |entry| {
         let custody = Arc::clone(&entry.custody);
         let sign_fn = ConcreteDidMethod::make_sign_fn(custody);
         let dht_client = Arc::new(InMemoryDhtClient::new());
@@ -520,175 +543,169 @@ fn build_node_identity(did: &str) -> PyResult<NodeIdentity> {
 }
 
 // ---------------------------------------------------------------------------
-// Free functions -- relay startup
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
 // ---------------------------------------------------------------------------
 
-/// Starts a relay with in-memory blob storage on an OS-assigned port.
-///
-/// Returns a :class:`RelayHandle` whose ``relay_url`` property contains the
-/// WebSocket URL for clients.
-#[pyfunction]
-pub fn py_relay_start_in_memory(py: Python<'_>) -> PyResult<PyRelayHandle> {
-    let rt = crate::runtime()?;
-    py.allow_threads(|| {
-        let relay = rt
-            .block_on(server::start_relay_in_memory())
-            .map_err(server_err)?;
-        let instance_id = crate::runtime::bridge_instance_raw()
-            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
-                bi.core.instance_id()
-            });
-        Ok(PyRelayHandle {
-            inner: relay,
-            instance_id,
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Starts a relay with in-memory blob storage on an OS-assigned port.
+    ///
+    /// Returns a :class:`RelayHandle` whose ``relay_url`` property contains the
+    /// WebSocket URL for clients.
+    #[pyo3(name = "relay_start_in_memory")]
+    pub fn relay_start_in_memory(&self, py: Python<'_>) -> PyResult<PyRelayHandle> {
+        let bi = &*self.inner;
+        let rt = crate::runtime()?;
+        py.allow_threads(|| {
+            let relay = rt
+                .block_on(server::start_relay_in_memory())
+                .map_err(server_err)?;
+            let instance_id = bi.core.instance_id();
+            Ok(PyRelayHandle {
+                inner: relay,
+                instance_id,
+            })
         })
-    })
-}
+    }
 
-/// Starts a relay with redb-backed blob storage on an OS-assigned port.
-///
-/// Opens (or creates) a redb database at ``<data_dir>/blobs.redb``.
-#[pyfunction]
-pub fn py_relay_start_local(py: Python<'_>, data_dir: String) -> PyResult<PyRelayHandle> {
-    let rt = crate::runtime()?;
-    py.allow_threads(|| {
-        let relay = rt
-            .block_on(server::start_relay_local(std::path::Path::new(&data_dir)))
-            .map_err(server_err)?;
-        let instance_id = crate::runtime::bridge_instance_raw()
-            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
-                bi.core.instance_id()
-            });
-        Ok(PyRelayHandle {
-            inner: relay,
-            instance_id,
+    /// Starts a relay with redb-backed blob storage on an OS-assigned port.
+    ///
+    /// Opens (or creates) a redb database at ``<data_dir>/blobs.redb``.
+    #[pyo3(name = "relay_start_local")]
+    pub fn relay_start_local(&self, py: Python<'_>, data_dir: String) -> PyResult<PyRelayHandle> {
+        let bi = &*self.inner;
+        let rt = crate::runtime()?;
+        py.allow_threads(|| {
+            let relay = rt
+                .block_on(server::start_relay_local(std::path::Path::new(&data_dir)))
+                .map_err(server_err)?;
+            let instance_id = bi.core.instance_id();
+            Ok(PyRelayHandle {
+                inner: relay,
+                instance_id,
+            })
         })
-    })
-}
+    }
 
-// ---------------------------------------------------------------------------
-// Free functions -- node startup
-// ---------------------------------------------------------------------------
+    /// Starts a full application node with in-memory storage.
+    ///
+    /// When ``identity_did`` is ``None`` (the default), auto-wires in-memory key
+    /// custody, in-memory storage, in-memory DHT client, self-signed TLS, and a
+    /// relay on an OS-assigned port with a fresh DID.
+    ///
+    /// When ``identity_did`` is provided, the node uses the pre-existing identity
+    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
+    /// This enables identity portability — the same DID persists across node
+    /// restarts.
+    #[pyo3(name = "node_start_in_memory", signature = (identity_did=None))]
+    pub fn node_start_in_memory(
+        &self,
+        py: Python<'_>,
+        identity_did: Option<String>,
+    ) -> PyResult<PyNodeHandle> {
+        let bi = &*self.inner;
+        let rt = crate::runtime()?;
+        let node_identity = match identity_did {
+            Some(ref did) => {
+                crate::validate::validate_did(did)?;
+                Some(build_node_identity(bi, did)?)
+            }
+            None => None,
+        };
+        let node = py.allow_threads(|| {
+            rt.block_on(server::start_node_in_memory(node_identity))
+                .map_err(server_err)
+        })?;
 
-/// Starts a full application node with in-memory storage.
-///
-/// When ``identity_did`` is ``None`` (the default), auto-wires in-memory key
-/// custody, in-memory storage, in-memory DHT client, self-signed TLS, and a
-/// relay on an OS-assigned port with a fresh DID.
-///
-/// When ``identity_did`` is provided, the node uses the pre-existing identity
-/// from the `PyO3` identity registry (populated by ``py_identity_create``).
-/// This enables identity portability — the same DID persists across node
-/// restarts.
-#[pyfunction]
-#[pyo3(signature = (identity_did=None))]
-pub fn py_node_start_in_memory(
-    py: Python<'_>,
-    identity_did: Option<String>,
-) -> PyResult<PyNodeHandle> {
-    let rt = crate::runtime()?;
-    let node_identity = match identity_did {
-        Some(ref did) => {
-            crate::validate::validate_did(did)?;
-            Some(build_node_identity(did)?)
-        }
-        None => None,
-    };
-    let node = py.allow_threads(|| {
-        rt.block_on(server::start_node_in_memory(node_identity))
+        // Auto-wire the ContextManager with relay transport so that
+        // context operations work immediately after node startup.
+        // Use the internal loopback URL (ws://127.0.0.1:{port}/scp/v1) instead of
+        // node.relay_url() which returns the advertised URL (wss://localhost/scp/v1)
+        // that requires TLS and lacks the actual bound port.
+        // The bridge token is required because ApplicationNode relays enforce
+        // Authorization: Bearer <token> on all WebSocket connections.
+        let did = node.identity().did().to_owned();
+        let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
+        let bridge_token = node.bridge_token_hex();
+        auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
+
+        let instance_id = bi.core.instance_id();
+        Ok(PyNodeHandle {
+            inner: RunningNode::InMemory(node),
+            instance_id,
+            bi: Arc::clone(&self.inner),
+        })
+    }
+
+    /// Starts a full application node with file-backed storage.
+    ///
+    /// Opens (or creates) persistent storage at ``<data_dir>/storage/`` and a redb
+    /// blob database at ``<data_dir>/blobs.redb``.
+    ///
+    /// When ``identity_did`` is ``None`` (the default), the node creates or
+    /// reloads a persistent identity from ``<data_dir>/identity.key``. The
+    /// ``passphrase`` parameter is required in this mode.
+    ///
+    /// When ``identity_did`` is provided, the node uses the pre-existing identity
+    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
+    /// No passphrase is required in this mode.
+    #[pyo3(name = "node_start_local", signature = (data_dir, identity_did=None, passphrase=None))]
+    pub fn node_start_local(
+        &self,
+        py: Python<'_>,
+        data_dir: String,
+        identity_did: Option<String>,
+        passphrase: Option<String>,
+    ) -> PyResult<PyNodeHandle> {
+        let bi = &*self.inner;
+        let rt = crate::runtime()?;
+        let node_identity = match identity_did {
+            Some(ref did) => {
+                crate::validate::validate_did(did)?;
+                Some(build_node_identity(bi, did)?)
+            }
+            None => None,
+        };
+        let zeroized_passphrase = passphrase.map(Zeroizing::new);
+        let node = py.allow_threads(|| {
+            rt.block_on(server::start_node_local(
+                std::path::Path::new(&data_dir),
+                node_identity,
+                zeroized_passphrase,
+            ))
             .map_err(server_err)
-    })?;
+        })?;
 
-    // Auto-wire the ContextManager with relay transport so that
-    // context operations work immediately after node startup.
-    // Use the internal loopback URL (ws://127.0.0.1:{port}/scp/v1) instead of
-    // node.relay_url() which returns the advertised URL (wss://localhost/scp/v1)
-    // that requires TLS and lacks the actual bound port.
-    // The bridge token is required because ApplicationNode relays enforce
-    // Authorization: Bearer <token> on all WebSocket connections.
-    let did = node.identity().did().to_owned();
-    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
-    let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(py, rt, &did, &relay_url, bridge_token);
+        // Auto-wire the ContextManager with relay transport so that
+        // context operations work immediately after node startup.
+        // Use the internal loopback URL — see comment in `node_start_in_memory`.
+        let did = node.identity().did().to_owned();
+        let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
+        let bridge_token = node.bridge_token_hex();
+        auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
 
-    let instance_id = crate::runtime::bridge_instance_raw()
-        .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
-            bi.core.instance_id()
-        });
-    Ok(PyNodeHandle {
-        inner: RunningNode::InMemory(node),
-        instance_id,
-    })
-}
-
-/// Starts a full application node with file-backed storage.
-///
-/// Opens (or creates) persistent storage at ``<data_dir>/storage/`` and a redb
-/// blob database at ``<data_dir>/blobs.redb``.
-///
-/// When ``identity_did`` is ``None`` (the default), the node creates or
-/// reloads a persistent identity from ``<data_dir>/identity.key``. The
-/// ``passphrase`` parameter is required in this mode.
-///
-/// When ``identity_did`` is provided, the node uses the pre-existing identity
-/// from the `PyO3` identity registry (populated by ``py_identity_create``).
-/// No passphrase is required in this mode.
-#[pyfunction]
-#[pyo3(signature = (data_dir, identity_did=None, passphrase=None))]
-pub fn py_node_start_local(
-    py: Python<'_>,
-    data_dir: String,
-    identity_did: Option<String>,
-    passphrase: Option<String>,
-) -> PyResult<PyNodeHandle> {
-    let rt = crate::runtime()?;
-    let node_identity = match identity_did {
-        Some(ref did) => {
-            crate::validate::validate_did(did)?;
-            Some(build_node_identity(did)?)
-        }
-        None => None,
-    };
-    let zeroized_passphrase = passphrase.map(Zeroizing::new);
-    let node = py.allow_threads(|| {
-        rt.block_on(server::start_node_local(
-            std::path::Path::new(&data_dir),
-            node_identity,
-            zeroized_passphrase,
-        ))
-        .map_err(server_err)
-    })?;
-
-    // Auto-wire the ContextManager with relay transport so that
-    // context operations work immediately after node startup.
-    // Use the internal loopback URL — see comment in py_node_start_in_memory.
-    let did = node.identity().did().to_owned();
-    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
-    let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(py, rt, &did, &relay_url, bridge_token);
-
-    let instance_id = crate::runtime::bridge_instance_raw()
-        .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
-            bi.core.instance_id()
-        });
-    Ok(PyNodeHandle {
-        inner: RunningNode::Filesystem(node),
-        instance_id,
-    })
+        let instance_id = bi.core.instance_id();
+        Ok(PyNodeHandle {
+            inner: RunningNode::Filesystem(node),
+            instance_id,
+            bi: Arc::clone(&self.inner),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
-/// Registers the server bridge functions and classes in the Python module.
+/// Registers the server bridge classes in the Python module.
+///
+/// Post-migration (Phase 4 PR 4 sub-slice D) relay/node startup operations are
+/// exposed as methods on `SCP` (see the `#[pymethods]` block above) and
+/// registered automatically with the class. Only the opaque [`PyRelayHandle`]
+/// and [`PyNodeHandle`] classes still require manual class registration here.
 pub fn register_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRelayHandle>()?;
     m.add_class::<PyNodeHandle>()?;
-    m.add_function(wrap_pyfunction!(py_relay_start_in_memory, m)?)?;
-    m.add_function(wrap_pyfunction!(py_relay_start_local, m)?)?;
-    m.add_function(wrap_pyfunction!(py_node_start_in_memory, m)?)?;
-    m.add_function(wrap_pyfunction!(py_node_start_local, m)?)?;
     Ok(())
 }
 
@@ -895,8 +912,9 @@ mod tests {
     fn auto_wire_populates_transport_manager_global() {
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
-        // BridgeInstance must exist for transport manager storage.
-        crate::runtime::init_supervisor_for_test();
+        // Tests construct a fresh per-test bridge instance.
+        let bi_setup = std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py());
+        crate::runtime::init_context_manager_for_test(&bi_setup);
 
         // Start a standalone relay to get a stable WebSocket endpoint.
         let relay = rt().block_on(server::start_relay_in_memory()).unwrap();
@@ -908,21 +926,23 @@ mod tests {
             url: relay_url,
             source: RelayUrlSource::Explicit,
         };
+        let selector = scp_transport::TransportSelector::new();
         let adapter = rt()
-            .block_on(NativeRelayAdapter::connect_sourced(&sourced, None))
+            .block_on(selector.select_and_connect(&sourced, None, None))
             .expect("should connect to the relay");
-        let manager = scp_transport::TransportManager::new(Box::new(adapter));
-        crate::runtime::set_transport_manager(manager)
+        let manager = scp_transport::TransportManager::new(adapter);
+        let bi = bi_setup;
+        crate::runtime::set_transport_manager(&bi, manager)
             .expect("should store transport manager in global");
 
         // Verify the global is populated.
         assert!(
-            crate::runtime::has_transport_manager(),
+            crate::runtime::has_transport_manager(&bi),
             "BridgeInstance transport manager should be populated after auto-wire"
         );
 
         // Clean up.
-        crate::runtime::clear_transport_manager().ok();
+        crate::runtime::clear_transport_manager(&bi).ok();
         relay.shutdown();
     }
 }

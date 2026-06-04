@@ -32,8 +32,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -41,22 +41,16 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import works.limn.scp.AssetEntry
 import works.limn.scp.BatchPublishResult
-import works.limn.scp.ConsequenceConfig
-import works.limn.scp.ConsequenceRule
-import works.limn.scp.encodeConsequenceConfigJson
-import works.limn.scp.encodeConsequenceRulesJson
-import works.limn.scp.validateContentPath
-import works.limn.scp.validateDeployId
-import works.limn.scp.validateMimeType
 import works.limn.scp.BridgeConnectorBindings
 import works.limn.scp.BridgeConnectorBridge
+import works.limn.scp.ConsequenceConfig
+import works.limn.scp.ConsequenceRule
 import works.limn.scp.DiscoveryBindings
 import works.limn.scp.DiscoveryBridge
 import works.limn.scp.EconomyBindings
 import works.limn.scp.EconomyBridge
 import works.limn.scp.IdentityAdvancedBindings
 import works.limn.scp.IdentityAdvancedBridge
-import works.limn.scp.InvitationBindings
 import works.limn.scp.MetadataBindings
 import works.limn.scp.MetadataBridge
 import works.limn.scp.ProvenanceBindings
@@ -66,9 +60,13 @@ import works.limn.scp.ServerBindings
 import works.limn.scp.ServerBridge
 import works.limn.scp.SyncBindings
 import works.limn.scp.SyncBridge
-import works.limn.scp.TrustBindings
 import works.limn.scp.auth.ScpIdBindings
 import works.limn.scp.auth.ScpIdBridge
+import works.limn.scp.encodeConsequenceConfigJson
+import works.limn.scp.encodeConsequenceRulesJson
+import works.limn.scp.validateContentPath
+import works.limn.scp.validateDeployId
+import works.limn.scp.validateMimeType
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.cancellation.CancellationException
 
@@ -1230,9 +1228,9 @@ interface NativeBindings :
  * @property identityAdvanced Agent key, migration, and device attestation bindings.
  * @property identityAttestation Identity link attestation CRUD bindings (§3.5).
  * @property scpId SCPID DID authentication bindings (spec section 3.11).
- * @property trust Trust aggregation bindings.
+ * @property metadata Metadata/petname bindings.
  * @property economy Economic governance bindings.
- * @property invitation Invitation evaluation bindings.
+ * @property server Node/server bindings.
  */
 data class ExtendedBindings(
     val provenance: ProvenanceBindings? = null,
@@ -1241,10 +1239,8 @@ data class ExtendedBindings(
     val bridgeConnector: BridgeConnectorBindings? = null,
     val identityAdvanced: IdentityAdvancedBindings? = null,
     val scpId: ScpIdBindings? = null,
-    val trust: TrustBindings? = null,
     val metadata: MetadataBindings? = null,
     val economy: EconomyBindings? = null,
-    val invitation: InvitationBindings? = null,
     val server: ServerBindings? = null,
 )
 
@@ -2550,13 +2546,12 @@ private fun JsonObject.requireString(
         )
 
 /** Parses a [JsonObject] into a [PublishResult], throwing on missing fields. */
-private fun JsonObject.toPublishResult(
-    context: String = "publish result",
-): PublishResult = PublishResult(
-    blobId = requireString("blob_id", context),
-    etag = requireString("etag", context),
-    deployId = requireString("deploy_id", context),
-)
+private fun JsonObject.toPublishResult(context: String = "publish result"): PublishResult =
+    PublishResult(
+        blobId = requireString("blob_id", context),
+        etag = requireString("etag", context),
+        deployId = requireString("deploy_id", context),
+    )
 
 /**
  * Parses a JSON publish result string into a [PublishResult].

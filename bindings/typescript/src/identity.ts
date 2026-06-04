@@ -1,17 +1,19 @@
 /**
  * Identity module for the SCP TypeScript SDK.
  *
- * Provides the `Identity` class for DID lifecycle management: creation,
- * loading, resolution, and key rotation. All operations delegate to the
- * runtime-selected bridge (napi-rs or WASM).
+ * After Phase 4 PR 4 (#1549, ADR-048) Agent B1, the `Identity`,
+ * `IdentityAttestation`, and `RevocationStatus` types collapse to pure
+ * handle/value types: no `#scp` backing, no instance methods that
+ * touch the bridge, no static factories. All lifecycle and attestation
+ * operations live on the {@link SCP} class.
  *
- * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
+ * See ADR-022 in `.docs/adrs/phase-4.md`, ADR-048, and
+ * `.docs/scaffold/typescript.md`.
  */
 
-import { IdentityError, mapBridgeError, ValidationError } from "./errors";
+import { ValidationError } from "./errors";
 import type { BridgeIdentityHandle } from "./internal/bridge";
-import { getBridge } from "./internal/bridge";
-import type { DIDDocument } from "./types";
+import type { SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // IdentityLinkAttestation
@@ -72,17 +74,19 @@ export type CustodyType = "platform" | "in_memory" | "software";
 // ---------------------------------------------------------------------------
 
 /**
- * An SCP identity backed by a DID.
+ * An opaque handle to an SCP identity.
  *
- * Identity objects are created via the static factory methods `create()` and
- * `load()`. They hold an opaque bridge handle that retains the key material
- * (for in-memory custody) or a reference to the platform key store.
- *
- * # Usage
+ * `Identity` is a pure data/handle type: it carries the DID string, the
+ * custody type, and the raw bridge handle. All lifecycle operations
+ * (`create`, `load`, `resolve`, `rotateKey`, agent-key management,
+ * migrate, attestation CRUD, recovery, custody migration) live as
+ * methods on the {@link SCP} class. Pass an `Identity` as an argument
+ * wherever the underlying bridge call needs access to key material.
  *
  * ```typescript
- * const identity = await Identity.create({ custody: "in_memory" });
+ * const identity = await scp.identityCreate("in_memory");
  * console.log(identity.did); // "did:dht:z6Mk..."
+ * await scp.identityRotateKey(identity);
  * ```
  */
 export class Identity {
@@ -93,368 +97,29 @@ export class Identity {
   readonly custodyType: string;
 
   /** @internal Opaque bridge handle — not part of the public API. */
-  readonly _handle: BridgeIdentityHandle;
+  readonly _rawHandle: BridgeIdentityHandle;
 
-  private constructor(did: string, custodyType: string, handle: BridgeIdentityHandle) {
+  private constructor(did: string, custodyType: string, rawHandle: BridgeIdentityHandle) {
     this.did = did;
     this.custodyType = custodyType;
-    this._handle = handle;
+    this._rawHandle = rawHandle;
   }
 
   /**
-   * Creates a new DID identity with the specified custody method.
+   * Constructs an `Identity` from a raw native NAPI handle.
    *
-   * For `"in_memory"` custody, key material is stored in heap memory. This is
-   * suitable for testing and CLI usage but NOT for production on devices with
-   * HSM capability. Use `"platform"` custody on iOS/Android.
+   * The native addon returns an opaque class instance with at least
+   * `did` and `custodyType` fields; this helper narrows `unknown` into
+   * an `Identity` wrapper. The `scp` parameter is retained for API
+   * symmetry with the other `_fromHandle` statics — the handle itself
+   * is self-contained so no `SCP` reference is stored.
    *
-   * @param options - Identity creation options.
-   * @param options.custody - The custody method. Defaults to `"platform"`.
-   * @returns A new `Identity` instance.
-   * @throws {IdentityError} If identity creation fails.
-   * @throws {ValidationError} If the custody type is not recognized.
+   * @internal Phase 4 PR 4 (#1549, ADR-048) — used by `SCP` method
+   *   forwarders that return identity-typed results.
    */
-  static async create(options: { custody?: CustodyType } = {}): Promise<Identity> {
-    const custody = options.custody ?? "platform";
-    try {
-      const bridge = await getBridge();
-      const handle = await bridge.identityCreate(custody);
-      return new Identity(handle.did, handle.custodyType, handle);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Loads an existing identity from a DID string.
-   *
-   * Validates the DID format and returns an identity handle. Key operations
-   * require a wired `KeyCustodyProvider` callback for platform/software
-   * custody types.
-   *
-   * @param did - The DID string to load (e.g., `"did:dht:z6Mk..."`).
-   * @returns The loaded `Identity` instance.
-   * @throws {IdentityError} If the DID format is invalid or loading fails.
-   */
-  static async load(did: string): Promise<Identity> {
-    try {
-      const bridge = await getBridge();
-      const handle = await bridge.identityLoad(did);
-      return new Identity(handle.did, handle.custodyType, handle);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Resolves a DID to its DID Document.
-   *
-   * Queries the DHT for the DID document. Requires network connectivity.
-   *
-   * @param did - The DID string to resolve.
-   * @returns The resolved DID document.
-   * @throws {IdentityError} If the DID cannot be resolved.
-   */
-  static async resolve(did: string): Promise<DIDDocument> {
-    try {
-      const bridge = await getBridge();
-      return await bridge.identityResolve(did);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Rotates the active signing key for this identity.
-   *
-   * Generates a new Active Signing Key, updates the DID document, and
-   * returns an updated identity with the same DID but a new key.
-   *
-   * @returns A new `Identity` instance with the rotated key.
-   * @throws {IdentityError} If key rotation fails.
-   */
-  async rotateKey(): Promise<Identity> {
-    try {
-      const bridge = await getBridge();
-      const handle = await bridge.identityRotateKey(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Creates a new identity with an agent signing key (ADR-039).
-   *
-   * Creates a DID identity with both the standard signing key and an
-   * `#agent` verification method in the DID document.
-   *
-   * @param options - Creation options.
-   * @param options.custody - The custody method. Defaults to `"platform"`.
-   * @returns A new `Identity` with an agent key.
-   * @throws {IdentityError} If creation fails.
-   */
-  static async createWithAgentKey(options: { custody?: CustodyType } = {}): Promise<Identity> {
-    const custody = options.custody ?? "platform";
-    try {
-      const bridge = await getBridge();
-      const handle = await bridge.identityCreateWithAgentKey(custody);
-      return new Identity(handle.did, handle.custodyType, handle);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Adds an agent signing key to this identity (ADR-039).
-   *
-   * @returns A new `Identity` with the agent key added.
-   * @throws {IdentityError} If this identity already has an agent key.
-   */
-  async addAgentKey(): Promise<Identity> {
-    try {
-      const bridge = await getBridge();
-      const handle = await bridge.identityAddAgentKey(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Rotates the agent signing key for this identity (ADR-039).
-   *
-   * @returns A new `Identity` with the rotated agent key.
-   * @throws {IdentityError} If this identity has no agent key.
-   */
-  async rotateAgentKey(): Promise<Identity> {
-    try {
-      const bridge = await getBridge();
-      const handle = await bridge.identityRotateAgentKey(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Removes the agent signing key from this identity (ADR-039).
-   *
-   * @returns A new `Identity` with the agent key removed.
-   * @throws {IdentityError} If this identity has no agent key.
-   */
-  async removeAgentKey(): Promise<Identity> {
-    try {
-      const bridge = await getBridge();
-      const handle = await bridge.identityRemoveAgentKey(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Migrates this identity to a new DID (Layer 2 rotation).
-   *
-   * Creates a new DID using the pre-rotation key. The old DID document
-   * is updated with an `alsoKnownAs` pointing to the new DID.
-   *
-   * @returns A new `Identity` with the new DID.
-   * @throws {IdentityError} If migration fails.
-   */
-  async migrate(): Promise<Identity> {
-    try {
-      const bridge = await getBridge();
-      const handle = await bridge.identityMigrate(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Generates a device attestation token for this identity.
-   *
-   * @returns The attestation token as a base64-encoded string.
-   * @throws {IdentityError} If attestation generation fails.
-   */
-  async attestDevice(): Promise<string> {
-    try {
-      const bridge = await getBridge();
-      return await bridge.identityAttestDevice(this.did);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Verifies a device attestation token.
-   *
-   * @param tokenBase64 - The base64-encoded attestation token.
-   * @returns `true` if valid, `false` otherwise.
-   * @throws {IdentityError} If verification fails.
-   */
-  async verifyDeviceAttestation(tokenBase64: string): Promise<boolean> {
-    try {
-      const bridge = await getBridge();
-      return await bridge.identityVerifyDeviceAttestation(this.did, tokenBase64);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Executes the compromise recovery protocol for this identity.
-   *
-   * Runs the 6-step recovery protocol from spec section 9.12.
-   *
-   * @param tier - Compromise tier: `"agent"`, `"active_signing"`, or `"identity_key"`.
-   * @param contextIds - Context IDs where this DID is a member.
-   * @returns The recovery result as a parsed object.
-   * @throws {IdentityError} If recovery fails.
-   */
-  async executeRecovery(
-    tier: "agent" | "active_signing" | "identity_key",
-    contextIds: string[] = [],
-  ): Promise<Record<string, unknown>> {
-    try {
-      const bridge = await getBridge();
-      const json = await bridge.identityExecuteRecovery(this.did, tier, contextIds);
-      return JSON.parse(json);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Executes the custody migration protocol for this identity.
-   *
-   * Runs the 5-step migration protocol from spec section 3.2.1.
-   *
-   * @param target - Target custody type: `"platform_managed"`, `"hardware"`, `"software"`, or `"in_memory"`.
-   * @param contextIds - Context IDs where this DID is a member.
-   * @returns The migration result as a parsed object.
-   * @throws {IdentityError} If migration fails.
-   */
-  async executeCustodyMigration(
-    target: "platform_managed" | "hardware" | "software" | "in_memory",
-    contextIds: string[] = [],
-  ): Promise<Record<string, unknown>> {
-    try {
-      const bridge = await getBridge();
-      const json = await bridge.identityExecuteCustodyMigration(this.did, target, contextIds);
-      return JSON.parse(json);
-    } catch (error) {
-      throw mapBridgeError(error);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Identity Link Attestations (§3.5)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Creates an identity link attestation for an external platform (§3.5).
-   *
-   * Cryptographically binds this DID to an external platform identity.
-   * The proof is platform-specific evidence of ownership.
-   *
-   * @param options - Attestation creation options.
-   * @param options.platform - Platform identifier (e.g., `"github.com"`).
-   * @param options.handle - Platform-specific handle or username.
-   * @param options.proof - Platform-specific proof of ownership.
-   * @param options.platformId - Optional platform-assigned unique identifier.
-   * @returns The created `IdentityAttestation`.
-   * @throws {IdentityError} If the bridge function is not available.
-   */
-  async createAttestation(options: {
-    platform: string;
-    handle: string;
-    proof: string;
-    verificationMethod?: string;
-    platformId?: string;
-  }): Promise<IdentityAttestation> {
-    try {
-      const bridge = await getBridge();
-      const fn = (bridge as unknown as Record<string, unknown>).identityCreateLinkAttestation as
-        | ((
-            did: string,
-            platform: string,
-            handle: string,
-            proof: string,
-            verificationMethod: string,
-            platformId: string | undefined,
-          ) => Promise<string>)
-        | undefined;
-      if (!fn) {
-        throw new IdentityError(
-          "Identity link attestation creation is not yet available in the bridge",
-          "SCP-ATTEST-9010",
-        );
-      }
-      const json = await fn(
-        this.did,
-        options.platform,
-        options.handle,
-        options.proof,
-        options.verificationMethod ?? "oauth",
-        options.platformId,
-      );
-      return IdentityAttestation._fromJson(json);
-    } catch (error) {
-      throw error instanceof IdentityError ? error : mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Lists all identity link attestations for this identity.
-   *
-   * @returns An array of `IdentityAttestation` objects.
-   * @throws {IdentityError} If the bridge function is not available.
-   */
-  async listAttestations(): Promise<readonly IdentityAttestation[]> {
-    try {
-      const bridge = await getBridge();
-      const fn = (bridge as unknown as Record<string, unknown>).identityLinkAttestations as
-        | ((did: string) => Promise<string>)
-        | undefined;
-      if (!fn) {
-        throw new IdentityError(
-          "Identity link attestation listing is not yet available in the bridge",
-          "SCP-ATTEST-9011",
-        );
-      }
-      const json = await fn(this.did);
-      const items = JSON.parse(json) as Record<string, unknown>[];
-      return items.map((item) => IdentityAttestation._fromRecord(item, JSON.stringify(item)));
-    } catch (error) {
-      throw error instanceof IdentityError ? error : mapBridgeError(error);
-    }
-  }
-
-  /**
-   * Removes an identity link attestation by ID.
-   *
-   * @param attestationId - The deterministic attestation ID to remove.
-   * @returns `true` if the attestation was found and removed.
-   * @throws {IdentityError} If the bridge function is not available.
-   */
-  async removeAttestation(attestationId: string): Promise<boolean> {
-    try {
-      const bridge = await getBridge();
-      const fn = (bridge as unknown as Record<string, unknown>).identityRemoveLinkAttestation as
-        | ((did: string, attestationId: string) => Promise<boolean>)
-        | undefined;
-      if (!fn) {
-        throw new IdentityError(
-          "Identity link attestation removal is not yet available in the bridge",
-          "SCP-ATTEST-9012",
-        );
-      }
-      return await fn(this.did, attestationId);
-    } catch (error) {
-      throw error instanceof IdentityError ? error : mapBridgeError(error);
-    }
+  static _fromHandle(_scp: SCP, raw: unknown): Identity {
+    const handle = raw as BridgeIdentityHandle;
+    return new Identity(handle.did, handle.custodyType, handle);
   }
 }
 
@@ -592,8 +257,10 @@ export interface IdentityAttestationData {
 /**
  * An identity link attestation binding a DID to an external platform (§3.5).
  *
- * Represents a cryptographically signed claim that the DID owner also
- * controls an identity on an external platform (e.g., GitHub, X, LinkedIn).
+ * Pure data/value class after Phase 4 PR 4 Agent B1 — no `#scp`
+ * backing, no `verify()` method. Call
+ * `scp.identityVerifyLinkAttestation(...)` with the raw attestation
+ * JSON when signature verification is needed.
  */
 export class IdentityAttestation implements IdentityAttestationData {
   /** Deterministic attestation ID. */
@@ -612,7 +279,7 @@ export class IdentityAttestation implements IdentityAttestationData {
   readonly platformId?: string | undefined;
 
   /** @internal Raw JSON string from the bridge for roundtrip verification. */
-  private readonly _rawJson?: string | undefined;
+  readonly _rawJson?: string | undefined;
 
   constructor(data: IdentityAttestationData, rawJson?: string) {
     if (!Number.isInteger(data.verifiedAt) || data.verifiedAt < 0) {
@@ -626,49 +293,6 @@ export class IdentityAttestation implements IdentityAttestationData {
     this.revocationStatus = data.revocationStatus;
     this.platformId = data.platformId;
     this._rawJson = rawJson;
-  }
-
-  /**
-   * Verifies this attestation's signature and validity.
-   *
-   * Delegates to the bridge's `identityVerifyLinkAttestation` function.
-   *
-   * The issuer's public key cannot be reliably extracted from the DID string
-   * because attestations are signed with `#active` or `#agent` keys
-   * (spec section 3.5.2), not the `#0` identity key embedded in the DID.
-   *
-   * @param issuerPublicKeyHex - Hex-encoded Ed25519 public key of the issuer.
-   * @returns `true` if the attestation is valid.
-   * @throws {IdentityError} If the bridge function is not available or raw JSON is missing.
-   */
-  async verify(issuerPublicKeyHex: string): Promise<boolean> {
-    try {
-      const bridge = await getBridge();
-      const fn = (bridge as unknown as Record<string, unknown>).identityVerifyLinkAttestation as
-        | ((json: string, issuerPublicKeyHex: string) => Promise<boolean>)
-        | undefined;
-      if (!fn) {
-        throw new IdentityError(
-          "Attestation verification is not yet available in the bridge",
-          "SCP-ATTEST-9014",
-        );
-      }
-      // Raw JSON is required for signature verification — _toBridgeRecord()
-      // does not preserve the full structure (claim/evidence nesting,
-      // signature bytes, etc.) needed for canonical hash computation.
-      if (!this._rawJson) {
-        throw new IdentityError(
-          "cannot verify attestation without raw JSON — attestation was not " +
-            "created via the bridge (missing _rawJson)",
-          "SCP-ATTEST-9006",
-        );
-      }
-      const json = this._rawJson;
-      const result = await fn(json, issuerPublicKeyHex);
-      return Boolean(result);
-    } catch (error) {
-      throw error instanceof IdentityError ? error : mapBridgeError(error);
-    }
   }
 
   /** @internal */

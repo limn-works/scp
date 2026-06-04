@@ -1,326 +1,306 @@
-//! Structural audit: every `#[uniffi::export]` function that touches
-//! `ContextManager` or `CoreFields` state MUST route through the
-//! lifecycle gate (`default_bridge_instance()?`, `context_manager()?`,
-//! `context_manager_expect()?`, `bridge_instance()`, or `check_ready()`).
+//! Structural audit: every `impl Scp` method exported via
+//! `#[uniffi::export]` that accepts a handle carrying an `instance_id`
+//! MUST call `self.inner.core.check_handle(handle.instance_id())`
+//! before touching the handle's state.
 //!
-//! This test is the mechanical enforcement for #1646 (ADR-048 PR 2
-//! commit 14). It parses `bridge.rs` as text, enumerates every export,
-//! classifies each into Category A (touches `ContextManager`),
-//! Category B (touches `CoreFields`), or Category C (pure / getter),
-//! and asserts every A/B export contains at least one gate token in
-//! its body.
+//! Phase D (#1695) replaced the old process-wide lifecycle gate
+//! (`default_bridge_instance()?`, `bridge_instance_for_affinity()?`,
+//! etc. on a shared `DEFAULT_BRIDGE_INSTANCE`) with per-instance
+//! handle-affinity enforcement: the caller-owned `Scp` mints handles
+//! stamped with its own `instance_id`, and every method that accepts
+//! such a handle rejects cross-instance use through the inline
+//! `CoreFields::check_handle` call.
 //!
-//! If this test fails, it means a new stateful export landed without
-//! routing through the lifecycle gate. Add a gate at the top of the
-//! function body (e.g. `let _bi = crate::runtime::default_bridge_instance()?;`)
-//! or resolve the manager via `context_manager()?` /
-//! `context_manager_expect()?`. See `.docs/audits/uniffi-check-ready-audit-1646.md`
-//! for the full audit table.
+//! If this test fails, it means a new `Scp` method that takes a
+//! handle argument (`Arc<Identity>`, `Arc<ContextHandle>`,
+//! `Arc<UcanToken>`, `Arc<TransportManager>`, `Arc<RelayHandle>`,
+//! `Arc<NodeHandle>`) landed without the inline handle-affinity check.
+//! Add `self.inner.core.check_handle(handle.instance_id()).map_err(ScpError::from)?;`
+//! at the top of the method body.
 //!
-//! The full audit table is committed to
-//! `.docs/audits/uniffi-check-ready-audit-1646.md`. CI runs this test on
-//! every PR.
+//! The justification for modifying this enforcement file in Phase D:
+//! the old helpers this test scanned for (`default_bridge_instance`,
+//! `bridge_instance`, `ensure_bridge_instance`,
+//! `bridge_instance_for_affinity`, `check_handle_affinity`) no longer
+//! exist in `crate::runtime` — the coverage list must be pruned to
+//! reflect the new per-instance invariant. The enforcement *guarantee*
+//! is strengthened, not weakened: the process-wide-default check could
+//! only compare against the shared default, whereas the inline
+//! `check_handle` rejects handles minted by any other `Scp`.
 
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
     clippy::format_push_string,
-    clippy::trim_split_whitespace
+    clippy::redundant_pub_crate,
+    clippy::doc_markdown,
+    clippy::collapsible_match,
+    clippy::collapsible_if
 )]
 
 use std::fs;
 use std::path::PathBuf;
 
-/// Patterns that indicate a function body contains a lifecycle gate.
-/// At least ONE must match for a Category A or Category B function.
-/// The bare `bridge_instance()` string match is intentional: every call
-/// site — whether `?`-propagating, `.ok()`-downgrading, or chained —
-/// invokes the same lifecycle check inside `bridge_instance()` itself.
-///
-/// The `supervisor_expect()` / `supervisor_lenient()` entries correspond
-/// to the ADR-049 commit-9/10/11 shim paths and the post-12c.9g.3 final
-/// surface — both resolve `DEFAULT_BRIDGE_INSTANCE` and invoke the same
-/// suspended/shutdown checks the removed `context_manager()` did, so
-/// they're real lifecycle gates.
-const GATE_PATTERNS: &[&str] = &[
-    "default_bridge_instance()",
-    "bridge_instance()",
-    "supervisor_expect()",
-    "supervisor_lenient()",
-    "check_ready",
-    "ensure_bridge_instance",
+use syn::visit::Visit;
+
+/// Argument type-name patterns that indicate a handle carrying an
+/// `instance_id`. Any `Scp::method` that accepts one of these MUST call
+/// `check_handle` on the handle's `instance_id()` before using it.
+const HANDLE_ARG_TYPES: &[&str] = &[
+    "Identity",
+    "ContextHandle",
+    "UcanToken",
+    "TransportManager",
+    "RelayHandle",
+    "NodeHandle",
 ];
 
-/// Patterns that indicate a function body touches per-instance
-/// supervisor / context state (Category A). The presence of any of
-/// these marks the function as stateful and therefore requires a gate.
-/// After ADR-049 commit 12c.9g.3 the bridge no longer holds an
-/// `Arc<ContextManager>` directly — `supervisor_expect()` /
-/// `supervisor_lenient()` are the only entry points that resolve the
-/// per-context state.
-const CM_PATTERNS: &[&str] = &["supervisor_expect()", "supervisor_lenient()"];
-
-/// Patterns that indicate a function body touches `CoreFields` state
-/// (Category B). Category A takes precedence over B when both patterns
-/// are present (the CM path implicitly carries `CoreFields` state).
-const CORE_PATTERNS: &[&str] = &[
-    "default_bridge_instance()",
-    "bridge_instance()",
-    ".known_contexts",
-    ".rate_limiters",
-    ".economy_budgets",
-    ".with_transport",
-    ".set_transport",
-    ".clear_transport",
-    ".did_resolver",
-    ".petname_registry",
-    ".handle_registry",
-    ".scope_registry",
-    ".identity_registry",
-    ".ucan_registry",
-    "core.instance_id",
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Category {
-    A,
-    B,
-    C,
-}
-
-#[derive(Debug)]
-struct Export {
-    line: usize,
-    name: String,
-    category: Category,
-    has_gate: bool,
+fn bridge_source_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bridge.rs")
 }
 
 fn bridge_source() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bridge.rs");
+    let path = bridge_source_path();
     fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!("failed to read bridge.rs at {}: {e}", path.display());
     })
 }
 
-/// Locates every `#[uniffi::export]` attribute, skips over any subsequent
-/// `#[...]` attributes, and returns the 0-indexed line where the actual
-/// declaration (fn / impl) begins.
-fn collect_export_decl_lines(lines: &[&str]) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        if lines[i].trim() == "#[uniffi::export]" {
-            let mut j = i + 1;
-            while j < lines.len() && lines[j].trim_start().starts_with("#[") {
-                j += 1;
-            }
-            if j < lines.len() {
-                out.push(j);
+/// Returns `true` if `attrs` contains `#[uniffi::export]` (with or
+/// without parenthesized args), possibly nested inside
+/// `#[cfg_attr(..., uniffi::export)]`.
+fn has_uniffi_export_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(is_uniffi_export_attr)
+}
+
+fn is_uniffi_export_attr(attr: &syn::Attribute) -> bool {
+    if path_matches(attr.path(), &["uniffi", "export"]) {
+        return true;
+    }
+    if path_matches(attr.path(), &["cfg_attr"]) {
+        let parsed = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        );
+        if let Ok(metas) = parsed {
+            for meta in metas.iter().skip(1) {
+                if let syn::Meta::Path(path) = meta
+                    && path_matches(path, &["uniffi", "export"])
+                {
+                    return true;
+                }
+                if let syn::Meta::List(list) = meta
+                    && path_matches(&list.path, &["uniffi", "export"])
+                {
+                    return true;
+                }
             }
         }
-        i += 1;
+    }
+    false
+}
+
+fn path_matches(path: &syn::Path, segments: &[&str]) -> bool {
+    if path.segments.len() != segments.len() {
+        return false;
+    }
+    path.segments
+        .iter()
+        .zip(segments.iter())
+        .all(|(seg, expected)| seg.ident == *expected)
+}
+
+/// Extracts the short (last-segment) type name from a signature input
+/// type, peeling through `Arc<...>`, `Option<Arc<...>>`, and references.
+fn handle_arg_type(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(p) => {
+            let last = p.path.segments.last()?;
+            let ident = last.ident.to_string();
+            // Unwrap Arc<...>, Option<Arc<...>>, Box<...>.
+            if matches!(ident.as_str(), "Arc" | "Option" | "Box")
+                && let syn::PathArguments::AngleBracketed(args) = &last.arguments
+                && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+            {
+                return handle_arg_type(inner);
+            }
+            Some(ident)
+        }
+        syn::Type::Reference(r) => handle_arg_type(&r.elem),
+        _ => None,
+    }
+}
+
+/// Extracts the parameter names whose declared type matches one of the
+/// handle patterns.
+fn collect_handle_params(sig: &syn::Signature) -> Vec<String> {
+    let mut out = Vec::new();
+    for input in &sig.inputs {
+        if let syn::FnArg::Typed(pat) = input
+            && let syn::Pat::Ident(ident) = &*pat.pat
+            && let Some(tname) = handle_arg_type(&pat.ty)
+            && HANDLE_ARG_TYPES.contains(&tname.as_str())
+        {
+            out.push(ident.ident.to_string());
+        }
     }
     out
 }
 
-/// Strips `pub`/`pub(..)`/`async`/`unsafe` modifiers from the start of a
-/// line so the declaration token (`fn` / `impl`) is flush with the start.
-fn strip_modifiers(line: &str) -> String {
-    let mut s = line.trim_start().to_owned();
-    // pub / pub(...)
-    if let Some(rest) = s.strip_prefix("pub") {
-        let after_pub = rest.trim_start();
-        if let Some(after_paren) = after_pub.strip_prefix('(') {
-            if let Some(close_idx) = after_paren.find(')') {
-                s = after_paren[close_idx + 1..].trim_start().to_owned();
-            } else {
-                s = after_pub.to_owned();
-            }
-        } else {
-            s = after_pub.to_owned();
+/// Walks a function body and counts the number of
+/// `<expr>.check_handle(<expr>.instance_id())` calls.
+///
+/// A method with N distinct handle parameters must contain at least N
+/// such calls — the scanner pairs them positionally (first call = first
+/// param, etc.) rather than matching on identifier names because
+/// `Option<Arc<T>>` parameters are usually destructured into a locally
+/// renamed binding (e.g. `if let Some(ref id) = identity`).
+#[derive(Default)]
+struct CheckHandleScan {
+    call_count: usize,
+}
+
+impl<'ast> Visit<'ast> for CheckHandleScan {
+    fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
+        if i.method == "check_handle"
+            && let Some(arg0) = i.args.first()
+            && let syn::Expr::MethodCall(inner) = arg0
+            && inner.method == "instance_id"
+            && inner.args.is_empty()
+        {
+            self.call_count += 1;
         }
+        syn::visit::visit_expr_method_call(self, i);
     }
-    for prefix in ["async ", "unsafe "] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            s = rest.to_owned();
-        }
-    }
-    s
 }
 
-/// Returns the 0-indexed line of the closing `}` that ends the block
-/// opening at or after `start_line`. Counts braces across the file and
-/// returns once the matched open is closed.
-fn find_block_end(lines: &[&str], start_line: usize) -> Option<usize> {
-    let mut depth: i64 = 0;
-    let mut in_body = false;
-    for (offset, line) in lines.iter().enumerate().skip(start_line) {
-        for ch in line.chars() {
-            if ch == '{' {
-                depth += 1;
-                in_body = true;
-            } else if ch == '}' {
-                depth -= 1;
-                if in_body && depth == 0 {
-                    return Some(offset);
-                }
-            }
-        }
-    }
-    None
+/// Line number (1-indexed) of a function name in the source, for audit
+/// messages. Matches the first line containing `fn <name>`.
+fn locate_line(source: &str, needle: &str) -> usize {
+    source
+        .lines()
+        .enumerate()
+        .find_map(|(idx, line)| line.contains(needle).then_some(idx + 1))
+        .unwrap_or(0)
 }
 
-/// Returns `true` if any pattern in `patterns` occurs in `body`.
-fn body_contains_any(body: &str, patterns: &[&str]) -> bool {
-    patterns.iter().any(|p| body.contains(*p))
+#[derive(Debug)]
+struct Export {
+    name: String,
+    line: usize,
+    handle_params: Vec<String>,
+    check_call_count: usize,
 }
 
-fn classify_body(body: &str) -> (Category, bool) {
-    let has_cm = body_contains_any(body, CM_PATTERNS);
-    let has_core = body_contains_any(body, CORE_PATTERNS);
-    let has_gate = body_contains_any(body, GATE_PATTERNS);
-    let category = if has_cm {
-        Category::A
-    } else if has_core {
-        Category::B
-    } else {
-        Category::C
-    };
-    (category, has_gate)
-}
+fn collect_scp_method_exports(source: &str) -> Vec<Export> {
+    let file = syn::parse_file(source).expect("failed to parse bridge.rs as a syn::File");
 
-/// Collects all `#[uniffi::export]` functions — both free functions and
-/// methods inside `#[uniffi::export] impl` blocks — along with their
-/// category + gate presence.
-fn enumerate_exports(source: &str) -> Vec<Export> {
-    let lines: Vec<&str> = source.lines().collect();
-    let decls = collect_export_decl_lines(&lines);
+    let mut out = Vec::new();
 
-    let mut exports = Vec::new();
-
-    for decl_line in decls {
-        let line = lines[decl_line];
-        let stripped = strip_modifiers(line);
-
-        if let Some(after_impl) = stripped.trim_start().strip_prefix("impl") {
-            // impl-block export: walk the block and pick up each fn.
-            let Some(block_end) = find_block_end(&lines, decl_line) else {
+    for item in &file.items {
+        // Only `impl Scp` blocks with `#[uniffi::export]` matter for the
+        // handle-affinity invariant.
+        if let syn::Item::Impl(impl_block) = item {
+            if !has_uniffi_export_attr(&impl_block.attrs) {
                 continue;
-            };
-            let impl_name = after_impl
-                .trim()
-                .split_whitespace()
-                .next()
-                .unwrap_or("?")
-                .to_owned();
-            for i in (decl_line + 1)..=block_end {
-                let method_line = lines[i];
-                let ms = strip_modifiers(method_line);
-                if let Some(rest) = ms.trim_start().strip_prefix("fn ") {
-                    let name = rest
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect::<String>();
-                    if name.is_empty() {
+            }
+            if impl_type_short_name(&impl_block.self_ty) != "Scp" {
+                continue;
+            }
+            for impl_item in &impl_block.items {
+                if let syn::ImplItem::Fn(method) = impl_item {
+                    let method_name = method.sig.ident.to_string();
+                    let handle_params = collect_handle_params(&method.sig);
+                    if handle_params.is_empty() {
                         continue;
                     }
-                    let Some(body_end) = find_block_end(&lines, i) else {
-                        continue;
-                    };
-                    let body = lines[i..=body_end].join("\n");
-                    let (category, has_gate) = classify_body(&body);
-                    exports.push(Export {
-                        line: i + 1,
-                        name: format!("{impl_name}::{name}"),
-                        category,
-                        has_gate,
+                    let mut scan = CheckHandleScan::default();
+                    scan.visit_block(&method.block);
+                    let needle = format!("fn {method_name}");
+                    out.push(Export {
+                        name: format!("Scp::{method_name}"),
+                        line: locate_line(source, &needle),
+                        handle_params,
+                        check_call_count: scan.call_count,
                     });
                 }
             }
-        } else if let Some(rest) = stripped.trim_start().strip_prefix("fn ") {
-            let name = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect::<String>();
-            if name.is_empty() {
-                continue;
-            }
-            let Some(body_end) = find_block_end(&lines, decl_line) else {
-                continue;
-            };
-            let body = lines[decl_line..=body_end].join("\n");
-            let (category, has_gate) = classify_body(&body);
-            exports.push(Export {
-                line: decl_line + 1,
-                name,
-                category,
-                has_gate,
-            });
         }
     }
 
-    exports
+    out
 }
 
+fn impl_type_short_name(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map_or_else(|| "?".to_owned(), |seg| seg.ident.to_string()),
+        _ => "?".to_owned(),
+    }
+}
+
+/// Asserts that every `impl Scp` `#[uniffi::export]` method whose signature
+/// accepts a handle argument (Identity/ContextHandle/UcanToken/TransportManager/
+/// RelayHandle/NodeHandle) calls `check_handle` against that argument's
+/// `instance_id()` inside its body.
 #[test]
-fn uniffi_check_ready_coverage() {
+fn uniffi_scp_handle_affinity_coverage() {
     let source = bridge_source();
-    let exports = enumerate_exports(&source);
+    let exports = collect_scp_method_exports(&source);
 
     assert!(
-        exports.len() >= 190,
-        "expected at least 190 exports in bridge.rs (165 free fns + 27 impl methods), got {}",
-        exports.len()
+        !exports.is_empty(),
+        "expected at least one Scp method with handle arg — got 0 (audit scanner broken?)"
     );
 
-    let missing: Vec<&Export> = exports
-        .iter()
-        .filter(|e| !matches!(e.category, Category::C) && !e.has_gate)
-        .collect();
-
-    if !missing.is_empty() {
-        let mut msg = format!(
-            "{} UniFFI export(s) touching CoreFields/Supervisor state are missing a \
-             lifecycle gate (#1646). Every Category A/B export must invoke one of: \
-             `default_bridge_instance()?`, `bridge_instance()`, `supervisor_expect()?`, \
-             `supervisor_lenient()?`, or `check_ready()`.\n\n",
-            missing.len()
-        );
-        for e in &missing {
-            msg.push_str(&format!(
-                "  - line {} `{}` (category {:?})\n",
-                e.line, e.name, e.category
+    let mut missing: Vec<String> = Vec::new();
+    for e in &exports {
+        if e.check_call_count < e.handle_params.len() {
+            missing.push(format!(
+                "  - line {} `{}`: method accepts {} handle param(s) ({}) \
+                 but body contains only {} `check_handle(...instance_id())` call(s)",
+                e.line,
+                e.name,
+                e.handle_params.len(),
+                e.handle_params.join(", "),
+                e.check_call_count,
             ));
         }
-        msg.push_str(
-            "\nFix: add `let _bi = crate::runtime::default_bridge_instance()?;` at the \
-             top of each offender's body, or resolve the supervisor via \
-             `supervisor_expect()?` / `supervisor_lenient()?`.\n\
-             See .docs/audits/uniffi-check-ready-audit-1646.md for the full audit table.",
-        );
-        panic!("{msg}");
     }
+
+    assert!(
+        missing.is_empty(),
+        "{} Scp method(s) are missing the Phase D (#1695) per-instance \
+         handle-affinity check. Add `self.inner.core.check_handle(\
+         <param>.instance_id()).map_err(ScpError::from)?;` at the top of \
+         each offender's body.\n\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
 }
 
-/// Sanity check on the classifier itself — at least one A, one B, and
-/// one C must exist (otherwise the patterns are wrong and the above test
-/// becomes vacuously true).
+/// Sanity check: the scanner must pick up at least one positive case
+/// (a method that does call check_handle) and at least one
+/// unambiguous handle param, otherwise the above assertion is vacuously
+/// true.
 #[test]
-fn classifier_identifies_all_three_categories() {
+fn scanner_finds_positive_cases() {
     let source = bridge_source();
-    let exports = enumerate_exports(&source);
+    let exports = collect_scp_method_exports(&source);
+
+    let any_with_handle = exports.iter().any(|e| !e.handle_params.is_empty());
     assert!(
-        exports.iter().any(|e| matches!(e.category, Category::A)),
-        "classifier must identify at least one Category A export"
+        any_with_handle,
+        "scanner must identify at least one Scp method with a handle parameter"
     );
+
+    let any_checked = exports.iter().any(|e| e.check_call_count > 0);
     assert!(
-        exports.iter().any(|e| matches!(e.category, Category::B)),
-        "classifier must identify at least one Category B export"
-    );
-    assert!(
-        exports.iter().any(|e| matches!(e.category, Category::C)),
-        "classifier must identify at least one Category C export"
+        any_checked,
+        "scanner must identify at least one check_handle call — \
+         otherwise the positive path of the scanner is broken"
     );
 }

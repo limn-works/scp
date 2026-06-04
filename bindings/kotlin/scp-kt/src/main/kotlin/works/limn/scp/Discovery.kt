@@ -121,6 +121,18 @@ interface DiscoveryBindings {
         contextId: String,
     ): String?
 
+    /** Applies a serialized petname event to the owner's petname map. */
+    fun petnameApplyEvent(
+        ownerDid: String,
+        eventJson: String,
+    )
+
+    /** Returns the number of DID petnames for an owner. */
+    fun petnameDidCount(ownerDid: String): UInt
+
+    /** Returns the number of context petnames for an owner. */
+    fun petnameContextCount(ownerDid: String): UInt
+
     // Handle registry operations (§22.3.1)
 
     /** Registers a handle in a context with discovery tools. Returns JSON result. */
@@ -358,6 +370,38 @@ class DiscoveryBridge internal constructor(
         ownerDid: String,
         contextId: String,
     ): String? = bridge.ffiCall { bindings.petnameGetForContext(ownerDid, contextId) }
+
+    /**
+     * Applies a serialized petname event to the owner's petname map.
+     *
+     * The event JSON must match the `PetnameEvent` serde format (§22.9.2). This
+     * is the event-driven mutation path matching `PetnameMap.apply_event`.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @param eventJson The serialized petname event.
+     */
+    suspend fun petnameApplyEvent(
+        ownerDid: String,
+        eventJson: String,
+    ) = bridge.ffiCall { bindings.petnameApplyEvent(ownerDid, eventJson) }
+
+    /**
+     * Returns the number of DID petnames for an owner.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @return The count of DID petnames.
+     */
+    suspend fun petnameDidCount(ownerDid: String): UInt =
+        bridge.ffiCall { bindings.petnameDidCount(ownerDid) }
+
+    /**
+     * Returns the number of context petnames for an owner.
+     *
+     * @param ownerDid DID of the identity that owns this petname map.
+     * @return The count of context petnames.
+     */
+    suspend fun petnameContextCount(ownerDid: String): UInt =
+        bridge.ffiCall { bindings.petnameContextCount(ownerDid) }
 
     // Handle registry operations (§22.3.1)
 

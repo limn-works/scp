@@ -7,13 +7,23 @@ and shared enums for building agents and applications on top of SCP.
 Usage::
 
     import scp_sdk
-    from scp_sdk import Identity, Context, ToolDefinition, evaluate_trust
+    from scp_sdk import SCP
+    from scp_sdk.types import CustodyType
 
-    # Or via namespace alias:
-    import scp_sdk as scp
-    identity = await scp.Identity.create()
+    # Caller-owned instance — every operation routes through scp.*
+    with SCP() as scp:
+        identity = await scp.identity_create(CustodyType.IN_MEMORY)
 
-See ``.docs/adrs/phase-3.md`` ADR-014 for the full SDK design.
+See ``.docs/adrs/phase-3.md`` ADR-014 and ADR-048 for the full SDK design.
+
+Phase 4 PR 5 (#1549) collapsed the module-level namespace classes onto
+:class:`SCP` methods. :class:`Identity`, :class:`Context`,
+:class:`Relay`, :class:`Node`, :class:`McpServer`, :class:`McpClient`,
+and :class:`UcanToken` are now pure handle / data wrappers. Every
+operation that previously lived as a namespace static or instance method
+is a method on the :class:`SCP` instance — pass ``obj._raw_handle`` (or
+the handle-holding wrapper directly) where the bridge expects an opaque
+handle.
 """
 
 from __future__ import annotations
@@ -35,12 +45,6 @@ from scp_sdk.auth import (
     ScpIdAuthentication,
     ScpIdChallenge,
     ScpIdResponse,
-    scpid_challenge,
-    scpid_sign,
-    scpid_verify,
-)
-from scp_sdk.bridge import (
-    create_shadow,
 )
 from scp_sdk.bridge import (
     evaluate_trust as bridge_evaluate_trust,
@@ -58,15 +62,9 @@ from scp_sdk.context import (
     validate_admission,
     validate_broadcast_key_hex,
 )
-from scp_sdk.discovery import create_query, discover, normalize_address, parse_address
+from scp_sdk.discovery import create_query, normalize_address, parse_address
 from scp_sdk.economy import (
-    antispam_escalated_cost,
-    antispam_record,
-    antispam_velocity,
     auto_accept_blocked,
-    budget_grant,
-    budget_record_spend,
-    budget_remaining,
     check_policy_lock,
     estimate_cost,
     evaluate_formula,
@@ -84,42 +82,15 @@ from scp_sdk.errors import (
     UcanPermissionError,
     ValidationError,
 )
-from scp_sdk.event_log import Checkpoint, Event, EventLog, Proof
-from scp_sdk.governance import (
-    GovernanceActionResult,
-    add_checkpoint_cosignature,
-    apply_pending_ceiling_modification,
-    approve_governance_proposal,
-    create_governance_checkpoint,
-    execute_governance_action,
-    finalize_close,
-    get_governance_proposal,
-    handle_ttl_expiry,
-    list_governance_proposals,
-    propose_governance_action,
-    propose_ttl_extension,
-    reject_governance_proposal,
-    reset_ttl_timer,
-    restore_all_contexts,
-    restore_context,
-    withdraw_governance_vote,
-)
+from scp_sdk.event_log import Checkpoint, Event, Proof, SignedCheckpoint
+from scp_sdk.governance import GovernanceActionResult
 from scp_sdk.identity import DIDDocument, Identity, IdentityAttestation, RevocationStatus
-from scp_sdk.lifecycle import resume, suspend
 from scp_sdk.mcp import (
     McpClient,
     McpProvenance,
     McpServer,
     McpToolDefinition,
     McpToolResult,
-    configure_stdio_allowlist,
-    disable_stdio_allowlist,
-    get_stdio_allowlist,
-    register_tool_handler,
-    registry_cleanup,
-    registry_stats,
-    reset_stdio_allowlist,
-    serve_mcp,
 )
 from scp_sdk.media import (
     activate_session as media_activate_session,
@@ -154,29 +125,15 @@ from scp_sdk.media import (
 from scp_sdk.media import (
     verify_sender_attribution as media_verify_sender_attribution,
 )
-from scp_sdk.provenance import (
-    attach as provenance_attach,
-)
-from scp_sdk.provenance import (
-    check_chain_depth,
-    evaluate_provenance_quality,
-)
-from scp_sdk.scp import SCP
+from scp_sdk.scp import SCP, InMemoryStorage, McpAllowlistState, SqliteStorage, StorageConfig
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
 from scp_sdk.tools import (
     TestVector,
     ToolCost,
     ToolDefinition,
-    interface_accept,
-    interface_expose,
-    interface_revoke,
-    invoke_cross_context,
-    session_close,
-    session_create,
-    session_invoke,
 )
-from scp_sdk.transport import TransportConfig, TransportStatus, connect_relay, relay_status
+from scp_sdk.transport import TransportConfig, TransportStatus
 from scp_sdk.trust import (
     PARTICIPATION_FACT_VARIANTS,
     PARTICIPATION_THRESHOLD_OPERATORS,
@@ -190,8 +147,6 @@ from scp_sdk.trust import (
     ParticipationThreshold,
     RequireParticipation,
     TrustEvaluation,
-    aggregate_trust_input,
-    evaluate_trust,
     verify_participation_requirements,
 )
 from scp_sdk.types import (
@@ -210,7 +165,7 @@ from scp_sdk.types import (
     ShadowStatus,
     SourceType,
 )
-from scp_sdk.ucan import UcanToken, delegate, mint, revoke, validate
+from scp_sdk.ucan import UcanToken
 
 __version__ = "0.1.0"
 
@@ -238,11 +193,12 @@ __all__ = [
     "DiscoveryMethod",
     "Endorsement",
     "Event",
-    "EventLog",
     "GovernanceActionResult",
     "Identity",
     "IdentityAttestation",
     "IdentityError",
+    "InMemoryStorage",
+    "McpAllowlistState",
     "McpClient",
     "McpProvenance",
     "McpServer",
@@ -269,8 +225,11 @@ __all__ = [
     "ScpIdChallenge",
     "ScpIdResponse",
     "ShadowStatus",
+    "SignedCheckpoint",
     "SiteConfig",
     "SourceType",
+    "SqliteStorage",
+    "StorageConfig",
     "TestVector",
     "ToolCost",
     "ToolDefinition",
@@ -283,46 +242,16 @@ __all__ = [
     "UcanToken",
     "ValidationError",
     "__version__",
-    "add_checkpoint_cosignature",
-    "aggregate_trust_input",
-    "antispam_escalated_cost",
-    "antispam_record",
-    "antispam_velocity",
-    "apply_pending_ceiling_modification",
-    "approve_governance_proposal",
     "auto_accept_blocked",
     "bridge_evaluate_trust",
     "bridge_register",
-    "budget_grant",
-    "budget_record_spend",
-    "budget_remaining",
-    "check_chain_depth",
     "check_media_capability",
     "check_policy_lock",
     "classify_offline",
-    "configure_stdio_allowlist",
-    "connect_relay",
-    "create_governance_checkpoint",
     "create_query",
-    "create_shadow",
-    "delegate",
-    "disable_stdio_allowlist",
-    "discover",
     "estimate_cost",
     "evaluate_formula",
-    "evaluate_provenance_quality",
-    "evaluate_trust",
-    "execute_governance_action",
-    "finalize_close",
-    "get_governance_proposal",
     "get_policy",
-    "get_stdio_allowlist",
-    "handle_ttl_expiry",
-    "interface_accept",
-    "interface_expose",
-    "interface_revoke",
-    "invoke_cross_context",
-    "list_governance_proposals",
     "media_activate_session",
     "media_create_answer",
     "media_create_ice_candidate",
@@ -333,37 +262,12 @@ __all__ = [
     "media_join_session",
     "media_send_signaling",
     "media_verify_sender_attribution",
-    "mint",
     "normalize_address",
     "parse_address",
     "policy_requires_payment",
-    "propose_governance_action",
-    "propose_ttl_extension",
-    "provenance_attach",
-    "register_tool_handler",
-    "registry_cleanup",
-    "registry_stats",
-    "reject_governance_proposal",
-    "relay_status",
-    "reset_stdio_allowlist",
-    "reset_ttl_timer",
-    "restore_all_contexts",
-    "restore_context",
-    "resume",
-    "revoke",
     "run_sync",
-    "scpid_challenge",
-    "scpid_sign",
-    "scpid_verify",
-    "serve_mcp",
-    "session_close",
-    "session_create",
-    "session_invoke",
-    "suspend",
-    "validate",
     "validate_admission",
     "validate_broadcast_key_hex",
     "validate_policy_change",
     "verify_participation_requirements",
-    "withdraw_governance_vote",
 ]

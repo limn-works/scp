@@ -1,46 +1,59 @@
-"""Basic messaging: create identity, create context, send and receive messages."""
+"""Basic messaging: create identity, create context, send and receive messages.
+
+Post-Phase-4 (#1549, ADR-048): every SDK call routes through an explicit
+:class:`scp_sdk.SCP` instance. Construct one at process start, call
+:meth:`SCP.identity_create` / :meth:`SCP.context_create` / etc., and let
+the ``with`` block drain in-flight work via ``scp.shutdown()`` on exit.
+"""
 
 import asyncio
 
-from scp_sdk import Context, Identity
+from scp_sdk import SCP
 from scp_sdk.types import Capability, CustodyType, MemoryScope
 
 
 async def main() -> None:
-    # Create two identities (in_memory custody for examples)
-    alice = await Identity.create(custody=CustodyType.IN_MEMORY)
-    bob = await Identity.create(custody=CustodyType.IN_MEMORY)
-    print(f"Alice DID: {alice.did}")
-    print(f"Bob DID: {bob.did}")
+    with SCP() as scp:
+        # Create two identities (in_memory custody for examples).
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        print(f"Alice DID: {alice.did}")
+        print(f"Bob DID: {bob.did}")
 
-    # Alice creates a context
-    async with await Context.create(
-        creator=alice,
-        ceiling=[Capability.MESSAGES_READ, Capability.MESSAGES_WRITE, Capability.MEMBER_INVITE],
-        memory_scope=MemoryScope.EPHEMERAL,
-        governance="single_admin",
-        ttl=3600.0,
-    ) as ctx:
+        # Alice creates a context.
+        ctx = await scp.context_create(
+            alice.did,
+            {
+                "ceiling": [
+                    Capability.MESSAGES_READ.value,
+                    Capability.MESSAGES_WRITE.value,
+                    Capability.MEMBER_INVITE.value,
+                ],
+                "memory_scope": MemoryScope.EPHEMERAL.value,
+                "governance": "single_admin",
+                "ttl": 3600.0,
+            },
+        )
         print(f"Context ID: {ctx.context_id}")
 
-        # Bob joins the context (admin adds bob via the context instance)
-        membership = await ctx.join(bob)
-        print(f"Bob joined as: {membership.role}")
+        # Bob joins the context.
+        await scp.context_join(ctx._raw_handle, bob.did)
+        print(f"Bob joined: {bob.did}")
 
-        # Alice sends a message
-        await ctx.send(b"Hello Bob, this is Alice")
+        # Alice sends a message.
+        await scp.context_send(ctx._raw_handle, alice.did, b"Hello Bob, this is Alice")
 
-        # Bob receives it
-        receiver = await ctx.receive()
+        # Bob receives it.
+        receiver = await scp.context_receive(ctx._raw_handle)
         async for msg in receiver:
-            print(f"Bob received from {msg.sender_did}: {msg.content!r}")
+            print(f"Bob received from {msg.sender_did}: {msg.payload!r}")
             break
 
-        # Bob leaves
-        await ctx.leave(bob)
+        # Bob leaves.
+        await scp.context_leave(ctx._raw_handle, bob.did)
 
-        # Alice closes the context
-        await ctx.close(alice)
+        # Alice closes the context.
+        await scp.context_close(ctx._raw_handle, alice.did)
 
 
 if __name__ == "__main__":

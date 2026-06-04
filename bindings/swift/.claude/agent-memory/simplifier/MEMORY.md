@@ -1,0 +1,1 @@
+- [Fixed-byte validation scattering](feedback_fixed_byte_validation.md) — "must be exactly 32 bytes" pattern recurs 20+ times across scp-ffi bridges; prime candidate for `scp_ffi_common::validate::try_array_bytes<N>` helper.

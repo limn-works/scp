@@ -1,5 +1,7 @@
 # Backend Agent Memory (scoped)
 
+- [project-adr049-main-merge-pyo3](project_adr049_main_merge_pyo3.md) — origin/main→actor MERGE, conflict-resolution recipe + 19-op dispatch MAP. PyO3 GREEN + NAPI GREEN (cargo check -p scp-ffi-napi = 0 err/warn; context.rs 77 hunks + runtime.rs:563 + bridge_runtime.rs variant fix, git-add'd, mid-merge). NAPI gotchas: HEAD free-fn → main `_on(bi,...)` shape (public #[napi] live in scp.rs); custody.as_ref() not &custody.0; ProtocolRepoVariant::InMemory→Arc<BridgeInMemoryRepo> (UniFFI needs same fix). Remaining: UniFFI bridge. SOLE upstream gate blocker = scp-platform/src/sqlite/mod.rs (passphrase-vs-fs2 union).
+
 - [project-adr-049-commit-4](project_adr_049_commit_4.md) — active work: ADR-049 actor-per-context, commit 4 (new traits + prod impls)
 - [project-adr-049-phase-2a8-governance](project_adr_049_phase_2a8_governance.md) — Phase 2A.8 governance multi-commit ladder: scaffold/strip/migrate-incrementally pattern for ~6K LOC modules
 - [project-adr-049-storage-foundation-step1](project_adr_049_storage_foundation_step1.md) — storage-foundation Step 1 (commit e8975ce05): mls_storage provider, build_actor_deps self-source, pub(in crate::context) test relocation, --no-verify mid-ladder, bridge worklist for Steps 2-4

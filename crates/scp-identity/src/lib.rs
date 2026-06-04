@@ -48,9 +48,9 @@ pub use attestation::{
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
-    DidDht, InMemorySequenceStore, PostResolveHook, SequenceStore, decode_multibase_key,
-    did_from_ed25519_public_key, extract_public_key, verify_bep44_signature, verify_migration,
-    verify_self_certification,
+    DidDht, InMemorySequenceStore, MigrationOutcome, MigrationPartialState, MigrationResumePhase,
+    PostResolveHook, SequenceStore, decode_multibase_key, did_from_ed25519_public_key,
+    extract_public_key, verify_bep44_signature, verify_migration, verify_self_certification,
 };
 // SigningKeyId re-exported from scp-primitives (see pub use above).
 pub use dht_client::{DhtClient, InMemoryDhtClient};
@@ -69,7 +69,7 @@ pub use resolver::{
 
 use serde::{Deserialize, Serialize};
 
-use scp_platform::traits::{KeyCustody, KeyHandle};
+use scp_platform::traits::{KeyCustody, KeyHandle, PreRotationCustody, PreRotationKeyHandle};
 
 // Re-export DID and SigningKeyId from scp-primitives for backward compatibility.
 pub use scp_primitives::{DID, SigningKeyId};
@@ -83,7 +83,13 @@ pub use scp_primitives::{DID, SigningKeyId};
 /// document as a `PreRotationCommitment` service.
 ///
 /// See ADR-003 acceptance criterion 1 and ADR-039 for the full construction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented manually to redact opaque [`KeyHandle`] slot
+/// indices: leaking them via logs/traces enables cross-identity
+/// correlation (ordering of key creation across identities sharing a
+/// custody) without revealing key material. The DID and commitment
+/// hash are public values, so they print verbatim.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ScpIdentity {
     /// `did:dht` Identity Key (`#0`). Derives the DID string. Stored in
     /// highest-security custody (Secure Enclave, HSM). Used ONLY for DID
@@ -103,10 +109,49 @@ pub struct ScpIdentity {
 
     /// SHA-256 hash of the next Identity Key's public key.
     /// Published in DID document as a `PreRotationCommitment` service.
+    ///
+    /// The corresponding pre-rotation private key is held in a separate
+    /// [`PreRotationCustody`](scp_platform::PreRotationCustody) instance
+    /// — never in operational [`KeyCustody`] alongside `identity_key` or
+    /// `active_signing_key`. Per spec §9.7.4.1 step 3 ("storage isolation")
+    /// the pre-rotation key MUST be on a separate custody provider /
+    /// authentication flow from daily operations, so that compromise of
+    /// the operational custody path does not compromise the recovery path.
+    ///
+    /// **Snapshot semantics — not authoritative for verification.** This
+    /// field is captured at `create_identity` / `migrate_identity` time
+    /// and is a convenience cache only. The authoritative source for
+    /// migration verification is the `PreRotationCommitment` service
+    /// entry on the published [`DidDocument`](crate::DidDocument)
+    /// (consulted by [`crate::dht::verify_migration`]). If a future SDK
+    /// path were to mutate pre-rotation custody outside
+    /// `migrate_identity` and the cached value drifted from the
+    /// document, the document is canonical — verifiers MUST consult
+    /// the document service entry, not this snapshot.
     pub pre_rotation_commitment: [u8; 32],
 
     /// The DID string: `did:dht:z<z-base-32(identity_key.public)>`.
     pub did: String,
+}
+
+impl std::fmt::Debug for ScpIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScpIdentity")
+            .field("did", &self.did)
+            .field("identity_key", &"KeyHandle(<redacted>)")
+            .field("active_signing_key", &"KeyHandle(<redacted>)")
+            .field(
+                "agent_signing_key",
+                &self
+                    .agent_signing_key
+                    .map_or("None", |_| "KeyHandle(<redacted>)"),
+            )
+            .field(
+                "pre_rotation_commitment",
+                &format_args!("{}", hex::encode(self.pre_rotation_commitment)),
+            )
+            .finish()
+    }
 }
 
 /// Errors produced by identity operations.
@@ -119,6 +164,15 @@ pub enum IdentityError {
     /// A platform key custody operation failed.
     #[error("platform error: {0}")]
     Platform(#[from] scp_platform::PlatformError),
+
+    /// A pre-rotation custody operation failed.
+    ///
+    /// Distinct from [`Platform`](Self::Platform) so that callers can
+    /// distinguish a daily-operations custody failure from a recovery-path
+    /// failure — the two surfaces have different SDK UX implications
+    /// (re-authenticate vs. re-prompt for the cold-storage substrate).
+    #[error("pre-rotation custody error: {0}")]
+    PreRotation(#[from] scp_platform::PreRotationCustodyError),
 
     /// The DID string has an invalid format.
     #[error("invalid DID format: {0}")]
@@ -209,6 +263,91 @@ pub enum IdentityError {
         /// The maximum allowed.
         max: usize,
     },
+
+    /// A DHT publish step inside [`DidDht::migrate_identity`](crate::dht::DidDht::migrate_identity)
+    /// failed AFTER the irreversible cold-custody mutation (step 5
+    /// `destroy_after_migration`) — meaning the caller cannot simply
+    /// re-invoke `migrate_identity`. The carried
+    /// [`MigrationPartialState`](crate::dht::MigrationPartialState) is the
+    /// byte-identical artifact set needed by
+    /// [`DidDht::resume_migration_publish`](crate::dht::DidDht::resume_migration_publish)
+    /// to finish the migration without re-deriving keys.
+    ///
+    /// `partial` is boxed to keep [`IdentityError`]'s size bounded — the
+    /// partial state holds two full identities, two documents, and a
+    /// rotation event, which would otherwise inflate every `Err` path in
+    /// the crate.
+    #[error("migration publish failed at {phase:?}: {source}")]
+    MigrationPublishFailed {
+        /// Which publish step failed; dictates which steps the resume
+        /// path must re-run.
+        phase: MigrationResumePhase,
+        /// The recovery handle — pass to
+        /// [`DidDht::resume_migration_publish`](crate::dht::DidDht::resume_migration_publish)
+        /// to finish the migration. Boxed to keep [`IdentityError`] size
+        /// bounded; the partial state aggregates two full identities,
+        /// two documents, the rotation event, and a pre-rotation handle.
+        partial: Box<crate::dht::MigrationPartialState>,
+        /// The underlying publish failure (DHT, relay, or sequence-store
+        /// error). Boxed for `IdentityError` size, and surfaced via
+        /// [`std::error::Error::source`] so callers can drill into the
+        /// root cause.
+        #[source]
+        source: Box<Self>,
+    },
+}
+
+impl IdentityError {
+    /// Borrows the partial state from a
+    /// [`IdentityError::MigrationPublishFailed`] variant. Returns
+    /// `None` for any other variant.
+    ///
+    /// Useful when a caller bubbled the error up through `?` and only
+    /// wants to peek at the recovery handle without destructuring the
+    /// `IdentityError` enum manually (for example, to log the in-flight
+    /// migration's old/new DID strings via
+    /// [`crate::dht::MigrationPartialState::old_did`] and
+    /// [`crate::dht::MigrationPartialState::new_did`]).
+    ///
+    /// For owning access — needed when calling
+    /// [`crate::dht::DidDht::resume_migration_publish`] — use
+    /// [`Self::into_migration_partial`] instead.
+    #[must_use]
+    pub fn as_migration_partial(&self) -> Option<&crate::dht::MigrationPartialState> {
+        match self {
+            Self::MigrationPublishFailed { partial, .. } => Some(partial),
+            _ => None,
+        }
+    }
+
+    /// Consumes this error, returning the owned partial state when the
+    /// variant is [`IdentityError::MigrationPublishFailed`]. Otherwise
+    /// returns the original error verbatim in the `Err` arm so the
+    /// caller can re-propagate it.
+    ///
+    /// This is the idiomatic shape for handing a recovery handle to
+    /// [`crate::dht::DidDht::resume_migration_publish`], which consumes
+    /// the partial state by value:
+    ///
+    /// ```ignore
+    /// match err.into_migration_partial() {
+    ///     Ok(partial) => dht.resume_migration_publish(partial, &custody).await?,
+    ///     Err(other) => return Err(other),
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` if the variant is not
+    /// [`IdentityError::MigrationPublishFailed`] — the original error is
+    /// returned unchanged so callers can re-propagate without
+    /// allocating a fresh wrapper.
+    pub fn into_migration_partial(self) -> Result<crate::dht::MigrationPartialState, Self> {
+        match self {
+            Self::MigrationPublishFailed { partial, .. } => Ok(*partial),
+            other => Err(other),
+        }
+    }
 }
 
 /// Abstract trait for DID method implementations.
@@ -227,15 +366,27 @@ pub enum IdentityError {
 pub trait DidMethod: Send + Sync {
     /// Creates a new identity with three Ed25519 keypairs.
     ///
-    /// Generates the Identity Key, Active Signing Key, and Pre-Rotation Key
-    /// via the provided [`KeyCustody`] implementation. Returns the
-    /// [`ScpIdentity`] handle and the constructed [`DidDocument`].
+    /// Generates the Identity Key and Active Signing Key in the operational
+    /// `key_custody`. Generates an ephemeral pre-rotation keypair, hashes
+    /// the public key as the `PreRotationCommitment`, hands the private
+    /// bytes off to the cold-storage `pre_rotation_custody`, and discards
+    /// the operational copy (spec §9.7.4.1 §1, §5(a), §5(f)). The two
+    /// custodies MUST be distinct instances on distinct substrates per
+    /// §9.7.4.1 §3 (storage isolation).
+    ///
+    /// Returns the [`ScpIdentity`] handle, the constructed [`DidDocument`],
+    /// and the [`PreRotationKeyHandle`] referencing the cold-stored
+    /// pre-rotation key. The caller persists the handle alongside the
+    /// identity so it can be presented to `migrate_identity` later.
     ///
     /// See ADR-003 acceptance criterion 1.
     fn create(
         &self,
         key_custody: &impl KeyCustody,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send;
+        pre_rotation_custody: &impl PreRotationCustody,
+    ) -> impl Future<
+        Output = Result<(ScpIdentity, DidDocument, PreRotationKeyHandle), IdentityError>,
+    > + Send;
 
     /// Verifies that a DID string is self-certifying for the given public key.
     ///

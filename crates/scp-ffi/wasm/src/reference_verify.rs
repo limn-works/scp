@@ -415,6 +415,30 @@ async fn verify_dns_record(issuer_did: &str, proof: &serde_json::Value) -> (bool
 /// console.log(result.verified); // true or false
 /// console.log(result.error);    // undefined or error string
 /// ```
+//
+// Cross-bridge parity-matrix status: WASM-only, intentionally NOT registered
+// in `scripts/bridge-aliases.json`.
+//
+// This is a live, browser-callable operation that verifies Reference-class
+// attestations by reaching external resources — the browser Fetch API for
+// `signed_post`, DNS-over-HTTPS for `dns_record`. There is no native
+// counterpart: no `reference_attestation::verify` exists in scp-protocol,
+// scp-runtime, or scp-identity. Reference verification is inherently an
+// external-resource fetch that lives at the JS bridge boundary per ADR-034
+// (the WASM bridge owns browser-runtime concerns the native bridges do not).
+// A native port would require a new upstream ADR defining a fetch/DoH verifier
+// in the core; until that exists, the operation is legitimately WASM-only.
+//
+// It is left unregistered (rather than added with an empty `pyo3` alias and a
+// pyo3/uniffi/napi exemption) because the parity-matrix harness treats PyO3 as
+// the reference bridge and requires 100% PyO3 coverage of every registered
+// canonical with NO exemption honoring on the reference side — see
+// `pyo3_bridge_covers_all_operations` and `cross_bridge_parity_matrix` in
+// `crates/scp-testing/tests/integration/ffi_conformance.rs`. Registering this
+// op would therefore break those gates. Additionally `reference_verify.rs` is
+// not among the WASM sources that harness embeds, so a `wasm:[...]` alias would
+// read as a phantom. Documenting the WASM-only nature here is the honest way to
+// surface it without subverting the reference-bridge invariant.
 #[wasm_bindgen]
 pub fn verify_reference_attestation(attestation_json: String) -> Promise {
     future_to_promise(async move {

@@ -1,15 +1,15 @@
 /**
- * Sync/offline module for the SCP TypeScript SDK.
+ * Sync/offline types for the SCP TypeScript SDK.
  *
- * Provides functions for classifying offline durations and querying
- * sync policy parameters.
+ * Defines the sync-policy wire type. The functional entry points
+ * (`classifyOffline`, `classifyOfflineCustom`, `getSyncPolicy`)
+ * moved onto the {@link SCP} class in Phase 4 PR 4 (#1549, ADR-048)
+ * as `scp.syncClassifyOffline(...)`, `scp.syncClassifyOfflineCustom(...)`,
+ * `scp.syncGetPolicy()`. The free-function shims that predated ADR-048
+ * were deleted in the same commit.
  *
  * See ADR-029 in `.docs/adrs/phase-6.md`.
  */
-
-import { mapBridgeError } from "./errors";
-import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,79 +25,4 @@ export interface SyncPolicy {
   readonly commitProcessTimeoutSecs: number;
   readonly senderKeyTimeoutSecs: number;
   readonly reconnectionDedupWindowSecs: number;
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/**
- * Classifies an offline duration into the appropriate recovery tier.
- *
- * @param lastRelayContact - Unix timestamp (seconds) of last relay contact.
- * @param now - Current Unix timestamp (seconds).
- * @returns `"short"`, `"extended"`, or `"long"`.
- */
-export async function classifyOffline(lastRelayContact: number, now: number): Promise<string> {
-  deprecatedDefaultInstance("classifyOffline");
-  try {
-    const bridge = await getBridge();
-    return bridge.syncClassifyOffline(lastRelayContact, now);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Classifies an offline duration using custom policy thresholds.
- *
- * @param lastRelayContact - Unix timestamp (seconds) of last relay contact.
- * @param now - Current Unix timestamp (seconds).
- * @param tier1ThresholdSecs - Custom upper bound for short offline tier (seconds).
- * @param tier2ThresholdSecs - Custom upper bound for extended offline tier (seconds).
- * @returns `"short"`, `"extended"`, or `"long"`.
- */
-export async function classifyOfflineCustom(
-  lastRelayContact: number,
-  now: number,
-  tier1ThresholdSecs: number,
-  tier2ThresholdSecs: number,
-): Promise<string> {
-  deprecatedDefaultInstance("classifyOfflineCustom");
-  try {
-    const bridge = await getBridge();
-    return bridge.syncClassifyOfflineCustom(
-      lastRelayContact,
-      now,
-      tier1ThresholdSecs,
-      tier2ThresholdSecs,
-    );
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Returns the default sync policy parameters.
- *
- * @returns A `SyncPolicy` with the default parameters.
- */
-export async function getSyncPolicy(): Promise<SyncPolicy> {
-  deprecatedDefaultInstance("getSyncPolicy");
-  try {
-    const bridge = await getBridge();
-    const raw = bridge.syncGetPolicy();
-    return {
-      tier1ThresholdSecs: raw.tier_1_threshold_secs,
-      tier2ThresholdSecs: raw.tier_2_threshold_secs,
-      gapTimeoutSecs: raw.gap_timeout_secs,
-      reorderBufferCapacity: raw.reorder_buffer_capacity,
-      maxSequentialCommits: raw.max_sequential_commits,
-      commitProcessTimeoutSecs: raw.commit_process_timeout_secs,
-      senderKeyTimeoutSecs: raw.sender_key_timeout_secs,
-      reconnectionDedupWindowSecs: raw.reconnection_dedup_window_secs,
-    };
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
 }

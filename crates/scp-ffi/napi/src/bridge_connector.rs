@@ -4,7 +4,7 @@
 //!
 //! - [`bridge_evaluate_trust`] -- Evaluate trust level for a bridge action.
 //! - [`bridge_register`] -- Register a bridge connector with a context.
-//! - [`bridge_create_shadow`] -- Create a shadow identity.
+//! - `bridge_create_shadow` -- Create a shadow identity.
 //!
 //! See spec section 12 (Bridge System) and ADR-023.
 
@@ -13,6 +13,7 @@ use scp_ffi_common::error_codes as codes;
 
 use napi_derive::napi;
 
+use scp_core::bridge::credentials::{BridgeCredentialStore, CredentialType};
 use scp_core::bridge::provenance::{evaluate_trust_level, mark_bridge_provenance};
 use scp_core::bridge::registration::{
     BridgeRegistrationMetadata, BridgeRegistrationRequest, BridgeRegistry, approve_registration,
@@ -24,6 +25,7 @@ use scp_core::bridge::{
 };
 use scp_core::crypto::sender_keys::SenderKeyStore;
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+use zeroize::Zeroizing;
 
 use crate::error::ScpNapiError;
 
@@ -62,6 +64,26 @@ pub struct NapiBridgeRegistration {
     pub status: String,
     /// Context the bridge is registered in.
     pub context_id: String,
+}
+
+/// Bridge credential metadata result.
+///
+/// Returned by `bridgeCredentialProvision` and `bridgeCredentialRotate`.
+/// Mirrors the `PyO3` dict (`bridge_id`, `credential_type`, `created_at`) and
+/// the `BridgeCredential` metadata exposed by the credential store. The
+/// encrypted credential bytes never cross the FFI boundary — only metadata.
+#[napi(object)]
+pub struct NapiBridgeCredential {
+    /// The bridge instance this credential belongs to.
+    pub bridge_id: String,
+    /// The credential type string (e.g. `"ApiKey"`, `"OAuthAccessToken"`,
+    /// `"Custom:<name>"`).
+    pub credential_type: String,
+    /// Unix timestamp (seconds) when the credential was created.
+    ///
+    /// `i64` because napi-rs `number` cannot represent the full `u64` range;
+    /// credential timestamps are well within the safe-integer range.
+    pub created_at: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,12 +186,13 @@ pub fn bridge_register(
 
     let parsed_platform_key = platform_key
         .map(|k| {
-            <[u8; 32]>::try_from(k.as_slice()).map_err(|_| {
-                napi::Error::from(ScpNapiError::Validation {
-                    message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
-                    code: codes::VALID_7052.to_owned(),
+            scp_ffi_common::validate::expect_fixed_bytes::<32>(k.as_slice(), "platform_key")
+                .map_err(|msg| {
+                    napi::Error::from(ScpNapiError::Validation {
+                        message: msg,
+                        code: codes::VALID_7052.to_owned(),
+                    })
                 })
-            })
         })
         .transpose()?;
 
@@ -222,14 +245,14 @@ pub fn bridge_register(
     })
 }
 
-/// Creates a shadow identity for an external platform participant.
+/// Per-bridge-instance implementation of `bridge_create_shadow`.
 ///
 /// Uses the persistent per-context `ShadowRegistry` and `SenderKeyStore`
-/// from the process-global bridge state registry, ensuring that shadow
-/// identity state and sender keys survive across function calls.
-#[napi]
+/// from `bi`, ensuring shadow identity state and sender keys survive across
+/// calls for a given `Scp` instance.
 #[allow(clippy::needless_pass_by_value)]
-pub fn bridge_create_shadow(
+pub(crate) fn bridge_create_shadow_on(
+    bi: &crate::runtime::NapiBridgeInstance,
     bridge_id: String,
     platform_handle: String,
     bridge_mode: String,
@@ -249,8 +272,8 @@ pub fn bridge_create_shadow(
         timestamp: 0,
     };
 
-    let bi = crate::runtime::bridge_instance()?;
     let mut entry = bi
+        .core
         .bridge_state()
         .entry(ctx_id.clone())
         .or_insert_with(|| BridgeContextState {
@@ -281,8 +304,250 @@ pub fn bridge_create_shadow(
 }
 
 // ---------------------------------------------------------------------------
+// Credential store operations (§12.11)
+//
+// Per-bridge-instance helpers mirroring the PyO3 `*_impl` functions in
+// `crates/scp-ffi/src/bridge_connector.rs`. Each resolves the credential
+// store from `bi.credential_store()` and drives the async
+// `BridgeCredentialStore` trait via the shared tokio runtime
+// (`crate::runtime().block_on(...)`) — the napi-rs worker thread has no
+// ambient tokio context, matching the recovery/migration `block_on` pattern.
+// ---------------------------------------------------------------------------
+
+/// Per-instance implementation of `bridgeCredentialProvision`.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn bridge_credential_provision_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    bridge_id: String,
+    credential_type: String,
+    plaintext: Vec<u8>,
+    bridge_credential_key: Vec<u8>,
+) -> napi::Result<NapiBridgeCredential> {
+    let ct = parse_credential_type(&credential_type)?;
+    let key_bytes = parse_credential_key_bytes(&bridge_credential_key)?;
+    let store = bi.credential_store();
+
+    let credential = crate::runtime()
+        .block_on(store.provision(&bridge_id, ct, &plaintext, &key_bytes))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("credential provision failed: {e}"),
+                code: codes::CTX_2105.to_owned(),
+            })
+        })?;
+
+    Ok(credential_to_napi(&credential))
+}
+
+/// Per-instance implementation of `bridgeCredentialRetrieve`.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn bridge_credential_retrieve_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    bridge_id: String,
+    credential_type: String,
+    bridge_credential_key: Vec<u8>,
+) -> napi::Result<Vec<u8>> {
+    let ct = parse_credential_type(&credential_type)?;
+    let key_bytes = parse_credential_key_bytes(&bridge_credential_key)?;
+    let store = bi.credential_store();
+
+    let plaintext = crate::runtime()
+        .block_on(store.retrieve(&bridge_id, &ct, &key_bytes))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("credential retrieve failed: {e}"),
+                code: codes::CTX_2106.to_owned(),
+            })
+        })?;
+
+    Ok(plaintext.to_vec())
+}
+
+/// Per-instance implementation of `bridgeCredentialRotate`.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn bridge_credential_rotate_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    bridge_id: String,
+    credential_type: String,
+    new_plaintext: Vec<u8>,
+    bridge_credential_key: Vec<u8>,
+) -> napi::Result<NapiBridgeCredential> {
+    let ct = parse_credential_type(&credential_type)?;
+    let key_bytes = parse_credential_key_bytes(&bridge_credential_key)?;
+    let store = bi.credential_store();
+
+    let credential = crate::runtime()
+        .block_on(store.rotate(&bridge_id, &ct, &new_plaintext, &key_bytes))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("credential rotate failed: {e}"),
+                code: codes::CTX_2107.to_owned(),
+            })
+        })?;
+
+    Ok(credential_to_napi(&credential))
+}
+
+/// Per-instance implementation of `bridgeCredentialRevoke`.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn bridge_credential_revoke_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    bridge_id: String,
+) -> napi::Result<()> {
+    let store = bi.credential_store();
+
+    crate::runtime()
+        .block_on(store.revoke(&bridge_id))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("credential revoke failed: {e}"),
+                code: codes::CTX_2108.to_owned(),
+            })
+        })?;
+
+    Ok(())
+}
+
+/// Per-instance implementation of `bridgeCredentialList`.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn bridge_credential_list_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    bridge_id: String,
+) -> napi::Result<Vec<String>> {
+    let store = bi.credential_store();
+
+    let types = crate::runtime()
+        .block_on(store.list(&bridge_id))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("credential list failed: {e}"),
+                code: codes::CTX_2109.to_owned(),
+            })
+        })?;
+
+    Ok(types.iter().map(std::string::ToString::to_string).collect())
+}
+
+/// Per-instance implementation of `bridgeCredentialStoreKey`.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn bridge_credential_store_key_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    bridge_id: String,
+    key: Vec<u8>,
+) -> napi::Result<()> {
+    let key_bytes = parse_credential_key_bytes(&key)?;
+    let store = bi.credential_store();
+
+    crate::runtime()
+        .block_on(store.store_bridge_credential_key(&bridge_id, key_bytes))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("credential key store failed: {e}"),
+                code: codes::CTX_2111.to_owned(),
+            })
+        })?;
+
+    Ok(())
+}
+
+/// Per-instance implementation of `bridgeCredentialGetKey`.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn bridge_credential_get_key_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    bridge_id: String,
+) -> napi::Result<Vec<u8>> {
+    let store = bi.credential_store();
+
+    let key = crate::runtime()
+        .block_on(store.get_bridge_credential_key(&bridge_id))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("credential key retrieval failed: {e}"),
+                code: codes::CTX_2112.to_owned(),
+            })
+        })?;
+
+    Ok(key.to_vec())
+}
+
+/// Per-instance implementation of `bridgeCredentialDeleteKey`.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn bridge_credential_delete_key_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    bridge_id: String,
+) -> napi::Result<()> {
+    let store = bi.credential_store();
+
+    crate::runtime()
+        .block_on(store.delete_bridge_credential_key(&bridge_id))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("credential key deletion failed: {e}"),
+                code: codes::CTX_2113.to_owned(),
+            })
+        })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Maps a `scp-core` [`scp_core::bridge::credentials::BridgeCredential`] to
+/// the FFI metadata result. The encrypted bytes are intentionally dropped —
+/// only non-secret metadata crosses the boundary.
+fn credential_to_napi(
+    credential: &scp_core::bridge::credentials::BridgeCredential,
+) -> NapiBridgeCredential {
+    NapiBridgeCredential {
+        bridge_id: credential.bridge_id.clone(),
+        credential_type: credential.credential_type.to_string(),
+        // `created_at` is a Unix-seconds `u64`; well within `i64` range.
+        created_at: i64::try_from(credential.created_at).unwrap_or(i64::MAX),
+    }
+}
+
+/// Parses a credential type string into a [`CredentialType`].
+///
+/// Accepts the four standard variants plus the `Custom:<name>` prefix form,
+/// mirroring the `PyO3` `parse_credential_type` helper.
+fn parse_credential_type(s: &str) -> napi::Result<CredentialType> {
+    match s {
+        "OAuthAccessToken" => Ok(CredentialType::OAuthAccessToken),
+        "OAuthRefreshToken" => Ok(CredentialType::OAuthRefreshToken),
+        "ApiKey" => Ok(CredentialType::ApiKey),
+        "WebhookSecret" => Ok(CredentialType::WebhookSecret),
+        other => other.strip_prefix("Custom:").map_or_else(
+            || {
+                Err(ScpNapiError::Validation {
+                    message: format!(
+                        "invalid credential type '{other}': expected 'OAuthAccessToken', \
+                         'OAuthRefreshToken', 'ApiKey', 'WebhookSecret', or 'Custom:<name>'"
+                    ),
+                    code: codes::VALID_7058.to_owned(),
+                }
+                .into())
+            },
+            |name| Ok(CredentialType::Custom(name.to_owned())),
+        ),
+    }
+}
+
+/// Validates that a credential key is exactly 32 bytes and returns it
+/// wrapped in [`Zeroizing`] so the copy is zeroed on drop.
+fn parse_credential_key_bytes(key: &[u8]) -> napi::Result<Zeroizing<[u8; 32]>> {
+    <[u8; 32]>::try_from(key).map(Zeroizing::new).map_err(|_| {
+        ScpNapiError::Validation {
+            message: format!(
+                "bridge_credential_key must be exactly 32 bytes, got {}",
+                key.len()
+            ),
+            code: codes::VALID_7057.to_owned(),
+        }
+        .into()
+    })
+}
 
 fn parse_bridge_mode(s: &str) -> napi::Result<BridgeMode> {
     match s {
@@ -317,7 +582,7 @@ fn parse_shadow_status(s: &str) -> napi::Result<ShadowProvenanceStatus> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use scp_core::bridge::provenance::BridgeTrustLevel;
@@ -425,8 +690,9 @@ mod tests {
 
     #[test]
     fn create_shadow_returns_observer_role() {
-        crate::runtime::init_supervisor_for_test();
-        let result = bridge_create_shadow(
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        let result = bridge_create_shadow_on(
+            &bi,
             "bridge-1".to_owned(),
             "@user".to_owned(),
             "relay".to_owned(),
@@ -434,5 +700,221 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.attributed_role, "observer");
+    }
+
+    // -------------------------------------------------------------------
+    // Credential type parsing
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_credential_type_standard_variants() {
+        assert!(matches!(
+            parse_credential_type("OAuthAccessToken").unwrap(),
+            CredentialType::OAuthAccessToken
+        ));
+        assert!(matches!(
+            parse_credential_type("OAuthRefreshToken").unwrap(),
+            CredentialType::OAuthRefreshToken
+        ));
+        assert!(matches!(
+            parse_credential_type("ApiKey").unwrap(),
+            CredentialType::ApiKey
+        ));
+        assert!(matches!(
+            parse_credential_type("WebhookSecret").unwrap(),
+            CredentialType::WebhookSecret
+        ));
+    }
+
+    #[test]
+    fn parse_credential_type_custom() {
+        let ct = parse_credential_type("Custom:discord-bot-token").unwrap();
+        assert_eq!(ct, CredentialType::Custom("discord-bot-token".to_owned()));
+    }
+
+    #[test]
+    fn parse_credential_type_invalid() {
+        assert!(parse_credential_type("InvalidType").is_err());
+    }
+
+    #[test]
+    fn parse_credential_key_bytes_valid() {
+        let key = [42u8; 32];
+        let result = parse_credential_key_bytes(&key);
+        assert!(result.is_ok());
+        assert_eq!(*result.unwrap(), key);
+    }
+
+    #[test]
+    fn parse_credential_key_bytes_wrong_length() {
+        let key = [42u8; 16];
+        assert!(parse_credential_key_bytes(&key).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // Credential store lifecycle (per-instance store)
+    // -------------------------------------------------------------------
+
+    fn fresh_key() -> Vec<u8> {
+        vec![7u8; 32]
+    }
+
+    #[test]
+    fn credential_provision_and_retrieve_roundtrip() {
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        let bridge_id = "bridge-cred-napi-001";
+
+        let provisioned = bridge_credential_provision_on(
+            &bi,
+            bridge_id.to_owned(),
+            "ApiKey".to_owned(),
+            b"my-secret-api-key".to_vec(),
+            fresh_key(),
+        )
+        .unwrap();
+        assert_eq!(provisioned.bridge_id, bridge_id);
+        assert_eq!(provisioned.credential_type, "ApiKey");
+
+        let plaintext = bridge_credential_retrieve_on(
+            &bi,
+            bridge_id.to_owned(),
+            "ApiKey".to_owned(),
+            fresh_key(),
+        )
+        .unwrap();
+        assert_eq!(plaintext, b"my-secret-api-key");
+    }
+
+    #[test]
+    fn credential_rotate_replaces_value() {
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        let bridge_id = "bridge-cred-napi-002";
+
+        bridge_credential_provision_on(
+            &bi,
+            bridge_id.to_owned(),
+            "OAuthAccessToken".to_owned(),
+            b"old-token".to_vec(),
+            fresh_key(),
+        )
+        .unwrap();
+
+        bridge_credential_rotate_on(
+            &bi,
+            bridge_id.to_owned(),
+            "OAuthAccessToken".to_owned(),
+            b"new-token".to_vec(),
+            fresh_key(),
+        )
+        .unwrap();
+
+        let plaintext = bridge_credential_retrieve_on(
+            &bi,
+            bridge_id.to_owned(),
+            "OAuthAccessToken".to_owned(),
+            fresh_key(),
+        )
+        .unwrap();
+        assert_eq!(plaintext, b"new-token");
+    }
+
+    #[test]
+    fn credential_list_returns_types() {
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        let bridge_id = "bridge-cred-napi-003";
+
+        bridge_credential_provision_on(
+            &bi,
+            bridge_id.to_owned(),
+            "ApiKey".to_owned(),
+            b"key-val".to_vec(),
+            fresh_key(),
+        )
+        .unwrap();
+        bridge_credential_provision_on(
+            &bi,
+            bridge_id.to_owned(),
+            "WebhookSecret".to_owned(),
+            b"secret-val".to_vec(),
+            fresh_key(),
+        )
+        .unwrap();
+
+        let types = bridge_credential_list_on(&bi, bridge_id.to_owned()).unwrap();
+        assert_eq!(types.len(), 2);
+    }
+
+    #[test]
+    fn credential_revoke_destroys_all() {
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        let bridge_id = "bridge-cred-napi-004";
+
+        bridge_credential_provision_on(
+            &bi,
+            bridge_id.to_owned(),
+            "ApiKey".to_owned(),
+            b"to-be-destroyed".to_vec(),
+            fresh_key(),
+        )
+        .unwrap();
+
+        bridge_credential_revoke_on(&bi, bridge_id.to_owned()).unwrap();
+
+        let result = bridge_credential_retrieve_on(
+            &bi,
+            bridge_id.to_owned(),
+            "ApiKey".to_owned(),
+            fresh_key(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn credential_store_and_get_key_roundtrip() {
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        let bridge_id = "bridge-cred-napi-005";
+
+        bridge_credential_store_key_on(&bi, bridge_id.to_owned(), fresh_key()).unwrap();
+        let retrieved = bridge_credential_get_key_on(&bi, bridge_id.to_owned()).unwrap();
+        assert_eq!(retrieved, fresh_key());
+    }
+
+    #[test]
+    fn credential_delete_key_removes_it() {
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        let bridge_id = "bridge-cred-napi-006";
+
+        bridge_credential_store_key_on(&bi, bridge_id.to_owned(), fresh_key()).unwrap();
+        bridge_credential_delete_key_on(&bi, bridge_id.to_owned()).unwrap();
+
+        assert!(bridge_credential_get_key_on(&bi, bridge_id.to_owned()).is_err());
+    }
+
+    #[test]
+    fn credential_store_is_per_instance() {
+        let bi_a = crate::runtime::NapiBridgeInstance::new_napi();
+        let bi_b = crate::runtime::NapiBridgeInstance::new_napi();
+        let bridge_id = "bridge-cred-napi-007";
+
+        bridge_credential_provision_on(
+            &bi_a,
+            bridge_id.to_owned(),
+            "ApiKey".to_owned(),
+            b"only-in-a".to_vec(),
+            fresh_key(),
+        )
+        .unwrap();
+
+        // Instance B has its own store — the credential is not visible.
+        let result = bridge_credential_retrieve_on(
+            &bi_b,
+            bridge_id.to_owned(),
+            "ApiKey".to_owned(),
+            fresh_key(),
+        );
+        assert!(
+            result.is_err(),
+            "credential provisioned on instance A must not leak into instance B"
+        );
     }
 }

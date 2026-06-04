@@ -1,16 +1,12 @@
 //! napi-rs bridge for media operations.
 //!
-//! Exposes SCP media session lifecycle and signaling to Node.js/Bun:
-//!
-//! - Session lifecycle: [`media_initiate_session`], [`media_activate_session`],
-//!   [`media_join_session`], [`media_end_session`]
-//! - Signaling: [`media_create_offer`], [`media_create_answer`],
-//!   [`media_create_ice_candidate`], [`media_create_session_end`],
-//!   [`media_send_signaling`], [`media_verify_sender_attribution`]
+//! Per-bridge-instance (`_on`) implementations consumed by the corresponding
+//! methods on [`crate::scp::Scp`]. Phase D (#1695) deleted the
+//! free-function wrappers that routed through the process-global default
+//! bridge instance.
 //!
 //! See ADR-024 in `.docs/adrs/phase-5.md`.
 
-use napi_derive::napi;
 use scp_ffi_common::error_codes as codes;
 
 use scp_media::session::{
@@ -23,6 +19,7 @@ use scp_media::signaling::{
 };
 
 use crate::error::ScpNapiError;
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -88,11 +85,15 @@ fn session_to_json(session: &MediaSession) -> napi::Result<String> {
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
-/// Checks that a media capability is present in the context's capability ceiling.
+/// Per-bridge-instance implementation of `media_check_capability`.
 ///
-/// Returns `true` if the capability is present.
-#[napi]
-pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> napi::Result<bool> {
+/// Media capability validation is pure — the `bi` parameter is carried for
+/// `_on` helper shape symmetry with the rest of the bridge.
+pub(crate) fn media_check_capability_on(
+    _bi: &NapiBridgeInstance,
+    ceiling: Vec<String>,
+    capability: String,
+) -> napi::Result<bool> {
     let cap = parse_media_capability(&capability)?;
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
@@ -102,12 +103,10 @@ pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> napi:
     Ok(true)
 }
 
-/// Initiates a media session after validating capabilities against the ceiling.
-///
-/// Returns a JSON string with session fields.
-#[napi]
+/// Per-bridge-instance implementation of `media_initiate_session`.
 #[allow(clippy::too_many_arguments)]
-pub fn media_initiate_session(
+pub(crate) fn media_initiate_session_on(
+    _bi: &NapiBridgeInstance,
     context_id: String,
     ceiling: Vec<String>,
     capabilities: Vec<String>,
@@ -142,11 +141,11 @@ pub fn media_initiate_session(
     session_to_json(&session)
 }
 
-/// Activates a media session (transitions from Initiating to Active).
-///
-/// Takes a JSON string representing the session and returns the updated session.
-#[napi]
-pub fn media_activate_session(session_json: String) -> napi::Result<String> {
+/// Per-bridge-instance implementation of `media_activate_session`.
+pub(crate) fn media_activate_session_on(
+    _bi: &NapiBridgeInstance,
+    session_json: String,
+) -> napi::Result<String> {
     let mut session: MediaSession = serde_json::from_str(&session_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid session JSON: {e}"),
@@ -158,11 +157,12 @@ pub fn media_activate_session(session_json: String) -> napi::Result<String> {
     session_to_json(&session)
 }
 
-/// Adds a participant to a media session.
-///
-/// Takes a JSON string and returns the updated session.
-#[napi]
-pub fn media_join_session(session_json: String, participant_did: String) -> napi::Result<String> {
+/// Per-bridge-instance implementation of `media_join_session`.
+pub(crate) fn media_join_session_on(
+    _bi: &NapiBridgeInstance,
+    session_json: String,
+    participant_did: String,
+) -> napi::Result<String> {
     let mut session: MediaSession = serde_json::from_str(&session_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid session JSON: {e}"),
@@ -174,11 +174,12 @@ pub fn media_join_session(session_json: String, participant_did: String) -> napi
     session_to_json(&session)
 }
 
-/// Ends a media session and returns metadata for event log recording.
-///
-/// Returns a JSON string with `session` and `metadata` keys.
-#[napi]
-pub fn media_end_session(session_json: String, timestamp: f64) -> napi::Result<String> {
+/// Per-bridge-instance implementation of `media_end_session`.
+pub(crate) fn media_end_session_on(
+    _bi: &NapiBridgeInstance,
+    session_json: String,
+    timestamp: f64,
+) -> napi::Result<String> {
     let mut session: MediaSession = serde_json::from_str(&session_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid session JSON: {e}"),
@@ -221,11 +222,9 @@ pub fn media_end_session(session_json: String, timestamp: f64) -> napi::Result<S
 // Signaling
 // ---------------------------------------------------------------------------
 
-/// Creates an SDP offer signaling message.
-///
-/// Returns a JSON string with `session_id` and `message` keys.
-#[napi]
-pub fn media_create_offer(
+/// Per-bridge-instance implementation of `media_create_offer`.
+pub(crate) fn media_create_offer_on(
+    _bi: &NapiBridgeInstance,
     session_id: String,
     sdp: String,
     sender_did: String,
@@ -256,11 +255,9 @@ pub fn media_create_offer(
     })
 }
 
-/// Creates an SDP answer signaling message.
-///
-/// Returns a JSON string with `session_id` and `message` keys.
-#[napi]
-pub fn media_create_answer(
+/// Per-bridge-instance implementation of `media_create_answer`.
+pub(crate) fn media_create_answer_on(
+    _bi: &NapiBridgeInstance,
     session_id: String,
     sdp: String,
     sender_did: String,
@@ -291,12 +288,10 @@ pub fn media_create_answer(
     })
 }
 
-/// Creates an ICE candidate signaling message.
-///
-/// Returns a JSON string with `session_id` and `message` keys.
-#[napi]
+/// Per-bridge-instance implementation of `media_create_ice_candidate`.
 #[allow(clippy::too_many_arguments)]
-pub fn media_create_ice_candidate(
+pub(crate) fn media_create_ice_candidate_on(
+    _bi: &NapiBridgeInstance,
     session_id: String,
     candidate: String,
     sender_did: String,
@@ -337,11 +332,12 @@ pub fn media_create_ice_candidate(
     })
 }
 
-/// Creates a session-end signaling message.
-///
-/// Returns a JSON string with `session_id` and `message` keys.
-#[napi]
-pub fn media_create_session_end(session_id: String, sender_did: String) -> napi::Result<String> {
+/// Per-bridge-instance implementation of `media_create_session_end`.
+pub(crate) fn media_create_session_end_on(
+    _bi: &NapiBridgeInstance,
+    session_id: String,
+    sender_did: String,
+) -> napi::Result<String> {
     let (sid, msg) = create_session_end(&session_id, sender_did.into());
     let msg_json = String::from_utf8(serialize_signaling(&msg).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
@@ -368,11 +364,11 @@ pub fn media_create_session_end(session_id: String, sender_did: String) -> napi:
     })
 }
 
-/// Serializes a signaling message and returns payload with message type.
-///
-/// Returns a JSON string with `payload` (base64) and `message_type` keys.
-#[napi]
-pub fn media_send_signaling(signaling_json: String) -> napi::Result<String> {
+/// Per-bridge-instance implementation of `media_send_signaling`.
+pub(crate) fn media_send_signaling_on(
+    _bi: &NapiBridgeInstance,
+    signaling_json: String,
+) -> napi::Result<String> {
     let msg = deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid signaling JSON: {e}"),
@@ -399,11 +395,9 @@ pub fn media_send_signaling(signaling_json: String) -> napi::Result<String> {
     })
 }
 
-/// Verifies that the sender DID in a signaling message matches the envelope sender.
-///
-/// Returns `true` if valid.
-#[napi]
-pub fn media_verify_sender_attribution(
+/// Per-bridge-instance implementation of `media_verify_sender_attribution`.
+pub(crate) fn media_verify_sender_attribution_on(
+    _bi: &NapiBridgeInstance,
     signaling_json: String,
     envelope_sender_did: String,
 ) -> napi::Result<bool> {
@@ -430,10 +424,17 @@ pub fn media_verify_sender_attribution(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::runtime::NapiBridgeInstance;
+
+    fn test_bi() -> NapiBridgeInstance {
+        NapiBridgeInstance::new_napi()
+    }
 
     #[test]
     fn check_capability_voice_in_ceiling() {
-        let result = media_check_capability(
+        let bi = test_bi();
+        let result = media_check_capability_on(
+            &bi,
             vec!["media:voice".to_owned(), "messages:read".to_owned()],
             "voice".to_owned(),
         );
@@ -443,23 +444,27 @@ mod tests {
 
     #[test]
     fn check_capability_missing_from_ceiling() {
-        let result = media_check_capability(vec!["messages:read".to_owned()], "voice".to_owned());
+        let bi = test_bi();
+        let result =
+            media_check_capability_on(&bi, vec!["messages:read".to_owned()], "voice".to_owned());
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_attribution_matching() {
+        let bi = test_bi();
         let (_, msg) = create_offer("s1", "v=0\r\n".into(), "did:dht:zAlice".into());
         let json = String::from_utf8(serialize_signaling(&msg).unwrap()).unwrap();
-        let result = media_verify_sender_attribution(json, "did:dht:zAlice".to_owned());
+        let result = media_verify_sender_attribution_on(&bi, json, "did:dht:zAlice".to_owned());
         assert!(result.is_ok());
     }
 
     #[test]
     fn verify_attribution_mismatch() {
+        let bi = test_bi();
         let (_, msg) = create_offer("s1", "v=0\r\n".into(), "did:dht:zAlice".into());
         let json = String::from_utf8(serialize_signaling(&msg).unwrap()).unwrap();
-        let result = media_verify_sender_attribution(json, "did:dht:zEve".to_owned());
+        let result = media_verify_sender_attribution_on(&bi, json, "did:dht:zEve".to_owned());
         assert!(result.is_err());
     }
 }

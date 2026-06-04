@@ -5,6 +5,87 @@ All notable changes to SCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-05-10
+
+### Enforcement infra hardening — PR-E (PR #1735)
+
+Five enforcement-infra improvements that close gaps surfaced in the #1543
+review series, plus the §1 cleanup the new gate identified. No protocol
+behaviour change; all changes are mechanical hardening of the bridge
+surface tests and refactoring of pure helpers per ADR-048 §1.
+
+**Internal changes only — no external SDK behaviour change** other than
+the SDK class methods listed below routing to module-level FFI exports
+internally (the SDK class shape is unchanged for TypeScript / Swift /
+Kotlin; Python continues to expose module-level functions per
+`scp_sdk.{auth,identity,provenance}` per ADR-048 §7).
+
+- **Phantom-alias scanner hardening (#26).** Bridge-symmetry alias
+  resolution now requires the candidate fn to be exported through the
+  bridge binding tooling, not merely defined in source. Both
+  `scripts/check-bridge-symmetry.sh` and the syn-based
+  `every_alias_resolves_to_a_real_fn_or_exemption` test in
+  `crates/scp-testing/tests/integration/ffi_conformance.rs` were
+  tightened. New fixture `bad-alias-undecorated-fn/`.
+- **Empty arrays for exempt bridges (#27).** 24 placeholder cells in
+  `scripts/bridge-aliases.json` (all wasm) replaced with `[]`. New invariant
+  `every_bridge_alias_array_is_non_empty_or_exempt`. (A 25th placeholder, the
+  napi `identity_migrate` cell, was instead wired to its real export — see the
+  exemption durable-provenance bullet below.)
+- **ADR-048 §1 pure-helpers mechanization (#28).** New syn-based gate
+  `pure_helpers_stay_free_fns_at_ffi_layer` flags methods with a `self`
+  receiver that never use it inside FFI-decorated impl blocks. Macro
+  bodies are walked via `proc-macro2` so `format!("{}", self.field)` is
+  correctly recognized as bound. 19 pre-existing violations cleaned up:
+  - 1 NAPI: `NapiScp::check_scoped_capability` → module-level free fn.
+  - 8 PyO3: `scpid_challenge`, `identity_verify_device_attestation`,
+    `verify_identity_link_attestation`, and 5 provenance helpers moved
+    from `#[pymethods] impl PyScp { ... }` to `#[pyfunction]` free fns
+    registered in the appropriate `register_*` hook.
+  - 10 UniFFI: `bridge_evaluate_trust`, `identity_resolve`,
+    `identity_verify_{device_attestation,link_attestation}`,
+    `sync_classify_offline{,_custom}`, `sync_get_policy`,
+    `trust_query_score`, `trust_verify_attestation`,
+    `verify_participation_requirements` moved from
+    `#[uniffi::export] impl Scp { ... }` to free fns.
+- **ADR-048 §7b cross-bridge semantic divergence registry (#29).**
+  Documents canonical operations where bridge implementations diverged in
+  semantics despite sharing the same name, and the evidence required to retire
+  an entry. Both current entries are RESOLVED (retained one release cycle to
+  flag the behavioral shift to consumers): `identity_create_link_attestation`
+  (WASM aligned to `#active` signing per spec §3.5.2) and `identity_rotate_key`
+  (WASM aligned to native active-key rotation by a later upstream change;
+  DID-migration semantics now live in WASM's separate `identity_migrate`
+  export). A single inline `// SEMANTIC DIVERGENCE` comment remains at the WASM
+  attestation call site for its retention window.
+- **Exemption durable-provenance gate.** New invariant
+  `every_exemption_reason_cites_durable_provenance` requires every
+  per-bridge exemption in `scripts/bridge-aliases.json` to justify itself
+  with an ADR (`ADR-NNN`), spec section (`§N…`), or PRD story (`SCP-NNN`).
+  Cited ADRs and SCP stories are existence-verified against `.docs/adrs/`
+  and `.docs/prds/` (a fabricated `ADR-999`/`SCP-9999` is rejected, not just
+  hand-waves); `§` sections remain shape-only. Issue/PR numbers are rejected
+  (ephemeral; policy forbids issue refs in tracked data). The gate
+  immediately caught a factually wrong exemption: `identity_migrate` was
+  marked "not yet exported (known gap)" in NAPI, but it IS exported as the
+  `Identity#migrate` instance method — the alias was simply never recorded.
+  Wired the real `migrate` alias and removed the false exemption.
+
+**Side fix:** `scripts/hooks/pretooluse-enforcement-files.sh` switched
+from suffix to exact-canonical-path matching anchored at the worktree
+root, and the enforcement-file guard was extended to `Bash` tool calls:
+best-effort detection of write verbs (`tee`/`mv`/`cp`/`sed` in-place in all
+GNU/BSD flag orderings/`python -c`) and stdout redirections (including `>|`
+force-clobber) targeting a protected basename. Reads
+(`cat`/`grep`/`jq`/`sed -n`/`node x.js file`/`python validate.py file`) are
+still allowed; CI remains the canonical gate. `check-pure-helpers.sh`,
+`pure-helpers-allowlist.txt`, and the hook script itself were registered in
+both the CLAUDE.md enforcement list and the hook's protected-paths set.
+Fixture copies of `bridge-aliases.json` no longer trigger false-positive
+blocks; symlink-bypass protection preserved. A regression matrix at
+`scripts/tests/enforcement-files-hook/run-tests.sh` locks the block/allow
+behavior and runs in CI.
+
 ## [Unreleased] - 2026-04-25
 
 ### Actor-per-context refactor (ADR-049)
@@ -41,6 +122,75 @@ References: ADR-049 §9 (coalesced persistence rule),
 `.docs/specs/17-persistence-and-storage.md` §17.15.
 
 ## [Unreleased] - 2026-04-18
+
+### `DidDht::migrate_identity` partial-publish recovery handle
+
+- **New `IdentityError::MigrationPublishFailed { phase, partial, source }` variant.** When either of `migrate_identity`'s two DHT publishes (step 7 publish-new, step 8 republish-old-with-`alsoKnownAs`) fails AFTER the irreversible cold-custody mutation at step 5 (`destroy_after_migration`), the function now returns this typed error instead of a generic `DhtPublishFailed`. The carried `Box<MigrationPartialState>` holds the byte-identical artifacts (new identity, new document, rotation event with the step-2 migration proof and pre-rotation proof, new pre-rotation handle, old identity, old document) needed to finish the migration. `MigrationPartialState` derives `Serialize`/`Deserialize` so callers can persist the recovery handle across process restarts; its fields are `pub(crate)` with read-only accessors (`phase()`, `new_did()`, `old_did()`, `rotation_event()`, `new_pre_rotation_handle()`) so the byte-parity invariant cannot be broken by field swaps.
+- **New `MigrationResumePhase` enum** (`PublishNew` | `RepublishOldAlsoKnownAs`) — identifies which publish step failed and which steps a resume call must re-run. Co-located with `MigrationPartialState` in `crate::dht`; re-exported from the crate root.
+- **New `MigrationOutcome` struct.** Replaces the prior 4-tuple return of `migrate_identity` / `resume_migration_publish` with a named struct (`new_identity`, `new_document`, `rotation_event`, `new_pre_rotation_handle`) — self-documenting at the call site, and forward-compatible: future additions (audit-log digest, attestation token) extend the struct without breaking destructuring callers.
+- **New `IdentityError::as_migration_partial(&self) -> Option<&MigrationPartialState>` and `into_migration_partial(self) -> Result<MigrationPartialState, Self>`.** Idiomatic borrowing and owning extractors on the error type itself (replaces the prior `MigrationPartialState::from_error(&IdentityError)` helper, which could only borrow). `into_migration_partial` consumes the error and returns the original error in the `Err` arm for any other variant — exactly the shape `resume_migration_publish` (which takes the partial state by value) needs.
+- **New `DidDht::resume_migration_publish(state, key_custody)` method.** Picks up exactly where `migrate_identity` left off: for `PublishNew`, re-runs step 7 + step 7b + step 8; for `RepublishOldAlsoKnownAs`, re-runs only step 8. Idempotent under BEP44 sequence monotonicity. Performs a custody-substrate pre-flight check (`public_key(&old_#0)` + `public_key(&new_#0)`) before any DHT publish so a mismatched substrate fails fast with a clean `IdentityError::Platform(KeyNotFound)` rather than a buried "publish failed at signing step." Returns a [`MigrationOutcome`] byte-identical to what a successful first-pass would have returned (spec §9.7.4.1 byte parity invariant).
+- **Bridge surface (phase 1).** Each FFI bridge (PyO3, NAPI, UniFFI) maps `MigrationPublishFailed` to the new error code `SCP-IDENT-1053` with the error message body. Structured partial-state plumbing per language idiom lands in subsequent PRs (ADR-048 §7). WASM's registry-only `identity_migrate` has no two-stage DHT publish, so the partial-publish recovery flow does not apply.
+- **Scope caveat — recovery covers DHT publish failures only.** The recovery handle is surfaced for failures at steps 7 (`publish_document(new)`) and 8 (`publish_document(old + alsoKnownAs)`). A failure between step 5's `destroy_after_migration` and the immediately-following `import_ed25519_signing_key` (e.g., a transient operational-custody fault that the step-0 probe missed) still propagates as a bare `IdentityError::Platform` with no partial state. The step-0 CSPRNG probe narrows the surface but does not eliminate it. A future `MigrationResumePhase::ImportNewIdentityKey` variant will close the window; tracked as follow-up work outside this release.
+- **Specs / ADR.** `.docs/specs/09-security-model.md` §9.7.4.1 gains a "Partial-publish recovery" paragraph (with explicit dual-reference between the spec's item-6 numbering and the code's step-5 sequence). `.docs/adrs/phase-1.md` §4b gains a forward-reference bullet. New evergreen lesson at `.docs/lessons/migration-publish-recovery-handle.md` covers the general principle ("multi-step operations that consume irreversible state mid-pipeline MUST surface a typed recovery handle"). The resume byte-parity invariant lives in spec §9.7.4.1; ADR-046 governs the sibling *cross-bridge* byte parity (seed-window order, ephemeral RNG).
+
+### Per-instance MCP stdio allowlist (PR #1725)
+
+**Security fix.** Closes a realm-local RCE-pivot vulnerability: previously, calling
+`mcp_disable_stdio_allowlist()` on any `SCP` instance unrestricted subprocess
+spawning across every other instance in the same process. The allowlist is now
+owned per-`BridgeInstance` (`CoreFields::mcp_allowlist`), so policy decisions on
+one tenant cannot leak into another. See
+`.docs/lessons/process-global-policy-state-is-realm-local-rce.md`.
+
+**Breaking changes — external SDK consumers:**
+
+- **Python:** the four module-level helpers in `scp_sdk.mcp` are deleted —
+  `configure_stdio_allowlist()`, `disable_stdio_allowlist()`,
+  `reset_stdio_allowlist()`, `get_stdio_allowlist()`. Use the per-instance
+  methods on `SCP` instead:
+  - `scp.mcp_configure_stdio_allowlist([...])`
+  - `scp.mcp_disable_stdio_allowlist(i_trust_all_commands=True)`
+  - `scp.mcp_reset_stdio_allowlist()`
+  - `scp.mcp_get_stdio_allowlist()` → `McpAllowlistState` (TypedDict)
+- **PyO3 extension (`_scp_core`):** the four `py_mcp_*_stdio_allowlist`
+  `#[pyfunction]`s are deleted and replaced by `#[pymethods]` on `PyScp`.
+  Callers reaching into `_scp_core` directly will see `AttributeError`.
+- **TypeScript:** `SCP.mcpDisableStdioAllowlist` now requires
+  `{ iTrustAllCommands: true }`; the snapshot returned by
+  `SCP.mcpGetStdioAllowlist` is a named `McpAllowlistState` interface
+  (was inline anonymous shape).
+- **Swift:** `SCP.mcpDisableStdioAllowlist(iTrustAllCommands: true)` is the
+  required call shape; throws `ScpError.Validation { code: "SCP-MCP-10010" }`
+  when the flag is omitted or false.
+- **Kotlin:** `SCP.mcpDisableStdioAllowlist(iTrustAllCommands = true)` —
+  throws `IllegalArgumentException` when the flag is omitted or false.
+- **UniFFI:** the four top-level `#[uniffi::export] pub fn mcp_*_stdio_allowlist`
+  free functions are deleted; only the per-instance methods on `Scp` remain.
+- **Rust core:** `scp_mcp::allowlist::StdioAllowlist` is now an owned `pub
+  struct` with method-form API (`new_with_defaults`, `validate_command`,
+  `configure`, `disable_enforcement(instance_id)`, `reset`, `snapshot`).
+  The process-global `OnceLock<Mutex<StdioAllowlist>>` and the
+  `AllowlistError::LockPoisoned` variant are deleted (`#[non_exhaustive]`
+  preserved).
+- **`scp-ffi-common`:** `CoreFields::mcp_allowlist`,
+  `CoreFields::with_mcp_allowlist(|a| ...)` helper, and
+  `AllowlistGuardError::Poisoned` typed error are public.
+
+Closes #1543 (PR-D in master plan). See ADR-048 §1 (multi-instance neutrality),
+the new lesson at `.docs/lessons/process-global-policy-state-is-realm-local-rce.md`,
+and the `BridgeInstanceCore` enumeration in `.docs/adrs/ADR-048-scp-multi-instance.md` §2.
+
+### Pre-rotation custody isolation + DID migration wiring
+
+- **New `PreRotationCustody` trait in `scp_platform`.** Pre-rotation private-key material now lives behind a separate trait (distinct from `KeyCustody`) and a distinct `PreRotationKeyHandle` type — `From`/`Into` between `PreRotationKeyHandle` and operational `KeyHandle` are NOT provided, so the type system rejects accidental cross-substrate handoff. Spec §9.7.4.1 §3 storage isolation is enforced at compile time. `InMemoryPreRotationCustody` is the shipped default backend; substrate isolation (FIDO2 / paper / cold callback) is a separate workstream and continues to land via `PreRotationCustody` impls without protocol churn.
+- **`DidDht::create_identity` return type changed** to `(Identity, DidDocument, PreRotationKeyHandle)`. Callers persist all three; the handle is the only reference to the pre-rotation private bytes (which never enter `ScpIdentity` itself — only the 32-byte SHA-256 commitment does), and the document is the published state callers republish to the DHT.
+- **`DidDht::migrate_identity` signature changed** to `(identity, old_document, pre_rotation_handle, pre_rotation_custody, key_custody, rotated_at) -> (Identity, DidDocument, DidRotationEvent, PreRotationKeyHandle)`. Migration consumes the OLD pre-rotation handle (returning its private bytes, which become the new `#0`) and mints a fresh pre-rotation key+commitment for the new identity.
+- **`verify_migration` signature widened** to `(old_did, old_document, new_did, migration_proof, pre_rotation_proof, rotated_at, now) -> Result<bool, IdentityError>` (was 4 args returning `bool`). Always-checked invariants (1-7, MODERATE assurance): (1) `old_document`'s `#0` verification method self-certifies to `old_did` (Step 0 precondition — rejects mismatched documents before any downstream invariant consults `old_document.pre_rotation_service()`; callers MUST supply `old_document` from a verified resolution path, see `verify_migration` rustdoc `# Caller contract`), (2) Ed25519 strict signature on the migration digest, (3) `old_public_key` self-certifies to `old_did`, (4) saturating future-skew bound (5 min) on `rotated_at`, (5) saturating past-window bound (5 years) on `rotated_at`, (6) hard epoch floor (`MIGRATION_EPOCH_FLOOR_UNIX_SECS = 1_700_000_000`, 2023-11-14 UTC) rejects pre-protocol timestamps even on a faulty verifier clock, (7) `pre_rotation_proof` MUST be `Some(_)` whenever the OLD DID document publishes a `PreRotationCommitment` service entry — STRONG assurance committed to at creation cannot be silently downgraded. Conditional invariants — applied only when `pre_rotation_proof` is `Some(_)` (STRONG assurance, 8-10): (8) `SHA-256(revealed_key) == commitment`, (9) `commitment` matches the OLD document's `PreRotationCommitment` service entry, (10) `revealed_key` self-certifies to `new_did`. See ADR-003 §4c.
+- **`MigrationProof` and `PreRotationProof` JSON wire format moved to lowercase hex** (via `serde_hex_array::array64` / `serde_hex_array::array32`). Was `serde_bytes` previously, which produced JSON-array-of-numbers output. The change aligns with the project-wide convention for cryptographic byte material and matches the WASM bridge's emitted shape.
+- **New SDK accessor: rotation event JSON** for distributing `DidRotationEvent` to active contexts after migration. Surfaced as `Identity.rotation_event_json` (Python), `BridgeIdentityHandle.rotationEventJson` (TypeScript), `Identity.rotationEventJson()` (Swift), and `Identity.rotationEventJson()` (Kotlin, surfaced through the `IdentityMigrateResult` returned by `IdentityAdvancedBridge.migrateWithRotationEvent`). The Kotlin `IdentityAdvancedBridge.migrate(handle)` overload is now `@Deprecated` because it silently drops the rotation event required by spec §3.2.1 step 4b; callers MUST switch to `migrateWithRotationEvent` and distribute the JSON to every active context (pre-context callers may discard explicitly).
+- **WASM `WasmIdentity::from_did` now enforces** zbase32 canonicality (rejects non-canonical padding), Ed25519 curve-point validity (rejects 32-byte payloads that decode to invalid public keys), and the WASM-local identity registry capacity guard (returns `[SCP-VALID-7400]` at the 10,000-DID cap rather than evicting silently).
+- **Kotlin** `IdentityAttestation.fromJsonObject` now fails closed on unrecognized `revocation_status` JSON shapes (throws `IllegalArgumentException` instead of silently defaulting to `Active`). A future Rust enum variant addition surfaces as a parse error rather than silent mis-categorization.
 
 ### Phase 4 PR 3 — Persistence + async resume + real UniFFI crypto
 

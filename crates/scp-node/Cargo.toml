@@ -32,6 +32,15 @@ ed25519-dalek = { workspace = true }
 instant-acme = "0.8"
 rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# default-features disabled to avoid quinn's `platform-verifier` feature, which
+# pulls in `aws-lc-rs` and conflicts with the rest of scp-node's ring-backed
+# rustls (a dual provider makes rustls' process-default ambiguous). We only need
+# the tokio runtime and the ring-backed rustls integration.
+quinn = { version = "0.11", optional = true, default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
 rustls-pemfile = "2"
 base64 = { workspace = true }
@@ -77,7 +86,7 @@ tempfile = "3"
 # Gates `ApplicationNodeBuilder::build_for_testing()` — accepts any `Storage`
 # backend without the `EncryptedStorage` bound. See issue #695.
 allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
-quic = ["scp-transport/quic"]
+quic = ["scp-transport/quic", "dep:quinn"]
 http3 = ["scp-transport/http3"]
 udp = ["scp-transport/udp"]
 coap = ["scp-transport/coap"]

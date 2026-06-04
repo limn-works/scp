@@ -10,8 +10,8 @@ publish = false
 [features]
 default = ["resolvers"]
 # Full resolver implementations (BridgeDidResolver, IdentityBackedDidResolver, etc.).
-# Requires scp-core, scp-identity, tokio. Disable for WASM (which only needs validate).
-resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
+# Requires scp-core, scp-identity, tokio, scp-mcp. Disable for WASM (which only needs validate).
+resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
 testing = ["resolvers"]
@@ -22,13 +22,14 @@ server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }
+scp-mcp = { path = "../../scp-mcp", optional = true }
 scp-protocol = { path = "../../scp-protocol" }
 scp-primitives = { path = "../../scp-primitives" }
 scp-event-log = { path = "../../scp-event-log", optional = true }
 scp-identity = { path = "../../scp-identity", optional = true }
 scp-transport = { path = "../../scp-transport", features = ["redb-blob"], optional = true }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
-scp-platform = { path = "../../scp-platform", features = ["encrypting"], optional = true }
+scp-platform = { path = "../../scp-platform", features = ["encrypting", "sqlite"], optional = true }
 async-trait = { workspace = true, optional = true }
 dashmap = { workspace = true }
 zeroize = { workspace = true }
@@ -38,6 +39,11 @@ hex = { workspace = true }
 z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+# `rand_core` with `getrandom` is used by the always-on
+# `generate_context_id` helper (spec §18.4.1). Compiles on every target
+# the four FFI bridges support, including `wasm32-unknown-unknown` via
+# `getrandom/js` pulled in by WASM's own dep set.
+rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }

@@ -1,5 +1,5 @@
-//! Integration tests for the `UniFFI` bridge lifecycle functions
-//! (`scp_suspend`, `scp_resume`).
+//! Integration tests for the `UniFFI` bridge lifecycle methods
+//! (`Scp::suspend` / `Scp::resume`).
 //!
 //! These tests live in a separate integration test binary so that flipping
 //! the process-wide `BridgeInstance::suspended` flag does not race with
@@ -12,38 +12,47 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use scp_ffi_uniffi::{runtime, scp_resume, scp_suspend};
+use scp_ffi_uniffi::Scp;
 
-/// Consolidated lifecycle roundtrip — suspend/resume before and after
-/// `ensure_bridge_instance`.
+/// Consolidated lifecycle roundtrip — suspend/resume roundtrips on a
+/// caller-owned `Scp` instance, exercising the idempotent paths.
 ///
 /// Consolidated into a single test to avoid cargo's parallel test runner
-/// interleaving concurrent invocations on the same global flag.
+/// interleaving concurrent invocations; although Phase D (#1695) deleted
+/// the process-wide default bridge, some shutdown bookkeeping remains
+/// process-global and parallel lifecycle tests can still race on it.
 ///
 /// Multi-threaded flavor because `resume()` now reaches into async
 /// persistence paths (`ProtocolRepositoryEventLogBridge::store_entries`
 /// uses `block_in_place`), which panic on the default current-thread
 /// runtime.
+///
+/// Phase 4 PR 4 demolition (#1549): the free-function `scp_suspend` /
+/// `scp_resume` façade exports were deleted along with the process-wide
+/// default bridge — tests now drive a freshly constructed `Scp::new()`
+/// instance through `.suspend()` / `.resume()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scp_suspend_resume_roundtrip() {
-    // Case 1: suspend / resume before any bridge init must succeed.
-    //
-    // Note: "before init" is not strictly guaranteed — a prior test in the
-    // same binary may have initialized the bridge. The guarantee we assert
-    // is that both functions succeed regardless of init state.
-    scp_suspend().expect("scp_suspend must succeed");
-    scp_resume().await.expect("scp_resume must succeed");
+    // Phase D (#1695): `Scp::default_instance` deleted — use `Scp::new()`.
+    let scp = Scp::new();
 
-    // Case 2: after ensure_bridge_instance(), suspend then resume round-trip.
-    runtime::ensure_bridge_instance();
-    scp_suspend().expect("scp_suspend after init must succeed");
-    scp_resume()
+    // Case 1: suspend/resume on a freshly-initialised instance.
+    scp.suspend().expect("scp.suspend must succeed");
+    scp.resume()
         .await
-        .expect("scp_resume after suspend must succeed");
+        .expect("scp.resume after suspend must succeed");
+
+    // Case 2: a second suspend/resume cycle still succeeds — idempotent
+    // by design.
+    scp.suspend()
+        .expect("scp.suspend after prior resume must succeed");
+    scp.resume()
+        .await
+        .expect("scp.resume after second suspend must succeed");
 
     // Case 3: double-suspend / double-resume are idempotent.
-    scp_suspend().expect("double suspend must succeed");
-    scp_suspend().expect("double suspend must succeed");
-    scp_resume().await.expect("double resume must succeed");
-    scp_resume().await.expect("double resume must succeed");
+    scp.suspend().expect("double suspend must succeed");
+    scp.suspend().expect("double suspend must succeed");
+    scp.resume().await.expect("double resume must succeed");
+    scp.resume().await.expect("double resume must succeed");
 }

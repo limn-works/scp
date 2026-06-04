@@ -35,6 +35,9 @@ pub mod backoff;
 pub mod coap;
 pub mod config;
 pub mod cover_traffic;
+pub mod discovery;
+#[cfg(all(test, feature = "quic"))]
+mod discovery_test_support;
 pub mod error;
 pub mod heartbeat;
 #[cfg(feature = "http3")]
@@ -51,8 +54,10 @@ pub mod provider;
 pub mod quic;
 pub mod relay;
 pub mod scoring;
+pub mod selection;
 #[cfg(feature = "startup")]
 pub mod startup;
+pub mod subscription;
 pub mod traits;
 #[cfg(feature = "udp")]
 pub mod udp;
@@ -67,6 +72,7 @@ pub use config::{DefaultRelayResolver, ResolveRelays, TransportConfig};
 pub use cover_traffic::{
     CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender, pad_to_bucket,
 };
+pub use discovery::{DiscoveredTransports, RelayTransportDiscovery, well_known_url};
 pub use error::TransportError;
 pub use heartbeat::{
     HeartbeatConfig, HeartbeatConfigError, HeartbeatMonitor, SuppressionSuspected,
@@ -82,4 +88,6 @@ pub use pool::{ConnectionPool, PoolKey, TransportType};
 pub use profile::{CoverTrafficTier, TransportProfile};
 pub use provider::RelayTransportProvider;
 pub use scoring::SuppressionWarning;
+pub use selection::TransportSelector;
+pub use subscription::{SubscriptionError, TransportSubscriptionMap};
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};

@@ -47,7 +47,7 @@ have been consolidated into `BridgeInstance` (see `scp-ffi-common/src/bridge_ins
 
 | Module | Delegates to | Functions |
 |--------|-------------|-----------|
-| `identity.rs` | scp-core identity | `py_init_storage`, `py_identity_create`, `py_identity_load`, `py_identity_resolve`, `py_identity_rotate_key`, `py_identity_migrate` |
+| `identity.rs` | scp-core identity | `py_identity_create`, `py_identity_load`, `py_identity_resolve`, `py_identity_rotate_key`, `py_identity_migrate` (storage attached at construction via `PyScp::with_storage`) |
 | `context.rs` | runtime registry | `py_context_create`, `py_context_join`, `py_context_leave`, `py_context_close`, `py_context_send`, `py_context_receive` |
 | `tools.rs` | scp-core tools | `py_tool_register`, `py_tool_invoke`, `py_tool_verify` |
 | `ucan.rs` | scp-core UCAN | `py_ucan_validate`, `py_ucan_mint`, `py_ucan_delegate`, `py_ucan_revoke` |
@@ -133,12 +133,13 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - **Thread leak on tool handler timeout**: When `FfiBridgeProvider::invoke_tool` times out (via `recv_timeout`), the spawned `std::thread` continues running in the background until the handler returns naturally. Rust has no mechanism to forcibly cancel a thread. The leaked thread holds an `Arc<dyn Fn>` (handler closure) and the Python GIL (for Python handlers). No DashMap locks are held (two-phase design from #122). Cooperative cancellation was rejected as unreasonable API burden for handler authors. Mitigation path if needed: process-level isolation, not in-process cancellation. See PR #170 review discussion and the doc comment in `invoke_tool` in `mcp.rs`.
 - `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
 - SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
-- **Stdio allowlist**: `StdioClientTransport::spawn` validates the command against a configurable allowlist before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Only bare binary names are accepted — paths (absolute or relative) are rejected to prevent basename-spoofing bypasses. The OS resolves the binary via `PATH`. Per MCP Security Best Practices.
-  - `py_mcp_configure_stdio_allowlist(additional_binaries)` — add entries (validated: no paths, no NUL, no empty).
-  - `py_mcp_disable_stdio_allowlist()` — enter unrestricted mode (separate function for ceremony).
-  - `py_mcp_reset_stdio_allowlist()` — restore defaults and re-enable enforcement.
-  - `py_mcp_get_stdio_allowlist()` — introspect current state (`{"allowed": [...], "unrestricted": bool}`).
-  - Python SDK exposes these as module-level functions: `configure_stdio_allowlist()`, `disable_stdio_allowlist(i_trust_all_commands=True)`, `reset_stdio_allowlist()`, `get_stdio_allowlist()`. Pre-validation in `McpClient.connect()` catches path and allowlist issues before crossing FFI, raising `ValidationError` with actionable messages.
+- **Stdio allowlist (per-instance)**: `StdioClientTransport::spawn` validates the command against a per-`PyBridgeInstance` allowlist (`bi.core.mcp_allowlist()`, an owned `Mutex<scp_mcp::allowlist::StdioAllowlist>`) before calling `Command::new`. Default allows: `uvx`, `npx`, `bunx`, `pipx`, `python`, `python3`, `node`, `bun`, `deno`, `docker`, `podman`, `scp-mcp`. Only bare binary names are accepted — paths (absolute or relative) are rejected to prevent basename-spoofing bypasses, even when the allowlist is in unrestricted mode. The OS resolves the binary via `PATH`. Per MCP Security Best Practices and ADR-048 §1 multi-instance neutrality.
+  - `PyScp::mcp_configure_stdio_allowlist(additional_binaries)` — add entries to THIS instance's allowlist (validated: no paths, no NUL, no empty).
+  - `PyScp::mcp_disable_stdio_allowlist()` — enter unrestricted mode for THIS instance only. `scp_mcp::allowlist::StdioAllowlist::disable_enforcement` emits `tracing::warn!` for operator audit.
+  - `PyScp::mcp_reset_stdio_allowlist()` — restore defaults and re-enable enforcement on THIS instance.
+  - `PyScp::mcp_get_stdio_allowlist()` — introspect current state (`{"allowed": [...], "unrestricted": bool}`).
+  - Python SDK exposes these as methods on `scp_sdk.SCP`: `scp.mcp_configure_stdio_allowlist(...)`, `scp.mcp_disable_stdio_allowlist(i_trust_all_commands=True)` (keyword-only ceremony + warning log), `scp.mcp_reset_stdio_allowlist()`, `scp.mcp_get_stdio_allowlist()`. Pre-validation in `validate_client_connect()` catches path / unlisted-binary issues before crossing FFI when an allowlist snapshot is supplied.
+  - The legacy process-global `OnceLock<Mutex<StdioAllowlist>>` and the four top-level `py_mcp_*_stdio_allowlist` `#[pyfunction]`s were deleted; one bridge instance disabling enforcement no longer affects another in the same process.
 - **Context discovery (SCP-213)**: `py_mcp_load_contexts` performs client-side context discovery combining three sources:
   1. **Local runtime registry** (`runtime::context_ids_for_member()`) — always available
   2. **Known-contexts registry** (`runtime::known_contexts_for_member()`) — tracks context-to-routing-id-to-relay mappings

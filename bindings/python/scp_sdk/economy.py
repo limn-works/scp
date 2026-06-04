@@ -9,18 +9,25 @@ See ``.docs/specs/`` section 19 (Economic Governance) and ADR-033.
 
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ScpError
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger("scp_sdk")
 
 
 def _bridge() -> Any:
-    """Return the ``_scp_core`` extension module, imported lazily."""
+    """Return the ``_scp_core`` extension module, imported lazily.
+
+    Used for pure economy helpers (policy parsing, formula evaluation)
+    that do not require an :class:`SCP` instance. Stateful budget and
+    antispam tracking take an explicit :class:`scp_sdk.SCP` and dispatch
+    on its ``_native`` handle.
+    """
     try:
         import _scp_core  # type: ignore[import-not-found]
 
@@ -38,7 +45,6 @@ def _bridge() -> Any:
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 def estimate_cost(
     policy_json: str,
     action_type: str,
@@ -71,7 +77,6 @@ def estimate_cost(
     return bridge.economy_estimate_cost(policy_json, action_type, m)
 
 
-@deprecated_default_instance
 def policy_requires_payment(policy_json: str) -> bool:
     """Check whether an economic policy requires payment for any action.
 
@@ -85,7 +90,6 @@ def policy_requires_payment(policy_json: str) -> bool:
     return bridge.economy_policy_requires_payment(policy_json)
 
 
-@deprecated_default_instance
 def auto_accept_blocked(policy_json: str) -> bool:
     """Check whether auto-accept is blocked by the economic policy.
 
@@ -101,7 +105,6 @@ def auto_accept_blocked(policy_json: str) -> bool:
     return bridge.economy_auto_accept_blocked(policy_json)
 
 
-@deprecated_default_instance
 def check_policy_lock(policy_json: str) -> bool:
     """Check whether an economic policy is locked (immutable).
 
@@ -115,7 +118,6 @@ def check_policy_lock(policy_json: str) -> bool:
     return bridge.economy_check_policy_lock(policy_json)
 
 
-@deprecated_default_instance
 def validate_policy_change(current_json: str, proposed_json: str) -> bool:
     """Validate a proposed economic policy change.
 
@@ -133,7 +135,6 @@ def validate_policy_change(current_json: str, proposed_json: str) -> bool:
     return bridge.economy_validate_policy_change(current_json, proposed_json)
 
 
-@deprecated_default_instance
 def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -> int | None:
     """Evaluate a pricing formula against observable metrics.
 
@@ -157,126 +158,13 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
-def budget_remaining(context_id: str, did: str) -> int:
-    """Query the remaining budget for a member in a context.
-
-    Args:
-        context_id: The context ID.
-        did: The member's DID.
-
-    Returns:
-        Remaining budget (smallest currency unit). Returns 0 if no budget
-        has been granted.
-    """
-    bridge = _bridge()
-    return bridge.economy_budget_remaining(context_id, did)
-
-
-@deprecated_default_instance
-def budget_grant(context_id: str, did: str, amount: int) -> None:
-    """Grant spending budget to a member.
-
-    Grants are additive: granting 100 twice gives a total limit of 200.
-
-    Args:
-        context_id: The context ID.
-        did: The member's DID.
-        amount: Budget to grant (smallest currency unit).
-    """
-    bridge = _bridge()
-    bridge.economy_budget_grant(context_id, did, amount)
-
-
-@deprecated_default_instance
-def budget_record_spend(context_id: str, did: str, amount: int) -> None:
-    """Record a spend against a member's budget.
-
-    Args:
-        context_id: The context ID.
-        did: The member's DID.
-        amount: Amount spent (smallest currency unit).
-
-    Raises:
-        ValueError: If no budget exists or the spend exceeds remaining budget.
-    """
-    bridge = _bridge()
-    bridge.economy_budget_record_spend(context_id, did, amount)
-
-
 # ---------------------------------------------------------------------------
 # Antispam velocity tracking
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
-def antispam_record(context_id: str, sender_did: str, timestamp: int) -> None:
-    """Record a message for antispam velocity tracking.
-
-    Args:
-        context_id: The context ID.
-        sender_did: The sender's DID.
-        timestamp: Unix timestamp in seconds.
-    """
-    bridge = _bridge()
-    bridge.economy_antispam_record(context_id, sender_did, timestamp)
-
-
-@deprecated_default_instance
-def antispam_velocity(context_id: str, sender_did: str, now: int) -> int:
-    """Query the sender's message velocity within the sliding window.
-
-    Args:
-        context_id: The context ID.
-        sender_did: The sender's DID.
-        now: Current Unix timestamp in seconds.
-
-    Returns:
-        Number of messages within the sliding window.
-    """
-    bridge = _bridge()
-    return bridge.economy_antispam_velocity(context_id, sender_did, now)
-
-
-@deprecated_default_instance
-def antispam_escalated_cost(
-    context_id: str,
-    sender_did: str,
-    now: int,
-    base_cost: int,
-    thresholds: list[tuple[int, int]],
-    floor: int | None = None,
-    cap: int | None = None,
-) -> int:
-    """Compute the escalated cost for a sender based on antispam velocity.
-
-    Args:
-        context_id: The context ID.
-        sender_did: The sender's DID.
-        now: Current Unix timestamp in seconds.
-        base_cost: Base cost (smallest currency unit).
-        thresholds: List of ``(velocity_threshold, additional_cost)`` pairs.
-        floor: Optional minimum cost.
-        cap: Optional maximum cost.
-
-    Returns:
-        Escalated cost (smallest currency unit).
-    """
-    bridge = _bridge()
-    thresholds_json = json.dumps(thresholds)
-    return bridge.economy_antispam_escalated_cost(
-        context_id, sender_did, now, base_cost, thresholds_json, floor, cap
-    )
-
-
 __all__ = [
-    "antispam_escalated_cost",
-    "antispam_record",
-    "antispam_velocity",
     "auto_accept_blocked",
-    "budget_grant",
-    "budget_record_spend",
-    "budget_remaining",
     "check_policy_lock",
     "estimate_cost",
     "evaluate_formula",

@@ -55,11 +55,15 @@ use scp_core::context::{
 #[cfg(feature = "sqlite")]
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
 #[cfg(feature = "sqlite")]
+use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
+#[cfg(feature = "sqlite")]
 use scp_core::store::ProtocolRepository;
 #[cfg(feature = "sqlite")]
 use scp_core::store::context::ProtocolRepositoryContextBridge;
 #[cfg(feature = "sqlite")]
 use scp_identity::DID;
+#[cfg(feature = "sqlite")]
+use scp_platform::testing::InMemoryStorage;
 
 #[cfg(feature = "sqlite")]
 use scp_platform::sqlite::SqliteStorage;
@@ -205,6 +209,14 @@ async fn context_create_persists_membership_to_sqlite() {
             None,
             None,
             None,
+            // ADR-049 storage-foundation: `with_providers` now requires an
+            // `mls_storage` adapter. These tests assert on the `ProtocolRepository`
+            // snapshot (membership/state), not MLS-group reload, so an in-memory
+            // MLS storage backend is sufficient and keeps the SQLCipher advisory
+            // lock on `scp.db` held by the persistence repo undisturbed.
+            Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+                InMemoryStorage::new(),
+            ))) as Arc<dyn OpenMlsStorageAdapter>,
         );
 
         manager.register_local_did(alice.clone()).await.unwrap();
@@ -296,6 +308,14 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
             None,
             None,
             None,
+            // ADR-049 storage-foundation: `with_providers` now requires an
+            // `mls_storage` adapter. These tests assert on the `ProtocolRepository`
+            // snapshot (membership/state), not MLS-group reload, so an in-memory
+            // MLS storage backend is sufficient and keeps the SQLCipher advisory
+            // lock on `scp.db` held by the persistence repo undisturbed.
+            Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+                InMemoryStorage::new(),
+            ))) as Arc<dyn OpenMlsStorageAdapter>,
         );
 
         manager.register_local_did(alice.clone()).await.unwrap();
@@ -354,6 +374,14 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         None,
         None,
         None,
+        // ADR-049 storage-foundation: `with_providers` now requires an
+        // `mls_storage` adapter. These tests assert on the `ProtocolRepository`
+        // snapshot (membership/state), not MLS-group reload, so an in-memory
+        // MLS storage backend is sufficient and keeps the SQLCipher advisory
+        // lock on `scp.db` held by the persistence repo undisturbed.
+        Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+            InMemoryStorage::new(),
+        ))) as Arc<dyn OpenMlsStorageAdapter>,
     );
 
     manager2.register_local_did(alice.clone()).await.unwrap();

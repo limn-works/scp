@@ -48,7 +48,7 @@
 pub mod context;
 pub mod economy;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -171,135 +171,24 @@ fn version() -> &'static str {
 
 /// Signals the tokio runtime to begin graceful shutdown.
 ///
-/// Called during Python interpreter exit via `atexit`. The atexit handler runs
-/// during Python cleanup, which completes BEFORE Rust module finalization.
-/// This ordering ensures all Python destructors (`__del__`, weak-ref callbacks)
-/// complete before the tokio runtime is dropped.
-///
-/// Also shuts down the default [`runtime::PyBridgeInstance`], which clears
-/// all owned registries (transport, known contexts, rate limiters) and runs
-/// registered shutdown hooks to clear bridge-specific singletons (identity
-/// registry, FFI bridge state, economy trackers). This releases
-/// `Arc<FfiKeyCustody>` references, allowing custody providers to zeroize
-/// key material when dropped.
-///
-/// The actual runtime drop (which invokes tokio's `shutdown_timeout`)
-/// happens when the process exits and the static `OnceLock` is reclaimed.
-/// This function serves as a coordination point: it blocks briefly to let
-/// in-flight tokio tasks observe that Python is shutting down.
+/// Phase D (#1695) removed the default bridge instance. This function now
+/// only drains in-flight tokio tasks that are not owned by any live
+/// `PyScp` handle; per-instance shutdown is the caller's responsibility via
+/// `SCP.shutdown(timeout_millis)`.
 ///
 /// This function is idempotent — calling it after the runtime is already
-/// shut down (or before it was initialized) is a no-op.
-///
-/// **Breaking change (#1549 Phase 4):** previously took no arguments;
-/// now accepts `timeout_millis: int` specifying the graceful deadline for
-/// in-flight async tasks (unified to **milliseconds** across all Rust
-/// bridges — `PyO3`, NAPI, `UniFFI`). The legacy 100ms fixed drain is
-/// retained as a fallback for the sync teardown path. Callers that
-/// passed no argument under the old API should pass `100` to preserve
-/// exact-old behaviour, or a larger value (e.g. `5000`) to give
-/// background tasks real time to exit cleanly.
+/// shut down (or before it was initialized) is a no-op. `timeout_millis`
+/// is retained for API stability and ignored post-demolition.
 #[pyfunction]
-fn shutdown_runtime(timeout_millis: u64) {
-    // Shut down the default PyBridgeInstance first (clears registries, runs
-    // hooks, drains JoinSet within `timeout_millis`). Best-effort: if the
-    // instance was never initialized or is already shut down, this is a no-op.
-    //
-    // Skip in test builds: shutdown permanently poisons the OnceLock-based
-    // default instance, destroying contexts from concurrently-running tests.
-    #[cfg(not(test))]
-    if let Some(bi) = runtime::DEFAULT_BRIDGE_INSTANCE.get()
-        && let Some(rt) = RUNTIME.get()
-    {
-        let bi_clone = std::sync::Arc::clone(bi);
-        let timeout = Duration::from_millis(timeout_millis);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rt.block_on(async move {
-                use scp_ffi_common::bridge_instance::BridgeInstanceCore;
-                // AlreadyShutDown is the documented idempotent-no-op variant.
-                let _ = bi_clone.shutdown(timeout).await;
-            });
-        }));
-        if result.is_err() {
-            tracing::error!("PyBridgeInstance shutdown panicked — cleanup may be incomplete");
-        }
-    }
-    #[cfg(test)]
-    let _ = timeout_millis; // timeout is consumed by the non-test path only
-
-    // Give in-flight tokio tasks that are not owned by the PyBridgeInstance
-    // a brief drain window. 100ms is sufficient for cooperative tasks to
-    // observe shutdown; anything longer blocks the Python GIL unnecessarily.
+fn shutdown_runtime(_timeout_millis: u64) {
+    // Give in-flight tokio tasks a brief drain window. 100ms is sufficient
+    // for cooperative tasks to observe shutdown; anything longer blocks the
+    // Python GIL unnecessarily.
     if let Some(rt) = RUNTIME.get() {
         rt.block_on(async {
             tokio::time::sleep(SHUTDOWN_DRAIN).await;
         });
     }
-}
-
-/// Suspends the bridge instance for mobile app backgrounding.
-///
-/// Disconnects transport (clears relay connection) and marks the instance as
-/// suspended. Context state is preserved — the instance remains alive but
-/// inactive. Transport-dependent operations will fail until [`scp_resume`]
-/// is called.
-///
-/// After suspension, callers should call [`scp_resume`] to re-activate,
-/// then re-establish the relay connection via `transport_connect`.
-///
-/// No-op if the instance is already shut down or not initialized.
-///
-/// # Errors
-///
-/// Raises `TransportError` if transport cleanup fails (transport lock is
-/// poisoned).
-#[pyfunction]
-pub fn scp_suspend() -> PyResult<()> {
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        bi.core
-            .suspend()
-            .map_err(|e| crate::error::ScpPyError::transport(format!("suspend failed: {e}")))?;
-    }
-    Ok(())
-}
-
-/// Resumes a suspended bridge instance.
-///
-/// Clears the suspended flag so bridge operations can proceed. The caller
-/// must re-establish the relay connection via `transport_connect` — resume
-/// does not reconnect automatically. Use `transport_status()` to check
-/// the previous relay URL.
-///
-/// No-op if the instance is not initialized.
-///
-/// # Errors
-///
-/// Raises `ContextError` (code `SCP-CTX-2000`) if the instance has been
-/// permanently shut down (`shutdown_runtime` was already called). The
-/// `CTX_2000` code matches the NAPI and `UniFFI` bridges exactly so the
-/// Python SDK wrapper can surface a consistent identifier across runtimes.
-#[pyfunction]
-pub fn scp_resume(py: Python<'_>) -> PyResult<()> {
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        let rt = crate::runtime()?;
-        let bi = Arc::clone(bi);
-        // Release the GIL — `resume` chains async transport reconnect and
-        // persisted-context restoration. Construct ContextError with
-        // explicit CTX_2000 (not the `context()` helper, which defaults to
-        // CTX_2001). Matches NAPI (`scp-ffi/napi/src/lib.rs::scp_resume`)
-        // and UniFFI (`scp-ffi/uniffi/src/lib.rs::scp_resume`) behaviour so
-        // all three bridges emit the same code on shutdown.
-        py.allow_threads(|| {
-            rt.block_on(async move {
-                scp_ffi_common::bridge_instance::BridgeInstanceCore::resume(&*bi).await
-            })
-        })
-        .map_err(|e| crate::error::ScpPyError::ContextError {
-            message: format!("resume failed: {e}"),
-            code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
-        })?;
-    }
-    Ok(())
 }
 
 /// The `_scp_core` Python extension module.
@@ -327,8 +216,6 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(runtime_is_initialized, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;
-    m.add_function(wrap_pyfunction!(scp_suspend, m)?)?;
-    m.add_function(wrap_pyfunction!(scp_resume, m)?)?;
 
     // Step 4b: Register the SCP #[pyclass] (Phase 4 PR 1 — #1549).
     m.add_class::<scp::PyScp>()?;

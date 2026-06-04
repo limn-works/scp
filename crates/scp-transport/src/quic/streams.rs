@@ -305,8 +305,10 @@ pub fn decode_relay_frame(payload: &[u8]) -> Result<QuicRelayFrame, TransportErr
             payload.len()
         )));
     }
-    rmp_serde::from_slice(payload)
-        .map_err(|e| TransportError::ProtocolError(format!("invalid relay frame: {e}")))
+    rmp_serde::from_slice(payload).map_err(|_| {
+        tracing::warn!("relay frame deserialization failed");
+        TransportError::ProtocolError("invalid relay frame".to_owned())
+    })
 }
 
 /// Deserializes a client frame from raw `MessagePack` bytes.
@@ -326,8 +328,10 @@ pub fn decode_client_frame(payload: &[u8]) -> Result<QuicClientFrame, TransportE
             payload.len()
         )));
     }
-    rmp_serde::from_slice(payload)
-        .map_err(|e| TransportError::ProtocolError(format!("invalid client frame: {e}")))
+    rmp_serde::from_slice(payload).map_err(|_| {
+        tracing::warn!("client frame deserialization failed");
+        TransportError::ProtocolError("invalid client frame".to_owned())
+    })
 }
 
 // ---------------------------------------------------------------------------

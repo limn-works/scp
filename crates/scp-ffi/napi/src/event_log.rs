@@ -2,8 +2,8 @@
 //!
 //! Exposes event log queries and Merkle proof verification:
 //!
-//! - [`event_log_query`] — Query the context event log with optional filters.
-//! - [`event_log_verify`] — Verify a claim against the event log (Merkle proof).
+//! - `event_log_query` — Query the context event log with optional filters.
+//! - `event_log_verify` — Verify a claim against the event log (Merkle proof).
 //!
 //! See ADR-011 (Event Log) and ADR-022 in `.docs/adrs/`.
 
@@ -13,6 +13,7 @@ use scp_primitives::Clock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // NapiEvent — protocol event record
@@ -57,36 +58,15 @@ pub struct NapiProof {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Queries the context event log with optional filter criteria.
-///
-/// Returns metadata about the event log: current event count and the Merkle
-/// root hash. Direct event replay requires the full transport layer; this
-/// function provides verifiable log state information.
-///
-/// # Arguments
-///
-/// * `handle` — The context whose event log to query (must be `"active"`).
-/// * `filter_json` — Optional JSON string with filter parameters:
-///   `event_type`, `actor_did`, `after_sequence`, `before_sequence`,
-///   `after_timestamp`, `before_timestamp`, `limit`. Pass `null` to return
-///   all events (up to the default limit).
-///
-/// # Returns
-///
-/// A `Promise<NapiEvent[]>` resolving to the matching events.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-CTX-2023` if the context is not found.
-/// - Rejects with `SCP-VALID-7000` if `filter_json` is not valid JSON.
-#[napi]
+/// Per-bridge-instance implementation of [`event_log_query`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-pub async fn event_log_query(
+pub(crate) async fn event_log_query_on(
+    bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     filter_json: Option<String>,
 ) -> napi::Result<Vec<NapiEvent>> {
-    crate::napi_check_handle!(handle);
-    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+    crate::napi_check_handle!(&bi.core, handle);
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     let filter: Option<serde_json::Value> = match filter_json {
         Some(ref json_str) => {
@@ -112,6 +92,19 @@ pub async fn event_log_query(
         .and_then(|f| f.get("event_type").or_else(|| f.get("eventType")))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
+    let actor_did_filter = filter
+        .as_ref()
+        .and_then(|f| f.get("actor_did").or_else(|| f.get("actorDid")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let after_sequence_filter = filter
+        .as_ref()
+        .and_then(|f| f.get("after_sequence").or_else(|| f.get("afterSequence")))
+        .and_then(serde_json::Value::as_u64);
+    let before_sequence_filter = filter
+        .as_ref()
+        .and_then(|f| f.get("before_sequence").or_else(|| f.get("beforeSequence")))
+        .and_then(serde_json::Value::as_u64);
 
     // Query the per-instance Supervisor's event log provider for real
     // Merkle entries. The UCAN state event log is a separate per-context
@@ -120,42 +113,49 @@ pub async fn event_log_query(
     let context_id_str = handle.context_id();
     let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id_str);
 
-    let manager_entries = crate::runtime::supervisor()
+    let manager_entries = crate::runtime::supervisor(bi)
         .ok()
         .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten());
 
     if let Some(entries) = manager_entries
         && !entries.is_empty()
     {
-        // Build NapiEvent list from the supervisor's Merkle entries.
-        // EventLogEntry has: event (name), timestamp, prev_hash, hash.
-        // Map event → event_type, no actor_did (unknown), index → sequence.
+        // Canonical filter — pinned across PyO3/NAPI/UniFFI by
+        // `scp_ffi_common::event_log::filter_manager_entries` so the three
+        // bridges cannot drift on `after_sequence` / `before_sequence` /
+        // `event_type` / `actor_did` / `limit`. Each bridge still owns its
+        // `Event`/`NapiEvent`/`PyEvent` mapping; the helper only encodes the
+        // filter contract. Filter semantics: `after_sequence` /
+        // `before_sequence` exclusive on both ends (matches UniFFI reference).
+        let filter = scp_ffi_common::event_log::EventLogFilter {
+            after_sequence: after_sequence_filter,
+            before_sequence: before_sequence_filter,
+            event_type: event_type_filter.as_deref(),
+            actor_did: actor_did_filter.as_deref(),
+            limit,
+        };
+        let filtered = scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
+
         #[allow(clippy::cast_precision_loss)]
-        let events: Vec<NapiEvent> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_idx, entry)| event_type_filter.as_ref().is_none_or(|f| entry.event == *f))
-            .map(|(idx, entry)| NapiEvent {
+        let events: Vec<NapiEvent> = filtered
+            .into_iter()
+            .map(|(seq, entry)| NapiEvent {
                 event_type: entry.event.clone(),
-                actor_did: String::new(), // EventLogEntry does not carry actor DID
+                actor_did: entry.actor_did.clone(),
                 timestamp: entry.timestamp as f64,
                 payload_json: serde_json::json!({
                     "hash": hex::encode(entry.hash),
                 })
                 .to_string(),
-                sequence: idx as f64,
+                sequence: seq as f64,
             })
             .collect();
 
-        return if let Some(lim) = limit {
-            Ok(events.into_iter().take(lim).collect())
-        } else {
-            Ok(events)
-        };
+        return Ok(events);
     }
 
     // Fallback: read from the per-context UCAN state event log.
-    let (event_count, merkle_root_hex) = crate::runtime::with_context(&context_id_str, |rt| {
+    let (event_count, merkle_root_hex) = crate::runtime::with_context(bi, &context_id_str, |rt| {
         let count = scp_event_log::tree::event_count(&rt.core.event_log);
         let root = scp_event_log::tree::root(&rt.core.event_log);
         Ok((count, hex::encode(root)))
@@ -195,38 +195,17 @@ pub async fn event_log_query(
     }
 }
 
-/// Verifies a claim against the context event log (Merkle proof).
-///
-/// Generates and verifies an inclusion or absence proof for the given claim.
-///
-/// # Arguments
-///
-/// * `handle` — The context whose event log to verify against.
-/// * `claim_json` — JSON string describing the claim:
-///   - `"type"`: `"inclusion"` or `"absence"`
-///   - `"leaf_index"` (for inclusion): event position in the log
-///   - `"event_hash"` (for absence): hex-encoded hash to prove absent
-///
-/// # Returns
-///
-/// A `Promise<NapiProof>` with the verification result and Merkle proof
-/// details.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-CTX-2025` if the context is not found or proof fails.
-/// - Rejects with `SCP-VALID-7000` if `claim_json` is not valid JSON or
-///   contains unrecognized proof type.
-#[napi]
+/// Per-bridge-instance implementation of [`event_log_verify`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 #[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
-pub async fn event_log_verify(
+pub(crate) async fn event_log_verify_on(
+    bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     claim_json: String,
 ) -> napi::Result<NapiProof> {
-    crate::napi_check_handle!(handle);
-    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+    crate::napi_check_handle!(&bi.core, handle);
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     let claim: serde_json::Value =
         serde_json::from_str(&claim_json).map_err(|e| ScpNapiError::Validation {
@@ -250,11 +229,11 @@ pub async fn event_log_verify(
     // tree that tracks lifecycle events. The UCAN-state EventLog starts
     // empty; this populates it from the authoritative MerkleEventLogProvider.
     let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id);
-    if let Some(entries) = crate::runtime::supervisor()
+    if let Some(entries) = crate::runtime::supervisor(bi)
         .ok()
         .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten())
     {
-        crate::runtime::with_context(&context_id, |rt| {
+        crate::runtime::with_context(bi, &context_id, |rt| {
             let existing_leaves = rt.core.event_log.leaves();
             let existing_count = existing_leaves.len();
 
@@ -294,7 +273,7 @@ pub async fn event_log_verify(
                 })
                 .map_err(napi::Error::from)?;
 
-            let (verified, details_json) = crate::runtime::with_context(&context_id, |rt| {
+            let (verified, details_json) = crate::runtime::with_context(bi, &context_id, |rt| {
                 let proof = scp_event_log::proof::prove_inclusion(&rt.core.event_log, leaf_index)
                     .map_err(|e| ScpNapiError::Context {
                     message: format!("inclusion proof failed: {e}"),
@@ -352,7 +331,7 @@ pub async fn event_log_verify(
                 })
             })?;
 
-            let (verified, details_json) = crate::runtime::with_context(&context_id, |rt| {
+            let (verified, details_json) = crate::runtime::with_context(bi, &context_id, |rt| {
                 let proof = scp_event_log::proof::prove_absence(&rt.core.event_log, &event_hash)
                     .map_err(|e| ScpNapiError::Context {
                         message: format!("absence proof failed: {e}"),
@@ -434,40 +413,18 @@ pub struct NapiCheckpoint {
     pub signature: String,
 }
 
-/// Generates a signed consistency checkpoint from the current event log state.
-///
-/// Creates a snapshot of the event log's Merkle root and event count, signs it
-/// with the caller's identity key, and returns the checkpoint. Checkpoints
-/// enable equivocation detection: members exchange signed Merkle roots and
-/// compare them to detect relay misbehavior.
-///
-/// # Arguments
-///
-/// * `handle` — The context whose event log to checkpoint.
-/// * `identity` — The identity generating the checkpoint (used for signing).
-/// * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
-///
-/// # Returns
-///
-/// A `Promise<NapiCheckpoint>` containing the signed checkpoint data.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-PERM-3023` if key custody is not available.
-/// - Rejects with `SCP-CTX-2023` if the context is not found.
-///
-/// See ADR-011 acceptance criterion 8 and ADR-030.
-#[napi]
+/// Per-bridge-instance implementation of [`event_log_checkpoint`].
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
-pub fn event_log_checkpoint(
+pub(crate) fn event_log_checkpoint_on(
+    bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     identity: &crate::identity::NapiIdentity,
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
-    crate::napi_check_handle!(handle, identity);
+    crate::napi_check_handle!(&bi.core, handle, identity);
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (&handle, &identity, &epoch);
+        let _ = (bi, &handle, &identity, &epoch);
         Err(napi::Error::from(ScpNapiError::Permission {
             message: "event log checkpoint requires key custody -- the in_memory custody path \
                        is not available in this build. Enable allow_in_memory_custody \
@@ -479,7 +436,7 @@ pub fn event_log_checkpoint(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
-        crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+        crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
         let custody = identity.inner.in_memory_custody.as_ref().ok_or_else(|| {
             napi::Error::from(ScpNapiError::Permission {
@@ -502,9 +459,9 @@ pub fn event_log_checkpoint(
         let sender_did = scp_identity::DID(identity.inner.did.clone());
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
-        let checkpoint = crate::runtime::with_context(&context_id, |rt| {
+        let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
             let signer = scp_core::event_log::KeyCustodySigner {
-                custody: &custody.0,
+                custody: custody.as_ref(),
                 key: &scp_id.active_signing_key,
             };
 
@@ -540,41 +497,18 @@ pub fn event_log_checkpoint(
     }
 }
 
-/// Generates a signed consistency checkpoint using a DID string to look up
-/// the identity from the global registry.
-///
-/// This variant accepts a DID string instead of a `NapiIdentity` reference,
-/// looking up the identity's key material from the global identity registry.
-/// This makes it callable from JavaScript without requiring the caller to
-/// pass the `NapiIdentity` JS object through the event log API.
-///
-/// # Arguments
-///
-/// * `handle` — The context whose event log to checkpoint.
-/// * `did` — The DID string of the identity generating the checkpoint.
-/// * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
-///
-/// # Returns
-///
-/// A `NapiCheckpoint` containing the signed checkpoint data.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-PERM-3023` if the DID is not in the identity registry.
-/// - Rejects with `SCP-CTX-2023` if the context is not found.
-///
-/// See #1144 (C4).
-#[napi(js_name = "eventLogCheckpointByDid")]
+/// Per-bridge-instance implementation of [`event_log_checkpoint_by_did`].
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
-pub fn event_log_checkpoint_by_did(
+pub(crate) fn event_log_checkpoint_by_did_on(
+    bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     did: String,
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(&bi.core, handle);
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (&handle, &did, &epoch);
+        let _ = (bi, &handle, &did, &epoch);
         Err(napi::Error::from(ScpNapiError::Permission {
             message: "event log checkpoint requires key custody -- the in_memory custody path \
                        is not available in this build. Enable allow_in_memory_custody \
@@ -586,9 +520,9 @@ pub fn event_log_checkpoint_by_did(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
-        crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+        crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
-        let (scp_id, custody) = crate::runtime::with_identity(&did, |entry| {
+        let (scp_id, custody) = crate::runtime::with_identity(bi, &did, |entry| {
             Ok((
                 entry.identity.clone(),
                 std::sync::Arc::clone(&entry.custody),
@@ -600,9 +534,9 @@ pub fn event_log_checkpoint_by_did(
         let sender_did = scp_identity::DID(did);
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
-        let checkpoint = crate::runtime::with_context(&context_id, |rt| {
+        let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
             let signer = scp_core::event_log::KeyCustodySigner {
-                custody: &custody.0,
+                custody: custody.as_ref(),
                 key: &scp_id.active_signing_key,
             };
 

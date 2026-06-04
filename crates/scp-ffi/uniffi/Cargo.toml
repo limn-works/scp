@@ -25,11 +25,16 @@ default = ["server"]
 allow_in_memory_custody = ["scp-platform/testing"]
 # Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
 server = ["scp-ffi-common/server", "dep:scp-node"]
+# Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
+# be enabled in production mobile builds; the parity harness (ADR-046)
+# enables it.
+testing = ["scp-core/testing"]
 
 [dependencies]
 uniffi = { version = "0.29", features = ["tokio", "cli"] }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-media = { path = "../../scp-media" }
@@ -69,6 +74,10 @@ scp-platform = { path = "../../scp-platform", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
 tempfile = "3"
+# #1694: AST-based scan for the `check_ready_coverage` enforcement test.
+# `full` enables statements + items; `visit` provides the `Visit` trait used
+# to walk the bridge source without substring matching (PR #1690 retro).
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 
 [[test]]
 name = "e2e_bridge"

@@ -1,7 +1,7 @@
 # ADR-048: SCP as First-Class Multi-Instance SDK Object
 
-**Status:** Proposed
-**Date:** 2026-04-18
+**Status:** Accepted
+**Date:** 2026-04-18 (re-scoped 2026-04-19 — façade deleted in PR 4, no deprecation window)
 **Phase:** Phase 4 remainder (issue #1549)
 **Related:** ADR-021 (UniFFI Bridge), ADR-022 (Language Bindings), ADR-028 (Kotlin SDK), ADR-034 (WASM Constraints), ADR-043 (Scope Registration as Handle Convention, phase-3), ADR-046 (Bridge Parity Harness, sibling), ADR-047 (Bridge Symmetry Enforcement, sibling)
 
@@ -28,7 +28,7 @@ Every language SDK exposes a class named exactly `SCP`:
 - Swift: `SCP` (`#[derive(uniffi::Object)] Scp`, renamed in UDL)
 - Kotlin: `SCP` (same UniFFI object, Kotlin binding)
 
-`SCP` wraps an owned `Arc<BridgeInstance>`. Instance state — ContextManager, identity registry, UCAN registry, MCP registries, transport manager, known-contexts cache, rate limiters, economy trackers, petname/handle/scope registries — lives on that instance. Operations that were previously free functions become methods on `SCP`:
+`SCP` wraps an owned `Arc<BridgeInstance>`. Instance state — ContextManager, identity registry, UCAN registry, MCP registries, transport manager, known-contexts cache, rate limiters, economy trackers, petname/handle/scope registries — lives on that instance. Operations that touch instance state become methods on `SCP`:
 
 ```python
 scp = scp_sdk.SCP()               # new
@@ -36,7 +36,17 @@ identity = scp.identity_create(…) # method, not module-level function
 context = scp.context_create(…)
 ```
 
-Pure protocol helpers that touch no registry (hashing, encoding, validation of shape-only inputs) stay as free functions.
+**Pure protocol helpers that touch no registry stay as free functions at the FFI Rust layer.** This rule is normative and non-negotiable. A function that takes `&self` but never reads `self` is a lie about its dependency surface — handle affinity (§4) becomes dead weight, lifecycle coupling (§5, §6) becomes spurious, and multi-instance neutrality (the central goal of this ADR) becomes inverted: `scp_a.X()` and `scp_b.X()` produce identical bytes for any pure helper, making the instance receiver meaningless variance. The compiler can express the difference between `pub fn` and `&self`; the FFI source must use it honestly.
+
+Examples of pure helpers that stay free at the FFI layer:
+- Protocol-constant lookups (`template_get_params` — maps a template ID enum to its canonical `ContextParams` struct)
+- Shape validators (`validate_against_template`, `validate_context_params`, `metadata_record_from_json`)
+- Pure builders (`discovery_create_query`)
+- Process-scoped resolvers (`context_discover` — uses `crate::runtime()` and per-call `DidDht::new()`; reads zero per-instance state)
+
+Detection heuristic during code review: if a `&self` method body never references `self`, or if the helper takes `_bi: &BridgeInstance` with the leading underscore (compiler-enforced unused-parameter elision), the helper is pure and belongs at module scope.
+
+**SDK wrapper layer is governed by §7, not §1.** Each SDK (Python, TypeScript, Swift, Kotlin, WASM) chooses whether to surface a pure helper as an `SCP` class method or as a module-level export based on its own language idiom. §1 governs the FFI Rust source; §7 governs the language-specific wrapper layer above it.
 
 The class is named after the protocol, not after internal plumbing. This matches the prevailing SDK convention (`OpenAI()`, `Anthropic()`, `Stripe()`) and avoids the collisions that `Node`, `Bridge`, or `Client` would create with existing application-layer classes (`server.py:125`, `server.ts:223`, `BridgeConnector` in spec §12).
 
@@ -45,22 +55,27 @@ The class is named after the protocol, not after internal plumbing. This matches
 `BridgeInstance` stops being a single struct hosting four `Box<dyn Any>` slots. It refactors into:
 
 - `PyBridgeInstance`, `NapiBridgeInstance`, `UniffiBridgeInstance` — concrete per-bridge structs holding typed fields for all bridge-specific registries (FFI_BRIDGE_STATE, MCP server/client registries, CREDENTIAL_STORE, identity_custody_registry, identity_link_attestation_registry, context_handle_registry, etc.).
-- `BridgeInstanceCore` — a shared trait in `scp-ffi-common` exposing the bridge-agnostic fields (ContextManager, transport manager, known_contexts, rate_limiters, economy trackers, persistence, relay_url, shutdown_hooks, petname/handle/scope maps) and lifecycle helpers (`suspend()`, `resume()`, `shutdown(timeout)`, `check_ready()`).
+- `BridgeInstanceCore` — a shared trait in `scp-ffi-common` exposing the bridge-agnostic fields (ContextManager, transport manager, known_contexts, rate_limiters, economy trackers, persistence, relay_url, shutdown_hooks, petname/handle/scope maps, MCP stdio allowlist) and lifecycle helpers (`suspend()`, `resume()`, `shutdown(timeout)`, `check_ready()`).
 
 Every shared helper in `scp-ffi-common` operates on `&dyn BridgeInstanceCore`. Per-bridge callers pass their concrete instance. The four `Box<dyn Any>` slots introduced in Phase 4a are removed. Type safety is compile-time; there are no runtime downcasts. This satisfies the CLAUDE.md rule "enforce mechanically — type system over documentation."
 
-### 3. Default-instance façade remains as a sunset scaffold
+**Approved exemption — shared-variant types for storage-backed repositories.** The rule "per-bridge concrete structs, no shared type-erased slots" has one deliberate carve-out: types that enumerate a **closed, protocol-level** set of storage backends. `ProtocolRepoVariant { InMemory(…), Sqlite(…) }` is the canonical case. It is not bridge plumbing — the variants are dictated by `StorageConfig` (itself protocol-shaped: in-memory vs. persistent SQLCipher), the `Storage` trait is `scp_platform`-level, and every non-WASM bridge dispatches identically over the same arms. Duplicating the enum into `NapiProtocolRepoVariant` + `UniffiProtocolRepoVariant` + `PyProtocolRepoVariant` produces three identical match statements with no extra type safety — each bridge already owns its own concrete instance type, so the enum lives on a per-bridge field without ambiguity. The exemption is **narrow**: it applies only to closed-set enums whose variants trace to a protocol-level configuration type (today: `StorageConfig`). It does not re-admit `Box<dyn Any>`, runtime downcasts, or open-ended trait objects — those remain rejected per Phase 4a. `ProtocolRepoVariant` has been promoted into `scp-ffi-common` so the three bridges share the single definition; the carve-out is documented here so future maintainers do not re-litigate the decision.
 
-`DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<{Py,Napi,Uniffi}BridgeInstance>>` (renamed from `BRIDGE_INSTANCE`; the concrete type varies per bridge — `PyBridgeInstance` in PyO3, `NapiBridgeInstance` in NAPI, `UniffiBridgeInstance` in UniFFI) stays in each bridge for one deprecation window. Existing free-function exports (`py_context_create`, `napi context_create`, UniFFI `context_create`) continue to work by forwarding to `SCP::default()`. Each forward emits a one-time deprecation warning per function name:
+### 3. Default-instance façade is DELETED in PR 4 (no deprecation window)
 
-- Python: `warnings.warn(..., DeprecationWarning)`
-- TypeScript: `console.warn(...)`
-- Swift: `@available(*, deprecated, message: "Use SCP().contextCreate(…) instead")`
-- Kotlin: `@Deprecated("Use SCP().contextCreate(…) instead")`
+**Re-scoped 2026-04-19 per builder tenet "no deferral" and pre-release posture (no external consumers).** The earlier draft of this ADR called for `DEFAULT_BRIDGE_INSTANCE` and every free-function façade to remain in place for a two-release-cycle sunset window. That plan is abandoned.
 
-Removal target: **two release cycles after Phase 4 merge.** At removal, `DEFAULT_BRIDGE_INSTANCE` and every free-function forward are deleted. Backward-compat during the deprecation window is functional equivalence, not byte-identical behavior — `DeprecationWarning` is intentional.
+The façade is **removed in PR 4 alongside the `SCP` migration**:
 
-A CI gate (`scripts/check-no-default-in-tests.sh`) rejects test files that call the free-function façade unless they carry the tag `SCP-DEFAULT-INSTANCE-OK: <reason>`. Production callers get the deprecation warning at runtime; test suites get the mechanical gate immediately.
+- `DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<{Py,Napi,Uniffi}BridgeInstance>>` — deleted in all three bridges.
+- Every free-function export that forwarded to the default instance — deleted (`py_context_create`, `napi context_create`, UniFFI `context_create`, and every sibling on all three bridges).
+- `SCP.default()` factories on all four SDKs — deleted.
+- Deprecation scaffolding (`_deprecation.py`, `internal/deprecation.ts`, `@available(*, deprecated)`, `@Deprecated` annotations) — deleted. No `DeprecationWarning` is emitted because there is no façade left to deprecate.
+- `scripts/check-no-default-in-tests.sh` and every `SCP-DEFAULT-INSTANCE-OK: <reason>` opt-in tag — deleted. The gate exists to police use of a façade that no longer exists; the tags are attached to tests that no longer call deleted functions. Both are removed together.
+
+**Rationale for the re-scope.** SCP is pre-release. There are no external callers of the free-function façade — every consumer lives in this repository. A deprecation window buys nothing a redundant migration cannot buy better: it adds a second round of churn (first to deprecated, then to deleted), keeps the test-serialization scaffolding live for the duration, and defers enforcement gates that the codebase was designed around. The builder tenet "no deferral" applies — the work is done now, in one PR, not split across two release cycles.
+
+Every call site that previously used the façade routes through a fresh `SCP()` instance per test, or through an application-owned `SCP` instance in long-lived code. Phases A-D of PR 4 migrated all four SDKs and all ~200 test files mechanically. Phase E (this phase) deletes the enforcement gate and opt-in tags that the migration made obsolete.
 
 ### 4. Handle affinity enforced via `instance_id: u64`
 
@@ -88,13 +103,138 @@ Signature across bridges:
 
 This is a breaking change versus the Phase 4a `shutdown()` that took no arguments. Migration is mechanical: pass a sensible default (e.g. 30 seconds). Documented in the Phase 4 migration guide (PR 4).
 
+### 6. Long-lived background tasks capture `Weak<BridgeInstance>`, not `Arc`
+
+Every long-lived task spawned on the shared tokio runtime that needs access to the per-instance state captures a `std::sync::Weak<BridgeInstance>`, not a strong `Arc`. Inside the task, the reference is upgraded per event; a `None` upgrade signals that the caller dropped the `SCP` and the task exits cleanly. Each task body also selects on `bridge_instance.core.cancel_token().cancelled()` so `emergency_cancel_tasks` (invoked by `impl Drop for BridgeInstance`) terminates them promptly.
+
+Rationale: without this, a `tokio::spawn(async move { ... bi: Arc<BridgeInstance> ... })` keeps the bridge alive as long as the task is scheduled, even after the caller drops the owning `SCP`. The cycle would leak `ContextManager`, identity custody, relay connections, and MLS group state for the life of the process.
+
+Covered spawn sites (all three bridges):
+
+- `spawn_suppression_scoring_task` — transport suppression scoring (PyO3, UniFFI; NAPI already used `Weak` pre-PR).
+- `FfiBridgeProvider.bi` / `McpUniFfiBridgeProvider.bi` — MCP server providers — `Weak<BridgeInstance>` field; every `ContextProvider` trait method `upgrade()`s and returns safe defaults when the upgrade fails.
+- `py_mcp_serve` / `mcp_server_create` — stdio/SSE server loops capture `sse_bi: Weak<BridgeInstance>`, select on `cancel_token.cancelled()` alongside `read_line().await`.
+
+Short-lived tasks (single-await-then-return) are allowed to hold an `Arc` for the duration of their work; they cannot delay Drop by more than one event. Tool-invocation paths are bounded by `FFI_TOOL_TIMEOUT_MS` (30 s) at the sync `recv_timeout` barrier, so a misbehaving tool handler delays Drop by at most one invocation's timeout.
+
+Regression tests at `crates/scp-ffi/src/transport.rs::tests`, `crates/scp-ffi/src/mcp.rs::tests`, and `crates/scp-ffi/uniffi/src/bridge.rs::tests` assert (a) `Arc::strong_count(&bi) == 1` while the task is parked, and (b) `weak.upgrade().is_none()` once the caller-held `Arc` drops — proving `impl Drop for BridgeInstance` runs and `emergency_cancel_tasks` propagates.
+
+### 7. Per-SDK idiomatic shape — language constraints stay local
+
+**The rule.** Each SDK chooses its method-vs-free-function shape based on
+its own language semantics and binding-tool constraints. Cross-language
+symmetry is not a value when it requires importing another language's
+constraints. The FFI Rust layer follows §1 strictly (pure helpers stay
+free functions at FFI); the SDK wrapper layer above is per-language.
+
+**Stateful operations are methods on `SCP` in every SDK.** Lifecycle,
+content, governance, economy, attestation, sync, MCP, relay, node,
+identity-registry-touching, and any operation that reads or mutates the
+per-instance `BridgeInstance` state lives as `scp.contextCreate(...)`,
+`scp.ucanMint(...)`, etc. Handles are owned by the issuing `SCP` and
+enforced via `instance_id` per §4. The pre-Phase-4 namespace classes
+(`Identity`, `Context`, `Transport`, `EventLog`, `McpServer`,
+`McpClient`, `Relay`, `Node`) collapsed to pure handle types with no
+methods.
+
+**Pure helpers' SDK-side shape is per-language**:
+
+- **Kotlin** (`bindings/kotlin/scp-kt/...`): pure helpers are methods on `SCP`. Driven by `CoroutineBridge`'s requirement for object-bound coroutine scope inheritance — Kotlin's structured concurrency makes module-level functions awkward to compose with `SupervisorJob` cancellation. This is a Kotlin-local language-runtime constraint.
+
+- **Python** (`bindings/python/scp_sdk/`): pure helpers stay as module-level functions (`scp_sdk.context.template_get_params`, `scp_sdk.discovery.context_discover`, etc.). Python idiom favors module-level functions for pure operations; forcing them onto `SCP` creates false instance dependencies and forces consumers to instantiate `SCP()` (which spins up the tokio runtime, identity registry, semaphores) just to call deterministic shape validators.
+
+- **TypeScript** (`bindings/typescript/src/scp.ts`): pure helpers MAY be exposed as `SCP` methods or as module-level exports — the choice is TS-local ergonomic. When exposed as methods on `SCP`, the method body routes to a module-level NAPI export, NOT to a method on the underlying `napi-rs` `Scp` class (which does not exist for pure helpers per §1). The class shape is decoration over a free-function FFI.
+
+- **Swift** (`bindings/swift/Sources/SCP/`): per-object UniFFI-generated wrappers retained alongside `Scp.swift`. Per ADR-021, UniFFI's generator constraints prevent collapsing `#[uniffi::Object]` receivers into methods on an unrelated outer class without hand-written shims on both sides — so the SDK surface follows the generator's natural shape. Pure helpers surface as free top-level functions; per-object methods stay on their `#[uniffi::Object]` types. The FFI Rust layer for these helpers is governed by §1 (free `pub fn`) and is unaffected by this Swift-side shape choice.
+
+- **WASM** (`crates/scp-ffi/wasm/src/`, consumed by browser TypeScript): pure helpers are free `#[wasm_bindgen] pub fn` exports. ADR-034 prohibits the full `BridgeInstance` surface in WASM; the wasm-bindgen idiom favors free function exports for stateless utilities.
+
+When a cross-bridge audit or symmetry check flags a function as "missing
+in X but present in Y," the ADR is the reference — both X and Y may be
+wrong. Read §1, then this section, then prescribe.
+
+**Cross-references**:
+- `.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md` — full lesson and the principle that triggered this amendment.
+- §1 above — the FFI Rust layer rule (pure helpers stay free fns).
+- ADR-034 — WASM bridge constraints (no scp-platform; constrained surface).
+- ADR-021 — UniFFI binding constraints.
+- ADR-047 — bridge-symmetry enforcement (matrix supports both alias forms; symmetry is per-bridge, not per-SDK).
+
+Commits documenting the original §7 collapse (issue #1549, all on `refactor/phase4-facade-delete`): `dc7face6d` (Python Agent A — class scaffold), `4fb4572f8` (TS Agent A — class scaffold), `bdd2cb58a` (TS B1 — namespace class collapse), `4612e7eff` (TS B2 — Proxy mock-bridge rewrite), `ecc668bd3` (Python B+C — handle collapse + test rewrite), `cd85f3f8b` (TS B4 — large test rewrites), `5271ef84d` (TS B5 — WASM + examples). The 2026-04-25 amendment that introduced the per-SDK framing is on the same issue (#1543 / Batch 3a follow-up).
+
+**Round-2 and round-3 hardening (post-§7 review loop, 2026-04-21).** After the §7 migration landed the full review roster surfaced three classes of finding that were addressed in `3de6cbe30`, `78102c871`, `d8ffcdadf`, and `d489f6610`. The decisions baked into those commits supersede naïve readings of the earlier §7 framing:
+
+- **Test-hook realm hardening (red-hat RED-PR5-001/007, black-hat BLACK-PR5-003).** The initial B-track landed `[NATIVE_HANDLE]` / `[NATIVE_SET]` Symbol-keyed accessors on the `SCP` prototype so `createMockNativeScp` could swap the native handle post-construction. `Object.getOwnPropertySymbols(SCP.prototype)` surfaced both — any in-realm import could overwrite the native handle. Round-2 replaced the Symbol accessors with two **module-local WeakMaps** (`nativeHandles` for the real handle, `nativeTestOverrides` for test-only swaps); neither is exported. The only reach-in helpers (`__getNativeScp`, `__constructScpWithNativeForTests`) hold WeakMap references by closure. Round-3 additionally gates `__constructScpWithNativeForTests` behind a runtime `NODE_ENV === "production"` guard so a deep import of `dist/scp.js` from a compromised transitive dep cannot swap the native bridge in a production deployment. `__setNativeForTests` and its companion `replaceNativeWithMock` were deleted outright — the post-construction swap was invisible to the ~180 SCP class methods that dispatch through the private `#native` field, so any test using it would have seen half-mocked state. The sole supported mock path is `mountMockScp` (constructs via `__constructScpWithNativeForTests` at `new SCP()` time).
+- **DID ownership + DoS cap on recovery / custody migration (red-hat RED-PR5-003/004).** `identity_execute_recovery` and `identity_execute_custody_migration` on `NapiScp` now reject DIDs absent from the bridge instance's identity registry with `SCP-IDENT-1020` / `SCP-IDENT-1024`. Without this gate any realm-local caller could drive unmetered recovery work on `crate::runtime()` against arbitrary DIDs. Both methods also enforce `MAX_CONTEXT_IDS_PER_{RECOVERY,MIGRATION} = 1024` at the FFI boundary; over-cap requests return `SCP-VALID-7120` before the orchestrator runs. The equivalent PyO3 and UniFFI surfaces inherit the same ownership gate through the shared identity registry.
+- **NAPI crypto methods stay sync (bug-catcher HIGH).** Commit `3de6cbe30` flipped the TS wrappers for `identityExecuteRecovery` / `identityExecuteCustodyMigration` to `async` under the misreading that the Rust methods were async. They are not — the Rust side runs on `crate::runtime()` via `block_on`, matching every other sync bridge function. Round-2 (`78102c871`) reverted the TS wrappers back to sync; the SDK surface is `string` (not `Promise<string>`). The JSON payload remains the return type; callers parse it as needed.
+- **Per-test `SCP` isolation in the TS integration suite.** The restored real-NAPI integration suite initially shared a single `new SCP()` + in-memory relay across every test in each `describe` via `beforeAll`/`afterAll`. Two tests (`identityExecuteCustodyMigration rejects an unknown target`, `identityExecuteRecovery rejects an unknown tier synchronously`) were only passing because fabricated `did:dht:z6Nope` DIDs happened to round-trip through the DID registry populated by earlier tests. Round-3 (`d8ffcdadf`) switched to `beforeEach`/`afterEach` with a fresh `SCP` + bridge + relay per test; the two affected tests now create real identities via `scp.identityCreate` so the validation branch they claim to exercise is actually reached. This is the canonical pattern documented in `.docs/migration/phase-4.md` — post-PR-5 the suite enforces it, not just recommends it.
+
+Concurrency cap on recovery / migration: a per-instance **semaphore**
+(`NapiBridgeInstance::recovery_semaphore`, cap =
+`RECOVERY_CONCURRENCY_CAP`) bounds concurrent `block_on`-backed
+orchestrator dispatches so a flood of valid-DID recovery or migration
+requests cannot saturate the libuv worker pool
+(RED-PR5-002 / BLACK-PR5-002). `try_acquire_owned` is non-blocking —
+exhausted permits return `SCP-VALID-7140` immediately rather than
+queue on the wait (a queued caller would still pin a libuv worker).
+The 1024-entry `context_ids` cap and the semaphore compose: the first
+bounds per-call amplification, the second bounds invocation
+concurrency.
+
+No round-3 findings remain open against §7.
+
+### 7a. Post-merge integration with ADR-046 bridge parity + ADR-047 bridge symmetry
+
+After §7 landed on the branch, `origin/main` advanced with three PRs that needed to integrate atomically with the façade-delete surface:
+
+- **#1682** — ADR-046 bridge-parity harness + ADR-047 bridge-symmetry enforcement.
+- **#1697** — retro review-fix consolidation.
+- **#1699** — P0/P1 review follow-up.
+
+The two workstreams touched the same bridge surfaces from opposite ends: §7 moved free-function façade exports to `Scp::*` instance methods, while ADR-046 added new parameters (`seed`, `signed_at_override`) and fields (`verifying_key_hex`) to those same façade functions. Integration required porting ADR-046's parity features onto §7's per-instance methods rather than resurrecting the façade. Scope of the merge integration:
+
+**Identity construction — `verifying_key_hex` field.** The `Identity` struct in every non-WASM bridge gains a `verifying_key_hex: Option<String>` field (hex-encoded Ed25519 verifying-key bytes for the identity key, VM `#0` — the DID-deriving key, not `#active`). Chosen because the WASM bridge uses a simplified single-key model in production where the DID-deriving key *is* the signing key; exposing the identity key gives byte-exact parity across all four bridges under a deterministic `seed`. Populated at every constructor site across PyO3 (`PyIdentity::new` / `PyIdentity::from_document` factory methods, 8+ sites), NAPI (`NapiIdentityInner` literal, 13 sites), UniFFI (`Identity { ... }` literal, 7 sites), WASM (`WasmIdentity { ... }` literal, 8 sites). Populated via `custody.public_key(&identity.identity_key).await.ok().map(|pk| hex::encode(pk.as_bytes()))` — an ADR-046 stability contract, not an exposed API at the SDK layer (read via `identity.verifying_key()`).
+
+**Identity creation — `testing_seed: Option<Vec<u8>>` parameter.** `Scp::identity_create(custody, testing_seed)` on every non-WASM bridge accepts an optional 32-byte deterministic RNG seed. When `Some(bytes)`, `InMemoryKeyCustody::from_seed_bytes(bytes)` replaces the default `OsRng`-backed `InMemoryKeyCustody::new()`, making subsequent `generate_keypair` calls produce byte-identical Ed25519 keys across bridges. Rejected with `SCP-VALID-7007` for length ≠ 32 bytes and with `SCP-VALID-7009` for non-`in_memory` custody (Platform/Software paths reject the parameter — seeded determinism is only meaningful for in-process testing custody).
+
+Swift / Kotlin SDK wrappers expose `testingSeed: Data? = nil` / `testingSeed: ByteArray? = null` defaults so production callers retain the single-argument call shape. The name makes intent explicit at the call site: `scp.identityCreate(custody: "in_memory", testingSeed: seedBytes)` reads as a testing affordance rather than a production knob.
+
+**SCPID signing — `signed_at_override: Option<u64>`.** `Scp::scpid_sign(identity, signing_key_id, challenge_json, signed_at_override)` accepts a Unix-millisecond timestamp that substitutes for the wall clock in the canonical hash. Only accepted when scp-core is built with the `testing` feature; production builds reject non-`None` values with `SCP-VALID-7008`. This affordance drives the cross-bridge parity harness's byte-exact SCPID signatures — two bridges signing the same challenge under the same seed with the same `signed_at_override` produce identical signatures. The feature gate is compile-time — a `testing`-enabled artifact reaching production is the threat model and is addressed by release-channel discipline (no `testing` feature on production wheels / jars / xcframeworks).
+
+**§18.4.1 context_id alignment.** Main's fix to emit 64-char lowercase hex context IDs across all four bridges (`hex::encode(32 random bytes)`, matching PyO3's reference `generate_context_id`) is preserved in `Scp::context_create` on every non-WASM bridge. The UniFFI per-instance method regressed to `ctx-<uuid>` during the merge because PR 5 had authored the per-instance `Scp::context_create` before main's fix landed on free-function `context_create`; the regression was caught by the preserved `context_create_returns_active_context` test and fixed in the post-merge SDK follow-up commit.
+
+**Enforcement alignment.**
+
+- `scripts/check-call-invariants.py` rule `did-resolver-init-on-identity-create` expected callee `ensure_did_resolver_initialized`; NAPI and UniFFI had renamed to `_on` suffix (per-instance helper convention), PyO3 had not. Unified PyO3 on `_on` and updated the matrix rule's `required_callee`. Rule ID unchanged; `required_rule_ids_digest` unchanged — the rule-level contract is unchanged, only the implementation pattern tracked a rename.
+- `scripts/bridge-aliases.json` PyO3 alias lists contained `py_*` free-function names; PR 5 renamed to PyScp method form. Extended each PyO3 alias list to include both forms (97 operations). Per-bridge symmetry check still independent — adding method-form aliases to PyO3 does not mask missing coverage in NAPI/UniFFI/WASM.
+
+**Swift `ScpId` unbound closures.** The free `scpidSign` / `scpidVerify` UniFFI exports were deleted in PR 5 (per-instance `Scp::scpid_sign` / `Scp::scpid_verify` replace them, routing the Identity handle-affinity check + DID resolver through the caller's own `SCP`). `ScpId.unboundSign` / `unboundChallenge` / `unboundVerify` in `bindings/swift/Sources/SCP/Auth/ScpId.swift` consequently cannot delegate to the deleted free functions; they throw `SCP-IDENT-1046` pointing at `SCP.scpidSign` / `SCP.scpidChallenge` / `SCP.scpidVerify`. No consumer code in `Sources/` / `Tests/` / `examples/` depends on these closures — the exported `ScpId.sign(scp:identity:signingKeyId:challenge:)` / `ScpId.verify(scp:response:challenge:)` methods already require an explicit `SCP` parameter.
+
+**Integration state at merge (this stack).** The Python harness driver and every helper runner (`bindings/python/tests/bridge_parity/helpers/{node,swift,kotlin}_bridge_runner/`) are rewritten for the per-instance surface — the driver constructs `SCP` instances and calls `scp.identity_create(...)` / `scp.context_create(...)` / `scp.scpid_*(...)`; each helper runner drives the same per-instance methods on its bridge. Rust-side parity plumbing (`testing_seed`, `verifying_key_hex`, `signed_at_override`) is live across all three non-WASM bridges. `scp-ffi-common::generate_context_id()` (`crates/scp-ffi/common/src/context_id.rs`) is the shared helper all four `Scp::context_create` implementations use, preventing the class of divergence this ADR documents — a regression in any single bridge would now require deleting the shared call, not silently re-rolling the 32-byte draw.
+
+**Resolved — `transport_status` handleless probe across UniFFI.** UniFFI's per-instance `Scp.transportStatus(manager: Arc<TransportManager>)` previously required a non-optional `TransportManager` handle, while PyO3's `PyScp::transport_status()`, NAPI's `Scp::transport_status()`, and WASM's equivalent kept the handleless probe that returns `{ connected: false, relay_url: None, latency_ms: None }` when no transport was attached. The parity harness's `transport_status_disconnected` op (`bindings/python/tests/bridge_parity/seed_operations.py`) was xfailed for `uniffi-kotlin` and `uniffi-swift`; PyO3/NAPI/WASM compared exactly. Resolved by adding a handleless `Scp::transport_manager_status()` to the UniFFI bridge that returns the same disconnected-state struct when no `TransportManager` has been attached — the handleless shape is a property of the disconnected state, not a capability gap, so the parity harness now runs against the common surface without needing a relay fixture on the UniFFI runners. The xfails on `uniffi-kotlin` and `uniffi-swift` for `transport_status_disconnected` are lifted; the parity harness now matches exactly across all four bridges. UniFFI retains both `transportStatus(manager)` and `transportManagerStatus()` methods because the UniFFI type system cannot emit Kotlin/Swift overloads with `Option<Arc<TransportManager>>`; the two-method pair is a deliberate bridge-aliases divergence recorded in `scripts/bridge-aliases.json`.
+
+### 7b. Cross-bridge semantic divergence registry
+
+Operations registered in `scripts/bridge-aliases.json` under the same canonical name where bridge implementations differ in semantics. Future agents working in WASM source for any of these operations MUST consult this registry before treating WASM behavior as equivalent to native; bridge-symmetry passes by alias name only — semantic equivalence is not enforced mechanically.
+
+The registry is intentionally narrow: it lists operations where the *behavior* differs across bridges under the same canonical, not operations that are merely missing in WASM (those live in `scripts/bridge-aliases.json`'s `exemptions.wasm` array with reasons). Adding an entry here is a load-bearing claim that two bridges run the same canonical with measurably different outputs; removing one requires evidence that the divergence is gone (test parity, behavioral fuzz, etc.).
+
+- **`identity_rotate_key`.** RESOLVED 2026-05-03 by PR [#1724](https://github.com/limn-works/scp/pull/1724) (closing [#1717](https://github.com/limn-works/scp/issues/1717), superseding the stub-replacement attempt in PR #1720). WASM (`crates/scp-ffi/wasm/src/identity.rs`) previously rotated the *identity* key (`#0`): it derived a fresh `did:dht:z…` DID and recorded the old DID under `alsoKnownAs` — DID-migration semantics. WASM was aligned to active-key-only rotation, matching `DidDht::rotate_active_key` on PyO3 / NAPI / UniFFI: only the `#active` signing key is replaced; the DID, `#0` identity key, and `#agent` key stay stable (spec §3.7). DID-migration semantics now live exclusively in WASM's separate `identity_migrate` export, so both capabilities remain reachable. The behavioral shift is significant — callers of the old WASM `identity_rotate_key` received a new DID, callers of the current one keep their DID — so this note is retained for one release cycle to flag the change to consumers, after which the entry should be removed.
+
+- **`identity_create_link_attestation`.** RESOLVED 2026-04-26 by PR [#1719](https://github.com/limn-works/scp/pull/1719). WASM previously signed link attestations with the identity key (`#0`) per a fabricated comment that did not match spec §3.5.2's wire-format requirement that issuer signatures use the `#active` or `#agent` key. WASM was aligned to `#active` so the canonical signing-key choice matches every other bridge. Note retained for one release cycle to flag the semantic shift to consumers verifying signatures with the old key — after one release the entry should be removed.
+
+- **`event_log_checkpoint` / `event_log_checkpoint_by_did`.** ACTIVE divergence (precedent: `identity_create_link_attestation` above). The native bridges (PyO3 `event_log_checkpoint`, NAPI `eventLogCheckpoint`/`eventLogCheckpointByDid`, UniFFI `eventLogCheckpoint`) sign the canonical checkpoint payload in-process with the identity's `#active` key and return a *signed* `Checkpoint` (carrying an Ed25519 `signature`). The WASM bridge (`crates/scp-ffi/wasm/src/event_log.rs`) cannot access the private key in the browser sandbox (ADR-006/ADR-034 — signing is a JS-side `WebCrypto`/`SubtleCrypto` responsibility), so it returns an *unsigned signable payload*: the `WasmCheckpoint` carries `signingPayloadHash` (SHA-256 of the canonical signing payload) and no signature. A JS SDK is expected to sign that hash to produce a signed checkpoint; the TS-SDK `SubtleCrypto` Ed25519 signing step is a separate, not-yet-implemented story. The capability matrix's `signed_checkpoint` row stays `typescript: true`, and that is honest: the native NAPI/Node-Bun TS runtime signs the checkpoint in-process **and** the TS SDK surfaces the resulting Ed25519 `signature` on the `Checkpoint` type (`bindings/typescript/src/types.ts`, mapped through `bindings/typescript/src/internal/native.ts`); the WASM/browser-TS runtime returns the unsigned `signingPayloadHash` (no `signature`) until JS-side `SubtleCrypto` signing lands. The per-runtime divergence is therefore: native → `signature` present (signed); WASM → `signingPayloadHash` present (unsigned). The byte layout of the payload is identical across bridges (same canonical hash) — only the *signing actor* differs (in-process Rust vs. JS-side). This entry is retained until a TS-SDK story implements `SubtleCrypto` checkpoint signing; at that point WASM-backed TS also produces a signed checkpoint and the per-runtime divergence is resolved.
+
+When a cross-bridge audit, symmetry script, or capability-matrix consistency check flags a cross-bridge mismatch involving an operation listed here, this registry is the reference. Where a resolved entry retains an inline `// SEMANTIC DIVERGENCE: see ADR-048 §7b cross-bridge semantic divergence registry` comment in WASM source during its one-release retention window, reading that comment is the in-source path to this section.
+
 ## Consequences
 
 - **Tests parallel-safe on every bridge.** Per-test `SCP` fixtures eliminate `BRIDGE_LIFECYCLE_SERIAL`, per-test `beforeAll` in NAPI, and the module-scope poisoning on every SDK. pytest-xdist, Gradle parallel tests, and XCTest concurrency all work.
 - **Multi-identity and multi-relay coexistence work.** A single process may hold multiple `SCP` instances, each with its own identity and its own relay connection. No shared mutable state leaks across them.
 - **Handle misuse is caught at the boundary.** Cross-instance handle reuse returns `SCP-PERM-3030` immediately, rather than corrupting silently.
 - **Shutdown is bounded and recoverable.** `shutdown(timeout)` drains outstanding work deterministically. Callers no longer deadlock on stuck tasks.
-- **Deprecation warnings during sunset window.** Every call to a free-function façade emits a one-time warning. External consumers may need to configure their test runners (`pytest -W default::DeprecationWarning`, Jest custom reporter) to avoid spurious failures — covered in the migration guide.
+- **No deprecation window.** The free-function façade is deleted in PR 4. There is no one-release-cycle tolerance period; every call site migrates in the same change that removes the façade. SCP is pre-release with no external consumers, so the cost of dropping the sunset window is zero and the benefit is eliminating a migration that would have to happen anyway two releases later.
 - **Breaking change to `shutdown` signature.** Documented in the migration guide with a minimal upgrade example.
 
 ## Rejected alternatives
@@ -110,34 +250,31 @@ This is a breaking change versus the Phase 4a `shutdown()` that took no argument
 ### Shutdown-timeout integer width across FFI bridges
 
 At the FFI boundary the `shutdown(timeout)` argument is carried as
-milliseconds in an unsigned integer. The three non-WASM bridges disagree on
-width:
+milliseconds in an unsigned 64-bit integer uniformly across all three
+non-WASM bridges:
 
-- **NAPI**: `u32` (max ≈ 4 294 967 295 ms ≈ 49.7 days).
-- **UniFFI**: `u64` (max ≈ 5 × 10¹¹ years — effectively unbounded).
+- **NAPI**: `u64`, exposed as JS `BigInt` (widened from `u32` in #1692).
+- **UniFFI**: `u64`.
 - **PyO3**: `u64` via Python `int`.
 
 The user-facing API is uniform — seconds at the SDK layer in every language
 (`TimeInterval` in Swift, `Duration` in Kotlin, `float` in Python, `number`
-in TypeScript). Each SDK wrapper clamps to its bridge's maximum before
-crossing FFI and treats out-of-range or non-finite inputs as "wait forever
-within the bridge's representable range". Swift's clamp uses `>= Double(UInt64.max) / 1000.0`
-(not `>`) because `Double(UInt64.max) == 2⁶⁴` after IEEE-754 rounding — a
-strict `>` would let the exact-boundary value trap in the subsequent cast
-(round 3 bug-catcher finding).
+in TypeScript). Each SDK wrapper clamps non-finite and out-of-range inputs
+to a safe representable maximum before crossing FFI (TypeScript uses
+`Number.MAX_SAFE_INTEGER` ms; Swift uses `>= Double(UInt64.max) / 1000.0`
+to avoid an IEEE-754 rounding trap at the exact boundary — round-3
+bug-catcher finding).
 
-Rationale for the NAPI/UniFFI asymmetry: JavaScript's `Number` safely
-represents integers up to 2⁵³−1, so a `u64` at the NAPI boundary would
-force callers onto `BigInt` — a real ergonomic tax for a shutdown timeout
-that in practice never exceeds a few seconds. `u32` covers any realistic
-value (49 days is far beyond any sensible deployment timeout) without the
-`BigInt` friction. Swift/Kotlin have native 64-bit integer ergonomics, so
-UniFFI exposes `u64` there without penalty. PyO3's `u64` matches UniFFI
-because Python's `int` is unbounded anyway — no ergonomic cost.
+The earlier NAPI/UniFFI asymmetry (`u32` on NAPI to avoid forcing JS
+callers onto `BigInt`) was rejected in #1692 in favor of uniform
+semantics. The cost of `BigInt` at the NAPI boundary for a shutdown
+timeout is trivial — the TypeScript SDK wrapper always accepts a plain
+`number` and coerces once before the FFI call — and the benefit of
+cross-bridge uniformity (one code path, one cap, one invariant) outweighs
+the ergonomic tax.
 
-This asymmetry is intentional and documented; it does NOT affect
-semantics. Any SDK caller passing a value larger than its bridge's maximum
-gets deterministic clamping at the boundary, not silent truncation.
+Any SDK caller passing a value larger than the clamp cap gets
+deterministic clamping at the boundary, not silent truncation.
 
 ### ADR numbering disambiguation (ADR-043)
 
@@ -155,7 +292,7 @@ Phase 4 remainder is four sequential PRs:
 1. **PR 1 — Foundation.** This ADR, the `SCP` class scaffold in all three bridges, `BridgeInstanceCore` trait + per-bridge concrete struct refactor, rename `BRIDGE_INSTANCE` → `DEFAULT_BRIDGE_INSTANCE`, deprecation scaffold on the free-function façade, `instance_id`-backed handle affinity, `shutdown(timeout)` signature change and plumbing. No singletons migrated yet — free functions still forward to the default instance.
 2. **PR 2 — Migrations + deletions + #1646.** Move every remaining per-identity singleton into typed fields on its per-bridge struct. Delete `EMPTY_IDENTITY_REGISTRY`, `EMPTY_UCAN_REGISTRY`, `BRIDGE_LIFECYCLE_SERIAL`. Fix `flush_all_contexts_sync` (AC3 bugs). Exhaustive security-reviewer audit of every path reaching ContextManager state.
 3. **PR 3 — Persistence + multi-relay + real UniFFI crypto.** [LANDED 2026-04-18.] Expose `SqliteStorage` via `SCP::with_storage`. Thread persistence provider through UniFFI `ContextManager::new()` (#1260). Make `resume()` async; restore contexts + reconnect transport using stored `pending_relay_url` (#1678). Wire real `MlsCryptoProvider` through UniFFI (#1342). Integration tests for multi-relay + suspend-kill-resume-restore. See **PR 3 actualized** section below for the final shape.
-4. **PR 4 — Tests + docs + enforcement.** Per-test `SCP` fixture codemod across all four SDKs. Spec clarifications for §3.7, §22.3.1, §22.3.5 (clarifications, not semantic changes — the spec just becomes explicit about "per-identity/per-context within an `SCP` instance"). CI gates (`check-no-bridge-globals.sh`, `check-once-lock-ratchet.sh`, `check-no-default-in-tests.sh`, `check-handle-affinity.sh`). SDK capability matrix updates. Migration guide for external SDK consumers.
+4. **PR 4 — Façade deletion + method migration + test codemod + enforcement.** (Re-scoped 2026-04-19.) (a) Every operation previously exposed as a free-function façade becomes an instance method on `PyScp` / `NapiScp` / `UniffiScp`. (b) Those methods are exposed in all four SDK wrappers. (c) Every free-function façade export is deleted, every `_deprecation.*` helper module removed, every `@available(*, deprecated)` / `@Deprecated` annotation stripped, `DEFAULT_BRIDGE_INSTANCE` `OnceLock` deleted in all three bridges, `SCP.default()` factory deleted in all four SDKs. (d) Every SDK test is rewritten to instantiate a fresh `SCP()` per test via the per-test fixture; the ~200-file mechanical codemod happens in this PR. (e) `scripts/check-no-default-in-tests.sh` gate and every `SCP-DEFAULT-INSTANCE-OK:` opt-in tag are deleted — the gate policed a façade that no longer exists. (f) This ADR is updated to reflect the outcome (façade DELETED in PR 4, no sunset window), and §3.7 / §22.3.1 / §22.3.5 carry the "per-identity/per-context within a single `SCP` instance" clarification. (g) Remaining CI gates stay in place and are verified to pass: `check-no-bridge-globals.sh` (with `DEFAULT_BRIDGE_INSTANCE` removed from the allowlist), `check-once-lock-ratchet.sh`, `check-no-fallback-registry.sh`, `check-handle-affinity.sh`. SDK capability matrix updated. CLAUDE.md enforcement-file list updated.
 
 PR 2 and PR 3 touch independent axes and may run concurrently after PR 1. PR 4 depends on all prior.
 
@@ -264,3 +401,25 @@ PR 3 closes the following issues:
 - **#1260** — UniFFI `ContextManager` persistence threading.
 - **#1678** — Async `resume` + multi-relay reconnect.
 - **#1342** — UniFFI real crypto; `FfiBridgeCrypto` deleted.
+
+### Non-SCP handle `instanceId` getters — known low-risk enumeration surface
+
+Every NAPI handle type (`NapiContextHandle`, `NapiIdentity`, `NapiUcanToken`, `NapiMcpServerHandle`, `NapiMcpClientHandle`, `NapiTestingHandle`, …) exposes a JS-visible `instanceId` getter via `#[napi(getter, js_name = "instanceId")]`. The getter returns the u64 as a JS string (u64 exceeds `Number.MAX_SAFE_INTEGER`) so the handle-affinity macro on the Rust side can read the value via `handle.instance_id()` — a separate inherent method used by `napi_check_handle!`.
+
+The getter is **redundant with the Rust-side method for affinity enforcement** — the macro calls the inherent `instance_id()` method on the Rust type, not the JS property. The getter exists so JS-side test harnesses and diagnostic code can correlate handles to the `Scp` instance that minted them.
+
+A defence-in-depth hardening would either:
+- mark the getters `#[napi(getter, skip)]` so the JS property is invisible at runtime (the Rust-side affinity check still sees the u64), or
+- gate the getter behind an authorisation check that verifies the caller holds the `Scp` instance that minted the handle.
+
+Both impose friction on legitimate tooling (e.g. `handle.instanceId === scp.instanceId` assertions in SDK tests) without reducing the risk surface meaningfully: an attacker who can execute JS in-process already has FFI reach, so enumerating `instanceId` across handles yields no capability they do not already have.
+
+Documented here so future security reviewers don't re-litigate: the getter stays. Any migration must coordinate with the SDK test harnesses and the handle-affinity macro. PR #1690 retro LOW.
+
+### `check-no-bridge-globals.sh` widened to function-local sharing primitives (PR #1699 review follow-up)
+
+The original ratchet walker ignored any `static` declaration at brace depth > 0 — the rationale was that function-local statics are "naturally scoped." A PR #1699 review correctly rejected that framing for the sharing primitives: a `static NETWORK: OnceLock<Mutex<…>>` inside a helper fn has the same `'static` lifetime, same single-init semantics, and same cross-invocation process-global behavior as a module-level one. Function scope changes only the namespace, not the sharing semantics.
+
+The walker now scans function-local `static` declarations too, but only when their type starts with or contains one of the process-global sharing primitives — `OnceLock<…>`, `LazyLock<…>`, `Mutex<…>`, `RwLock<…>`, `parking_lot::Mutex<…>`, or `parking_lot::RwLock<…>`. These get a `COUNT_FN_LOCAL` tag (still counted against the same per-bridge ratchet total as module-level globals) or `ALLOW` if their name is on the allowlist. Function-local statics of naturally function-scoped types — atomics (`AtomicU64`, `AtomicBool`, …), `Cell`, `RefCell`, `std::sync::Once` init guards, thread-local macros — remain ignored.
+
+The `NETWORK` slot in `crates/scp-ffi/napi/src/testing.rs` — a function-local `OnceLock<Mutex<Option<FullStackNetwork>>>` used by the cross-test-file full-stack harness — is allowlisted by name because the `testing` module is feature-gated behind `allow_in_memory_custody` and is never compiled into production builds. The doc-comment on the declaration carries the full rationale. Any future function-local sharing static in a bridge must either move onto the per-bridge instance struct or extend the allowlist with the same kind of justification; bumping the ratchet count alone is not a valid fix.

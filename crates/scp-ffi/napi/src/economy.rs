@@ -1,26 +1,16 @@
 //! napi-rs bridge for SCP economic governance operations.
 //!
-//! Exposes economic operations to Node.js/Bun:
-//!
-//! - [`economy_estimate_cost`] — Estimate cost for an action.
-//! - [`economy_policy_requires_payment`] — Check if a policy requires payment.
-//! - [`economy_auto_accept_blocked`] — Check if auto-accept is blocked.
-//! - [`economy_check_policy_lock`] — Check if policy is locked.
-//! - [`economy_validate_policy_change`] — Validate a proposed policy change.
-//! - [`economy_evaluate_formula`] — Evaluate a pricing formula.
-//! - [`economy_budget_remaining`] — Query remaining budget.
-//! - [`economy_budget_grant`] — Grant spending budget.
-//! - [`economy_budget_record_spend`] — Record a spend.
-//! - [`economy_antispam_record`] — Record a message for velocity tracking.
-//! - [`economy_antispam_velocity`] — Query sender velocity.
-//! - [`economy_antispam_escalated_cost`] — Compute escalated cost.
+//! Per-bridge-instance (`_on`) implementations consumed by the corresponding
+//! methods on [`crate::scp::Scp`]. Phase D (#1695) deleted the
+//! free-function wrappers that routed through the process-global default
+//! bridge instance.
 //!
 //! See spec section 19 (Economic Governance) and ADR-033.
 
-use napi_derive::napi;
 use scp_ffi_common::error_codes as codes;
 
 use crate::error::ScpNapiError;
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -81,14 +71,15 @@ fn parse_metrics(json: &str) -> Result<scp_core::economy::ObservableMetrics, nap
 }
 
 // ---------------------------------------------------------------------------
-// Bridge functions
+// Per-bridge-instance implementations
 // ---------------------------------------------------------------------------
 
-/// Estimates the cost for a given action in a context.
+/// Per-bridge-instance implementation of `economy_estimate_cost`.
 ///
-/// Returns the cost (smallest currency unit), or -1 on arithmetic overflow.
-#[napi]
-pub fn economy_estimate_cost(
+/// Pure computation — the bridge instance is unused but accepted for API
+/// symmetry with the other `_on` helpers in this module.
+pub(crate) fn economy_estimate_cost_on(
+    _bi: &NapiBridgeInstance,
     policy_json: String,
     action_type: String,
     metrics_json: String,
@@ -111,9 +102,11 @@ pub fn economy_estimate_cost(
     )
 }
 
-/// Returns `true` if the policy requires payment for any action.
-#[napi]
-pub fn economy_policy_requires_payment(policy_json: String) -> napi::Result<bool> {
+/// Per-bridge-instance implementation of `economy_policy_requires_payment`.
+pub(crate) fn economy_policy_requires_payment_on(
+    _bi: &NapiBridgeInstance,
+    policy_json: String,
+) -> napi::Result<bool> {
     if policy_json.is_empty() || policy_json == "null" {
         return Ok(false);
     }
@@ -122,9 +115,11 @@ pub fn economy_policy_requires_payment(policy_json: String) -> napi::Result<bool
     Ok(scp_core::economy::policy_requires_payment(&policy))
 }
 
-/// Returns `true` if auto-accept is blocked by the economic policy.
-#[napi]
-pub fn economy_auto_accept_blocked(policy_json: String) -> napi::Result<bool> {
+/// Per-bridge-instance implementation of `economy_auto_accept_blocked`.
+pub(crate) fn economy_auto_accept_blocked_on(
+    _bi: &NapiBridgeInstance,
+    policy_json: String,
+) -> napi::Result<bool> {
     if policy_json.is_empty() || policy_json == "null" {
         return Ok(false);
     }
@@ -135,9 +130,11 @@ pub fn economy_auto_accept_blocked(policy_json: String) -> napi::Result<bool> {
     )))
 }
 
-/// Returns `true` if the economic policy is locked (immutable).
-#[napi]
-pub fn economy_check_policy_lock(policy_json: String) -> napi::Result<bool> {
+/// Per-bridge-instance implementation of `economy_check_policy_lock`.
+pub(crate) fn economy_check_policy_lock_on(
+    _bi: &NapiBridgeInstance,
+    policy_json: String,
+) -> napi::Result<bool> {
     if policy_json.is_empty() || policy_json == "null" {
         return Ok(false);
     }
@@ -146,9 +143,9 @@ pub fn economy_check_policy_lock(policy_json: String) -> napi::Result<bool> {
     Ok(scp_core::economy::check_policy_lock(&policy).is_err())
 }
 
-/// Validates a proposed economic policy change.
-#[napi]
-pub fn economy_validate_policy_change(
+/// Per-bridge-instance implementation of `economy_validate_policy_change`.
+pub(crate) fn economy_validate_policy_change_on(
+    _bi: &NapiBridgeInstance,
     current_policy_json: String,
     proposed_policy_json: String,
 ) -> napi::Result<bool> {
@@ -162,11 +159,12 @@ pub fn economy_validate_policy_change(
     Ok(true)
 }
 
-/// Evaluates a pricing formula against observable metrics.
-///
-/// Returns the cost, or -1 on arithmetic overflow.
-#[napi]
-pub fn economy_evaluate_formula(formula_json: String, metrics_json: String) -> napi::Result<i64> {
+/// Per-bridge-instance implementation of `economy_evaluate_formula`.
+pub(crate) fn economy_evaluate_formula_on(
+    _bi: &NapiBridgeInstance,
+    formula_json: String,
+    metrics_json: String,
+) -> napi::Result<i64> {
     let formula: scp_core::economy::PricingFormula = serde_json::from_str(&formula_json)
         .map_err(|e| validation_error(&format!("invalid formula JSON: {e}")))?;
     let metrics = parse_metrics(&metrics_json)?;
@@ -174,9 +172,12 @@ pub fn economy_evaluate_formula(formula_json: String, metrics_json: String) -> n
     Ok(scp_core::economy::evaluate_formula(&formula, &metrics).map_or(-1, |a| a.value() as i64))
 }
 
-/// Queries the remaining budget for a member in a context.
-#[napi]
-pub fn economy_budget_remaining(context_id: String, did: String) -> napi::Result<i64> {
+/// Per-bridge-instance implementation of `economy_budget_remaining`.
+pub(crate) fn economy_budget_remaining_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    did: String,
+) -> napi::Result<i64> {
     if context_id.is_empty() {
         return Err(validation_error("context_id must not be empty"));
     }
@@ -184,40 +185,16 @@ pub fn economy_budget_remaining(context_id: String, did: String) -> napi::Result
         return Err(validation_error("DID must not be empty"));
     }
     let member_did = scp_identity::DID::from(did.as_str());
-    let remaining = crate::runtime::bridge_instance()?
+    let remaining = bi
+        .core
         .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
     #[allow(clippy::cast_possible_wrap)]
     Ok(remaining.value() as i64)
 }
 
-/// Grants spending budget to a member in a context.
-#[napi]
-pub fn economy_budget_grant(context_id: String, did: String, amount: i64) -> napi::Result<()> {
-    if context_id.is_empty() {
-        return Err(validation_error("context_id must not be empty"));
-    }
-    if did.is_empty() {
-        return Err(validation_error("DID must not be empty"));
-    }
-    if amount < 0 {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: format!("amount must be non-negative, got {amount}"),
-            code: codes::VALID_7001.to_owned(),
-        }));
-    }
-    let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
-        tracker.grant(
-            &member_did,
-            scp_core::economy::Amount::new(amount.cast_unsigned()),
-        );
-    });
-    Ok(())
-}
-
-/// Records a spend against a member's budget in a context.
-#[napi]
-pub fn economy_budget_record_spend(
+/// Per-bridge-instance implementation of `economy_budget_grant`.
+pub(crate) fn economy_budget_grant_on(
+    bi: &NapiBridgeInstance,
     context_id: String,
     did: String,
     amount: i64,
@@ -235,7 +212,36 @@ pub fn economy_budget_record_spend(
         }));
     }
     let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
+    bi.core.with_economy_budget_mut(&context_id, |tracker| {
+        tracker.grant(
+            &member_did,
+            scp_core::economy::Amount::new(amount.cast_unsigned()),
+        );
+    });
+    Ok(())
+}
+
+/// Per-bridge-instance implementation of `economy_budget_record_spend`.
+pub(crate) fn economy_budget_record_spend_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    did: String,
+    amount: i64,
+) -> napi::Result<()> {
+    if context_id.is_empty() {
+        return Err(validation_error("context_id must not be empty"));
+    }
+    if did.is_empty() {
+        return Err(validation_error("DID must not be empty"));
+    }
+    if amount < 0 {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("amount must be non-negative, got {amount}"),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
+    let member_did = scp_identity::DID::from(did.as_str());
+    bi.core.with_economy_budget_mut(&context_id, |tracker| {
         tracker
             .record_spend(
                 &member_did,
@@ -245,9 +251,9 @@ pub fn economy_budget_record_spend(
     })
 }
 
-/// Records a message from a sender for antispam velocity tracking.
-#[napi]
-pub fn economy_antispam_record(
+/// Per-bridge-instance implementation of `economy_antispam_record`.
+pub(crate) fn economy_antispam_record_on(
+    bi: &NapiBridgeInstance,
     context_id: String,
     sender_did: String,
     timestamp: i64,
@@ -265,15 +271,15 @@ pub fn economy_antispam_record(
         }));
     }
     let did = scp_identity::DID::from(sender_did.as_str());
-    crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
+    bi.core.with_economy_antispam(&context_id, |tracker| {
         tracker.record_message(&did, timestamp.cast_unsigned());
     });
     Ok(())
 }
 
-/// Queries the sender's message velocity within the sliding window.
-#[napi]
-pub fn economy_antispam_velocity(
+/// Per-bridge-instance implementation of `economy_antispam_velocity`.
+pub(crate) fn economy_antispam_velocity_on(
+    bi: &NapiBridgeInstance,
     context_id: String,
     sender_did: String,
     now: i64,
@@ -292,17 +298,17 @@ pub fn economy_antispam_velocity(
     }
     let did = scp_identity::DID::from(sender_did.as_str());
     #[allow(clippy::cast_possible_wrap)]
-    let velocity = crate::runtime::bridge_instance()?
-        .with_economy_antispam(&context_id, |tracker| {
-            tracker.get_velocity(&did, now.cast_unsigned())
-        });
+    let velocity = bi.core.with_economy_antispam(&context_id, |tracker| {
+        tracker.get_velocity(&did, now.cast_unsigned())
+    });
     #[allow(clippy::cast_possible_wrap)]
     Ok(velocity as i64)
 }
 
-/// Computes the escalated cost for a sender based on antispam velocity.
-#[napi]
-pub fn economy_antispam_escalated_cost(
+/// Per-bridge-instance implementation of `economy_antispam_escalated_cost`.
+#[allow(clippy::too_many_arguments)] // napi-rs signature matches the free-function wrapper.
+pub(crate) fn economy_antispam_escalated_cost_on(
+    bi: &NapiBridgeInstance,
     context_id: String,
     sender_did: String,
     now: i64,
@@ -359,7 +365,7 @@ pub fn economy_antispam_escalated_cost(
     };
 
     let did = scp_identity::DID::from(sender_did.as_str());
-    let cost = crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
+    let cost = bi.core.with_economy_antispam(&context_id, |tracker| {
         tracker.compute_escalated_cost(
             &did,
             now.cast_unsigned(),
@@ -381,81 +387,109 @@ pub fn economy_antispam_escalated_cost(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::runtime::NapiBridgeInstance;
+
+    fn test_bi() -> NapiBridgeInstance {
+        NapiBridgeInstance::new_napi()
+    }
 
     #[test]
     fn estimate_cost_no_policy_returns_zero() {
-        let result =
-            economy_estimate_cost(String::new(), "MessageSend".to_owned(), "{}".to_owned());
+        let bi = test_bi();
+        let result = economy_estimate_cost_on(
+            &bi,
+            String::new(),
+            "MessageSend".to_owned(),
+            "{}".to_owned(),
+        );
         assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
     fn estimate_cost_invalid_action() {
-        let result = economy_estimate_cost("null".to_owned(), "bad".to_owned(), "{}".to_owned());
+        let bi = test_bi();
+        let result =
+            economy_estimate_cost_on(&bi, "null".to_owned(), "bad".to_owned(), "{}".to_owned());
         assert!(result.is_err());
     }
 
     #[test]
     fn policy_requires_payment_empty() {
-        assert!(!economy_policy_requires_payment(String::new()).unwrap());
+        let bi = test_bi();
+        assert!(!economy_policy_requires_payment_on(&bi, String::new()).unwrap());
     }
 
     #[test]
     fn check_policy_lock_empty() {
-        assert!(!economy_check_policy_lock(String::new()).unwrap());
+        let bi = test_bi();
+        assert!(!economy_check_policy_lock_on(&bi, String::new()).unwrap());
     }
 
     #[test]
     fn budget_remaining_empty_context_returns_zero() {
-        crate::runtime::init_supervisor_for_test();
-        let result = economy_budget_remaining("test-ctx".to_owned(), "did:key:test".to_owned());
+        let bi = test_bi();
+        let result =
+            economy_budget_remaining_on(&bi, "test-ctx".to_owned(), "did:key:test".to_owned());
         assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
     fn budget_grant_and_spend() {
-        crate::runtime::init_supervisor_for_test();
-        economy_budget_grant("napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 1000).unwrap();
-        let r = economy_budget_remaining("napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
-            .unwrap();
+        let bi = test_bi();
+        economy_budget_grant_on(
+            &bi,
+            "napi-econ-ctx".to_owned(),
+            "did:key:alice".to_owned(),
+            1000,
+        )
+        .unwrap();
+        let r = economy_budget_remaining_on(
+            &bi,
+            "napi-econ-ctx".to_owned(),
+            "did:key:alice".to_owned(),
+        )
+        .unwrap();
         assert_eq!(r, 1000);
 
-        economy_budget_record_spend("napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 400)
-            .unwrap();
-        let r = economy_budget_remaining("napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
-            .unwrap();
+        economy_budget_record_spend_on(
+            &bi,
+            "napi-econ-ctx".to_owned(),
+            "did:key:alice".to_owned(),
+            400,
+        )
+        .unwrap();
+        let r = economy_budget_remaining_on(
+            &bi,
+            "napi-econ-ctx".to_owned(),
+            "did:key:alice".to_owned(),
+        )
+        .unwrap();
         assert_eq!(r, 600);
     }
 
     #[test]
     fn antispam_velocity_starts_at_zero() {
-        crate::runtime::init_supervisor_for_test();
-        let v =
-            economy_antispam_velocity("napi-spam-ctx".to_owned(), "did:key:bob".to_owned(), 1000);
+        let bi = test_bi();
+        let v = economy_antispam_velocity_on(
+            &bi,
+            "napi-spam-ctx".to_owned(),
+            "did:key:bob".to_owned(),
+            1000,
+        );
         assert_eq!(v.unwrap(), 0);
     }
 
     #[test]
     fn budget_validates_empty_inputs() {
-        assert!(economy_budget_remaining(String::new(), "did:key:x".to_owned()).is_err());
-        assert!(economy_budget_remaining("ctx".to_owned(), String::new()).is_err());
+        let bi = test_bi();
+        assert!(economy_budget_remaining_on(&bi, String::new(), "did:key:x".to_owned()).is_err());
+        assert!(economy_budget_remaining_on(&bi, "ctx".to_owned(), String::new()).is_err());
     }
 
     #[test]
     fn budget_grant_rejects_negative_amount() {
-        crate::runtime::init_supervisor_for_test();
-        let err =
-            economy_budget_grant("ctx".to_owned(), "did:key:alice".to_owned(), -1).unwrap_err();
-        assert!(
-            err.reason.contains("non-negative"),
-            "error should mention 'non-negative': {err:?}"
-        );
-    }
-
-    #[test]
-    fn budget_record_spend_rejects_negative_amount() {
-        crate::runtime::init_supervisor_for_test();
-        let err = economy_budget_record_spend("ctx".to_owned(), "did:key:alice".to_owned(), -100)
+        let bi = test_bi();
+        let err = economy_budget_grant_on(&bi, "ctx".to_owned(), "did:key:alice".to_owned(), -1)
             .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
@@ -464,10 +498,22 @@ mod tests {
     }
 
     #[test]
-    fn antispam_record_rejects_negative_timestamp() {
-        crate::runtime::init_supervisor_for_test();
+    fn budget_record_spend_rejects_negative_amount() {
+        let bi = test_bi();
         let err =
-            economy_antispam_record("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
+            economy_budget_record_spend_on(&bi, "ctx".to_owned(), "did:key:alice".to_owned(), -100)
+                .unwrap_err();
+        assert!(
+            err.reason.contains("non-negative"),
+            "error should mention 'non-negative': {err:?}"
+        );
+    }
+
+    #[test]
+    fn antispam_record_rejects_negative_timestamp() {
+        let bi = test_bi();
+        let err = economy_antispam_record_on(&bi, "ctx".to_owned(), "did:key:bob".to_owned(), -1)
+            .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -476,9 +522,9 @@ mod tests {
 
     #[test]
     fn antispam_velocity_rejects_negative_now() {
-        crate::runtime::init_supervisor_for_test();
-        let err =
-            economy_antispam_velocity("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
+        let bi = test_bi();
+        let err = economy_antispam_velocity_on(&bi, "ctx".to_owned(), "did:key:bob".to_owned(), -1)
+            .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"

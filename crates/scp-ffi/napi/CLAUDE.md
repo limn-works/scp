@@ -83,6 +83,23 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
 ## Gotchas
 
 - Bridge functions in `context.rs` delegate to the shared `Supervisor` (formerly the now-deleted `ContextManager`) via the per-bridge supervisor accessor. The `NapiContextHandle` stores a `core_handle: Option<ContextHandle>` for supervisor operations.
+- **Recovery / custody-migration ownership + concurrency invariants (ADR-048 §7, round-2/3).**
+  `Scp::identity_execute_recovery` and `Scp::identity_execute_custody_migration` enforce three mechanical
+  gates before the orchestrator runs, in order:
+  1. **DID ownership** — the DID must be present in this instance's identity registry
+     (`crate::runtime::identity_registry(&self.inner).contains_key(&did)`). Missing DIDs
+     return `SCP-IDENT-1020` (recovery) / `SCP-IDENT-1024` (migration). Closes the
+     realm-local amplifier where any caller could drive unmetered orchestrator work
+     on `crate::runtime()` against arbitrary DIDs.
+  2. **Length cap** — `context_ids.len() <= MAX_CONTEXT_IDS_PER_{RECOVERY,MIGRATION} = 1024`;
+     over-cap returns `SCP-VALID-7120`.
+  3. **Concurrency semaphore** — `NapiBridgeInstance::recovery_semaphore`
+     (`RECOVERY_CONCURRENCY_CAP` permits, `try_acquire_owned`). Exhausted permits
+     return `SCP-VALID-7140` non-blockingly. Queueing would itself pin a libuv
+     worker on the wait, so the bridge prefers immediate-busy over queued.
+  These methods are **sync** napi entry points — the async orchestrator is driven by
+  `crate::runtime().block_on(...)`. Do not change them back to `async fn`; the
+  napi-rs worker thread has no tokio context (see `3de6cbe30` / `78102c871` history).
 - UCAN validation state (revocation lists, nonce trackers) lives in a separate `DashMap` registry,
   NOT in the `Supervisor`. The `ensure_registered` / `with_context` pattern accesses this state.
 - `context_close` does NOT perform bridge-layer authorization — it delegates to `Supervisor::close_context` (the hoisted `lifecycle_helpers::close_context` body) which checks the `ContextClose` capability. Removes UCAN state via `remove_context` after closing.

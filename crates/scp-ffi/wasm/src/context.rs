@@ -280,7 +280,11 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
         // silently ignores (spec §13.4).
         validate_min_protocol_version(&params).map_err(ScpWasmError::into_js)?;
 
-        let context_id = format!("ctx-{}", uuid::Uuid::new_v4().as_hyphenated());
+        // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
+        // embed in `scp://context/<context_id_hex>` URIs. The shared helper
+        // in `scp-ffi-common` is the single source of truth for all four
+        // bridges — see ADR-048 §7a.
+        let context_id = scp_ffi_common::generate_context_id();
 
         with_manager(|mgr| mgr.create_context(&context_id, &identity_did, &params))
             .map_err(ScpWasmError::into_js)?;

@@ -27,10 +27,12 @@
 
 mod attestation;
 mod key_custody;
+mod pre_rotation_custody;
 mod push;
 mod storage;
 
 pub use attestation::InMemoryDeviceAttestation;
 pub use key_custody::InMemoryKeyCustody;
+pub use pre_rotation_custody::InMemoryPreRotationCustody;
 pub use push::InMemoryPush;
 pub use storage::InMemoryStorage;

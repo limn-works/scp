@@ -4,6 +4,7 @@ package works.limn.scp
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -204,6 +205,52 @@ class IdentityAttestationTest {
         """.trimIndent()
         val att = IdentityAttestation.fromJson(json)
         assertTrue(att.revocationStatus is RevocationStatus.Active)
+    }
+
+    @Test
+    fun `fromJson rejects unknown revocation_status primitive fail-closed`() {
+        // A future Rust-side enum variant (e.g. Suspended) MUST NOT be
+        // silently mis-categorized as Active — that would be a
+        // security-relevant fail-open default. The parser must throw.
+        val json =
+            """
+            {
+                "id": "jkl012",
+                "platform": "github.com",
+                "platform_handle": "dave",
+                "verification_method": "did:dht:z6Mk...#active",
+                "verified_at": 1700000000,
+                "revocation_status": "Suspended"
+            }
+            """.trimIndent()
+        val err =
+            assertFailsWith<IllegalArgumentException> {
+                IdentityAttestation.fromJson(json)
+            }
+        assertTrue(
+            err.message?.contains("Unrecognized revocation_status JSON shape") == true,
+            "expected fail-closed error message, got: ${err.message}",
+        )
+    }
+
+    @Test
+    fun `fromJson rejects unknown revocation_status object fail-closed`() {
+        // A JsonObject that is not {"Revoked": {...}} (e.g. a future
+        // {"Suspended": {...}} variant) must also fail closed.
+        val json =
+            """
+            {
+                "id": "mno345",
+                "platform": "github.com",
+                "platform_handle": "eve",
+                "verification_method": "did:dht:z6Mk...#active",
+                "verified_at": 1700000000,
+                "revocation_status": {"Suspended": {"reason": "review"}}
+            }
+            """.trimIndent()
+        assertFailsWith<IllegalArgumentException> {
+            IdentityAttestation.fromJson(json)
+        }
     }
 
     @Test

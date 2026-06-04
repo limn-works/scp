@@ -1,17 +1,14 @@
-// Scp.kt — Kotlin SDK caller-owned SCP instance wrapper (#1549 Phase 4 PR 1, ADR-048).
+// Scp.kt — Kotlin SDK caller-owned SCP instance wrapper (#1549 Phase 4, ADR-048).
 //
 // Each [SCP] wraps an independent UniFFI `Scp` opaque object (generated from
 // `crates/scp-ffi/uniffi/src/scp.rs`). The class owns its own
 // `UniffiBridgeInstance` — registries, transport, context manager — and is
-// the preferred SDK entry point for multi-identity apps, per-tenant services,
-// and parallel-safe tests.
-//
-// The free-function façade (`suspend(bridge, bindings)`, `resume(bridge,
-// bindings)` in Lifecycle.kt, and the singleton-delegating top-level
-// `suspend fun`s in the other modules) currently operates on the process-wide
-// default instance and is annotated `@Deprecated` with
-// `DeprecationLevel.WARNING`. Removal target: two release cycles after
-// Phase 4 PR 1 merge.
+// the SDK entry point for every caller: multi-identity apps, per-tenant
+// services, and parallel-safe tests. The free-function façade
+// (`suspend(bridge, bindings)`, `resume(bridge, bindings)`, and the
+// singleton-delegating top-level `suspend fun`s in the other modules) was
+// deleted in Phase 4 PR 4 (demolition) — callers MUST construct an [SCP]
+// explicitly.
 //
 // REGENERATION REQUIRED: The UniFFI-generated Kotlin bindings (`internal/`)
 // are gitignored and regenerated at build time via
@@ -23,22 +20,49 @@
 //
 // Provenance: #1549, ADR-048, master plan decision 4 (SDK-facing class name).
 
-@file:Suppress("MatchingDeclarationName")
+@file:Suppress("MatchingDeclarationName", "TooManyFunctions")
 
 package works.limn.scp
 
+import uniffi.scp.AssetEntry
+import uniffi.scp.AttestationVerificationResult
+import uniffi.scp.BatchPublishResult
+import uniffi.scp.BridgeCredentialResult
+import uniffi.scp.ChallengeResult
+import uniffi.scp.Checkpoint
+import uniffi.scp.ContextHandle
+import uniffi.scp.ContextParams
+import uniffi.scp.DidDocument
+import uniffi.scp.Event
+import uniffi.scp.Identity
+import uniffi.scp.KeyCustodyProvider
+import uniffi.scp.McpAllowlistState
+import uniffi.scp.McpInvokeResult
+import uniffi.scp.McpServerConfig
+import uniffi.scp.McpToolInfo
+import uniffi.scp.MessageListener
+import uniffi.scp.Proof
+import uniffi.scp.PublishResult
+import uniffi.scp.SqliteKeyMaterial
+import uniffi.scp.StorageConfig
+import uniffi.scp.SyncPolicyResult
+import uniffi.scp.ToolDefinition
+import uniffi.scp.ToolVerificationResult
+import uniffi.scp.TransportManager
+import uniffi.scp.TransportStatus
+import uniffi.scp.TrustScoreResult
+import uniffi.scp.UcanToken
+import works.limn.scp.bridge.CoroutineBridge
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.logging.Level
 import java.util.logging.Logger
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import uniffi.scp.Scp as NativeScp
-import uniffi.scp.SqliteKeyMaterial
-import uniffi.scp.StorageConfig
-import works.limn.scp.bridge.CoroutineBridge
 
 /**
- * Caller-owned SCP instance — the preferred SDK entry point.
+ * Caller-owned SCP instance — the SDK entry point.
  *
  * Each [SCP] wraps an independent UniFFI `Scp` opaque object. Handles
  * minted by one instance are rejected by others via `HandleAffinityError`
@@ -47,9 +71,6 @@ import works.limn.scp.bridge.CoroutineBridge
  * ```kotlin
  * // Fresh in-memory instance.
  * val scp = SCP()
- *
- * // Process-wide default (shared with the deprecated free-function façade).
- * val shared = SCP.default()
  *
  * // Graceful shutdown with a 1-second deadline for in-flight tasks.
  * val bridge = CoroutineBridge(...)
@@ -61,8 +82,12 @@ import works.limn.scp.bridge.CoroutineBridge
  * `close()` cannot honor the timeout and would silently swallow it —
  * callers must invoke [shutdown] explicitly from a coroutine scope.
  *
+ * After Phase 4 PR 4 (demolition) there is no `SCP.default()` — every
+ * caller must construct `SCP()` explicitly. See ADR-048.
+ *
  * @see works.limn.scp.bridge.CoroutineBridge
  */
+@Suppress("TooManyFunctions", "LargeClass")
 class SCP internal constructor(
     internal val inner: NativeScp,
 ) {
@@ -80,7 +105,7 @@ class SCP internal constructor(
      * Constructs a fresh [SCP] with default in-memory state.
      *
      * Equivalent to the UniFFI `Scp()` constructor. No state is shared
-     * with the process-wide default instance.
+     * with any other [SCP] instance.
      *
      * @param storage Storage configuration. Defaults to
      *   [StorageConfig.InMemory]; [StorageConfig.Sqlite] is also supported
@@ -104,9 +129,13 @@ class SCP internal constructor(
      * Dispatched on [kotlinx.coroutines.Dispatchers.IO] via the supplied
      * [CoroutineBridge].
      *
+     * Named [suspendInstance] (not `suspend`) because `suspend` is a soft
+     * Kotlin keyword that shadows the coroutine modifier in IDE refactors,
+     * documentation generators, and code-gen consumers (#1693).
+     *
      * @throws uniffi.scp.ScpException.Transport if the transport lock is poisoned.
      */
-    suspend fun suspend(bridge: CoroutineBridge) {
+    suspend fun suspendInstance(bridge: CoroutineBridge) {
         bridge.ffiCall { inner.suspend() }
     }
 
@@ -139,9 +168,19 @@ class SCP internal constructor(
      * precision is not preserved. Negative durations are clamped to
      * zero.
      *
+     * [timeout] defaults to 5 seconds — the same default the PyO3 and
+     * NAPI SDK wrappers carry. Callers that need an explicit deadline
+     * (e.g. abort immediately with `Duration.ZERO`, or wait
+     * effectively-forever with a large `Duration.ofHours(n)`) pass the
+     * argument explicitly. See PR #1690 retro api-design MODERATE.
+     *
      * @param timeout Maximum duration to wait for in-flight tasks.
+     *   Defaults to 5 seconds.
      */
-    suspend fun shutdown(bridge: CoroutineBridge, timeout: Duration) {
+    suspend fun shutdown(
+        bridge: CoroutineBridge,
+        timeout: Duration = 5.seconds,
+    ) {
         val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
         bridge.ffiCallSuspend { inner.shutdown(timeoutMillis = millis) }
         // Record shutdown AFTER the FFI call returns so that a failed
@@ -189,33 +228,1421 @@ class SCP internal constructor(
         }
     }
 
-    companion object {
-        /**
-         * Returns a [SCP] wrapping the process-wide default instance.
-         *
-         * Repeated calls return distinct wrapper objects sharing the
-         * same underlying UniFFI `Arc<UniffiBridgeInstance>` — their
-         * [instanceId]s match.
-         *
-         * This is the bridge the deprecated free-function façade uses
-         * under the hood. Prefer explicit construction ([SCP]) in new
-         * code. Removal target: two release cycles after Phase 4 merge
-         * (ADR-048).
-         *
-         * @throws uniffi.scp.ScpException.Context if the default instance
-         *   is currently suspended or permanently shut down.
-         */
-        @Deprecated(
-            message = (
-                "SCP.default() returns the shared process-wide bridge instance. " +
-                    "Construct `SCP()` explicitly per tenant/identity instead. " +
-                    "Removal target: two release cycles after Phase 4 merge (ADR-048)."
-            ),
-            replaceWith = ReplaceWith("SCP()"),
-            level = DeprecationLevel.WARNING,
-        )
-        fun default(): SCP = SCP(NativeScp.defaultInstance())
+    // ─── Bridge method forwarding (ADR-048 PR 4 — demolition Phase C) ───
+    //
+    // Every UniFFI `Scp` method is forwarded through the `inner` handle so
+    // that callers write `scp.identityCreate(...)` as an idiomatic Kotlin
+    // method call. No state is shared with any other [SCP] instance.
+    //
+    // UniFFI generates `suspend fun` for Rust `async fn` methods (dispatched
+    // on the shared tokio runtime internally), and blocking `fun` for
+    // synchronous Rust methods. Callers that need to dispatch the blocking
+    // forwarders off the calling thread should wrap with
+    // `withContext(Dispatchers.IO)` — mirroring the Swift SDK, the SCP class
+    // does not inject a dispatcher around inner calls.
 
+    /** Forwards to [NativeScp.accessKeyGenerate] on [inner]. */
+    suspend fun accessKeyGenerate(
+        contextId: String,
+        memberDid: String,
+        callerDid: String,
+    ) = inner.accessKeyGenerate(
+        contextId = contextId,
+        memberDid = memberDid,
+        callerDid = callerDid,
+    )
+
+    /** Forwards to [NativeScp.accessKeyRestore] on [inner]. */
+    suspend fun accessKeyRestore(
+        contextId: String,
+        memberDid: String,
+        callerDid: String,
+    ) = inner.accessKeyRestore(
+        contextId = contextId,
+        memberDid = memberDid,
+        callerDid = callerDid,
+    )
+
+    /** Forwards to [NativeScp.accessKeyRevoke] on [inner]. */
+    suspend fun accessKeyRevoke(
+        contextId: String,
+        memberDid: String,
+        callerDid: String,
+    ) = inner.accessKeyRevoke(
+        contextId = contextId,
+        memberDid = memberDid,
+        callerDid = callerDid,
+    )
+
+    // Bridge credential store (spec §12.11). Per-instance credential store
+    // ops; each forwards to [inner]. Credentials live in THIS instance's
+    // store (ADR-048 §1). The encrypted bytes never cross the FFI boundary;
+    // only metadata is returned for provision/rotate.
+
+    /** Forwards to [NativeScp.bridgeCredentialProvision] on [inner]. */
+    suspend fun bridgeCredentialProvision(
+        bridgeId: String,
+        credentialType: String,
+        plaintext: ByteArray,
+        bridgeCredentialKey: ByteArray,
+    ): BridgeCredentialResult =
+        inner.bridgeCredentialProvision(
+            bridgeId = bridgeId,
+            credentialType = credentialType,
+            plaintext = plaintext,
+            bridgeCredentialKey = bridgeCredentialKey,
+        )
+
+    /** Forwards to [NativeScp.bridgeCredentialRetrieve] on [inner]. */
+    suspend fun bridgeCredentialRetrieve(
+        bridgeId: String,
+        credentialType: String,
+        bridgeCredentialKey: ByteArray,
+    ): ByteArray =
+        inner.bridgeCredentialRetrieve(
+            bridgeId = bridgeId,
+            credentialType = credentialType,
+            bridgeCredentialKey = bridgeCredentialKey,
+        )
+
+    /** Forwards to [NativeScp.bridgeCredentialRotate] on [inner]. */
+    suspend fun bridgeCredentialRotate(
+        bridgeId: String,
+        credentialType: String,
+        newPlaintext: ByteArray,
+        bridgeCredentialKey: ByteArray,
+    ): BridgeCredentialResult =
+        inner.bridgeCredentialRotate(
+            bridgeId = bridgeId,
+            credentialType = credentialType,
+            newPlaintext = newPlaintext,
+            bridgeCredentialKey = bridgeCredentialKey,
+        )
+
+    /** Forwards to [NativeScp.bridgeCredentialRevoke] on [inner]. */
+    suspend fun bridgeCredentialRevoke(bridgeId: String) = inner.bridgeCredentialRevoke(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.bridgeCredentialList] on [inner]. */
+    suspend fun bridgeCredentialList(bridgeId: String): List<String> = inner.bridgeCredentialList(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.bridgeCredentialStoreKey] on [inner]. */
+    suspend fun bridgeCredentialStoreKey(
+        bridgeId: String,
+        key: ByteArray,
+    ) = inner.bridgeCredentialStoreKey(bridgeId = bridgeId, key = key)
+
+    /** Forwards to [NativeScp.bridgeCredentialGetKey] on [inner]. */
+    suspend fun bridgeCredentialGetKey(bridgeId: String): ByteArray = inner.bridgeCredentialGetKey(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.bridgeCredentialDeleteKey] on [inner]. */
+    suspend fun bridgeCredentialDeleteKey(bridgeId: String) = inner.bridgeCredentialDeleteKey(bridgeId = bridgeId)
+
+    /** Forwards to [NativeScp.addCheckpointCosignature] on [inner]. */
+    suspend fun addCheckpointCosignature(
+        handle: ContextHandle,
+        checkpointJson: String,
+        signerDid: String,
+        signatureHex: String,
+    ): String =
+        inner.addCheckpointCosignature(
+            handle = handle,
+            checkpointJson = checkpointJson,
+            signerDid = signerDid,
+            signatureHex = signatureHex,
+        )
+
+    /** Forwards to [NativeScp.addressResolve] on [inner]. */
+    fun addressResolve(
+        ownerDid: String,
+        address: String,
+        knownContextsJson: String?,
+    ): String =
+        inner.addressResolve(
+            ownerDid = ownerDid,
+            address = address,
+            knownContextsJson = knownContextsJson,
+        )
+
+    /** Forwards to [NativeScp.aggregateTrustInput] on [inner]. */
+    @Suppress("LongParameterList")
+    fun aggregateTrustInput(
+        contextId: String,
+        subjectDid: String,
+        eventsJson: String,
+        merkleRootJson: String,
+        consequenceRulesJson: String,
+        thresholdRequirementsJson: String,
+        attestorSetsJson: String,
+        cachedAttestationsJson: String,
+        challengeResultsJson: String,
+    ): String =
+        inner.aggregateTrustInput(
+            contextId = contextId,
+            subjectDid = subjectDid,
+            eventsJson = eventsJson,
+            merkleRootJson = merkleRootJson,
+            consequenceRulesJson = consequenceRulesJson,
+            thresholdRequirementsJson = thresholdRequirementsJson,
+            attestorSetsJson = attestorSetsJson,
+            cachedAttestationsJson = cachedAttestationsJson,
+            challengeResultsJson = challengeResultsJson,
+        )
+
+    /** Forwards to [NativeScp.applyPendingCeilingModification] on [inner]. */
+    suspend fun applyPendingCeilingModification(
+        handle: ContextHandle,
+        currentTimestamp: ULong,
+    ): Boolean =
+        inner.applyPendingCeilingModification(
+            handle = handle,
+            currentTimestamp = currentTimestamp,
+        )
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.bridgeEvaluateTrust]. ADR-048 §1 + §7 Kotlin bullet:
+     * pure helper at the FFI Rust layer, method on `SCP` at the SDK
+     * surface per Kotlin idiom.
+     */
+    fun bridgeEvaluateTrust(
+        isBridged: Boolean,
+        isNativeTransport: Boolean,
+        shadowStatus: String,
+    ): UByte =
+        uniffi.scp.bridgeEvaluateTrust(
+            isBridged = isBridged,
+            isNativeTransport = isNativeTransport,
+            shadowStatus = shadowStatus,
+        )
+
+    /** Forwards to [NativeScp.broadcastAdmission] on [inner]. */
+    suspend fun broadcastAdmission(handle: ContextHandle): String? = inner.broadcastAdmission(handle = handle)
+
+    /** Forwards to [NativeScp.broadcastBlockSubscriber] on [inner]. */
+    suspend fun broadcastBlockSubscriber(
+        handle: ContextHandle,
+        subscriberDid: String,
+        blockerDid: String,
+    ) = inner.broadcastBlockSubscriber(
+        handle = handle,
+        subscriberDid = subscriberDid,
+        blockerDid = blockerDid,
+    )
+
+    /** Forwards to [NativeScp.broadcastHandleKeyRequest] on [inner]. */
+    suspend fun broadcastHandleKeyRequest(
+        handle: ContextHandle,
+        authorDid: String,
+        requesterDid: String,
+    ): String =
+        inner.broadcastHandleKeyRequest(
+            handle = handle,
+            authorDid = authorDid,
+            requesterDid = requesterDid,
+        )
+
+    /** Forwards to [NativeScp.broadcastIsSubscriber] on [inner]. */
+    suspend fun broadcastIsSubscriber(
+        handle: ContextHandle,
+        did: String,
+    ): Boolean =
+        inner.broadcastIsSubscriber(
+            handle = handle,
+            did = did,
+        )
+
+    /** Forwards to [NativeScp.broadcastPublish] on [inner]. */
+    suspend fun broadcastPublish(
+        handle: ContextHandle,
+        identity: Identity,
+        payload: ByteArray,
+    ) = inner.broadcastPublish(
+        handle = handle,
+        identity = identity,
+        payload = payload,
+    )
+
+    /** Forwards to [NativeScp.broadcastPublishAsset] on [inner]. */
+    suspend fun broadcastPublishAsset(
+        handle: ContextHandle,
+        identity: Identity,
+        asset: AssetEntry,
+        deployId: String?,
+    ): PublishResult =
+        inner.broadcastPublishAsset(
+            handle = handle,
+            identity = identity,
+            asset = asset,
+            deployId = deployId,
+        )
+
+    /** Forwards to [NativeScp.broadcastPublishAssets] on [inner]. */
+    suspend fun broadcastPublishAssets(
+        handle: ContextHandle,
+        identity: Identity,
+        assets: List<AssetEntry>,
+        deployId: String?,
+    ): BatchPublishResult =
+        inner.broadcastPublishAssets(
+            handle = handle,
+            identity = identity,
+            assets = assets,
+            deployId = deployId,
+        )
+
+    /** Forwards to [NativeScp.broadcastSubscribe] on [inner]. */
+    suspend fun broadcastSubscribe(
+        handle: ContextHandle,
+        subscriberDid: String,
+    ) = inner.broadcastSubscribe(
+        handle = handle,
+        subscriberDid = subscriberDid,
+    )
+
+    /** Forwards to [NativeScp.broadcastSubscriberCount] on [inner]. */
+    suspend fun broadcastSubscriberCount(handle: ContextHandle): ULong? =
+        inner.broadcastSubscriberCount(
+            handle = handle,
+        )
+
+    /** Forwards to [NativeScp.broadcastUnblockSubscriber] on [inner]. */
+    suspend fun broadcastUnblockSubscriber(
+        handle: ContextHandle,
+        subscriberDid: String,
+        unblockerDid: String,
+    ) = inner.broadcastUnblockSubscriber(
+        handle = handle,
+        subscriberDid = subscriberDid,
+        unblockerDid = unblockerDid,
+    )
+
+    /** Forwards to [NativeScp.broadcastUnsubscribe] on [inner]. */
+    suspend fun broadcastUnsubscribe(
+        handle: ContextHandle,
+        subscriberDid: String,
+        rotateKeys: Boolean,
+    ) = inner.broadcastUnsubscribe(
+        handle = handle,
+        subscriberDid = subscriberDid,
+        rotateKeys = rotateKeys,
+    )
+
+    /** Forwards to [NativeScp.configureLocalTransport] on [inner]. */
+    fun configureLocalTransport(localDid: String) = inner.configureLocalTransport(localDid = localDid)
+
+    /** Forwards to [NativeScp.configureRelayTransport] on [inner]. */
+    suspend fun configureRelayTransport(
+        relayUrl: String,
+        localDid: String,
+    ) = inner.configureRelayTransport(
+        relayUrl = relayUrl,
+        localDid = localDid,
+    )
+
+    /** Forwards to [NativeScp.contextClose] on [inner]. */
+    suspend fun contextClose(
+        handle: ContextHandle,
+        identity: Identity,
+    ) = inner.contextClose(
+        handle = handle,
+        identity = identity,
+    )
+
+    /** Forwards to [NativeScp.contextCreate] on [inner]. */
+    suspend fun contextCreate(
+        identity: Identity,
+        params: ContextParams,
+    ): ContextHandle =
+        inner.contextCreate(
+            identity = identity,
+            params = params,
+        )
+
+    /** Forwards to [NativeScp.contextDrainEvents] on [inner]. */
+    suspend fun contextDrainEvents(handle: ContextHandle): List<String> = inner.contextDrainEvents(handle = handle)
+
+    /** Forwards to [NativeScp.contextExport] on [inner]. */
+    suspend fun contextExport(handle: ContextHandle): ByteArray = inner.contextExport(handle = handle)
+
+    /** Forwards to [NativeScp.contextHandleTtlExpiry] on [inner]. */
+    suspend fun contextHandleTtlExpiry(handle: ContextHandle) = inner.contextHandleTtlExpiry(handle = handle)
+
+    /** Forwards to [NativeScp.contextImport] on [inner]. */
+    suspend fun contextImport(data: ByteArray): String = inner.contextImport(data = data)
+
+    /** Forwards to [NativeScp.contextIsMember] on [inner]. */
+    suspend fun contextIsMember(
+        handle: ContextHandle,
+        did: String,
+    ): Boolean =
+        inner.contextIsMember(
+            handle = handle,
+            did = did,
+        )
+
+    /** Forwards to [NativeScp.contextJoin] on [inner]. */
+    suspend fun contextJoin(
+        handle: ContextHandle,
+        identity: Identity,
+        spendingUcanJwt: String?,
+    ) = inner.contextJoin(
+        handle = handle,
+        identity = identity,
+        spendingUcanJwt = spendingUcanJwt,
+    )
+
+    /** Forwards to [NativeScp.contextLeave] on [inner]. */
+    suspend fun contextLeave(
+        handle: ContextHandle,
+        identity: Identity,
+    ) = inner.contextLeave(
+        handle = handle,
+        identity = identity,
+    )
+
+    /** Forwards to [NativeScp.contextMemberCount] on [inner]. */
+    suspend fun contextMemberCount(handle: ContextHandle): ULong? = inner.contextMemberCount(handle = handle)
+
+    /** Forwards to [NativeScp.contextMemberDids] on [inner]. */
+    suspend fun contextMemberDids(handle: ContextHandle): List<String> = inner.contextMemberDids(handle = handle)
+
+    /** Forwards to [NativeScp.contextMemberRole] on [inner]. */
+    suspend fun contextMemberRole(
+        handle: ContextHandle,
+        did: String,
+    ): String? =
+        inner.contextMemberRole(
+            handle = handle,
+            did = did,
+        )
+
+    /** Forwards to [NativeScp.contextProposeTtlExtension] on [inner]. */
+    suspend fun contextProposeTtlExtension(
+        handle: ContextHandle,
+        memberDid: String,
+        proposedSeconds: ULong,
+    ): Boolean =
+        inner.contextProposeTtlExtension(
+            handle = handle,
+            memberDid = memberDid,
+            proposedSeconds = proposedSeconds,
+        )
+
+    /** Forwards to [NativeScp.contextResetTtlTimer] on [inner]. */
+    suspend fun contextResetTtlTimer(
+        handle: ContextHandle,
+        newSeconds: ULong,
+    ) = inner.contextResetTtlTimer(
+        handle = handle,
+        newSeconds = newSeconds,
+    )
+
+    /** Forwards to [NativeScp.contextSend] on [inner]. */
+    suspend fun contextSend(
+        handle: ContextHandle,
+        identity: Identity,
+        payload: ByteArray,
+        spendingUcanJwt: String?,
+    ) = inner.contextSend(
+        handle = handle,
+        identity = identity,
+        payload = payload,
+        spendingUcanJwt = spendingUcanJwt,
+    )
+
+    /** Forwards to [NativeScp.contextSubscribe] on [inner]. */
+    suspend fun contextSubscribe(
+        handle: ContextHandle,
+        listener: MessageListener,
+    ) = inner.contextSubscribe(
+        handle = handle,
+        listener = listener,
+    )
+
+    /** Forwards to [NativeScp.createGovernanceCheckpoint] on [inner]. */
+    @Suppress("LongParameterList")
+    suspend fun createGovernanceCheckpoint(
+        handle: ContextHandle,
+        checkpointSeq: ULong,
+        merkleRootHex: String,
+        eventCount: ULong,
+        lastEventHashHex: String,
+        stateSnapshotHashHex: String,
+        creatorDid: String,
+        creatorSignatureHex: String,
+    ): String =
+        inner.createGovernanceCheckpoint(
+            handle = handle,
+            checkpointSeq = checkpointSeq,
+            merkleRootHex = merkleRootHex,
+            eventCount = eventCount,
+            lastEventHashHex = lastEventHashHex,
+            stateSnapshotHashHex = stateSnapshotHashHex,
+            creatorDid = creatorDid,
+            creatorSignatureHex = creatorSignatureHex,
+        )
+
+    /** Forwards to [NativeScp.economyAntispamEscalatedCost] on [inner]. */
+    @Suppress("LongParameterList")
+    fun economyAntispamEscalatedCost(
+        contextId: String,
+        senderDid: String,
+        now: ULong,
+        baseCost: ULong,
+        thresholdsJson: String,
+        floor: ULong?,
+        cap: ULong?,
+    ): ULong =
+        inner.economyAntispamEscalatedCost(
+            contextId = contextId,
+            senderDid = senderDid,
+            now = now,
+            baseCost = baseCost,
+            thresholdsJson = thresholdsJson,
+            floor = floor,
+            cap = cap,
+        )
+
+    /** Forwards to [NativeScp.economyAntispamRecord] on [inner]. */
+    fun economyAntispamRecord(
+        contextId: String,
+        senderDid: String,
+        timestamp: ULong,
+    ) = inner.economyAntispamRecord(
+        contextId = contextId,
+        senderDid = senderDid,
+        timestamp = timestamp,
+    )
+
+    /** Forwards to [NativeScp.economyAntispamVelocity] on [inner]. */
+    fun economyAntispamVelocity(
+        contextId: String,
+        senderDid: String,
+        now: ULong,
+    ): ULong =
+        inner.economyAntispamVelocity(
+            contextId = contextId,
+            senderDid = senderDid,
+            now = now,
+        )
+
+    /** Forwards to [NativeScp.economyBudgetGrant] on [inner]. */
+    fun economyBudgetGrant(
+        contextId: String,
+        did: String,
+        amount: ULong,
+    ) = inner.economyBudgetGrant(
+        contextId = contextId,
+        did = did,
+        amount = amount,
+    )
+
+    /** Forwards to [NativeScp.economyBudgetRecordSpend] on [inner]. */
+    fun economyBudgetRecordSpend(
+        contextId: String,
+        did: String,
+        amount: ULong,
+    ) = inner.economyBudgetRecordSpend(
+        contextId = contextId,
+        did = did,
+        amount = amount,
+    )
+
+    /** Forwards to [NativeScp.economyBudgetRemaining] on [inner]. */
+    fun economyBudgetRemaining(
+        contextId: String,
+        did: String,
+    ): ULong =
+        inner.economyBudgetRemaining(
+            contextId = contextId,
+            did = did,
+        )
+
+    /** Forwards to [NativeScp.evaluateInvitation] on [inner]. */
+    @Suppress("LongParameterList")
+    fun evaluateInvitation(
+        paramsJson: String,
+        inviterDid: String,
+        identityDid: String,
+        policyJson: String?,
+        spendingJson: String?,
+        trustedDids: List<String>,
+    ): String =
+        inner.evaluateInvitation(
+            paramsJson = paramsJson,
+            inviterDid = inviterDid,
+            identityDid = identityDid,
+            policyJson = policyJson,
+            spendingJson = spendingJson,
+            trustedDids = trustedDids,
+        )
+
+    /** Forwards to [NativeScp.eventLogCheckpoint] on [inner]. */
+    suspend fun eventLogCheckpoint(
+        handle: ContextHandle,
+        identity: Identity,
+        epoch: ULong,
+    ): Checkpoint =
+        inner.eventLogCheckpoint(
+            handle = handle,
+            identity = identity,
+            epoch = epoch,
+        )
+
+    /**
+     * Forwards to [NativeScp.eventLogCheckpointByDid] on [inner].
+     *
+     * Signs with [identity]'s key material and records [did] as the
+     * checkpoint sender. The UniFFI bridge has no DID-keyed identity
+     * registry, so [identity] supplies the key material while [did] names
+     * the member the checkpoint is attributed to (ADR-048 §7 per-SDK idiom).
+     */
+    suspend fun eventLogCheckpointByDid(
+        handle: ContextHandle,
+        identity: Identity,
+        did: String,
+        epoch: ULong,
+    ): Checkpoint =
+        inner.eventLogCheckpointByDid(
+            handle = handle,
+            identity = identity,
+            did = did,
+            epoch = epoch,
+        )
+
+    /** Forwards to [NativeScp.eventLogQuery] on [inner]. */
+    suspend fun eventLogQuery(
+        handle: ContextHandle,
+        filterJson: String?,
+    ): List<Event> =
+        inner.eventLogQuery(
+            handle = handle,
+            filterJson = filterJson,
+        )
+
+    /** Forwards to [NativeScp.eventLogVerify] on [inner]. */
+    suspend fun eventLogVerify(
+        handle: ContextHandle,
+        claimJson: String,
+    ): Proof =
+        inner.eventLogVerify(
+            handle = handle,
+            claimJson = claimJson,
+        )
+
+    /** Forwards to [NativeScp.finalizeClose] on [inner]. */
+    suspend fun finalizeClose(handle: ContextHandle) = inner.finalizeClose(handle = handle)
+
+    /** Forwards to [NativeScp.getEconomicPolicy] on [inner]. */
+    fun getEconomicPolicy(handle: ContextHandle): String? = inner.getEconomicPolicy(handle = handle)
+
+    /** Forwards to [NativeScp.governanceApprove] on [inner]. */
+    suspend fun governanceApprove(
+        handle: ContextHandle,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String =
+        inner.governanceApprove(
+            handle = handle,
+            voterDid = voterDid,
+            proposalIdHex = proposalIdHex,
+        )
+
+    /** Forwards to [NativeScp.governanceExecute] on [inner]. */
+    suspend fun governanceExecute(
+        handle: ContextHandle,
+        proposalJson: String,
+    ): String =
+        inner.governanceExecute(
+            handle = handle,
+            proposalJson = proposalJson,
+        )
+
+    /** Forwards to [NativeScp.governanceGetProposal] on [inner]. */
+    suspend fun governanceGetProposal(
+        handle: ContextHandle,
+        proposalIdHex: String,
+    ): String =
+        inner.governanceGetProposal(
+            handle = handle,
+            proposalIdHex = proposalIdHex,
+        )
+
+    /** Forwards to [NativeScp.governanceListProposals] on [inner]. */
+    suspend fun governanceListProposals(handle: ContextHandle): String = inner.governanceListProposals(handle = handle)
+
+    /** Forwards to [NativeScp.governancePropose] on [inner]. */
+    suspend fun governancePropose(
+        handle: ContextHandle,
+        proposerDid: String,
+        actionJson: String,
+    ): String =
+        inner.governancePropose(
+            handle = handle,
+            proposerDid = proposerDid,
+            actionJson = actionJson,
+        )
+
+    /** Forwards to [NativeScp.governanceReject] on [inner]. */
+    suspend fun governanceReject(
+        handle: ContextHandle,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String =
+        inner.governanceReject(
+            handle = handle,
+            voterDid = voterDid,
+            proposalIdHex = proposalIdHex,
+        )
+
+    /** Forwards to [NativeScp.governanceWithdraw] on [inner]. */
+    suspend fun governanceWithdraw(
+        handle: ContextHandle,
+        voterDid: String,
+        proposalIdHex: String,
+    ): String =
+        inner.governanceWithdraw(
+            handle = handle,
+            voterDid = voterDid,
+            proposalIdHex = proposalIdHex,
+        )
+
+    /** Forwards to [NativeScp.handleDeregister] on [inner]. */
+    fun handleDeregister(
+        discoveryContextId: String,
+        handle: String,
+        did: String,
+    ): String =
+        inner.handleDeregister(
+            discoveryContextId = discoveryContextId,
+            handle = handle,
+            did = did,
+        )
+
+    /** Forwards to [NativeScp.handleLookup] on [inner]. */
+    fun handleLookup(
+        discoveryContextId: String,
+        handle: String,
+        typeFilter: String?,
+    ): String =
+        inner.handleLookup(
+            discoveryContextId = discoveryContextId,
+            handle = handle,
+            typeFilter = typeFilter,
+        )
+
+    /** Forwards to [NativeScp.handleRegister] on [inner]. */
+    @Suppress("LongParameterList")
+    fun handleRegister(
+        discoveryContextId: String,
+        handle: String,
+        targetJson: String,
+        registrantDid: String,
+        description: String?,
+        tags: List<String>?,
+    ): String =
+        inner.handleRegister(
+            discoveryContextId = discoveryContextId,
+            handle = handle,
+            targetJson = targetJson,
+            registrantDid = registrantDid,
+            description = description,
+            tags = tags,
+        )
+
+    /** Forwards to [NativeScp.identityAttestDevice] on [inner]. */
+    suspend fun identityAttestDevice(identity: Identity): String = inner.identityAttestDevice(identity = identity)
+
+    /**
+     * Forwards to [NativeScp.identityCreate] on [inner].
+     *
+     * [testingSeed] is a testing-only parameter for the ADR-046
+     * cross-bridge parity harness; pass `null` from production callers
+     * (in-memory custody uses OS RNG when [testingSeed] is `null`). A
+     * non-`null` [testingSeed] is only valid for `custody == "in_memory"`;
+     * other custody types reject it with `SCP-VALID-7009`.
+     */
+    suspend fun identityCreate(custody: String, testingSeed: ByteArray? = null): Identity =
+        inner.identityCreate(custody = custody, testingSeed = testingSeed)
+
+    /** Forwards to [NativeScp.identityCreateLinkAttestation] on [inner]. */
+    @Suppress("LongParameterList")
+    suspend fun identityCreateLinkAttestation(
+        identity: Identity,
+        platform: String,
+        handle: String,
+        proof: String,
+        verificationMethod: String,
+        platformId: String?,
+    ): String =
+        inner.identityCreateLinkAttestation(
+            identity = identity,
+            platform = platform,
+            handle = handle,
+            proof = proof,
+            verificationMethod = verificationMethod,
+            platformId = platformId,
+        )
+
+    /** Forwards to [NativeScp.identityCreateWithAgentKey] on [inner]. */
+    suspend fun identityCreateWithAgentKey(custody: String): Identity =
+        inner.identityCreateWithAgentKey(
+            custody = custody,
+        )
+
+    /** Forwards to [NativeScp.identityCreateWithCustody] on [inner]. */
+    suspend fun identityCreateWithCustody(provider: KeyCustodyProvider): Identity =
+        inner.identityCreateWithCustody(
+            provider = provider,
+        )
+
+    /** Forwards to [NativeScp.identityExecuteCustodyMigration] on [inner]. */
+    fun identityExecuteCustodyMigration(
+        did: String,
+        target: String,
+        contextIds: List<String>,
+    ): String =
+        inner.identityExecuteCustodyMigration(
+            did = did,
+            target = target,
+            contextIds = contextIds,
+        )
+
+    /** Forwards to [NativeScp.identityExecuteRecovery] on [inner]. */
+    fun identityExecuteRecovery(
+        did: String,
+        tier: String,
+        contextIds: List<String>,
+    ): String =
+        inner.identityExecuteRecovery(
+            did = did,
+            tier = tier,
+            contextIds = contextIds,
+        )
+
+    /** Forwards to [NativeScp.identityLinkAttestations] on [inner]. */
+    fun identityLinkAttestations(did: String): String = inner.identityLinkAttestations(did = did)
+
+    /** Forwards to [NativeScp.identityLoad] on [inner]. */
+    suspend fun identityLoad(did: String): Identity = inner.identityLoad(did = did)
+
+    /** Forwards to [NativeScp.identityMigrate] on [inner]. */
+    suspend fun identityMigrate(identity: Identity): Identity = inner.identityMigrate(identity = identity)
+
+    /** Forwards to [NativeScp.identityRemoveLinkAttestation] on [inner]. */
+    fun identityRemoveLinkAttestation(
+        did: String,
+        attestationId: String,
+    ): Boolean =
+        inner.identityRemoveLinkAttestation(
+            did = did,
+            attestationId = attestationId,
+        )
+
+    /**
+     * Forwards to [NativeScp.identityRemove] on [inner].
+     *
+     * Removes the DID from this instance's SCP-side identity registry.
+     * Idempotent — succeeds silently when the DID is not present.
+     */
+    fun identityRemove(did: String) = inner.identityRemove(did = did)
+
+    /**
+     * Forwards to [NativeScp.identityRemoveIfPresent] on [inner].
+     *
+     * Returns `true` if the identity was found and removed, `false` if the
+     * DID was not in the registry.
+     */
+    fun identityRemoveIfPresent(did: String): Boolean = inner.identityRemoveIfPresent(did = did)
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.identityResolve]. ADR-048 §1 + §7 Kotlin bullet.
+     */
+    suspend fun identityResolve(did: String): DidDocument = uniffi.scp.identityResolve(did = did)
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.identityVerifyDeviceAttestation]. ADR-048 §1 + §7
+     * Kotlin bullet.
+     */
+    suspend fun identityVerifyDeviceAttestation(
+        did: String,
+        tokenBase64: String,
+    ): Boolean =
+        uniffi.scp.identityVerifyDeviceAttestation(
+            did = did,
+            tokenBase64 = tokenBase64,
+        )
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.identityVerifyLinkAttestation]. ADR-048 §1 + §7
+     * Kotlin bullet.
+     */
+    fun identityVerifyLinkAttestation(
+        attestationJson: String,
+        issuerPublicKeyHex: String,
+    ): Boolean =
+        uniffi.scp.identityVerifyLinkAttestation(
+            attestationJson = attestationJson,
+            issuerPublicKeyHex = issuerPublicKeyHex,
+        )
+
+    /** Forwards to [NativeScp.isLocalDid] on [inner]. */
+    suspend fun isLocalDid(did: String): Boolean = inner.isLocalDid(did = did)
+
+    /** Forwards to [NativeScp.mcpClientConnectSse] on [inner]. */
+    suspend fun mcpClientConnectSse(url: String): String = inner.mcpClientConnectSse(url = url)
+
+    /**
+     * Forwards to [NativeScp.mcpClientConnectStdio] on [inner].
+     *
+     * `command[0]` is validated against THIS instance's stdio allowlist
+     * (per-instance — disabling enforcement on another [Scp] does not
+     * affect this one). To permit a binary not in the default allowlist,
+     * call [mcpConfigureStdioAllowlist] first; use [mcpGetStdioAllowlist]
+     * to inspect the current state.
+     */
+    suspend fun mcpClientConnectStdio(command: List<String>): String = inner.mcpClientConnectStdio(command = command)
+
+    /** Forwards to [NativeScp.mcpClientDisconnect] on [inner]. */
+    suspend fun mcpClientDisconnect(handle: String) = inner.mcpClientDisconnect(handle = handle)
+
+    /** Forwards to [NativeScp.mcpClientInvoke] on [inner]. */
+    suspend fun mcpClientInvoke(
+        handle: String,
+        toolName: String,
+        inputJson: String,
+        contextId: String,
+        invokerDid: String,
+    ): McpInvokeResult =
+        inner.mcpClientInvoke(
+            handle = handle,
+            toolName = toolName,
+            inputJson = inputJson,
+            contextId = contextId,
+            invokerDid = invokerDid,
+        )
+
+    /** Forwards to [NativeScp.mcpClientListTools] on [inner]. */
+    suspend fun mcpClientListTools(handle: String): List<McpToolInfo> = inner.mcpClientListTools(handle = handle)
+
+    /** Forwards to [NativeScp.mcpConfigureStdioAllowlist] on [inner]. */
+    fun mcpConfigureStdioAllowlist(additionalBinaries: List<String>) =
+        inner.mcpConfigureStdioAllowlist(
+            additionalBinaries = additionalBinaries,
+        )
+
+    /**
+     * Disable this instance's stdio allowlist (unrestricted mode).
+     *
+     * After calling this, **any** binary may be spawned by
+     * [mcpClientConnectStdio] on this [Scp]. Other instances are
+     * unaffected. Pass [iTrustAllCommands] = true to confirm
+     * acknowledgement of the security implication; the call also writes
+     * a warning via `println` for operator audit.
+     */
+    fun mcpDisableStdioAllowlist(iTrustAllCommands: Boolean = false) {
+        require(iTrustAllCommands) {
+            "Disabling the stdio allowlist allows any binary to be spawned by this Scp instance. " +
+                "Pass iTrustAllCommands = true to confirm."
+        }
+        println(
+            "[scp] MCP stdio allowlist enforcement disabled — arbitrary subprocess " +
+                "spawning is now permitted on this instance",
+        )
+        inner.mcpDisableStdioAllowlist()
+    }
+
+    /** Forwards to [NativeScp.mcpGetStdioAllowlist] on [inner]. */
+    fun mcpGetStdioAllowlist(): McpAllowlistState = inner.mcpGetStdioAllowlist()
+
+    /** Forwards to [NativeScp.mcpResetStdioAllowlist] on [inner]. */
+    fun mcpResetStdioAllowlist() = inner.mcpResetStdioAllowlist()
+
+    /** Forwards to [NativeScp.mcpServerCreate] on [inner]. */
+    suspend fun mcpServerCreate(config: McpServerConfig): String = inner.mcpServerCreate(config = config)
+
+    /** Forwards to [NativeScp.mcpServerStop] on [inner]. */
+    suspend fun mcpServerStop(handle: String) = inner.mcpServerStop(handle = handle)
+
+    /** Forwards to [NativeScp.migrationState] on [inner]. */
+    suspend fun migrationState(handle: ContextHandle): String? = inner.migrationState(handle = handle)
+
+    /** Forwards to [NativeScp.petnameApplyEvent] on [inner]. */
+    fun petnameApplyEvent(
+        ownerDid: String,
+        eventJson: String,
+    ) = inner.petnameApplyEvent(
+        ownerDid = ownerDid,
+        eventJson = eventJson,
+    )
+
+    /** Forwards to [NativeScp.petnameContextCount] on [inner]. */
+    fun petnameContextCount(ownerDid: String): UInt = inner.petnameContextCount(ownerDid = ownerDid)
+
+    /** Forwards to [NativeScp.petnameDidCount] on [inner]. */
+    fun petnameDidCount(ownerDid: String): UInt = inner.petnameDidCount(ownerDid = ownerDid)
+
+    /** Forwards to [NativeScp.petnameGetForContext] on [inner]. */
+    fun petnameGetForContext(
+        ownerDid: String,
+        contextId: String,
+    ): String? =
+        inner.petnameGetForContext(
+            ownerDid = ownerDid,
+            contextId = contextId,
+        )
+
+    /** Forwards to [NativeScp.petnameGetForDid] on [inner]. */
+    fun petnameGetForDid(
+        ownerDid: String,
+        targetDid: String,
+    ): String? =
+        inner.petnameGetForDid(
+            ownerDid = ownerDid,
+            targetDid = targetDid,
+        )
+
+    /** Forwards to [NativeScp.petnameRemove] on [inner]. */
+    fun petnameRemove(
+        ownerDid: String,
+        targetDid: String,
+    ) = inner.petnameRemove(
+        ownerDid = ownerDid,
+        targetDid = targetDid,
+    )
+
+    /** Forwards to [NativeScp.petnameRemoveContext] on [inner]. */
+    fun petnameRemoveContext(
+        ownerDid: String,
+        contextId: String,
+    ) = inner.petnameRemoveContext(
+        ownerDid = ownerDid,
+        contextId = contextId,
+    )
+
+    /** Forwards to [NativeScp.petnameResolveContext] on [inner]. */
+    fun petnameResolveContext(
+        ownerDid: String,
+        name: String,
+    ): String =
+        inner.petnameResolveContext(
+            ownerDid = ownerDid,
+            name = name,
+        )
+
+    /** Forwards to [NativeScp.petnameResolveDid] on [inner]. */
+    fun petnameResolveDid(
+        ownerDid: String,
+        name: String,
+    ): String =
+        inner.petnameResolveDid(
+            ownerDid = ownerDid,
+            name = name,
+        )
+
+    /** Forwards to [NativeScp.petnameSet] on [inner]. */
+    fun petnameSet(
+        ownerDid: String,
+        targetDid: String,
+        name: String,
+    ) = inner.petnameSet(
+        ownerDid = ownerDid,
+        targetDid = targetDid,
+        name = name,
+    )
+
+    /** Forwards to [NativeScp.petnameSetContext] on [inner]. */
+    fun petnameSetContext(
+        ownerDid: String,
+        contextId: String,
+        name: String,
+    ) = inner.petnameSetContext(
+        ownerDid = ownerDid,
+        contextId = contextId,
+        name = name,
+    )
+
+    /** Forwards to [NativeScp.provenanceAttach] on [inner]. */
+    @Suppress("LongParameterList")
+    fun provenanceAttach(
+        sourceContextId: String,
+        sourceType: String,
+        memoryScopeStr: String,
+        members: List<String>,
+        targetContextId: String,
+        actorDid: String,
+        existingChainDepth: UByte?,
+    ): String =
+        inner.provenanceAttach(
+            sourceContextId = sourceContextId,
+            sourceType = sourceType,
+            memoryScopeStr = memoryScopeStr,
+            members = members,
+            targetContextId = targetContextId,
+            actorDid = actorDid,
+            existingChainDepth = existingChainDepth,
+        )
+
+    /** Forwards to [NativeScp.registerLocalDid] on [inner]. */
+    suspend fun registerLocalDid(did: String) = inner.registerLocalDid(did = did)
+
+    /** Forwards to [NativeScp.restoreAllContexts] on [inner]. */
+    suspend fun restoreAllContexts(): String = inner.restoreAllContexts()
+
+    /** Forwards to [NativeScp.restoreContext] on [inner]. */
+    suspend fun restoreContext(contextId: String) = inner.restoreContext(contextId = contextId)
+
+    /** Forwards to [NativeScp.scopeDeregister] on [inner]. */
+    fun scopeDeregister(
+        scopeContextId: String,
+        name: String,
+        did: String,
+    ): String =
+        inner.scopeDeregister(
+            scopeContextId = scopeContextId,
+            name = name,
+            did = did,
+        )
+
+    /** Forwards to [NativeScp.scopeLookup] on [inner]. */
+    fun scopeLookup(
+        scopeContextId: String,
+        name: String,
+    ): String =
+        inner.scopeLookup(
+            scopeContextId = scopeContextId,
+            name = name,
+        )
+
+    /** Forwards to [NativeScp.scopeRegister] on [inner]. */
+    @Suppress("LongParameterList")
+    fun scopeRegister(
+        scopeContextId: String,
+        name: String,
+        targetContextId: String,
+        relayUrls: List<String>,
+        registrantDid: String,
+        description: String?,
+        tags: List<String>?,
+    ): String =
+        inner.scopeRegister(
+            scopeContextId = scopeContextId,
+            name = name,
+            targetContextId = targetContextId,
+            relayUrls = relayUrls,
+            registrantDid = registrantDid,
+            description = description,
+            tags = tags,
+        )
+
+    /** Forwards to [NativeScp.setEconomicPolicy] on [inner]. */
+    fun setEconomicPolicy(
+        handle: ContextHandle,
+        policyJson: String,
+    ) = inner.setEconomicPolicy(
+        handle = handle,
+        policyJson = policyJson,
+    )
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.syncClassifyOffline]. ADR-048 §1 + §7 Kotlin bullet.
+     */
+    fun syncClassifyOffline(
+        lastRelayContact: ULong,
+        now: ULong,
+    ): String =
+        uniffi.scp.syncClassifyOffline(
+            lastRelayContact = lastRelayContact,
+            now = now,
+        )
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.syncClassifyOfflineCustom]. ADR-048 §1 + §7 Kotlin
+     * bullet.
+     */
+    fun syncClassifyOfflineCustom(
+        lastRelayContact: ULong,
+        now: ULong,
+        tier1ThresholdSecs: ULong,
+        tier2ThresholdSecs: ULong,
+    ): String =
+        uniffi.scp.syncClassifyOfflineCustom(
+            lastRelayContact = lastRelayContact,
+            now = now,
+            tier1ThresholdSecs = tier1ThresholdSecs,
+            tier2ThresholdSecs = tier2ThresholdSecs,
+        )
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.syncGetPolicy]. ADR-048 §1 + §7 Kotlin bullet.
+     */
+    fun syncGetPolicy(): SyncPolicyResult = uniffi.scp.syncGetPolicy()
+
+    /** Forwards to [NativeScp.tombstoneMigratedContext] on [inner]. */
+    suspend fun tombstoneMigratedContext(handle: ContextHandle) = inner.tombstoneMigratedContext(handle = handle)
+
+    /** Forwards to [NativeScp.toolInterfaceAccept] on [inner]. */
+    suspend fun toolInterfaceAccept(
+        handle: ContextHandle,
+        interfaceJson: String,
+    ): String =
+        inner.toolInterfaceAccept(
+            handle = handle,
+            interfaceJson = interfaceJson,
+        )
+
+    /** Forwards to [NativeScp.toolInterfaceExpose] on [inner]. */
+    suspend fun toolInterfaceExpose(
+        handle: ContextHandle,
+        toolId: String,
+        targetContextId: String,
+        rateLimitJson: String?,
+    ): String =
+        inner.toolInterfaceExpose(
+            handle = handle,
+            toolId = toolId,
+            targetContextId = targetContextId,
+            rateLimitJson = rateLimitJson,
+        )
+
+    /** Forwards to [NativeScp.toolInterfaceRevoke] on [inner]. */
+    suspend fun toolInterfaceRevoke(
+        handle: ContextHandle,
+        interfaceIdHex: String,
+    ): String =
+        inner.toolInterfaceRevoke(
+            handle = handle,
+            interfaceIdHex = interfaceIdHex,
+        )
+
+    /** Forwards to [NativeScp.toolInvoke] on [inner]. */
+    @Suppress("LongParameterList")
+    suspend fun toolInvoke(
+        handle: ContextHandle,
+        toolId: String,
+        inputJson: String,
+        identity: Identity,
+        ucanToken: String?,
+        proofTokens: List<String>?,
+        spendingUcanJwt: String?,
+    ): String =
+        inner.toolInvoke(
+            handle = handle,
+            toolId = toolId,
+            inputJson = inputJson,
+            identity = identity,
+            ucanToken = ucanToken,
+            proofTokens = proofTokens,
+            spendingUcanJwt = spendingUcanJwt,
+        )
+
+    /** Forwards to [NativeScp.toolInvokeCrossContext] on [inner]. */
+    @Suppress("LongParameterList")
+    suspend fun toolInvokeCrossContext(
+        sourceHandle: ContextHandle,
+        targetHandle: ContextHandle,
+        toolId: String,
+        inputJson: String,
+        identity: Identity,
+        ucanToken: String,
+        chainDepth: UByte,
+        proofTokens: List<String>?,
+    ): String =
+        inner.toolInvokeCrossContext(
+            sourceHandle = sourceHandle,
+            targetHandle = targetHandle,
+            toolId = toolId,
+            inputJson = inputJson,
+            identity = identity,
+            ucanToken = ucanToken,
+            chainDepth = chainDepth,
+            proofTokens = proofTokens,
+        )
+
+    /** Forwards to [NativeScp.toolRegister] on [inner]. */
+    suspend fun toolRegister(
+        handle: ContextHandle,
+        definition: ToolDefinition,
+    ): String =
+        inner.toolRegister(
+            handle = handle,
+            definition = definition,
+        )
+
+    /** Forwards to [NativeScp.toolSessionClose] on [inner]. */
+    suspend fun toolSessionClose(
+        handle: ContextHandle,
+        sessionId: String,
+    ) = inner.toolSessionClose(
+        handle = handle,
+        sessionId = sessionId,
+    )
+
+    /** Forwards to [NativeScp.toolSessionCreate] on [inner]. */
+    suspend fun toolSessionCreate(
+        handle: ContextHandle,
+        toolId: String,
+        sourceContextId: String,
+        ttlSeconds: ULong?,
+    ): String =
+        inner.toolSessionCreate(
+            handle = handle,
+            toolId = toolId,
+            sourceContextId = sourceContextId,
+            ttlSeconds = ttlSeconds,
+        )
+
+    /** Forwards to [NativeScp.toolSessionInvoke] on [inner]. */
+    @Suppress("LongParameterList")
+    suspend fun toolSessionInvoke(
+        handle: ContextHandle,
+        sessionId: String,
+        inputJson: String,
+        identity: Identity,
+        ucanToken: String,
+        proofTokens: List<String>?,
+    ): String =
+        inner.toolSessionInvoke(
+            handle = handle,
+            sessionId = sessionId,
+            inputJson = inputJson,
+            identity = identity,
+            ucanToken = ucanToken,
+            proofTokens = proofTokens,
+        )
+
+    /** Forwards to [NativeScp.toolVerify] on [inner]. */
+    suspend fun toolVerify(
+        handle: ContextHandle,
+        toolId: String,
+    ): ToolVerificationResult =
+        inner.toolVerify(
+            handle = handle,
+            toolId = toolId,
+        )
+
+    /** Forwards to [NativeScp.transportConnect] on [inner]. */
+    suspend fun transportConnect(relayUrl: String): TransportManager = inner.transportConnect(relayUrl = relayUrl)
+
+    /** Forwards to [NativeScp.transportDisconnect] on [inner]. */
+    suspend fun transportDisconnect(manager: TransportManager) = inner.transportDisconnect(manager = manager)
+
+    /** Forwards to [NativeScp.transportStatus] on [inner]. */
+    suspend fun transportStatus(manager: TransportManager): TransportStatus = inner.transportStatus(manager = manager)
+
+    /** Forwards to [NativeScp.trustCreateChallenge] on [inner]. */
+    fun trustCreateChallenge(targetDid: String): ChallengeResult = inner.trustCreateChallenge(targetDid = targetDid)
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.trustQueryScore]. ADR-048 §1 + §7 Kotlin bullet.
+     */
+    fun trustQueryScore(
+        did: String,
+        contextId: String,
+    ): TrustScoreResult =
+        uniffi.scp.trustQueryScore(
+            did = did,
+            contextId = contextId,
+        )
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.trustVerifyAttestation]. ADR-048 §1 + §7 Kotlin
+     * bullet.
+     */
+    fun trustVerifyAttestation(attestationJson: String): AttestationVerificationResult =
+        uniffi.scp.trustVerifyAttestation(
+            attestationJson = attestationJson,
+        )
+
+    /** Forwards to [NativeScp.trustVerifyResponse] on [inner]. */
+    fun trustVerifyResponse(
+        challengeJson: String,
+        responseJson: String,
+    ): Boolean =
+        inner.trustVerifyResponse(
+            challengeJson = challengeJson,
+            responseJson = responseJson,
+        )
+
+    /** Forwards to [NativeScp.ucanDelegate] on [inner]. */
+    suspend fun ucanDelegate(
+        handle: ContextHandle,
+        delegatorDid: String,
+        delegateeDid: String,
+        parentToken: String,
+        capabilities: List<String>,
+    ): UcanToken =
+        inner.ucanDelegate(
+            handle = handle,
+            delegatorDid = delegatorDid,
+            delegateeDid = delegateeDid,
+            parentToken = parentToken,
+            capabilities = capabilities,
+        )
+
+    /** Forwards to [NativeScp.ucanMint] on [inner]. */
+    suspend fun ucanMint(
+        handle: ContextHandle,
+        memberDid: String,
+        capabilities: List<String>,
+        proofs: List<String>?,
+    ): UcanToken =
+        inner.ucanMint(
+            handle = handle,
+            memberDid = memberDid,
+            capabilities = capabilities,
+            proofs = proofs,
+        )
+
+    /** Forwards to [NativeScp.ucanRevoke] on [inner]. */
+    suspend fun ucanRevoke(
+        handle: ContextHandle,
+        token: String,
+        revokerDid: String,
+    ) = inner.ucanRevoke(
+        handle = handle,
+        token = token,
+        revokerDid = revokerDid,
+    )
+
+    /** Forwards to [NativeScp.ucanValidate] on [inner]. */
+    suspend fun ucanValidate(
+        handle: ContextHandle,
+        token: String,
+        capability: String,
+        presentingAgentDid: String?,
+        proofTokens: List<String>?,
+    ) = inner.ucanValidate(
+        handle = handle,
+        token = token,
+        capability = capability,
+        presentingAgentDid = presentingAgentDid,
+        proofTokens = proofTokens,
+    )
+
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.verifyParticipationRequirements]. ADR-048 §1 + §7
+     * Kotlin bullet.
+     */
+    fun verifyParticipationRequirements(
+        profileJson: String,
+        requirementsJson: String,
+    ): Boolean =
+        uniffi.scp.verifyParticipationRequirements(
+            profileJson = profileJson,
+            requirementsJson = requirementsJson,
+        )
+
+    companion object {
         /**
          * Constructs an [SCP] with an explicit storage configuration.
          *
@@ -245,7 +1672,10 @@ class SCP internal constructor(
          * @param key Raw encryption key material (typically 32 bytes).
          *   Callers are responsible for zeroizing their reference.
          */
-        fun withSqlite(dir: File, key: ByteArray): SCP =
+        fun withSqlite(
+            dir: File,
+            key: ByteArray,
+        ): SCP =
             SCP(
                 NativeScp.withStorage(
                     StorageConfig.Sqlite(

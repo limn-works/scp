@@ -302,6 +302,100 @@ pub fn build_event_log_provider() -> (
 }
 
 // ---------------------------------------------------------------------------
+// ProtocolRepoVariant — shared storage-backed repository enum
+//
+// Approved exemption from ADR-048 §2 "per-bridge concrete structs, no
+// shared type-erased slots": this is a closed protocol-level enum whose
+// variants trace to `StorageConfig` (in-memory vs. persistent SQLCipher).
+// Duplicating it per bridge produces three identical match statements
+// with no additional type safety — each bridge already owns its own
+// concrete instance type, so the enum lives on a per-bridge field
+// without ambiguity. See ADR-048 §2 for the rationale.
+// ---------------------------------------------------------------------------
+
+/// Protocol repository variant: an `Arc<ProtocolRepository<_>>` whose inner
+/// `Storage` matches the bridge's configured persistence backend.
+///
+/// Before this variant existed, each bridge's `protocol_repository` was
+/// always `Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>`,
+/// even when the bridge was constructed with a `Sqlite` storage config.
+/// That meant the Merkle event log — which uses the protocol repository
+/// as its backing `EventLogPersistence` — silently ran against an ephemeral
+/// in-memory store, while context snapshots correctly landed in `SQLite`. On
+/// restart the event log would be empty even though the rest of the state
+/// survived, producing a split-brain the caller had no way to detect.
+///
+/// The enum dispatches the event log bridge and the trust bridge onto the
+/// real backing store for each variant, so `SCP({storage: sqlite})` now
+/// persists *both* snapshots and Merkle event log entries to the same
+/// `SQLCipher` database.
+pub enum ProtocolRepoVariant {
+    /// Encrypted in-memory repository. Event log and trust aggregation are
+    /// backed by an `Arc<EncryptingAdapter<BridgeInMemoryStorage>>`
+    /// ([`BridgeInMemoryStorageHandle`]) with a random per-instance
+    /// AES-256-GCM key. The store is held behind an `Arc` so the SAME
+    /// encrypted backend feeds the event-log repository AND the supervisor's
+    /// `mls_storage` view (spec §17.6 — one chosen backend, derived
+    /// consumers). Data is lost when the instance drops.
+    InMemory(Arc<BridgeInMemoryRepo>),
+    /// SQLCipher-backed repository. Event log and trust aggregation share the
+    /// same `Arc<SqliteStorage>` that backs `CoreFields::persistence`, so
+    /// context snapshots, trust attestations, and event log entries all
+    /// survive restart and share a single `SQLCipher` connection.
+    Sqlite(Arc<ProtocolRepository<Arc<scp_platform::sqlite::SqliteStorage>>>),
+}
+
+impl ProtocolRepoVariant {
+    /// Constructs a [`ContextEventLogProvider`] backed by this repository.
+    ///
+    /// The bridge is retained by `Arc` inside
+    /// `MerkleEventLogProvider`, so subsequent `append` calls persist
+    /// entries through the backing store that was configured at
+    /// instance-construction time.
+    #[must_use]
+    pub fn event_log_provider(&self) -> Box<dyn ContextEventLogProvider> {
+        match self {
+            Self::InMemory(repo) => {
+                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
+                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+            }
+            Self::Sqlite(repo) => {
+                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
+                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+            }
+        }
+    }
+
+    /// Releases persistent resources held by the variant.
+    ///
+    /// For [`ProtocolRepoVariant::Sqlite`] this walks the
+    /// `Arc<ProtocolRepository<Arc<SqliteStorage>>>` chain to reach
+    /// the `SqliteStorage` and calls
+    /// [`scp_platform::sqlite::SqliteStorage::close`] — releasing the
+    /// advisory lock on `{dir}/scp.db.lock` even when other `Arc`
+    /// holders (`CoreFields::persistence`, `ContextManager`) keep the
+    /// storage struct alive until the bridge instance drops.
+    /// [`ProtocolRepoVariant::InMemory`] has no persistent resources
+    /// and the call is a no-op.
+    ///
+    /// Called from `bridge_specific_shutdown` on the NAPI + `UniFFI`
+    /// bridges so that `SCP.shutdown()` at the SDK surface releases
+    /// the lock without requiring the caller to drop the `SCP` handle
+    /// itself.
+    pub fn close(&self) {
+        match self {
+            Self::InMemory(_) => {}
+            Self::Sqlite(repo) => {
+                // `ProtocolRepository<S>::storage()` returns `&S` — here
+                // `&Arc<SqliteStorage>` — and `SqliteStorage::close()` is
+                // `&self`, so the `Arc` deref gives us the call we need.
+                repo.storage().close();
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared UCAN validation state
 // ---------------------------------------------------------------------------
 

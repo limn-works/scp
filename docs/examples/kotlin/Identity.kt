@@ -68,8 +68,13 @@ fun identityExample(bridge: CoroutineBridge) = runBlocking {
     println("Removed agent key, new handle: $cleaned")
 
     // 8. Migrate identity to a new DID (Layer 2 rotation).
-    val migrated = advanced.migrate(identityHandle)
-    println("Migrated identity, new handle: $migrated")
+    //    The DidRotationEvent JSON must be distributed to every active
+    //    context where the OLD DID is a member (spec §3.2.1 step 4b)
+    //    so peers accept the new DID's #active key. Pre-context callers
+    //    can ignore the event (it has nowhere to go yet).
+    val migrated = advanced.migrateWithRotationEvent(identityHandle)
+    println("Migrated identity, new handle: ${migrated.handle}")
+    // In a real app, forward migrated.rotationEventJson to each active context here.
 
     // 9. Device attestation (section 9.3).
     val token = advanced.attestDevice(identityHandle)

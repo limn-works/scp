@@ -1,10 +1,22 @@
 //! `PyO3` bridge functions for tool registration, invocation, and verification.
 //!
-//! Exposes SCP tool operations to Python:
+//! Exposes SCP tool operations to Python as methods on the `SCP` class:
 //!
-//! - [`py_tool_register`] — Register a tool in a context (returns tool ID).
-//! - [`py_tool_invoke`] — Invoke a tool (returns JSON-compatible output).
-//! - [`py_tool_verify`] — Verify a tool against its test vectors.
+//! - `PyScp::tool_register` — Register a tool in a context (returns tool ID).
+//! - `PyScp::tool_invoke` — Invoke a tool (returns JSON-compatible output).
+//! - `PyScp::tool_verify` — Verify a tool against its test vectors.
+//! - `PyScp::tool_invoke_cross_context` — Invoke a tool across context
+//!   boundaries.
+//! - `PyScp::tool_session_create` — Create a stateful tool session.
+//! - `PyScp::tool_session_invoke` — Invoke a tool within a session.
+//! - `PyScp::tool_session_close` — Close a stateful tool session.
+//! - `PyScp::tool_interface_expose` — Expose a tool interface (step 1 of
+//!   the §6.2.0.1 bidirectional handshake).
+//! - `PyScp::tool_interface_accept` — Accept an exposed interface (step 4).
+//! - `PyScp::tool_interface_revoke` — Revoke an interface unilaterally.
+//!
+//! All free `#[pyfunction]` exports were migrated to `#[pymethods] impl PyScp`
+//! methods in Phase 4 PR 4 sub-slice E (#1549).
 //!
 //! # Types
 //!
@@ -21,6 +33,7 @@ use scp_ffi_common::error_codes as codes;
 use scp_primitives::Clock;
 
 use crate::error::ScpPyError;
+use crate::runtime::PyBridgeInstance;
 use crate::types::{json_to_py_dict, py_dict_to_json};
 use crate::validate;
 
@@ -99,7 +112,7 @@ impl PyToolRegistration {
 
 /// Result of verifying a tool against its test vectors.
 ///
-/// Returned by [`py_tool_verify`]. Contains the tool ID, overall pass/fail
+/// Returned by `py_tool_verify`. Contains the tool ID, overall pass/fail
 /// status, and a list of failure messages (empty if all vectors passed).
 #[pyclass(name = "ToolVerificationResult")]
 #[derive(Debug, Clone)]
@@ -130,30 +143,17 @@ impl PyToolVerificationResult {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge functions
+// Bridge helpers — per-bridge implementations used by PyScp methods
 // ---------------------------------------------------------------------------
 
-/// Registers a tool in an SCP context.
+/// Registers a tool in an SCP context on the given bridge instance.
 ///
-/// # Arguments
-///
-/// * `context_id` — The ID of the context to register the tool in.
-/// * `registration` — A Python dict containing tool registration data
-///   (name, description, schema, `test_vectors`, `operator_did`).
-///
-/// # Returns
-///
-/// The tool ID (string) assigned to the registered tool.
-///
-/// # Errors
-///
-/// Raises `ContextError` if the context is not connected to the runtime
-/// or if registration fails (permission denied, schema invalid, etc.).
-///
-/// See ADR-013 §4: `py_tool_register(handle, registration) -> str`.
-#[pyfunction]
-#[pyo3(name = "tool_register")]
-pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> PyResult<String> {
+/// See ADR-013 §4.
+fn tool_register_impl(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    registration: &Bound<'_, PyDict>,
+) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
     // Extract registration fields from the Python dict.
@@ -227,7 +227,8 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     let cost = extract_cost(registration)?;
 
     // Generate a tool ID from the name (deterministic, human-readable).
-    let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
+    // Shared with every other bridge via `scp_ffi_common::tool_id`.
+    let tool_id = scp_ffi_common::tool_id::generate_tool_id(&name);
 
     // Build the scp-core ToolRegistration.
     let core_registration = scp_core::context::tools::ToolRegistration {
@@ -249,7 +250,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     };
 
     // Look up the context runtime and register the tool.
-    let registered_id = crate::runtime::with_context(context_id, |rt| {
+    let registered_id = crate::runtime::with_context(bi, context_id, |rt| {
         let (registered_id, _event) = scp_core::context::tools::register_tool(
             &mut rt.tool_registry,
             &rt.role_state,
@@ -266,9 +267,10 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 /// Validates a UCAN token for tool invocation authorization.
 ///
 /// Runs the full 11-step ADR-016 pipeline, requiring `tool_invoke:{tool_id}`
-/// or `tool_invoke:*` capability. Extracted to keep `py_tool_invoke` within
+/// or `tool_invoke:*` capability. Extracted to keep `tool_invoke_impl` within
 /// the 100-line clippy limit.
 fn validate_tool_ucan(
+    bi: &PyBridgeInstance,
     context_id: &str,
     tool_id: &str,
     ucan_token: &str,
@@ -278,8 +280,8 @@ fn validate_tool_ucan(
     let proof_resolver =
         crate::ucan::build_proof_resolver_from_tokens(proof_tokens.map(Vec::as_slice))?;
 
-    crate::runtime::with_context(context_id, |rt| {
-        let production_resolver = crate::runtime::did_resolver();
+    crate::runtime::with_context(bi, context_id, |rt| {
+        let production_resolver = crate::runtime::did_resolver(bi);
         let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
             production_resolver.map(std::convert::AsRef::as_ref),
         );
@@ -371,15 +373,11 @@ fn validate_tool_ucan(
 /// underlying tool dispatch fails. Callers should consult `.code` rather
 /// than string-matching `.message`.
 ///
-/// See ADR-013 §4: `py_tool_invoke(handle, tool_id, input, identity) -> PyObject`.
-/// See SCP-212 for the handler registration and dispatch design.
-/// See spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
-#[pyfunction]
-#[pyo3(name = "tool_invoke")]
-#[pyo3(signature = (context_id, tool_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
+/// See ADR-013 §4, SCP-212, spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // Bridge mirrors the runtime's economy entry point.
-pub fn py_tool_invoke(
+fn tool_invoke_impl(
+    bi: &PyBridgeInstance,
     py: Python<'_>,
     context_id: &str,
     tool_id: &str,
@@ -410,6 +408,7 @@ pub fn py_tool_invoke(
     // wrapper does NOT re-validate the action UCAN — it enforces the
     // economy/budget/spending side. See spec §6.2, §8, ADR-016, #319.
     validate_tool_ucan(
+        bi,
         context_id,
         tool_id,
         ucan_token,
@@ -442,7 +441,7 @@ pub fn py_tool_invoke(
     let ctx_id_owned = context_id.to_owned();
     let tool_id_owned = tool_id.to_owned();
     let identity_did_owned = identity_did.to_owned();
-    let (registry, handler) = crate::runtime::with_context(context_id, |rt| {
+    let (registry, handler) = crate::runtime::with_context(bi, context_id, |rt| {
         Ok((
             rt.tool_registry.clone(),
             rt.tool_handlers.get(tool_id).cloned(),
@@ -485,7 +484,7 @@ pub fn py_tool_invoke(
     // are sync; the Python SDK wrapper invokes us via `asyncio.to_thread`
     // so we are NOT inside a tokio runtime context — `block_on` on the
     // multi-thread global runtime is safe (matches `py_context_send`).
-    let supervisor = crate::runtime::supervisor()?;
+    let supervisor = crate::runtime::supervisor(bi)?;
     let invoker_did_typed: scp_primitives::DID = identity_did_owned.into();
     let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id_owned.as_str());
     let rt = crate::runtime()?;
@@ -532,17 +531,19 @@ pub fn py_tool_invoke(
 /// Raises `ContextError` if the context is not connected or the tool
 /// is not found.
 ///
-/// See ADR-013 §4: `py_tool_verify(handle, tool_id) -> PyToolVerificationResult`.
-#[pyfunction]
-#[pyo3(name = "tool_verify")]
-pub fn py_tool_verify(context_id: &str, tool_id: &str) -> PyResult<PyToolVerificationResult> {
+/// See ADR-013 §4.
+fn tool_verify_impl(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    tool_id: &str,
+) -> PyResult<PyToolVerificationResult> {
     validate::validate_context_id(context_id)?;
     validate::validate_tool_id(tool_id)?;
     // Look up the context and verify the tool against its test vectors.
     // The executor returns the expected output (identity function) since the
     // bridge layer has no external tool executor. This verifies the test
     // vector structure is intact.
-    let result = crate::runtime::with_context(context_id, |rt| {
+    let result = crate::runtime::with_context(bi, context_id, |rt| {
         let (verification_result, _event) = scp_core::context::tools::verify_tool(
             &rt.tool_registry,
             tool_id,
@@ -767,12 +768,10 @@ fn extract_test_vectors(
 /// or lacks the required tool invocation capability.
 /// Raises `ContextError` if either context is not connected, the tool is
 /// not found, chain depth is exceeded, or the interface is not approved.
-#[pyfunction]
-#[pyo3(name = "tool_invoke_cross_context")]
-#[pyo3(signature = (source_context_id, target_context_id, tool_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // FFI boundary: PyO3 requires explicit params
-pub fn py_tool_invoke_cross_context(
+fn tool_invoke_cross_context_impl(
+    bi: &PyBridgeInstance,
     py: Python<'_>,
     source_context_id: &str,
     target_context_id: &str,
@@ -799,6 +798,7 @@ pub fn py_tool_invoke_cross_context(
     // ADR-016 pipeline against the TARGET context's ceiling.
     // See spec §6.2, §8, ADR-016, and issue #319.
     validate_tool_ucan(
+        bi,
         target_context_id,
         tool_id,
         ucan_token,
@@ -807,7 +807,7 @@ pub fn py_tool_invoke_cross_context(
     )?;
 
     // Defense-in-depth: check role-state capabilities in the source context.
-    let source_has_capability = crate::runtime::with_context(source_context_id, |rt| {
+    let source_has_capability = crate::runtime::with_context(bi, source_context_id, |rt| {
         Ok(scp_core::context::tools::has_tool_invoke_capability(
             &rt.role_state,
             invoker_did,
@@ -824,7 +824,7 @@ pub fn py_tool_invoke_cross_context(
 
     // Validate chain depth (context-configurable, default 8 per ADR-043).
     let max_chain_depth = {
-        let supervisor = crate::runtime::supervisor()?;
+        let supervisor = crate::runtime::supervisor(bi)?;
         let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
         let source_max = tokio_rt
             .block_on(supervisor.context_params(source_context_id))
@@ -839,7 +839,7 @@ pub fn py_tool_invoke_cross_context(
     }
 
     // Invoke the tool in the target context with echo mode.
-    let output_json = crate::runtime::with_context(target_context_id, |rt| {
+    let output_json = crate::runtime::with_context(bi, target_context_id, |rt| {
         let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
             ScpPyError::context(format!(
                 "tool '{tool_id}' not found in target context '{target_context_id}'"
@@ -923,9 +923,8 @@ pub fn py_tool_invoke_cross_context(
 ///
 /// Raises `ContextError` if the context is not connected, the tool is
 /// not found, or the per-caller session cap is exceeded.
-#[pyfunction]
-#[pyo3(name = "tool_session_create", signature = (context_id, tool_id, source_context_id, ttl_seconds=None))]
-pub fn py_tool_session_create(
+fn tool_session_create_impl(
+    bi: &PyBridgeInstance,
     context_id: &str,
     tool_id: &str,
     source_context_id: &str,
@@ -935,7 +934,7 @@ pub fn py_tool_session_create(
     validate::validate_tool_id(tool_id)?;
     validate::validate_context_id(source_context_id)?;
 
-    let session_id = crate::runtime::with_context(context_id, |rt| {
+    let session_id = crate::runtime::with_context(bi, context_id, |rt| {
         // Validate tool exists.
         if !rt.tool_registry.contains(tool_id) {
             return Err(ScpPyError::context(format!(
@@ -945,7 +944,7 @@ pub fn py_tool_session_create(
 
         // Enforce per-caller session cap (context-configured, default 1000, ADR-043).
         let cap = {
-            let supervisor = crate::runtime::supervisor()?;
+            let supervisor = crate::runtime::supervisor(bi)?;
             let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
             tokio_rt
                 .block_on(supervisor.context_params(context_id))
@@ -1007,11 +1006,10 @@ pub fn py_tool_session_create(
 /// or lacks the required tool invocation capability.
 /// Raises `ContextError` if the session is not found, has expired, or
 /// the invoker lacks capability.
-#[pyfunction]
-#[pyo3(name = "tool_session_invoke")]
-#[pyo3(signature = (context_id, session_id, input, invoker_did, ucan_token, proof_tokens=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
-pub fn py_tool_session_invoke(
+#[allow(clippy::too_many_arguments)] // FFI surface: spec-defined signature
+fn tool_session_invoke_impl(
+    bi: &PyBridgeInstance,
     py: Python<'_>,
     context_id: &str,
     session_id: &str,
@@ -1032,7 +1030,7 @@ pub fn py_tool_session_invoke(
 
     // Look up the tool_id from the session before UCAN validation so we can
     // validate against the correct tool capability.
-    let tool_id_for_ucan = crate::runtime::with_context(context_id, |rt| {
+    let tool_id_for_ucan = crate::runtime::with_context(bi, context_id, |rt| {
         let session = rt
             .session_store
             .get(session_id)
@@ -1043,6 +1041,7 @@ pub fn py_tool_session_invoke(
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
     validate_tool_ucan(
+        bi,
         context_id,
         &tool_id_for_ucan,
         ucan_token,
@@ -1050,7 +1049,7 @@ pub fn py_tool_session_invoke(
         proof_tokens.as_ref(),
     )?;
 
-    let output_json = crate::runtime::with_context(context_id, |rt| {
+    let output_json = crate::runtime::with_context(bi, context_id, |rt| {
         // Look up session.
         let session = rt
             .session_store
@@ -1135,12 +1134,14 @@ pub fn py_tool_session_invoke(
 ///
 /// Raises `ContextError` if the context is not connected or the session
 /// is not found.
-#[pyfunction]
-#[pyo3(name = "tool_session_close")]
-pub fn py_tool_session_close(context_id: &str, session_id: &str) -> PyResult<()> {
+fn tool_session_close_impl(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    session_id: &str,
+) -> PyResult<()> {
     validate::validate_context_id(context_id)?;
 
-    crate::runtime::with_context(context_id, |rt| {
+    crate::runtime::with_context(bi, context_id, |rt| {
         if rt.session_store.remove(session_id).is_none() {
             return Err(ScpPyError::context(format!(
                 "session '{session_id}' not found"
@@ -1179,9 +1180,8 @@ pub fn py_tool_session_close(context_id: &str, session_id: &str) -> PyResult<()>
 /// # Errors
 ///
 /// Raises `ToolError` if the caller is not an admin or the tool is not found.
-#[pyfunction]
-#[pyo3(name = "tool_interface_expose", signature = (context_id, tool_id, target_context_id, rate_limit_json=None))]
-pub fn py_tool_interface_expose(
+fn tool_interface_expose_impl(
+    bi: &PyBridgeInstance,
     context_id: &str,
     tool_id: &str,
     target_context_id: &str,
@@ -1203,7 +1203,7 @@ pub fn py_tool_interface_expose(
         None => None,
     };
 
-    Ok(crate::runtime::with_context(context_id, |rt| {
+    Ok(crate::runtime::with_context(bi, context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.to_string(),
             scp_core::context::ContextParams::default(),
@@ -1250,9 +1250,11 @@ pub fn py_tool_interface_expose(
 ///
 /// Raises `ToolError` if the caller is not an admin or the interface's target
 /// context does not match `context_id`.
-#[pyfunction]
-#[pyo3(name = "tool_interface_accept")]
-pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyResult<String> {
+fn tool_interface_accept_impl(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    interface_json: &str,
+) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
     let mut interface: scp_core::context::tools::interface::ToolInterface =
@@ -1261,7 +1263,7 @@ pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyRes
             code: codes::VALID_7041.to_owned(),
         })?;
 
-    Ok(crate::runtime::with_context(context_id, |rt| {
+    Ok(crate::runtime::with_context(bi, context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.to_string(),
             scp_core::context::ContextParams::default(),
@@ -1303,9 +1305,11 @@ pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyRes
 /// # Errors
 ///
 /// Raises `ValidationError` if `interface_id` is not valid hex or not 32 bytes.
-#[pyfunction]
-#[pyo3(name = "tool_interface_revoke")]
-pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyResult<String> {
+fn tool_interface_revoke_impl(
+    _bi: &PyBridgeInstance,
+    context_id: &str,
+    interface_id_hex: &str,
+) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
     let interface_id_bytes =
@@ -1313,16 +1317,14 @@ pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyR
             message: format!("invalid interface_id_hex: not valid hex: {e}"),
             code: codes::VALID_7042.to_owned(),
         })?;
-    let interface_id: [u8; 32] =
-        <[u8; 32]>::try_from(interface_id_bytes.as_slice()).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: format!(
-                    "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
-                    interface_id_bytes.len()
-                ),
-                code: codes::VALID_7042.to_owned(),
-            }
-        })?;
+    let interface_id: [u8; 32] = scp_ffi_common::validate::expect_fixed_bytes::<32>(
+        interface_id_bytes.as_slice(),
+        "interface_id_hex",
+    )
+    .map_err(|msg| ScpPyError::ValidationError {
+        message: format!("{msg} (64 hex chars)"),
+        code: codes::VALID_7042.to_owned(),
+    })?;
 
     let now_ms = scp_primitives::SystemClock.now_millis();
 
@@ -1341,29 +1343,305 @@ pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyR
 }
 
 // ---------------------------------------------------------------------------
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
+// ---------------------------------------------------------------------------
+
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Registers a tool in an SCP context.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` — The ID of the context to register the tool in.
+    /// * `registration` — A Python dict containing tool registration data
+    ///   (name, description, schema, `test_vectors`, `operator_did`).
+    ///
+    /// # Returns
+    ///
+    /// The tool ID (string) assigned to the registered tool.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the context is not connected to the runtime
+    /// or if registration fails.
+    ///
+    /// See ADR-013 §4.
+    #[pyo3(name = "tool_register")]
+    pub fn tool_register(
+        &self,
+        context_id: &str,
+        registration: &Bound<'_, PyDict>,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        tool_register_impl(bi, context_id, registration)
+    }
+
+    /// Invokes a tool within an SCP context, fully wired through the
+    /// `ContextManager::invoke_tool_with_economy` pipeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` — The ID of the context containing the tool.
+    /// * `tool_id` — The ID of the tool to invoke.
+    /// * `input` — A Python dict of input parameters matching the tool's
+    ///   input schema.
+    /// * `identity_did` — The DID of the invoking identity (used for
+    ///   capability checking).
+    /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+    /// * `proof_tokens` — Optional encoded parent UCAN tokens for delegation
+    ///   chain traversal.
+    /// * `spending_ucan` — Optional JWT-encoded spending UCAN for paid tool
+    ///   invocations.
+    ///
+    /// # Returns
+    ///
+    /// A Python object (dict) containing the tool's JSON-compatible output.
+    ///
+    /// # Errors
+    ///
+    /// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
+    /// or lacks the required tool invocation capability.
+    /// Raises `ContextError` if the economy pre-check, budget, payment escrow,
+    /// hard rate limit, or underlying tool dispatch fails.
+    ///
+    /// See ADR-013 §4, SCP-212, spec §6.2, §8, §19.5, §19.7, ADR-016, #319.
+    #[pyo3(name = "tool_invoke")]
+    #[pyo3(signature = (context_id, tool_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    pub fn tool_invoke(
+        &self,
+        py: Python<'_>,
+        context_id: &str,
+        tool_id: &str,
+        input: &Bound<'_, PyDict>,
+        identity_did: &str,
+        ucan_token: &str,
+        proof_tokens: Option<Vec<String>>,
+        spending_ucan: Option<&str>,
+    ) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        tool_invoke_impl(
+            bi,
+            py,
+            context_id,
+            tool_id,
+            input,
+            identity_did,
+            ucan_token,
+            proof_tokens,
+            spending_ucan,
+        )
+    }
+
+    /// Verifies a tool against its registered test vectors.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` — The ID of the context containing the tool.
+    /// * `tool_id` — The ID of the tool to verify.
+    ///
+    /// # Returns
+    ///
+    /// A [`PyToolVerificationResult`] with the tool ID, overall pass/fail
+    /// status, and any failure messages.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the context is not connected or the tool
+    /// is not found.
+    ///
+    /// See ADR-013 §4.
+    #[pyo3(name = "tool_verify")]
+    pub fn tool_verify(
+        &self,
+        context_id: &str,
+        tool_id: &str,
+    ) -> PyResult<PyToolVerificationResult> {
+        let bi = &*self.inner;
+        tool_verify_impl(bi, context_id, tool_id)
+    }
+
+    /// Invokes a tool across context boundaries.
+    ///
+    /// The source context exposes the tool and the target context accepts the
+    /// interface. Both contexts must have approved the interface before calls
+    /// are permitted. Rate limits and chain depth are enforced per spec §6.2.
+    ///
+    /// # Errors
+    ///
+    /// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
+    /// or lacks the required tool invocation capability.
+    /// Raises `ContextError` if either context is not connected, the tool is
+    /// not found, chain depth is exceeded, or the interface is not approved.
+    #[pyo3(name = "tool_invoke_cross_context")]
+    #[pyo3(signature = (source_context_id, target_context_id, tool_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    pub fn tool_invoke_cross_context(
+        &self,
+        py: Python<'_>,
+        source_context_id: &str,
+        target_context_id: &str,
+        tool_id: &str,
+        input: &Bound<'_, PyDict>,
+        invoker_did: &str,
+        ucan_token: &str,
+        chain_depth: u8,
+        proof_tokens: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        tool_invoke_cross_context_impl(
+            bi,
+            py,
+            source_context_id,
+            target_context_id,
+            tool_id,
+            input,
+            invoker_did,
+            ucan_token,
+            chain_depth,
+            proof_tokens,
+        )
+    }
+
+    /// Creates a stateful tool session.
+    ///
+    /// Sessions enable multi-turn workflows with state preservation across
+    /// invocations.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the context is not connected, the tool is
+    /// not found, or the per-caller session cap is exceeded.
+    #[pyo3(name = "tool_session_create", signature = (context_id, tool_id, source_context_id, ttl_seconds=None))]
+    pub fn tool_session_create(
+        &self,
+        context_id: &str,
+        tool_id: &str,
+        source_context_id: &str,
+        ttl_seconds: Option<u64>,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        tool_session_create_impl(bi, context_id, tool_id, source_context_id, ttl_seconds)
+    }
+
+    /// Invokes a tool within an active session.
+    ///
+    /// Each call is individually governed: the invoker must hold `ToolInvoke`
+    /// capability and present a valid UCAN token. Session state is carried
+    /// forward across invocations.
+    ///
+    /// # Errors
+    ///
+    /// Raises `UcanError` if the UCAN token is invalid.
+    /// Raises `ContextError` if the session is not found, has expired, or the
+    /// invoker lacks capability.
+    #[pyo3(name = "tool_session_invoke")]
+    #[pyo3(signature = (context_id, session_id, input, invoker_did, ucan_token, proof_tokens=None))]
+    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::too_many_arguments)] // FFI surface: spec-defined signature
+    pub fn tool_session_invoke(
+        &self,
+        py: Python<'_>,
+        context_id: &str,
+        session_id: &str,
+        input: &Bound<'_, PyDict>,
+        invoker_did: &str,
+        ucan_token: &str,
+        proof_tokens: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        tool_session_invoke_impl(
+            bi,
+            py,
+            context_id,
+            session_id,
+            input,
+            invoker_did,
+            ucan_token,
+            proof_tokens,
+        )
+    }
+
+    /// Closes a stateful tool session.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the context is not connected or the session
+    /// is not found.
+    #[pyo3(name = "tool_session_close")]
+    pub fn tool_session_close(&self, context_id: &str, session_id: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        tool_session_close_impl(bi, context_id, session_id)
+    }
+
+    /// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+    ///
+    /// # Errors
+    ///
+    /// Raises `ToolError` if the caller is not an admin or the tool is not found.
+    #[pyo3(name = "tool_interface_expose", signature = (context_id, tool_id, target_context_id, rate_limit_json=None))]
+    pub fn tool_interface_expose(
+        &self,
+        context_id: &str,
+        tool_id: &str,
+        target_context_id: &str,
+        rate_limit_json: Option<&str>,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        tool_interface_expose_impl(bi, context_id, tool_id, target_context_id, rate_limit_json)
+    }
+
+    /// Accepts a cross-context tool interface (§6.2.0.1 step 4).
+    ///
+    /// # Errors
+    ///
+    /// Raises `ToolError` if the caller is not an admin or the interface's
+    /// target context does not match `context_id`.
+    #[pyo3(name = "tool_interface_accept")]
+    pub fn tool_interface_accept(
+        &self,
+        context_id: &str,
+        interface_json: &str,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        tool_interface_accept_impl(bi, context_id, interface_json)
+    }
+
+    /// Revokes a cross-context tool interface (§6.2.0.1 step 5).
+    ///
+    /// Either context may revoke unilaterally.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if `interface_id` is not valid hex or not 32 bytes.
+    #[pyo3(name = "tool_interface_revoke")]
+    pub fn tool_interface_revoke(
+        &self,
+        context_id: &str,
+        interface_id_hex: &str,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        tool_interface_revoke_impl(bi, context_id, interface_id_hex)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
-/// Registers tool bridge functions and classes on the `_scp_core` module.
+/// Registers tool bridge classes on the `_scp_core` module.
+///
+/// Post-migration (Phase 4 PR 4 sub-slice E), tool operations are exposed as
+/// methods on `SCP`. Only opaque result classes require registration here.
 ///
 /// Called from [`crate::_scp_core`] during module initialization.
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if registration of functions or classes fails.
+/// Returns `PyErr` if registration of classes fails.
 pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyToolRegistration>()?;
     m.add_class::<PyToolVerificationResult>()?;
-    m.add_function(wrap_pyfunction!(py_tool_register, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_invoke, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_verify, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_invoke_cross_context, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_session_create, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_session_invoke, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_session_close, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_interface_expose, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_interface_accept, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_interface_revoke, m)?)?;
     Ok(())
 }
 
@@ -1376,6 +1654,10 @@ pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use scp_ffi_common::error_codes as codes;
+
+    fn default_scp() -> crate::scp::PyScp {
+        crate::scp::PyScp::new()
+    }
 
     #[test]
     fn json_value_type_name_covers_all_variants() {
@@ -1407,7 +1689,7 @@ mod tests {
             schema.set_item("output_schema", PyDict::new(py)).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject missing input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1439,7 +1721,7 @@ mod tests {
             schema.set_item("input_schema", inner).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject missing output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1472,7 +1754,7 @@ mod tests {
             schema.set_item("output_schema", output).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-object input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1502,7 +1784,7 @@ mod tests {
             schema.set_item("output_schema", output_list).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-object output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1544,7 +1826,7 @@ mod tests {
             let dict = valid_registration_dict(py);
             dict.set_item("test_vectors", "not-a-list").unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-list test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1567,7 +1849,7 @@ mod tests {
             let vectors = pyo3::types::PyList::new(py, [42i32]).unwrap();
             dict.set_item("test_vectors", vectors).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject non-dict items in test_vectors"
@@ -1594,7 +1876,7 @@ mod tests {
             wrong_type.set_item("not", "a list").unwrap();
             dict.set_item("test_vectors", wrong_type).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject dict as test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1645,7 +1927,7 @@ mod tests {
             let dict = valid_registration_dict(py);
             dict.set_item("implementation_hash", 12345).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject non-string implementation_hash"
@@ -1672,7 +1954,7 @@ mod tests {
             dict.set_item("implementation_hash", "abcdef0123456789abcdef0123456789")
                 .unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject wrong-length implementation_hash"
@@ -1702,7 +1984,7 @@ mod tests {
             )
             .unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject invalid hex in implementation_hash"
@@ -1756,7 +2038,7 @@ mod tests {
 
     /// `registered_at` on a tool registered via the `PyO3` bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
-    /// Calls the actual `py_tool_register` bridge function and inspects the
+    /// Calls the actual `PyScp::tool_register` bridge method and inspects the
     /// stored `ToolRegistration`. Catches the original bug from issue #871.
     #[test]
     fn registered_at_is_seconds_epoch() {
@@ -1764,8 +2046,11 @@ mod tests {
         let ctx_id = format!("ctx-ts-test-{}", std::process::id());
         let creator_did = "did:dht:z6MkTestTimestamp";
 
+        let scp = default_scp();
+        let bi = &*scp.inner;
+
         // Register FFI state so the context exists in the runtime registry.
-        crate::runtime::register_ffi_state(&ctx_id, creator_did, &[]).unwrap();
+        crate::runtime::register_ffi_state(bi, &ctx_id, creator_did, &[]).unwrap();
 
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
@@ -1794,11 +2079,12 @@ mod tests {
             schema.set_item("output_schema", output).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let tool_id = py_tool_register(&ctx_id, &dict.as_borrowed())
-                .expect("py_tool_register should succeed");
+            let tool_id = scp
+                .tool_register(&ctx_id, &dict.as_borrowed())
+                .expect("tool_register should succeed");
 
             // Read the stored registration back from the runtime registry.
-            let registered_at = crate::runtime::with_ffi_state(&ctx_id, |state| {
+            let registered_at = crate::runtime::with_ffi_state(bi, &ctx_id, |state| {
                 let reg = state
                     .tool_registry
                     .get(&tool_id)
@@ -1815,6 +2101,6 @@ mod tests {
         });
 
         // Clean up global state.
-        crate::runtime::remove_ffi_state(&ctx_id);
+        crate::runtime::remove_ffi_state(bi, &ctx_id);
     }
 }

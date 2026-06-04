@@ -2625,6 +2625,12 @@ mod tests {
             hostname_index: RwLock::new(HashMap::new()),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
+            #[cfg(feature = "quic")]
+            publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
+            #[cfg(feature = "quic")]
+            quic_server_config: None,
+            #[cfg(feature = "quic")]
+            quic_listening: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

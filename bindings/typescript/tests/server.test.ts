@@ -112,11 +112,15 @@ describe("Node lifecycle methods (SCP-296)", () => {
   });
 
   it("Node class exports from server module", async () => {
-    // Verify the Node class is exported and has expected static methods
+    // Verify the Node class is exported. Phase 4 PR 4 (#1549, ADR-048)
+    // deleted the static `Node.startInMemory` / `Node.startLocal`
+    // factories — callers construct nodes via
+    // `scp.nodeStartInMemory(...)` / `scp.nodeStartLocal(...)` which
+    // hydrate via `Node._fromHandle`. The class itself is still a
+    // real export used as a type and for the instance method surface.
     const { Node } = await import("../src/server");
     expect(Node).toBeDefined();
-    expect(typeof Node.startInMemory).toBe("function");
-    expect(typeof Node.startLocal).toBe("function");
+    expect(typeof Node._fromHandle).toBe("function");
   });
 
   it("Node class exports from index", async () => {

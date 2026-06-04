@@ -123,7 +123,31 @@ tasks.register<Exec>("generateUniffiBindings") {
     group = "codegen"
     description = "Generate Kotlin bindings from the scp-ffi-uniffi Rust crate via UniFFI"
     workingDir = rootProject.projectDir.parentFile.parentFile
-    commandLine("./scripts/generate-uniffi-kotlin.sh")
+    // Extra cargo features passed alongside the default `allow_in_memory_custody`.
+    // The bridge-parity CI job sets `-Pscp.uniffi.extraFeatures=testing` so the
+    // regenerated cdylib keeps the `signed_at_override` parity affordance
+    // (`#[cfg(feature = "testing")]`). Production consumers leave it unset so
+    // the testing surface is not linked into release binaries.
+    val extraFeatures = providers.gradleProperty("scp.uniffi.extraFeatures").getOrElse("")
+    val featuresArg = if (extraFeatures.isEmpty()) {
+        "--features=allow_in_memory_custody"
+    } else {
+        "--features=allow_in_memory_custody,$extraFeatures"
+    }
+    commandLine("./scripts/generate-uniffi-kotlin.sh", featuresArg)
+    // Invalidate on any Rust change under the uniffi crate so stale bindings never compile.
+    inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/uniffi/src")))
+    inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/common/src")))
+    outputs.dir(uniffiBindingsDir)
+}
+
+// Wire generation into the compile chain so `./gradlew :scp-kt:build` or `test`
+// always regenerates when Rust sources change. Without this, a developer who
+// edits the UniFFI bridge and forgets to regenerate would compile Kotlin
+// against stale bindings — every caller would silently miss any new handle-
+// affinity check or API change. (Round-2 black-hat finding.)
+tasks.matching { it.name == "compileKotlin" }.configureEach {
+    dependsOn("generateUniffiBindings")
 }
 
 publishing {

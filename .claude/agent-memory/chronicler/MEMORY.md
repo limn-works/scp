@@ -41,3 +41,18 @@
 - `.claude/state/current.md` -- active work + recently completed
 - `.claude/state/blocked.md` -- items waiting on dependencies
 - `.claude/state/planned.md` -- unblocked work ready to pick up
+
+## Cross-Bridge Matrix (PR #1702, 2026-04-25)
+- See [feedback_bridge_canonical_naming.md](feedback_bridge_canonical_naming.md) -- canonical name in bridge-aliases.json must already exist in all 4 bridges; otherwise file source-side rename
+- See [feedback_enforcement_hook_matrix_expansion.md](feedback_enforcement_hook_matrix_expansion.md) -- ADD-only edits to bridge-aliases.json bypass the PreToolUse hook via dangerouslyDisableSandbox; only for additive diffs
+- See [feedback_lockstep_enforcement.md](feedback_lockstep_enforcement.md) -- bridge-aliases.json wasm_required:true entries must equal WASM_REQUIRED_OPERATIONS in ffi_conformance.rs; aliases_json_is_in_sync_with_parity_operations test enforces. Edit both atomically.
+- Lesson at `.docs/lessons/cross-bridge-canonical-naming.md` covers naming divergence (PyO3/UniFFI bare-verb vs NAPI/WASM noun-verb), inverse-coverage blind spot in bridge-symmetry harness, sibling-stem alignment, category-by-semantics rule, lockstep enforcement pattern
+
+## Cross-Bridge Matrix Batch 2 (PR #1703, 2026-04-25)
+- Branch `cross-bridge/1543-batch2-ratchet-promotion`. Added 6 ops (4 WASM-exempt per ADR-034). 5 new include_str! + 7 category coverage tests gated on per-bridge exemptions. Promoted 33 ops to wasm_required:true (96 of 134 total). All reviews CLEAN.
+- Batch 3 next: ~60 real impl gaps in UniFFI economy/provenance/discovery/petnames/handle/scope/media + canonical reconciliation for 14 bare-verb vs noun-verb divergences.
+
+## SCP-1717 Pre-Rotation Key Retention (2026-04-27)
+- See [project_scp_1717_pre_rotation_retention.md](project_scp_1717_pre_rotation_retention.md) -- pre_rotation_key now retained on ScpIdentity; spec §9.7.4.1 #3/#5f and §9.12 cold-storage drift unresolved; ADR-003 phase-1.md struct text stale; CLAUDE.md Integration checklist owes item 6 for behavioral cross-bridge crypto invariants.
+- Lesson at `.docs/lessons/behavioral-invariant-must-be-asserted-on-every-bridge.md` -- matrix-name parity is necessary but not sufficient; every bridge emitting a wire artifact must assert the cryptographic invariant on emitted bytes (SHA-256(revealed) == commitment recomputation per spec §3.7).
+- Lesson at `.docs/lessons/hash-commitment-preimage-lifetime.md` -- generalizes pre-rotation key bug to all hash-then-reveal commitments (KeyPackage, sender key, MLS leaf); preimage must persist from t=commit to t=reveal on every reachable code path.

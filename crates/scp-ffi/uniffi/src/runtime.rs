@@ -1,55 +1,59 @@
-//! Shared `ContextManager` and per-context UCAN state registry.
+//! Per-instance `UniffiBridgeInstance` and its registries.
 //!
-//! A single `Arc<UniffiBridgeInstance>` is allocated into
-//! [`DEFAULT_BRIDGE_INSTANCE`] the first time a free-function bridge entry
-//! touches bridge state. Bridge functions access its `ContextManager` and
-//! typed registries (UCAN, identity custody, protocol repository) via
-//! [`default_bridge_instance`] / [`bridge_instance`].
+//! Each `Arc<UniffiBridgeInstance>` is owned by the caller via a
+//! `#[derive(uniffi::Object)] Scp` handle. The instance bundles a
+//! shared `ContextManager` and typed registries (UCAN, identity custody,
+//! protocol repository, context handles, MCP servers/clients, identity
+//! link attestations) so lifecycle (`suspend` / `resume` / `shutdown`)
+//! cascades to all of them as a unit.
 //!
 //! # Per-context UCAN state
 //!
 //! The `ContextManager` does not own UCAN revocation lists or nonce trackers.
-//! Those are validation-layer concerns that live in the bridge. A typed
-//! `DashMap<String, UcanContextState>` on [`UniffiBridgeInstance`] owns them,
+//! Those are validation-layer concerns that live on the `UniffiBridgeInstance`.
+//! A typed `Arc<DashMap<String, UcanContextState>>` on the instance owns them,
 //! keyed by context ID. This mirrors the NAPI bridge's `UcanContextState`
 //! pattern (see `crates/scp-ffi/napi/src/runtime.rs`).
 //!
 //! # Lifecycle
 //!
-//! 1. First call to a bridge free function initializes the default
-//!    [`UniffiBridgeInstance`] via [`ensure_bridge_instance`].
-//! 2. Bridge functions call `context_manager()` or [`bridge_instance()`]
-//!    and delegate to the manager's async methods or the instance's typed
-//!    registries.
-//! 3. The `UniffiBridgeInstance` is dropped on process exit (static
-//!    `OnceLock`) or permanently deactivated via
-//!    [`UniffiBridgeInstance::shutdown`].
+//! 1. `Scp::new` (or `Scp::with_storage` / `Scp::with_persistence`)
+//!    constructs a fresh `UniffiBridgeInstance`; per-instance setup
+//!    (e.g. `init_context_manager_with_did`, transport setup) happens
+//!    lazily on the first `Scp::identity_create` / `context_create` /
+//!    `context_join` call.
+//! 2. `Scp::method(...)` delegates to methods on
+//!    `UniffiBridgeInstance` (`context_manager_expect`, `with_ucan_state`,
+//!    `ensure_ucan_registered`, `did_resolver`, etc.) — all per-instance,
+//!    no process-wide shared state. `context_manager_expect` returns the
+//!    instance's `Arc<Supervisor>` (ADR-049 actor migration).
+//! 3. The instance is dropped when the last `Arc` reference is released
+//!    or permanently deactivated via [`UniffiBridgeInstance::shutdown`].
 //!
 //! This replaces the old `DashMap<String, ContextRuntime>` global registry
-//! (deleted as part of issue #387) and the type-erased `Box<dyn Any>` slots
-//! on `BridgeInstance` (deleted as part of #1549 Phase 4 PR 1).
+//! (deleted as part of issue #387), the type-erased `Box<dyn Any>` slots on
+//! `BridgeInstance` (deleted as part of #1549 Phase 4 PR 1), and the
+//! process-wide `DEFAULT_BRIDGE_INSTANCE` façade (deleted as part of
+//! #1549 Phase 4 PR 4 Phase D).
 
 use async_trait::async_trait;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
-// Re-export `CoreFields` at `crate::runtime::CoreFields` so the
-// `uniffi_check_handle!` macro can refer to it as
-// `$crate::runtime::CoreFields`.
+// Re-export `CoreFields` at `crate::runtime::CoreFields` so bridge.rs
+// and server.rs can name it in impl blocks without pulling in the full
+// path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::error_codes as codes;
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use scp_core::context::builder::ContextEventLogProvider;
-use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
-use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
-use scp_platform::sqlite::SqliteStorage;
 
 // ---------------------------------------------------------------------------
 // UniffiBridgeInstance — per-bridge concrete bridge instance (#1549 Phase 4 PR 1)
@@ -176,54 +180,11 @@ impl From<StorageInitError> for crate::ScpError {
     }
 }
 
-/// Protocol repository variant: an `Arc<ProtocolRepository<_>>` whose inner
-/// `Storage` matches the bridge's configured persistence backend.
-///
-/// Before this variant existed, `UniffiBridgeInstance::protocol_repository`
-/// was always `Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>`,
-/// even when the bridge was constructed with [`StorageConfig::Sqlite`]. That
-/// meant the Merkle event log — which uses the protocol repository as its
-/// backing `EventLogPersistence` — silently ran against an ephemeral
-/// in-memory store, while context snapshots correctly landed in `SQLite`. On
-/// restart the event log would be empty even though the rest of the state
-/// survived, producing a split-brain the caller had no way to detect.
-///
-/// The enum dispatches the event log bridge and the trust bridge onto the
-/// real backing store for each variant, so `SCP({storage: sqlite})` now
-/// persists *both* snapshots and Merkle event log entries to the same
-/// `SQLCipher` database.
-pub enum ProtocolRepoVariant {
-    /// Encrypted in-memory repository. Event log and trust aggregation are
-    /// backed by an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
-    /// per-instance AES-256-GCM key. Data is lost when the instance drops.
-    InMemory(Arc<scp_ffi_common::bridge_runtime::BridgeInMemoryRepo>),
-    /// SQLCipher-backed repository. Event log and trust aggregation share the
-    /// same `Arc<SqliteStorage>` that backs `CoreFields::persistence`, so
-    /// context snapshots, trust attestations, and event log entries all
-    /// survive restart and share a single `SQLCipher` connection.
-    Sqlite(Arc<ProtocolRepository<Arc<SqliteStorage>>>),
-}
-
-impl ProtocolRepoVariant {
-    /// Constructs a [`ContextEventLogProvider`] backed by this repository.
-    ///
-    /// The bridge is retained by `Arc` inside [`MerkleEventLogProvider`], so
-    /// subsequent `append` calls persist entries through the backing store
-    /// that was configured at instance-construction time.
-    #[must_use]
-    pub fn event_log_provider(&self) -> Box<dyn ContextEventLogProvider> {
-        match self {
-            Self::InMemory(repo) => {
-                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
-                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
-            }
-            Self::Sqlite(repo) => {
-                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
-                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
-            }
-        }
-    }
-}
+// `ProtocolRepoVariant` lives in `scp-ffi-common::bridge_runtime`. Re-exported
+// here so existing `crate::runtime::ProtocolRepoVariant` references across
+// the UniFFI bridge keep compiling without mass rename. See ADR-048 §2 for
+// the "shared-variant types for storage-backed repositories" exemption.
+pub use scp_ffi_common::bridge_runtime::ProtocolRepoVariant;
 
 /// `UniFFI`-specific concrete bridge instance.
 ///
@@ -235,9 +196,10 @@ impl ProtocolRepoVariant {
 ///
 /// Constructed via [`UniffiBridgeInstance::new_uniffi`] /
 /// [`UniffiBridgeInstance::with_persistence_uniffi`] /
-/// [`UniffiBridgeInstance::with_storage_uniffi`]. The default global instance
-/// is lazily allocated into [`DEFAULT_BRIDGE_INSTANCE`]; user-owned instances
-/// (via `#[derive(uniffi::Object)] Scp`) build their own instead.
+/// [`UniffiBridgeInstance::with_storage_uniffi`]. Every caller-owned
+/// `#[derive(uniffi::Object)] Scp` constructs its own instance —
+/// Phase D (#1695, ADR-048) deleted the process-wide
+/// `DEFAULT_BRIDGE_INSTANCE` that earlier revisions lazily allocated.
 ///
 /// Implements [`BridgeInstanceCore`] so shared helpers can operate on
 /// `&dyn BridgeInstanceCore`. `shutdown(timeout)` delegates to
@@ -259,7 +221,9 @@ pub struct UniffiBridgeInstance {
     /// Previously stored type-erased in `CoreFields::identity_registry` AND
     /// as a bridge-local `OnceLock` in `bridge.rs::identity_custody_registry`.
     /// Both paths are unified here: `bridge.rs::identity_custody_registry`
-    /// now returns a reference to this field on the default instance.
+    /// now returns a reference to this field on the caller's own
+    /// `UniffiBridgeInstance` (Phase D, #1695, deleted the process-wide
+    /// default that the earlier `OnceLock` path backed).
     /// Feature-gated because only the `allow_in_memory_custody` build flag
     /// pulls in [`OpaqueInMemoryKeyCustody`](crate::bridge::OpaqueInMemoryKeyCustody).
     /// Cleared on shutdown — drops the `Arc<OpaqueInMemoryKeyCustody>` values
@@ -341,6 +305,20 @@ pub struct UniffiBridgeInstance {
     /// the supervisor exists — every constructor sets it to `Some`.
     pub(crate) mls_storage_backend:
         Option<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>,
+
+    /// Per-instance bridge credential store (spec §12.11).
+    ///
+    /// Mirrors `PyBridgeInstance::credential_store` and
+    /// `NapiBridgeInstance::credential_store` — each `Scp` instance owns its
+    /// own `InMemoryCredentialStore` so OAuth tokens, API keys, and bridge
+    /// credential keys provisioned through one instance are isolated from
+    /// every other instance in the same process (ADR-048 §1 multi-instance
+    /// neutrality). Thread-safe via the store's internal
+    /// `tokio::sync::RwLock`. Production deployments should replace this with
+    /// a `Storage`-backed implementation when it lands (spec §12.11.2).
+    /// Dropping the `Arc` on shutdown zeroizes any retained bridge
+    /// credential keys via the store's `Zeroizing` fields.
+    pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
 }
 
 impl UniffiBridgeInstance {
@@ -369,6 +347,9 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             mls_storage_backend: Some(mls_storage_backend),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -397,6 +378,9 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             mls_storage_backend: Some(mls_storage_backend),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -427,6 +411,15 @@ impl UniffiBridgeInstance {
         match config {
             StorageConfig::InMemory => Ok(Self::new_uniffi()),
             StorageConfig::Sqlite { path, key } => {
+                // Defense-in-depth: validate path string at FFI boundary
+                // (matches the project pattern for every other caller-supplied
+                // string). #1543 PR-C security review.
+                scp_ffi_common::validate::validate_storage_path(&path).map_err(|e| {
+                    StorageInitError::SqliteOpen {
+                        path: path.clone(),
+                        message: format!("invalid 'path' — {}", e.message),
+                    }
+                })?;
                 let path_buf = std::path::PathBuf::from(&path);
                 // Move the passphrase into `Zeroizing` at the bridge entry
                 // before any use; the raw-key bytes are zeroed after
@@ -525,6 +518,9 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             mls_storage_backend: Some(mls_storage_backend),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
         }
     }
 
@@ -549,6 +545,20 @@ impl UniffiBridgeInstance {
         self.core.instance_id()
     }
 
+    /// Returns a reference to this instance's bridge credential store.
+    ///
+    /// Mirrors `PyBridgeInstance::credential_store` /
+    /// `NapiBridgeInstance::credential_store`. The returned
+    /// `Arc<InMemoryCredentialStore>` is the same instance the
+    /// `UniffiBridgeInstance` holds — thread-safe via internal
+    /// `tokio::sync::RwLock`.
+    #[must_use]
+    pub const fn credential_store(
+        &self,
+    ) -> &Arc<scp_core::bridge::credentials::InMemoryCredentialStore> {
+        &self.credential_store
+    }
+
     /// Returns a reference to the typed UCAN registry.
     #[must_use]
     pub const fn ucan_registry(&self) -> &Arc<DashMap<String, UcanContextState>> {
@@ -562,8 +572,9 @@ impl UniffiBridgeInstance {
     ///
     /// Marked `#[allow(dead_code)]` because bridge callers currently reach
     /// the registry via the free helper `bridge::identity_custody_registry()`
-    /// which dereferences this field directly. The typed accessor is kept for
-    /// per-instance callers introduced in later PRs.
+    /// which dereferences this field directly. The typed accessor is kept
+    /// for any future per-instance callers that prefer the typed path; it
+    /// is not gated on any pending work.
     #[cfg(feature = "allow_in_memory_custody")]
     #[must_use]
     #[allow(dead_code)]
@@ -624,6 +635,366 @@ impl UniffiBridgeInstance {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-instance accessor methods — #1549 Phase 4 PR 4 sub-slice A
+// ---------------------------------------------------------------------------
+//
+// These methods are the per-instance equivalents of the module-level free
+// helpers further down in this file. They operate on `&self` instead of
+// looking up `DEFAULT_BRIDGE_INSTANCE`. Sub-slice A (this commit) is purely
+// additive — the module-level helpers are still present and callers have not
+// yet migrated. Sub-slices B–E migrate callers and then remove the free
+// helpers as each domain is fully switched over. The `#[allow(dead_code)]`
+// attribute on methods without any in-tree caller yet is intentional and is
+// removed incrementally as the sub-slices land.
+
+impl UniffiBridgeInstance {
+    /// Per-instance equivalent of the module-level
+    /// `context_manager_expect` free function.
+    ///
+    /// Returns the attached `ContextManager` if the instance is not suspended
+    /// and not shut down. A shutdown bridge is a hard error (not a warning)
+    /// so stateful exports never run against a zombie bridge
+    /// (ADR-048 §PR 2, #1646).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (code `SCP-CTX-2000`) when no local DID has
+    /// been registered yet (no `ContextManager` attached), when the instance
+    /// is currently suspended, or when the instance has been permanently shut
+    /// down.
+    #[allow(dead_code)]
+    pub fn context_manager_expect(
+        &self,
+    ) -> Result<&Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
+        if self.core.is_suspended() {
+            return Err(crate::ScpError::Context {
+                msg: "bridge not ready: suspended".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            });
+        }
+        if self.core.is_shutdown() {
+            return Err(crate::ScpError::Context {
+                msg: "bridge not ready: shut down".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            });
+        }
+        self.core
+            .try_supervisor()
+            .ok_or_else(|| crate::ScpError::Context {
+                msg: "bridge not ready: no local DID registered".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            })
+    }
+
+    /// Per-instance equivalent of the module-level `context_manager` free
+    /// function.
+    ///
+    /// Like [`UniffiBridgeInstance::context_manager_expect`] but treats
+    /// shutdown as a logged warning rather than a hard error — this mirrors
+    /// the legacy behaviour of the free `context_manager()` helper which some
+    /// callers still rely on to let operations fail naturally at the MLS or
+    /// transport layer after shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the instance is
+    /// currently suspended or when no `ContextManager` has been attached.
+    #[allow(dead_code)]
+    pub fn context_manager_or_error(
+        &self,
+    ) -> Result<&Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
+        if self.core.is_suspended() {
+            return Err(crate::ScpError::Context {
+                msg: "bridge is suspended — call resume() before performing operations".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            });
+        }
+        if self.core.is_shutdown() {
+            tracing::warn!(
+                "context_manager_or_error() called after shutdown — operations may fail"
+            );
+        }
+        self.core
+            .try_supervisor()
+            .ok_or_else(|| crate::ScpError::Context {
+                msg: "ContextManager not yet attached — call context_create, \
+                      context_join, context_import, or init_context_manager first"
+                    .to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            })
+    }
+
+    /// Returns the attached `ContextManager` only when the instance is in a
+    /// ready state (not suspended, not shut down, and a manager is attached).
+    ///
+    /// Unlike [`UniffiBridgeInstance::context_manager_or_error`] this is an
+    /// infallible `Option` accessor — callers that simply want to skip work
+    /// when the bridge isn't ready use this.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn try_context_manager_ready(
+        &self,
+    ) -> Option<&Arc<scp_core::context::supervisor::Supervisor>> {
+        if self.core.is_suspended() || self.core.is_shutdown() {
+            return None;
+        }
+        self.core.try_supervisor()
+    }
+
+    /// Per-instance equivalent of the module-level
+    /// `init_context_manager_with_did` free function.
+    ///
+    /// Installs an `MlsCryptoProvider(local_did)` and
+    /// `NotConfiguredTransportProvider` on this instance. No-op if a
+    /// `ContextManager` is already attached.
+    #[allow(dead_code)]
+    pub fn init_context_manager_with_did(&self, local_did: &str) {
+        if self.core.has_supervisor() {
+            tracing::debug!(
+                requested_did = %local_did,
+                "init_context_manager_with_did: ContextManager already attached — using existing instance"
+            );
+            return;
+        }
+        let did = local_did.to_owned();
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let event_log = self.protocol_repository.event_log_provider();
+        let persistence = self.core.persistence_arc_clone();
+        // Storage-before-supervisor precondition (spec §17.6): the chosen
+        // storage must already be erased into the `mls_storage` view. The
+        // runtime never defaults storage, so a missing backend fails closed —
+        // no supervisor is attached and subsequent operations error rather
+        // than fabricating an in-memory default. Every constructor populates
+        // this, so this is a defense-in-depth guard.
+        let Some(mls_storage) = self.mls_storage_ref().map(Arc::clone) else {
+            tracing::error!(
+                "init_context_manager_with_did: storage-before-supervisor                  precondition failed — no mls_storage backend on the bridge                  instance; refusing to attach a supervisor (fail closed, spec §17.6)"
+            );
+            return;
+        };
+        let supervisor_arc = build_supervisor(
+            crypto,
+            Box::new(scp_core::context::NotConfiguredTransportProvider),
+            event_log,
+            persistence,
+            mls_storage,
+        );
+
+        self.core.set_supervisor(supervisor_arc);
+    }
+
+    /// Per-instance equivalent of the module-level
+    /// `init_context_manager_with_relay_transport` free function.
+    ///
+    /// Installs an `MlsCryptoProvider(local_did)` and a
+    /// `RelayTransportProvider` wrapping the supplied `NativeRelayAdapter` on
+    /// this instance. No-op if a `ContextManager` is already attached.
+    #[allow(dead_code)]
+    pub fn init_context_manager_with_relay_transport(
+        &self,
+        local_did: &str,
+        adapter: Box<dyn scp_transport::TransportAdapter>,
+    ) {
+        if self.core.has_supervisor() {
+            tracing::warn!(
+                requested_did = %local_did,
+                "init_context_manager_with_relay_transport: ContextManager already attached — ignoring"
+            );
+            return;
+        }
+        let did = local_did.to_owned();
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
+        let event_log = self.protocol_repository.event_log_provider();
+        let persistence = self.core.persistence_arc_clone();
+        let Some(mls_storage) = self.mls_storage_ref().map(Arc::clone) else {
+            tracing::error!(
+                "init_context_manager_with_relay_transport: storage-before-supervisor                  precondition failed — no mls_storage backend on the bridge                  instance; refusing to attach a supervisor (fail closed, spec §17.6)"
+            );
+            return;
+        };
+        let supervisor_arc =
+            build_supervisor(crypto, transport, event_log, persistence, mls_storage);
+
+        self.core.set_supervisor(supervisor_arc);
+    }
+
+    /// Per-instance initializer that installs an `MlsCryptoProvider(local_did)`
+    /// and an in-process loopback `LocalTransportProvider` on this instance.
+    ///
+    /// Mirrors [`UniffiBridgeInstance::init_context_manager_with_relay_transport`]
+    /// except the transport silently succeeds on all send/publish calls instead
+    /// of routing through a real relay. Used by `Scp::configure_local_transport`
+    /// so that E2E tests can exercise `context_send` / `broadcast_publish`
+    /// (encryption included) without a real relay server. No-op if a
+    /// `ContextManager` is already attached.
+    #[allow(dead_code)]
+    pub fn init_context_manager_with_local_transport(&self, local_did: &str) {
+        if self.core.has_supervisor() {
+            tracing::warn!(
+                requested_did = %local_did,
+                "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
+            );
+            return;
+        }
+        let did = local_did.to_owned();
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let transport = Box::new(scp_core::context::LocalTransportProvider);
+        let event_log = self.protocol_repository.event_log_provider();
+        let persistence = self.core.persistence_arc_clone();
+        let Some(mls_storage) = self.mls_storage_ref().map(Arc::clone) else {
+            tracing::error!(
+                "init_context_manager_with_local_transport: storage-before-supervisor                  precondition failed — no mls_storage backend on the bridge                  instance; refusing to attach a supervisor (fail closed, spec §17.6)"
+            );
+            return;
+        };
+        let supervisor_arc =
+            build_supervisor(crypto, transport, event_log, persistence, mls_storage);
+
+        self.core.set_supervisor(supervisor_arc);
+    }
+
+    /// Per-instance equivalent of the module-level
+    /// `sync_role_state_from_manager` free function.
+    ///
+    /// Validates that the attached `ContextManager` has role state for the
+    /// given context after a governance operation. Logs the sync for
+    /// traceability.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (code `SCP-CTX-2040`) if the context is
+    /// not registered in the attached `ContextManager`, or any error returned
+    /// by [`UniffiBridgeInstance::context_manager_or_error`] if no manager is
+    /// attached.
+    #[allow(dead_code)]
+    pub async fn sync_role_state_from_manager(
+        &self,
+        context_id: &str,
+    ) -> Result<(), crate::ScpError> {
+        let supervisor = self.context_manager_or_error()?;
+        let _role_state = supervisor.get_role_state(context_id).await.ok_or_else(|| {
+            crate::ScpError::Context {
+                msg: format!(
+                    "context '{context_id}' not found in Supervisor during role state sync"
+                ),
+                code: codes::CTX_2040.to_owned(),
+            }
+        })?;
+        tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the module-level
+    /// `with_rate_limit_tracker` free function.
+    ///
+    /// Delegates to [`CoreFields::with_rate_limit_tracker`].
+    #[allow(dead_code)]
+    pub fn with_rate_limit_tracker<F, T>(&self, identity_did: &str, f: F) -> T
+    where
+        F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
+    {
+        self.core.with_rate_limit_tracker(identity_did, f)
+    }
+
+    /// Per-instance equivalent of the module-level `did_resolver` free
+    /// function.
+    ///
+    /// Returns a cloned `Arc` to the production DID resolver, if one has been
+    /// installed via [`UniffiBridgeInstance::set_did_resolver`]. Returning an
+    /// owned `Arc` (instead of a `&'static Arc`) keeps the accessor usable
+    /// from per-instance callers that don't have `'static` lifetimes.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn did_resolver(&self) -> Option<Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+        self.core.did_resolver().map(Arc::clone)
+    }
+
+    /// Per-instance equivalent of the module-level `init_did_resolver` free
+    /// function.
+    ///
+    /// Wraps the supplied `DidResolver` in an `IdentityBackedDidResolver` and
+    /// stores it on this instance. Subsequent calls are no-ops
+    /// (`OnceLock` guarantees single initialization — the underlying
+    /// `CoreFields::set_did_resolver` logs a warning on repeat calls).
+    #[allow(dead_code)]
+    pub fn set_did_resolver<R>(&self, resolver: Arc<R>, handle: tokio::runtime::Handle)
+    where
+        R: scp_identity::resolver::DidResolver + 'static,
+    {
+        self.core
+            .set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+                resolver, handle,
+            )));
+    }
+
+    /// Per-instance equivalent of the module-level `ensure_ucan_registered`
+    /// free function.
+    ///
+    /// Ensures UCAN validation state is registered for `context_id` in this
+    /// instance's UCAN registry. No-op if the context is already registered.
+    #[allow(dead_code)]
+    pub fn ensure_ucan_registered(&self, context_id: &str, creator_did: &str, ceiling: &[String]) {
+        if self.ucan_registry.contains_key(context_id) {
+            return;
+        }
+
+        let ceiling_strings = if ceiling.is_empty() {
+            scp_core::context::roles::default_ceiling()
+                .capabilities
+                .iter()
+                .map(scp_core::context::roles::Capability::ucan_capability_name)
+                .collect::<HashSet<String>>()
+        } else {
+            ceiling
+                .iter()
+                .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+                .collect::<HashSet<String>>()
+        };
+
+        let event_log = EventLog::new(context_id.to_owned());
+        let revocation_list = RevocationList::new(context_id.to_owned());
+        let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
+
+        self.ucan_registry.insert(
+            context_id.to_owned(),
+            UcanContextState {
+                revocation_list,
+                nonce_tracker,
+                ceiling_strings,
+                creator_did: creator_did.to_owned(),
+                event_log,
+            },
+        );
+    }
+
+    /// Per-instance equivalent of the module-level `with_ucan_state` free
+    /// function.
+    ///
+    /// Accesses per-context UCAN state on this instance via a closure.
+    /// Returns `None` if the context is not registered.
+    #[allow(dead_code)]
+    pub fn with_ucan_state<T, F>(&self, context_id: &str, f: F) -> Option<T>
+    where
+        F: FnOnce(&mut UcanContextState) -> T,
+    {
+        let mut entry = self.ucan_registry.get_mut(context_id)?;
+        Some(f(&mut entry))
+    }
+
+    /// Per-instance equivalent of the module-level `remove_ucan_state` free
+    /// function.
+    ///
+    /// Removes per-context UCAN state from this instance and evicts the
+    /// corresponding known-context entry from `CoreFields`.
+    #[allow(dead_code)]
+    pub fn remove_ucan_state(&self, context_id: &str) {
+        self.ucan_registry.remove(context_id);
+        self.core.remove_known_context(context_id);
+    }
+}
+
 #[async_trait]
 impl BridgeInstanceCore for UniffiBridgeInstance {
     fn core(&self) -> &CoreFields {
@@ -649,6 +1020,15 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         self.ucan_registry.clear();
         #[cfg(feature = "allow_in_memory_custody")]
         self.identity_custody_registry.clear();
+        // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
+        // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
+        // (`CoreFields::persistence`, `ContextManager`) keep the storage
+        // struct alive until the `UniffiBridgeInstance` drops, but the
+        // advisory lock must be released now so that a subsequent
+        // `SCP.withStorage(sqlite { path, key })` call against the same
+        // directory does not fail with "already open by another SCP
+        // instance". The `InMemory` variant's `close()` is a no-op.
+        self.protocol_repository.close();
         // Clear MCP registries so server shutdown senders and client
         // connections drop, allowing background tasks to terminate cleanly.
         // Migrated off `crate::bridge::clear_mcp_registries` (called by a
@@ -665,260 +1045,52 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
     }
 }
 
+/// Emergency cancellation for `UniffiBridgeInstance` dropped without a
+/// prior `shutdown(timeout)`.
+///
+/// The graceful path is `BridgeInstanceCore::shutdown(timeout)` — Swift
+/// and Kotlin callers that want deterministic cleanup of subscriptions,
+/// timers, and relay connections must still invoke that. This `Drop` is
+/// the safety net for the case where a caller constructs a `Scp` and
+/// then lets `Arc<UniffiBridgeInstance>` go out of scope without awaiting
+/// `shutdown`. Without this impl, background tasks hold their
+/// `Arc<UniffiBridgeInstance>` captures forever — leaking a
+/// `ContextManager`, relay connection, and attached platform callbacks.
+///
+/// See ADR-048 for the multi-instance lifecycle contract.
+impl Drop for UniffiBridgeInstance {
+    fn drop(&mut self) {
+        self.core.emergency_cancel_tasks();
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Default bridge instance — consolidated singleton for the free-function façade
+// Phase D (#1695): `DEFAULT_BRIDGE_INSTANCE` + façade helpers deleted
 // ---------------------------------------------------------------------------
-
-/// Default [`UniffiBridgeInstance`] used by the flat `#[uniffi::export]`
-/// free-function façade.
-///
-/// Lazily initialized on the first free-function call that touches bridge
-/// state (via [`ensure_bridge_instance`]). User-owned instances (from the
-/// `#[derive(uniffi::Object)] Scp` class) do **not** share state with this
-/// default — the two paths have independent `ContextManager`s, registries,
-/// and transports.
-pub(crate) static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<UniffiBridgeInstance>> = OnceLock::new();
-
-/// Initializes the default [`UniffiBridgeInstance`] without a `ContextManager`.
-///
-/// All typed registries (MCP, UCAN, identity custody, etc.) are fields on
-/// `UniffiBridgeInstance` and are cleared by
-/// `BridgeInstanceCore::bridge_specific_shutdown`; no shutdown hooks need to
-/// be registered here. Subsequent calls are no-ops (`OnceLock` guarantees
-/// single initialization).
-fn init_default_bridge_instance() {
-    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| Arc::new(UniffiBridgeInstance::new_uniffi()));
-}
-
-/// Returns the raw default `UniffiBridgeInstance` without lifecycle checks.
-///
-/// Used by [`crate::scp_shutdown`] and the `#[derive(uniffi::Object)] Scp`
-/// `default_instance` factory to reach the default bridge during teardown or
-/// wrapping. Returns `None` if the default was never initialized.
-#[must_use]
-#[cfg_attr(test, allow(dead_code))]
-pub fn default_bridge_instance_raw() -> Option<&'static Arc<UniffiBridgeInstance>> {
-    DEFAULT_BRIDGE_INSTANCE.get()
-}
-
-/// Back-compat alias for [`default_bridge_instance_raw`].
-///
-/// Kept so that `lib.rs::scp_shutdown` and other callers using the previous
-/// name continue to compile. Removed when all call sites are migrated.
-#[must_use]
-#[cfg_attr(test, allow(dead_code))]
-pub fn bridge_instance_raw() -> Option<&'static Arc<UniffiBridgeInstance>> {
-    DEFAULT_BRIDGE_INSTANCE.get()
-}
-
-/// Returns the default `UniffiBridgeInstance`, initializing it if needed.
-///
-/// Used by the `#[derive(uniffi::Object)] Scp::default_instance` factory to
-/// surface the same long-lived `Arc` shared by the free-function façade.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` if the default bridge is currently suspended
-/// or has been permanently shut down.
-pub fn default_bridge_instance() -> Result<Arc<UniffiBridgeInstance>, crate::ScpError> {
-    ensure_bridge_instance();
-    let bi = DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "default bridge instance not initialized".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    if bi.core.is_suspended() {
-        return Err(crate::ScpError::Context {
-            msg: "bridge is suspended — call resume() before performing operations".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        });
-    }
-    if bi.core.is_shutdown() {
-        return Err(crate::ScpError::Context {
-            msg: "default bridge instance has been permanently shut down".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        });
-    }
-    Ok(Arc::clone(bi))
-}
-
-/// Ensures a `UniffiBridgeInstance` exists (without a `ContextManager`).
-///
-/// Called by `identity_create` before `DidDht::create()` runs, so that the
-/// DID resolver slot owned by `CoreFields` is available. The `ContextManager`
-/// is attached later via `Self::init_context_manager_with_did` (or
-/// `Supervisor::with_providers`) once the identity is known. Per
-/// spec §12.2.3 the bridge instance container has no DID requirement — the
-/// authoritative local DID lives inside the `ContextManager`'s
-/// `MlsCryptoProvider`.
-///
-/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn ensure_bridge_instance() {
-    if DEFAULT_BRIDGE_INSTANCE.get().is_some() {
-        return;
-    }
-    init_default_bridge_instance();
-}
-
-// the legacy `*_to_bridge` shim was deleted in ADR-049 commit
-// 12c.9g.3. The FFI bridge no longer surfaces an `Arc<ContextManager>`;
-// callers route through `init_supervisor*` and `Supervisor::*` methods.
-
-/// Returns a reference to the default [`UniffiBridgeInstance`]'s core for
-/// handle-affinity checks only.
-///
-/// Unlike [`bridge_instance`], this helper does NOT return an error when
-/// the bridge is suspended — a handle-affinity check is a pure
-/// compare-two-u64 operation that does not touch transport or context
-/// manager state, so suspending the bridge must not block it. Used
-/// exclusively by the [`crate::uniffi_check_handle!`] macro at FFI entry
-/// points.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` if the default bridge has not been
-/// initialized. Initializes the bridge if needed — same semantics as
-/// the old `check_handle_affinity` path.
-#[must_use = "the returned CoreFields reference must be used for the affinity check"]
-pub fn bridge_instance_for_affinity() -> Result<&'static CoreFields, crate::ScpError> {
-    ensure_bridge_instance();
-    DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .map(|bi| &bi.core)
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "bridge not initialized — call context_create, \
-                  context_join, context_import, or init_context_manager first"
-                .to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-}
-
-/// Returns a reference to the default [`UniffiBridgeInstance`].
-///
-/// Called by rate-limiter delegation and other functions that access the
-/// consolidated instance state (#1549).
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` if the bridge has not been initialized or is
-/// currently suspended. Shutdown is a warning (not an error) because shutdown
-/// is terminal and operations fail naturally at the MLS/transport layer.
-pub fn bridge_instance() -> Result<&'static Arc<UniffiBridgeInstance>, crate::ScpError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "bridge not initialized — call context_create, \
-                  context_join, context_import, or init_context_manager first"
-                .to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    if bi.core.is_suspended() {
-        return Err(crate::ScpError::Context {
-            msg: "bridge is suspended — call resume() before performing operations".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        });
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!("bridge_instance() called after shutdown — operations may fail");
-    }
-    Ok(bi)
-}
-
-/// Returns the default instance id for handle-affinity checks on the
-/// free-function façade.
-///
-/// Every handle minted by the free-function façade carries this id, so the
-/// `check_handle` call at each entry is essentially a sanity check in PR 1.
-/// Distinct `instance_id`s appear once `Scp::new` is the primary construction
-/// path (PR 2+).
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` if the default bridge is not initialized.
-pub fn default_instance_id() -> Result<u64, crate::ScpError> {
-    ensure_bridge_instance();
-    DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .map(|bi| bi.core.instance_id())
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "default bridge instance not initialized".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-}
-
-/// Runtime handle-affinity check against the default `UniffiBridgeInstance`.
-///
-/// Compares `handle_instance_id` against the default bridge's
-/// [`CoreFields::instance_id`] and maps any mismatch to
-/// [`crate::ScpError::Permission`] with error code `SCP-PERM-3030`.
-///
-/// Every free-function bridge entry that takes a handle with a stored
-/// `instance_id` calls this helper (via the
-/// [`crate::uniffi_check_handle!`] macro). Once multi-instance is primary
-/// (PR 2+), `Scp::method` entries will instead compare against
-/// `self.inner.core.instance_id`.
-///
-/// # Errors
-///
-/// Returns `ScpError::Permission` with code `SCP-PERM-3030` on mismatch, or
-/// `ScpError::Context` if the default bridge is not initialized.
-pub fn check_handle_affinity(handle_instance_id: u64) -> Result<(), crate::ScpError> {
-    let expected = default_instance_id()?;
-    if handle_instance_id == expected {
-        Ok(())
-    } else {
-        Err(crate::ScpError::from(
-            scp_ffi_common::bridge_instance::HandleAffinityError::new(handle_instance_id, expected),
-        ))
-    }
-}
+//
+// The process-wide default [`UniffiBridgeInstance`] and its lifecycle
+// helpers (`default_bridge_instance`, `default_bridge_instance_raw`,
+// `bridge_instance_raw`, `bridge_instance`, `bridge_instance_for_affinity`,
+// `ensure_bridge_instance`, `default_instance_id`, `check_handle_affinity`,
+// `attach_context_manager_to_bridge`) are removed in Phase D along with
+// the free-function façade they served.
+//
+// Every caller (bridge.rs handle methods, `Scp::...` methods, server
+// startup, the `uniffi_check_handle!` macro) now threads through the
+// caller-owned `Scp`'s `Arc<UniffiBridgeInstance>` via
+// `&self.inner` / `bi` parameters, or calls a per-instance method on
+// `UniffiBridgeInstance` directly. Handle-affinity is enforced inline
+// via `self.inner.core.check_handle(handle.instance_id())` — there is no
+// process-wide default to compare against.
 
 // All UniFFI handle types (`Identity`, `ContextHandle`, `UcanToken`,
 // `TransportManager`, `RelayHandle`, `NodeHandle`) carry an inherent
-// `instance_id(&self) -> u64` method. The `uniffi_check_handle!` macro uses
-// method syntax (`handle.instance_id()`) which auto-derefs through `&T`,
-// `&Arc<T>`, and `Arc<T>` without needing the `HandleInstance` /
-// `AsHandleInstance` traits from earlier drafts. Those traits were deleted
-// in PR 1 post-review; the inherent methods alone are sufficient.
+// `instance_id(&self) -> u64` method so `&self.inner.core.check_handle(...)`
+// composes cleanly from `Scp` methods without any trait imports.
 
 // ---------------------------------------------------------------------------
-// DID resolver shims (preserved for existing callers)
+// Per-instance helpers used by `UniffiBridgeInstance`
 // ---------------------------------------------------------------------------
-
-/// Returns the production DID resolver on the default bridge instance, if
-/// initialized.
-///
-/// `bridge_runtime::did_resolver_from` takes `&Arc<CoreFields>`. Because
-/// [`UniffiBridgeInstance`] embeds `CoreFields` (not `Arc<CoreFields>`),
-/// the helper is incompatible with the new pattern. Access the resolver
-/// directly on the embedded core.
-#[must_use]
-pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
-    DEFAULT_BRIDGE_INSTANCE.get()?.core.did_resolver()
-}
-
-/// Initializes the production DID resolver on the default bridge instance.
-///
-/// See [`did_resolver`] for why the `scp_ffi_common::bridge_runtime` helpers
-/// cannot be used here.
-pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
-where
-    R: scp_identity::resolver::DidResolver + 'static,
-{
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() {
-        bi.core
-            .set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
-                resolver, handle,
-            )));
-    } else {
-        tracing::error!(
-            "init_did_resolver called before DEFAULT_BRIDGE_INSTANCE initialized — \
-             resolver not stored"
-        );
-    }
-}
 
 /// Returns a key resolver that rejects all lookups with a logged error.
 ///
@@ -963,16 +1135,6 @@ fn zero_key_material(key: SqliteKeyMaterial) {
 fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     scp_ffi_common::bridge_runtime::not_configured_key_resolver()
 }
-
-// ---------------------------------------------------------------------------
-// Supervisor accessors
-// ---------------------------------------------------------------------------
-//
-// `context_manager()` / `context_manager_expect()` were deleted in
-// ADR-049 commit 12c.9g.3. Bridge code routes through
-// [`supervisor_expect`] / [`supervisor_lenient`] (already present below)
-// and uses `Supervisor::*` methods for every operation that previously
-// went through `ContextManager`.
 
 /// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
 /// consumed by `ContextManager::with_persistence` which requires a `Box`.
@@ -1092,223 +1254,22 @@ fn build_supervisor(
     )
 }
 
-/// Builds an event log provider that reuses the already-registered
-/// `ProtocolRepoVariant` on the default [`UniffiBridgeInstance`].
-///
-/// Reusing the repository is critical — a fresh repository would have a
-/// different encryption key, rendering any already persisted event log
-/// entries unreadable. When the bridge is SQLite-backed, this returns an
-/// event log provider that writes into the same `SQLCipher` database as
-/// context snapshots.
-fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProvider>> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get()?;
-    Some(bi.protocol_repository.event_log_provider())
-}
-
-/// Returns the per-instance
-/// [`Supervisor`](scp_core::context::supervisor::Supervisor) for the
-/// default bridge instance.
-///
-/// Per ADR-049 commit 12c.9g.3 the FFI bridge no longer surfaces an
-/// `Arc<ContextManager>`. Every bridge function that previously routed
-/// through `context_manager_expect()` now goes through this accessor
-/// and uses `Supervisor::*` methods.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge
-/// instance has not been initialized, when no supervisor has been
-/// wired yet, or when the bridge is suspended or shut down.
-pub fn supervisor_expect()
--> Result<&'static Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "bridge not ready: no local DID registered".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    if bi.core.is_suspended() {
-        return Err(crate::ScpError::Context {
-            msg: "bridge not ready: suspended".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        });
-    }
-    if bi.core.is_shutdown() {
-        return Err(crate::ScpError::Context {
-            msg: "bridge not ready: shut down".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        });
-    }
-    bi.core
-        .try_supervisor()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "bridge not ready: no local DID registered".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-}
-
-/// Lenient sibling of [`supervisor_expect`].
-///
-/// Returns the supervisor even when [`CoreFields::is_shutdown`] is
-/// `true`, matching the legacy shutdown-tolerance contract that the
-/// removed `context_manager()` provided (which only logged a warning
-/// on shutdown rather than erroring). Used by the lifecycle shim paths
-/// (`context_create`, `context_close`) so the shim behaviour reaches
-/// parity with the pre-shim `ContextManager::...` call sites those
-/// paths delegate to. Still errors on `is_suspended` (the
-/// resume-required contract) and on missing-bridge / missing-supervisor.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge
-/// instance has not been initialized, when no supervisor is wired
-/// yet, or when the bridge is explicitly suspended.
-pub fn supervisor_lenient()
--> Result<&'static Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "bridge not ready: no local DID registered".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    if bi.core.is_suspended() {
-        return Err(crate::ScpError::Context {
-            msg: "bridge not ready: suspended".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        });
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!(
-            "supervisor_lenient() called after shutdown — \
-             operations may fail (ADR-049 commit 9 shim path)"
-        );
-    }
-    bi.core
-        .try_supervisor()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "bridge not ready: no local DID registered".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-}
-
-/// Initializes the per-instance `Supervisor` with [`MlsCryptoProvider`]
-/// and [`scp_core::context::NotConfiguredTransportProvider`].
-///
-/// Must be called before any context lifecycle operation — the bridge no
-/// longer supports a DID-less stub crypto path. Callers that have a local
-/// DID (for example `context_create`, `context_join`, `context_import`,
-/// `register_local_did`, or `identity_create`) invoke this to attach a real
-/// `MlsCryptoProvider::new(local_did)` to the default bridge instance.
-///
-/// Subsequent calls are no-ops (`OnceLock`).
-pub fn init_supervisor_with_did(local_did: &str) {
-    ensure_bridge_instance();
-    let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_supervisor_with_did: default instance unexpectedly None");
-        return;
-    };
-    if bi.core.has_supervisor() {
-        tracing::debug!(
-            requested_did = %local_did,
-            "init_supervisor_with_did: Supervisor already attached — using existing instance"
-        );
-        return;
-    }
-    let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
-    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
-        tracing::error!(
-            "init_supervisor_with_did: missing ProtocolRepository after \
-             ensure_bridge_instance — falling back to a fresh event log provider"
-        );
-        build_event_log_provider().0
-    });
-    let persistence = bi.core.persistence_arc_clone();
-    // Storage-before-supervisor precondition (spec §17.6): the chosen storage
-    // must already be erased into the `mls_storage` view. The runtime never
-    // defaults storage, so a missing backend fails closed — no supervisor is
-    // attached and subsequent operations error, rather than fabricating an
-    // in-memory default. Every constructor populates this, so this is a
-    // defense-in-depth guard.
-    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
-        tracing::error!(
-            "init_supervisor_with_did: storage-before-supervisor precondition              failed — no mls_storage backend on the bridge instance; refusing              to attach a supervisor (fail closed, spec §17.6)"
-        );
-        return;
-    };
-    let supervisor_arc = build_supervisor(
-        crypto,
-        Box::new(scp_core::context::NotConfiguredTransportProvider),
-        event_log,
-        persistence,
-        mls_storage,
-    );
-
-    bi.core.set_supervisor(supervisor_arc);
-}
-
-/// Initializes the per-instance `Supervisor` with
-/// `RelayTransportProvider`.
-///
-/// Identical to [`init_supervisor_with_did`] except the transport
-/// provider is a `RelayTransportProvider` wrapping a real
-/// `NativeRelayAdapter` connected to the given relay URL.
-///
-/// Subsequent calls are no-ops (`OnceLock`).
-pub fn init_supervisor_with_relay_transport(
-    local_did: &str,
-    adapter: scp_transport::native::adapter::NativeRelayAdapter,
-) {
-    ensure_bridge_instance();
-    let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_supervisor_with_relay_transport: default instance unexpectedly None");
-        return;
-    };
-    if bi.core.has_supervisor() {
-        tracing::warn!(
-            requested_did = %local_did,
-            "init_supervisor_with_relay_transport: Supervisor already attached — ignoring"
-        );
-        return;
-    }
-    let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
-    let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
-        tracing::error!(
-            "init_supervisor_with_relay_transport: missing ProtocolRepository after \
-             ensure_bridge_instance — falling back to a fresh event log provider"
-        );
-        build_event_log_provider().0
-    });
-    let persistence = bi.core.persistence_arc_clone();
-    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
-        tracing::error!(
-            "init_supervisor_with_relay_transport: storage-before-supervisor              precondition failed — no mls_storage backend on the bridge              instance; refusing to attach a supervisor (fail closed, spec §17.6)"
-        );
-        return;
-    };
-    let supervisor_arc = build_supervisor(crypto, transport, event_log, persistence, mls_storage);
-
-    bi.core.set_supervisor(supervisor_arc);
-}
-
-/// Returns the default instance's `ProtocolRepoVariant`, if initialized.
-///
-/// Used by the trust aggregation bridge to construct a
-/// `ProtocolRepositoryTrustBridge` backed by the configured storage (either
-/// encrypted in-memory or SQLCipher-on-disk).
-#[must_use]
-pub fn protocol_repository() -> Option<&'static ProtocolRepoVariant> {
-    DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .map(|bi| &bi.protocol_repository)
-}
+// Phase D (#1695): module-level `context_manager`, `context_manager_expect`,
+// `init_context_manager_with_did`, `init_context_manager_with_relay_transport`,
+// `did_resolver`, `init_did_resolver`, `protocol_repository`, and
+// `event_log_provider_from_existing_repo` free functions deleted. Every
+// caller now accesses these through `Scp::` methods or directly on the
+// caller-owned `UniffiBridgeInstance` (see the `impl UniffiBridgeInstance`
+// block above for equivalents: `context_manager_expect`, `did_resolver`,
+// `init_context_manager_with_did`, `init_context_manager_with_relay_transport`,
+// `protocol_repository`, `event_log_provider_from_existing_repo`).
 
 /// Constructs a persistent event log provider backed by encrypted in-memory
 /// storage.
 ///
 /// Delegates to [`scp_ffi_common::bridge_runtime::build_event_log_provider`].
+/// Retained for tests and for
+/// [`UniffiBridgeInstance::init_context_manager_with_did`] fallback paths.
 #[must_use]
 pub fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
@@ -1327,125 +1288,12 @@ pub fn build_event_log_provider() -> (
 /// Type alias for [`scp_ffi_common::bridge_runtime::UcanContextStateCore`].
 pub type UcanContextState = scp_ffi_common::bridge_runtime::UcanContextStateCore;
 
-/// Returns a reference to the default instance's UCAN registry.
-///
-/// The registry is a typed `Arc<DashMap<String, UcanContextState>>` field
-/// on [`UniffiBridgeInstance`]. `ensure_bridge_instance()` initializes
-/// `DEFAULT_BRIDGE_INSTANCE` if it is not yet set, so the registry is
-/// always real — there is no fallback empty map that writers could land in
-/// before a reader sees the instance registry (the H1 bug fixed in commit
-/// 10 of #1549 Phase 4 PR 2).
-fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
-    ensure_bridge_instance();
-    DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || unreachable!("DEFAULT_BRIDGE_INSTANCE set by ensure_bridge_instance()"),
-        |bi| bi.ucan_registry.as_ref(),
-    )
-}
-
-/// Ensures UCAN validation state is registered for a context.
-pub fn ensure_ucan_registered(context_id: &str, creator_did: &str, ceiling: &[String]) {
-    let map = ucan_registry();
-
-    if map.contains_key(context_id) {
-        return;
-    }
-
-    let ceiling_strings = if ceiling.is_empty() {
-        scp_core::context::roles::default_ceiling()
-            .capabilities
-            .iter()
-            .map(scp_core::context::roles::Capability::ucan_capability_name)
-            .collect::<HashSet<String>>()
-    } else {
-        ceiling
-            .iter()
-            .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
-            .collect::<HashSet<String>>()
-    };
-
-    let event_log = EventLog::new(context_id.to_owned());
-    let revocation_list = RevocationList::new(context_id.to_owned());
-    let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
-
-    map.insert(
-        context_id.to_owned(),
-        UcanContextState {
-            revocation_list,
-            nonce_tracker,
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
-            event_log,
-        },
-    );
-}
-
-/// Accesses per-context UCAN state via a closure.
-pub fn with_ucan_state<T, F>(context_id: &str, f: F) -> Option<T>
-where
-    F: FnOnce(&mut UcanContextState) -> T,
-{
-    let map = ucan_registry();
-    let mut entry = map.get_mut(context_id)?;
-    Some(f(&mut entry))
-}
-
-/// Removes UCAN validation state for a context.
-pub fn remove_ucan_state(context_id: &str) {
-    let map = ucan_registry();
-    map.remove(context_id);
-    if let Ok(bi) = bridge_instance() {
-        bi.core.remove_known_context(context_id);
-    }
-}
-
-/// Syncs role state from the per-instance `Supervisor` after governance
-/// operations.
-///
-/// Validates the supervisor state is consistent and logs the sync for
-/// traceability.
-///
-/// # Errors
-///
-/// Returns `ScpError` if the context is not registered in the supervisor.
-pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), crate::ScpError> {
-    let supervisor = supervisor_expect()?;
-    let _role_state =
-        supervisor
-            .get_role_state(context_id)
-            .await
-            .ok_or_else(|| crate::ScpError::Context {
-                msg: format!(
-                    "context '{context_id}' not found in Supervisor during role state sync"
-                ),
-                code: codes::CTX_2040.to_owned(),
-            })?;
-    tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Invitation rate limit tracker registry (#614)
-// ---------------------------------------------------------------------------
-
-/// Returns a mutable reference to the rate limit tracker for the given
-/// identity DID, creating one if it does not exist.
-///
-/// Delegates to [`CoreFields::with_rate_limit_tracker`].
-pub fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
-where
-    F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
-{
-    if let Ok(bi) = bridge_instance() {
-        bi.core.with_rate_limit_tracker(identity_did, f)
-    } else {
-        tracing::warn!(
-            "with_rate_limit_tracker called before bridge init — using ephemeral tracker"
-        );
-        let mut tracker = scp_core::context::invitation::RateLimitTracker::default();
-        f(&mut tracker)
-    }
-}
+// Phase D (#1695): module-level `ucan_registry`, `ensure_ucan_registered`,
+// `with_ucan_state`, `remove_ucan_state`, `sync_role_state_from_manager`,
+// and `with_rate_limit_tracker` free functions deleted. Every caller
+// accesses the per-instance equivalents on `UniffiBridgeInstance`
+// (`ensure_ucan_registered`, `with_ucan_state`, `remove_ucan_state`,
+// `sync_role_state_from_manager`, `with_rate_limit_tracker`).
 
 /// Queries event counts for trust scoring within a context.
 ///
@@ -1466,20 +1314,12 @@ mod tests {
     // UniffiBridgeInstance tests (#1549)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn default_instance_is_same_arc() -> Result<(), crate::ScpError> {
-        // Two calls to default_bridge_instance() must return the same
-        // underlying Arc<UniffiBridgeInstance>.
-        ensure_bridge_instance();
-        let a = default_bridge_instance()?;
-        let b = default_bridge_instance()?;
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "default_bridge_instance() must return the same Arc on every call"
-        );
-        assert_eq!(a.instance_id(), b.instance_id());
-        Ok(())
-    }
+    // Phase D (#1695): `default_instance_is_same_arc` deleted —
+    // `DEFAULT_BRIDGE_INSTANCE` no longer exists. The new invariant is that
+    // each `Scp::new()` returns a distinct `Arc<UniffiBridgeInstance>`
+    // (see `test_uniffi_bridge_instance_unique_ids` below) and that a
+    // handle minted by one `Scp` fails `check_handle` on a different
+    // `Scp` (see `test_handle_affinity_rejects_cross_instance`).
 
     #[test]
     fn test_uniffi_bridge_instance_unique_ids() {
@@ -1723,26 +1563,25 @@ mod tests {
     }
 
     #[test]
-    fn bridge_instance_populated_by_init_supervisor() -> Result<(), crate::ScpError> {
-        init_supervisor_with_did("did:dht:ztest");
-        let sup = supervisor_expect()?;
-        let bi = bridge_instance()?;
+    fn bridge_instance_populated_by_init_context_manager() -> Result<(), crate::ScpError> {
+        let bi = UniffiBridgeInstance::new_uniffi();
+        bi.init_context_manager_with_did("did:dht:ztest");
+        let cm = bi.context_manager_expect()?;
         assert!(
-            Arc::ptr_eq(sup, bi.core.try_supervisor().unwrap()),
-            "bridge_instance().try_supervisor() must be the same Arc as supervisor_expect()"
+            Arc::ptr_eq(cm, bi.core.try_supervisor().unwrap()),
+            "instance.context_manager_expect() must be the same Arc as core.try_supervisor()"
         );
         Ok(())
     }
 
     #[test]
-    fn bridge_instance_not_shutdown_initially() -> Result<(), crate::ScpError> {
-        init_supervisor_with_did("did:dht:ztest");
-        let bi = bridge_instance()?;
+    fn bridge_instance_not_shutdown_initially() {
+        let bi = UniffiBridgeInstance::new_uniffi();
+        bi.init_context_manager_with_did("did:dht:ztest");
         assert!(
             !bi.core.is_shutdown(),
-            "bridge_instance should not be shutdown immediately after init"
+            "fresh UniffiBridgeInstance must not be shutdown immediately after init"
         );
-        Ok(())
     }
 
     #[test]

@@ -2336,6 +2336,43 @@ impl WasmContextManager {
         Ok((count, root))
     }
 
+    /// Returns the events stored in the context's event log.
+    ///
+    /// Produces one entry per appended event, preserving append order.
+    /// Each entry carries the protocol-level fields the TypeScript
+    /// `Event` interface exposes (event type, actor DID, timestamp,
+    /// sequence) plus the payload bytes rendered as a hex string so
+    /// JSON transport remains lossless. This mirrors how the NAPI
+    /// bridge surfaces per-event records via `MerkleEventLogProvider`,
+    /// keeping cross-bridge parity on `event_log_query` observable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found.
+    pub fn event_log_query_events(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<serde_json::Value>, ScpWasmError> {
+        let ctx = self.require_context(context_id)?;
+
+        #[allow(clippy::cast_precision_loss)]
+        let events = ctx
+            .event_log_events()
+            .iter()
+            .map(|ev| {
+                serde_json::json!({
+                    "eventType": format!("{:?}", ev.event_type),
+                    "actorDid": ev.actor_did.to_string(),
+                    "timestamp": ev.timestamp as f64,
+                    "payloadJson": crate::runtime::encode_hex(&ev.payload.data),
+                    "sequence": ev.sequence as f64,
+                })
+            })
+            .collect();
+
+        Ok(events)
+    }
+
     /// Generates and verifies a Merkle inclusion proof.
     ///
     /// # Errors

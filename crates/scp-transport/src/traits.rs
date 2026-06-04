@@ -185,6 +185,12 @@ pub trait TransportAdapter: Send + Sync {
     /// Returns [`TransportError::SubscriptionFailed`] if the subscription
     /// cannot be established, or [`TransportError::NotConnected`] if the
     /// adapter has no active connection.
+    ///
+    /// # Behavior on duplicate `routing_id`
+    ///
+    /// `subscribe` semantics on duplicate routing-id are not uniform across
+    /// adapters; callers must not depend on either rejection or replacement.
+    /// Track local subscription state and avoid issuing duplicate subscribes.
     fn subscribe(
         &self,
         routing_id: &RoutingId,
@@ -231,6 +237,45 @@ pub trait TransportAdapter: Send + Sync {
     /// connection, or [`TransportError::SendFailed`] if the delete request
     /// fails.
     fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>>;
+}
+
+/// Blanket impl so a boxed adapter is itself a [`TransportAdapter`].
+///
+/// The [`TransportSelector`](crate::selection::TransportSelector) returns the
+/// chosen transport as `Box<dyn TransportAdapter>` (transparent QUIC↔WebSocket
+/// selection). This impl lets that box be passed anywhere a concrete adapter
+/// `A: TransportAdapter` is expected — e.g.
+/// [`RelayTransportProvider::new`](crate::provider::RelayTransportProvider::new)
+/// — without the call site naming a concrete transport type. Each method
+/// forwards to the inner trait object.
+impl TransportAdapter for Box<dyn TransportAdapter> {
+    fn send(&self, envelope: &OuterEnvelope) -> BoxFuture<'_, Result<BlobId, TransportError>> {
+        (**self).send(envelope)
+    }
+
+    fn subscribe(
+        &self,
+        routing_id: &RoutingId,
+        since: Option<u64>,
+    ) -> BoxFuture<'_, Result<SubscriptionStream, TransportError>> {
+        (**self).subscribe(routing_id, since)
+    }
+
+    fn unsubscribe(&self, routing_id: &RoutingId) -> BoxFuture<'_, Result<(), TransportError>> {
+        (**self).unsubscribe(routing_id)
+    }
+
+    fn query(
+        &self,
+        routing_id: &RoutingId,
+        since: Option<u64>,
+    ) -> BoxFuture<'_, Result<Vec<OuterEnvelope>, TransportError>> {
+        (**self).query(routing_id, since)
+    }
+
+    fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>> {
+        (**self).delete(blob_id)
+    }
 }
 
 #[cfg(test)]

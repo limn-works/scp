@@ -16,6 +16,12 @@ import Foundation
 // signature (String, hex-encoded).
 //
 // See ADR-011 acceptance criterion 8 in `.docs/adrs/phase-2.md`.
+//
+// Phase 4 PR 4 (ADR-048 demolition, #1549): the `EventLogBridge` namespace
+// — closures whose defaults called `Scp.defaultInstance()` — has been
+// deleted. Every event-log operation now dispatches through an explicit
+// ``SCP`` instance stored on ``EventLog`` / passed into the free
+// checkpoint helper.
 
 // MARK: - EventLogHandle
 
@@ -50,56 +56,13 @@ final class EventLogHandle: Sendable {
     }
 }
 
-// MARK: - EventLogBridge
-
-/// Namespace for UniFFI bridge function references used by event log operations.
-/// Each typealias maps 1:1 to a UniFFI-generated async function. Closures are
-/// injected for testability; defaults call through to ScpBindings.
-///
-/// See ADR-026 for the flat delegation pattern and ADR-011 for event log spec.
-public enum EventLogBridge {
-    /// Query events from a context's event log. Maps to ``eventLogQuery``.
-    public typealias QueryFn = @Sendable (
-        _ handle: ContextHandle,
-        _ filterJson: String?
-    ) async throws -> [Event]
-
-    /// Verify an event log claim. Maps to ``eventLogVerify``.
-    public typealias VerifyFn = @Sendable (
-        _ handle: ContextHandle,
-        _ claimJson: String
-    ) async throws -> Proof
-
-    /// Default query function that delegates to the UniFFI-generated binding.
-    public static let defaultQuery: QueryFn = { handle, filterJson in
-        try await eventLogQuery(handle: handle, filterJson: filterJson)
-    }
-
-    /// Default verify function that delegates to the UniFFI-generated binding.
-    public static let defaultVerify: VerifyFn = { handle, claimJson in
-        try await eventLogVerify(handle: handle, claimJson: claimJson)
-    }
-
-    /// Generate a signed consistency checkpoint. Maps to ``eventLogCheckpoint``.
-    public typealias CheckpointFn = @Sendable (
-        _ handle: ContextHandle,
-        _ identity: Identity,
-        _ epoch: UInt64
-    ) async throws -> Checkpoint
-
-    /// Default checkpoint function — delegates to UniFFI
-    /// ``eventLogCheckpoint(handle:identity:epoch:)``.
-    public static let defaultCheckpoint: CheckpointFn = { handle, identity, epoch in
-        try await eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
-    }
-}
-
 // MARK: - EventLog
 
 /// A verifiable, append-only Merkle event log for an SCP context.
 ///
 /// Delegates to UniFFI ``eventLogQuery`` and ``eventLogVerify`` bridge
-/// functions when backed by a real ``ContextHandle``.
+/// methods on the stored ``SCP`` instance when backed by a real
+/// ``ContextHandle``.
 ///
 /// See ADR-011 (Event Log) in `.docs/adrs/phase-2.md`.
 ///
@@ -107,30 +70,29 @@ public enum EventLogBridge {
 ///
 /// - ADR-011 (Event Log) in `.docs/adrs/phase-2.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+/// - ADR-048 (Multi-instance SCP) — SCP instance is caller-owned
 /// - Story SCP-221
 public nonisolated struct EventLog: Sendable {
     /// The context ID this event log belongs to.
     public let contextId: String
 
+    /// The SDK-level ``SCP`` instance that minted the underlying
+    /// ``ContextHandle``. Every UniFFI call flows through this reference.
+    public let scp: SCP
+
     /// The internal handle wrapping the native UniFFI event log object.
     private let handle: EventLogHandle
 
-    /// Bridge function for querying events (injectable for testing).
-    private let queryFn: EventLogBridge.QueryFn
-
-    /// Bridge function for verifying proofs (injectable for testing).
-    private let verifyFn: EventLogBridge.VerifyFn
-
     /// Creates an ``EventLog`` from an internal ``EventLogHandle``.
-    init(
-        handle: EventLogHandle,
-        queryFn: @escaping EventLogBridge.QueryFn = EventLogBridge.defaultQuery,
-        verifyFn: @escaping EventLogBridge.VerifyFn = EventLogBridge.defaultVerify
-    ) {
+    ///
+    /// - Parameters:
+    ///   - scp: The SDK-level ``SCP`` instance that owns the handle.
+    ///   - handle: The internal event-log handle (backed by a
+    ///     ``ContextHandle`` in production).
+    init(scp: SCP, handle: EventLogHandle) {
+        self.scp = scp
         contextId = handle.contextId
         self.handle = handle
-        self.queryFn = queryFn
-        self.verifyFn = verifyFn
     }
 
     /// Retrieves events from the log with optional filter criteria.
@@ -148,7 +110,7 @@ public nonisolated struct EventLog: Sendable {
             )
         }
         let filterJson = #"{"after_sequence": \#(fromSequence), "limit": \#(limit)}"#
-        return try await queryFn(contextHandle, filterJson)
+        return try await scp.eventLogQuery(handle: contextHandle, filterJson: filterJson)
     }
 
     /// Generates a Merkle inclusion proof for the event at the given index.
@@ -164,7 +126,7 @@ public nonisolated struct EventLog: Sendable {
             )
         }
         let claimJson = #"{"type": "inclusion", "leaf_index": \#(leafIndex)}"#
-        return try await verifyFn(contextHandle, claimJson)
+        return try await scp.eventLogVerify(handle: contextHandle, claimJson: claimJson)
     }
 
     /// Verifies a Merkle inclusion proof.
@@ -184,14 +146,14 @@ public nonisolated struct EventLog: Sendable {
 /// different roots for the same event count, the relay is equivocating
 /// (showing different histories to different members).
 ///
-/// Delegates to the UniFFI ``eventLogCheckpoint`` bridge function.
+/// Forwards to ``SCP/eventLogCheckpoint(handle:identity:epoch:)``.
 ///
 /// - Parameters:
+///   - scp: The SDK-level ``SCP`` instance that owns ``handle``.
 ///   - handle: The ``ContextHandle`` for the context whose event log to
 ///     checkpoint.
 ///   - identity: The ``Identity`` generating the checkpoint (used for signing).
 ///   - epoch: The current MLS epoch (pass 0 for broadcast contexts).
-///   - checkpointFn: Bridge function override for testing.
 /// - Returns: A ``Checkpoint`` containing the signed checkpoint data.
 /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not found.
 ///   ``ScpError/Permission(msg:code:)`` if key custody is not available.
@@ -200,11 +162,46 @@ public nonisolated struct EventLog: Sendable {
 ///
 /// - ADR-011 (Event Log) acceptance criterion 8 in `.docs/adrs/phase-2.md`
 /// - ADR-030 (Pruning/Checkpointing)
+/// - ADR-048 (Multi-instance SCP)
 public func generateEventLogCheckpoint(
+    scp: SCP,
     handle: ContextHandle,
     identity: Identity,
-    epoch: UInt64,
-    checkpointFn: EventLogBridge.CheckpointFn = EventLogBridge.defaultCheckpoint
+    epoch: UInt64
 ) async throws -> Checkpoint {
-    try await checkpointFn(handle, identity, epoch)
+    try await scp.eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
+}
+
+/// Generates a signed consistency checkpoint scoped to a member DID.
+///
+/// Signs with the supplied ``identity``'s key material and records ``did`` as
+/// the checkpoint's sender. The UniFFI bridge holds no DID-keyed identity
+/// registry, so the ``Identity`` handle supplies the key material while
+/// ``did`` names the member the checkpoint is attributed to (e.g. an agent
+/// key). Forwards to ``SCP/eventLogCheckpointByDid(handle:identity:did:epoch:)``.
+///
+/// - Parameters:
+///   - scp: The SDK-level ``SCP`` instance that owns ``handle``.
+///   - handle: The ``ContextHandle`` for the context whose event log to
+///     checkpoint.
+///   - identity: The ``Identity`` whose key material signs the checkpoint.
+///   - did: The DID of the member the checkpoint is attributed to.
+///   - epoch: The current MLS epoch (pass 0 for broadcast contexts).
+/// - Returns: A ``Checkpoint`` containing the signed checkpoint data.
+/// - Throws: ``ScpError/Context(msg:code:)`` if the context is not found.
+///   ``ScpError/Permission(msg:code:)`` if key custody is not available.
+///
+/// ## Provenance
+///
+/// - ADR-011 (Event Log) acceptance criterion 8 in `.docs/adrs/phase-2.md`
+/// - ADR-030 (Pruning/Checkpointing)
+/// - ADR-048 (Multi-instance SCP) §7 (per-SDK idiom)
+public func generateEventLogCheckpointByDid(
+    scp: SCP,
+    handle: ContextHandle,
+    identity: Identity,
+    did: String,
+    epoch: UInt64
+) async throws -> Checkpoint {
+    try await scp.eventLogCheckpointByDid(handle: handle, identity: identity, did: did, epoch: epoch)
 }

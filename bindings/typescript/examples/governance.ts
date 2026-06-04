@@ -1,66 +1,85 @@
 /**
  * Governance demo.
  *
- * Starts an in-memory relay, creates an identity, creates a governed
- * context, executes a governance action (role change), and verifies the
- * result.
+ * Starts an in-memory relay via the caller-owned `SCP`, creates an
+ * identity, creates a governed context, executes a governance action
+ * (role change), and reports the outcome.
+ *
+ * Post-Phase-4 (ADR-048): every SDK call routes through an explicit
+ * `SCP` instance. The static `Relay.startInMemory()` factory was
+ * removed — construct via `scp.relayStartInMemory()`.
  *
  * Run: bun run examples/governance.ts
  */
 
-import { connectLocalTransport, Context, Identity, Relay } from "@limn-works/scp-ts";
+import { SCP } from "../src/index";
 
 async function main(): Promise<void> {
-  // 1. Start an in-memory relay
-  const relay = await Relay.startInMemory();
+  const scp = new SCP();
+  let relay: Awaited<ReturnType<SCP["relayStartInMemory"]>> | null = null;
   try {
+    // 1. Start an in-memory relay.
+    relay = await scp.relayStartInMemory();
     console.log(`Relay listening at ${relay.relayUrl}`);
 
-    // 1b. Connect transport to the relay
-    await connectLocalTransport(relay.relayUrl);
-
-    // 2. Create admin identity
-    const admin = await Identity.create({ custody: "in_memory" });
+    // 2. Create admin identity.
+    const admin = await scp.identityCreate("in_memory");
     console.log(`Admin DID: ${admin.did}`);
 
-    // 3. Create a context with governance enabled
-    const ctx = await Context.create(admin, {
-      ceiling: [
-        "messages:read",
-        "messages:write",
-        "member:invite",
-        "governance:propose",
-        "governance:vote",
-      ],
-      memoryScope: "ephemeral",
-      governance: "single_admin",
-      ttl: 600,
-    });
+    // 3. Wire the bridge's transport to the relay.
+    await scp.configureRelayTransport(relay.relayUrl, admin.did);
+
+    // 4. Create a context with governance enabled.
+    const ctx = await scp.contextCreate(
+      admin,
+      JSON.stringify({
+        ceiling: [
+          "messages:read",
+          "messages:write",
+          "member:invite",
+          "governance:propose",
+          "governance:vote",
+        ],
+        memoryScope: "ephemeral",
+        governance: "single_admin",
+        ttl: 600,
+      }),
+    );
     console.log(`Governed context created: ${ctx.contextId}`);
 
-    // 4. Create a second identity and have them join
-    const member = await Identity.create({ custody: "in_memory" });
-    await ctx.join(member);
+    // 5. Create a second identity and have them join.
+    const member = await scp.identityCreate("in_memory");
+    await scp.contextJoin(ctx._rawHandle, member.did, null);
     console.log(`Member ${member.did} joined`);
 
-    // 5. Admin executes a governance action to change the member's role
+    // 6. Admin executes a governance action to change the member's role.
     try {
-      const proposal = JSON.stringify({
+      const action = JSON.stringify({
         ChangeRole: { did: member.did, new_role: "moderator" },
       });
-      const result = await ctx.executeGovernanceAction(proposal);
+      const result = await scp.contextExecuteGovernanceAction(
+        ctx._rawHandle,
+        action,
+        admin.did,
+      );
       console.log("Governance action result:", result);
     } catch (err) {
       console.log("Governance action:", err);
     }
 
-    // 6. Cleanup
-    await ctx.close();
+    // 7. Cleanup.
+    await scp.contextClose(ctx._rawHandle, admin.did);
     console.log("Context closed");
   } finally {
-    await relay.shutdown();
+    if (relay !== null) {
+      await relay.shutdown();
+    }
+    await scp.shutdown(5);
     console.log("Demo complete");
   }
 }
 
-main().catch(console.error);
+main().catch((error: unknown) => {
+  console.error("Demo failed:", error);
+  process.exit(1);
+});

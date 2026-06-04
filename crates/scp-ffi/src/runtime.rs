@@ -1,13 +1,13 @@
 //! Global runtime registry mapping context IDs to live `scp-core` objects.
 //!
 //! The FFI bridge functions accept `context_id: &str` parameters but need
-//! access to both the shared `ContextManager` (for lifecycle, membership,
+//! access to both the shared [`ContextManager`] (for lifecycle, membership,
 //! governance, and messaging operations) and per-context FFI-specific state
 //! (tool registries, event logs, UCAN state, message channels).
 //!
 //! # Architecture (post-#386 rewrite)
 //!
-//! Context lifecycle is delegated to a shared `ContextManager` which holds
+//! Context lifecycle is delegated to a shared [`ContextManager`] which holds
 //! the canonical membership, role, governance, broadcast, and TTL state.
 //! Per-context FFI-specific state (tool registries, event logs, UCAN
 //! revocation/nonce tracking, tool handlers, message channels) lives in
@@ -37,7 +37,7 @@
 //! 1. `py_context_create` delegates to `ContextManager::create_context`, then
 //!    registers FFI-specific state via [`register_ffi_state`].
 //! 2. Bridge functions call [`with_ffi_state`] for FFI-specific state and
-//!    `Self::context_manager` for the shared `ContextManager`.
+//!    [`context_manager`] for the shared `ContextManager`.
 //! 3. `py_context_close` delegates to `ContextManager::close_context`, then
 //!    removes FFI state via [`remove_ffi_state`].
 //!
@@ -56,13 +56,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use scp_core::context::builder::{
     ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::persistence::ContextPersistence;
-use scp_core::context::providers::ProtocolRepositoryContextBridge;
+use scp_core::context::providers::{
+    MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
+};
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
@@ -70,7 +73,7 @@ use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
-use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError, ShutdownOutcome};
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `pyscp_check_handle!` macro can refer to it as
 // `$crate::runtime::CoreFields`.
@@ -97,38 +100,38 @@ use crate::error::ScpPyError;
 /// Runtime handle-affinity enforcement at every `#[pyfunction]` entry point
 /// that accepts a handle.
 ///
-/// Resolves [`bridge_instance_for_affinity`](crate::runtime::bridge_instance_for_affinity)
-/// internally to obtain a [`CoreFields`] reference, then checks that each
+/// The caller passes a [`CoreFields`] reference as the first argument (typically
+/// `&self.inner.core` on a `PyScp` method, or `&bi.core` where `bi` is a
+/// `&PyBridgeInstance` already in scope). The macro then checks that each
 /// supplied `$handle.instance_id` matches the core's `instance_id`. On
 /// mismatch, returns a [`ScpPyError::UcanError`] with code
 /// [`scp_ffi_common::error_codes::PERM_3030`] (mapped via the
 /// [`From<HandleAffinityError>`](scp_ffi_common::bridge_instance::HandleAffinityError)
 /// conversion).
 ///
-/// Round 5 simplifier review removed the explicit `$core` parameter: all
-/// 175 call sites passed `crate::runtime::bridge_instance_for_affinity()?`
-/// identically, so YAGNI applied. If a future per-instance `SCP` method
-/// needs to target a different core (e.g. `&self.inner.core`), add a
-/// second macro arm rather than re-expanding the default one.
+/// Sub-slice A of #1549 Phase 4 PR 4 reintroduced the explicit `$core`
+/// parameter so per-`PyBridgeInstance` call paths can flow their own core
+/// through without routing via the process-global default. Sub-slices B-E
+/// update every call site.
 ///
 /// The affinity check is never blocked by transient lifecycle state
-/// (e.g., a suspended bridge) because `bridge_instance_for_affinity`
-/// intentionally bypasses the suspended guard.
+/// (e.g., a suspended bridge) because it is a pure `u64` comparison that
+/// does not touch transport or `ContextManager` state.
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[pyfunction]
-/// pub fn example(handle: &SomeHandle) -> PyResult<()> {
-///     pyscp_check_handle!(handle);
+/// pub fn example(scp: &PyScp, handle: &SomeHandle) -> PyResult<()> {
+///     pyscp_check_handle!(&scp.inner.core, handle);
 ///     // ... real work ...
 ///     Ok(())
 /// }
 /// ```
 #[macro_export]
 macro_rules! pyscp_check_handle {
-    ($($handle:expr),+ $(,)?) => {{
-        let __core = $crate::runtime::bridge_instance_for_affinity()?;
+    ($core:expr, $($handle:expr),+ $(,)?) => {{
+        let __core: &$crate::runtime::CoreFields = $core;
         $(
             __core
                 .check_handle($handle.instance_id)
@@ -148,46 +151,39 @@ pub type ToolHandler =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
-// Supervisor (per-bridge, process-global default)
+// ContextManager (shared, process-global)
 // ---------------------------------------------------------------------------
 
-/// Returns a reference to the shared
-/// [`Supervisor`](scp_core::context::supervisor::Supervisor) from the
-/// default bridge instance.
+/// Returns a reference to the shared [`ContextManager`] from the given
+/// bridge instance.
 ///
-/// Per ADR-049 commit 12c.9g.3 the FFI bridge no longer hands out an
-/// `Arc<ContextManager>`. Every bridge function that previously routed
-/// through `context_manager()` now goes through this accessor and uses
-/// the supervisor's
-/// [`dispatch_*`](scp_core::context::supervisor::Supervisor) family or
-/// the per-method passthrough surface added on the supervisor.
+/// Delegates to [`PyBridgeInstance::core`] → [`CoreFields::try_context_manager`].
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ContextError` if the bridge instance has not
-/// been initialized yet, if no supervisor has been wired (i.e.
-/// `ensure_bridge_instance` ran but `init_supervisor` has not), or if
-/// the bridge is currently suspended.
-pub fn supervisor() -> Result<&'static Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        ScpPyError::context(
-            "Supervisor not initialized — call py_context_create, \
-             py_context_join, py_context_import, or init_supervisor first"
-                .to_owned(),
-        )
-    })?;
+/// Returns `ScpPyError::ContextError` if the `ContextManager` has not been
+/// attached to the instance yet (i.e., `init_context_manager` has not been
+/// called), or if the bridge is currently suspended.
+pub fn supervisor(
+    bi: &PyBridgeInstance,
+) -> Result<&Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
+    // Suspended: return error (recoverable — caller should call resume()).
+    // AlreadyShutDown: warn only. Shutdown already destroyed MLS groups,
+    // cleared registries, and disconnected transport — operations will fail
+    // naturally. Returning an error breaks test suites that call shutdown
+    // before exit, since OnceLock cannot be re-initialized.
     if bi.core.is_suspended() {
         return Err(ScpPyError::context(
             "bridge is suspended — call resume() before performing operations".to_owned(),
         ));
     }
     if bi.core.is_shutdown() {
-        tracing::warn!("supervisor() called after shutdown — operations may fail");
+        tracing::warn!("context_manager() called after shutdown — operations may fail");
     }
     bi.core.try_supervisor().ok_or_else(|| {
         ScpPyError::context(
-            "Supervisor not yet attached — call py_context_create, \
-             py_context_join, py_context_import, or init_supervisor first"
+            "ContextManager not yet attached — call py_context_create, \
+             py_context_join, py_context_import, or init_context_manager first"
                 .to_owned(),
         )
     })
@@ -203,7 +199,7 @@ pub fn supervisor() -> Result<&'static Arc<scp_core::context::supervisor::Superv
 /// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
 /// - [`StorageConfig::Sqlite`] — persistent SQLCipher-encrypted storage on
 ///   disk. The `key` is the raw encryption key material held in
-///   `Zeroizing` so it is wiped from memory as soon as the config is
+///   [`Zeroizing`] so it is wiped from memory as soon as the config is
 ///   consumed.
 ///
 /// Keeping this as an enum (instead of a string parameter) means adding future
@@ -215,59 +211,27 @@ pub enum StorageConfig {
     /// SQLCipher-encrypted storage at `{path}/scp.db`.
     ///
     /// Wraps [`scp_platform::sqlite::SqliteStorage`]. Persists across
-    /// process restarts. The encryption key material is selected via
-    /// [`SqliteKeyMaterial`] — either raw key bytes or a passphrase that is
-    /// run through Argon2id (spec §17.6). Both forms are held in `Zeroizing`
-    /// so the caller's copy is wiped after construction.
+    /// process restarts. The `key` is raw encryption key material wrapped in
+    /// [`Zeroizing`] so the caller's copy is wiped after construction.
     Sqlite {
         /// Directory the database file is created in.
         path: PathBuf,
-        /// Encryption key material — raw bytes or passphrase (mutually
-        /// exclusive; the type enforces "exactly one").
-        key: SqliteKeyMaterial,
+        /// Raw encryption key material (32 bytes recommended).
+        key: Zeroizing<Vec<u8>>,
     },
 }
 
-/// `SQLCipher` key-material selector for [`StorageConfig::Sqlite`] (spec §17.6).
-///
-/// The caller supplies EITHER raw key material OR a passphrase — never both,
-/// never neither. The sum type makes that mutual exclusion unrepresentable as
-/// an invalid state: there is exactly one happy path per variant. Both forms
-/// are wrapped in `Zeroizing` so they are wiped from memory on drop.
-///
-/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
-///   mode; the existing, unchanged path).
-/// - [`SqliteKeyMaterial::Passphrase`] feeds
-///   [`SqliteStorage::with_passphrase`], which derives the `SQLCipher`
-///   PRAGMA key from the passphrase via the shared Argon2id parameterization with a
-///   persisted per-database salt sidecar.
-#[derive(Debug, Clone)]
-pub enum SqliteKeyMaterial {
-    /// Raw encryption key material (32 bytes recommended).
-    Raw(Zeroizing<Vec<u8>>),
-    /// Human-chosen passphrase; the `SQLCipher` key is derived via Argon2id.
-    Passphrase(Zeroizing<String>),
-}
-
 /// Bridge-internal error returned by [`PyBridgeInstance::with_storage_py`]
-/// when a durable storage backend cannot be opened.
+/// when a persistence backend cannot be initialized.
 ///
-/// Surfacing this (rather than silently degrading to in-memory or no storage)
-/// is the fail-closed contract from spec §17.6: a failed durable-backend open
-/// is a terminal error the caller observes, never a condition the system
-/// recovers from by downgrading durability. Converted to a Python
-/// `ValidationError` at the [`PyScp::with_storage`](crate::scp::PyScp) factory
-/// surface.
-///
+/// Converted to [`ScpPyError`] at the `PyScp::with_storage` factory surface.
 /// Kept as a dedicated enum so the `runtime` layer does not depend on the
-/// bridge error vocabulary and so future durable backends can extend it
-/// without touching every caller.
+/// bridge error vocabulary and so new backends (e.g. encrypted filesystem)
+/// can extend the enum without touching every caller.
 #[derive(Debug)]
 pub enum StorageInitError {
-    /// `SqliteStorage::new` / `SqliteStorage::with_passphrase` failed —
-    /// directory permission denied, key/passphrase rejected by `SQLCipher` on an
-    /// existing DB, salt-sidecar fail-closed condition, corrupt file, and so
-    /// on. The message never contains key or passphrase bytes.
+    /// `SqliteStorage::new` failed — directory permission denied, key
+    /// mismatch on an existing DB, `SQLCipher` init error, and so on.
     SqliteOpen {
         /// The directory path the caller asked for (for the error message).
         path: String,
@@ -299,8 +263,8 @@ impl std::error::Error for StorageInitError {}
 /// not `EncryptedStorage` because the sealed trait lives in `scp-platform`
 /// and cannot be implemented here. Call sites that need
 /// [`scp_core::store::ProtocolRepository`] dispatch on the variant and
-/// construct the concrete `ProtocolRepository<S>` directly (see
-/// [`build_persistence_provider`]).
+/// construct the concrete `ProtocolRepository<S>` directly (see the
+/// `build_persistence_provider` helper in this module).
 #[derive(Clone)]
 pub enum StorageProvider {
     /// Encrypted in-memory storage.
@@ -321,38 +285,22 @@ impl StorageProvider {
         )))
     }
 
-    /// Constructs a `SQLCipher`-encrypted provider at the given directory.
+    /// Releases any persistent resources held by the variant.
     ///
-    /// # Errors
+    /// For [`StorageProvider::Sqlite`] this delegates to
+    /// [`SqliteStorage::close`] to release the advisory lock on
+    /// `scp.db.lock` even when outer `Arc<SqliteStorage>` references
+    /// remain alive. [`StorageProvider::InMemoryEncrypted`] has no
+    /// persistent resources and the call is a no-op.
     ///
-    /// Returns [`PlatformError::StorageError`] if the database cannot be
-    /// opened or the encryption key is rejected. The key material is
-    /// consumed (moved) so that the original `Zeroizing<Vec<u8>>` is
-    /// dropped — `SQLCipher` retains its own derived key internally.
-    pub fn new_sqlite(path: &std::path::Path, key: &[u8]) -> Result<Self, PlatformError> {
-        let storage = SqliteStorage::new(path, key)?;
-        Ok(Self::Sqlite(Arc::new(storage)))
-    }
-
-    /// Constructs a `SQLCipher`-encrypted provider whose key is derived from a
-    /// passphrase via Argon2id (spec §17.6).
-    ///
-    /// Delegates to [`SqliteStorage::with_passphrase`], which loads-or-creates
-    /// the per-database salt sidecar and derives the `SQLCipher` PRAGMA key with
-    /// the shared Argon2id parameterization. The passphrase bytes are not
-    /// retained — `SQLCipher` holds its own derived key internally.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::StorageError`] if the database cannot be
-    /// opened, the salt sidecar is in a fail-closed state (present-db /
-    /// missing-salt, wrong-length salt), or the passphrase is rejected.
-    pub fn new_sqlite_passphrase(
-        path: &std::path::Path,
-        passphrase: &[u8],
-    ) -> Result<Self, PlatformError> {
-        let storage = SqliteStorage::with_passphrase(path, passphrase)?;
-        Ok(Self::Sqlite(Arc::new(storage)))
+    /// Called from `bridge_specific_shutdown` on the `PyO3` bridge so
+    /// that `SCP.shutdown()` on a `StorageConfig::Sqlite` instance
+    /// releases the lock at the SDK surface.
+    pub fn close(&self) {
+        match self {
+            Self::InMemoryEncrypted(_) => {}
+            Self::Sqlite(storage) => storage.close(),
+        }
     }
 }
 
@@ -424,9 +372,10 @@ pub struct PyBridgeInstance {
 
     /// Encrypted storage provider — [`StorageProvider`] enum dispatching
     /// between `EncryptingAdapter<InMemoryStorage>` and `SqliteStorage`.
-    /// `OnceLock` because it is set once at `py_init_storage` (or
-    /// construction) time. Typed (not `dyn`) because the `Storage` trait is
-    /// not dyn-compatible (RPITIT).
+    /// `OnceLock` because it is set once at construction via
+    /// [`PyBridgeInstance::with_storage_py`] (driven from Python by
+    /// `SCP.with_storage({...})`). Typed (not `dyn`) because the `Storage`
+    /// trait is not dyn-compatible (RPITIT).
     pub(crate) storage_provider: OnceLock<StorageProvider>,
 
     // -----------------------------------------------------------------
@@ -464,6 +413,10 @@ pub struct PyBridgeInstance {
     /// Migrated from a process-global `OnceLock<InMemoryCredentialStore>`
     /// singleton in commit 5. Production deployments should replace this with
     /// a `Storage`-backed implementation when it lands (spec §12.11.2).
+    /// Dropping the `Arc` on shutdown zeroizes any retained bridge credential
+    /// keys via the store's `Zeroizing` fields — there is no explicit clear
+    /// step in `bridge_specific_shutdown`, so the store lives exactly as long
+    /// as its last `Arc` reference.
     pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
 
     /// Most recently connected relay URL (replaces `CONNECTED_RELAY_URL` in
@@ -546,21 +499,15 @@ impl PyBridgeInstance {
     ///   also registered as `storage_provider` so identity, event log,
     ///   trust, and MCP reads hit the same connection pool (one DB
     ///   connection per process — `SQLite` cannot share one across two
-    ///   `SqliteStorage::new` calls). If opening fails, a
-    ///   [`StorageInitError::SqliteOpen`] is returned to the caller (and
-    ///   logged via `tracing::error!`) — the bridge FAILS CLOSED (spec
-    ///   §17.6). There is no silent degrade to in-memory or no-storage; a
-    ///   failed durable open is terminal. The key material is selected via
-    ///   [`SqliteKeyMaterial`]: raw bytes feed [`SqliteStorage::new`];
-    ///   a passphrase feeds [`SqliteStorage::with_passphrase`] (Argon2id).
+    ///   `SqliteStorage::new` calls). If opening fails, the
+    ///   [`StorageInitError::SqliteOpen`] error is returned to the caller
+    ///   (and logged via `tracing::error!`) — no half-constructed bridge
+    ///   is exposed.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageInitError::SqliteOpen`] if the `SQLCipher` database
-    /// cannot be opened (bad key/passphrase, permission denied, corrupt file,
-    /// schema mismatch, salt-sidecar fail-closed condition). In-memory storage
-    /// is reachable only via [`StorageConfig::InMemory`] — never as a
-    /// degradation path from a failed durable open.
+    /// Returns [`StorageInitError::SqliteOpen`] if `SqliteStorage::new`
+    /// fails (bad key, permission denied, corrupt file, schema mismatch).
     pub fn with_storage_py(cfg: StorageConfig) -> Result<Self, StorageInitError> {
         match cfg {
             StorageConfig::InMemory => {
@@ -579,35 +526,20 @@ impl PyBridgeInstance {
                 // draft called `SqliteStorage::new` twice (once for the
                 // provider, once for the persistence bridge) and hit
                 // `SQLITE_BUSY` the moment both tried to write.
-                //
-                // FAIL CLOSED (spec §17.6): on open failure we return the
-                // error to the caller rather than degrading to no-storage.
-                // The key/passphrase material is wiped on drop regardless of
-                // outcome; the error message never carries key bytes.
-                let open_result = match &key {
-                    SqliteKeyMaterial::Raw(bytes) => SqliteStorage::new(&path, bytes),
-                    SqliteKeyMaterial::Passphrase(pass) => {
-                        SqliteStorage::with_passphrase(&path, pass.as_bytes())
-                    }
-                };
-                let storage = open_result.map_err(|e| {
+                let storage = SqliteStorage::new(&path, &key).map_err(|e| {
                     tracing::error!(
                         error = %e,
                         path = %path.display(),
-                        "with_storage_py: SQLCipher open failed — failing closed, no in-memory fallback"
+                        "with_storage_py: SqliteStorage::new failed — returning error to caller"
                     );
                     StorageInitError::SqliteOpen {
                         path: path.display().to_string(),
                         message: e.to_string(),
                     }
                 })?;
-                // `key` (Raw bytes or Passphrase string) is `Zeroizing`; wipe
-                // the caller's copy now that SQLCipher has retained its own
-                // derived key internally.
-                drop(key);
                 let arc_storage = Arc::new(storage);
-                // Build persistence bridge first so we can share the same Arc
-                // across CoreFields + storage_provider (one SQLite connection).
+                // Build persistence bridge first so we can share
+                // the same Arc across CoreFields + storage_provider.
                 let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                 let persistence: Arc<dyn ContextPersistence + Send + Sync> =
                     Arc::new(ProtocolRepositoryContextBridge::new(repo));
@@ -628,6 +560,11 @@ impl PyBridgeInstance {
                 let _ = instance
                     .storage_provider
                     .set(StorageProvider::Sqlite(arc_storage));
+                // `key` is `Zeroizing<Vec<u8>>`, zeroed on drop here.
+                // SQLCipher has already retained its derived key
+                // internally, so the caller's key material is safe
+                // to wipe at this point.
+                drop(key);
                 Ok(instance)
             }
         }
@@ -637,6 +574,16 @@ impl PyBridgeInstance {
     #[must_use]
     pub const fn identity_registry(&self) -> &Arc<DashMap<String, IdentityEntry>> {
         &self.identity_registry
+    }
+
+    /// Returns a reference to the attached [`ContextManager`], if any.
+    ///
+    /// Convenience accessor that delegates to
+    /// [`CoreFields::try_context_manager`]. Returns `None` until
+    /// `init_context_manager` (or one of its variants) has been called.
+    #[must_use]
+    pub fn try_supervisor(&self) -> Option<&Arc<scp_core::context::supervisor::Supervisor>> {
+        self.core.try_supervisor()
     }
 
     /// Returns a reference to the storage provider if initialized.
@@ -703,52 +650,6 @@ impl PyBridgeInstance {
     ) -> &std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>> {
         &self.network
     }
-
-    /// Initializes the in-memory storage provider on this instance.
-    ///
-    /// Returns an error if storage was already initialized on this instance
-    /// (`OnceLock` semantics) — matches the previous
-    /// `set_storage_provider` warning behaviour but surfaces the failure
-    /// to the caller instead of silently dropping it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ScpPyError::ContextError` if storage was already set.
-    pub fn init_in_memory_storage(&self) -> Result<(), ScpPyError> {
-        self.storage_provider
-            .set(StorageProvider::new_in_memory_encrypted())
-            .map_err(|_| {
-                ScpPyError::context(
-                    "storage already initialized — py_init_storage may only be called once per SCP instance"
-                        .to_owned(),
-                )
-            })
-    }
-
-    /// Initializes a SQLCipher-encrypted storage provider on this instance.
-    ///
-    /// Opens a database at `{path}/scp.db` with the given raw encryption
-    /// key. Subsequent calls return an error (`OnceLock` semantics).
-    ///
-    /// # Errors
-    ///
-    /// Returns `ScpPyError::ContextError` if storage was already set or if
-    /// `SqliteStorage::new` fails (database open, schema creation, or
-    /// encryption key rejection).
-    pub fn init_sqlite_storage(
-        &self,
-        path: &std::path::Path,
-        key: &[u8],
-    ) -> Result<(), ScpPyError> {
-        let provider = StorageProvider::new_sqlite(path, key)
-            .map_err(|e| ScpPyError::context(format!("failed to open SQLite storage: {e}")))?;
-        self.storage_provider.set(provider).map_err(|_| {
-            ScpPyError::context(
-                "storage already initialized — init_sqlite_storage may only be called once per SCP instance"
-                    .to_owned(),
-            )
-        })
-    }
 }
 
 #[async_trait::async_trait]
@@ -757,25 +658,52 @@ impl BridgeInstanceCore for PyBridgeInstance {
         &self.core
     }
 
-    // `resume` inherits the `BridgeInstanceCore` default (ADR-049 §11,
-    // landed in commit 6): flag flip + transport reconnect +
-    // persisted-context restore. Overriding here would diverge from
-    // the shared contract and be caught by the cross-bridge consistency
-    // gate `scripts/check-bridge-instance-lifecycle.py`.
+    /// `PyO3`-specific resume: flag flip, then transport reconnect, then
+    /// persisted-context restore.
+    ///
+    /// Mirrors the NAPI / `UniFFI` overrides so the Python SDK sees the
+    /// same resume semantics as the other bridges.
+    async fn resume(&self) -> Result<(), scp_ffi_common::bridge_instance::LifecycleError> {
+        self.core.resume().await?;
+        // Reconnect transport BEFORE rehydrating persisted contexts so
+        // restored subscriptions can attach to a live relay connection.
+        self.core.reconnect_transport_if_pending().await?;
+        self.core.restore_all_persisted_contexts().await;
+        Ok(())
+    }
 
-    // `shutdown` inherits the `BridgeInstanceCore` default (ADR-049 §11,
-    // landed in commit 6): `core.shutdown_core_async(timeout).await +
-    // bridge_specific_shutdown()`. Overriding here would diverge from
-    // the shared contract and be caught by the cross-bridge consistency
-    // gate `scripts/check-bridge-instance-lifecycle.py`.
+    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
+        // Drain async tasks first (respects timeout + cancellation token),
+        // then run bridge-specific cleanup (clears typed fields).
+        //
+        // `bridge_specific_shutdown` MUST run even when
+        // `shutdown_core_async` returns `AlreadyShutDown` — that variant
+        // signals the sync shutdown path raced ahead; without the cleanup
+        // call, typed PyO3 registries (identity, MCP, FFI bridge state)
+        // leak key material past shutdown.
+        let result = self.core.shutdown_core_async(timeout).await;
+        self.bridge_specific_shutdown();
+        result
+    }
 
     fn bridge_specific_shutdown(&self) {
         // Clear the identity registry so held `Arc<FfiKeyCustody>` entries
         // drop, triggering `Zeroizing` on key material.
         self.identity_registry.clear();
-        // `storage_provider` is `OnceLock` — we cannot clear it. The
-        // `Arc<EncryptingAdapter>` is released when the `PyBridgeInstance`
-        // is dropped.
+        // `storage_provider` is `OnceLock` — we cannot clear the slot, but
+        // the `Sqlite` variant holds an advisory lock on
+        // `{dir}/scp.db.lock` that must be released at shutdown so
+        // `SCP(storage=...)` against the same path succeeds after a prior
+        // `SCP.shutdown()`. `StorageProvider::close()` delegates to
+        // `SqliteStorage::close()` which drops the `File` inside the
+        // lock-file mutex without dropping the `Arc<SqliteStorage>`
+        // (other Arc holders — `CoreFields::persistence`,
+        // `ContextManager::persistence` — keep the storage struct alive
+        // until the `PyBridgeInstance` itself drops). The
+        // `InMemoryEncrypted` variant's `close()` is a no-op.
+        if let Some(provider) = self.storage_provider.get() {
+            provider.close();
+        }
         // Clear the typed per-context FFI state registry so per-context
         // `ToolRegistry`, `EventLog`, receive channel senders, and
         // registered tool handlers drop.
@@ -784,138 +712,55 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // connections drop, allowing background tasks to terminate cleanly.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Reset lifecycle-owned typed slots so their held URLs / networks
+        // do not survive past shutdown. Best-effort: on lock poisoning
+        // we swallow the error and leave the slot alone — a poisoned
+        // lock means another thread panicked while holding it, and the
+        // caller already has bigger problems than a stale `None`
+        // inconsistency.
+        if let Ok(mut slot) = self.connected_relay_url.write() {
+            *slot = None;
+        }
+        #[cfg(feature = "allow_in_memory_custody")]
+        if let Ok(mut net) = self.network.lock() {
+            *net = None;
+        }
     }
 }
 
-/// Default (process-global) `PyBridgeInstance`.
+/// Emergency cancellation for `PyBridgeInstance` dropped without a prior
+/// `shutdown(timeout)`.
 ///
-/// Retained as a `OnceLock` for backward compatibility with the PR 0
-/// flat `#[pyfunction]` API (`py_identity_create`, `py_context_create`, …).
-/// New callers should prefer explicit [`crate::scp::PyScp`] instances.
+/// The graceful path is `BridgeInstanceCore::shutdown(timeout)` — callers
+/// that want deterministic cleanup of subscriptions, timers, and relay
+/// connections must still invoke that. This `Drop` is the safety net for
+/// the case where a caller constructs a `PyBridgeInstance` (typically via
+/// `PyScp`), spawns background work under its `CancellationToken` +
+/// `JoinSet`, and then drops the whole thing without awaiting shutdown.
+/// Without this impl, those tasks hold `Arc<PyBridgeInstance>` captures
+/// and live forever — leaking a `ContextManager`, relay connection, and
+/// any attached Python callbacks.
 ///
-/// # Safety: Single-Tenant Fallback
-///
-/// Callers that construct their own `PyScp` instance escape the process-
-/// global pattern entirely. The default instance is retained only so the
-/// flat bridge functions continue to work during the migration.
-pub(crate) static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<PyBridgeInstance>> = OnceLock::new();
-
-/// Initializes the default [`PyBridgeInstance`] without a `ContextManager`.
-///
-/// Called by [`ensure_bridge_instance`] and (transitively) by
-/// `Self::init_context_manager`. The `ContextManager` is attached later via
-/// `CoreFields::set_context_manager` once `identity_create` has produced
-/// the local DID and the `MlsCryptoProvider` has been constructed with it.
-///
-/// `PyBridgeInstance` itself carries no DID (spec §12.2.3) — the
-/// authoritative local DID lives inside the `ContextManager`'s
-/// `MlsCryptoProvider`. The instance is created before any identity exists
-/// so that the DID resolver slot (owned by `CoreFields`) is available while
-/// `DidDht::create()` runs.
-///
-/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-fn init_bridge_instance_empty() {
-    if DEFAULT_BRIDGE_INSTANCE.get().is_some() {
-        return;
+/// See ADR-048 for the multi-instance lifecycle contract.
+impl Drop for PyBridgeInstance {
+    fn drop(&mut self) {
+        self.core.emergency_cancel_tasks();
     }
-    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| Arc::new(PyBridgeInstance::new_py()));
 }
 
-/// Returns the raw default `PyBridgeInstance` reference without lifecycle
-/// checks.
-///
-/// Used by lifecycle / shutdown code that must touch the container even
-/// when the `ContextManager` has not been attached yet.
-#[must_use]
-pub fn bridge_instance_raw() -> Option<&'static Arc<PyBridgeInstance>> {
-    DEFAULT_BRIDGE_INSTANCE.get()
-}
-
-/// Returns a reference to the default `PyBridgeInstance`.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` if the bridge has not been initialized
-/// via `Self::init_context_manager` (which also creates the default instance),
-/// or if the bridge is currently suspended. Shutdown is a warning (not an
-/// error) because shutdown is terminal and operations fail naturally at the
-/// MLS/transport layer.
-pub fn bridge_instance() -> Result<&'static Arc<PyBridgeInstance>, ScpPyError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        ScpPyError::context("bridge not initialized — call identity_create first".to_owned())
-    })?;
-    if bi.core.is_suspended() {
-        return Err(ScpPyError::context(
-            "bridge is suspended — call resume() before performing operations".to_owned(),
-        ));
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!("bridge_instance() called after shutdown — operations may fail");
-    }
-    Ok(bi)
-}
-
-/// Lazily initializes and returns the default `PyBridgeInstance`.
-///
-/// Unlike [`bridge_instance`], this never fails due to "not yet initialized"
-/// — it creates the default instance on first call. Used by shared helpers
-/// that must resolve the default instance regardless of caller order.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` if the bridge is currently suspended.
-pub fn default_bridge_instance() -> Result<Arc<PyBridgeInstance>, ScpPyError> {
-    ensure_bridge_instance();
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        ScpPyError::context("failed to initialize default bridge instance".to_owned())
-    })?;
-    if bi.core.is_suspended() {
-        return Err(ScpPyError::context(
-            "bridge is suspended — call resume() before performing operations".to_owned(),
-        ));
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!("default_bridge_instance() called after shutdown — operations may fail");
-    }
-    Ok(Arc::clone(bi))
-}
-
-/// Returns a reference to the default `PyBridgeInstance`'s `CoreFields` for
-/// handle-affinity checks only.
-///
-/// Unlike [`bridge_instance`] / [`default_bridge_instance`], this helper does
-/// NOT return an error when the bridge is suspended — a handle-affinity check
-/// is a pure compare-two-u64 operation that does not touch transport or
-/// `ContextManager` state, so suspending the bridge must not block it. Used
-/// exclusively by the [`crate::pyscp_check_handle!`] macro at FFI entry
-/// points to mirror the NAPI/UniFFI [`bridge_instance_for_affinity`] helpers
-/// (cross-bridge symmetry).
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` if the default bridge failed to
-/// initialize (very unlikely — [`ensure_bridge_instance`] runs first and is
-/// infallible in practice).
-#[must_use = "the returned CoreFields reference must be used for the affinity check"]
-pub fn bridge_instance_for_affinity() -> Result<&'static CoreFields, ScpPyError> {
-    ensure_bridge_instance();
-    DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .map(|bi| &bi.core)
-        .ok_or_else(|| {
-            ScpPyError::context(
-                "bridge not initialized — call identity_create or \
-                 init_context_manager first"
-                    .to_owned(),
-            )
-        })
-}
+// Phase D (#1695): DEFAULT_BRIDGE_INSTANCE static and default-lookup helpers
+// (`default_bridge_instance`, `bridge_instance`, `bridge_instance_raw`,
+// `bridge_instance_for_affinity`, `ensure_bridge_instance`) have been
+// deleted. All FFI entry points must route through an explicit
+// `&PyBridgeInstance` — typically `&*self.inner` inside a `#[pymethods]
+// impl PyScp` block. Tests construct fresh `PyBridgeInstance::new_py()`
+// instances directly.
 
 // ---------------------------------------------------------------------------
 // ContextManager initialization
 // ---------------------------------------------------------------------------
 
-/// Initializes the per-bridge `Supervisor` with production providers.
+/// Initializes the global [`ContextManager`] with production providers.
 ///
 /// Uses `MlsCryptoProvider` (real OpenMLS-backed encryption, sender keys, and
 /// group management — ported from NAPI bridge #1305, closes #1324),
@@ -930,60 +775,41 @@ pub fn bridge_instance_for_affinity() -> Result<&'static CoreFields, ScpPyError>
 /// returning `None`, ensuring governance vote signature verification failures
 /// are visible rather than silently skipped.
 ///
-/// When the `BridgeInstance` storage provider has been initialized via
-/// [`init_storage`], a [`ProtocolRepositoryContextBridge`] is constructed
-/// from it and injected into the `ContextManager` that the supervisor wraps.
-/// This enables context state persistence across process restarts without
-/// requiring callers to manually wire persistence. See issue #329.
+/// When the `BridgeInstance` was constructed via
+/// [`PyBridgeInstance::with_storage_py`] (driven from Python by
+/// `SCP.with_storage({...})`), a [`ProtocolRepositoryContextBridge`] is
+/// constructed from the attached storage provider and injected into the
+/// `ContextManager`. This enables context state persistence across process
+/// restarts without requiring callers to manually wire persistence.
+/// See issue #329.
 ///
 /// The `local_did` is consumed only by `MlsCryptoProvider::new` — the
 /// `BridgeInstance` itself carries no DID (spec §12.2.3).
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-/// If the supervisor is already initialized with a different DID, a warning is
-/// logged.
-pub fn init_supervisor(local_did: &str) {
-    // Always ensure the BridgeInstance exists first so that identity-time
-    // state (DID resolver, identity registry) is wired up before we attempt
-    // to attach a Supervisor.
-    ensure_bridge_instance();
-
-    let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!(
-            "init_supervisor: PyBridgeInstance unexpectedly None after ensure_bridge_instance"
-        );
-        return;
-    };
-
+/// If the manager is already initialized with a different DID, a warning is logged.
+pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
     if bi.core.has_supervisor() {
         tracing::debug!(
             requested_did = %local_did,
-            "init_supervisor: Supervisor already attached — using existing instance"
+            "init_context_manager: ContextManager already attached — using existing instance"
         );
         return;
     }
 
-    // Storage-before-supervisor (spec §17.6): the supervisor requires a
-    // single Storage handle for its `mls_storage` consumer. The legacy
-    // default-instance free-function flow has no `with_storage(...)`
-    // selection point, so the bridge layer makes the explicit in-memory
-    // dev-affordance selection here when none was set. The runtime core
-    // itself never defaults storage — this is a bridge-layer choice.
-    ensure_default_instance_storage(bi);
-
     let did = local_did.to_owned();
     let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
-    let persistence = build_persistence_provider();
+    let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
         crypto,
         Box::new(NotConfiguredTransportProvider),
-        Box::new(NoOpEventLogProvider),
+        build_event_log_provider(bi),
         persistence,
     ) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(error = %e, "init_supervisor: build_supervisor failed");
+            tracing::error!(error = %e, "init_context_manager: build_supervisor failed");
             return;
         }
     };
@@ -991,30 +817,16 @@ pub fn init_supervisor(local_did: &str) {
     bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Ensures the default [`PyBridgeInstance`] exists (without a `Supervisor`).
+/// Initializes the global [`ContextManager`] with custom providers.
 ///
-/// Called by `ensure_did_resolver_initialized` before
-/// `DidDht::create()` runs, so that the DID resolver slot owned by
-/// `BridgeInstance` is available. The `Supervisor` is attached later
-/// via [`init_supervisor`] once the identity is known and the
-/// `MlsCryptoProvider` has been constructed with it. Per spec §12.2.3
-/// the `BridgeInstance` container has no DID requirement.
-///
-/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn ensure_bridge_instance() {
-    init_bridge_instance_empty();
-}
-
-/// Initializes the per-bridge `Supervisor` with custom providers.
-///
-/// Allows injecting real or custom provider implementations. If the
-/// supervisor is already initialized, this is a no-op (first call wins).
+/// Allows injecting real or custom provider implementations. If the manager
+/// is already initialized, this is a no-op (first call wins).
 ///
 /// When `persistence` is `None` but the global storage provider has been
-/// initialized, a [`ProtocolRepositoryContextBridge`] is automatically
-/// constructed from it. Pass `Some(...)` to override with a custom
-/// implementation.
-pub fn init_supervisor_with(
+/// initialized, a [`ProtocolRepositoryContextBridge`] is automatically constructed
+/// from it. Pass `Some(...)` to override with a custom implementation.
+pub fn init_context_manager_with(
+    bi: &PyBridgeInstance,
     _local_did: &str,
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
@@ -1024,27 +836,68 @@ pub fn init_supervisor_with(
     // `_local_did` is retained in the signature for API stability: callers
     // construct `crypto` with the DID before calling into this function
     // (it is the `MlsCryptoProvider` that carries the DID; see spec §12.2.3).
-    ensure_bridge_instance();
-    let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_supervisor_with: PyBridgeInstance unexpectedly None");
-        return;
-    };
     if bi.core.has_supervisor() {
         return;
     }
-    ensure_default_instance_storage(bi);
-    let persistence = persistence.or_else(build_persistence_provider);
+    let persistence = persistence.or_else(|| build_persistence_provider(bi));
     let supervisor_arc = match build_supervisor(bi, crypto, transport, event_log, persistence) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(error = %e, "init_supervisor_with: build_supervisor failed");
+            tracing::error!(error = %e, "init_context_manager_with: build_supervisor failed");
             return;
         }
     };
     bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Test variant of [`init_supervisor`] that uses `LocalTransportProvider`
+/// Initializes the given bridge instance's [`ContextManager`] with a
+/// `LocalTransportProvider`.
+///
+/// Identical to [`init_context_manager`] except the transport provider is
+/// `LocalTransportProvider` (silently succeeds on all send/publish calls)
+/// instead of `NotConfiguredTransportProvider` (rejects everything). Like
+/// production initialization, it installs a real `MlsCryptoProvider` bound to
+/// `local_did` so encryption is exercised end to end against an in-process
+/// loopback transport.
+///
+/// **Must be called before any `context_create` / `context_join` /
+/// `context_import`** — those functions call `init_context_manager` which wins
+/// the `OnceLock` race if called first.
+///
+/// Exposed to Python via `PyScp::configure_local_transport` so that E2E tests
+/// can exercise `context_send` and `broadcast_publish` without a real relay
+/// server.
+///
+/// No-op if the bridge already has a `ContextManager` attached.
+pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_did: &str) {
+    if bi.core.has_supervisor() {
+        tracing::warn!(
+            requested_did = %local_did,
+            "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
+        );
+        return;
+    }
+    let did = local_did.to_owned();
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let persistence = build_persistence_provider(bi);
+    let supervisor_arc = match build_supervisor(
+        bi,
+        crypto,
+        Box::new(scp_core::context::LocalTransportProvider),
+        build_event_log_provider(bi),
+        persistence,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "init_context_manager_with_local_transport: build_supervisor failed");
+            return;
+        }
+    };
+
+    bi.core.set_supervisor(supervisor_arc);
+}
+
+/// Test variant of [`init_context_manager`] that uses `LocalTransportProvider`
 /// instead of `NotConfiguredTransportProvider`.
 ///
 /// Production code uses `NotConfiguredTransportProvider` to surface descriptive
@@ -1054,32 +907,35 @@ pub fn init_supervisor_with(
 ///
 /// Not behind `#[cfg(test)]` because integration tests (`tests/e2e_bridge.rs`)
 /// compile as separate crates and need access to this function.
-pub fn init_supervisor_for_test() {
-    ensure_bridge_instance();
-    let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_supervisor_for_test: PyBridgeInstance unexpectedly None");
-        return;
-    };
+pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
     if bi.core.has_supervisor() {
         return;
     }
-    // Test inits set up the in-memory storage provider explicitly (dev
-    // opt-in, spec §17.6) so the storage-before-supervisor precondition in
-    // `build_supervisor` is satisfied.
-    ensure_default_instance_storage(bi);
-    let persistence = build_persistence_provider();
+    // The supervisor's `mls_storage` consumer requires a single Storage
+    // handle (storage-before-supervisor precondition, spec §17.6). Test
+    // instances built via `new_py()` carry no storage, so the bridge layer
+    // makes the explicit in-memory dev-affordance selection here when none
+    // was set. The runtime core itself never defaults storage — this is a
+    // bridge-layer choice. A no-op if a provider is already set (`OnceLock`).
+    if bi.storage_provider().is_none() {
+        let _ = bi
+            .storage_provider
+            .set(StorageProvider::new_in_memory_encrypted());
+    }
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        "did:test:pyo3-bridge-test".to_owned(),
+    ));
+    let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
-        Arc::new(MlsCryptoProvider::new(
-            "did:test:pyo3-bridge-test".to_owned(),
-        )),
+        crypto,
         Box::new(scp_core::context::LocalTransportProvider),
-        Box::new(NoOpEventLogProvider),
+        build_event_log_provider(bi),
         persistence,
     ) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(error = %e, "init_supervisor_for_test: build_supervisor failed");
+            tracing::error!(error = %e, "init_context_manager_for_test: build_supervisor failed");
             return;
         }
     };
@@ -1087,29 +943,14 @@ pub fn init_supervisor_for_test() {
     bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Ensures the legacy default-instance has an in-memory storage provider.
+/// Constructs a [`ProtocolRepositoryContextBridge`] from the bridge's storage
+/// provider, if one was attached at construction time.
 ///
-/// The per-instance `SCP.with_storage({...})` factory selects storage
-/// explicitly; the legacy default-instance free-function flow
-/// (`py_identity_create` / `py_context_create`) has no such selection point.
-/// To satisfy the storage-before-supervisor precondition (spec §17.6) the
-/// bridge layer makes the explicit in-memory dev-affordance selection here
-/// when none was set. This is a bridge-layer choice — the runtime core never
-/// defaults storage. A no-op if a provider is already set (`OnceLock`).
-fn ensure_default_instance_storage(bi: &PyBridgeInstance) {
-    if bi.storage_provider().is_none() {
-        let _ = bi
-            .storage_provider
-            .set(StorageProvider::new_in_memory_encrypted());
-    }
-}
-
-/// Constructs a [`ProtocolRepositoryContextBridge`] from the global storage provider,
-/// if it has been initialized.
-///
-/// Returns `None` if [`init_storage`] has not been called yet. This is
-/// expected during early initialization -- the `ContextManager` will operate
-/// without persistence until the storage provider is available.
+/// Returns `None` for `PyBridgeInstance` instances built via
+/// [`PyBridgeInstance::new_py`] (no storage attached) — only instances
+/// constructed via [`PyBridgeInstance::with_storage_py`] (driven from Python
+/// by `SCP.with_storage({...})`) carry a provider. The `ContextManager` will
+/// operate without persistence in the no-storage case.
 ///
 /// Uses `Arc<EncryptingAdapter<InMemoryStorage>>` as the storage backend
 /// for `ProtocolRepository`, sharing the same underlying storage instance as
@@ -1120,8 +961,7 @@ fn ensure_default_instance_storage(bi: &PyBridgeInstance) {
 /// The `EncryptingAdapter` wraps `InMemoryStorage` with per-value
 /// AES-256-GCM encryption, satisfying the sealed `EncryptedStorage`
 /// bound required by `ProtocolRepository::new()`.
-fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get()?;
+fn build_persistence_provider(bi: &PyBridgeInstance) -> Option<Box<dyn ContextPersistence>> {
     // Prefer the shared provider attached to `CoreFields` at construction
     // time — this is the path the `Sqlite` variant of `with_storage_py`
     // uses, and it guarantees the ContextManager and the CoreFields
@@ -1212,17 +1052,59 @@ impl ContextPersistence for ArcContextPersistence {
     }
 }
 
+/// Constructs a persistent [`MerkleEventLogProvider`] backed by the global
+/// storage provider if initialized, or a non-persistent one otherwise.
+///
+/// This is NOT a direct reuse of
+/// `scp-ffi-common::bridge_runtime::build_event_log_provider` — that common
+/// fn owns its own storage (creates a fresh `BridgeInMemoryStorage` +
+/// `ProtocolRepository` and returns both) so the NAPI / `UniFFI` bridges can
+/// keep the repository handle around for later queries. The `PyO3` bridge
+/// instead reads from `DEFAULT_BRIDGE_INSTANCE.storage_provider()` so the
+/// event log shares storage with every other per-context data sink
+/// (identity state, protocol repository, blobs) — one backend per bridge
+/// instance, switchable between `InMemoryEncrypted` and `Sqlite` at init
+/// time. Collapsing the two would force the `PyO3` bridge to duplicate its
+/// storage or force the common fn to grow a storage-provider parameter,
+/// both of which cost more than the current 30-line duplication. See
+/// `.claude/memory/feedback_dedup_bridge_validators.md` for the dedup
+/// heuristic and when to break it.
+///
+/// The persistent provider writes event entries to encrypted in-memory
+/// storage via `ProtocolRepositoryEventLogBridge`, so `ContextCreated`
+/// (appended by `builder_create_context`) survives across manager calls
+/// and is visible to `py_event_log_query`.
+///
+/// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
+/// same initial `ContextCreated` event as the NAPI, WASM, and `UniFFI`
+/// bridges (cross-bridge parity, ADR-046 `OP_EVENT_LOG_APPEND`).
+fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogProvider> {
+    match bi.storage_provider() {
+        Some(StorageProvider::InMemoryEncrypted(storage)) => {
+            let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
+            Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+        }
+        Some(StorageProvider::Sqlite(storage)) => {
+            let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
+            Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+        }
+        None => Box::new(MerkleEventLogProvider::new()),
+    }
+}
+
 /// Constructs a fresh per-instance `Supervisor` with the given providers.
 ///
-/// ADR-049 commit 12c.9g.3.6 — the FFI bridge no longer touches
-/// `ContextManager` at all. `Supervisor::with_providers` is the single entry
-/// point that constructs the supervisor + populates the lifted-provider slots.
-/// The supervisor is the only handle returned to the bridge layer.
+/// ADR-049 — the FFI bridge no longer touches `ContextManager` at all.
+/// `Supervisor::with_providers` is the single entry point that constructs the
+/// supervisor + populates the lifted-provider slots. The supervisor is the
+/// only handle returned to the bridge layer.
 ///
 /// The supervisor's `mls_storage` consumer (the `OpenMLS` storage view) is
-/// derived from the bridge instance's single chosen Storage: `storage_provider()`
-/// is wrapped ONCE via [`SpawnBlockingStorageAdapter`] into an
-/// `Arc<dyn OpenMlsStorageAdapter>`. This is the same `StorageProvider` that
+/// derived from the bridge instance's single chosen Storage:
+/// `storage_provider()` is wrapped ONCE via `SpawnBlockingStorageAdapter` into
+/// an `Arc<dyn OpenMlsStorageAdapter>`. This is the same `StorageProvider` that
 /// backs persistence and the event log, so all three consumers share one
 /// backend (spec §17.6).
 ///
@@ -1230,9 +1112,7 @@ impl ContextPersistence for ArcContextPersistence {
 ///
 /// Returns a [`ScpPyError::ContextError`] if the bridge instance has no
 /// storage provider set (storage-before-supervisor precondition). The runtime
-/// never defaults storage; the caller (bridge layer) must supply it first. In
-/// the production / test `init_supervisor*` paths this is guaranteed by
-/// `ensure_default_instance_storage`.
+/// never defaults storage; the caller (bridge layer) must supply it first.
 fn build_supervisor(
     bi: &PyBridgeInstance,
     crypto: Arc<MlsCryptoProvider>,
@@ -1254,11 +1134,11 @@ fn build_supervisor(
     ))
 }
 
-/// Derives the supervisor's `OpenMLS` storage adapter from the bridge instance's
-/// single chosen [`StorageProvider`] (spec §17.6).
+/// Derives the supervisor's `OpenMLS` storage adapter from the bridge
+/// instance's single chosen [`StorageProvider`] (spec §17.6).
 ///
 /// `StorageProvider` implements `Storage` (enum dispatch) and `Clone`, so we
-/// wrap a clone in [`SpawnBlockingStorageAdapter`] to obtain the dyn-safe
+/// wrap a clone in `SpawnBlockingStorageAdapter` to obtain the dyn-safe
 /// `OpenMlsStorageAdapter` view. The clone shares the same inner backend
 /// (`Arc<EncryptingAdapter<InMemoryStorage>>` or `Arc<SqliteStorage>`), so the
 /// `OpenMLS` view, persistence, and event log all read/write one backend.
@@ -1272,7 +1152,9 @@ fn derive_mls_storage(
 ) -> Result<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>, ScpPyError> {
     let provider = bi.storage_provider().ok_or_else(|| {
         ScpPyError::context(
-            "storage-before-supervisor precondition failed: no storage provider              set on the bridge instance — the runtime never defaults storage              (spec §17.6). Select storage via SCP.with_storage({...}) first."
+            "storage-before-supervisor precondition failed: no storage provider \
+             set on the bridge instance — the runtime never defaults storage \
+             (spec §17.6). Select storage via SCP.with_storage({...}) first."
                 .to_owned(),
         )
     })?;
@@ -1289,43 +1171,31 @@ fn derive_mls_storage(
 // DID resolver (global, production)
 // ---------------------------------------------------------------------------
 
-/// Returns the production DID resolver on the default bridge instance, if
+/// Returns the production DID resolver on the given bridge instance, if
 /// initialized.
 ///
-/// Reads the DID resolver slot on [`DEFAULT_BRIDGE_INSTANCE`]'s `CoreFields`.
-/// Returns `None` when the bridge has not been initialized or no resolver
-/// has been set.
+/// Reads the DID resolver slot on the [`PyBridgeInstance`]'s `CoreFields`.
+/// Returns `None` when no resolver has been set.
 #[must_use]
-pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
-    // SAFETY: DEFAULT_BRIDGE_INSTANCE is in a OnceLock<Arc<...>> which is
-    // 'static. The DID resolver inside CoreFields is in a OnceLock<Arc<...>>
-    // which is also 'static. The returned reference has 'static lifetime
-    // because both OnceLocks are static.
-    DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .and_then(|bi| bi.core.did_resolver())
+pub fn did_resolver(
+    bi: &PyBridgeInstance,
+) -> Option<&Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+    bi.core.did_resolver()
 }
 
-/// Initializes the production DID resolver on the default bridge instance.
+/// Initializes the production DID resolver on the given bridge instance.
 ///
 /// Wraps any `scp_identity::resolver::DidResolver` implementation (typically
 /// `DualLayerResolver`) in an `IdentityBackedDidResolver` and stores it in
-/// the default `PyBridgeInstance`'s `CoreFields`.
-pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
+/// the bridge instance's `CoreFields`.
+pub fn init_did_resolver<R>(bi: &PyBridgeInstance, resolver: Arc<R>, handle: tokio::runtime::Handle)
 where
     R: scp_identity::resolver::DidResolver + 'static,
 {
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() {
-        bi.core
-            .set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
-                resolver, handle,
-            )));
-    } else {
-        tracing::error!(
-            "init_did_resolver called before PyBridgeInstance initialized — resolver not stored"
-        );
-    }
+    bi.core
+        .set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+            resolver, handle,
+        )));
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,41 +1243,21 @@ impl ContextEventLogProvider for NoOpEventLogProvider {
 // FfiBridgeState -- per-context FFI-specific state
 // ---------------------------------------------------------------------------
 
-/// Fallback empty FFI bridge state registry for when the default
-/// `PyBridgeInstance` has not been initialized yet.
-///
-/// Mirrors the `EMPTY_IDENTITY_REGISTRY` pattern introduced for the
-/// identity-registry migration. Used by [`ffi_state_registry`] to keep the
-/// existing free-function signatures infallible even when callers touch
-/// bridge state before `ensure_bridge_instance` runs.
-static EMPTY_FFI_BRIDGE_STATE: OnceLock<DashMap<String, FfiBridgeState>> = OnceLock::new();
-
-/// Returns a reference to the default bridge instance's FFI bridge state
+/// Returns a reference to the given bridge instance's FFI bridge state
 /// registry.
 ///
 /// Resolves the registry via the typed `ffi_bridge_state` field on the
-/// default [`PyBridgeInstance`]. Falls back to an empty registry when the
-/// default instance has not been initialized yet — matching the behaviour of
-/// the removed standalone `OnceLock<DashMap<...>>` (callers previously saw
-/// an empty registry on first touch; they still do).
+/// passed [`PyBridgeInstance`].
 ///
-/// Stores state that is NOT managed by `ContextManager`: tool registries,
+/// Stores state that is NOT managed by [`ContextManager`]: tool registries,
 /// event logs, UCAN revocation/nonce tracking, tool handlers, and message
 /// channels. Context lifecycle state (membership, roles, governance,
 /// broadcast, TTL) lives in the `ContextManager`.
-///
-/// # Safety: Single-Tenant Only
-///
-/// The default instance's registry is process-global. See module-level
-/// documentation.
-fn ffi_state_registry() -> &'static DashMap<String, FfiBridgeState> {
-    DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || EMPTY_FFI_BRIDGE_STATE.get_or_init(DashMap::new),
-        |bi| bi.ffi_bridge_state.as_ref(),
-    )
+pub(crate) fn ffi_state_registry(bi: &PyBridgeInstance) -> &DashMap<String, FfiBridgeState> {
+    bi.ffi_bridge_state.as_ref()
 }
 
-/// Per-context FFI-specific state that does NOT duplicate `ContextManager`.
+/// Per-context FFI-specific state that does NOT duplicate [`ContextManager`].
 ///
 /// Contains subsystem state used by `tools.rs`, `ucan.rs`, `event_log.rs`,
 /// and `mcp.rs`, plus FFI-specific message channel and tool handler state.
@@ -1488,13 +1338,14 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 /// Returns `ScpPyError::ContextError` if the context ID is already registered
 /// or if role state creation fails.
 pub fn register_ffi_state(
+    bi: &PyBridgeInstance,
     context_id: &str,
     creator_did: &str,
     user_ceiling: &[String],
 ) -> Result<(), ScpPyError> {
     use dashmap::mapref::entry::Entry;
 
-    let map = ffi_state_registry();
+    let map = ffi_state_registry(bi);
 
     match map.entry(context_id.to_owned()) {
         Entry::Occupied(_) => {
@@ -1557,11 +1408,11 @@ pub fn register_ffi_state(
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found.
-pub fn with_ffi_state<T, F>(context_id: &str, f: F) -> Result<T, ScpPyError>
+pub fn with_ffi_state<T, F>(bi: &PyBridgeInstance, context_id: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&mut FfiBridgeState) -> Result<T, ScpPyError>,
 {
-    let map = ffi_state_registry();
+    let map = ffi_state_registry(bi);
 
     let mut entry = map.get_mut(context_id).ok_or_else(|| {
         ScpPyError::context(format!(
@@ -1579,8 +1430,8 @@ where
 /// relay transport is not yet wired. Returns an empty Vec if no contexts
 /// match.
 #[must_use]
-pub fn context_ids_for_member(member_did: &str) -> Vec<String> {
-    ffi_state_registry()
+pub fn context_ids_for_member(bi: &PyBridgeInstance, member_did: &str) -> Vec<String> {
+    ffi_state_registry(bi)
         .iter()
         .filter(|entry| entry.value().role_state.members.contains(member_did))
         .map(|entry| entry.key().clone())
@@ -1600,11 +1451,12 @@ pub fn context_ids_for_member(member_did: &str) -> Vec<String> {
 /// Returns `ScpPyError::ContextError` if the context is not found or the
 /// tool is not registered in the context's `ToolRegistry`.
 pub fn register_tool_handler(
+    bi: &PyBridgeInstance,
     context_id: &str,
     tool_id: &str,
     handler: ToolHandler,
 ) -> Result<(), ScpPyError> {
-    with_ffi_state(context_id, |st| {
+    with_ffi_state(bi, context_id, |st| {
         // Verify the tool exists in the registry before accepting a handler.
         if st.tool_registry.get(tool_id).is_none() {
             return Err(ScpPyError::context(format!(
@@ -1624,17 +1476,13 @@ pub fn register_tool_handler(
 /// closes the receive channel and causes `__anext__` to raise
 /// `StopAsyncIteration`. Does not error if the context was not found
 /// (idempotent).
-pub fn remove_ffi_state(context_id: &str) {
-    ffi_state_registry().remove(context_id);
+pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
+    ffi_state_registry(bi).remove(context_id);
     // Clean up known-context discovery entry via CoreFields.
-    if let Ok(bi) = bridge_instance() {
-        bi.core.remove_known_context(context_id);
-    }
+    bi.core.remove_known_context(context_id);
     // Clean up per-context bridge connector state and economy state via CoreFields.
-    if let Ok(bi) = bridge_instance() {
-        bi.core.remove_bridge_state(context_id);
-        bi.core.remove_economy_state(context_id);
-    }
+    bi.core.remove_bridge_state(context_id);
+    bi.core.remove_economy_state(context_id);
 }
 
 /// Re-syncs the `FfiBridgeState.role_state` for a context from the shared
@@ -1649,35 +1497,17 @@ pub fn remove_ffi_state(context_id: &str) {
 /// Returns `ScpPyError` if the context manager is not initialized, the
 /// context is not registered in either the manager or the FFI state registry,
 /// or the tokio runtime is unavailable.
-pub fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpPyError> {
-    use scp_core::context::actor::commands::QueriesCommand;
-    let sup = supervisor()?;
+pub fn sync_role_state_from_manager(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpPyError> {
+    let sup = supervisor(bi)?;
     let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-    let context_id_owned = context_id.to_owned();
-    // Route through the ADR-049 query shim. The handler returns
-    // `Ok(None)` when the context is unknown, matching the legacy
-    // `ContextManager::get_role_state` `Option` contract.
-    let new_role_state = rt
-        .block_on(async move {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let cmd = QueriesCommand::GetRoleState {
-                context_id: context_id_owned,
-                reply: tx,
-            };
-            sup.dispatch_query(cmd).await.map_err(|e| {
-                ScpPyError::context(format!("supervisor dispatch_query failed: {e}"))
-            })?;
-            rx.await
-                .map_err(|e| ScpPyError::context(format!("query shim reply dropped: {e}")))?
-                .map_err(|e| ScpPyError::context(e.to_string()))
-        })?
-        .ok_or_else(|| {
-            ScpPyError::context(format!(
-                "context '{context_id}' not registered with Supervisor"
-            ))
-        })?;
+    let new_role_state = rt.block_on(sup.get_role_state(context_id)).ok_or_else(|| {
+        ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
+    })?;
 
-    with_ffi_state(context_id, |st| {
+    with_ffi_state(bi, context_id, |st| {
         st.role_state = new_role_state;
         Ok(())
     })
@@ -1695,8 +1525,8 @@ pub fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpPyError> 
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found.
-pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
-    with_ffi_state(context_id, |st| {
+pub fn close_receive_channel(bi: &PyBridgeInstance, context_id: &str) -> Result<(), ScpPyError> {
+    with_ffi_state(bi, context_id, |st| {
         st.message_tx.take();
         st.message_rx.take();
         Ok(())
@@ -1720,8 +1550,12 @@ pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found, has no
 /// active receive channel, or if the channel is closed.
-pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPyError> {
-    let (tx, rx_arc) = with_ffi_state(context_id, |st| {
+pub fn deliver_message(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    message: PyMessage,
+) -> Result<(), ScpPyError> {
+    let (tx, rx_arc) = with_ffi_state(bi, context_id, |st| {
         let tx = st.message_tx.clone().ok_or_else(|| {
             ScpPyError::context(format!(
                 "context '{context_id}' has no active receive channel \
@@ -1757,6 +1591,7 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
             #[allow(clippy::cast_precision_loss)]
             // Unix timestamp seconds fit in f64 mantissa for centuries.
             let overflow_warning = PyMessage::new(
+                bi,
                 "scp:system".to_owned(),
                 b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
                 scp_primitives::SystemClock.now_secs() as f64,
@@ -1784,46 +1619,37 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
 // (callers must initialize identity first, which initializes the bridge).
 // ---------------------------------------------------------------------------
 
-/// Registers a known context in the discovery registry.
+/// Registers a known context in the discovery registry for the supplied
+/// [`PyBridgeInstance`].
 ///
 /// Called after `py_context_create` to record the context's routing ID and
 /// relay URL for later discovery via `py_mcp_load_contexts`.
 ///
 /// Overwrites any existing entry for the same context ID (idempotent).
-///
-/// # Panics
-///
-/// Panics if the bridge has not been initialized via `Self::init_context_manager`.
-pub fn register_known_context(context_id: &str, known: KnownContext) {
-    if let Ok(bi) = bridge_instance() {
-        bi.core.register_known_context(context_id, known);
-    } else {
-        tracing::warn!(
-            "register_known_context called before bridge init — context '{}' not tracked",
-            context_id
-        );
-    }
+pub fn register_known_context_on(bi: &PyBridgeInstance, context_id: &str, known: KnownContext) {
+    bi.core.register_known_context(context_id, known);
 }
 
-/// Returns all known contexts from the discovery registry.
+// Phase D (#1695): legacy default-bridge free-fn shims deleted. Callers
+// must use the `*_on(bi, ...)` variants with an explicit PyBridgeInstance.
+
+/// Returns all known contexts registered against the supplied
+/// [`PyBridgeInstance`].
 ///
 /// Used by `py_mcp_load_contexts` to find routing IDs to probe on the relay.
-/// Returns an empty `Vec` if the bridge has not been initialized.
 #[must_use]
-pub fn all_known_contexts() -> Vec<(String, KnownContext)> {
-    bridge_instance()
-        .map(|bi| bi.core.all_known_contexts())
-        .unwrap_or_default()
+pub fn all_known_contexts_on(bi: &PyBridgeInstance) -> Vec<(String, KnownContext)> {
+    bi.core.all_known_contexts()
 }
 
-/// Returns known contexts where the given DID is the registered member.
-///
-/// Returns an empty `Vec` if the bridge has not been initialized.
+/// Returns known contexts (registered against the supplied
+/// [`PyBridgeInstance`]) where the given DID is the registered member.
 #[must_use]
-pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)> {
-    bridge_instance()
-        .map(|bi| bi.core.known_contexts_for_member(member_did))
-        .unwrap_or_default()
+pub fn known_contexts_for_member_on(
+    bi: &PyBridgeInstance,
+    member_did: &str,
+) -> Vec<(String, KnownContext)> {
+    bi.core.known_contexts_for_member(member_did)
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,59 +1659,22 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 // Delegates to the `BridgeInstance`'s `rate_limiters` DashMap.
 // ---------------------------------------------------------------------------
 
-/// Returns a mutable reference to the rate limit tracker for the given
-/// identity DID, creating one if it does not exist.
-///
-/// Delegates to the `BridgeInstance`'s rate-limiter registry. If the bridge
-/// has not been initialized (unusual — identity must be created before
-/// invitation evaluation), falls back to a thread-local default tracker
-/// to preserve the original infallible signature.
-///
-/// The caller passes a closure that receives `&mut RateLimitTracker`.
-pub fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
-where
-    F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
-{
-    if let Ok(bi) = bridge_instance() {
-        bi.core.with_rate_limit_tracker(identity_did, f)
-    } else {
-        // Bridge not initialized — use a temporary tracker. This path
-        // should not be hit in normal operation (identity is always
-        // created before invitation evaluation).
-        tracing::warn!(
-            "with_rate_limit_tracker called before bridge init — using ephemeral tracker"
-        );
-        let mut tracker = scp_core::context::invitation::RateLimitTracker::default();
-        f(&mut tracker)
-    }
-}
+// Phase D (#1695): `with_rate_limit_tracker` default-bridge shim deleted.
+// Callers use `bi.core.with_rate_limit_tracker(...)` directly.
 
 // ---------------------------------------------------------------------------
 // Identity registry (SCP-214: KeyCustody wiring)
 // ---------------------------------------------------------------------------
 
-/// Returns the default bridge instance's identity registry.
+/// Returns the given bridge instance's identity registry.
 ///
 /// The registry is a typed `Arc<DashMap<String, IdentityEntry>>` field on
-/// [`PyBridgeInstance`]. `ensure_bridge_instance()` initializes
-/// `DEFAULT_BRIDGE_INSTANCE` if it is not yet set, so the registry is
-/// always real — there is no fallback empty map that writers could land in
-/// before a reader sees the instance registry (the H1 bug fixed in commit
-/// 10 of #1549 Phase 4 PR 2).
+/// [`PyBridgeInstance`] — always real, no fallback.
 ///
 /// The `DashMap` provides lock-free concurrent access matching the context
 /// registry pattern (ADR-006).
-fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
-    ensure_bridge_instance();
-    // `ensure_bridge_instance()` returns early if the instance is already
-    // set, otherwise it runs `OnceLock::get_or_init` to allocate one. The
-    // only `None` path left is a compiler-level `OnceLock` bug — treat that
-    // as unreachable. A panicking fallback matches the previous behavior
-    // on instance-poisoned paths (e.g. `context_manager()` after shutdown).
-    DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || unreachable!("DEFAULT_BRIDGE_INSTANCE set by ensure_bridge_instance()"),
-        |bi| bi.identity_registry.as_ref(),
-    )
+pub(crate) fn identity_registry(bi: &PyBridgeInstance) -> &DashMap<String, IdentityEntry> {
+    bi.identity_registry.as_ref()
 }
 
 /// Retained identity state for a single DID.
@@ -1911,6 +1700,15 @@ pub struct IdentityEntry {
     pub document: DidDocument,
     /// Identity link attestations (§3.5.1). Stored locally per identity.
     pub identity_link_attestations: Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
+    /// Handle to the per-identity pre-rotation key in cold-storage custody.
+    /// Returned by `DidDht::create` / `migrate_identity` and consumed by
+    /// the next `migrate_identity` call. See ADR-003 §4b.
+    pub pre_rotation_handle: scp_platform::PreRotationKeyHandle,
+    /// Cold-storage custody for the pre-rotation key. A separate substrate
+    /// from operational `key_custody` (spec §9.7.4.1 §3). The same `Arc` is
+    /// preserved across migrations (we don't mint a new custody per
+    /// migration — only a new handle).
+    pub pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
 /// Registers an identity in the global identity registry.
@@ -1921,8 +1719,8 @@ pub struct IdentityEntry {
 /// provider and key handles.
 ///
 /// Overwrites any existing entry for the same DID (idempotent).
-pub fn register_identity(did: &str, entry: IdentityEntry) {
-    identity_registry().insert(did.to_owned(), entry);
+pub fn register_identity(bi: &PyBridgeInstance, did: &str, entry: IdentityEntry) {
+    identity_registry(bi).insert(did.to_owned(), entry);
 }
 
 /// Executes a closure with a reference to an identity's retained state.
@@ -1934,11 +1732,11 @@ pub fn register_identity(did: &str, entry: IdentityEntry) {
 /// # Errors
 ///
 /// Returns `ScpPyError::IdentityError` if the DID is not found.
-pub fn with_identity<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+pub fn with_identity<T, F>(bi: &PyBridgeInstance, did: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&IdentityEntry) -> Result<T, ScpPyError>,
 {
-    let entry = identity_registry().get(did).ok_or_else(|| {
+    let entry = identity_registry(bi).get(did).ok_or_else(|| {
         ScpPyError::identity(format!(
             "identity '{did}' not found in registry \
              -- was it created with py_identity_create?"
@@ -1953,11 +1751,11 @@ where
 /// # Errors
 ///
 /// Returns `ScpPyError::IdentityError` if the DID is not found.
-pub fn with_identity_mut<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+pub fn with_identity_mut<T, F>(bi: &PyBridgeInstance, did: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&mut IdentityEntry) -> Result<T, ScpPyError>,
 {
-    let mut entry = identity_registry().get_mut(did).ok_or_else(|| {
+    let mut entry = identity_registry(bi).get_mut(did).ok_or_else(|| {
         ScpPyError::identity(format!(
             "identity '{did}' not found in registry \
              -- was it created with py_identity_create?"
@@ -1973,80 +1771,41 @@ where
 /// crypto state before returning it. Without registry presence, a loaded
 /// identity would be a dangling handle (SCP-IDENT-1010).
 #[must_use]
-pub fn identity_registry_contains(did: &str) -> bool {
-    identity_registry().contains_key(did)
+pub fn identity_registry_contains(bi: &PyBridgeInstance, did: &str) -> bool {
+    identity_registry(bi).contains_key(did)
 }
 
 /// Removes an identity from the global registry.
 ///
 /// Called when an identity is migrated to a new DID. The old entry is
 /// removed and the new entry is registered under the new DID.
-pub fn remove_identity(did: &str) {
-    identity_registry().remove(did);
+pub fn remove_identity(bi: &PyBridgeInstance, did: &str) {
+    identity_registry(bi).remove(did);
 }
 
 // ---------------------------------------------------------------------------
 // Storage provider registry (SCP-217: identity persistence)
 // ---------------------------------------------------------------------------
 
-/// Initializes the storage provider and stores it in the `BridgeInstance`.
+/// Returns a reference to the storage provider attached to this bridge instance.
 ///
-/// Must be called before any storage-dependent bridge function
-/// (`py_identity_create`, `py_identity_load`). Calling multiple times is
-/// a no-op — the first call wins (`OnceLock` in `BridgeInstance`).
-///
-/// Wraps `InMemoryStorage` in [`EncryptingAdapter`] with a random
-/// AES-256-GCM key generated via `OsRng`. This ensures all stored
-/// values are encrypted at rest, satisfying the `EncryptedStorage` bound.
-///
-/// See spec section 17.3 for key conventions and section 17.4 for
-/// `ProtocolRepository` design.
-///
-/// # Arguments
-///
-/// * `storage_type` — Currently only `"in_memory"` is supported.
+/// Storage is fixed at construction via [`PyBridgeInstance::with_storage_py`]
+/// (driven from Python by `SCP.with_storage({...})`). A `PyBridgeInstance`
+/// constructed via [`PyBridgeInstance::new_py`] has no storage attached —
+/// callers needing persistence must use the factory.
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ValidationError` if the storage type is not
-/// recognized, or `ScpPyError::ContextError` if the bridge has not been
-/// initialized.
-pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
-    match storage_type {
-        "in_memory" => {
-            let bi = bridge_instance()?;
-            // `init_in_memory_storage` returns an error if already set; match
-            // the previous silent-no-op behaviour by converting already-set
-            // to Ok (OnceLock semantics: first wins, subsequent silent).
-            if bi.init_in_memory_storage().is_err() {
-                tracing::debug!(
-                    "init_storage: storage already initialized on default instance — reusing existing provider"
-                );
-            }
-            Ok(())
-        }
-        other => Err(ScpPyError::validation(format!(
-            "unknown storage type: {other:?} — expected \"in_memory\""
-        ))),
-    }
-}
-
-/// Returns a reference to the global storage provider.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::IdentityError` if storage has not been initialized
-/// via [`init_storage`], or `ScpPyError::ContextError` if the bridge has
-/// not been initialized.
-pub fn get_storage() -> Result<&'static StorageProvider, ScpPyError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        ScpPyError::identity(
-            "bridge not initialized — call identity_create before storage operations".to_owned(),
-        )
-    })?;
+/// Returns `ScpPyError::IdentityError` if no storage provider was attached
+/// at construction time. The legacy `init_storage` imperative-attach path
+/// (and the matching Python `SCP.init_storage(...)` shim) was removed in
+/// favour of the `with_storage` factory — see #1543 PR-C.
+pub fn get_storage(bi: &PyBridgeInstance) -> Result<&StorageProvider, ScpPyError> {
     bi.storage_provider().ok_or_else(|| {
         ScpPyError::identity(
-            "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
+            "storage not initialized — construct the SCP instance via \
+             SCP.with_storage({...}) instead of bare SCP()"
+                .to_owned(),
         )
     })
 }
@@ -2066,12 +1825,10 @@ pub fn get_storage() -> Result<&'static StorageProvider, ScpPyError> {
 ///
 /// Returns `ScpPyError::TransportError` if the transport manager lock is
 /// poisoned or the bridge is not initialized.
-pub fn set_transport_manager(manager: scp_transport::TransportManager) -> Result<(), ScpPyError> {
-    let bi = bridge_instance().map_err(|_| {
-        ScpPyError::transport(
-            "bridge not initialized — call identity_create before transport_connect".to_owned(),
-        )
-    })?;
+pub fn set_transport_manager(
+    bi: &PyBridgeInstance,
+    manager: scp_transport::TransportManager,
+) -> Result<(), ScpPyError> {
     bi.core
         .set_transport(Arc::new(manager))
         .map_err(|e| ScpPyError::transport(e.to_string()))
@@ -2086,11 +1843,9 @@ pub fn set_transport_manager(manager: scp_transport::TransportManager) -> Result
 /// Returns `ScpPyError::TransportError` if the lock is poisoned, no
 /// transport manager has been initialized, or the bridge is not initialized.
 pub fn with_transport_manager<T>(
+    bi: &PyBridgeInstance,
     f: impl FnOnce(&scp_transport::TransportManager) -> Result<T, ScpPyError>,
 ) -> Result<T, ScpPyError> {
-    let bi = bridge_instance().map_err(|_| {
-        ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
-    })?;
     bi.core
         .with_transport(f)
         .map_err(|e| ScpPyError::transport(e.to_string()))?
@@ -2105,11 +1860,9 @@ pub fn with_transport_manager<T>(
 /// Returns `ScpPyError::TransportError` if the lock is poisoned, no
 /// transport manager has been initialized, or the bridge is not initialized.
 pub fn with_transport_manager_mut<T>(
+    bi: &PyBridgeInstance,
     f: impl FnOnce(&mut scp_transport::TransportManager) -> Result<T, ScpPyError>,
 ) -> Result<T, ScpPyError> {
-    let bi = bridge_instance().map_err(|_| {
-        ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
-    })?;
     bi.core
         .with_transport_mut(f)
         .map_err(|e| ScpPyError::transport(e.to_string()))?
@@ -2117,8 +1870,8 @@ pub fn with_transport_manager_mut<T>(
 
 /// Returns `true` if a transport manager has been initialized.
 #[must_use]
-pub fn has_transport_manager() -> bool {
-    bridge_instance().is_ok_and(|bi| bi.core.has_transport())
+pub fn has_transport_manager(bi: &PyBridgeInstance) -> bool {
+    bi.core.has_transport()
 }
 
 /// Records a heartbeat suppression event for a relay, downgrading its
@@ -2128,10 +1881,7 @@ pub fn has_transport_manager() -> bool {
 /// `transport_connect` that drains the per-adapter suppression receiver
 /// (#1533 AC5). Silently no-ops if the bridge or transport manager has
 /// been cleared (e.g., after disconnect).
-pub fn record_suppression(relay_url: &str) {
-    let Ok(bi) = bridge_instance() else {
-        return;
-    };
+pub fn record_suppression(bi: &PyBridgeInstance, relay_url: &str) {
     let _ = bi.core.with_transport(|manager| {
         manager.update_score(relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
         Ok::<(), ScpPyError>(())
@@ -2147,12 +1897,7 @@ pub fn record_suppression(relay_url: &str) {
 ///
 /// Returns `ScpPyError::TransportError` if the transport manager lock is
 /// poisoned or the bridge is not initialized.
-pub fn clear_transport_manager() -> Result<(), ScpPyError> {
-    let bi = bridge_instance().map_err(|_| {
-        ScpPyError::transport(
-            "bridge not initialized — call identity_create before transport_disconnect".to_owned(),
-        )
-    })?;
+pub fn clear_transport_manager(bi: &PyBridgeInstance) -> Result<(), ScpPyError> {
     bi.core
         .clear_transport()
         .map_err(|e| ScpPyError::transport(e.to_string()))
@@ -2174,6 +1919,7 @@ pub fn clear_transport_manager() -> Result<(), ScpPyError> {
 ///
 /// Returns `ScpPyError::ContextError` if registration fails.
 pub fn register_context(
+    bi: &PyBridgeInstance,
     context_id: &str,
     creator_did: &str,
     user_ceiling: &[String],
@@ -2185,12 +1931,12 @@ pub fn register_context(
     // context is valid locally even without relay publication, #501).
     // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1324).
     #[cfg(test)]
-    init_supervisor_for_test();
+    init_context_manager_for_test(bi);
     #[cfg(not(test))]
-    init_supervisor(creator_did);
+    init_context_manager(bi, creator_did);
 
     // Register FFI-specific state.
-    register_ffi_state(context_id, creator_did, user_ceiling)
+    register_ffi_state(bi, context_id, creator_did, user_ceiling)
 }
 
 /// Backward-compatible alias for [`with_ffi_state`].
@@ -2203,16 +1949,16 @@ pub fn register_context(
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found, or
 /// propagates any error returned by the closure `f`.
-pub fn with_context<T, F>(context_id: &str, f: F) -> Result<T, ScpPyError>
+pub fn with_context<T, F>(bi: &PyBridgeInstance, context_id: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&mut FfiBridgeState) -> Result<T, ScpPyError>,
 {
-    with_ffi_state(context_id, f)
+    with_ffi_state(bi, context_id, f)
 }
 
 /// Backward-compatible alias for [`remove_ffi_state`].
-pub fn remove_context(context_id: &str) {
-    remove_ffi_state(context_id);
+pub fn remove_context(bi: &PyBridgeInstance, context_id: &str) {
+    remove_ffi_state(bi, context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -2243,15 +1989,12 @@ pub struct RegistryStats {
 /// state). Known contexts and transport status are read from the
 /// `BridgeInstance` (returns 0/false if the bridge is not initialized).
 #[must_use]
-pub fn registry_stats() -> RegistryStats {
-    let (known_count, relay_connected) = bridge_instance().map_or((0, false), |bi| {
-        (bi.core.known_context_count(), bi.core.has_transport())
-    });
+pub fn registry_stats(bi: &PyBridgeInstance) -> RegistryStats {
     RegistryStats {
-        contexts: ffi_state_registry().len(),
-        known_contexts: known_count,
-        identities: identity_registry().len(),
-        relay_connected,
+        contexts: ffi_state_registry(bi).len(),
+        known_contexts: bi.core.known_context_count(),
+        identities: identity_registry(bi).len(),
+        relay_connected: bi.core.has_transport(),
     }
 }
 
@@ -2272,8 +2015,8 @@ pub fn registry_stats() -> RegistryStats {
 ///
 /// Returns `(0, 0)` if the context is not registered.
 #[must_use]
-pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
-    let map = ffi_state_registry();
+pub fn query_trust_event_counts(bi: &PyBridgeInstance, context_id: &str, _did: &str) -> (u64, u64) {
+    let map = ffi_state_registry(bi);
     match map.get(context_id) {
         Some(entry) => {
             let total = entry.event_log.leaves().len() as u64;
@@ -2294,12 +2037,16 @@ pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
 /// Provided as a cleanup mechanism for long-running processes alongside
 /// [`remove_identity`] which is unconditional.
 #[must_use]
-pub fn remove_identity_if_present(did: &str) -> bool {
-    identity_registry().remove(did).is_some()
+pub fn remove_identity_if_present(bi: &PyBridgeInstance, did: &str) -> bool {
+    identity_registry(bi).remove(did).is_some()
 }
 
-// Economy state is now owned by BridgeInstance. Callers access it via
-// `bridge_instance()?.with_economy_budget(...)` etc. directly.
+// Economy state is owned by `PyBridgeInstance`. Callers thread a
+// `&PyBridgeInstance` through from the enclosing `PyScp` method and
+// access it via `bi.with_economy_budget(...)` / `bi.economy_*(...)`
+// directly. The `bridge_instance()` default-lookup helper was deleted
+// in Phase D (#1549 PR 4) along with the rest of the process-wide
+// default-instance scaffolding.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -2332,12 +2079,14 @@ mod tests {
 
     #[test]
     fn registry_stats_reflects_context_registration() {
-        init_supervisor_for_test();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("stats-ctx");
         let creator = "did:dht:z6MkStatsTest";
 
-        register_context(&ctx_id, creator, &[]).unwrap();
-        let stats = registry_stats();
+        register_context(bi, &ctx_id, creator, &[]).unwrap();
+        let stats = registry_stats(bi);
 
         // Verify that stats reports at least 1 context (our registered one).
         // Cannot assert exact counts due to parallel test interference.
@@ -2349,13 +2098,13 @@ mod tests {
 
         // Verify the specific entry exists via direct registry access.
         assert!(
-            ffi_state_registry().contains_key(&ctx_id),
+            ffi_state_registry(bi).contains_key(&ctx_id),
             "registered context should be in registry"
         );
 
-        remove_context(&ctx_id);
+        remove_context(bi, &ctx_id);
         assert!(
-            !ffi_state_registry().contains_key(&ctx_id),
+            !ffi_state_registry(bi).contains_key(&ctx_id),
             "removed context should not be in registry"
         );
     }
@@ -2363,7 +2112,9 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn registry_stats_reflects_identity_registration() {
-        init_supervisor_for_test();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
         let did = "did:dht:z6MkStatsIdentityUnique9988";
 
         let entry = IdentityEntry {
@@ -2379,9 +2130,11 @@ mod tests {
             )),
             document: test_did_document(did),
             identity_link_attestations: Vec::new(),
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            pre_rotation_custody: Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
         };
-        register_identity(did, entry);
-        let stats = registry_stats();
+        register_identity(bi, did, entry);
+        let stats = registry_stats(bi);
 
         assert!(
             stats.identities >= 1,
@@ -2389,13 +2142,13 @@ mod tests {
             stats.identities,
         );
         assert!(
-            identity_registry().contains_key(did),
+            identity_registry(bi).contains_key(did),
             "registered identity should be in registry"
         );
 
-        remove_identity(did);
+        remove_identity(bi, did);
         assert!(
-            !identity_registry().contains_key(did),
+            !identity_registry(bi).contains_key(did),
             "removed identity should not be in registry"
         );
     }
@@ -2403,8 +2156,9 @@ mod tests {
     #[test]
     fn registry_stats_reflects_known_context_registration() {
         // Ensure bridge is initialized so known_contexts DashMap exists.
-        init_supervisor_for_test();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
 
         let ctx_id = unique_ctx_id("stats-known");
         let known = KnownContext {
@@ -2414,8 +2168,8 @@ mod tests {
             last_seen: 0,
         };
 
-        register_known_context(&ctx_id, known);
-        let stats = registry_stats();
+        register_known_context_on(bi, &ctx_id, known);
+        let stats = registry_stats(bi);
 
         assert!(
             stats.known_contexts >= 1,
@@ -2429,8 +2183,8 @@ mod tests {
 
         // remove_ffi_state clears both registries (FFI state + known contexts).
         // Register FFI state first so remove_ffi_state has something to remove.
-        let _ = register_ffi_state(&ctx_id, "did:dht:z6MkStatsKnown", &[]);
-        remove_ffi_state(&ctx_id);
+        let _ = register_ffi_state(bi, &ctx_id, "did:dht:z6MkStatsKnown", &[]);
+        remove_ffi_state(bi, &ctx_id);
         assert!(
             !bi.core.has_known_context(&ctx_id),
             "removed known context should not be in BridgeInstance"
@@ -2440,7 +2194,9 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn remove_identity_if_present_returns_true_when_found() {
-        init_supervisor_for_test();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
         let did = "did:dht:z6MkRemoveIfPresent";
         let entry = IdentityEntry {
             identity: ScpIdentity {
@@ -2455,22 +2211,31 @@ mod tests {
             )),
             document: test_did_document(did),
             identity_link_attestations: Vec::new(),
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            pre_rotation_custody: Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
         };
-        register_identity(did, entry);
-        assert!(remove_identity_if_present(did));
+        register_identity(bi, did, entry);
+        assert!(remove_identity_if_present(bi, did));
     }
 
     #[test]
     fn remove_identity_if_present_returns_false_when_not_found() {
-        init_supervisor_for_test();
-        assert!(!remove_identity_if_present("did:dht:z6MkNotPresent9999"));
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        assert!(!remove_identity_if_present(
+            bi,
+            "did:dht:z6MkNotPresent9999"
+        ));
     }
 
     #[test]
     fn registry_stats_returns_all_fields() {
-        init_supervisor_for_test();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
         // Verifies the struct shape and that registry_stats() doesn't panic.
-        let stats = registry_stats();
+        let stats = registry_stats(bi);
         // Destructure to catch struct changes at compile time. If a field is
         // added or removed, this will fail to compile.
         let RegistryStats {
@@ -2487,30 +2252,38 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_initializes_once() {
-        init_supervisor_for_test();
-        let sup1 = supervisor().unwrap();
-        init_supervisor_for_test();
-        let sup2 = supervisor().unwrap();
+    fn context_manager_initializes_once() {
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let sup1 = supervisor(bi).unwrap();
+        init_context_manager_for_test(bi);
+        let sup2 = supervisor(bi).unwrap();
         // Same Arc (same pointer).
         assert!(Arc::ptr_eq(sup1, sup2));
     }
 
     #[test]
     fn with_ffi_state_finds_registered_context() {
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("ffi-find");
         let creator = "did:dht:z6MkFfiFind";
-        register_context(&ctx_id, creator, &[]).unwrap();
+        register_context(bi, &ctx_id, creator, &[]).unwrap();
 
-        let creator_did = with_ffi_state(&ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
+        let creator_did = with_ffi_state(bi, &ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
         assert_eq!(creator_did, creator);
 
-        remove_context(&ctx_id);
+        remove_context(bi, &ctx_id);
     }
 
     #[test]
     fn with_ffi_state_errors_on_missing_context() {
-        let result = with_ffi_state("nonexistent-ctx-id", |_| Ok(()));
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let result = with_ffi_state(bi, "nonexistent-ctx-id", |_| Ok(()));
         assert!(result.is_err());
     }
 
@@ -2522,6 +2295,9 @@ mod tests {
     /// raw string.
     #[test]
     fn user_ceiling_strings_converted_to_ucan_format() {
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("ceiling-conv");
         let creator = "did:dht:z6MkCeilingConv";
 
@@ -2532,9 +2308,9 @@ mod tests {
             "tool:invoke:calculator".to_owned(),
         ];
 
-        register_context(&ctx_id, creator, &user_ceiling).unwrap();
+        register_context(bi, &ctx_id, creator, &user_ceiling).unwrap();
 
-        let ceiling = with_ffi_state(&ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
         // Compound resources must have underscores joining their segments.
         assert!(
@@ -2564,19 +2340,22 @@ mod tests {
             "raw 'context:child:create' should not be in ceiling: {ceiling:?}"
         );
 
-        remove_context(&ctx_id);
+        remove_context(bi, &ctx_id);
     }
 
     /// When no user ceiling is provided (empty slice), the default ceiling
     /// should be used with proper UCAN underscore format.
     #[test]
     fn empty_user_ceiling_uses_default_in_ucan_format() {
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("ceiling-default");
         let creator = "did:dht:z6MkCeilingDefault";
 
-        register_context(&ctx_id, creator, &[]).unwrap();
+        register_context(bi, &ctx_id, creator, &[]).unwrap();
 
-        let ceiling = with_ffi_state(&ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
         // Default ceiling must include tool_invoke:* (not tool:invoke:*).
         assert!(
@@ -2588,7 +2367,7 @@ mod tests {
             "default ceiling should not contain raw 'tool:invoke:*': {ceiling:?}"
         );
 
-        remove_context(&ctx_id);
+        remove_context(bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2596,29 +2375,28 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn bridge_instance_populated_by_init_supervisor() {
-        // init_supervisor_for_test populates DEFAULT_BRIDGE_INSTANCE which
-        // owns the per-instance Supervisor. Since OnceLock is process-global,
-        // the first call in any test wins — subsequent calls are no-ops. We
-        // rely on this being called (possibly by other tests) before
-        // asserting.
-        init_supervisor_for_test();
+    fn bridge_instance_populated_by_init_context_manager() {
+        // init_context_manager_for_test populates the per-instance
+        // ContextManager. Phase D (#1695) removed the global default.
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
 
-        let sup = supervisor().expect("supervisor should be initialized");
-        let bi = bridge_instance().expect("bridge_instance should be initialized");
+        let sup = supervisor(bi).expect("supervisor should be initialized");
 
-        // Both should point to the same Supervisor allocation.
+        // Both should point to the same ContextManager allocation.
         assert!(
             Arc::ptr_eq(sup, bi.core.try_supervisor().unwrap()),
-            "bridge_instance().try_supervisor() must be the same Arc as supervisor()"
+            "context_manager() must return the per-instance ContextManager Arc"
         );
     }
 
     #[test]
     fn bridge_instance_not_shutdown_initially() {
-        init_supervisor_for_test();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
 
-        let bi = bridge_instance().expect("bridge_instance should be initialized");
         assert!(
             !bi.core.is_shutdown(),
             "bridge_instance should not be shutdown immediately after init"
@@ -2676,7 +2454,8 @@ mod tests {
         // Verify that the typed identity_registry field is wired correctly:
         // inserting an entry through the field is observable via the same
         // Arc<DashMap> from both sides.
-        let bi = PyBridgeInstance::new_py();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         assert!(bi.identity_registry().is_empty());
         bi.identity_registry().insert(
             "did:dht:z6MkTest".to_owned(),
@@ -2701,6 +2480,10 @@ mod tests {
                     service: vec![],
                 },
                 identity_link_attestations: Vec::new(),
+                pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                pre_rotation_custody: Arc::new(
+                    scp_platform::testing::InMemoryPreRotationCustody::new(),
+                ),
             },
         );
         assert_eq!(bi.identity_registry().len(), 1);
@@ -2725,82 +2508,167 @@ mod tests {
         assert!(a.core.check_handle(a.core.instance_id()).is_ok());
     }
 
-    #[test]
-    fn test_default_instance_is_same_arc() {
-        // Two calls to default_bridge_instance() must return the same Arc.
-        let a = default_bridge_instance().expect("default instance");
-        let b = default_bridge_instance().expect("default instance");
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "default_bridge_instance must return the same Arc on repeated calls"
-        );
-    }
+    // Phase D (#1695): `test_default_instance_is_same_arc` deleted — there
+    // is no process-global default instance to assert identity against.
 
     #[test]
     fn test_py_bridge_instance_with_storage_py_initializes_storage() {
         let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
-            .expect("in-memory storage construction is infallible");
+            .expect("in-memory storage must always succeed");
         assert!(
             bi.storage_provider().is_some(),
             "with_storage_py(InMemory) must initialize the storage provider"
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Per-instance ContextManager attachment (bug-catcher follow-up, #1549)
+    // -----------------------------------------------------------------------
+    //
+    // Regression: `init_context_manager*` previously always attached to the
+    // default `DEFAULT_BRIDGE_INSTANCE`, ignoring the `bi` passed by newer
+    // `PyScp::method` call paths. That meant a non-default `PyScp` instance
+    // would appear to "work" while secretly wiring its `ContextManager` onto
+    // the default bridge — breaking multi-instance isolation entirely.
+
+    /// `init_context_manager_for_test(bi)` must attach the `ContextManager`
+    /// to `bi.core` (not the default bridge instance).
     #[test]
-    fn derive_mls_storage_errors_when_storage_unset() {
-        // Storage-before-supervisor precondition (spec §17.6): an instance with
-        // no storage provider set must NOT yield an mls_storage adapter — it
-        // must error rather than fabricate a default.
-        let bi = PyBridgeInstance::new_py();
+    fn init_context_manager_for_test_respects_explicit_bi() {
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         assert!(
-            bi.storage_provider().is_none(),
-            "fresh new_py() instance must have no storage provider"
+            !bi.core.has_supervisor(),
+            "fresh PyBridgeInstance must not have a ContextManager attached"
         );
-        let result = derive_mls_storage(&bi);
+        init_context_manager_for_test(bi);
         assert!(
-            result.is_err(),
-            "derive_mls_storage must fail closed when storage is unset"
-        );
-        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(
-            msg.contains("storage-before-supervisor"),
-            "precondition error must name the storage-before-supervisor invariant, got: {msg}"
+            bi.core.has_supervisor(),
+            "init_context_manager_for_test(bi) must attach a ContextManager to bi.core"
         );
     }
 
+    /// Each freshly constructed `PyBridgeInstance` must be able to attach
+    /// its own `ContextManager` in isolation, with no dependency on any
+    /// other bridge instance.
+    ///
+    /// Before the fix, `init_context_manager_for_test()` silently targeted
+    /// the since-deleted process-wide `DEFAULT_BRIDGE_INSTANCE`, so the
+    /// explicit `bi` passed into it appeared unaffected. Phase D (#1695)
+    /// deleted that default bridge and this test now verifies that two
+    /// independent instances get independent managers.
     #[test]
-    fn build_supervisor_fails_closed_without_storage() {
-        // The supervisor construction surface refuses to build without a
-        // caller-supplied backend; the runtime never defaults storage.
-        let bi = PyBridgeInstance::new_py();
-        let result = build_supervisor(
-            &bi,
-            Arc::new(MlsCryptoProvider::new("did:test:no-storage".to_owned())),
-            Box::new(scp_core::context::LocalTransportProvider),
-            Box::new(NoOpEventLogProvider),
-            None,
-        );
+    fn non_default_bi_gets_its_own_context_manager() {
+        let bi_a = PyBridgeInstance::new_py();
+        let bi_b = PyBridgeInstance::new_py();
+        init_context_manager_for_test(&bi_a);
+        init_context_manager_for_test(&bi_b);
+        assert!(bi_a.core.has_supervisor());
+        assert!(bi_b.core.has_supervisor());
+        // Each instance holds a distinct Arc<ContextManager>.
+        let cm_a = bi_a.core.try_supervisor().unwrap();
+        let cm_b = bi_b.core.try_supervisor().unwrap();
         assert!(
-            result.is_err(),
-            "build_supervisor must fail closed when no storage provider is set"
+            !Arc::ptr_eq(cm_a, cm_b),
+            "distinct PyBridgeInstances must hold distinct ContextManager Arcs"
         );
     }
 
+    /// `register_context(bi_b, ...)` must attach `bi_b`'s own `ContextManager`.
+    ///
+    /// Post-Phase D (#1695) there is no default bridge instance; this test
+    /// still verifies that two independent instances get independent managers.
     #[test]
-    fn build_supervisor_succeeds_with_in_memory_storage() {
-        // Explicit in-memory selection (dev opt-in) satisfies the precondition.
-        let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
-            .expect("in-memory storage construction is infallible");
-        let result = build_supervisor(
-            &bi,
-            Arc::new(MlsCryptoProvider::new("did:test:in-memory".to_owned())),
-            Box::new(scp_core::context::LocalTransportProvider),
-            Box::new(NoOpEventLogProvider),
-            None,
-        );
+    fn register_context_on_non_default_bi_attaches_cm_to_bi() {
+        let first = PyBridgeInstance::new_py();
+        init_context_manager_for_test(&first);
+        let first_manager = Arc::clone(first.core.try_supervisor().unwrap());
+
+        let second = PyBridgeInstance::new_py();
         assert!(
-            result.is_ok(),
-            "build_supervisor must succeed once in-memory storage is selected"
+            !second.core.has_supervisor(),
+            "fresh bi must not inherit a ContextManager from another instance"
+        );
+
+        let ctx_id = unique_ctx_id("per-instance-cm");
+        let creator = "did:dht:z6MkPerInstanceCm";
+        register_context(&second, &ctx_id, creator, &[]).unwrap();
+
+        assert!(
+            second.core.has_supervisor(),
+            "register_context(second, ...) must attach a ContextManager to it"
+        );
+        let second_manager = second.core.try_supervisor().unwrap();
+        assert!(
+            !Arc::ptr_eq(&first_manager, second_manager),
+            "second bi must hold a distinct ContextManager — not the first's"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-instance known-context registry (bug-catcher follow-up, #1549)
+    // -----------------------------------------------------------------------
+    //
+    // Regression: `known_contexts_for_member`/`register_known_context` used
+    // `bridge_instance()` internally, so discovery routed through the default
+    // bridge even when called from a non-default `PyScp::load_contexts`.
+
+    /// `register_known_context_on(bi_b, ...)` must persist into `bi_b`'s
+    /// registry and be visible via `known_contexts_for_member_on(bi_b, ...)`.
+    #[test]
+    fn known_contexts_are_per_instance() {
+        let bi_a = PyBridgeInstance::new_py();
+        let bi_b = PyBridgeInstance::new_py();
+        let member = "did:dht:z6MkPerInstanceKnown";
+        let ctx_id = unique_ctx_id("known-per-instance");
+
+        let known = KnownContext {
+            routing_id: [0x11; 32],
+            relay_url: Some("ws://127.0.0.1:9000/scp/v1".to_owned()),
+            member_did: member.to_owned(),
+            last_seen: 1_700_000_000,
+        };
+
+        // Register against bi_b only.
+        register_known_context_on(&bi_b, &ctx_id, known);
+
+        let found_b = known_contexts_for_member_on(&bi_b, member);
+        assert!(
+            found_b.iter().any(|(id, _)| id == &ctx_id),
+            "bi_b must see its own registered known context"
+        );
+
+        // bi_a must NOT see bi_b's registration. Before the fix,
+        // known_contexts_for_member routed through the default bridge, which
+        // would have surfaced bi_b's entry on the default path.
+        let found_a = known_contexts_for_member_on(&bi_a, member);
+        assert!(
+            !found_a.iter().any(|(id, _)| id == &ctx_id),
+            "bi_a must NOT see known contexts registered against bi_b"
+        );
+    }
+
+    /// `all_known_contexts_on(bi)` is per-instance.
+    #[test]
+    fn all_known_contexts_is_per_instance() {
+        let bi_a = PyBridgeInstance::new_py();
+        let bi_b = PyBridgeInstance::new_py();
+        let ctx_id = unique_ctx_id("all-known-per-instance");
+        let known = KnownContext {
+            routing_id: [0x22; 32],
+            relay_url: None,
+            member_did: "did:dht:z6MkAllKnownPerInstance".to_owned(),
+            last_seen: 0,
+        };
+
+        register_known_context_on(&bi_a, &ctx_id, known);
+
+        let list_a = all_known_contexts_on(&bi_a);
+        let list_b = all_known_contexts_on(&bi_b);
+        assert!(list_a.iter().any(|(id, _)| id == &ctx_id));
+        assert!(
+            !list_b.iter().any(|(id, _)| id == &ctx_id),
+            "bi_b must not see bi_a's known contexts"
         );
     }
 }
