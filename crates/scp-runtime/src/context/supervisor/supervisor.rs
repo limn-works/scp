@@ -2305,12 +2305,22 @@ impl Supervisor {
     /// bodies onto `&mut self.state` + `&self.deps` is 12b.2b's
     /// atomic transition across all nine handler submodules.
     ///
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CreationFailed`] if an actor is already
+    /// registered for this context id. The legacy bootstrap insert
+    /// (`manager_methods::insert_context`) rejected a duplicate id with
+    /// `CreationFailed`; this restores that first-writer-wins guarantee
+    /// for the owned-state spawn path (create / restore / import). The
+    /// import replace path despawns the prior actor before respawning,
+    /// so the slot is vacant by the time it reaches here.
     pub(in crate::context) async fn spawn_actor_with_state(
         &self,
         state: crate::context::actor::state::PerContextState,
         deps: crate::context::actor::deps::ActorDeps,
         mailbox_capacity: Option<usize>,
-    ) -> ContextActorHandle {
+    ) -> Result<ContextActorHandle, ContextError> {
         let capacity = mailbox_capacity.unwrap_or(ACTOR_MAILBOX_CAPACITY);
         let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(capacity);
 
@@ -2322,9 +2332,17 @@ impl Supervisor {
 
         let handle = ContextActorHandle::from_sender(tx);
         {
-            // Write-path mutation: register the handle under the
-            // write lock — same contract as [`Self::spawn_actor`].
+            // Write-path mutation: register the handle under the write
+            // lock — same contract as [`Self::spawn_actor`]. Reject a
+            // duplicate registration (first-writer-wins) instead of
+            // silently overwriting a live actor: the overwrite would
+            // leak the loser's spawned task and diverge crypto state.
             let _guard = self.write_lock.lock().await;
+            if self.actors.contains_key(&ctx_id_str) {
+                return Err(ContextError::CreationFailed(format!(
+                    "context '{ctx_id_str}' is already registered"
+                )));
+            }
             self.actors.insert(ctx_id_str.clone(), handle.clone());
         }
 
@@ -2334,75 +2352,6 @@ impl Supervisor {
         let inbox = rx;
         tokio::spawn(async move {
             Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox).run()).await;
-        });
-
-        handle
-    }
-
-    /// Spawn a `ContextActor` that proxies its state through the legacy
-    /// [`Self::contexts`] DashMap entry for `context_id` (ADR-049
-    /// Phase 2A finalization bootstrap dual-write).
-    ///
-    /// Looks up the `Arc<tokio::sync::Mutex<PerContextState>>` already
-    /// registered by [`crate::context::manager_methods::insert_context`]
-    /// / [`crate::context::supervisor::handle::SupervisorHandle::replace_context`],
-    /// hands it to
-    /// [`crate::context::actor::ContextActor::new_dashmap_backed`], and
-    /// registers the resulting [`ContextActorHandle`] in
-    /// [`Self::actors`] under [`Self::write_lock`] so the registration
-    /// is atomic with respect to other spawn / despawn writers.
-    ///
-    /// During the dual-write window the actor does NOT own a fresh
-    /// `PerContextState` payload: the per-context state lives once, in
-    /// the DashMap, and the actor proxies every command through that
-    /// `Arc<Mutex<...>>`. Subsequent finalization sessions delete the
-    /// DashMap entirely; at that point the bootstrap path switches to
-    /// [`Self::spawn_actor_with_state`] (owned state).
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ContextNotRegistered`] if no DashMap entry
-    ///   exists for `context_id` — the bootstrap caller must have
-    ///   completed the legacy insert / replace before invoking this
-    ///   method.
-    ///
-    /// # Visibility
-    ///
-    /// `pub(in crate::context)` — only the lifecycle bootstrap in
-    /// [`crate::context::lifecycle_helpers`] reaches this, via the
-    /// capability-reduced
-    /// [`crate::context::supervisor::handle::SupervisorHandle::spawn_actor_for_context`]
-    /// wrapper.
-    #[allow(dead_code)] // first production caller lands with the bootstrap wiring in this PR
-    pub(in crate::context) async fn spawn_actor_dashmap_backed(
-        &self,
-        context_id: String,
-        deps: crate::context::actor::deps::ActorDeps,
-        mailbox_capacity: Option<usize>,
-    ) -> Result<ContextActorHandle, ContextError> {
-        // Resolve the per-context state Arc through the existing
-        // manager-methods lookup — that path returns the same error
-        // surface (`ContextNotRegistered`) callers already handle.
-        let state_arc = crate::context::manager_methods::get_context_arc(self, &context_id)?;
-
-        let capacity = mailbox_capacity.unwrap_or(ACTOR_MAILBOX_CAPACITY);
-        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(capacity);
-
-        let handle = ContextActorHandle::from_sender(tx);
-        {
-            let _guard = self.write_lock.lock().await;
-            self.actors.insert(context_id.clone(), handle.clone());
-        }
-
-        let inbox = rx;
-        tokio::spawn(async move {
-            Box::pin(
-                crate::context::actor::ContextActor::new_dashmap_backed(
-                    context_id, deps, state_arc, inbox,
-                )
-                .run(),
-            )
-            .await;
         });
 
         Ok(handle)
@@ -5122,7 +5071,8 @@ mod tests {
 
         let handle = supervisor_arc
             .spawn_actor_with_state(state, deps, None)
-            .await;
+            .await
+            .expect("spawn_actor_with_state: fresh context id registers");
         // Handle is registered under the hex-encoded context id key.
         assert!(
             supervisor_arc.lookup(&expected_ctx_key).is_some(),
@@ -5181,7 +5131,8 @@ mod tests {
 
         let actor_handle = supervisor_arc
             .spawn_actor_with_state(state, deps, None)
-            .await;
+            .await
+            .expect("spawn_actor_with_state: fresh context id registers");
         assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
         // Install a short TTL timer through the capability-reduced
@@ -5248,7 +5199,8 @@ mod tests {
 
         let actor_handle = supervisor_arc
             .spawn_actor_with_state(state, deps, None)
-            .await;
+            .await
+            .expect("spawn_actor_with_state: fresh context id registers");
         assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
         // Dispatch StartTimeoutTask and observe the install reply.
@@ -5264,11 +5216,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_actor_with_state_overwrites_existing_handle() {
-        // Same contract as the skeleton `spawn_actor`: a second spawn
-        // with the same context_id overwrites. The watchdog / panic-
-        // recovery path (commit 11) polices duplicate spawns; this
-        // method stays minimal.
+    async fn spawn_actor_with_state_rejects_duplicate_context_id() {
+        // First-writer-wins: a second spawn with the same context_id is
+        // REJECTED with CreationFailed rather than silently overwriting a
+        // live actor (which would leak the loser's task and diverge
+        // crypto state). This restores the duplicate-rejection the legacy
+        // `manager_methods::insert_context` provided. The import replace
+        // path despawns the prior actor first, so it never trips this.
         let supervisor_arc = supervisor_with_providers();
 
         let ctx_id_bytes = [0xCDu8; 32];
@@ -5282,7 +5236,8 @@ mod tests {
         let deps1 = test_actor_deps(&supervisor_arc).await;
         let h1 = supervisor_arc
             .spawn_actor_with_state(state1, deps1, None)
-            .await;
+            .await
+            .expect("first spawn of a fresh context id registers");
         assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
         let state2 = crate::context::actor::state::PerContextState::new_for_test_encrypted(
@@ -5291,73 +5246,137 @@ mod tests {
             DID("did:example:admin".to_owned()),
         );
         let deps2 = test_actor_deps(&supervisor_arc).await;
-        let h2 = supervisor_arc
+        // `ContextActorHandle` is not `Debug`, so pattern-match on the
+        // `Result` rather than calling `expect_err` (which needs `Debug`
+        // on the `Ok` variant).
+        match supervisor_arc
             .spawn_actor_with_state(state2, deps2, None)
-            .await;
+            .await
+        {
+            Err(ContextError::CreationFailed(_)) => {}
+            Err(other) => panic!("duplicate spawn must fail with CreationFailed, got {other:?}"),
+            Ok(_) => panic!("duplicate spawn must be rejected, got Ok"),
+        }
+        // The original actor is still the registered one.
         assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
-        // Shut down both to avoid leaked tasks.
+        // Shut down the survivor to avoid a leaked task.
         let _ = h1.send_shutdown().await;
-        let _ = h2.send_shutdown().await;
     }
 
-    // -----------------------------------------------------------------
-    // ADR-049 Phase 2A finalization — `spawn_actor_dashmap_backed` tests
-    // -----------------------------------------------------------------
+    /// Security invariant (import): `PrepareForReplace` MUST reject a
+    /// LIVE (Active) context — an import may never overwrite a live
+    /// context. The actor stays alive after the reject so the still-live
+    /// context keeps being served (no terminal break on reject).
+    #[tokio::test]
+    async fn prepare_for_replace_rejects_live_context() {
+        use crate::context::actor::commands::LifecycleControlCommand;
 
-    /// Insert a per-context entry through the legacy manager-methods
-    /// path so `spawn_actor_dashmap_backed` has something to look up.
-    /// Returns the supervisor's stringified context-id key.
-    fn seed_dashmap_context(supervisor: &Arc<Supervisor>, ctx_id_bytes: [u8; 32]) -> String {
+        let supervisor_arc = supervisor_with_providers();
+        let deps = test_actor_deps(&supervisor_arc).await;
+        let ctx_id_bytes = [0x9Eu8; 32];
         let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
             1_700_000_000,
             DID("did:example:admin".to_owned()),
         );
-        // `insert_context` produces the canonical String key by taking
-        // the caller's argument verbatim; we mirror that here.
-        let key = hex::encode(ctx_id_bytes);
-        crate::context::manager_methods::insert_context(supervisor, key.clone(), state)
-            .expect("seed insert must succeed");
-        key
-    }
-
-    #[tokio::test]
-    async fn spawn_actor_dashmap_backed_registers_handle_for_inserted_context() {
-        let supervisor_arc = supervisor_with_providers();
-        let ctx_id_bytes = [0x5Au8; 32];
-        let key = seed_dashmap_context(&supervisor_arc, ctx_id_bytes);
-
-        let deps = test_actor_deps(&supervisor_arc).await;
-        let handle = supervisor_arc
-            .spawn_actor_dashmap_backed(key.clone(), deps, None)
+        // Drive the context's handle to Active — a live, non-replaceable
+        // context.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
             .await
-            .expect("dashmap-backed spawn must succeed for an inserted context");
+            .unwrap();
+        let handle = supervisor_arc
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers the live context");
 
+        let result: Result<(), ContextError> = handle
+            .send(|reply| {
+                ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
+                    mls_state: Vec::new(),
+                    reply,
+                })
+            })
+            .await;
         assert!(
-            supervisor_arc.lookup(&key).is_some(),
-            "actor registry must contain a handle for the dashmap-backed actor"
+            matches!(result, Err(ContextError::MembershipFailed(_))),
+            "import must REJECT overwriting a live context, got {result:?}"
+        );
+
+        // The actor must still be alive after the reject — prove it by
+        // issuing a follow-up command and observing a reply (not an
+        // ActorBusy/closed-inbox error).
+        let followup: Result<(), ContextError> = handle
+            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+            .await;
+        assert!(
+            !matches!(followup, Err(ContextError::ActorBusy(_))),
+            "live context's actor must survive a rejected PrepareForReplace, got {followup:?}"
         );
 
         let _ = handle.send_shutdown().await;
     }
 
+    /// `PrepareForReplace` SUCCEEDS for a replaceable (Closing/Closed)
+    /// context: it runs the §23.17 crypto teardown + epoch-floor merge,
+    /// claims itself terminal, and the actor exits its run loop.
     #[tokio::test]
-    async fn spawn_actor_dashmap_backed_rejects_unknown_context() {
+    async fn prepare_for_replace_succeeds_for_replaceable_context() {
+        use crate::context::actor::commands::LifecycleControlCommand;
+
         let supervisor_arc = supervisor_with_providers();
         let deps = test_actor_deps(&supervisor_arc).await;
+        let ctx_id_bytes = [0x8Du8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        // Drive the handle Active → Closing — a replaceable state.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .await
+            .unwrap();
+        let handle = supervisor_arc
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers the replaceable context");
 
-        // `ContextActorHandle` does not implement `Debug`, so we
-        // pattern-match on the `Result` rather than calling
-        // `expect_err` (which requires `Debug` on the `Ok` variant).
-        let result = supervisor_arc
-            .spawn_actor_dashmap_backed("ctx-does-not-exist".to_owned(), deps, None)
+        let result: Result<(), ContextError> = handle
+            .send(|reply| {
+                ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
+                    mls_state: Vec::new(),
+                    reply,
+                })
+            })
             .await;
-        match result {
-            Err(ContextError::ContextNotRegistered(ref s)) if s == "ctx-does-not-exist" => {}
-            Err(other) => panic!("expected ContextNotRegistered, got {other:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+        assert!(
+            result.is_ok(),
+            "PrepareForReplace must succeed for a replaceable (Closing) context, got {result:?}"
+        );
+
+        // The actor claimed itself terminal and exits — a follow-up send
+        // must observe the closed inbox. (The supervisor despawns the
+        // dead handle in the import path; here we just prove termination.)
+        let followup: Result<(), ContextError> = handle
+            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+            .await;
+        assert!(
+            matches!(followup, Err(ContextError::ActorBusy(_))),
+            "actor must have exited after a successful PrepareForReplace, got {followup:?}"
+        );
+
+        // Handle is still registered until the import path despawns it.
+        assert!(supervisor_arc.lookup(&ctx_key).is_some());
     }
 
     // -----------------------------------------------------------------
@@ -5587,7 +5606,8 @@ mod tests {
 
         let handle = supervisor_arc
             .spawn_actor_with_state(state, deps, None)
-            .await;
+            .await
+            .expect("spawn_actor_with_state: fresh context id registers");
         assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
         // Issue two reservations back-to-back via the mailbox.

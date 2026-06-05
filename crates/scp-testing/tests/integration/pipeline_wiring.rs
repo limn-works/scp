@@ -211,11 +211,12 @@ fn deliver_incoming_calls_open() {
 
 // Supervisor level: the lifecycle bootstrap arms spawn a real per-context
 // actor by delegating to the actor-shape `lifecycle_helpers::*` bodies
-// (each of which calls `spawn_actor_for_context`). ADR-049 Phase 2A
-// finalization. This is an additive assertion — `dispatch_lifecycle_direct`
-// still references the `_legacy` helpers for the per-context Join / Leave /
-// Close / Export / AccessKey arms, so we pin the presence of the actor-shape
-// bootstrap calls rather than the absence of all legacy references.
+// (each of which spawns an owned-state actor via `spawn_actor_with_state`).
+// ADR-049 Phase 2A finalization. This is an additive assertion —
+// `dispatch_lifecycle_direct` still references the `_legacy` helpers for the
+// per-context Join / Leave / Close / Export / AccessKey arms, so we pin the
+// presence of the actor-shape bootstrap calls rather than the absence of all
+// legacy references.
 #[test]
 fn dispatch_lifecycle_direct_bootstrap_arms_call_actor_shape_helpers() {
     assert!(
@@ -245,6 +246,47 @@ fn dispatch_lifecycle_direct_bootstrap_arms_call_actor_shape_helpers() {
         "dispatch_lifecycle_direct RestoreContext arm must delegate to the \
          actor-shape lifecycle_helpers::restore_context (spawns the per-context actor)"
     );
+}
+
+// Supervisor level: import is actor-native. The replaceability gate (NEVER
+// overwrite a live context) + the §23.17 epoch-floor capture/teardown/merge
+// run INSIDE the existing actor via `dispatch_prepare_for_replace`
+// (PrepareForReplace), and the imported state is spawned as an owned-state
+// actor via `spawn_actor_with_state`. ADR-049 Phase 2A finalization keystone.
+// Pins the actor-native shape AND the absence of the deleted DashMap
+// dual-write machinery so a regression cannot reintroduce a silent
+// live-context overwrite. Additive assertion.
+#[test]
+fn import_context_is_actor_native_not_dashmap_dual_write() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "import_context",
+            "dispatch_prepare_for_replace"
+        ),
+        "lifecycle_helpers::import_context must run the replaceability gate + \
+         crypto teardown inside the existing actor via dispatch_prepare_for_replace"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "import_context", "spawn_actor_with_state"),
+        "lifecycle_helpers::import_context must spawn the imported state as an \
+         owned-state actor via spawn_actor_with_state"
+    );
+    for legacy in [
+        "with_existing_context_for_import",
+        "replace_context(",
+        "spawn_actor_for_context(",
+    ] {
+        assert!(
+            !fn_body_contains(MANAGER_SRC, "import_context", legacy),
+            "lifecycle_helpers::import_context must not reach the deleted DashMap \
+             dual-write machinery ({legacy}) — the gate is actor-native now"
+        );
+    }
+    // Note: the lifecycle_control handler's dispatch of PrepareForReplace and
+    // the actor run-loop's terminal-exit arm are compiler-guaranteed (the
+    // match is exhaustive and the `is_terminal` arm would not compile if the
+    // variant were unhandled), so no string assertion is needed for those.
 }
 
 // Timer level: the actor-shape TTL timer helpers install the timer on

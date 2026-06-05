@@ -21,7 +21,7 @@
 //! buffer to flush because no state mutation has happened through the
 //! actor path yet.
 
-use scp_protocol::context::ContextError;
+use scp_protocol::context::{ContextError, ContextState};
 
 use crate::context::actor::commands::LifecycleControlCommand;
 use crate::context::actor::deps::ActorDeps;
@@ -36,7 +36,7 @@ use crate::context::actor::state::{ContextLifecycleState, PerContextState};
 /// are minimal and locally-owned — no persistence, no transport.
 pub async fn dispatch(
     state: &mut PerContextState,
-    _deps: &ActorDeps,
+    deps: &ActorDeps,
     cmd: LifecycleControlCommand,
 ) -> Outcome<()> {
     match cmd {
@@ -58,12 +58,98 @@ pub async fn dispatch(
             let _ = reply.send(Ok(()));
             Outcome::ok_mutated(())
         }
+        LifecycleControlCommand::PrepareForReplace { mls_state, reply } => {
+            handle_prepare_for_replace(state, deps, &mls_state, reply)
+        }
     }
 }
 
-// Quiet the unused-import lint in configurations that don't exercise
-// the tests. `ContextError` is referenced through the handler's
-// `oneshot::Sender<Result<(), ContextError>>` type — keep the import
-// visible so future migration diffs see the intended error type.
-#[allow(dead_code)]
-const _: fn() -> ContextError = || ContextError::ActorBusy(String::new());
+/// Handle [`LifecycleControlCommand::PrepareForReplace`] — the
+/// actor-native replacement gate for `import_context`.
+///
+/// Runs on the actor's OWN `&mut PerContextState`, so it is naturally
+/// serialized with every other command this actor processes — that
+/// serialization is what the legacy `write_lock`-guarded import gate
+/// (`SupervisorHandle::with_existing_context_for_import`) provided.
+///
+/// Security invariant: an import MUST NOT overwrite a live context. The
+/// handler rejects unless the context's lifecycle state is `Closing |
+/// Closed | Expired | Tombstoned`. A second concurrent
+/// `PrepareForReplace` is rejected by the terminal-claim check on
+/// `state.lifecycle_state` (the first sets it to `Closed`). The crypto
+/// teardown / epoch-floor validate+merge (§23.17 Inv 3/4) is a verbatim
+/// move of the former import-gate closure. On success the actor claims
+/// itself terminal and the run loop exits.
+fn handle_prepare_for_replace(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    mls_state: &[u8],
+    reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let ctx_id_bytes = state.context_id;
+
+    // Terminal-claim guard: a prior PrepareForReplace already claimed
+    // (and is terminating) this actor. Reject the racing second import.
+    if matches!(state.lifecycle_state, ContextLifecycleState::Closed) {
+        let _ = reply.send(Err(ContextError::MembershipFailed(
+            "context is already being replaced".to_owned(),
+        )));
+        return Outcome::ok(());
+    }
+
+    // Security invariant: never overwrite a LIVE context.
+    let replaceable = state.handle.try_read_state().is_some_and(|s| {
+        matches!(
+            s,
+            ContextState::Closing
+                | ContextState::Closed
+                | ContextState::Expired
+                | ContextState::Tombstoned
+        )
+    });
+    if !replaceable {
+        let _ = reply.send(Err(ContextError::MembershipFailed(
+            "context already exists — cannot import".to_owned(),
+        )));
+        return Outcome::ok(());
+    }
+
+    // §23.17 Invariant 3: capture per-sender epoch floors BEFORE
+    // destroying crypto state so they can be validated against the
+    // incoming snapshot (replay-based floor regression guard).
+    let local_epoch_floors = deps.crypto.export_sender_key_epochs(&ctx_id_bytes);
+
+    // Clean up old crypto state before reimport.
+    let _ = deps.crypto.destroy_mls_group(&ctx_id_bytes);
+    let _ = deps.crypto.destroy_sender_key(&ctx_id_bytes);
+
+    // Restore incoming crypto state (if the export carries any).
+    if !mls_state.is_empty()
+        && let Err(e) = deps.crypto.restore_crypto_state(&ctx_id_bytes, mls_state)
+    {
+        let _ = reply.send(Err(ContextError::PersistenceFailed(format!(
+            "import: crypto state restore failed: {e}"
+        ))));
+        return Outcome::ok(());
+    }
+
+    // §23.17 Invariant 3/4: validate that no per-sender epoch floor
+    // regresses, and merge local floors back (max-merge). On failure,
+    // roll back the restored crypto state.
+    if let Err(e) = deps.crypto.validate_and_merge_epoch_floors(
+        &ctx_id_bytes,
+        local_epoch_floors,
+        crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
+    ) {
+        let _ = deps.crypto.destroy_mls_group(&ctx_id_bytes);
+        let _ = deps.crypto.destroy_sender_key(&ctx_id_bytes);
+        let _ = reply.send(Err(e));
+        return Outcome::ok(());
+    }
+
+    // Claim the slot terminal (rejects a racing second PrepareForReplace)
+    // and signal run() to exit so the supervisor can despawn + respawn.
+    state.lifecycle_state = ContextLifecycleState::Closed;
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
+}

@@ -1166,7 +1166,8 @@ pub async fn create_context(
     let owned_deps = deps.clone_for_spawn();
     deps.supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
-        .await;
+        .await
+        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
 
     finalize_create(deps, &context_id, params.ttl, &handle).await;
     Ok(handle)
@@ -1280,66 +1281,56 @@ pub async fn import_context(
     let context_id = export.snapshot.context_id.clone();
     let ctx_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
 
-    // 2. Existing-context replaceability check + crypto state cleanup.
-    // The supervisor handle's replace_context performs the atomic
-    // gate-and-replace under the supervisor's write_lock so a
-    // concurrent caller cannot insert an Active context after the
-    // replaceability check.
-    deps.supervisor
-        .with_existing_context_for_import(&context_id, |existing_state| {
-            let is_replaceable = existing_state.handle.try_read_state().is_some_and(|s| {
-                matches!(
-                    s,
-                    ContextState::Closing
-                        | ContextState::Closed
-                        | ContextState::Expired
-                        | ContextState::Tombstoned
-                )
-            });
-            if !is_replaceable {
-                return Err(ContextError::MembershipFailed(format!(
-                    "context '{context_id}' already exists — cannot import"
-                )));
+    // 2. Existing-context replaceability check + crypto state cleanup,
+    // actor-native. If a context actor is already registered for this id,
+    // the replaceability gate (NEVER overwrite a live context) AND the
+    // §23.17 epoch-floor capture/teardown/restore/merge run INSIDE that
+    // actor via `PrepareForReplace` — the actor processes one command at
+    // a time, which is the serialization the legacy write_lock-guarded
+    // gate provided. On success the prior actor claims itself terminal
+    // and exits; we deterministically despawn its dead handle before the
+    // fresh spawn below.
+    if deps.supervisor.lookup(&context_id).is_some() {
+        match deps
+            .supervisor
+            .dispatch_prepare_for_replace(&context_id, export.mls_state.clone())
+            .await
+        {
+            Ok(()) => {
+                // Prior actor tore down + restored crypto and is exiting.
+                // Remove its handle so the respawn slot is vacant.
+                let _ = deps.supervisor.despawn_actor(&context_id).await;
             }
-            // §23.17 Invariant 3: capture per-sender epoch floors BEFORE
-            // destroying crypto state so they can be validated against the
-            // incoming snapshot (replay-based floor regression guard).
-            let local_epoch_floors = deps.crypto.export_sender_key_epochs(&ctx_id_bytes);
-
-            // Clean up old crypto state before reimport.
-            let _ = deps.crypto.destroy_mls_group(&ctx_id_bytes);
-            let _ = deps.crypto.destroy_sender_key(&ctx_id_bytes);
-
-            // Restore incoming crypto state (if the export carries any).
-            if !export.mls_state.is_empty() {
-                deps.crypto
-                    .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
-                    .map_err(|e| {
-                        ContextError::PersistenceFailed(format!(
-                            "import: crypto state restore failed: {e}"
-                        ))
-                    })?;
-            }
-
-            // §23.17 Invariant 3: validate that no per-sender epoch floor
-            // regresses, and merge local floors back (max-merge) to
-            // preserve Invariant 4. On failure, roll back the restored
-            // crypto state.
-            if let Err(e) = deps.crypto.validate_and_merge_epoch_floors(
-                &ctx_id_bytes,
-                local_epoch_floors,
-                crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
-            ) {
-                // Rollback: destroy the just-restored crypto state.
-                let _ = deps.crypto.destroy_mls_group(&ctx_id_bytes);
-                let _ = deps.crypto.destroy_sender_key(&ctx_id_bytes);
+            // Live (non-replaceable) context, or a concurrent replace
+            // already claimed it — propagate the reject.
+            Err(e @ ContextError::MembershipFailed(_)) => return Err(e),
+            // Crypto teardown / epoch-floor merge failure — propagate.
+            Err(e @ (ContextError::PersistenceFailed(_) | ContextError::CryptoFailed(_))) => {
                 return Err(e);
             }
-            Ok(())
-        })
-        .await?;
-    // No-existing-context path: restore crypto state directly.
-    if !deps.supervisor.has_context(&context_id) && !export.mls_state.is_empty() {
+            // Stale handle: the prior actor already exited before we could
+            // reach it. Re-check; if still registered, a concurrent
+            // operation owns the slot — fail. If now vacant, fall through
+            // to the fresh path and restore crypto directly.
+            Err(_stale) => {
+                if deps.supervisor.lookup(&context_id).is_some() {
+                    return Err(ContextError::MembershipFailed(format!(
+                        "context '{context_id}' import: existing actor unreachable"
+                    )));
+                }
+                if !export.mls_state.is_empty() {
+                    deps.crypto
+                        .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
+                        .map_err(|e| {
+                            ContextError::PersistenceFailed(format!(
+                                "import: crypto state restore failed: {e}"
+                            ))
+                        })?;
+                }
+            }
+        }
+    } else if !export.mls_state.is_empty() {
+        // Fresh import (no existing actor): restore crypto state directly.
         deps.crypto
             .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
             .map_err(|e| {
@@ -1577,31 +1568,18 @@ pub async fn import_context(
         mode: ContextModeState::Encrypted(Box::<ContextCryptoState>::default()),
     };
 
-    // 7. Register the context atomically (replace-if-exists).
+    // 7. Register the imported context as an owned-state actor.
     //
-    // Before swapping the legacy DashMap entry, despawn any per-
-    // context actor that was attached to the prior entry. The prior
-    // actor's `state_arc` field references the about-to-be-removed
-    // `Arc<Mutex<PerContextState>>`; once `replace_context` swaps in a
-    // fresh `Arc<Mutex<...>>`, the stale actor would silently keep
-    // serving the old state until its mailbox drains. Despawning
-    // first closes that window (the handle's drop closes the mpsc
-    // sender, which causes the actor's run-loop to exit on the next
-    // inbox-empty poll).
-    let _despawned = deps.supervisor.despawn_actor(&context_id).await;
-    deps.supervisor
-        .replace_context(context_id.clone(), per_context)
-        .await
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
-    // ADR-049 Phase 2A finalization bootstrap dual-write: import path
-    // mirrors create/restore — populate the actor registry alongside
-    // the legacy contexts DashMap. The new dashmap-backed actor
-    // proxies the fresh `Arc<Mutex<PerContextState>>` registered by
-    // `replace_context` above.
+    // Any prior actor for this id was already replaceability-gated,
+    // crypto-torn-down, claimed-terminal, and despawned by the
+    // `PrepareForReplace` step above, so the registry slot is vacant.
+    // `spawn_actor_with_state` rejects a duplicate (first-writer-wins) if
+    // a concurrent operation raced into the slot — surfaced as a typed
+    // error rather than a silent overwrite. The actor OWNS the imported
+    // state; no legacy contexts DashMap write, no `Arc<Mutex<>>` proxy.
     let owned_deps = deps.clone_for_spawn();
     deps.supervisor
-        .spawn_actor_for_context(context_id.clone(), owned_deps)
+        .spawn_actor_with_state(per_context, owned_deps, None)
         .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
@@ -1943,7 +1921,8 @@ pub async fn restore_context(
     let owned_deps = deps.clone_for_spawn();
     deps.supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
-        .await;
+        .await
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
     // Start governance timeout task (ADR-031 §5) via the actor mailbox.
     crate::context::governance_helpers::start_governance_timeout_task(&deps.supervisor, context_id)

@@ -2238,6 +2238,28 @@ pub enum LifecycleControlCommand {
         /// final persist completes.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+    /// Terminal command — the supervisor asks this actor to make way for
+    /// an imported context with the same id. Running on its own owned
+    /// `PerContextState`, the actor checks it is replaceable (lifecycle
+    /// state `Closing | Closed | Expired | Tombstoned` — NEVER overwrite
+    /// a live context), then atomically captures, tears down, restores,
+    /// and validate/merges the per-sender MLS epoch floors (§23.17 Inv
+    /// 3/4) against the incoming crypto bytes. On success it transitions
+    /// its own lifecycle to a terminal claim and the dispatch loop exits,
+    /// so the supervisor can despawn it and spawn the imported state.
+    /// Because each actor processes one command at a time, this is the
+    /// serialization point the legacy `write_lock`-guarded import gate
+    /// provided.
+    PrepareForReplace {
+        /// The incoming export's MLS crypto bytes (empty = no incoming
+        /// crypto state) — the only handler-side payload import needs.
+        mls_state: Vec<u8>,
+        /// `Ok(())` iff the context was replaceable AND crypto teardown +
+        /// epoch-floor validate/merge succeeded; `Err(MembershipFailed)`
+        /// if the context is live or already claimed by a prior
+        /// `PrepareForReplace`.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
 }
 
 // ---------------------------------------------------------------------------

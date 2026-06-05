@@ -307,16 +307,14 @@ impl SupervisorHandle {
     // -----------------------------------------------------------------
     // Lifecycle bootstrap surface (Phase 2A.9 / ADR-049 finalization).
     //
-    // These methods wrap the supervisor's registry / contexts-map
-    // operations through a capability-reduced interface so the
-    // actor-shape bootstrap entry points in
-    // [`crate::context::lifecycle_helpers`] can register fresh
-    // `PerContextState` without holding `&Supervisor` directly. The
-    // `create`/`restore` paths register through
-    // [`Self::spawn_actor_with_state`] (owned-state spawn); `import`
-    // registers through [`Self::replace_context`] +
-    // [`Self::spawn_actor_for_context`] pending its actor-native
-    // replaceability primitive.
+    // These methods wrap the supervisor's registry operations through a
+    // capability-reduced interface so the actor-shape bootstrap entry
+    // points in [`crate::context::lifecycle_helpers`] can register fresh
+    // `PerContextState` without holding `&Supervisor` directly. All three
+    // bootstrap paths (`create` / `restore` / `import`) register through
+    // [`Self::spawn_actor_with_state`] (owned-state spawn). Import's
+    // replaceability gate runs inside the existing actor via
+    // [`Self::dispatch_prepare_for_replace`].
     // -----------------------------------------------------------------
 
     /// Initialize a `BroadcastContext` (SCP-227) and persist its
@@ -367,77 +365,6 @@ impl SupervisorHandle {
         .await;
     }
 
-    /// `true` if the supervisor's contexts map currently registers
-    /// `context_id`. Used by the import path to distinguish the
-    /// no-existing-context branch from the replace-existing branch.
-    #[must_use]
-    pub(crate) fn has_context(&self, context_id: &str) -> bool {
-        self.supervisor.contexts_ref().contains_key(context_id)
-    }
-
-    /// Run `f` against the per-context state for an existing context if
-    /// one is registered, with the supervisor's write-lock held across
-    /// the callback. Used by the import path to perform the
-    /// replaceability gate + crypto cleanup atomically — the
-    /// write-lock prevents a concurrent caller from inserting an
-    /// Active context after the gate.
-    ///
-    /// If no context is registered for `context_id`, `f` is not
-    /// invoked and `Ok(())` is returned.
-    ///
-    /// # Errors
-    ///
-    /// Returns whatever error `f` returns. Propagates the per-context
-    /// lookup failure mode as `Ok(())` because the no-existing branch
-    /// is the legitimate "fresh slot" path the caller must handle on
-    /// its own.
-    #[allow(private_interfaces)]
-    pub(crate) async fn with_existing_context_for_import<F>(
-        &self,
-        context_id: &str,
-        f: F,
-    ) -> Result<(), ContextError>
-    where
-        F: FnOnce(&crate::context::state::PerContextState) -> Result<(), ContextError>,
-    {
-        let _write_guard = self.supervisor.write_lock.lock().await;
-        if let Ok(ctx_arc) =
-            crate::context::manager_methods::get_context_arc(&self.supervisor, context_id)
-        {
-            let guard = ctx_arc.lock().await;
-            return f(&guard);
-        }
-        Ok(())
-    }
-
-    /// Replace an existing context in the contexts map atomically
-    /// under the supervisor's `write_lock`. Used by the import path's
-    /// step 7 to swap in the freshly-built `PerContextState` after
-    /// the replaceability gate has already passed.
-    ///
-    /// If the context does not exist, this is equivalent to a fresh
-    /// insert. If it does exist, the existing entry is removed and
-    /// replaced — the per-context lock on the prior entry is dropped
-    /// inside the swap (the write-lock keeps the remove+insert
-    /// atomic with respect to other writers).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed)
-    /// if the insert fails after the remove (only possible under a
-    /// hostile concurrent insert — `write_lock` makes this impossible
-    /// in normal operation).
-    #[allow(private_interfaces)]
-    pub(crate) async fn replace_context(
-        &self,
-        context_id: String,
-        state: crate::context::state::PerContextState,
-    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-        let _write_guard = self.supervisor.write_lock.lock().await;
-        crate::context::manager_methods::remove_context(&self.supervisor, &context_id);
-        crate::context::manager_methods::insert_context(&self.supervisor, context_id, state)
-    }
-
     /// **TRANSITIONAL — shim dispatch period only.** Returns the inner
     /// `Arc<Supervisor>` so the actor's `run()` loop can route commands
     /// through the legacy `dispatch_from_shim` handler entry points
@@ -481,52 +408,72 @@ impl SupervisorHandle {
     /// `PerContextState` and `ActorDeps` are `pub(crate)` while the
     /// method itself is reachable from inside the `context` module
     /// tree.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError::CreationFailed`] when an actor is
+    /// already registered for this context id (first-writer-wins).
     #[allow(private_interfaces)]
     pub(in crate::context) async fn spawn_actor_with_state(
         &self,
         state: crate::context::actor::state::PerContextState,
         deps: crate::context::actor::deps::ActorDeps,
         mailbox_capacity: Option<usize>,
-    ) -> crate::context::actor::handle::ContextActorHandle {
+    ) -> Result<crate::context::actor::handle::ContextActorHandle, ContextError> {
         self.supervisor
             .spawn_actor_with_state(state, deps, mailbox_capacity)
             .await
     }
 
-    /// Spawn a per-context `ContextActor` that proxies its state through
-    /// the legacy `Supervisor::contexts` DashMap entry (ADR-049 Phase 2A
-    /// finalization bootstrap dual-write).
+    /// Dispatch [`LifecycleControlCommand::PrepareForReplace`] to the
+    /// actor currently registered for `context_id`, awaiting its verdict.
     ///
-    /// Capability-reduced wrapper around
-    /// [`Supervisor::spawn_actor_dashmap_backed`](crate::context::supervisor::Supervisor::spawn_actor_dashmap_backed).
-    /// The lifecycle bootstrap in [`crate::context::lifecycle_helpers`]
-    /// calls this after [`Self::insert_context`] / [`Self::replace_context`]
-    /// stamps the DashMap entry — every production context construction
-    /// thus populates BOTH the legacy contexts DashMap AND the actor
-    /// registry. Subsequent finalization sessions delete the legacy
-    /// DashMap once every consumer is ported.
+    /// This is the actor-native replacement gate for
+    /// [`crate::context::lifecycle_helpers::import_context`]: the existing
+    /// actor, running on its own owned state, checks replaceability and
+    /// performs the crypto teardown + epoch-floor validate/merge, then
+    /// claims itself terminal and exits. Capability-reduced wrapper —
+    /// import never holds the raw `ContextActorHandle`.
     ///
     /// # Errors
     ///
-    /// - [`ContextError::ContextNotRegistered`] if the bootstrap caller
-    ///   did not first insert / replace the per-context state in the
-    ///   supervisor's DashMap.
-    ///
-    /// # Visibility
-    ///
-    /// `pub(in crate::context)` — only lifecycle bootstrap reaches this.
-    /// The returned `ContextActorHandle` is dropped by the bootstrap
-    /// caller (the registration in `Supervisor::actors` keeps the
-    /// actor's mailbox alive for the lifetime of the context).
-    #[allow(private_interfaces, dead_code)]
-    pub(in crate::context) async fn spawn_actor_for_context(
+    /// - `Err(MembershipFailed)` if the context is live (not replaceable)
+    ///   or already claimed by a concurrent replace.
+    /// - `Err(PersistenceFailed)` / crypto error from the floor merge.
+    /// - `Err(ContextNotRegistered)` if no actor is registered, or the
+    ///   mailbox send / reply failed (a stale handle whose actor already
+    ///   exited) — the caller re-checks `lookup` and falls back to the
+    ///   fresh-import path.
+    pub(in crate::context) async fn dispatch_prepare_for_replace(
         &self,
-        context_id: String,
-        deps: crate::context::actor::deps::ActorDeps,
-    ) -> Result<crate::context::actor::handle::ContextActorHandle, ContextError> {
-        self.supervisor
-            .spawn_actor_dashmap_backed(context_id, deps, None)
+        context_id: &str,
+        mls_state: Vec<u8>,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::{ContextCommand, LifecycleControlCommand};
+
+        let Some(actor) = self.supervisor.lookup(context_id) else {
+            return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
+            mls_state,
+            reply: reply_tx,
+        });
+        if actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
             .await
+            .is_err()
+        {
+            // Stale handle: the actor exited (e.g. a prior replace) before
+            // we could send. Signal the caller to re-`lookup`.
+            return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
+        }
+        // The actor dropped the reply sender mid-flight (it exited
+        // without answering) → treat as a stale handle; otherwise return
+        // the handler's verdict.
+        reply_rx
+            .await
+            .unwrap_or_else(|_| Err(ContextError::ContextNotRegistered(context_id.to_owned())))
     }
 
     /// Despawn the actor registered for `context_id`, removing the

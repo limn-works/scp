@@ -246,26 +246,7 @@ pub fn insert_context(
 }
 
 // ---------------------------------------------------------------------------
-// 6. remove_context
-// ---------------------------------------------------------------------------
-
-/// Remove a context from the map, returning its state `Arc` if it existed.
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::remove_context`](crate::context::supervisor::Supervisor::remove_context)
-/// (ADR-049 commit 12). Byte-identical behavior. Returns `None` if
-/// the context is not registered OR the supervisor has not been attached
-/// — observationally identical for callers that already gate on a prior
-/// successful registration.
-pub fn remove_context(
-    supervisor: &Supervisor,
-    context_id: &str,
-) -> Option<Arc<Mutex<PerContextState>>> {
-    supervisor.contexts_ref().remove(context_id).map(|(_, v)| v)
-}
-
-// ---------------------------------------------------------------------------
-// 7. has_persistence
+// 6. has_persistence
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if a persistence provider is configured.
