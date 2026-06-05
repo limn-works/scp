@@ -310,7 +310,7 @@ class AndroidKeyCustody internal constructor(
     /**
      * Derives a deterministic, context-scoped Ed25519 pseudonym keypair.
      *
-     * ## Algorithm (spec section 9.10.4A):
+     * ## Algorithm (spec section 9.10.4.A):
      *
      * **Software keys (API 26-32, [CustodyType.SOFTWARE]):**
      *   1. Extract 32-byte private key bytes from the Bouncy Castle [Ed25519PrivateKeyParameters].

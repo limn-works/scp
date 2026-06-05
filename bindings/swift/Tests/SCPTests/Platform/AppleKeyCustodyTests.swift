@@ -309,7 +309,7 @@
         /// This test imports a known private key into the Keychain, derives the
         /// pseudonym, and compares the result against the reference algorithm
         /// computed locally.
-        @Test("derivePseudonym cross-platform golden vector (spec section 9.10.4A)")
+        @Test("derivePseudonym cross-platform golden vector (spec section 9.10.4.A)")
         func derivePseudonymGoldenVector() async throws {
             // Known identity key seed: 0x00...01 (31 zeros, then 0x01).
             var seedBytes = Data(repeating: 0, count: 32)

@@ -208,6 +208,7 @@
 - **What's missing**: `metadata_routing_id = SHA-256(context_id || "scp-metadata")` -- this is publicly derivable from `context_id`. Anyone who knows a context_id can query relays for its metadata without being a member. Combined with the previous finding (pseudonyms derivable from public key + context_id), this means a relay operator who knows a context_id can compute the pseudonym for every known DID and check which ones are subscribed. The spec acknowledges relay metadata visibility but not this specific enumeration attack.
 - **Why it matters**: An attacker who knows (or guesses) a context_id can enumerate which DIDs are members by computing pseudonyms for all known DIDs and checking which routing_ids have active subscriptions. This is a membership oracle.
 - **Severity**: HIGH
+- **Resolution (later)**: Addressed by the keyed metadata-routing-id derivation. The routing id is now `HMAC-SHA256(context_metadata_key, ...)` (spec §9.10.4.B) and is no longer computable from `context_id` alone. Preserved as historical record.
 
 ---
 
@@ -625,6 +626,7 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 - **What's missing**: "For software keys, the HMAC uses the raw Ed25519 public key bytes." The public key is... public. Anyone with the DID and the context_id can compute `HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")` and derive the pseudonym. The spec claims pseudonyms are "unlinkable across contexts" -- but they are fully linkable if you know the context_id.
 - **Why it matters**: A relay operator who knows a context_id can test every known DID against it by computing pseudonyms and checking active subscriptions. Combined with the metadata routing_id (`SHA-256(context_id || "scp-metadata")`) which is also publicly derivable, this enables a membership enumeration oracle.
 - **Severity**: HIGH
+- **Resolution (later)**: Rejected the public-key-as-HMAC-key approach. Spec §9.10.4.A now keys the HMAC with a private-derived `pseudonym_secret` (software custody: `HKDF-SHA256` over the Ed25519 private seed, cross-platform deterministic; hardware custody: device-local secret), never the public key -- closing the enumeration oracle. Line references are from the audit-time spec revision and have since shifted. See spec §9.10.4.A and KAT vectors §25.19. Preserved as historical record.
 
 ### [9.10.4] Metadata Routing ID Enables Membership Enumeration
 - **Category**: Security-relevant omission
@@ -632,6 +634,7 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 - **What's missing**: `metadata_routing_id = SHA-256(context_id || "scp-metadata")` is publicly derivable from context_id. Combined with publicly derivable pseudonyms (above), enables enumeration of which DIDs are members of a context.
 - **Why it matters**: Any party knowing a context_id can query relays for membership presence. The context_id itself may be guessable or leaked through other protocol interactions.
 - **Severity**: HIGH
+- **Resolution (later)**: The unkeyed `SHA-256(context_id || "scp-metadata")` routing id was replaced by the keyed `HMAC-SHA256(context_metadata_key, ...)` form (spec §9.10.4.B), which is not publicly derivable, closing the enumeration vector. Preserved as historical record.
 
 ### [9.16.2] SenderKeyRequest Signature Scope Unspecified
 - **Category**: Security-relevant omission
