@@ -4,11 +4,13 @@
 // Apple Keychain backend. Each test creates keys with unique handles
 // and cleans up after itself to prevent Keychain pollution.
 //
-// The pseudonym derivation golden vector test verifies cross-platform
+// The pseudonym derivation known-answer test verifies cross-platform
 // determinism with the canonical Rust reference implementation
-// (`InMemoryKeyCustody` in `scp-platform/src/testing/key_custody.rs`).
+// (`derive_pseudonym_keypair` in `scp-platform/src/pseudonym.rs`), asserting
+// the literal spec §25.19 vectors for both the static (v1) and rotatable (v2)
+// derivations.
 //
-// ## Pseudonym derivation (spec §9.10.4.A)
+// ## Pseudonym derivation (spec §9.10.4.A, §9.10.4.1)
 //
 // The HMAC key is a private-derived `pseudonym_secret`, NEVER the public key
 // (public-key keying would be a membership-enumeration oracle). For software
@@ -18,7 +20,12 @@
 // pseudonym is device-local by design. The earlier ADR-027 amendment proposing
 // public-key keying was rejected.
 //
-// See spec §9.10.4.A, ADR-025 (Apple Platform Adapter), and ADR-006 (KeyCustody trait).
+// v1 (static):   seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")
+// v2 (rotatable): seed = HMAC-SHA256(pseudonym_secret,
+//                          contextId || BE64(epoch) || "scp-pseudonym-v2")
+//
+// See spec §9.10.4.A, §9.10.4.1, §25.19, ADR-025 (Apple Platform Adapter), and
+// ADR-006 (KeyCustody trait).
 
 #if os(iOS) || os(macOS)
 
@@ -297,68 +304,6 @@
             try await custody.destroyKey(pseudonym.handle)
         }
 
-        /// Cross-platform golden-value test for pseudonym derivation.
-        ///
-        /// Verifies that the Swift `AppleKeyCustody.derivePseudonym` produces
-        /// the same pseudonym public key as the Rust `InMemoryKeyCustody`
-        /// reference implementation for the same inputs.
-        ///
-        /// The golden vector uses:
-        /// - Identity key seed: 0x00...01 (31 zeros, then 0x01)
-        /// - Context ID: "test" (4 bytes UTF-8)
-        /// - Algorithm: HKDF-SHA256 derives pseudonym_secret from private key,
-        ///   then HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
-        ///
-        /// This test imports a known private key into the Keychain, derives the
-        /// pseudonym, and compares the result against the reference algorithm
-        /// computed locally.
-        @Test("derivePseudonym cross-platform golden vector (spec section 9.10.4.A)")
-        func derivePseudonymGoldenVector() async throws {
-            // Known identity key seed: 0x00...01 (31 zeros, then 0x01).
-            var seedBytes = Data(repeating: 0, count: 32)
-            seedBytes[31] = 1
-            let contextId = Data("test".utf8)
-
-            // Derive the public key from the seed for metadata caching.
-            let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seedBytes)
-            let publicKeyBytes = signingKey.publicKey.rawRepresentation
-
-            // Store the known seed as an Ed25519 private key in Keychain.
-            let handle = UUID().uuidString
-            try custody.storePrivateKeyBytes(
-                seedBytes, for: handle, keyType: .ed25519, publicKeyBytes: publicKeyBytes
-            )
-
-            // Compute expected pseudonym using the reference algorithm directly:
-            // Step 1: pseudonym_secret = HKDF-SHA256(ikm: private_key, salt: "scp-pseudonym-secret-v1", info: "", len: 32)
-            let pseudonymSecret = HKDF<SHA256>.deriveKey(
-                inputKeyMaterial: SymmetricKey(data: seedBytes),
-                salt: Data("scp-pseudonym-secret-v1".utf8),
-                info: Data(),
-                outputByteCount: 32
-            )
-            // Step 2: seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
-            var hmac = CryptoKit.HMAC<SHA256>(key: pseudonymSecret)
-            hmac.update(data: contextId)
-            hmac.update(data: Data("scp-pseudonym".utf8))
-            let expectedSeed = Data(hmac.finalize())
-
-            let expectedKey = try Curve25519.Signing.PrivateKey(rawRepresentation: expectedSeed.prefix(32))
-            let expectedPublicKey = expectedKey.publicKey.rawRepresentation
-
-            // Derive pseudonym through AppleKeyCustody
-            let pseudonym = try await custody.derivePseudonym(handle, contextId: contextId)
-
-            #expect(
-                pseudonym.publicKey == expectedPublicKey,
-                "pseudonym public key must match reference HKDF+HMAC-SHA256 algorithm output"
-            )
-
-            // Cleanup
-            try await custody.destroyKey(handle)
-            try await custody.destroyKey(pseudonym.handle)
-        }
-
         // MARK: - custodyType
 
         @Test("custodyType returns 'software' for all keys")
@@ -388,6 +333,182 @@
             try await custody.destroyKey(handle1)
             try await custody.destroyKey(handle2)
             try await custody.destroyKey(handle3)
+        }
+    }
+
+    // MARK: - Rotatable Pseudonym Tests
+
+    /// Tests for the v2 (rotatable, epoch-bound) pseudonym derivation and the
+    /// cross-platform §25.19 known-answer vectors covering both v1 and v2.
+    struct AppleKeyCustodyRotatablePseudonymTests {
+        /// Shared custody instance using default Keychain (no access group).
+        private let custody = AppleKeyCustody(accessGroup: nil)
+
+        @Test("deriveRotatablePseudonym is deterministic for same inputs")
+        func deriveRotatablePseudonymDeterministic() async throws {
+            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let contextId = Data("test-context".utf8)
+
+            let first = try await custody.deriveRotatablePseudonym(
+                handle, contextId: contextId, pseudonymEpoch: 1
+            )
+            let second = try await custody.deriveRotatablePseudonym(
+                handle, contextId: contextId, pseudonymEpoch: 1
+            )
+
+            #expect(
+                first.publicKey == second.publicKey,
+                "same identity key + same context_id + same epoch = same pseudonym public key"
+            )
+
+            // Cleanup
+            try await custody.destroyKey(handle)
+            try await custody.destroyKey(first.handle)
+            // second.handle is deterministic and equals first.handle, so already destroyed
+        }
+
+        @Test("deriveRotatablePseudonym produces different keys for different epochs")
+        func deriveRotatablePseudonymDifferentEpochs() async throws {
+            let handle = try await custody.generateKeypair(keyType: "ed25519")
+            let contextId = Data("rotating-context".utf8)
+
+            let epoch1 = try await custody.deriveRotatablePseudonym(
+                handle, contextId: contextId, pseudonymEpoch: 1
+            )
+            let epoch2 = try await custody.deriveRotatablePseudonym(
+                handle, contextId: contextId, pseudonymEpoch: 2
+            )
+
+            #expect(
+                epoch1.publicKey != epoch2.publicKey,
+                "different epochs must produce different pseudonyms"
+            )
+            #expect(
+                epoch1.handle != epoch2.handle,
+                "different epochs must occupy distinct Keychain handle slots"
+            )
+
+            // Cleanup
+            try await custody.destroyKey(handle)
+            try await custody.destroyKey(epoch1.handle)
+            try await custody.destroyKey(epoch2.handle)
+        }
+
+        @Test("deriveRotatablePseudonym with X25519 key throws wrongKeyType")
+        func deriveRotatablePseudonymX25519Fails() async throws {
+            let handle = try await custody.generateKeypair(keyType: "x25519")
+            await #expect(throws: PlatformError.self) {
+                _ = try await custody.deriveRotatablePseudonym(
+                    handle, contextId: Data("ctx".utf8), pseudonymEpoch: 1
+                )
+            }
+            // Cleanup
+            try await custody.destroyKey(handle)
+        }
+
+        /// Cross-platform known-answer test (KAT) for pseudonym derivation.
+        ///
+        /// Asserts the Swift `AppleKeyCustody` pseudonym derivations reproduce
+        /// the canonical spec §25.19 vectors byte-for-byte, proving the Swift
+        /// adapter is wire-compatible with the Rust `derive_pseudonym_keypair`
+        /// reference (`scp-platform/src/pseudonym.rs`) across all SDKs.
+        ///
+        /// Both vectors use `context_id = "context-alpha"` (ASCII). For each
+        /// identity seed the test asserts:
+        /// - v1 (`derivePseudonym`) public key equals the literal §25.19 hex.
+        /// - v2 epoch 1 (`deriveRotatablePseudonym`) public key equals the
+        ///   literal §25.19 hex.
+        /// - v1 ≠ v2 (domain separation between `"scp-pseudonym"` and
+        ///   `"scp-pseudonym-v2"`).
+        @Test("pseudonym derivation matches §25.19 known-answer vectors")
+        func pseudonymKnownAnswerVectors() async throws {
+            let contextId = Data("context-alpha".utf8)
+
+            // §25.19 V30: identity seed = 0x01 repeated 32 times.
+            let seedV30 = Data(repeating: 0x01, count: 32)
+            let v1ExpectedV30 = try hexToData(
+                "fddc04882a48aa39888f6dbec622f9c5aa6f06b2e40820a69a2e0e89b5f09ac2"
+            )
+            let v2ExpectedV30 = try hexToData(
+                "43e50a947c4b2be44f871e309c7edc64afaf4207b9a589c9b01f61c01158090f"
+            )
+
+            // §25.19 V31: identity seed = 0x9D, then 0x01, 0x02, ..., 0x1F.
+            var seedV31 = Data([0x9D])
+            seedV31.append(contentsOf: [UInt8](1 ... 31))
+            let v1ExpectedV31 = try hexToData(
+                "ff6e2e909a008318f97bb2c26c1d787ceb9aa2996f746766335e10ba7e2213cc"
+            )
+            let v2ExpectedV31 = try hexToData(
+                "edd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639"
+            )
+
+            for (seedBytes, v1Expected, v2Expected) in [
+                (seedV30, v1ExpectedV30, v2ExpectedV30),
+                (seedV31, v1ExpectedV31, v2ExpectedV31)
+            ] {
+                #expect(seedBytes.count == 32, "identity seed must be 32 bytes")
+
+                // Derive the public key from the seed for metadata caching.
+                let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seedBytes)
+                let publicKeyBytes = signingKey.publicKey.rawRepresentation
+
+                // Store the known seed as an Ed25519 identity key in Keychain.
+                let handle = UUID().uuidString
+                try custody.storePrivateKeyBytes(
+                    seedBytes, for: handle, keyType: .ed25519, publicKeyBytes: publicKeyBytes
+                )
+
+                // v1 (static) pseudonym.
+                let staticPseudonym = try await custody.derivePseudonym(handle, contextId: contextId)
+                #expect(
+                    staticPseudonym.publicKey == v1Expected,
+                    "v1 pseudonym public key must match the §25.19 KAT vector"
+                )
+
+                // v2 (rotatable) pseudonym at epoch 1.
+                let rotatablePseudonym = try await custody.deriveRotatablePseudonym(
+                    handle, contextId: contextId, pseudonymEpoch: 1
+                )
+                #expect(
+                    rotatablePseudonym.publicKey == v2Expected,
+                    "v2 (epoch=1) pseudonym public key must match the §25.19 KAT vector"
+                )
+
+                // Domain separation: v1 and v2 must differ.
+                #expect(
+                    staticPseudonym.publicKey != rotatablePseudonym.publicKey,
+                    "v1 and v2 derivations must differ (domain separation)"
+                )
+
+                // Cleanup
+                try await custody.destroyKey(handle)
+                try await custody.destroyKey(staticPseudonym.handle)
+                try await custody.destroyKey(rotatablePseudonym.handle)
+            }
+        }
+
+        // MARK: - Helpers
+
+        /// Decodes an even-length lowercase hex string into raw bytes.
+        ///
+        /// Used to load the literal §25.19 known-answer vectors without any
+        /// self-derivation, so a regression in the derivation cannot mask itself.
+        private func hexToData(_ hex: String) throws -> Data {
+            guard hex.count % 2 == 0 else {
+                throw PlatformError.custodyError("hex string must have even length")
+            }
+            var data = Data(capacity: hex.count / 2)
+            var index = hex.startIndex
+            while index < hex.endIndex {
+                let next = hex.index(index, offsetBy: 2)
+                guard let byte = UInt8(hex[index ..< next], radix: 16) else {
+                    throw PlatformError.custodyError("invalid hex byte in '\(hex)'")
+                }
+                data.append(byte)
+                index = next
+            }
+            return data
         }
     }
 
