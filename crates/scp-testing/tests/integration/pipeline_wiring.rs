@@ -45,6 +45,7 @@ const PROVIDER_SRC: &str =
 const WASM_MANAGER_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/manager.rs");
 const WASM_CONSEQUENCE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/wasm/src/consequence.rs");
+const WASM_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/outlets.rs");
 
 // Non-WASM FFI bridge sources. PR #1606 / C4 wired all 3 of these to
 // `ContextManager::invoke_outlet_with_economy` so per-invocation pricing,
@@ -777,6 +778,112 @@ fn dispatch_with_economy_passes_caveat_enforcement() {
          `caveat_enforcement` to the underlying aggregating dispatcher \
          (SCP-OUT-021 remediation — streaming surface MUST enforce \
          caveats on parity with the single-shot path)"
+    );
+}
+
+// SCP-OUT-021 single-shot parity. The streaming outlet path enforced the
+// §7.3.8 post-input caveat gate while the NON-streaming (single-shot) bridge
+// invoke paths passed `caveat_enforcement: None` — a delegate could evade
+// `max_calls` / `amount_max_cumulative` / `rate_window` /
+// `amount_max_per_call` / `allowed_target_dids` / narrowed `input_schema`
+// simply by invoking single-shot. These assertions are the SIBLING of
+// `dispatch_with_economy_passes_caveat_enforcement` (the streaming-side pin):
+// they prove every single-shot bridge `outlet_invoke` path BUILDS and
+// FORWARDS caveat enforcement so the bypass cannot be reintroduced by a future
+// refactor that drops the bundle back to a hardcoded `None`.
+//
+// The three native bridges (PyO3 / NAPI / UniFFI) resolve the action UCAN's
+// validated-narrowed `nb` caveats (via the shared `resolve_action_caveats`
+// helper) and forward a `CaveatEnforcement` bundle to
+// `invoke_outlet_with_economy`. WASM has no async runtime / durable counter
+// store (ADR-034) and rejects paid contexts, so it enforces the subset it can
+// — the non-counter local caveats + `max_calls` from the validated `nb` — via
+// the WASM-local `enforce_single_shot_caveats` helper.
+#[test]
+fn single_shot_pyo3_outlet_invoke_builds_caveat_enforcement() {
+    let body =
+        extract_fn_body(PYO3_OUTLETS_SRC, "py_outlet_invoke").expect("py_outlet_invoke body");
+    assert!(
+        body.contains("resolve_action_caveats"),
+        "PyO3 py_outlet_invoke must resolve the action UCAN's validated-narrowed \
+         nb caveats (resolve_action_caveats) — single-shot §7.3.8 parity with the \
+         streaming path"
+    );
+    assert!(
+        body.contains("CaveatEnforcement {"),
+        "PyO3 py_outlet_invoke must construct a CaveatEnforcement bundle so the \
+         runtime runs the §7.3.8 post-input gate on single-shot"
+    );
+    assert!(
+        body.contains("caveat_enforcement"),
+        "PyO3 py_outlet_invoke must forward `caveat_enforcement` to \
+         invoke_outlet_with_economy — never a hardcoded `None` (single-shot \
+         caveat-bypass remediation)"
+    );
+}
+
+#[test]
+fn single_shot_napi_outlet_invoke_builds_caveat_enforcement() {
+    let body = extract_fn_body(NAPI_OUTLETS_SRC, "outlet_invoke").expect("NAPI outlet_invoke body");
+    assert!(
+        body.contains("resolve_action_caveats"),
+        "NAPI outlet_invoke must resolve the action UCAN's validated-narrowed nb \
+         caveats (resolve_action_caveats) — single-shot §7.3.8 parity"
+    );
+    assert!(
+        body.contains("CaveatEnforcement {"),
+        "NAPI outlet_invoke must construct a CaveatEnforcement bundle so the \
+         runtime runs the §7.3.8 post-input gate on single-shot"
+    );
+    assert!(
+        body.contains("caveat_enforcement"),
+        "NAPI outlet_invoke must forward `caveat_enforcement` to \
+         invoke_outlet_with_economy — never a hardcoded `None`"
+    );
+}
+
+#[test]
+fn single_shot_uniffi_outlet_invoke_builds_caveat_enforcement() {
+    // `extract_fn_body` returns the first match — the top-level
+    // `outlet_invoke` (not `outlet_invoke_cross_context`).
+    let body =
+        extract_fn_body(UNIFFI_BRIDGE_SRC, "outlet_invoke").expect("UniFFI outlet_invoke body");
+    assert!(
+        body.contains("resolve_action_caveats"),
+        "UniFFI outlet_invoke must resolve the action UCAN's validated-narrowed nb \
+         caveats (resolve_action_caveats) — single-shot §7.3.8 parity"
+    );
+    assert!(
+        body.contains("CaveatEnforcement {"),
+        "UniFFI outlet_invoke must construct a CaveatEnforcement bundle so the \
+         runtime runs the §7.3.8 post-input gate on single-shot"
+    );
+    assert!(
+        body.contains("caveat_enforcement"),
+        "UniFFI outlet_invoke must forward `caveat_enforcement` to \
+         invoke_outlet_with_economy — never a hardcoded `None`"
+    );
+}
+
+#[test]
+fn single_shot_wasm_outlet_invoke_enforces_validated_caveats() {
+    // WASM single-shot lives in `outlet_invoke_inner` (the async body the
+    // `outlet_invoke` wrapper delegates to). It must enforce the validated
+    // `nb` caveats it is capable of enforcing.
+    let body = extract_fn_body(WASM_OUTLETS_SRC, "outlet_invoke_inner")
+        .expect("WASM outlet_invoke_inner body");
+    assert!(
+        body.contains("enforce_single_shot_caveats"),
+        "WASM outlet_invoke_inner must call enforce_single_shot_caveats so the \
+         action UCAN's validated-narrowed nb caveats (the non-counter local set \
+         + max_calls from the validated nb) are enforced on single-shot — \
+         §7.3.8 parity for everything WASM is capable of enforcing (ADR-034)"
+    );
+    assert!(
+        body.contains("payload.nb"),
+        "WASM outlet_invoke_inner must read the action UCAN's validated `nb` \
+         field (payload.nb) — max_calls and the local caveats come FROM the \
+         validated nb, not a caller estimate"
     );
 }
 
