@@ -310,7 +310,7 @@ class AndroidKeyCustody internal constructor(
     /**
      * Derives a deterministic, context-scoped Ed25519 pseudonym keypair.
      *
-     * ## Algorithm (spec section 9.10.4A):
+     * ## Algorithm (spec section 9.10.4.A):
      *
      * **Software keys (API 26-32, [CustodyType.SOFTWARE]):**
      *   1. Extract 32-byte private key bytes from the Bouncy Castle [Ed25519PrivateKeyParameters].
@@ -356,7 +356,7 @@ class AndroidKeyCustody internal constructor(
         }
 
         // Derive pseudonym_secret: HKDF for software keys, TEE-sign for hardware keys.
-        // Both approaches prevent the membership enumeration oracle (#1494):
+        // Both approaches prevent the membership enumeration oracle (spec §9.10.4.A):
         // only the key holder can compute pseudonyms.
         val pseudonymSecret = derivePseudonymSecret(keyHandle)
 

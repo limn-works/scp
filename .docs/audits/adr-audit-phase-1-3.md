@@ -67,6 +67,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 - **What's missing**: `HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")` uses the *public* key as the HMAC key. This was changed from private key for Android Keystore compatibility (ADR-027 amendment). The security analysis of this change is missing from the ADR. Since the HMAC key is public, any party that knows the DID can compute the pseudonym for any context_id. This means a relay that knows a user's DID can precompute all their pseudonyms and link activity across contexts -- exactly the attack pseudonyms are supposed to prevent.
 - **Why it matters**: The entire metadata privacy architecture (Decisions 2, 7, and 10) rests on pseudonym unlinkability. If the HMAC key is the public key, pseudonyms are unlinkable only if the DID is unknown to the relay. But DID resolution is public (Mainline DHT). A relay operator can resolve DIDs and compute pseudonyms, completely defeating the privacy goal. This is a fundamental design tension introduced by the Android Keystore constraint that requires explicit analysis.
 - **Severity**: CRITICAL
+- **Resolution (later)**: Accepted and fixed. The public-key-as-HMAC-key approach was rejected. Pseudonym derivation now uses a `pseudonym_secret` that is NOT publicly derivable: software custody derives it via `HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")` (cross-platform deterministic); hardware custody uses a device-local secret inside the TEE (device-local by design, since the key is non-exportable). See spec §9.10.4.A, ADR-027 (phase-6), and KAT vectors in §25.19. This finding is preserved as the historical record that drove the fix.
 
 ### [ADR-003] DID Document Size vs. BEP44 Payload Limit
 
@@ -460,6 +461,8 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 The ADR-027 amendment changed pseudonym derivation from private-key HMAC to public-key HMAC. This change cascades through ADR-002 (routing), ADR-008 (broadcast routing), ADR-012 (relay set partitioning), and all metadata privacy decisions. The entire metadata privacy architecture assumes pseudonyms are unlinkable to DIDs -- but with a public HMAC key, any party that knows the DID (which is public) can compute the pseudonym. This requires either accepting the privacy degradation or redesigning pseudonym derivation (e.g., using a separate software-managed pseudonym seed).
 
+- **Resolution (later)**: The public-key-as-HMAC-key approach was rejected; spec §9.10.4.A now keys the HMAC with a private-derived `pseudonym_secret` (software custody derives it via HKDF-SHA256, hardware custody uses a device-local secret), restoring unlinkability.
+
 ### Nonce Format Is Inconsistent Across ADRs
 
 ADR-009 and ADR-016 both claim to be normative for nonce format, and they specify different formats. ADR-016's `mint_ucan` says "UUID v4 or 32 random bytes" but validation expects `{unix_millis}-{hex16}`. This must be resolved to a single format before any implementation.
@@ -487,6 +490,7 @@ ADR-008 introduces `CeilingPolicy::Governed` while ADR-009 repeatedly asserts ce
 **CRITICAL findings** (must be resolved before implementation):
 1. Inner envelope signature preimage has no canonical encoding or length prefixes
 2. Pseudonym derivation with public key as HMAC key defeats unlinkability
+   - **Resolution (later)**: The public-key-as-HMAC-key approach was rejected; spec §9.10.4.A now keys the HMAC with a private-derived `pseudonym_secret` (software custody derives it via HKDF-SHA256, hardware custody uses a device-local secret), restoring unlinkability.
 3. Nonce format contradiction between minting (UUID v4) and validation ({unix_millis}-{hex16})
 
 **HIGH findings** (significant risk if not addressed):

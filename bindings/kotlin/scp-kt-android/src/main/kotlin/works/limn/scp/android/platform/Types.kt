@@ -268,9 +268,16 @@ interface KeyCustodyProvider {
     /**
      * Derive a deterministic, context-scoped pseudonym keypair.
      *
-     * Algorithm (all implementations MUST produce identical output):
-     *   1. `seed = HMAC-SHA256(identity_key_material, contextId || "scp-pseudonym")`
-     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+     * Algorithm (spec §9.10.4.A). The HMAC key is a private-derived
+     * `pseudonym_secret`, NEVER the public key (public-key keying would be a
+     * membership-enumeration oracle):
+     *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`
+     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
+     *
+     * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+     * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Hardware
+     * custody: a device-local secret inside the secure boundary — device-local
+     * by design (not identical across devices).
      *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.

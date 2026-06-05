@@ -2,11 +2,11 @@
 
 ## AppleKeyCustody Biometric Gating Review (2026-03-08, #392)
 
-### Critical: Pseudonym HMAC key mismatch (Swift vs Rust)
-- Swift `derivePseudonym` uses **private** key bytes as HMAC key (line 731)
-- Rust `InMemoryKeyCustody::derive_pseudonym` uses **public** key bytes (ADR-027 amendment)
-- This breaks cross-platform determinism — the core requirement of ADR-027
-- Golden vector test would catch this but cannot compile (`storePrivateKeyBytes` is `private`, `@testable` only exposes `internal`)
+### RESOLVED: Pseudonym HMAC key model (spec §9.10.4.A)
+- HMAC key is the private-derived `pseudonym_secret`, NEVER the public key (public-key keying = membership-enumeration oracle).
+- Software custody (Swift + Rust + Kotlin): `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1")`; all software impls produce IDENTICAL pseudonyms (pinned by KAT §25.19).
+- Hardware custody (Secure Enclave / TEE): device-local secret, device-local by design.
+- The earlier ADR-027 "use public key bytes" amendment was REJECTED. Do not "fix" correct private-seed code toward the public key.
 
 ### High: publicKey() triggers biometric under .required policy
 - `publicKey()` calls `fetchPrivateKeyBytes` (line 547) which hits biometric-gated Keychain item

@@ -94,7 +94,14 @@ extern "C" {
     ) -> Result<Vec<u8>, JsValue>;
 
     /// Derive a context-scoped Ed25519 pseudonym keypair.
-    /// Algorithm: seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym"), Ed25519_keygen(seed[0..32])
+    /// The injected JS custody (browser/software, e.g. WebCrypto) MUST use:
+    ///   seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
+    ///   Ed25519_keygen(seed[0..32])   // seed is an RFC-8032 Ed25519 seed
+    /// where pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+    /// salt="scp-pseudonym-secret-v1", info="", len=32). The HMAC key is the
+    /// pseudonym_secret, NEVER the public key (public key bytes would be a
+    /// membership-enumeration oracle, §9.10.4.A). WASM custody is software, so this
+    /// derivation is cross-platform deterministic and matches the §25.19 vectors.
     /// Returns a JS object: { publicKeyBytes: Uint8Array, keyId: string }
     #[wasm_bindgen(method, catch, js_name = "derivePseudonym")]
     pub fn derive_pseudonym(

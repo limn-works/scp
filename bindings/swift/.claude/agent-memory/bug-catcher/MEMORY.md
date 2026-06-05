@@ -2,12 +2,10 @@
 
 ## AppleKeyCustody Review (2026-03-08)
 
-### CRITICAL: derivePseudonym uses private key bytes as HMAC key
-- Swift `derivePseudonym` at line 731 uses `privateKeyBytes` as HMAC key
-- Rust reference (InMemoryKeyCustody line 369) uses `verifying_key()` (public key bytes)
-- UniFFI trait doc (line 384) mandates `HMAC-SHA256(public_key_bytes, ...)`
-- ADR-027 amendment requires public key bytes for cross-platform determinism
-- Golden vector test (line 291) can't compile: calls `private` method via `@testable`
+### RESOLVED: derivePseudonym HMAC key is the private-derived pseudonym_secret
+- UniFFI/WASM trait docs specify the HMAC key is the private-derived `pseudonym_secret` (HKDF-SHA256 over the Ed25519 private seed for software custody; device-local secret for hardware), NEVER the public key — public-key-keyed derivation is a rejected enumeration oracle (§9.10.4.A). Do not "fix" correct private-seed code toward the public key.
+- The earlier "ADR-027 amendment requires public key bytes" claim is REJECTED — public keys are publicly derivable, so a public-key-keyed pseudonym is a membership-enumeration oracle.
+- Golden vector tests must assert the private-seed-HKDF derivation, not a public-key-based HMAC.
 
 ### HIGH: publicKey() triggers biometric prompt
 - publicKey calls `fetchPrivateKeyBytes` which does `kSecReturnData = true`

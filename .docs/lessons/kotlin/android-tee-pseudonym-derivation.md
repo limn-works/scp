@@ -1,26 +1,60 @@
-# Android TEE Pseudonym Derivation — HMAC Key Material
+# Pseudonym Derivation — HMAC Key Material (Software vs Hardware Custody)
 
-**Problem**: `derivePseudonym` in `AndroidKeyCustody` uses the public key bytes as the HMAC key
-material for hardware-backed Ed25519 keys. This is not because it is correct, but because the
-Android Keystore TEE does not allow private key bytes to be exported — they are inaccessible
-outside the secure enclave. ADR-006 says `HMAC-SHA256(identity_key_material, ...)` but does not
-define what "key material" means when the private key is in a TEE.
+**Decision**: The per-context pseudonym keypair is derived as
 
-**Impact**: If the Apple adapter uses private key bytes as the HMAC key, the Android 13+ adapter
-will derive a *different pseudonym* for the same identity in the same context. Cross-platform test
-vectors will fail. A user who upgrades from API 26-32 (software key, can use private bytes) to
-API 33+ (hardware key, must use public key) will have their pseudonym silently change in every
-context they participate in.
+```
+seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")          // v1 (static)
+seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(epoch) || "scp-pseudonym-v2")  // v2 (rotatable)
+pseudonym_keypair = Ed25519_keygen(seed[0..32])   // seed is an RFC-8032 Ed25519 seed, not a clamped scalar
+```
 
-**Resolution**: The spec must be amended before any cross-platform test vectors are written.
-Options:
-1. All adapters use the **public key** as the HMAC key (32 bytes, always accessible). This is the
-   only option that works uniformly across TEE and software keys.
-2. All adapters use the **private key** as the HMAC key, and Android software fallback (API 26-32)
-   does too. This breaks on API 33+ hardware-backed keys.
+The HMAC key is the 32-byte `pseudonym_secret`, **never the public key**. How the
+`pseudonym_secret` is obtained differs by custody type:
 
-Option 1 is correct. Update ADR-006 acceptance criterion 6 and the cross-platform test vectors to
-read: `seed = HMAC-SHA256(public_key_bytes, contextId || "scp-pseudonym")`.
+- **Software custody** (Rust `InMemory`/`File`/`SQLite`, Android Bouncy Castle API 26-32,
+  Apple software Keychain, WASM/JS WebCrypto):
+  `pseudonym_secret = HKDF-SHA256(ikm = ed25519_private_seed, salt = "scp-pseudonym-secret-v1", info = "", len = 32)`.
+  This is byte-identical across every platform, so software pseudonyms are **cross-platform
+  deterministic**. The canonical implementation is `derive_pseudonym_secret()` /
+  `derive_pseudonym_keypair()` in `crates/scp-platform/src/pseudonym.rs`. Known-answer
+  vectors are pinned in `.docs/specs/25-test-vectors.md` §25.19.
 
-**Where to fix**: ADR-006 acceptance criterion 6, ADR-027 §Rationale, and the same comment in
-`AndroidKeyCustody.kt` at `derivePseudonym`.
+- **Hardware custody** (Android Keystore TEE API 33+, Apple Secure Enclave, HSM):
+  the private key bytes are **non-exportable** — they never leave the secure boundary. The
+  `pseudonym_secret` is therefore a **device-local** value computed inside the boundary.
+  Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` (Ed25519 signing is deterministic
+  per RFC 8032, so this is reproducible on that device). Hardware pseudonyms are
+  **device-local by design** and are intentionally NOT identical across devices or to the
+  software vectors.
+
+## Why NOT the public key
+
+An earlier proposal used the raw Ed25519 **public key** bytes as the HMAC key, motivated by
+the fact that the public key is the only key material accessible for a TEE-backed key, which
+would have made all custody types produce identical pseudonyms.
+
+**This was rejected.** The public key is public by definition. If it were the HMAC key, any
+party who knows a member's public key and a `context_id` could compute
+`HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")` and probe relays to detect
+whether that pseudonym is an active subscription — a **membership-enumeration oracle**
+(spec §9.10.4.A). Using a secret known only to the key holder is what makes the pseudonym
+unguessable, which is the entire point of pseudonymous routing.
+
+## Why hardware being device-local is fine
+
+Cross-device pseudonym identity is **not** a protocol requirement. Hardware keys are
+non-exportable precisely so the private material cannot be copied — that is the security
+property hardware custody exists to provide. A participant moving to a new device uses the
+social/device recovery protocol (spec §3.3), which provisions a fresh identity (and thus a
+fresh device-local `pseudonym_secret`) at the destination. "The key is the key" — we do not
+need deterministic pseudonym generation across devices for hardware-bound keys.
+
+## Where this lives
+
+- Canonical recipe + KAT: `crates/scp-platform/src/pseudonym.rs`
+  (`derive_pseudonym_secret`, `derive_pseudonym_keypair`).
+- Software backends: `file.rs`, `sqlite/key_custody.rs`, `testing/key_custody.rs`.
+- Android adapter: `bindings/kotlin/scp-kt-android/.../AndroidKeyCustody.kt`
+  (`derivePseudonym`, `derivePseudonymSecret`).
+- Spec: §9.10.4, §9.10.4.A, §9.10.4.1; vectors in §25.19.
+- ADRs: ADR-006 acceptance criterion 6 (phase-1), ADR-027 (phase-6).

@@ -751,7 +751,7 @@ public extension AppleKeyCustody {
 
     /// Derives a deterministic, context-scoped Ed25519 pseudonym keypair.
     ///
-    /// ## Algorithm (ADR-006, spec section 9.10.4A):
+    /// ## Algorithm (ADR-006, spec section 9.10.4.A):
     /// 1. Retrieve the Ed25519 private key bytes for `keyHandle` from Keychain.
     /// 2. Derive `pseudonym_secret = HKDF-SHA256(ikm: private_key_bytes,
     ///    salt: "scp-pseudonym-secret-v1", info: "", len: 32)`.
@@ -760,7 +760,7 @@ public extension AppleKeyCustody {
     /// 5. Store the derived private key in Keychain under a deterministic handle.
     /// 6. Return a ``PseudonymResult`` with the 32-byte public key and the handle.
     ///
-    /// **CRITICAL:** Using public key bytes as the HMAC key (pre-#1494) would
+    /// **CRITICAL:** Using public key bytes as the HMAC key would
     /// be a membership enumeration oracle — anyone who knows a member's public
     /// key could compute their pseudonym for any context ID and check relay
     /// subscriptions. The `pseudonym_secret` is derived from private key bytes
@@ -783,7 +783,7 @@ public extension AppleKeyCustody {
     ///   ``PlatformError/custodyError(_:)`` for HMAC or keygen failures.
     ///
     /// See ADR-025 Key custody, ADR-006 `derive_pseudonym`, spec section
-    /// 9.10.4A, and `InMemoryKeyCustody.derive_pseudonym` in
+    /// 9.10.4.A, and `InMemoryKeyCustody.derive_pseudonym` in
     /// `scp-platform/src/testing/key_custody.rs` for the canonical Rust
     /// reference implementation.
     @concurrent
@@ -803,7 +803,7 @@ public extension AppleKeyCustody {
 
         do {
             // Derive pseudonym_secret from private key via HKDF-SHA256 (spec
-            // section 9.10.4A). This prevents membership enumeration attacks:
+            // section 9.10.4.A). This prevents membership enumeration attacks:
             // only the key holder can compute pseudonyms.
             let pseudonymSecret = HKDF<SHA256>.deriveKey(
                 inputKeyMaterial: SymmetricKey(data: privateKeyBytes),

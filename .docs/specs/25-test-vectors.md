@@ -642,3 +642,66 @@ cargo test -p scp-event-log --test test_vectors -- --nocapture
 The test vector generation test is defined in `crates/scp-core/tests/test_vectors.rs` and `crates/scp-event-log/tests/test_vectors.rs`. These tests print hex-encoded intermediate and final values for each vector defined above.
 
 Independent implementations SHOULD run these tests against the Rust implementation to obtain the expected outputs, then embed those outputs in their own test suites.
+
+## 25.19 Per-Context Pseudonym Derivation Vectors (§9.10.4, §9.10.4.A, §9.10.4.1)
+
+These vectors pin the **software-custody** per-context pseudonym keypair derivation. Software custody is cross-platform deterministic: every SDK (Rust, Swift, Kotlin, TypeScript) MUST reproduce the exact public-key bytes below for the same identity seed, `context_id`, and epoch. **Hardware custody** (Secure Enclave, Android Keystore TEE, HSM) is device-local by design — the `pseudonym_secret` is derived inside the hardware boundary from a non-exportable key, so hardware pseudonyms are NOT expected to match these values and are NOT cross-device deterministic (§9.10.4.A).
+
+Derivation recipe (all implementations agree):
+
+```
+pseudonym_secret = HKDF-SHA256(
+  ikm  = ed25519_private_seed_bytes (32 bytes),
+  salt = "scp-pseudonym-secret-v1",
+  info = "",                                   (empty)
+  len  = 32
+)
+
+# v1 (static):
+context_seed_v1 = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
+
+# v2 (rotatable, BE64 epoch):
+context_seed_v2 = HMAC-SHA256(pseudonym_secret, context_id || BE64(epoch) || "scp-pseudonym-v2")
+
+pseudonym_public_key = Ed25519_keygen(context_seed[0..32]).public_key
+```
+
+The 32-byte `context_seed` is interpreted as an **RFC-8032 Ed25519 seed** (fed to the standard key expansion: SHA-512 of the seed, then clamp the lower half to form the scalar), NOT as a pre-clamped scalar. The HMAC `data` is plain concatenation with NO length prefixes — these are fixed-format internal inputs, and the domain-separator suffix (`"scp-pseudonym"` vs `"scp-pseudonym-v2"`) plus the fixed 8-byte BE64 epoch make the encoding unambiguous.
+
+### Vector 30: Pseudonym Derivation — identity seed 0x01×32
+
+```
+Input:
+  ed25519_private_seed:  0x0101010101010101010101010101010101010101010101010101010101010101
+  context_id:            "context-alpha"  (0x636f6e746578742d616c706861, 13 bytes)
+  epoch (v2):            1
+
+Expected pseudonym_secret:
+  0x27456a3dd24ed5813b2645f0ee001f57760c49b9117b93c8fa98e4129d36a643
+
+Expected v1 pseudonym public key:
+  0xfddc04882a48aa39888f6dbec622f9c5aa6f06b2e40820a69a2e0e89b5f09ac2
+
+Expected v2 pseudonym public key (epoch = 1):
+  0x43e50a947c4b2be44f871e309c7edc64afaf4207b9a589c9b01f61c01158090f
+```
+
+### Vector 31: Pseudonym Derivation — identity seed 0x9d,0x01..0x1f
+
+```
+Input:
+  ed25519_private_seed:  0x9d0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+  context_id:            "context-alpha"  (0x636f6e746578742d616c706861, 13 bytes)
+  epoch (v2):            1
+
+Expected pseudonym_secret:
+  0xa586191a1ab6cd3efe45697b3510ee1edac8c54a7f27863546b6e0333e20d690
+
+Expected v1 pseudonym public key:
+  0xff6e2e909a008318f97bb2c26c1d787ceb9aa2996f746766335e10ba7e2213cc
+
+Expected v2 pseudonym public key (epoch = 1):
+  0xedd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639
+```
+
+These vectors are mechanically enforced by the Rust known-answer test `derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-platform/src/pseudonym.rs`.

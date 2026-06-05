@@ -54,9 +54,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use hmac::{Hmac, Mac};
 use rand::RngCore;
-use sha2::Sha256;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -538,7 +536,7 @@ impl FileKeyCustody {
     }
 }
 
-use crate::pseudonym::derive_pseudonym_secret;
+use crate::pseudonym::derive_pseudonym_keypair;
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
@@ -793,18 +791,11 @@ impl KeyCustody for FileKeyCustody {
             let handle = KeyHandle::new(key_id);
             let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
 
-            // HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
-            // Uses a secret derived from the private key via HKDF (§9.10.4A),
+            // Software custody: pseudonym keypair = Ed25519_keygen(HMAC-SHA256(
+            //   pseudonym_secret, context_id || "scp-pseudonym")), where the
+            // pseudonym_secret is derived from the private seed via HKDF (§9.10.4.A),
             // NOT the public key, to prevent membership enumeration attacks.
-            let pseudonym_secret = derive_pseudonym_secret(&signing_key);
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
-                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-            mac.update(&context_id);
-            mac.update(b"scp-pseudonym");
-            let hmac_bytes = Zeroizing::new(mac.finalize().into_bytes());
-            let mut hmac_output = Zeroizing::new([0u8; 32]);
-            hmac_output.copy_from_slice(&hmac_bytes[..32]);
-            let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);
+            let pseudonym_signing_key = derive_pseudonym_keypair(&signing_key, &context_id, None);
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             // Store derived key in memory (pseudonyms are software-managed).
@@ -832,19 +823,13 @@ impl KeyCustody for FileKeyCustody {
             let handle = KeyHandle::new(key_id);
             let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
 
-            // HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
-            // Uses a secret derived from the private key via HKDF (§9.10.4A),
-            // NOT the public key, to prevent membership enumeration attacks.
-            let pseudonym_secret = derive_pseudonym_secret(&signing_key);
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
-                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-            mac.update(&context_id);
-            mac.update(&pseudonym_epoch.to_be_bytes());
-            mac.update(b"scp-pseudonym-v2");
-            let hmac_bytes = Zeroizing::new(mac.finalize().into_bytes());
-            let mut hmac_output = Zeroizing::new([0u8; 32]);
-            hmac_output.copy_from_slice(&hmac_bytes[..32]);
-            let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);
+            // Software custody: rotatable pseudonym keypair = Ed25519_keygen(
+            //   HMAC-SHA256(pseudonym_secret, context_id || epoch_BE
+            //   || "scp-pseudonym-v2")). The pseudonym_secret is derived from the
+            // private seed via HKDF (§9.10.4.A), NOT the public key, to prevent
+            // membership enumeration attacks. epoch_BE breaks long-term correlation.
+            let pseudonym_signing_key =
+                derive_pseudonym_keypair(&signing_key, &context_id, Some(pseudonym_epoch));
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             let pseudo_handle = self.next_handle();
