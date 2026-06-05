@@ -27,11 +27,11 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.Signature
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.security.spec.NamedParameterSpec
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
