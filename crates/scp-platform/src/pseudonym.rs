@@ -1,7 +1,7 @@
 //! Shared pseudonym secret derivation and keypair derivation for all
 //! [`KeyCustody`](crate::traits::KeyCustody) backends.
 //!
-//! CRITICAL PRIVACY REQUIREMENT (§9.10.4A): Using public key bytes as the
+//! CRITICAL PRIVACY REQUIREMENT (§9.10.4.A): Using public key bytes as the
 //! HMAC key for pseudonym derivation would be a membership enumeration oracle —
 //! anyone who knows a member's public key could compute their pseudonym for any
 //! `context_id` and check relay subscriptions. The `pseudonym_secret` is derived
@@ -14,7 +14,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-/// Salt for HKDF-SHA-256 pseudonym secret derivation (§9.10.4A).
+/// Salt for HKDF-SHA-256 pseudonym secret derivation (§9.10.4.A).
 const PSEUDONYM_SECRET_SALT: &[u8] = b"scp-pseudonym-secret-v1";
 
 /// Domain separator for v1 (static) pseudonym derivation (§9.10.4).

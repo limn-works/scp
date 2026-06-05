@@ -202,7 +202,7 @@ impl SharedSecret {
 ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
 ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
 ///
-/// The HMAC key is the 32-byte `pseudonym_secret` (NEVER the public key, §9.10.4A).
+/// The HMAC key is the 32-byte `pseudonym_secret` (NEVER the public key, §9.10.4.A).
 /// The returned keypair is always software-managed regardless of whether the
 /// source identity key is hardware-backed.
 #[derive(Debug, Clone)]
@@ -395,7 +395,7 @@ pub trait KeyCustody: Send + Sync {
     ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])` — `seed` is an RFC-8032 Ed25519 seed
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (public
-    /// key bytes would be a membership-enumeration oracle, §9.10.4A). For SOFTWARE
+    /// key bytes would be a membership-enumeration oracle, §9.10.4.A). For SOFTWARE
     /// keys the `pseudonym_secret` is HKDF-derived from the private seed and is
     /// cross-platform deterministic (pinned by §25.19 vectors). For HARDWARE keys
     /// (Secure Enclave, Keystore TEE, HSM) the private key is non-exportable, so the
@@ -432,7 +432,7 @@ pub trait KeyCustody: Send + Sync {
     ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])` — `seed` is an RFC-8032 Ed25519 seed
     ///
     /// where `epoch_BE` is the `pseudonym_epoch` as an 8-byte big-endian u64. As in
-    /// v1, the HMAC key is the `pseudonym_secret` (NEVER the public key, §9.10.4A):
+    /// v1, the HMAC key is the `pseudonym_secret` (NEVER the public key, §9.10.4.A):
     /// software custody is cross-platform deterministic, hardware custody is
     /// device-local by design.
     ///

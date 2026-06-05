@@ -10,6 +10,8 @@
 //! 1. `seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")`
 //! 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
 //!
+//! Here `identity_key_material` is the private-derived `pseudonym_secret` (HKDF-SHA256 over the Ed25519 private seed; spec §9.10.4.A), NEVER the public key.
+//!
 //! # Rotatable derivation (v2 — epoch > 0)
 //!
 //! To mitigate relay-side pseudonym correlation (BLACK-001), pseudonyms can
@@ -40,6 +42,8 @@ use scp_protocol::envelope::EnvelopeError;
 /// seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")
 /// pseudonym_keypair = Ed25519_keygen(seed[0..32])
 /// ```
+///
+/// Here `identity_key_material` is the private-derived `pseudonym_secret` (HKDF-SHA256 over the Ed25519 private seed; spec §9.10.4.A), NEVER the public key.
 ///
 /// The pseudonym keypair's public key is the `routing_id` used in outer
 /// envelopes. Same identity key + same `context_id` always produces the same

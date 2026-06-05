@@ -365,7 +365,7 @@ impl KeyCustody for InMemoryKeyCustody {
 
             // Software custody: pseudonym keypair = Ed25519_keygen(HMAC-SHA256(
             //   pseudonym_secret, context_id || "scp-pseudonym")), where the
-            // pseudonym_secret is derived from the private seed via HKDF (§9.10.4A),
+            // pseudonym_secret is derived from the private seed via HKDF (§9.10.4.A),
             // NOT the public key, to prevent membership enumeration attacks.
             let pseudonym_signing_key = derive_pseudonym_keypair(signing_key, &context_id, None);
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
@@ -412,7 +412,7 @@ impl KeyCustody for InMemoryKeyCustody {
             // Software custody: rotatable pseudonym keypair = Ed25519_keygen(
             //   HMAC-SHA256(pseudonym_secret, context_id || epoch_BE
             //   || "scp-pseudonym-v2")). The pseudonym_secret is derived from the
-            // private seed via HKDF (§9.10.4A), NOT the public key, to prevent
+            // private seed via HKDF (§9.10.4.A), NOT the public key, to prevent
             // membership enumeration attacks. epoch_BE breaks long-term correlation.
             let pseudonym_signing_key =
                 derive_pseudonym_keypair(signing_key, &context_id, Some(pseudonym_epoch));
@@ -932,7 +932,7 @@ mod tests {
     /// Verifies that `derive_pseudonym` is deterministic and that different
     /// context IDs produce different pseudonyms. The `expected_seed` value is
     /// computed from the reference HMAC-SHA256 algorithm using an HKDF-derived
-    /// pseudonym secret from the private key (§9.10.4A). This golden vector is
+    /// pseudonym secret from the private key (§9.10.4.A). This golden vector is
     /// authoritative for cross-language (Swift, Kotlin, TypeScript) verification.
     #[tokio::test]
     async fn derive_pseudonym_cross_platform_golden_vector() {
@@ -947,7 +947,7 @@ mod tests {
 
         // Compute expected pseudonym seed using the reference algorithm directly:
         // seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
-        // §9.10.4A: HMAC key is a secret derived from the private key via HKDF,
+        // §9.10.4.A: HMAC key is a secret derived from the private key via HKDF,
         // NOT the public key, to prevent membership enumeration attacks.
         let identity_signing_key = SigningKey::from_bytes(&seed_bytes);
         let pseudonym_secret = derive_pseudonym_secret(&identity_signing_key);

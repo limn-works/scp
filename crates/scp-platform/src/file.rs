@@ -793,7 +793,7 @@ impl KeyCustody for FileKeyCustody {
 
             // Software custody: pseudonym keypair = Ed25519_keygen(HMAC-SHA256(
             //   pseudonym_secret, context_id || "scp-pseudonym")), where the
-            // pseudonym_secret is derived from the private seed via HKDF (§9.10.4A),
+            // pseudonym_secret is derived from the private seed via HKDF (§9.10.4.A),
             // NOT the public key, to prevent membership enumeration attacks.
             let pseudonym_signing_key = derive_pseudonym_keypair(&signing_key, &context_id, None);
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
@@ -826,7 +826,7 @@ impl KeyCustody for FileKeyCustody {
             // Software custody: rotatable pseudonym keypair = Ed25519_keygen(
             //   HMAC-SHA256(pseudonym_secret, context_id || epoch_BE
             //   || "scp-pseudonym-v2")). The pseudonym_secret is derived from the
-            // private seed via HKDF (§9.10.4A), NOT the public key, to prevent
+            // private seed via HKDF (§9.10.4.A), NOT the public key, to prevent
             // membership enumeration attacks. epoch_BE breaks long-term correlation.
             let pseudonym_signing_key =
                 derive_pseudonym_keypair(&signing_key, &context_id, Some(pseudonym_epoch));
