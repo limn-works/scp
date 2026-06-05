@@ -546,6 +546,45 @@ pub(crate) fn validate_outlet_ucan(
 /// See ADR-013 §4: `py_outlet_invoke(handle, outlet_id, input, identity) -> PyObject`.
 /// See SCP-212 for the handler registration and dispatch design.
 /// See spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
+///
+/// Builds the Phase-2 executor closure for an outlet invocation.
+///
+/// The runtime invokes this WITHOUT holding the `contexts` mutex. When a
+/// Python handler is registered it dispatches to it; otherwise it falls back
+/// to schema-only echo mode (`"status": "validated"`), matching the prior
+/// PyO3 behavior. Extracted from [`py_outlet_invoke`] so the public bridge
+/// function stays under the per-function line ceiling and the dispatch
+/// behavior has a single, named definition.
+fn build_outlet_executor(
+    handler: Option<crate::runtime::OutletHandler>,
+    context_id: String,
+    outlet_id: String,
+    invoker_did: String,
+) -> impl FnOnce(
+    serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
+> {
+    move |input: serde_json::Value| {
+        let input_for_echo = input.clone();
+        Box::pin(async move {
+            handler.map_or_else(
+                || {
+                    Ok(serde_json::json!({
+                        "tool": outlet_id,
+                        "context": context_id,
+                        "status": "validated",
+                        "input_valid": true,
+                        "invoker_did": invoker_did,
+                        "validated_input": input_for_echo,
+                    }))
+                },
+                |h| h(input).map_err(|e| format!("tool handler for '{outlet_id}' failed: {e}")),
+            )
+        })
+    }
+}
+
 #[pyfunction]
 #[pyo3(name = "context_outlet_invoke")]
 #[pyo3(signature = (context_id, outlet_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
@@ -596,19 +635,14 @@ pub fn py_outlet_invoke(
     // `caveat_enforcement: None`), so a delegated UCAN's `max_calls`,
     // `amount_max_cumulative`, `rate_window`, `allowed_target_dids`, and
     // narrowed `input_schema` were NEVER enforced on single-shot — a trivial
-    // authorization bypass. Parse the token to recover its `nb` + CID; the
-    // runtime OWNS the counter store and the fail-closed guard, so the
-    // bridge only supplies the validated caveats. `parse_ucan` cannot fail
-    // here — `validate_outlet_ucan` already validated the same string — but
-    // surface a clean error rather than unwrap.
-    let action_ucan_parsed = scp_core::crypto::ucan::validate::parse_ucan(ucan_token)
-        .map_err(|e| ScpPyError::ucan(format!("failed to parse action UCAN: {e}")))?;
-    let effective_caveats = action_ucan_parsed
-        .payload
-        .nb
-        .clone()
-        .unwrap_or_else(scp_core::trust::caveats::InvocationCaveats::empty);
-    let action_ucan_cid = scp_core::crypto::ucan::mint::compute_cid(&action_ucan_parsed);
+    // authorization bypass. The shared `resolve_action_caveats` helper
+    // recovers the `nb` + CID (same parse all three native bridges use); the
+    // runtime OWNS the counter store and the fail-closed guard, so the bridge
+    // only supplies the validated caveats. Parsing cannot fail here —
+    // `validate_outlet_ucan` already validated the same string — but surface
+    // a clean error rather than unwrap.
+    let (effective_caveats, action_ucan_cid) =
+        scp_ffi_common::caveats::resolve_action_caveats(ucan_token).map_err(ScpPyError::ucan)?;
 
     // Parse the optional spending UCAN JWT (§19.5 AND-composition). We
     // parse it once here so an invalid JWT surfaces as a clean
@@ -647,32 +681,12 @@ pub fn py_outlet_invoke(
     // `contexts` mutex. The closure dispatches to a registered Python
     // handler when present and falls back to schema-only echo mode
     // otherwise (matching the prior PyO3 behavior).
-    let ctx_id_for_executor = ctx_id_owned.clone();
-    let outlet_id_for_executor = outlet_id_owned.clone();
-    let identity_did_for_executor = identity_did_owned.clone();
-    let executor = move |input: serde_json::Value| {
-        let handler = handler.clone();
-        let input_for_echo = input.clone();
-        async move {
-            handler.map_or_else(
-                || {
-                    Ok(serde_json::json!({
-                        "tool": outlet_id_for_executor,
-                        "context": ctx_id_for_executor,
-                        "status": "validated",
-                        "input_valid": true,
-                        "invoker_did": identity_did_for_executor,
-                        "validated_input": input_for_echo,
-                    }))
-                },
-                |h| {
-                    h(input).map_err(|e| {
-                        format!("tool handler for '{outlet_id_for_executor}' failed: {e}")
-                    })
-                },
-            )
-        }
-    };
+    let executor = build_outlet_executor(
+        handler,
+        ctx_id_owned.clone(),
+        outlet_id_owned.clone(),
+        identity_did_owned.clone(),
+    );
 
     // Dispatch to the runtime via the global tokio runtime. PyO3 calls
     // are sync; the Python SDK wrapper invokes us via `asyncio.to_thread`
@@ -692,7 +706,7 @@ pub fn py_outlet_invoke(
     // resolves the durable counter store itself and FAILS CLOSED on any
     // counter-bearing cap it cannot enforce.
     let caveat_enforcement = effective_caveats.requires_post_input_check().then(|| {
-        scp_core::context::manager::outlets::CaveatEnforcement {
+        scp_core::context::manager::CaveatEnforcement {
             caveats: &effective_caveats,
             ucan_cid: &action_ucan_cid,
             // The PyO3 single-shot surface negotiates neither a payment

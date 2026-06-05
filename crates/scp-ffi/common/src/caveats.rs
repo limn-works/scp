@@ -80,6 +80,45 @@ pub fn caveats_to_json(caveats: &InvocationCaveats) -> Result<String, String> {
         .map_err(|e| format!("InvocationCaveats serialization failed: {e}"))
 }
 
+/// Resolves the §7.3.8 effective invocation caveats and CID from an
+/// already-validated action UCAN token (single-shot outlet invoke).
+///
+/// The non-streaming outlet invoke must enforce the SAME §7.3.8 post-input
+/// caveat gate the streaming path enforces. The action UCAN's
+/// validated-narrowed `nb` field IS the effective caveat set; its CID forms
+/// half of the durable counter-store key (`(context_id, ucan_cid,
+/// caveat_kind)`). Each native bridge (PyO3, NAPI, UniFFI) validates the
+/// token through the full 11-step ADR-016 pipeline, then calls this helper to
+/// recover the caveat set + CID so it can build a
+/// [`scp_core::context::manager::CaveatEnforcement`] bundle. Centralizing the
+/// parse here means a single source of truth for what "effective caveats"
+/// means across the three native bridges — a bridge cannot drift by parsing
+/// differently.
+///
+/// `nb == None` (no invocation caveats minted) decodes to
+/// [`InvocationCaveats::empty`], for which
+/// [`InvocationCaveats::requires_post_input_check`] is `false` and the caller
+/// builds no enforcement bundle — identical to the streaming path's gate.
+///
+/// # Errors
+///
+/// Returns the wrapped parse error as a string. In practice this is
+/// unreachable: the caller has already validated the same token string
+/// through the ADR-016 pipeline (which parses it). Bridges map the string
+/// into their idiomatic UCAN/permission error envelope rather than unwrap.
+#[cfg(feature = "resolvers")]
+pub fn resolve_action_caveats(ucan_token: &str) -> Result<(InvocationCaveats, String), String> {
+    let parsed = scp_core::crypto::ucan::validate::parse_ucan(ucan_token)
+        .map_err(|e| format!("failed to parse action UCAN: {e}"))?;
+    let effective = parsed
+        .payload
+        .nb
+        .clone()
+        .unwrap_or_else(InvocationCaveats::empty);
+    let cid = scp_core::crypto::ucan::mint::compute_cid(&parsed);
+    Ok((effective, cid))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

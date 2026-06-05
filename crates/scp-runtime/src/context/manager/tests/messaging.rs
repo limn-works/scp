@@ -5339,8 +5339,9 @@ async fn manager_dispatch_query_outlet_misdeclared_emits_signal() {
 //   3. the per-context `MemberBudgetTracker` snapshot is read at dispatch
 //      time and AND-composed with the SpendingCapability ceiling.
 //
-// `caveat_test_setup` reuses the SCP-OUT-021 fixtures (counter store, signed
-// spending UCAN, granted budget, registered echo outlet).
+// `caveat_test_setup` reuses the SCP-OUT-021 fixtures (runtime-owned counter
+// store wired onto the manager, signed spending UCAN, granted budget,
+// registered echo outlet).
 // =============================================================================
 
 /// SCP-OUT-021 dispatch wiring AC: dispatching with `max_calls: 2` admits
@@ -5357,7 +5358,7 @@ async fn dispatch_with_economy_max_calls_rejects_after_cap_reached() {
         MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
     };
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         max_calls: Some(2),
         ..InvocationCaveats::empty()
@@ -5388,7 +5389,6 @@ async fn dispatch_with_economy_max_calls_rejects_after_cap_reached() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         let caveats = caveats.clone();
         let exec_ref = &exec;
@@ -5407,7 +5407,6 @@ async fn dispatch_with_economy_max_calls_rejects_after_cap_reached() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,
@@ -5444,7 +5443,7 @@ async fn dispatch_with_economy_amount_max_cumulative_rejects_when_exhausted() {
         MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
     };
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         amount_max_cumulative: Some(Amount::new(100)),
         ..InvocationCaveats::empty()
@@ -5475,7 +5474,6 @@ async fn dispatch_with_economy_amount_max_cumulative_rejects_when_exhausted() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         let caveats = caveats.clone();
         let exec_ref = &exec;
@@ -5494,7 +5492,6 @@ async fn dispatch_with_economy_amount_max_cumulative_rejects_when_exhausted() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,
@@ -5669,7 +5666,7 @@ async fn dispatch_with_economy_spending_capability_denies_over_max_per_action() 
         MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
     };
 
-    let (manager, registry, _ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, _ucan, ucan_cid) = caveat_test_setup().await;
     // Tight per-action ceiling (5 USD); estimated cost = 100 must reject
     // at the SpendingCapability layer (§19.5) inside `evaluate_all_layers`.
     let tight_ucan = dummy_spending_ucan_with_cap(&"did:key:invoker".into(), 5, 1_000_000);
@@ -5717,7 +5714,6 @@ async fn dispatch_with_economy_spending_capability_denies_over_max_per_action() 
             None,
             Some(crate::context::manager::outlets::CaveatEnforcement {
                 caveats: &caveats,
-                counter_store,
                 ucan_cid: &ucan_cid,
                 negotiated_adapter: None,
                 target_did: None,
