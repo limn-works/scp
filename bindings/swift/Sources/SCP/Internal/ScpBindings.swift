@@ -11950,14 +11950,21 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     /**
      * Derive a deterministic, context-scoped Ed25519 pseudonym keypair.
      *
-     * Algorithm (all implementations MUST produce identical output):
-     * 1. `seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")`
-     * 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+     * The actual derivation runs inside the injected platform `KeyCustody`
+     * callback (Swift Keychain/Secure Enclave, Kotlin Keystore). Algorithm:
+     * 1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+     * 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // seed is an RFC-8032 Ed25519 seed
      *
-     * ADR-027 amendment: use public key bytes as HMAC key for cross-platform
-     * determinism with hardware TEE keys.
+     * The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key --
+     * public key bytes would be a membership-enumeration oracle (§9.10.4.A).
+     * For software custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+     * salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic
+     * (§25.19 vectors). For hardware custody (Secure Enclave, Keystore TEE) the
+     * private key is non-exportable, so `pseudonym_secret` is a device-local value
+     * computed inside the secure boundary, and those pseudonyms are device-local
+     * by design.
      *
-     * Returns a two-element list: `[public_key_bytes (32), key_id (string as UTF-8)]`.
+     * Returns a two-element list: `[pseudonym_public_key_bytes (32), key_id (string as UTF-8)]`.
      * The bridge unpacks this into a `PseudonymKeypair`.
      */
     func derivePseudonym(keyId: String, contextId: Data) async throws  -> Data
