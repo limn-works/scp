@@ -760,7 +760,7 @@ public extension AppleKeyCustody {
     /// 5. Store the derived private key in Keychain under a deterministic handle.
     /// 6. Return a ``PseudonymResult`` with the 32-byte public key and the handle.
     ///
-    /// **CRITICAL:** Using public key bytes as the HMAC key (pre-#1494) would
+    /// **CRITICAL:** Using public key bytes as the HMAC key would
     /// be a membership enumeration oracle — anyone who knows a member's public
     /// key could compute their pseudonym for any context ID and check relay
     /// subscriptions. The `pseudonym_secret` is derived from private key bytes
