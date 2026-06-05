@@ -974,9 +974,11 @@ fn record_payment_capture_failure(
 
 /// Creates a new SCP context with the two-phase commit pattern.
 ///
-/// Validates parameters, builds a fresh `PerContextState`, and
-/// registers it through
-/// [`SupervisorHandle::insert_context`](crate::context::supervisor::handle::SupervisorHandle::insert_context).
+/// Validates parameters, builds a fresh `PerContextState`, and hands
+/// it to
+/// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state),
+/// which spawns an actor that OWNS the state and registers its handle
+/// in the supervisor registry (no legacy contexts `DashMap` write).
 /// Calls [`finalize_create`] to set up gauges, governance timeout,
 /// persistence, and TTL timer.
 ///
@@ -1151,27 +1153,20 @@ pub async fn create_context(
         mode,
     };
 
-    // Atomic check-and-insert — eliminates TOCTOU race between
-    // contains_key and insert. Stamps a fresh generation atomically.
-    deps.supervisor
-        .insert_context(context_id.clone(), per_context)?;
-
-    // ADR-049 Phase 2A finalization bootstrap dual-write: every
-    // production context construction now populates BOTH the legacy
-    // contexts DashMap (above) AND the actor registry. The actor
-    // proxies its state through the same `Arc<Mutex<PerContextState>>`
-    // the DashMap holds (`new_dashmap_backed` semantics — see
-    // `Supervisor::spawn_actor_dashmap_backed`), so there is no
-    // divergence during the transition window. Subsequent finalization
-    // sessions delete the DashMap once every legacy consumer is
-    // ported. Bootstrap keeps its `&ActorDeps` borrow alive for
-    // `finalize_create` below; `clone_for_spawn` hands the actor task
-    // an owned bundle without disturbing that borrow.
+    // ADR-049 Phase 2A finalization owned-state spawn: the create path
+    // no longer writes the legacy contexts DashMap. It hands the freshly
+    // built `PerContextState` directly to
+    // `Supervisor::spawn_actor_with_state`, which derives the registry
+    // key from `state.context_id`, registers the handle under the
+    // write lock, and spawns an actor that OWNS its state (no
+    // `Arc<Mutex<PerContextState>>` proxy, no DashMap divergence).
+    // Bootstrap keeps its `&ActorDeps` borrow alive for `finalize_create`
+    // below; `clone_for_spawn` hands the actor task an owned bundle
+    // without disturbing that borrow.
     let owned_deps = deps.clone_for_spawn();
     deps.supervisor
-        .spawn_actor_for_context(context_id.clone(), owned_deps)
-        .await
-        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        .spawn_actor_with_state(per_context, owned_deps, None)
+        .await;
 
     finalize_create(deps, &context_id, params.ttl, &handle).await;
     Ok(handle)
@@ -1184,15 +1179,19 @@ pub async fn create_context(
 /// Post-creation finalization: gauges, governance timeout, persistence,
 /// TTL timer.
 ///
-/// Runs after a fresh `PerContextState` has been registered through
-/// [`SupervisorHandle::insert_context`](crate::context::supervisor::handle::SupervisorHandle::insert_context).
-/// Reaches the supervisor through the handle for cross-context surfaces
-/// (gauges, contexts-arc); the designated-legacy
-/// `start_governance_timeout_task_legacy` is reached via the
-/// [shim escape](
-/// crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-/// because that helper iterates the contexts `DashMap` and stays
-/// legacy-shape until the per-context governance-timeout actor lands.
+/// Runs after a context actor has been spawned and registered. The
+/// `create`/`restore` bootstrap paths register through
+/// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state)
+/// (owned-state spawn — no legacy contexts `DashMap` write); `import`
+/// still registers through
+/// [`SupervisorHandle::replace_context`](crate::context::supervisor::handle::SupervisorHandle::replace_context)
+/// +
+/// [`SupervisorHandle::spawn_actor_for_context`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_for_context)
+/// pending its actor-native replaceability primitive. Every surface
+/// `finalize_create` touches is mailbox-based — gauges, the
+/// governance-timeout interval task, persistence/broadcast, and the TTL
+/// timer all reach the freshly-spawned actor through the supervisor
+/// registry, never the `DashMap`.
 pub async fn finalize_create(
     deps: &ActorDeps,
     context_id: &str,
@@ -1703,9 +1702,11 @@ fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
 /// Restores a context into the supervisor from persisted state.
 ///
 /// Loads the persisted `ContextSnapshot` and optional broadcast state,
-/// reconstructs `PerContextState`, and registers it through
-/// [`SupervisorHandle::insert_context`](crate::context::supervisor::handle::SupervisorHandle::insert_context).
-/// Re-spawns the TTL timer if `ttl_remaining_secs` is `Some`.
+/// reconstructs `PerContextState`, and hands it to
+/// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state),
+/// which spawns an actor that OWNS the rehydrated state and registers
+/// its handle in the supervisor registry (no legacy contexts `DashMap`
+/// write). Re-spawns the TTL timer if `ttl_remaining_secs` is `Some`.
 ///
 /// # Errors
 ///
@@ -1933,20 +1934,16 @@ pub async fn restore_context(
         mode,
     };
 
-    deps.supervisor
-        .insert_context(context_id.to_owned(), per_context)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
-    // ADR-049 Phase 2A finalization bootstrap dual-write: restore
-    // path mirrors create — populate the actor registry alongside the
-    // legacy contexts DashMap. The dashmap-backed actor proxies its
-    // state through the same `Arc<Mutex<PerContextState>>` the
-    // DashMap insert above produced.
+    // ADR-049 Phase 2A finalization owned-state spawn: restore mirrors
+    // create — hand the rehydrated `PerContextState` directly to
+    // `Supervisor::spawn_actor_with_state`. The actor OWNS its state;
+    // the registry key is derived from `state.context_id` and the handle
+    // is registered under the write lock. No legacy contexts DashMap
+    // write, no `Arc<Mutex<PerContextState>>` proxy.
     let owned_deps = deps.clone_for_spawn();
     deps.supervisor
-        .spawn_actor_for_context(context_id.to_owned(), owned_deps)
-        .await
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        .spawn_actor_with_state(per_context, owned_deps, None)
+        .await;
 
     // Start governance timeout task (ADR-031 §5) via the actor mailbox.
     crate::context::governance_helpers::start_governance_timeout_task(&deps.supervisor, context_id)

@@ -305,36 +305,19 @@ impl SupervisorHandle {
     }
 
     // -----------------------------------------------------------------
-    // Lifecycle bootstrap surface (Phase 2A.9).
+    // Lifecycle bootstrap surface (Phase 2A.9 / ADR-049 finalization).
     //
-    // These methods wrap the supervisor's contexts-map operations
-    // through a capability-reduced interface so the actor-shape
-    // bootstrap entry points in
-    // [`crate::context::lifecycle_helpers`] (`create_context`,
-    // `restore_context`, `import_context`) can register fresh
-    // `PerContextState` without holding `&Supervisor` directly.
+    // These methods wrap the supervisor's registry / contexts-map
+    // operations through a capability-reduced interface so the
+    // actor-shape bootstrap entry points in
+    // [`crate::context::lifecycle_helpers`] can register fresh
+    // `PerContextState` without holding `&Supervisor` directly. The
+    // `create`/`restore` paths register through
+    // [`Self::spawn_actor_with_state`] (owned-state spawn); `import`
+    // registers through [`Self::replace_context`] +
+    // [`Self::spawn_actor_for_context`] pending its actor-native
+    // replaceability primitive.
     // -----------------------------------------------------------------
-
-    /// Insert a fresh `PerContextState` into the supervisor's contexts
-    /// map. Stamps the generation counter atomically.
-    ///
-    /// Capability-reduced wrapper around
-    /// [`crate::context::manager_methods::insert_context`] so actor
-    /// bootstrap helpers do not need to hold `&Supervisor` directly.
-    ///
-    /// # Errors
-    ///
-    /// Returns
-    /// [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed)
-    /// if `context_id` is already registered.
-    #[allow(private_interfaces)]
-    pub(crate) fn insert_context(
-        &self,
-        context_id: String,
-        state: crate::context::state::PerContextState,
-    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-        crate::context::manager_methods::insert_context(&self.supervisor, context_id, state)
-    }
 
     /// Initialize a `BroadcastContext` (SCP-227) and persist its
     /// initial state if persistence is configured. Capability-reduced
@@ -498,7 +481,7 @@ impl SupervisorHandle {
     /// `PerContextState` and `ActorDeps` are `pub(crate)` while the
     /// method itself is reachable from inside the `context` module
     /// tree.
-    #[allow(private_interfaces, dead_code)]
+    #[allow(private_interfaces)]
     pub(in crate::context) async fn spawn_actor_with_state(
         &self,
         state: crate::context::actor::state::PerContextState,

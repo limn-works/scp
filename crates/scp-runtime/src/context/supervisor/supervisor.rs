@@ -1193,8 +1193,16 @@ impl Supervisor {
                     p.creator_did,
                     p.local_pseudonym,
                 );
-                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
-                    .await
+                // `Box::pin` the create future: owned-state spawn keeps the
+                // freshly built `PerContextState` live across the spawn
+                // await inside `create_context`, so the future is large
+                // (>16 KiB). Heap-boxing it keeps this lifecycle frame off
+                // the stack.
+                let (outcome, reply_result) = match tokio::time::timeout(
+                    LIFECYCLE_TIMEOUT,
+                    Box::pin(fut),
+                )
+                .await
                 {
                     Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
                     Ok(Err(e)) => {
@@ -2297,9 +2305,6 @@ impl Supervisor {
     /// bodies onto `&mut self.state` + `&self.deps` is 12b.2b's
     /// atomic transition across all nine handler submodules.
     ///
-    /// `dead_code` allow: no production call site yet. 12b.2b is the
-    /// first.
-    #[allow(dead_code)]
     pub(in crate::context) async fn spawn_actor_with_state(
         &self,
         state: crate::context::actor::state::PerContextState,

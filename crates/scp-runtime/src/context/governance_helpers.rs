@@ -2317,12 +2317,12 @@ pub fn execute_modify_hard_rate_limit(
 ///
 /// Returns a hand-boxed `Pin<Box<dyn Future + Send>>` rather than the
 /// usual `async fn` opaque-type future. This signature is mechanical
-/// (ADR-049 Phase 2A finalization bootstrap dual-write): the function
+/// (ADR-049 Phase 2A finalization owned-state spawn): the function
 /// is reachable from `ContextActor::run()` via the migrated governance
 /// dispatch, AND it transitively calls
 /// `lifecycle_helpers::create_context` which now spawns a
 /// `ContextActor::run()` task through
-/// `Supervisor::spawn_actor_dashmap_backed`. The recursive Send-inference
+/// `Supervisor::spawn_actor_with_state`. The recursive Send-inference
 /// cycle through opaque async-fn types fails to converge; a named
 /// `dyn Future + Send` return type erases the opaque chain and lets the
 /// spawned actor's `.run()` future be provably `Send`.
@@ -2422,9 +2422,9 @@ pub fn execute_propose_context_migration<'a>(
         // Type-erased `Pin<Box<dyn Future + Send>>` breaks the
         // Send-inference auto-trait cycle: this helper is reachable from
         // `ContextActor::run()` via the migrated governance dispatch, AND
-        // `create_context` (Phase 2A finalization bootstrap dual-write)
+        // `create_context` (Phase 2A finalization owned-state spawn)
         // spawns a `ContextActor::run()` task through
-        // `Supervisor::spawn_actor_dashmap_backed`. Erasing the inner
+        // `Supervisor::spawn_actor_with_state`. Erasing the inner
         // future type here shields auto-trait propagation from chasing the
         // cycle.
         let create_fut: std::pin::Pin<
