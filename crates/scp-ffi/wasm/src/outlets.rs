@@ -383,7 +383,7 @@ fn extract_outlet_kind(
 ///
 /// # Parity with the native bridges
 ///
-/// The native (PyO3 / NAPI / UniFFI) single-shot path forwards a
+/// The native (`PyO3` / `NAPI` / `UniFFI`) single-shot path forwards a
 /// `CaveatEnforcement` bundle to the runtime, which runs
 /// [`scp_protocol::trust::caveats::InvocationCaveats::check_invocation_local`]
 /// (synchronous, non-counter caveats: `input_schema`, `amount_max_per_call`,
@@ -2391,7 +2391,7 @@ mod tests {
     fn single_shot_caveats_admits_empty() {
         // No caveats → nothing to enforce, admit.
         let caveats = InvocationCaveats::empty();
-        enforce_single_shot_caveats(&caveats, &serde_json::json!({})).expect("empty caveats admit");
+        enforce_single_shot_caveats(&caveats, &serde_json::json!({})).unwrap();
     }
 
     #[test]
@@ -2401,8 +2401,7 @@ mod tests {
             max_calls: Some(0),
             ..InvocationCaveats::empty()
         };
-        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}))
-            .expect_err("max_calls=0 must reject the single call");
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({})).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("max_calls"),
@@ -2417,8 +2416,7 @@ mod tests {
             max_calls: Some(1),
             ..InvocationCaveats::empty()
         };
-        enforce_single_shot_caveats(&caveats, &serde_json::json!({}))
-            .expect("max_calls=1 admits the single call");
+        enforce_single_shot_caveats(&caveats, &serde_json::json!({})).unwrap();
     }
 
     #[test]
@@ -2432,10 +2430,9 @@ mod tests {
             })),
             ..InvocationCaveats::empty()
         };
-        enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 10 }))
-            .expect("conforming input admitted");
-        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 1 }))
-            .expect_err("input below narrowed minimum must reject");
+        enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 10 })).unwrap();
+        let err =
+            enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 1 })).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("PERM-3000") || msg.to_lowercase().contains("caveat"),
@@ -2452,8 +2449,7 @@ mod tests {
             allowed_target_dids: Some(vec!["did:key:allowed".into()]),
             ..InvocationCaveats::empty()
         };
-        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}))
-            .expect_err("allowed_target_dids set + no target must reject");
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({})).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("PERM-3000") || msg.to_lowercase().contains("caveat"),

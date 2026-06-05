@@ -86,10 +86,11 @@ pub fn caveats_to_json(caveats: &InvocationCaveats) -> Result<String, String> {
 /// The non-streaming outlet invoke must enforce the SAME §7.3.8 post-input
 /// caveat gate the streaming path enforces. The action UCAN's
 /// validated-narrowed `nb` field IS the effective caveat set; its CID forms
-/// half of the durable counter-store key (`(context_id, ucan_cid,
-/// caveat_kind)`). Each native bridge (PyO3, NAPI, UniFFI) validates the
-/// token through the full 11-step ADR-016 pipeline, then calls this helper to
-/// recover the caveat set + CID so it can build a
+/// half of the durable counter-store key
+/// (`(context_id, ucan_cid, caveat_kind)`). Each native bridge (`PyO3`,
+/// `NAPI`, `UniFFI`) validates the token through the full 11-step ADR-016
+/// pipeline,
+/// then calls this helper to recover the caveat set + CID so it can build a
 /// [`scp_core::context::manager::CaveatEnforcement`] bundle. Centralizing the
 /// parse here means a single source of truth for what "effective caveats"
 /// means across the three native bridges — a bridge cannot drift by parsing

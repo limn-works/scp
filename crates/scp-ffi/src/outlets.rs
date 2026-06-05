@@ -552,7 +552,7 @@ pub(crate) fn validate_outlet_ucan(
 /// The runtime invokes this WITHOUT holding the `contexts` mutex. When a
 /// Python handler is registered it dispatches to it; otherwise it falls back
 /// to schema-only echo mode (`"status": "validated"`), matching the prior
-/// PyO3 behavior. Extracted from [`py_outlet_invoke`] so the public bridge
+/// `PyO3` behavior. Extracted from [`py_outlet_invoke`] so the public bridge
 /// function stays under the per-function line ceiling and the dispatch
 /// behavior has a single, named definition.
 fn build_outlet_executor(
