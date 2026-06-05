@@ -1928,18 +1928,36 @@ async fn caveat_test_setup() -> (
     std::sync::Arc<ContextManager>,
     scp_protocol::context::outlets::registry::OutletRegistry,
     scp_protocol::crypto::ucan::UcanToken,
-    std::sync::Arc<dyn crate::trust::CaveatCounterApi>,
     String,
 ) {
     use scp_protocol::context::outlets::registry::OutletRegistry;
     use scp_protocol::economy::types::Amount;
 
-    let manager = std::sync::Arc::new(ContextManager::new(
+    // Build the manager mutably so the §7.3.8 counter store can be wired
+    // BEFORE the `Arc` wrap. The runtime now OWNS the counter store and
+    // resolves it internally via `caveat_counter_store()` (single-shot
+    // parity with the streaming path) — callers no longer pass it through
+    // `CaveatEnforcement`.
+    let mut manager_inner = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    ));
+    );
+
+    // Set up an in-memory CaveatCounterStore type-erased into
+    // CaveatCounterApi and wire it onto the manager.
+    let storage = std::sync::Arc::new(scp_platform::testing::InMemoryStorage::new());
+    let repository =
+        std::sync::Arc::new(crate::store::ProtocolRepository::new_for_testing(storage));
+    let clock: std::sync::Arc<dyn scp_primitives::Clock> =
+        std::sync::Arc::new(scp_primitives::TestClock::new(1_000_000));
+    let store = crate::trust::CaveatCounterStore::new(repository, clock);
+    let counter_store: std::sync::Arc<dyn crate::trust::CaveatCounterApi> =
+        std::sync::Arc::new(store);
+    manager_inner.set_caveat_counter_store(std::sync::Arc::clone(&counter_store));
+
+    let manager = std::sync::Arc::new(manager_inner);
 
     let mut params = governance_params();
     params
@@ -1963,19 +1981,8 @@ async fn caveat_test_setup() -> (
 
     let ucan = dummy_spending_ucan_for(&"did:key:invoker".into());
 
-    // Set up an in-memory CaveatCounterStore type-erased into
-    // CaveatCounterApi.
-    let storage = std::sync::Arc::new(scp_platform::testing::InMemoryStorage::new());
-    let repository =
-        std::sync::Arc::new(crate::store::ProtocolRepository::new_for_testing(storage));
-    let clock: std::sync::Arc<dyn scp_primitives::Clock> =
-        std::sync::Arc::new(scp_primitives::TestClock::new(1_000_000));
-    let store = crate::trust::CaveatCounterStore::new(repository, clock);
-    let counter_store: std::sync::Arc<dyn crate::trust::CaveatCounterApi> =
-        std::sync::Arc::new(store);
-
     let ucan_cid = "ucan-caveat-test".to_owned();
-    (manager, registry, ucan, counter_store, ucan_cid)
+    (manager, registry, ucan, ucan_cid)
 }
 
 /// SCP-OUT-021 AC: invocation exceeding `max_calls` is rejected at post-input.
@@ -1985,7 +1992,7 @@ async fn caveat_max_calls_rejects_after_cap_reached() {
     use scp_protocol::economy::types::Amount;
     use scp_protocol::trust::caveats::InvocationCaveats;
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         max_calls: Some(2),
         ..InvocationCaveats::empty()
@@ -1995,7 +2002,6 @@ async fn caveat_max_calls_rejects_after_cap_reached() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         async move {
             manager
@@ -2011,7 +2017,6 @@ async fn caveat_max_calls_rejects_after_cap_reached() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,
@@ -2047,7 +2052,7 @@ async fn caveat_amount_max_cumulative_rejects_when_exhausted() {
     use scp_protocol::economy::types::Amount;
     use scp_protocol::trust::caveats::InvocationCaveats;
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         amount_max_cumulative: Some(Amount::new(100)),
         ..InvocationCaveats::empty()
@@ -2057,7 +2062,6 @@ async fn caveat_amount_max_cumulative_rejects_when_exhausted() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         async move {
             manager
@@ -2073,7 +2077,6 @@ async fn caveat_amount_max_cumulative_rejects_when_exhausted() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,
@@ -2108,7 +2111,7 @@ async fn caveat_rate_window_rejects_when_full() {
     use scp_protocol::economy::types::Amount;
     use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         rate_window: Some(RateWindow {
             max: 2,
@@ -2121,7 +2124,6 @@ async fn caveat_rate_window_rejects_when_full() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         let caveats = caveats.clone();
         async move {
@@ -2138,7 +2140,6 @@ async fn caveat_rate_window_rejects_when_full() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,
@@ -2159,6 +2160,212 @@ async fn caveat_rate_window_rejects_when_full() {
     assert!(
         msg.contains("authorization.rate-exceeded") || msg.contains("rate_window"),
         "expected rate-exceeded rejection, got: {msg}"
+    );
+}
+
+/// SCP-OUT-021 AC: a single-shot invocation whose input violates the action
+/// UCAN's narrowed `input_schema` caveat is rejected at the §7.3.8 post-input
+/// gate (synchronous local check, before the executor runs). This is one of
+/// the caveats a delegate could previously evade by invoking single-shot.
+#[tokio::test]
+async fn caveat_input_schema_rejects_nonconforming_single_shot() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
+    // Caveat narrows input to require an integer `n` >= 10.
+    let caveats = InvocationCaveats {
+        input_schema: Some(serde_json::json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer", "minimum": 10 } },
+            "required": ["n"]
+        })),
+        ..InvocationCaveats::empty()
+    };
+
+    let invoke = |input: serde_json::Value| {
+        let manager = std::sync::Arc::clone(&manager);
+        let registry = registry.clone();
+        let ucan = ucan.clone();
+        let ucan_cid = ucan_cid.clone();
+        let caveats = caveats.clone();
+        async move {
+            manager
+                .invoke_outlet_with_economy(
+                    "caveat-ctx",
+                    &registry,
+                    &OutletId::from("echo"),
+                    input,
+                    &"did:key:invoker".into(),
+                    Some(&ucan),
+                    None,
+                    |_| async { Ok(serde_json::json!({})) },
+                    None,
+                    Some(crate::context::manager::outlets::CaveatEnforcement {
+                        caveats: &caveats,
+                        ucan_cid: &ucan_cid,
+                        negotiated_adapter: None,
+                        target_did: None,
+                        estimated_cost: Amount::new(0),
+                    }),
+                    None,
+                )
+                .await
+        }
+    };
+
+    // Conforming input is admitted.
+    invoke(serde_json::json!({ "n": 10 }))
+        .await
+        .expect("conforming input admitted");
+    // Non-conforming input (n below the narrowed minimum) is rejected.
+    let err = invoke(serde_json::json!({ "n": 1 }))
+        .await
+        .expect_err("input violating narrowed input_schema must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("authorization.denied") || msg.contains("input"),
+        "expected input_schema rejection, got: {msg}"
+    );
+}
+
+/// SCP-OUT-021 AC: a single-shot cross-context invocation whose target DID is
+/// not in the action UCAN's `allowed_target_dids` caveat is rejected at the
+/// §7.3.8 post-input gate. Exercised here directly through
+/// `invoke_outlet_with_economy` by supplying a `target_did` outside the
+/// allow-list in the enforcement bundle.
+#[tokio::test]
+async fn caveat_allowed_target_dids_rejects_disallowed_single_shot() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
+    let allowed: scp_identity::DID = "did:key:allowed-target".into();
+    let caveats = InvocationCaveats {
+        allowed_target_dids: Some(vec![allowed.clone()]),
+        ..InvocationCaveats::empty()
+    };
+
+    let invoke = |target: Option<scp_identity::DID>| {
+        let manager = std::sync::Arc::clone(&manager);
+        let registry = registry.clone();
+        let ucan = ucan.clone();
+        let ucan_cid = ucan_cid.clone();
+        let caveats = caveats.clone();
+        async move {
+            manager
+                .invoke_outlet_with_economy(
+                    "caveat-ctx",
+                    &registry,
+                    &OutletId::from("echo"),
+                    serde_json::json!({}),
+                    &"did:key:invoker".into(),
+                    Some(&ucan),
+                    None,
+                    |_| async { Ok(serde_json::json!({})) },
+                    None,
+                    Some(crate::context::manager::outlets::CaveatEnforcement {
+                        caveats: &caveats,
+                        ucan_cid: &ucan_cid,
+                        negotiated_adapter: None,
+                        target_did: target.as_ref(),
+                        estimated_cost: Amount::new(0),
+                    }),
+                    None,
+                )
+                .await
+        }
+    };
+
+    // Target in the allow-list is admitted.
+    invoke(Some(allowed.clone()))
+        .await
+        .expect("allowed target admitted");
+    // Target outside the allow-list is rejected.
+    let err = invoke(Some("did:key:other-target".into()))
+        .await
+        .expect_err("target DID outside allowed_target_dids must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("authorization.denied") || msg.contains("target"),
+        "expected allowed_target_dids rejection, got: {msg}"
+    );
+}
+
+/// SCP-OUT-021 fail-closed AC: when the action UCAN carries a counter-bearing
+/// caveat (`max_calls` / `amount_max_cumulative` / `rate_window`) but the
+/// manager has NO durable counter store wired, the invocation is REJECTED
+/// (fail-closed) rather than silently admitted — single-shot parity with the
+/// streaming path's `OpenStreamRejection::CaveatPostInputViolation`. The
+/// counter store is runtime-owned, so this guard fires regardless of what the
+/// bridge supplies.
+#[tokio::test]
+async fn caveat_counter_bearing_without_store_rejects_fail_closed() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::registry::OutletRegistry;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    // Build a manager WITHOUT a caveat counter store.
+    let manager = std::sync::Arc::new(ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    ));
+    let mut params = governance_params();
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
+    let _handle = manager
+        .create_context("nostore-ctx".into(), params, "did:key:invoker".into(), None)
+        .await
+        .unwrap();
+    {
+        let arc = manager.contexts.get("nostore-ctx").unwrap().value().clone();
+        let mut ctx = arc.lock().await;
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:invoker".into(), Amount::new(1_000_000));
+    }
+    let mut registry = OutletRegistry::new();
+    registry.insert(test_outlet_registration("echo"));
+    let ucan = dummy_spending_ucan_for(&"did:key:invoker".into());
+    let ucan_cid = "ucan-nostore-test".to_owned();
+
+    // A counter-bearing caveat (max_calls) with no store wired MUST reject.
+    let caveats = InvocationCaveats {
+        max_calls: Some(5),
+        ..InvocationCaveats::empty()
+    };
+    let err = manager
+        .invoke_outlet_with_economy(
+            "nostore-ctx",
+            &registry,
+            &OutletId::from("echo"),
+            serde_json::json!({}),
+            &"did:key:invoker".into(),
+            Some(&ucan),
+            None,
+            |_| async { Ok(serde_json::json!({})) },
+            None,
+            Some(crate::context::manager::outlets::CaveatEnforcement {
+                caveats: &caveats,
+                ucan_cid: &ucan_cid,
+                negotiated_adapter: None,
+                target_did: None,
+                estimated_cost: Amount::new(0),
+            }),
+            None,
+        )
+        .await
+        .expect_err("counter-bearing caveat without a counter store must fail closed");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("authorization.denied") || msg.contains("counter store"),
+        "expected fail-closed rejection, got: {msg}"
     );
 }
 
@@ -5338,8 +5545,9 @@ async fn manager_dispatch_query_outlet_misdeclared_emits_signal() {
 //   3. the per-context `MemberBudgetTracker` snapshot is read at dispatch
 //      time and AND-composed with the SpendingCapability ceiling.
 //
-// `caveat_test_setup` reuses the SCP-OUT-021 fixtures (counter store, signed
-// spending UCAN, granted budget, registered echo outlet).
+// `caveat_test_setup` reuses the SCP-OUT-021 fixtures (runtime-owned counter
+// store wired onto the manager, signed spending UCAN, granted budget,
+// registered echo outlet).
 // =============================================================================
 
 /// SCP-OUT-021 dispatch wiring AC: dispatching with `max_calls: 2` admits
@@ -5356,7 +5564,7 @@ async fn dispatch_with_economy_max_calls_rejects_after_cap_reached() {
         MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
     };
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         max_calls: Some(2),
         ..InvocationCaveats::empty()
@@ -5387,7 +5595,6 @@ async fn dispatch_with_economy_max_calls_rejects_after_cap_reached() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         let caveats = caveats.clone();
         let exec_ref = &exec;
@@ -5406,7 +5613,6 @@ async fn dispatch_with_economy_max_calls_rejects_after_cap_reached() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,
@@ -5443,7 +5649,7 @@ async fn dispatch_with_economy_amount_max_cumulative_rejects_when_exhausted() {
         MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
     };
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         amount_max_cumulative: Some(Amount::new(100)),
         ..InvocationCaveats::empty()
@@ -5474,7 +5680,6 @@ async fn dispatch_with_economy_amount_max_cumulative_rejects_when_exhausted() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         let caveats = caveats.clone();
         let exec_ref = &exec;
@@ -5493,7 +5698,6 @@ async fn dispatch_with_economy_amount_max_cumulative_rejects_when_exhausted() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,
@@ -5668,7 +5872,7 @@ async fn dispatch_with_economy_spending_capability_denies_over_max_per_action() 
         MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
     };
 
-    let (manager, registry, _ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, _ucan, ucan_cid) = caveat_test_setup().await;
     // Tight per-action ceiling (5 USD); estimated cost = 100 must reject
     // at the SpendingCapability layer (§19.5) inside `evaluate_all_layers`.
     let tight_ucan = dummy_spending_ucan_with_cap(&"did:key:invoker".into(), 5, 1_000_000);
@@ -5716,7 +5920,6 @@ async fn dispatch_with_economy_spending_capability_denies_over_max_per_action() 
             None,
             Some(crate::context::manager::outlets::CaveatEnforcement {
                 caveats: &caveats,
-                counter_store,
                 ucan_cid: &ucan_cid,
                 negotiated_adapter: None,
                 target_did: None,

@@ -4190,6 +4190,28 @@ pub async fn outlet_invoke(
                 proof_tokens.as_ref(),
             )?;
 
+            // §7.3.8 (single-shot caveat parity with the streaming path): the
+            // ACTION UCAN's validated-narrowed `nb` field IS the effective
+            // caveat set the runtime must enforce as the §7.3.8 post-input
+            // gate. The prior code dropped these caveats on the single-shot
+            // path (passing `caveat_enforcement: None`), so a delegated UCAN's
+            // `max_calls`, `amount_max_cumulative`, `rate_window`,
+            // `allowed_target_dids`, and narrowed `input_schema` were NEVER
+            // enforced on single-shot — a trivial authorization bypass. The
+            // shared `resolve_action_caveats` helper recovers the `nb` + CID
+            // (same parse all three native bridges use); the runtime OWNS the
+            // counter store and the fail-closed guard, so the bridge only
+            // supplies the validated caveats. Parsing cannot fail here —
+            // `validate_outlet_ucan_uniffi` already validated the same string —
+            // but surface a clean error rather than unwrap.
+            let (effective_caveats, action_ucan_cid) =
+                scp_ffi_common::caveats::resolve_action_caveats(&ucan_token).map_err(|e| {
+                    ScpError::Permission {
+                        msg: e,
+                        code: codes::PERM_3001.to_owned(),
+                    }
+                })?;
+
             // Parse the optional spending UCAN JWT (§19.5
             // AND-composition). Mirrors `context_send`. An invalid JWT
             // surfaces as `SCP-ECON-12061` before the manager call.
@@ -4263,6 +4285,32 @@ pub async fn outlet_invoke(
             let manager = crate::runtime::context_manager_expect()?;
             let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
             let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
+
+            // §7.3.8 post-input caveat enforcement bundle. Built whenever the
+            // action UCAN's effective caveats carry a post-input constraint
+            // (`input_schema` / `amount_max_per_call` / `allowed_adapters` /
+            // `allowed_target_dids` / `max_calls` / `amount_max_cumulative` /
+            // `rate_window`); `None` when the token has no such caveats (the
+            // runtime then builds no hook — identical to the streaming path's
+            // `requires_post_input_check()` gate). The runtime resolves the
+            // durable counter store itself and FAILS CLOSED on any
+            // counter-bearing cap it cannot enforce.
+            let caveat_enforcement = effective_caveats.requires_post_input_check().then(|| {
+                scp_core::context::manager::CaveatEnforcement {
+                    caveats: &effective_caveats,
+                    ucan_cid: &action_ucan_cid,
+                    // The UniFFI single-shot surface negotiates neither a
+                    // payment adapter nor a cross-context target DID (parity
+                    // with the streaming open). `estimated_cost` is 0 —
+                    // single-shot does not price per-call here;
+                    // `amount_max_cumulative` increments by 0 and
+                    // `amount_max_per_call` gates against 0.
+                    negotiated_adapter: None,
+                    target_did: None,
+                    estimated_cost: scp_core::economy::types::Amount::new(0),
+                }
+            });
+
             let outcome = manager
                 .invoke_outlet_with_economy(
                     &context_id,
@@ -4274,7 +4322,7 @@ pub async fn outlet_invoke(
                     None,
                     executor,
                     None,
-                    None,
+                    caveat_enforcement,
                     // SCP-OUT-022 layer composition is opt-in via the
                     // higher-level interface invocation path; the UniFFI
                     // bridge surface does not yet expose OutboundPolicy /
