@@ -13,8 +13,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -389,18 +387,12 @@ impl KeyCustody for SqliteKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
-            // Uses a secret derived from the private key via HKDF (§9.10.4A),
+            // Software custody: pseudonym keypair = Ed25519_keygen(HMAC-SHA256(
+            //   pseudonym_secret, context_id || "scp-pseudonym")), where the
+            // pseudonym_secret is derived from the private seed via HKDF (§9.10.4A),
             // NOT the public key, to prevent membership enumeration attacks.
-            let pseudonym_secret = crate::pseudonym::derive_pseudonym_secret(signing_key);
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
-                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-            mac.update(&context_id);
-            mac.update(b"scp-pseudonym");
-            let hmac_bytes = Zeroizing::new(mac.finalize().into_bytes());
-            let mut hmac_output = Zeroizing::new([0u8; 32]);
-            hmac_output.copy_from_slice(&hmac_bytes[..32]);
-            let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);
+            let pseudonym_signing_key =
+                crate::pseudonym::derive_pseudonym_keypair(signing_key, &context_id, None);
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             // Store the derived signing key in the cache only (not persisted —
@@ -442,20 +434,16 @@ impl KeyCustody for SqliteKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
-            // Uses a secret derived from the private key via HKDF (§9.10.4A),
-            // NOT the public key, to prevent membership enumeration attacks.
-            // BLACK-001 mitigation: epoch_BE breaks long-term pseudonym correlation.
-            let pseudonym_secret = crate::pseudonym::derive_pseudonym_secret(signing_key);
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
-                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-            mac.update(&context_id);
-            mac.update(&pseudonym_epoch.to_be_bytes());
-            mac.update(b"scp-pseudonym-v2");
-            let hmac_bytes = Zeroizing::new(mac.finalize().into_bytes());
-            let mut hmac_output = Zeroizing::new([0u8; 32]);
-            hmac_output.copy_from_slice(&hmac_bytes[..32]);
-            let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);
+            // Software custody: rotatable pseudonym keypair = Ed25519_keygen(
+            //   HMAC-SHA256(pseudonym_secret, context_id || epoch_BE
+            //   || "scp-pseudonym-v2")). The pseudonym_secret is derived from the
+            // private seed via HKDF (§9.10.4A), NOT the public key, to prevent
+            // membership enumeration attacks. epoch_BE breaks long-term correlation.
+            let pseudonym_signing_key = crate::pseudonym::derive_pseudonym_keypair(
+                signing_key,
+                &context_id,
+                Some(pseudonym_epoch),
+            );
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));

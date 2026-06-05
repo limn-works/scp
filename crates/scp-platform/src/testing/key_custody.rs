@@ -8,9 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use hmac::{Hmac, Mac};
 use rand::{CryptoRng, RngCore, SeedableRng};
-use sha2::Sha256;
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -193,7 +191,7 @@ impl Default for InMemoryKeyCustody {
     }
 }
 
-use crate::pseudonym::derive_pseudonym_secret;
+use crate::pseudonym::derive_pseudonym_keypair;
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
@@ -365,20 +363,11 @@ impl KeyCustody for InMemoryKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
-            // Uses a secret derived from the private key via HKDF (§9.10.4A),
+            // Software custody: pseudonym keypair = Ed25519_keygen(HMAC-SHA256(
+            //   pseudonym_secret, context_id || "scp-pseudonym")), where the
+            // pseudonym_secret is derived from the private seed via HKDF (§9.10.4A),
             // NOT the public key, to prevent membership enumeration attacks.
-            let pseudonym_secret = derive_pseudonym_secret(signing_key);
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
-                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-            mac.update(&context_id);
-            mac.update(b"scp-pseudonym");
-            let hmac_vec = Zeroizing::new(mac.finalize().into_bytes().to_vec());
-            let mut hmac_output = Zeroizing::new([0u8; 32]);
-            hmac_output.copy_from_slice(&hmac_vec[..32]);
-
-            // Derive Ed25519 keypair from first 32 bytes of HMAC output.
-            let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);
+            let pseudonym_signing_key = derive_pseudonym_keypair(signing_key, &context_id, None);
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             // Store the derived signing key and return a handle.
@@ -420,22 +409,13 @@ impl KeyCustody for InMemoryKeyCustody {
                 .get(&key_id)
                 .ok_or(PlatformError::KeyNotFound)?;
 
-            // HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
-            // Uses a secret derived from the private key via HKDF (§9.10.4A),
-            // NOT the public key, to prevent membership enumeration attacks.
-            // BLACK-001 mitigation: epoch_BE breaks long-term pseudonym correlation.
-            let pseudonym_secret = derive_pseudonym_secret(signing_key);
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pseudonym_secret.as_slice())
-                .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-            mac.update(&context_id);
-            mac.update(&pseudonym_epoch.to_be_bytes());
-            mac.update(b"scp-pseudonym-v2");
-            let hmac_vec = Zeroizing::new(mac.finalize().into_bytes().to_vec());
-            let mut hmac_output = Zeroizing::new([0u8; 32]);
-            hmac_output.copy_from_slice(&hmac_vec[..32]);
-
-            // Derive Ed25519 keypair from first 32 bytes of HMAC output.
-            let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);
+            // Software custody: rotatable pseudonym keypair = Ed25519_keygen(
+            //   HMAC-SHA256(pseudonym_secret, context_id || epoch_BE
+            //   || "scp-pseudonym-v2")). The pseudonym_secret is derived from the
+            // private seed via HKDF (§9.10.4A), NOT the public key, to prevent
+            // membership enumeration attacks. epoch_BE breaks long-term correlation.
+            let pseudonym_signing_key =
+                derive_pseudonym_keypair(signing_key, &context_id, Some(pseudonym_epoch));
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             // Store the derived signing key and return a handle.
@@ -545,6 +525,9 @@ mod tests {
     }
 
     use super::*;
+    use crate::pseudonym::derive_pseudonym_secret;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
     #[tokio::test]
     async fn generate_ed25519_keypair_returns_handle() {

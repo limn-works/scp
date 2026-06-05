@@ -198,10 +198,11 @@ impl SharedSecret {
 /// A deterministic pseudonym keypair derived from an identity key and a context
 /// ID via [`KeyCustody::derive_pseudonym`].
 ///
-/// The derivation algorithm is specified in ADR-006:
-///   1. `seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")`
+/// The derivation algorithm is specified in ADR-006 and §9.10.4:
+///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
 ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
 ///
+/// The HMAC key is the 32-byte `pseudonym_secret` (NEVER the public key, §9.10.4A).
 /// The returned keypair is always software-managed regardless of whether the
 /// source identity key is hardware-backed.
 #[derive(Debug, Clone)]
@@ -389,14 +390,19 @@ pub trait KeyCustody: Send + Sync {
 
     /// Derive a deterministic, context-scoped pseudonym keypair (v1, non-rotatable).
     ///
-    /// Algorithm (all implementations MUST produce identical output):
-    ///   1. `seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")`
-    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+    /// Algorithm:
+    ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])` — `seed` is an RFC-8032 Ed25519 seed
     ///
-    /// For hardware-backed keys: the HMAC is computed inside the HSM using an
-    /// associated symmetric key derived during [`generate_keypair`](KeyCustody::generate_keypair).
-    /// For software keys: the HMAC key is an HKDF-derived pseudonym secret from
-    /// the private key (§9.10.4A), NOT the public key, to prevent enumeration attacks.
+    /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (public
+    /// key bytes would be a membership-enumeration oracle, §9.10.4A). For SOFTWARE
+    /// keys the `pseudonym_secret` is HKDF-derived from the private seed and is
+    /// cross-platform deterministic (pinned by §25.19 vectors). For HARDWARE keys
+    /// (Secure Enclave, Keystore TEE, HSM) the private key is non-exportable, so the
+    /// `pseudonym_secret` is a device-local value computed inside the boundary;
+    /// hardware pseudonyms are therefore device-local BY DESIGN, not cross-platform
+    /// identical. The Rust software backends share this derivation via
+    /// [`crate::pseudonym::derive_pseudonym_keypair`].
     ///
     /// The returned [`PseudonymKeypair`] is always software-managed (derived
     /// output).
@@ -421,11 +427,14 @@ pub trait KeyCustody: Send + Sync {
     /// rotation epoch in the HMAC derivation, producing a different pseudonym
     /// for each epoch within the same context.
     ///
-    /// Algorithm (all implementations MUST produce identical output):
-    ///   1. `seed = HMAC-SHA256(identity_key_material, context_id || epoch_BE || "scp-pseudonym-v2")`
-    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+    /// Algorithm:
+    ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")`
+    ///   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])` — `seed` is an RFC-8032 Ed25519 seed
     ///
-    /// where `epoch_BE` is the `pseudonym_epoch` as an 8-byte big-endian u64.
+    /// where `epoch_BE` is the `pseudonym_epoch` as an 8-byte big-endian u64. As in
+    /// v1, the HMAC key is the `pseudonym_secret` (NEVER the public key, §9.10.4A):
+    /// software custody is cross-platform deterministic, hardware custody is
+    /// device-local by design.
     ///
     /// The domain separator `"scp-pseudonym-v2"` is intentionally different from
     /// the v1 separator `"scp-pseudonym"` so that epoch 0 in v2 produces a
