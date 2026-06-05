@@ -402,6 +402,26 @@ class InvocationHandle internal constructor(
      */
     private val invokerDid: String? = null,
     private val aggregateSchemaJson: String? = null,
+    /**
+     * Deferred §5.4.5 `request_id` (32-char lowercase hex), resolved
+     * once the streaming bridge open completes. `null` for handles that
+     * already know their `request_id` at construction time (the literal
+     * [requestIdHex] path) or for the non-streaming degenerate
+     * single-shot path.
+     *
+     * The production streaming namespace returns the [InvocationHandle]
+     * synchronously, before the `suspend outletInvokeStream` open
+     * resolves, so the real `request_id` is not known at construction
+     * time. The namespace passes an unresolved [CompletableDeferred] and
+     * completes it from inside the pump coroutine as soon as
+     * `outletInvokeStream` returns; [grantCredit] / [cancel] await it
+     * before the terminal-state check. This closes the race
+     * deterministically — a caller may invoke `grantCredit` / `cancel`
+     * immediately after `invoke()` returns without losing to the
+     * bridge's first chunk. Mirrors the TypeScript `requestIdPromise`
+     * and the Swift `RequestIdBox`.
+     */
+    private val requestIdDeferred: kotlinx.coroutines.Deferred<String?>? = null,
 ) {
     private val terminatedFlag = java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -515,15 +535,26 @@ class InvocationHandle internal constructor(
      * [StreamAlreadyClosed] otherwise. Returning a `(rid, did)` pair
      * keeps each call site below the detekt `ThrowsCount` ceiling
      * without sacrificing the three discrete guards.
+     *
+     * Resolves the `request_id` BEFORE the terminal check — on the
+     * streaming path the deferred completes once `outletInvokeStream`
+     * returns, so awaiting here lets a caller invoke `grantCredit` /
+     * `cancel` immediately after `invoke()` returns without racing the
+     * bridge's first chunk. Mirrors the TypeScript `resolveRequestId()`
+     * and the Swift `RequestIdBox.value()` await ordering.
      */
     @Suppress("ThrowsCount") // three discrete guards: terminated, request id present, invoker did present
-    private fun preflightControlPlane(verb: String): Pair<String, String> {
+    private suspend fun preflightControlPlane(verb: String): Pair<String, String> {
+        // Prefer a literal request id; otherwise await the streaming-mode
+        // deferred. `null` from either means the non-streaming path.
+        val rid = requestIdHex ?: requestIdDeferred?.await()
+        // Race-check terminated AFTER the await — a terminal chunk may
+        // have arrived while we were waiting on the bridge open.
         if (terminatedFlag.get()) {
             throw StreamAlreadyClosed(
                 "$verb rejected: stream has already emitted a terminal chunk",
             )
         }
-        val rid = requestIdHex
         val did = invokerDid
         if (rid == null) {
             throw StreamAlreadyClosed(
@@ -768,18 +799,23 @@ interface OutletOffersNamespace {
 }
 
 // ---------------------------------------------------------------------------
-// SDK-level facade — wraps a plain UniFFI caller (in-memory tests or a
-// host-supplied bridge) around the OutletNamespace interfaces.
+// OutletNamespace implementations.
 //
-// The real UniFFI-backed impl lives in works.limn.scp.bridge.ToolBridge —
-// this facade gives a synchronous-looking entry point that honors the AC
-// shape (namespace + sub-namespaces + verbs).
+// - `BridgeBackedOutletNamespace` (in `OutletsBridge.kt`) is the
+//   PRODUCTION implementation: it routes every verb through the UniFFI
+//   `uniffi.scp.outlet*` exports, opens real §5.4.5 streams via
+//   `outletInvokeStream`, and threads the runtime `request_id` + pinned
+//   invoker DID into the production `InvocationHandle` so `grantCredit` /
+//   `cancel` reach `outletStreamGrantCredit` / `outletStreamCancel`.
+//   Obtain it via `outletNamespace(handle, identity)`.
+// - `InMemoryOutletNamespace` (below) is a test/example stub: it returns
+//   a synthesized End chunk and never opens a real stream.
 // ---------------------------------------------------------------------------
 
 /**
  * A minimal in-memory [OutletNamespace] used by tests and examples.
- * Production callers obtain an `OutletNamespace` from their `Context`
- * instance.
+ * Production callers obtain an `OutletNamespace` from
+ * [outletNamespace] (a bridge-backed [BridgeBackedOutletNamespace]).
  */
 internal class InMemoryOutletNamespace(
     override val sessions: OutletSessionsNamespace = InMemoryOutletSessionsNamespace(),

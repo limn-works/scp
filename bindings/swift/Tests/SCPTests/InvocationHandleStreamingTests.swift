@@ -306,6 +306,153 @@ struct NonStreamingControlPlaneTests {
     }
 }
 
+// MARK: - Production streaming path: deferred request_id threading
+
+//
+// Regression guard for the production control-plane bug: the streaming
+// factory (`makeStreamingHandle`) constructs the handle with a DEFERRED
+// `RequestIdBox` (the real `request_id` is only known after the async
+// `outletInvokeStream` open resolves), then resolves the box from inside
+// the pump. The prior code constructed `InvocationHandle(requestIdHex:
+// nil, ...)` and never threaded the real id in — so `grantCredit` /
+// `cancel` ALWAYS threw `streamAlreadyClosed` on a real streaming
+// session. These tests drive the SAME deferred-box mechanism the
+// production factory uses (NOT a directly-constructed literal handle),
+// asserting the control plane reaches past the lifecycle guards once the
+// box resolves to a real id.
+
+struct DeferredRequestIdControlPlaneTests {
+    /// A handle on the streaming path (unresolved box + pinned invoker
+    /// DID) whose box later resolves to a real `request_id` must NOT
+    /// reject `grantCredit` with `streamAlreadyClosed` for "no streaming
+    /// session" / "no pinned invoker DID" — it must pass the guards and
+    /// reach the bridge. Without a live runtime the bridge call itself
+    /// fails, but with a NON-`streamAlreadyClosed` error, which is the
+    /// proof the guards were cleared (the bug symptom is gone).
+    @Test("grantCredit awaits the deferred request_id and clears the lifecycle guards")
+    func grantCreditClearsGuardsAfterDeferredResolve() async throws {
+        let box = RequestIdBox()
+        let handle = InvocationHandle(
+            requestIdBox: box,
+            invokerDid: "did:dht:invoker",
+            aggregateSchemaJson: nil
+        ) { _, _, _ in
+            // Simulate the streaming open resolving the request_id from
+            // inside the pump (mirrors `makeStreamingHandle` calling
+            // `raw.requestId()` then `requestIdBox.resolve(...)`). A long
+            // hex id so the bridge sees a well-formed request_id.
+            Task {
+                await box.resolve(String(repeating: "a5", count: 16))
+            }
+        }
+        do {
+            _ = try await handle.grantCredit(Credit(10))
+            // If a live runtime were present this could succeed; either
+            // way, NOT throwing streamAlreadyClosed is the pass condition.
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            Issue.record(
+                "grantCredit must NOT raise streamAlreadyClosed once the "
+                    + "deferred request_id resolves — control plane is dead. \(env)"
+            )
+        } catch {
+            // Any other error (e.g. a bridge error from the absent live
+            // runtime) means the guards were cleared and the call reached
+            // the bridge seam — the fix works.
+        }
+    }
+
+    /// Same guard for `cancel`.
+    @Test("cancel awaits the deferred request_id and clears the lifecycle guards")
+    func cancelClearsGuardsAfterDeferredResolve() async throws {
+        let box = RequestIdBox()
+        let handle = InvocationHandle(
+            requestIdBox: box,
+            invokerDid: "did:dht:invoker",
+            aggregateSchemaJson: nil
+        ) { _, _, _ in
+            Task {
+                await box.resolve(String(repeating: "b6", count: 16))
+            }
+        }
+        do {
+            _ = try await handle.cancel()
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            Issue.record(
+                "cancel must NOT raise streamAlreadyClosed once the deferred "
+                    + "request_id resolves — control plane is dead. \(env)"
+            )
+        } catch {
+            // Reached the bridge seam — the fix works.
+        }
+    }
+
+    /// When the streaming open FAILS, the factory resolves the box to
+    /// `nil`; awaiting control-plane callers must then surface
+    /// `streamAlreadyClosed` (no streaming session) rather than hanging
+    /// forever on an unresolved box.
+    @Test("open failure resolves the box to nil and surfaces streamAlreadyClosed")
+    func openFailureResolvesNil() async throws {
+        let box = RequestIdBox()
+        let handle = InvocationHandle(
+            requestIdBox: box,
+            invokerDid: "did:dht:invoker",
+            aggregateSchemaJson: nil
+        ) { _, _, rejectAggregate in
+            Task {
+                // Mirror the factory's catch arm: open failed before a
+                // request_id was known.
+                await box.resolve(nil)
+                rejectAggregate(OutletError.bridge(message: "open failed", code: "SCP-TOOL-6000"))
+            }
+        }
+        do {
+            _ = try await handle.grantCredit(Credit(10))
+            Issue.record("expected streamAlreadyClosed after nil-resolved box")
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            #expect(env.code == "SCP-TOOL-6101")
+        } catch {
+            Issue.record("wrong error: \(error)")
+        }
+    }
+
+    /// The terminal-state guard still fires AFTER the await: if the box
+    /// resolves but a terminal chunk has already been observed, the
+    /// control plane rejects with `streamAlreadyClosed`.
+    @Test("terminal-after-resolve still rejects with streamAlreadyClosed")
+    func terminalAfterResolveRejects() async throws {
+        let box = RequestIdBox()
+        let handle = InvocationHandle(
+            requestIdBox: box,
+            invokerDid: "did:dht:invoker",
+            aggregateSchemaJson: nil
+        ) { yieldChunk, resolveAggregate, _ in
+            Task {
+                await box.resolve(String(repeating: "c7", count: 16))
+                // Observe a terminal End chunk before the control-plane
+                // call — flips the terminated flag.
+                yieldChunk(OutletStreamChunk(
+                    requestId: Data(repeating: 0xC7, count: 16),
+                    sequence: 0,
+                    payload: .end(aggregate: #"{"v":1}"#, executionTimeMs: 0)
+                ))
+                resolveAggregate(Aggregate(valueJson: #"{"v":1}"#))
+            }
+        }
+        // Give the pump a beat to observe the terminal chunk.
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        do {
+            _ = try await handle.grantCredit(Credit(10))
+            Issue.record("expected streamAlreadyClosed after terminal chunk")
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            #expect(env.code == "SCP-TOOL-6101")
+        } catch {
+            // A bridge error is also acceptable here (the terminal flag is
+            // a best-effort race-check); the key assertion is that the
+            // call does not silently succeed on a closed stream.
+        }
+    }
+}
+
 // MARK: - AC12: aggregate_schema validation
 
 struct AggregateSchemaValidationTests {

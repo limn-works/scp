@@ -571,9 +571,23 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     private let stream: AsyncThrowingStream<OutletStreamChunk, Error>
     private let aggregateTask: Task<Aggregate, Error>
 
-    /// 32-char lowercase hex `request_id` of the underlying §5.4.5
-    /// stream — `nil` for handles backed by the non-streaming bridge.
-    private let requestIdHex: String?
+    /// Resolves to the 32-char lowercase hex `request_id` of the
+    /// underlying §5.4.5 stream once the streaming open completes, or
+    /// `nil` for handles backed by the non-streaming (degenerate
+    /// single-shot) bridge.
+    ///
+    /// `OutletNamespace.invoke` is synchronous (it returns the handle
+    /// immediately, before the async `outletInvokeStream` open
+    /// resolves), so the real `request_id` is NOT known at construction
+    /// time on the streaming path. `makeStreamingHandle` resolves this
+    /// box from inside the pump `Task` as soon as `outletInvokeStream`
+    /// returns; `grantCredit` / `cancel` await it before the
+    /// terminal-state check. This closes the race deterministically —
+    /// a caller may invoke `grantCredit` / `cancel` immediately after
+    /// `invoke()` returns without losing to the bridge's first chunk.
+    /// Mirrors the TypeScript `requestIdPromise` and the Python
+    /// `request_id` field threaded after the awaited open.
+    private let requestIdBox: RequestIdBox
 
     /// Pinned invoker DID; threaded through to every control-plane
     /// bridge call as `callerDid` so the bridge can verify against
@@ -598,7 +612,13 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     /// shape (code `SCP-TOOL-6020`, slug `protocol.handle-double-consumed`).
     private let consumedModeBox = ConsumedModeBox()
 
-    public init(
+    /// Construct a handle whose `request_id` is already known at
+    /// construction time (a literal hex value, or `nil` for the
+    /// non-streaming / degenerate single-shot path). The box is created
+    /// pre-resolved. The streaming factory uses the deferred
+    /// `init(requestIdBox:...)` designated initializer instead so it can
+    /// resolve the box once `outletInvokeStream` returns.
+    public convenience init(
         requestIdHex: String? = nil,
         invokerDid: String? = nil,
         aggregateSchemaJson: String? = nil,
@@ -608,7 +628,30 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
             @Sendable @escaping (Error) -> Void
         ) -> Void
     ) {
-        self.requestIdHex = requestIdHex
+        self.init(
+            requestIdBox: RequestIdBox(resolved: requestIdHex),
+            invokerDid: invokerDid,
+            aggregateSchemaJson: aggregateSchemaJson,
+            pump: pump
+        )
+    }
+
+    /// Designated initializer. `requestIdBox` resolves to the §5.4.5
+    /// `request_id` (or `nil`); the streaming factory passes an
+    /// unresolved box and resolves it from inside the pump once
+    /// `outletInvokeStream` returns, while the one-shot / direct paths
+    /// pass a pre-resolved box via the convenience initializers.
+    init(
+        requestIdBox: RequestIdBox,
+        invokerDid: String?,
+        aggregateSchemaJson: String?,
+        pump: @Sendable @escaping (
+            @Sendable @escaping (OutletStreamChunk) -> Void,
+            @Sendable @escaping (Aggregate) -> Void,
+            @Sendable @escaping (Error) -> Void
+        ) -> Void
+    ) {
+        self.requestIdBox = requestIdBox
         self.invokerDid = invokerDid
         self.aggregateSchemaJson = aggregateSchemaJson
         var chunkCont: AsyncThrowingStream<OutletStreamChunk, Error>.Continuation?
@@ -712,10 +755,19 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     ///   stream has already emitted a terminal chunk.
     @discardableResult
     public func grantCredit(_ grant: Credit) async throws -> UInt32 {
+        // Resolve the request id BEFORE the terminal check — on the
+        // streaming path the box is resolved once `outletInvokeStream`
+        // returns, so awaiting here lets a caller invoke `grantCredit`
+        // immediately after `invoke()` returns without racing the
+        // bridge's first chunk. Mirrors the TypeScript
+        // `resolveRequestId()` await ordering.
+        let ridHex = await requestIdBox.value()
+        // Race-check terminated AFTER the await — a terminal chunk may
+        // have arrived while we were waiting on the open.
         if terminatedFlag.isTerminated {
             throw OutletError.makeStreamAlreadyClosed()
         }
-        guard let ridHex = requestIdHex else {
+        guard let ridHex else {
             throw OutletError.makeStreamAlreadyClosed(
                 message: "grantCredit rejected: handle was opened without a streaming session"
             )
@@ -742,10 +794,14 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     ///   stream has already emitted a terminal chunk.
     @discardableResult
     public func cancel() async throws -> UInt64? {
+        // Mirror `grantCredit` — resolve the request id (awaiting the
+        // streaming-mode open if necessary), THEN race-check the
+        // terminated state.
+        let ridHex = await requestIdBox.value()
         if terminatedFlag.isTerminated {
             throw OutletError.makeStreamAlreadyClosed()
         }
-        guard let ridHex = requestIdHex else {
+        guard let ridHex else {
             throw OutletError.makeStreamAlreadyClosed(
                 message: "cancel rejected: handle was opened without a streaming session"
             )
@@ -848,6 +904,69 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
                 registrationEventId: nil
             )
         )
+    }
+}
+
+/// Internal — single-resolution awaitable carrier for the §5.4.5
+/// `request_id` (32-char lowercase hex) of an `InvocationHandle`.
+///
+/// `OutletNamespace.invoke` returns the handle synchronously, before
+/// the async `outletInvokeStream` open resolves, so on the streaming
+/// path the real `request_id` is not yet known at construction time.
+/// The streaming factory constructs an unresolved box and resolves it
+/// from inside the pump `Task` once `outletInvokeStream` returns;
+/// `grantCredit` / `cancel` `await value()` before the terminal check.
+/// The one-shot / direct-construction paths use `init(resolved:)`,
+/// which yields the value immediately.
+///
+/// Resolution is single-shot and idempotent — a second `resolve(_:)`
+/// is a no-op (the first value wins). Awaiters that arrive after
+/// resolution return the stored value without suspending; awaiters
+/// that arrive before resolution suspend on a continuation that is
+/// resumed exactly once at resolution time. Implemented as an `actor`
+/// so concurrent awaiters and the single resolver serialize without an
+/// explicit lock (per the Swift SDK's actor-over-locks convention).
+actor RequestIdBox {
+    private var resolved: Bool
+    private var value: String?
+    private var waiters: [CheckedContinuation<String?, Never>] = []
+
+    /// Pre-resolved box (one-shot / direct-construction path). `value()`
+    /// returns `requestId` immediately without suspending.
+    init(resolved requestId: String?) {
+        resolved = true
+        value = requestId
+    }
+
+    /// Unresolved box (streaming path). `value()` suspends until the
+    /// streaming factory calls `resolve(_:)`.
+    init() {
+        resolved = false
+        value = nil
+    }
+
+    /// Resolve the box exactly once. Subsequent calls are no-ops so a
+    /// late open-failure path cannot clobber an already-resolved id.
+    func resolve(_ requestId: String?) {
+        guard !resolved else { return }
+        resolved = true
+        value = requestId
+        let pending = waiters
+        waiters = []
+        for waiter in pending {
+            waiter.resume(returning: requestId)
+        }
+    }
+
+    /// Await the resolved `request_id` (or `nil` for the non-streaming
+    /// path). Returns immediately if already resolved.
+    func value() async -> String? {
+        if resolved {
+            return value
+        }
+        return await withCheckedContinuation { cont in
+            waiters.append(cont)
+        }
     }
 }
 
@@ -1182,8 +1301,19 @@ public actor OutletNamespace {
         let handle = self.handle
         let identity = self.identity
         let invokerDidValue = identity.did()
+        // Unresolved box — the real `request_id` is only known after the
+        // async `outletInvokeStream` open returns. The pump below
+        // resolves it (to the bridge value on success, or `nil` on open
+        // failure) so `grantCredit` / `cancel` callers awaiting it
+        // unblock deterministically rather than always seeing the prior
+        // `nil` placeholder. This was the production control-plane bug:
+        // the handle was constructed with `requestIdHex: nil` and the
+        // real id was only ever read inside the recheck task, never
+        // threaded into the handle — so `grantCredit` / `cancel` always
+        // threw `streamAlreadyClosed`.
+        let requestIdBox = RequestIdBox()
         return InvocationHandle(
-            requestIdHex: nil,
+            requestIdBox: requestIdBox,
             invokerDid: invokerDidValue,
             aggregateSchemaJson: aggregateSchemaJson
         ) { yieldChunk, resolveAggregate, rejectAggregate in
@@ -1202,13 +1332,20 @@ public actor OutletNamespace {
                         estimatedChunkCount: estimatedChunkCount,
                         spendingUcan: spendingUcan
                     )
+                    // Thread the real §5.4.5 `request_id` into the handle
+                    // as soon as the open resolves — BEFORE pumping
+                    // chunks — so control-plane callers that raced to
+                    // `grantCredit` / `cancel` immediately after
+                    // `invoke()` unblock with a valid id.
+                    let requestIdHex = raw.requestId()
+                    await requestIdBox.resolve(requestIdHex)
                     let recheckTask = makeRevocationRecheckTask(
                         contextHandle: handle,
                         outletId: outletId,
                         ucanToken: ucanToken,
                         proofTokens: proofTokens,
                         recheckSecs: ucanRecheckSecs,
-                        requestIdHex: raw.requestId(),
+                        requestIdHex: requestIdHex,
                         invokerDid: invokerDidValue
                     )
                     defer { recheckTask.cancel() }
@@ -1219,6 +1356,11 @@ public actor OutletNamespace {
                         rejectAggregate: rejectAggregate
                     )
                 } catch {
+                    // Open failed before a `request_id` was known —
+                    // resolve the box to `nil` so awaiting control-plane
+                    // callers unblock and surface `streamAlreadyClosed`
+                    // (no streaming session) rather than hanging forever.
+                    await requestIdBox.resolve(nil)
                     rejectAggregate(error)
                 }
             }
