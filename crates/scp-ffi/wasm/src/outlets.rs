@@ -374,6 +374,77 @@ fn extract_outlet_kind(
 }
 
 // ---------------------------------------------------------------------------
+// §7.3.8 single-shot caveat enforcement (WASM-local, non-counter subset)
+// ---------------------------------------------------------------------------
+
+/// Enforces the §7.3.8 post-input caveat gate that the WASM bridge is capable
+/// of enforcing on a single-shot outlet invocation, from the action UCAN's
+/// VALIDATED-NARROWED `nb` caveat set.
+///
+/// # Parity with the native bridges
+///
+/// The native (PyO3 / NAPI / UniFFI) single-shot path forwards a
+/// `CaveatEnforcement` bundle to the runtime, which runs
+/// [`scp_protocol::trust::caveats::InvocationCaveats::check_invocation_local`]
+/// (synchronous, non-counter caveats: `input_schema`, `amount_max_per_call`,
+/// `allowed_adapters`, `allowed_target_dids`) plus a durable counter-store CAS
+/// for the three counter-bearing caveats (`max_calls`,
+/// `amount_max_cumulative`, `rate_window`).
+///
+/// The WASM bridge has no async runtime and no durable counter store
+/// (ADR-034), and it already rejects paid contexts up front
+/// (`SCP-ECON-12096`), so the cumulative `amount_*` / `rate_window` caps are
+/// moot here. What WASM CAN — and now does — enforce for single-shot:
+///
+/// - the full `check_invocation_local` synchronous set, with
+///   `estimated_cost = 0`, `negotiated_adapter = None`, `target_did = None`
+///   (single-shot intra-context — identical to the native bridges' bundle), and
+/// - `max_calls` taken FROM THE VALIDATED `nb`: a single-shot invoke is
+///   exactly one call, so a `max_calls` of `0` permits zero calls and MUST
+///   reject. (`max_calls >= 1` admits the one call; WASM cannot track
+///   cross-invocation cumulative counts without a durable store, an honest
+///   ADR-034 limitation — but a token that forbids ALL calls is enforced.)
+///
+/// This closes the single-shot bypass for the caveats WASM can enforce and
+/// removes the prior asymmetry where the WASM single-shot path dropped the
+/// validated `nb` entirely.
+///
+/// # Errors
+///
+/// Returns `ScpWasmError::Permission` (`SCP-PERM-3000`, the same code the
+/// WASM UCAN-authorization failure uses) carrying the violated caveat's spec
+/// slug when any enforceable caveat rejects.
+fn enforce_single_shot_caveats(
+    caveats: &scp_protocol::trust::caveats::InvocationCaveats,
+    input: &serde_json::Value,
+) -> Result<(), ScpWasmError> {
+    use scp_protocol::economy::types::Amount;
+
+    // `max_calls` from the validated nb: single-shot is one call; a cap of 0
+    // forbids it. (>=1 admits the single call.)
+    if caveats.max_calls == Some(0) {
+        return Err(ScpWasmError::Permission {
+            message: "invocation rejected: action UCAN caveat max_calls=0 permits no calls \
+                      (§7.3.8 authorization.denied)"
+                .to_owned(),
+            code: codes::PERM_3000.to_owned(),
+        });
+    }
+
+    // Synchronous non-counter caveats: input_schema / amount_max_per_call /
+    // allowed_adapters / allowed_target_dids. Single-shot negotiates no
+    // adapter and has no cross-context target (parity with the native
+    // bridges, which pass `negotiated_adapter: None`, `target_did: None`,
+    // `estimated_cost: 0`).
+    caveats
+        .check_invocation_local(input, Amount::new(0), None, None)
+        .map_err(|e| ScpWasmError::Permission {
+            message: format!("invocation rejected by §7.3.8 caveat ({}): {e}", e.slug()),
+            code: codes::PERM_3000.to_owned(),
+        })
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -552,64 +623,107 @@ pub fn outlet_invoke(
     }
     let context_id = context.context_id();
     future_to_promise(async move {
-        // UCAN authorization: validate the token via the WASM-local
-        // 11-step pipeline. See spec §6.2, §8, ADR-016, and issue #319.
-        // Look up the outlet's registered kind so the UCAN validator
-        // checks the correct split capability stem (SCP-OUT-014).
-        let outlet_kind_for_ucan =
-            crate::manager::with_manager(|mgr| mgr.outlet_kind(&context_id, &outlet_id))
-                .map_err(ScpWasmError::into_js)?;
-        match ucan_token {
-            Some(ref token) if !token.is_empty() => {
-                crate::ucan::validate_outlet_ucan_wasm(
-                    &context_id,
-                    &outlet_id,
-                    outlet_kind_for_ucan,
-                    token,
-                    &identity_did,
-                )
-                .map_err(|e| {
-                    ScpWasmError::Permission {
-                        message: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),
-                        code: codes::PERM_3000.to_owned(),
-                    }
-                    .into_js()
-                })?;
-            }
-            _ => {
-                return Err(JsValue::from(
-                    ScpWasmError::Validation {
-                        message: "ucan_token is required for tool invocation".to_owned(),
-                        code: codes::VALID_7000.to_owned(),
-                    }
-                    .into_js(),
-                ));
-            }
-        }
-
-        let parsed_input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("input_json is not valid JSON: {e}"),
-                code: codes::VALID_7000.to_owned(),
-            }
-            .into_js()
-        })?;
-
-        let result = with_manager(|mgr| {
-            mgr.invoke_outlet_one_shot(&context_id, &outlet_id, &parsed_input, &identity_did)
-        })
-        .map_err(ScpWasmError::into_js)?;
-
-        let json_str = serde_json::to_string(&result).map_err(|e| {
-            ScpWasmError::Tool {
-                message: format!("failed to serialize tool output: {e}"),
-                code: codes::TOOL_6002.to_owned(),
-            }
-            .into_js()
-        })?;
-
-        Ok(JsValue::from_str(&json_str))
+        outlet_invoke_inner(context_id, outlet_id, input_json, identity_did, ucan_token)
     })
+}
+
+/// Body of [`outlet_invoke`], extracted so the `#[wasm_bindgen]` entry point
+/// stays under the per-function line ceiling and so the payment-precondition
+/// gates (paid-context / spending-UCAN rejection) read as a flat sequence in
+/// the public wrapper.
+///
+/// Runs the WASM-local 11-step UCAN authorization, parses the input, enforces
+/// the §7.3.8 single-shot caveat gate ([`enforce_single_shot_caveats`]), then
+/// dispatches to `invoke_outlet_one_shot`. Synchronous — the WASM bridge has
+/// no async executor (ADR-034); the public wrapper lifts the `Result` into the
+/// `future_to_promise` future.
+fn outlet_invoke_inner(
+    context_id: String,
+    outlet_id: String,
+    input_json: String,
+    identity_did: String,
+    ucan_token: Option<String>,
+) -> Result<JsValue, JsValue> {
+    // UCAN authorization: validate the token via the WASM-local
+    // 11-step pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+    // Look up the outlet's registered kind so the UCAN validator
+    // checks the correct split capability stem (SCP-OUT-014).
+    let outlet_kind_for_ucan =
+        crate::manager::with_manager(|mgr| mgr.outlet_kind(&context_id, &outlet_id))
+            .map_err(ScpWasmError::into_js)?;
+    match ucan_token {
+        Some(ref token) if !token.is_empty() => {
+            crate::ucan::validate_outlet_ucan_wasm(
+                &context_id,
+                &outlet_id,
+                outlet_kind_for_ucan,
+                token,
+                &identity_did,
+            )
+            .map_err(|e| {
+                ScpWasmError::Permission {
+                    message: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),
+                    code: codes::PERM_3000.to_owned(),
+                }
+                .into_js()
+            })?;
+        }
+        _ => {
+            return Err(JsValue::from(
+                ScpWasmError::Validation {
+                    message: "ucan_token is required for tool invocation".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
+                }
+                .into_js(),
+            ));
+        }
+    }
+
+    let parsed_input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("input_json is not valid JSON: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        }
+        .into_js()
+    })?;
+
+    // §7.3.8 single-shot caveat parity: enforce the action UCAN's
+    // VALIDATED-NARROWED `nb` caveats that WASM is capable of enforcing
+    // (the non-counter local set + `max_calls` from the validated nb).
+    // The prior single-shot path dropped the `nb` entirely — a delegated
+    // UCAN's narrowed `input_schema` / `allowed_target_dids` / `max_calls`
+    // were never enforced on WASM single-shot. `ucan_token` is the
+    // already-validated token (matched as non-empty above); re-parse to
+    // recover its `nb`. Parsing cannot fail here — `validate_outlet_ucan_wasm`
+    // already parsed and validated the same string.
+    if let Some(token) = ucan_token.as_deref() {
+        let parsed = scp_protocol::crypto::ucan::validate::parse_ucan(token).map_err(|e| {
+            ScpWasmError::Permission {
+                message: format!("failed to parse action UCAN: {e}"),
+                code: codes::PERM_3000.to_owned(),
+            }
+            .into_js()
+        })?;
+        if let Some(effective_caveats) = parsed.payload.nb.as_ref() {
+            enforce_single_shot_caveats(effective_caveats, &parsed_input)
+                .map_err(ScpWasmError::into_js)?;
+        }
+    }
+
+    let result = with_manager(|mgr| {
+        mgr.invoke_outlet_one_shot(&context_id, &outlet_id, &parsed_input, &identity_did)
+    })
+    .map_err(ScpWasmError::into_js)?;
+
+    let json_str = serde_json::to_string(&result).map_err(|e| {
+        ScpWasmError::Tool {
+            message: format!("failed to serialize tool output: {e}"),
+            code: codes::TOOL_6002.to_owned(),
+        }
+        .into_js()
+    })?;
+
+    Ok(JsValue::from_str(&json_str))
 }
 
 /// Verifies a tool against its registered test vectors.
