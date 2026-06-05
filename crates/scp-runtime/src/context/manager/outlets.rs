@@ -930,6 +930,7 @@ impl ContextManager {
                 role_state,
                 ticket,
                 ctx_gen,
+                action_cost,
             }
         };
 
@@ -938,6 +939,7 @@ impl ContextManager {
             role_state,
             ticket,
             ctx_gen,
+            action_cost,
         } = phase1;
 
         // SCP-OUT-021 + SCP-OUT-022: build the post-input caveat /
@@ -1004,6 +1006,23 @@ impl ContextManager {
                         .to_owned(),
                 },
             ));
+        }
+
+        // §7.3.8 amount-caveat binding: replace the caller-supplied
+        // `estimated_cost` with the REAL per-invocation cost the runtime
+        // priced under the Phase 1 lock (`economy_pre_check`). Single-shot
+        // bridges (PyO3 / NAPI / UniFFI) have no per-call price at the bridge
+        // layer and pass `estimated_cost: 0`, which would make
+        // `amount_max_per_call` always pass and `amount_max_cumulative` accrue
+        // 0 — the §7.3.8 amount caps would be inert on single-shot. The cost
+        // is only knowable here, after pricing, so the runtime is the correct
+        // layer to bind the amount caveats to it. The runtime owns the cost,
+        // so a bridge cannot under-report it. Streaming prices per-chunk
+        // through `build_stream_post_input_hook`'s `cost_per_chunk`, which is
+        // the streaming analogue of this assignment.
+        let mut caveat_enforcement = caveat_enforcement;
+        if let Some(enf) = caveat_enforcement.as_mut() {
+            enf.estimated_cost = action_cost;
         }
 
         // §7.3.8 fail-closed defense-in-depth: if the leaf caveats require a
@@ -2692,6 +2711,14 @@ struct Phase1Snapshot {
     role_state: scp_protocol::context::roles::ContextRoleState,
     ticket: OutletEconomyTicket,
     ctx_gen: ContextGeneration,
+    /// The real per-invocation cost the runtime priced under the Phase 1
+    /// lock via `economy_pre_check`. Surfaced out of Phase 1 so the
+    /// §7.3.8 post-input hook builder can drive the `amount_max_per_call` /
+    /// `amount_max_cumulative` caveats against the ACTUAL cost rather than
+    /// the bridge-supplied estimate (single-shot bridges have no per-call
+    /// price at the bridge layer and pass `estimated_cost: 0`). For free
+    /// actions this is `Amount::new(0)`.
+    action_cost: Amount,
 }
 
 // ===========================================================================
