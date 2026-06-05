@@ -1928,18 +1928,36 @@ async fn caveat_test_setup() -> (
     std::sync::Arc<ContextManager>,
     scp_protocol::context::outlets::registry::OutletRegistry,
     scp_protocol::crypto::ucan::UcanToken,
-    std::sync::Arc<dyn crate::trust::CaveatCounterApi>,
     String,
 ) {
     use scp_protocol::context::outlets::registry::OutletRegistry;
     use scp_protocol::economy::types::Amount;
 
-    let manager = std::sync::Arc::new(ContextManager::new(
+    // Build the manager mutably so the §7.3.8 counter store can be wired
+    // BEFORE the `Arc` wrap. The runtime now OWNS the counter store and
+    // resolves it internally via `caveat_counter_store()` (single-shot
+    // parity with the streaming path) — callers no longer pass it through
+    // `CaveatEnforcement`.
+    let mut manager_inner = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    ));
+    );
+
+    // Set up an in-memory CaveatCounterStore type-erased into
+    // CaveatCounterApi and wire it onto the manager.
+    let storage = std::sync::Arc::new(scp_platform::testing::InMemoryStorage::new());
+    let repository =
+        std::sync::Arc::new(crate::store::ProtocolRepository::new_for_testing(storage));
+    let clock: std::sync::Arc<dyn scp_primitives::Clock> =
+        std::sync::Arc::new(scp_primitives::TestClock::new(1_000_000));
+    let store = crate::trust::CaveatCounterStore::new(repository, clock);
+    let counter_store: std::sync::Arc<dyn crate::trust::CaveatCounterApi> =
+        std::sync::Arc::new(store);
+    manager_inner.set_caveat_counter_store(std::sync::Arc::clone(&counter_store));
+
+    let manager = std::sync::Arc::new(manager_inner);
 
     let mut params = governance_params();
     params
@@ -1963,19 +1981,8 @@ async fn caveat_test_setup() -> (
 
     let ucan = dummy_spending_ucan_for(&"did:key:invoker".into());
 
-    // Set up an in-memory CaveatCounterStore type-erased into
-    // CaveatCounterApi.
-    let storage = std::sync::Arc::new(scp_platform::testing::InMemoryStorage::new());
-    let repository =
-        std::sync::Arc::new(crate::store::ProtocolRepository::new_for_testing(storage));
-    let clock: std::sync::Arc<dyn scp_primitives::Clock> =
-        std::sync::Arc::new(scp_primitives::TestClock::new(1_000_000));
-    let store = crate::trust::CaveatCounterStore::new(repository, clock);
-    let counter_store: std::sync::Arc<dyn crate::trust::CaveatCounterApi> =
-        std::sync::Arc::new(store);
-
     let ucan_cid = "ucan-caveat-test".to_owned();
-    (manager, registry, ucan, counter_store, ucan_cid)
+    (manager, registry, ucan, ucan_cid)
 }
 
 /// SCP-OUT-021 AC: invocation exceeding `max_calls` is rejected at post-input.
@@ -1985,7 +1992,7 @@ async fn caveat_max_calls_rejects_after_cap_reached() {
     use scp_protocol::economy::types::Amount;
     use scp_protocol::trust::caveats::InvocationCaveats;
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         max_calls: Some(2),
         ..InvocationCaveats::empty()
@@ -1995,7 +2002,6 @@ async fn caveat_max_calls_rejects_after_cap_reached() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         async move {
             manager
@@ -2011,7 +2017,6 @@ async fn caveat_max_calls_rejects_after_cap_reached() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,
@@ -2047,7 +2052,7 @@ async fn caveat_amount_max_cumulative_rejects_when_exhausted() {
     use scp_protocol::economy::types::Amount;
     use scp_protocol::trust::caveats::InvocationCaveats;
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         amount_max_cumulative: Some(Amount::new(100)),
         ..InvocationCaveats::empty()
@@ -2057,7 +2062,6 @@ async fn caveat_amount_max_cumulative_rejects_when_exhausted() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         async move {
             manager
@@ -2073,7 +2077,6 @@ async fn caveat_amount_max_cumulative_rejects_when_exhausted() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,
@@ -2108,7 +2111,7 @@ async fn caveat_rate_window_rejects_when_full() {
     use scp_protocol::economy::types::Amount;
     use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
 
-    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let (manager, registry, ucan, ucan_cid) = caveat_test_setup().await;
     let caveats = InvocationCaveats {
         rate_window: Some(RateWindow {
             max: 2,
@@ -2121,7 +2124,6 @@ async fn caveat_rate_window_rejects_when_full() {
         let manager = std::sync::Arc::clone(&manager);
         let registry = registry.clone();
         let ucan = ucan.clone();
-        let counter_store = std::sync::Arc::clone(&counter_store);
         let ucan_cid = ucan_cid.clone();
         let caveats = caveats.clone();
         async move {
@@ -2138,7 +2140,6 @@ async fn caveat_rate_window_rejects_when_full() {
                     None,
                     Some(crate::context::manager::outlets::CaveatEnforcement {
                         caveats: &caveats,
-                        counter_store,
                         ucan_cid: &ucan_cid,
                         negotiated_adapter: None,
                         target_did: None,

@@ -89,28 +89,32 @@ pub struct ManagedOutletInvocationOutput {
 /// enforcement.
 ///
 /// Construct one of these and pass it into
-/// [`ContextManager::invoke_outlet_with_economy_and_caveats`] when the
-/// presented spending UCAN (or another token in the chain) carries
-/// invocation caveats. The fields hold owned references / shared `Arc`
-/// handles so the caller retains ownership of the underlying data
-/// across the off-lock invocation.
+/// [`ContextManager::invoke_outlet_with_economy`] when the presenting
+/// (leaf) action UCAN carries invocation caveats (its validated-narrowed
+/// `nb` field per §7.3.8). The fields hold owned references so the caller
+/// retains ownership of the underlying data across the off-lock
+/// invocation.
 ///
-/// The `counter_store` field is type-erased as
-/// `Arc<dyn CaveatCounterApi>` so the manager API does not have to
-/// propagate the [`Storage`](scp_platform::traits::Storage) generic
-/// parameter through every caller. Concrete
-/// [`CaveatCounterStore<S>`](crate::trust::CaveatCounterStore) values
-/// implement [`CaveatCounterApi`](crate::trust::CaveatCounterApi) for
-/// every `S: Storage + 'static`, so callers wrap their store as
-/// `Arc::new(store) as Arc<dyn CaveatCounterApi>`.
+/// # Counter store ownership (§7.3.8 fail-closed)
+///
+/// The durable per-`(context_id, ucan_cid, caveat_kind)` counter store is
+/// NOT a field of this struct — it is owned by the [`ContextManager`] and
+/// resolved internally via `caveat_counter_store()` at invocation time,
+/// exactly as the streaming path ([`ContextManager::open_outlet_stream`])
+/// resolves it through [`build_stream_post_input_hook`]. This is a
+/// deliberate design choice: a bridge cannot forget to enforce the
+/// counter-bearing caveats (`max_calls`, `amount_max_cumulative`,
+/// `rate_window`) by omitting the store, because the store is never a
+/// caller responsibility. When the leaf caveats carry a counter-bearing
+/// cap but the manager has no counter store the invocation FAILS CLOSED
+/// (rejected) rather than silently admitting an unenforceable cap —
+/// identical to `build_stream_post_input_hook`'s
+/// `OpenStreamRejection::CaveatPostInputViolation`.
 ///
 /// # Field semantics
 ///
 /// - `caveats` — the [`InvocationCaveats`] to enforce. Comes from the
 ///   resolved `nb` field of the presenting (leaf) UCAN per §7.3.8.
-/// - `counter_store` — durable per-`(ucan_cid, caveat_kind)` counter
-///   store. Atomic CAS prevents racing invocations from double-spending
-///   `max_calls`, `amount_max_cumulative`, or `rate_window` capacity.
 /// - `ucan_cid` — the CID of the presenting UCAN. Forms half of the
 ///   counter-store key alongside `context_id` (which the manager
 ///   wrapper already knows).
@@ -125,8 +129,6 @@ pub struct ManagedOutletInvocationOutput {
 pub struct CaveatEnforcement<'a> {
     /// Invocation caveats from the presenting UCAN's `nb` field.
     pub caveats: &'a scp_protocol::trust::caveats::InvocationCaveats,
-    /// Durable counter store (type-erased) for atomic per-UCAN cap accounting.
-    pub counter_store: Arc<dyn crate::trust::CaveatCounterApi>,
     /// CID of the presenting UCAN (counter-store key).
     pub ucan_cid: &'a str,
     /// Negotiated payment adapter reference, if any.
@@ -977,15 +979,73 @@ impl ContextManager {
         } else {
             None
         };
+
+        // §7.3.8 fail-closed (R3 single-shot parity with streaming):
+        // a counter-bearing caveat (`max_calls` / `amount_max_cumulative` /
+        // `rate_window`) that the manager has NO counter store to enforce
+        // MUST reject the invocation, never silently admit. This mirrors
+        // `build_stream_post_input_hook` returning
+        // `OpenStreamRejection::CaveatPostInputViolation`. The check sits
+        // BEFORE the hook is built so a missing store can never reach the
+        // `build_post_input_hook`-returns-`None` bypass. The counter store
+        // is RUNTIME-OWNED (resolved here, not supplied by the caller) so a
+        // bridge cannot omit it.
+        let caveat_counter_store = self.caveat_counter_store().cloned();
+        if let Some(enf) = caveat_enforcement.as_ref()
+            && enf.caveats.has_counter_bearing_caveat()
+            && caveat_counter_store.is_none()
+        {
+            rollback_outlet_economy_ticket(self, context_id, ticket).await;
+            return Err(invocation_error_to_context(
+                InvocationError::CaveatViolation {
+                    slug: scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
+                    message: "counter-bearing caveat present but no counter store is \
+                              configured — invocation rejected fail-closed (§7.3.8)"
+                        .to_owned(),
+                },
+            ));
+        }
+
+        // §7.3.8 fail-closed defense-in-depth: if the leaf caveats require a
+        // post-input check, a hook MUST be built. `build_post_input_hook`
+        // returns `None` only when NEITHER `caveat_enforcement` NOR
+        // `layer_composition` is present; capture whether enforcement is
+        // required here so the post-build guard can reject a (would-be)
+        // silent bypass.
+        let caveat_requires_post_input = caveat_enforcement
+            .as_ref()
+            .is_some_and(|enf| enf.caveats.requires_post_input_check());
+
         let caveat_hook: Option<crate::context::outlets::invoke::CaveatPostInputCheck<'_>> =
             build_post_input_hook(
                 context_id,
                 invoker_did,
                 now_secs,
                 caveat_enforcement,
+                caveat_counter_store,
                 layer_composition,
                 outlet_for_layer_composition,
             );
+
+        // §7.3.8 fail-closed (defense-in-depth). If the leaf caveats require a
+        // post-input check but no hook was produced, the §7.3.8 gate would be
+        // silently skipped — the exact bypass this remediation closes. Reject
+        // rather than admit. With the wiring above this is unreachable (a
+        // post-input-requiring `caveat_enforcement` always yields a hook), but
+        // the guard makes the invariant mechanical: a future refactor that
+        // drops the hook for an enforcement-bearing token is caught at runtime
+        // instead of silently re-opening the bypass.
+        if caveat_requires_post_input && caveat_hook.is_none() {
+            rollback_outlet_economy_ticket(self, context_id, ticket).await;
+            return Err(invocation_error_to_context(
+                InvocationError::CaveatViolation {
+                    slug: scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
+                    message: "leaf caveats require a §7.3.8 post-input check but no \
+                              enforcement hook is active — invocation rejected fail-closed"
+                        .to_owned(),
+                },
+            ));
+        }
 
         // ------------------------------------------------------------
         // Phase 2 — UNLOCKED.
@@ -3289,12 +3349,22 @@ fn caveat_counter_error_to_invocation_error(
 ///
 /// Returns `None` when neither bundle is present — the caller bypasses the
 /// §7.3.8 post-input gate entirely in that case.
+///
+/// `counter_store` is the RUNTIME-OWNED durable counter store (resolved by
+/// the caller from `caveat_counter_store()`, never supplied by a bridge —
+/// mirroring how [`build_stream_post_input_hook`] reads it from the manager).
+/// It is `None` only when the manager was built without a storage backend; in
+/// that case the caller has ALREADY rejected any counter-bearing caveat
+/// fail-closed before reaching this builder, so the counter-CAS branches
+/// below are unreachable for counter-bearing caveats and the local-only
+/// checks still run.
 #[allow(clippy::too_many_lines)] // §7.3.8 spec ordering — splitting masks the spec mapping; SCP-OUT-022 ACs hinge on the ordering being visible in one place.
 fn build_post_input_hook<'a>(
     context_id: &str,
     invoker_did: &DID,
     now_secs: u64,
     caveat_enforcement: Option<CaveatEnforcement<'_>>,
+    counter_store: Option<Arc<dyn crate::trust::CaveatCounterApi>>,
     layer_composition: Option<LayerCompositionEnforcement>,
     outlet_for_layer_composition: Option<scp_protocol::context::outlets::OutletRegistration>,
 ) -> Option<crate::context::outlets::invoke::CaveatPostInputCheck<'a>> {
@@ -3310,10 +3380,12 @@ fn build_post_input_hook<'a>(
     let invoker_did_owned = invoker_did.clone();
 
     // SCP-OUT-021 captures (only meaningful when caveat_enforcement.is_some()).
+    // The counter store is RUNTIME-OWNED — moved into the capture here so the
+    // counter-CAS branches and the OUT-022 fold both read the same handle.
     let out021 = caveat_enforcement.map(|enf| OUT021Capture {
         ucan_cid: enf.ucan_cid.to_owned(),
+        counter_store,
         caveats: enf.caveats.clone(),
-        counter_store: enf.counter_store,
         estimated_cost: enf.estimated_cost,
         adapter: enf.negotiated_adapter.cloned(),
         target_did: enf.target_did.cloned(),
@@ -3358,12 +3430,20 @@ fn build_post_input_hook<'a>(
                 // increment. Order is fixed: max_calls → amount_max_cumulative
                 // → rate_window so the rejection slug stays deterministic
                 // when more than one counter caveat would fail.
+                // The counter store is RUNTIME-OWNED and may be `None` only
+                // when the manager has no storage backend. In that case the
+                // caller already rejected any counter-bearing caveat
+                // fail-closed before this hook was built, so reaching the
+                // counter-CAS branches with a populated counter-bearing
+                // caveat AND a `None` store is unreachable. The
+                // `if let Some(store)` makes that invariant explicit instead
+                // of unwrapping.
                 if let Some(cap) = out021.as_ref()
                     && out022.is_none()
+                    && let Some(store) = cap.counter_store.as_ref()
                 {
                     if let Some(max) = cap.caveats.max_calls
-                        && let Err(err) = cap
-                            .counter_store
+                        && let Err(err) = store
                             .check_and_increment(
                                 &context_id_owned,
                                 &cap.ucan_cid,
@@ -3377,8 +3457,7 @@ fn build_post_input_hook<'a>(
                         return Err(caveat_counter_error_to_invocation_error(err));
                     }
                     if let Some(max) = cap.caveats.amount_max_cumulative
-                        && let Err(err) = cap
-                            .counter_store
+                        && let Err(err) = store
                             .check_and_increment(
                                 &context_id_owned,
                                 &cap.ucan_cid,
@@ -3392,8 +3471,7 @@ fn build_post_input_hook<'a>(
                         return Err(caveat_counter_error_to_invocation_error(err));
                     }
                     if let Some(window) = cap.caveats.rate_window
-                        && let Err(err) = cap
-                            .counter_store
+                        && let Err(err) = store
                             .check_and_increment(
                                 &context_id_owned,
                                 &cap.ucan_cid,
@@ -3429,9 +3507,13 @@ fn build_post_input_hook<'a>(
                     ) = out021
                         .as_ref()
                         .map_or((&empty_caveats, None, ""), |out021_cap| {
+                            // `counter_store` is runtime-owned and optional;
+                            // `as_deref()` already yields the
+                            // `Option<&dyn CaveatCounterApi>` the layer fold
+                            // expects (no extra `Some`-wrapping).
                             (
                                 &out021_cap.caveats,
-                                Some(out021_cap.counter_store.as_ref()),
+                                out021_cap.counter_store.as_deref(),
                                 out021_cap.ucan_cid.as_str(),
                             )
                         });
@@ -3609,7 +3691,10 @@ fn build_stream_post_input_hook(
 struct OUT021Capture {
     ucan_cid: String,
     caveats: scp_protocol::trust::caveats::InvocationCaveats,
-    counter_store: Arc<dyn crate::trust::CaveatCounterApi>,
+    /// Runtime-owned durable counter store. `None` only when the manager has
+    /// no storage backend, in which case the caller has already rejected any
+    /// counter-bearing caveat fail-closed before this capture is built.
+    counter_store: Option<Arc<dyn crate::trust::CaveatCounterApi>>,
     estimated_cost: scp_protocol::economy::types::Amount,
     adapter: Option<scp_protocol::economy::types::PaymentAdapterRef>,
     target_did: Option<DID>,
