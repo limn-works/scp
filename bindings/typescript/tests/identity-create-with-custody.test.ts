@@ -53,19 +53,22 @@ class CryptoKeychain implements KeyCustodyProvider {
     return kid;
   }
 
-  #keyObject(keyId: string): crypto.KeyObject {
-    const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    // Reconstruct an Ed25519 private key from the raw 32-byte seed via the
-    // standard PKCS8 DER encoding. Node's OKP JWK import requires the public
-    // `x` too; the PKCS8 form needs only the seed.
+  // Reconstruct an Ed25519 private key from a raw 32-byte seed via the standard
+  // PKCS8 DER encoding. Node's OKP JWK import requires the public `x` too; the
+  // PKCS8 form needs only the seed.
+  #keyObjectFromSeed(seed: Uint8Array): crypto.KeyObject {
     const der = Buffer.concat([
       // 16-byte Ed25519 PKCS8 prefix + 32-byte seed = valid PKCS8 DER.
       Buffer.from("302e020100300506032b657004220420", "hex"),
       Buffer.from(seed),
     ]);
-    const priv = crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
-    return priv;
+    return crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+  }
+
+  #keyObject(keyId: string): crypto.KeyObject {
+    const seed = this.#seeds.get(keyId);
+    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
+    return this.#keyObjectFromSeed(seed);
   }
 
   sign(keyId: string, message: Uint8Array): Uint8Array {
@@ -92,25 +95,60 @@ class CryptoKeychain implements KeyCustodyProvider {
     return new Uint8Array(h.digest());
   }
 
-  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
-    const seed = this.#seeds.get(keyId) ?? new Uint8Array(32);
-    const h = crypto.createHash("sha256");
-    h.update(Buffer.from(seed));
-    h.update(Buffer.from(contextId));
-    const pseudoSeed = h.digest(); // 32 bytes
-    // Reconstruct the derived Ed25519 key from the seed via PKCS8 DER (the OKP
-    // JWK import path requires the public `x`; PKCS8 needs only the seed).
-    const der = Buffer.concat([
-      // 16-byte Ed25519 PKCS8 prefix + 32-byte seed = valid PKCS8 DER.
-      Buffer.from("302e020100300506032b657004220420", "hex"),
-      Buffer.from(pseudoSeed),
-    ]);
-    const priv = crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
-    const pubJwk = crypto.createPublicKey(priv).export({ format: "jwk" }) as { x: string };
+  // Canonical per-context pseudonym secret (spec §9.10.4.A / §25.19):
+  //   pseudonym_secret = HKDF-SHA256(ikm = seed, salt = "scp-pseudonym-secret-v1",
+  //                                  info = "", len = 32)
+  #pseudonymSecret(keyId: string): Buffer {
+    const seed = this.#seeds.get(keyId);
+    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
+    return Buffer.from(
+      crypto.hkdfSync(
+        "sha256",
+        Buffer.from(seed),
+        Buffer.from("scp-pseudonym-secret-v1"),
+        Buffer.alloc(0),
+        32,
+      ),
+    );
+  }
+
+  // Register a derived 32-byte context seed as a fresh signing key and return
+  // `publicKey(32) || keyIdUtf8` — the wire layout the native bridge unpacks.
+  #pseudonymFromContextSeed(contextSeed: Buffer): Uint8Array {
+    const pubJwk = crypto
+      .createPublicKey(this.#keyObjectFromSeed(contextSeed))
+      .export({ format: "jwk" }) as { x: string };
     const pub = Buffer.from(pubJwk.x, "base64url");
     const kid = String(this.#next++);
-    this.#seeds.set(kid, new Uint8Array(pseudoSeed));
+    this.#seeds.set(kid, new Uint8Array(contextSeed));
     return new Uint8Array(Buffer.concat([pub, Buffer.from(kid, "utf-8")]));
+  }
+
+  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
+    // v1 (static): context_seed = HMAC-SHA256(secret, context_id || "scp-pseudonym")
+    const data = Buffer.concat([Buffer.from(contextId), Buffer.from("scp-pseudonym")]);
+    const contextSeed = crypto
+      .createHmac("sha256", this.#pseudonymSecret(keyId))
+      .update(data)
+      .digest();
+    return this.#pseudonymFromContextSeed(contextSeed);
+  }
+
+  deriveRotatablePseudonym(
+    keyId: string,
+    contextId: Uint8Array,
+    pseudonymEpoch: bigint,
+  ): Uint8Array {
+    // v2 (rotatable): context_seed = HMAC-SHA256(
+    //   secret, context_id || BE64(epoch) || "scp-pseudonym-v2")
+    const be = Buffer.alloc(8);
+    be.writeBigUInt64BE(pseudonymEpoch);
+    const data = Buffer.concat([Buffer.from(contextId), be, Buffer.from("scp-pseudonym-v2")]);
+    const contextSeed = crypto
+      .createHmac("sha256", this.#pseudonymSecret(keyId))
+      .update(data)
+      .digest();
+    return this.#pseudonymFromContextSeed(contextSeed);
   }
 
   exportSigningKeyBytes(keyId: string): Uint8Array {
