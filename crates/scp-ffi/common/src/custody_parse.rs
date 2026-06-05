@@ -82,35 +82,6 @@ pub fn unpack_pseudonym(method: &str, bytes: &[u8]) -> Result<PseudonymKeypair, 
     })
 }
 
-/// Builds the extended context-id input for a rotatable pseudonym derivation.
-///
-/// The callback-custody protocol exposes only a single `derive_pseudonym`
-/// method, so the rotatable variant is synthesized by appending the big-endian
-/// epoch and the `v2` domain separator to the caller-supplied `context_id`,
-/// then delegating to `derive_pseudonym`.
-///
-/// Layout: `context_id || epoch.to_be_bytes() (8) || b"scp-pseudonym-v2" (16)`.
-///
-/// This is the canonical recipe defined in `scp-platform`
-/// `KeyCustody::derive_rotatable_pseudonym` (traits.rs) — the byte ordering of
-/// this preimage is fixed by the protocol (spec §9.10.4.1), not by any single
-/// bridge. There is deliberately NO length
-/// separator between `context_id` and the epoch: the epoch is always exactly 8
-/// big-endian bytes appended directly after the caller-supplied `context_id`,
-/// and the trailing domain separator is a fixed 16-byte literal. A length
-/// prefix would change the produced bytes and is therefore a wire-format change
-/// that must originate upstream in the spec/ADR and `scp-platform` (and be
-/// applied identically across all bridges and the native custody backends) — it
-/// cannot be introduced here without breaking cross-bridge and over-time
-/// pseudonym derivation parity.
-#[must_use]
-pub fn extend_context_id_for_rotation(context_id: &[u8], epoch: u64) -> Vec<u8> {
-    let mut extended = context_id.to_vec();
-    extended.extend_from_slice(&epoch.to_be_bytes());
-    extended.extend_from_slice(b"scp-pseudonym-v2");
-    extended
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
@@ -218,25 +189,5 @@ mod tests {
             }
             other => panic!("expected CustodyError, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn extend_context_id_for_rotation_byte_layout() {
-        let context_id = b"ctx";
-        let epoch: u64 = 5;
-        let extended = extend_context_id_for_rotation(context_id, epoch);
-
-        // Layout: context_id || epoch_BE(8) || "scp-pseudonym-v2" (16 bytes).
-        let mut expected = Vec::new();
-        expected.extend_from_slice(b"ctx");
-        expected.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 5]); // 5 as 8 big-endian bytes
-        expected.extend_from_slice(b"scp-pseudonym-v2");
-
-        assert_eq!(extended, expected);
-        assert_eq!(extended.len(), 3 + 8 + 16);
-        // Domain separator is exactly the trailing 16 bytes.
-        assert_eq!(&extended[extended.len() - 16..], b"scp-pseudonym-v2");
-        // Epoch occupies the 8 bytes immediately after context_id.
-        assert_eq!(&extended[3..11], &epoch.to_be_bytes());
     }
 }

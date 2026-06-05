@@ -69,6 +69,15 @@ pub struct NapiKeyCustodyProvider {
     /// `publicKey(32) || keyIdUtf8`.
     #[napi(ts_type = "(keyId: string, contextId: Uint8Array) => Uint8Array")]
     pub derive_pseudonym: Function<'static, (String, Vec<u8>), Vec<u8>>,
+    /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => Uint8Array`
+    /// — canonical rotatable v2 pseudonym; returns `publicKey(32) || keyIdUtf8`.
+    /// The provider performs the canonical derivation (HMAC key is the
+    /// private-derived `pseudonym_secret`, domain `"scp-pseudonym-v2"`); the
+    /// bridge does NOT synthesize the preimage.
+    #[napi(
+        ts_type = "(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => Uint8Array"
+    )]
+    pub derive_rotatable_pseudonym: Function<'static, (String, Vec<u8>, u64), Vec<u8>>,
     /// `(keyId: string) => Uint8Array` — 32 raw private-seed bytes.
     #[napi(ts_type = "(keyId: string) => Uint8Array")]
     pub export_signing_key_bytes: Function<'static, String, Vec<u8>>,
@@ -99,6 +108,13 @@ struct CallbackTsfns {
         ThreadsafeFunction<(String, Vec<u8>), Vec<u8>, (String, Vec<u8>), napi::Status, false>,
     derive_pseudonym:
         ThreadsafeFunction<(String, Vec<u8>), Vec<u8>, (String, Vec<u8>), napi::Status, false>,
+    derive_rotatable_pseudonym: ThreadsafeFunction<
+        (String, Vec<u8>, u64),
+        Vec<u8>,
+        (String, Vec<u8>, u64),
+        napi::Status,
+        false,
+    >,
     export_signing_key_bytes: ThreadsafeFunction<String, Vec<u8>, String, napi::Status, false>,
     custody_type: ThreadsafeFunction<String, String, String, napi::Status, false>,
 }
@@ -158,6 +174,11 @@ impl NapiCallbackKeyCustody {
                     .build()?,
                 derive_pseudonym: provider
                     .derive_pseudonym
+                    .build_threadsafe_function()
+                    .weak::<false>()
+                    .build()?,
+                derive_rotatable_pseudonym: provider
+                    .derive_rotatable_pseudonym
                     .build_threadsafe_function()
                     .weak::<false>()
                     .build()?,
@@ -288,23 +309,20 @@ impl KeyCustody for NapiCallbackKeyCustody {
         context_id: &[u8],
         pseudonym_epoch: u64,
     ) -> Result<PseudonymKeypair, PlatformError> {
-        // Synthesize the rotatable variant by extending the context_id with
-        // the big-endian epoch and the v2 domain separator, then delegating to
-        // the single `derive_pseudonym` callback (matches the UniFFI/PyO3
-        // CallbackKeyCustody contract — keeps the JS surface to one method). The
-        // canonical byte layout (`context_id || epoch_BE(8) || "scp-pseudonym-v2"`)
-        // lives in `scp_ffi_common::custody_parse::extend_context_id_for_rotation`,
-        // shared across all callback bridges so the wire format cannot drift.
-        let extended = scp_ffi_common::custody_parse::extend_context_id_for_rotation(
-            context_id,
-            pseudonym_epoch,
-        );
+        // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the provider performs
+        // the rotatable derivation itself — seed = HMAC-SHA256(pseudonym_secret,
+        // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); keypair =
+        // Ed25519_keygen(seed[0..32]). The epoch is threaded through to the
+        // provider rather than synthesized into the context_id bridge-side, so
+        // the v1 platform adapter does not re-append its own "scp-pseudonym"
+        // domain separator (which would corrupt the v2 domain). Mirrors the
+        // UniFFI / PyO3 CallbackKeyCustody contract.
         let bytes = self
             .tsfns
-            .derive_pseudonym
-            .call_async((key.id().to_string(), extended))
+            .derive_rotatable_pseudonym
+            .call_async((key.id().to_string(), context_id.to_vec(), pseudonym_epoch))
             .await
-            .map_err(|e| Self::map_call_err("derive_pseudonym", &e))?;
+            .map_err(|e| Self::map_call_err("derive_rotatable_pseudonym", &e))?;
         scp_ffi_common::custody_parse::unpack_pseudonym("derive_rotatable_pseudonym", &bytes)
     }
 

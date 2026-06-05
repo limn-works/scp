@@ -382,6 +382,49 @@ pub trait KeyCustodyProvider: Send + Sync {
         context_id: Vec<u8>,
     ) -> Result<Vec<u8>, ScpError>;
 
+    /// Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
+    ///
+    /// Canonical recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
+    /// private-derived `pseudonym_secret` (HKDF over the Ed25519 private seed),
+    /// NEVER the public key.
+    /// `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
+    /// `keypair = Ed25519_keygen(seed[0..32])` (RFC-8032 seed). Returns
+    /// `[pseudonym_public_key_bytes (32) || key_id_utf8]`.
+    ///
+    /// The `pseudonym_epoch` is passed through to the provider so it performs
+    /// the canonical v2 derivation itself. Bridges MUST NOT synthesize a
+    /// `context_id || BE64(epoch) || "scp-pseudonym-v2"` preimage and feed it to
+    /// the v1 `derive_pseudonym` — that double-appends the v1 domain separator
+    /// (`"scp-pseudonym"`) and diverges from the Rust reference.
+    ///
+    /// # Default
+    ///
+    /// Rust-side providers that do not rotate return `ScpError::Context`
+    /// (SCP-CTX-2050) indicating the method is not implemented. Platform SDK
+    /// adapters (Swift `AppleKeyCustody`, Kotlin `AndroidKeyCustody`) override
+    /// this with real implementations.
+    ///
+    /// **Note:** `UniFFI` callback interfaces require foreign implementations to
+    /// define all methods. The generated Swift protocol / Kotlin interface will
+    /// include this method. The default here applies only to Rust-side callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError` if the key is not found, is not an Ed25519 key, or the
+    /// provider does not support rotatable pseudonyms.
+    async fn derive_rotatable_pseudonym(
+        &self,
+        key_id: String,
+        context_id: Vec<u8>,
+        pseudonym_epoch: u64,
+    ) -> Result<Vec<u8>, ScpError> {
+        let _ = (key_id, context_id, pseudonym_epoch);
+        Err(ScpError::Context {
+            msg: "derive_rotatable_pseudonym not implemented by this KeyCustodyProvider".to_owned(),
+            code: codes::CTX_2050.to_owned(),
+        })
+    }
+
     /// Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
     ///
     /// Required for governance vote signing, which uses `ed25519_dalek::SigningKey`
