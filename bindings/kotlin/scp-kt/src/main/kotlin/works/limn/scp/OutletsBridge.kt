@@ -43,7 +43,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import uniffi.scp.ContextHandle
 import uniffi.scp.Identity
 import uniffi.scp.OutletStreamChunkRecord
@@ -63,18 +62,24 @@ import uniffi.scp.OutletStreamHandle
  * Opaque per-stream cursor the production namespace pumps. Abstracts the
  * UniFFI `OutletStreamHandle` so the pump + control-plane wiring is
  * testable against a fake. `requestId()` returns the 32-char lowercase
- * hex §5.4.5 `request_id`; `next()` yields the next chunk or `null` at
- * end-of-stream.
+ * hex §5.4.5 `request_id`; `next()` yields the next chunk as the
+ * cdylib-independent [StreamChunkSource] (the UniFFI `OutletStreamHandle`
+ * adapter performs the record → source mapping), or `null` at
+ * end-of-stream. Surfacing [StreamChunkSource] — not the UniFFI
+ * `OutletStreamChunkRecord` — keeps the seam constructible in tests
+ * without the compiled binary.
  */
 internal interface OutletStreamCursor {
     fun requestId(): String
-    suspend fun next(): OutletStreamChunkRecord?
+
+    suspend fun next(): StreamChunkSource?
 }
 
 /** Adapter wrapping a real UniFFI [OutletStreamHandle] as a cursor. */
 private class UniffiStreamCursor(private val raw: OutletStreamHandle) : OutletStreamCursor {
     override fun requestId(): String = raw.requestId()
-    override suspend fun next(): OutletStreamChunkRecord? = raw.next()
+
+    override suspend fun next(): StreamChunkSource? = raw.next()?.toSource()
 }
 
 /**
@@ -87,7 +92,12 @@ internal data class OutletBridgeFns(
     val get: suspend (handle: ContextHandle, outletId: String) -> String,
     val list: suspend (handle: ContextHandle) -> List<String>,
     val verify: suspend (handle: ContextHandle, outletId: String) -> uniffi.scp.OutletVerificationResult,
-    val update: suspend (handle: ContextHandle, outletId: String, definition: uniffi.scp.OutletDefinition, updaterDid: String) -> String,
+    val update: suspend (
+        handle: ContextHandle,
+        outletId: String,
+        definition: uniffi.scp.OutletDefinition,
+        updaterDid: String,
+    ) -> String,
     val deregister: suspend (handle: ContextHandle, outletId: String, actorDid: String) -> Unit,
     val invoke: suspend (
         handle: ContextHandle,
@@ -121,34 +131,71 @@ internal data class OutletBridgeFns(
         chainDepth: UByte,
         proofTokens: List<String>?,
     ) -> String,
-    val sessionOpen: suspend (handle: ContextHandle, outletId: String, sourceContextId: String, ttlSeconds: ULong?) -> String,
-    val sessionInvoke: suspend (handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: List<String>?) -> String,
+    val sessionOpen: suspend (
+        handle: ContextHandle,
+        outletId: String,
+        sourceContextId: String,
+        ttlSeconds: ULong?,
+    ) -> String,
+    val sessionInvoke: suspend (
+        handle: ContextHandle,
+        sessionId: String,
+        inputJson: String,
+        identity: Identity,
+        ucanToken: String,
+        proofTokens: List<String>?,
+    ) -> String,
     val sessionClose: suspend (handle: ContextHandle, sessionId: String) -> Unit,
-    val interfaceOffer: suspend (handle: ContextHandle, outletId: String, targetContextId: String, rateLimitJson: String?) -> String,
+    val interfaceOffer: suspend (
+        handle: ContextHandle,
+        outletId: String,
+        targetContextId: String,
+        rateLimitJson: String?,
+    ) -> String,
     val interfaceAccept: suspend (handle: ContextHandle, interfaceJson: String) -> String,
     val interfaceRevoke: suspend (handle: ContextHandle, interfaceIdHex: String) -> String,
-    val ucanValidate: suspend (handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: List<String>?) -> Unit,
-    val streamTerminate: suspend (requestIdHex: String, callerDid: String, reason: uniffi.scp.TerminateReason, messageOverride: String?) -> Unit,
+    val ucanValidate: suspend (
+        handle: ContextHandle,
+        token: String,
+        capability: String,
+        presentingAgentDid: String?,
+        proofTokens: List<String>?,
+    ) -> Unit,
+    val streamTerminate: suspend (
+        requestIdHex: String,
+        callerDid: String,
+        reason: uniffi.scp.TerminateReason,
+        messageOverride: String?,
+    ) -> Unit,
+    val streamGrantCredit: suspend (requestIdHex: String, callerDid: String, grant: UInt) -> UInt,
+    val streamCancel: suspend (requestIdHex: String, callerDid: String) -> ULong?,
 ) {
     companion object {
         /** Production bridge wiring — calls the real UniFFI exports. */
-        val production: OutletBridgeFns = OutletBridgeFns(
-            register = { handle, definition -> uniffi.scp.outletRegister(handle, definition) },
-            get = { handle, outletId -> uniffi.scp.outletGet(handle, outletId) },
-            list = { handle -> uniffi.scp.outletList(handle) },
-            verify = { handle, outletId -> uniffi.scp.outletVerify(handle, outletId) },
-            update = { handle, outletId, definition, updaterDid ->
-                uniffi.scp.outletUpdate(handle, outletId, definition, updaterDid)
-            },
-            deregister = { handle, outletId, actorDid ->
-                uniffi.scp.outletDeregister(handle, outletId, actorDid)
-            },
-            invoke = { handle, outletId, inputJson, identity, ucanToken, proofTokens, spendingUcanJwt ->
-                uniffi.scp.outletInvoke(handle, outletId, inputJson, identity, ucanToken, proofTokens, spendingUcanJwt)
-            },
-            invokeStream = { handle, outletId, inputJson, identity, ucanToken, caveatsBindingHex, streamEpoch, proofTokens, creditWindow, estimatedChunkCount, spendingUcan ->
-                UniffiStreamCursor(
-                    uniffi.scp.outletInvokeStream(
+        val production: OutletBridgeFns =
+            OutletBridgeFns(
+                register = { handle, definition -> uniffi.scp.outletRegister(handle, definition) },
+                get = { handle, outletId -> uniffi.scp.outletGet(handle, outletId) },
+                list = { handle -> uniffi.scp.outletList(handle) },
+                verify = { handle, outletId -> uniffi.scp.outletVerify(handle, outletId) },
+                update = { handle, outletId, definition, updaterDid ->
+                    uniffi.scp.outletUpdate(handle, outletId, definition, updaterDid)
+                },
+                deregister = { handle, outletId, actorDid ->
+                    uniffi.scp.outletDeregister(handle, outletId, actorDid)
+                },
+                invoke = { handle, outletId, inputJson, identity, ucanToken, proofTokens, spendingUcanJwt ->
+                    uniffi.scp.outletInvoke(
+                        handle,
+                        outletId,
+                        inputJson,
+                        identity,
+                        ucanToken,
+                        proofTokens,
+                        spendingUcanJwt,
+                    )
+                },
+                invokeStream = {
                         handle,
                         outletId,
                         inputJson,
@@ -160,40 +207,71 @@ internal data class OutletBridgeFns(
                         creditWindow,
                         estimatedChunkCount,
                         spendingUcan,
-                    ),
-                )
-            },
-            invokeCrossContext = { sourceHandle, targetHandle, outletId, inputJson, identity, ucanToken, chainDepth, proofTokens ->
-                uniffi.scp.outletInvokeCrossContext(
-                    sourceHandle,
-                    targetHandle,
-                    outletId,
-                    inputJson,
-                    identity,
-                    ucanToken,
-                    chainDepth,
-                    proofTokens,
-                )
-            },
-            sessionOpen = { handle, outletId, sourceContextId, ttlSeconds ->
-                uniffi.scp.outletSessionOpen(handle, outletId, sourceContextId, ttlSeconds)
-            },
-            sessionInvoke = { handle, sessionId, inputJson, identity, ucanToken, proofTokens ->
-                uniffi.scp.outletSessionInvoke(handle, sessionId, inputJson, identity, ucanToken, proofTokens)
-            },
-            sessionClose = { handle, sessionId -> uniffi.scp.outletSessionClose(handle, sessionId) },
-            interfaceOffer = { handle, outletId, targetContextId, rateLimitJson ->
-                uniffi.scp.outletInterfaceOffer(handle, outletId, targetContextId, rateLimitJson)
-            },
-            interfaceAccept = { handle, interfaceJson -> uniffi.scp.outletInterfaceAccept(handle, interfaceJson) },
-            interfaceRevoke = { handle, interfaceIdHex -> uniffi.scp.outletInterfaceRevoke(handle, interfaceIdHex) },
-            ucanValidate = { handle, token, capability, presentingAgentDid, proofTokens ->
-                uniffi.scp.ucanValidate(handle, token, capability, presentingAgentDid, proofTokens)
-            },
-            streamTerminate = { requestIdHex, callerDid, reason, messageOverride ->
-                uniffi.scp.outletStreamTerminate(requestIdHex, callerDid, reason, messageOverride)
-            },
-        )
+                    ->
+                    UniffiStreamCursor(
+                        uniffi.scp.outletInvokeStream(
+                            handle,
+                            outletId,
+                            inputJson,
+                            identity,
+                            ucanToken,
+                            caveatsBindingHex,
+                            streamEpoch,
+                            proofTokens,
+                            creditWindow,
+                            estimatedChunkCount,
+                            spendingUcan,
+                        ),
+                    )
+                },
+                invokeCrossContext = {
+                        sourceHandle,
+                        targetHandle,
+                        outletId,
+                        inputJson,
+                        identity,
+                        ucanToken,
+                        chainDepth,
+                        proofTokens,
+                    ->
+                    uniffi.scp.outletInvokeCrossContext(
+                        sourceHandle,
+                        targetHandle,
+                        outletId,
+                        inputJson,
+                        identity,
+                        ucanToken,
+                        chainDepth,
+                        proofTokens,
+                    )
+                },
+                sessionOpen = { handle, outletId, sourceContextId, ttlSeconds ->
+                    uniffi.scp.outletSessionOpen(handle, outletId, sourceContextId, ttlSeconds)
+                },
+                sessionInvoke = { handle, sessionId, inputJson, identity, ucanToken, proofTokens ->
+                    uniffi.scp.outletSessionInvoke(handle, sessionId, inputJson, identity, ucanToken, proofTokens)
+                },
+                sessionClose = { handle, sessionId -> uniffi.scp.outletSessionClose(handle, sessionId) },
+                interfaceOffer = { handle, outletId, targetContextId, rateLimitJson ->
+                    uniffi.scp.outletInterfaceOffer(handle, outletId, targetContextId, rateLimitJson)
+                },
+                interfaceAccept = { handle, interfaceJson -> uniffi.scp.outletInterfaceAccept(handle, interfaceJson) },
+                interfaceRevoke = { handle, interfaceIdHex ->
+                    uniffi.scp.outletInterfaceRevoke(handle, interfaceIdHex)
+                },
+                ucanValidate = { handle, token, capability, presentingAgentDid, proofTokens ->
+                    uniffi.scp.ucanValidate(handle, token, capability, presentingAgentDid, proofTokens)
+                },
+                streamTerminate = { requestIdHex, callerDid, reason, messageOverride ->
+                    uniffi.scp.outletStreamTerminate(requestIdHex, callerDid, reason, messageOverride)
+                },
+                streamGrantCredit = { requestIdHex, callerDid, grant ->
+                    uniffi.scp.outletStreamGrantCredit(requestIdHex, callerDid, grant)
+                },
+                streamCancel = { requestIdHex, callerDid ->
+                    uniffi.scp.outletStreamCancel(requestIdHex, callerDid)
+                },
+            )
     }
 }
 
@@ -222,8 +300,10 @@ internal class BridgeBackedOutletNamespace internal constructor(
     override val offers: OutletOffersNamespace =
         BridgeBackedOutletOffersNamespace(handle, bridge)
 
-    override suspend fun register(kind: OutletKind, definitionJson: String): String =
-        bridge.register(handle, parseDefinition(kind, definitionJson))
+    override suspend fun register(
+        kind: OutletKind,
+        definitionJson: String,
+    ): String = bridge.register(handle, parseDefinition(kind, definitionJson))
 
     @Suppress("LongParameterList")
     override fun invoke(
@@ -247,11 +327,11 @@ internal class BridgeBackedOutletNamespace internal constructor(
             )
         }
         return if (caveatsBindingHex != null && streamEpoch != null) {
-            requireStreamingUcan(ucanToken)
+            val validatedUcan = requireStreamingUcan(ucanToken)
             makeStreamingHandle(
                 outletId = outletId,
                 inputJson = inputJson,
-                ucanToken = ucanToken,
+                ucanToken = validatedUcan,
                 caveatsBindingHex = caveatsBindingHex,
                 streamEpoch = streamEpoch,
                 proofTokens = proofTokens,
@@ -273,7 +353,11 @@ internal class BridgeBackedOutletNamespace internal constructor(
         }
     }
 
-    override suspend fun update(outletId: String, definitionJson: String, updaterDid: String?): String =
+    override suspend fun update(
+        outletId: String,
+        definitionJson: String,
+        updaterDid: String?,
+    ): String =
         bridge.update(
             handle,
             outletId,
@@ -294,7 +378,10 @@ internal class BridgeBackedOutletNamespace internal constructor(
         )
     }
 
-    override suspend fun deregister(outletId: String, actorDid: String?) {
+    override suspend fun deregister(
+        outletId: String,
+        actorDid: String?,
+    ) {
         bridge.deregister(handle, outletId, actorDid ?: identity.did())
     }
 
@@ -319,6 +406,7 @@ internal class BridgeBackedOutletNamespace internal constructor(
 
     // -- one-shot (degenerate single-chunk) --------------------------------
 
+    @Suppress("LongParameterList")
     private fun makeOneShotHandle(
         outletId: String,
         inputJson: String,
@@ -350,12 +438,14 @@ internal class BridgeBackedOutletNamespace internal constructor(
             requestIdHex = null,
             invokerDid = null,
             aggregateSchemaJson = aggregateSchemaJson,
+            grantCreditFn = bridge.streamGrantCredit,
+            cancelFn = bridge.streamCancel,
         )
     }
 
     // -- streaming (§5.4.5) -------------------------------------------------
 
-    @Suppress("LongParameterList", "LongMethod")
+    @Suppress("LongParameterList")
     private fun makeStreamingHandle(
         outletId: String,
         inputJson: String,
@@ -371,58 +461,55 @@ internal class BridgeBackedOutletNamespace internal constructor(
     ): InvocationHandle {
         val invokerDid = identity.did()
         // The §5.4.5 open is `suspend`, but `invoke` returns the handle
-        // synchronously. The cursor (and its `request_id`) are therefore
-        // resolved lazily inside the consuming coroutine. A shared
-        // `CompletableDeferred<OutletStreamCursor>` lets the aggregate
-        // path, the flow path, AND the request-id deferred all reuse a
+        // synchronously. `StreamOpener` opens EAGERLY on a background
+        // coroutine (see `eagerOpen()` below) and resolves a shared
+        // `CompletableDeferred<OutletStreamCursor>` that the aggregate
+        // path, the flow path, AND the request-id deferred all reuse — a
         // single open rather than racing to open the stream twice.
         // `request_id` is threaded into the handle via `requestIdDeferred`
-        // so `grantCredit` / `cancel` await it before the terminal check.
+        // so `grantCredit` / `cancel` await it before the terminal check,
+        // even when the caller never consumes the chunk stream.
         val cursorDeferred = CompletableDeferred<OutletStreamCursor>()
         val requestIdDeferred = CompletableDeferred<String?>()
-        val opener = StreamOpener(
-            bridge = bridge,
-            handle = handle,
-            identity = identity,
-            outletId = outletId,
-            inputJson = inputJson,
-            ucanToken = ucanToken,
-            caveatsBindingHex = caveatsBindingHex,
-            streamEpoch = streamEpoch,
-            proofTokens = proofTokens,
-            creditWindow = creditWindow,
-            estimatedChunkCount = estimatedChunkCount,
-            spendingUcan = spendingUcan,
-            invokerDid = invokerDid,
-            recheckSecs = ucanRecheckSecs,
-            cursorDeferred = cursorDeferred,
-            requestIdDeferred = requestIdDeferred,
-        )
+        val opener =
+            StreamOpener(
+                bridge = bridge,
+                handle = handle,
+                identity = identity,
+                outletId = outletId,
+                inputJson = inputJson,
+                ucanToken = ucanToken,
+                caveatsBindingHex = caveatsBindingHex,
+                streamEpoch = streamEpoch,
+                proofTokens = proofTokens,
+                creditWindow = creditWindow,
+                estimatedChunkCount = estimatedChunkCount,
+                spendingUcan = spendingUcan,
+                invokerDid = invokerDid,
+                recheckSecs = ucanRecheckSecs,
+                cursorDeferred = cursorDeferred,
+                requestIdDeferred = requestIdDeferred,
+            )
+        // Open eagerly (background) so `grantCredit` / `cancel` and the
+        // revocation re-check loop resolve independent of chunk
+        // consumption — parity with the Swift / TS / Python factories.
+        opener.eagerOpen()
 
-        val flowFn: () -> Flow<OutletStreamChunk> = {
-            channelFlow {
-                val cursor = opener.open()
-                outletStreamFlowFromNext { cursor.next()?.toSource() }.collect { data ->
-                    send(data.toSdkChunk())
-                }
-            }
-        }
-        val aggregateFn: suspend () -> Aggregate = {
-            val cursor = opener.open()
-            drainToAggregate(cursor)
-        }
-        return InvocationHandle(
-            aggregateFn = aggregateFn,
-            flowFn = flowFn,
-            requestIdHex = null,
+        return buildStreamingInvocationHandle(
+            open = opener::open,
+            stopRecheck = opener::stopRecheck,
+            requestIdDeferred = requestIdDeferred,
             invokerDid = invokerDid,
             aggregateSchemaJson = aggregateSchemaJson,
-            requestIdDeferred = requestIdDeferred,
+            grantCreditFn = bridge.streamGrantCredit,
+            cancelFn = bridge.streamCancel,
         )
     }
 
-    private fun parseDefinition(kind: OutletKind, definitionJson: String): uniffi.scp.OutletDefinition =
-        outletDefinitionFromJson(kind, definitionJson)
+    private fun parseDefinition(
+        kind: OutletKind,
+        definitionJson: String,
+    ): uniffi.scp.OutletDefinition = outletDefinitionFromJson(kind, definitionJson)
 
     private fun definitionJsonToKind(definitionJson: String): OutletKind {
         val obj = runCatching { Json.parseToJsonElement(definitionJson).jsonObject }.getOrNull()
@@ -444,84 +531,122 @@ internal class BridgeBackedOutletNamespace internal constructor(
 }
 
 /**
- * Drives a single lazy §5.4.5 stream open. The cursor and its
+ * Drives a single eager §5.4.5 stream open. The cursor and its
  * `request_id` are resolved exactly once and shared across the
- * aggregate / flow consumers; the receiver-side UCAN revocation re-check
- * loop is launched on first open and force-terminates the stream on
- * observed revocation (`RevokedMidStream` / `SCP-TOOL-6110`).
+ * aggregate / flow consumers and the control plane; the receiver-side
+ * UCAN revocation re-check loop is launched on open and force-terminates
+ * the stream on observed revocation (`RevokedMidStream` /
+ * `SCP-TOOL-6110`). The open, the recheck loop, and any consumer share a
+ * single [scope] that [stopRecheck] cancels at stream end.
  */
-private class StreamOpener(
-    private val bridge: OutletBridgeFns,
-    private val handle: ContextHandle,
-    private val identity: Identity,
-    private val outletId: String,
-    private val inputJson: String,
-    private val ucanToken: String,
-    private val caveatsBindingHex: String,
-    private val streamEpoch: ULong,
-    private val proofTokens: List<String>?,
-    private val creditWindow: UInt?,
-    private val estimatedChunkCount: UInt?,
-    private val spendingUcan: String?,
-    private val invokerDid: String,
-    private val recheckSecs: UInt,
-    private val cursorDeferred: CompletableDeferred<OutletStreamCursor>,
-    private val requestIdDeferred: CompletableDeferred<String?>,
-) {
-    private val opened = java.util.concurrent.atomic.AtomicBoolean(false)
-    private val terminated = java.util.concurrent.atomic.AtomicBoolean(false)
+private class StreamOpener
+    @Suppress("LongParameterList")
+    constructor(
+        private val bridge: OutletBridgeFns,
+        private val handle: ContextHandle,
+        private val identity: Identity,
+        private val outletId: String,
+        private val inputJson: String,
+        private val ucanToken: String,
+        private val caveatsBindingHex: String,
+        private val streamEpoch: ULong,
+        private val proofTokens: List<String>?,
+        private val creditWindow: UInt?,
+        private val estimatedChunkCount: UInt?,
+        private val spendingUcan: String?,
+        private val invokerDid: String,
+        private val recheckSecs: UInt,
+        private val cursorDeferred: CompletableDeferred<OutletStreamCursor>,
+        private val requestIdDeferred: CompletableDeferred<String?>,
+    ) {
+        private val opened = java.util.concurrent.atomic.AtomicBoolean(false)
+        private val terminated = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /**
-     * Opens the stream on first call; subsequent calls await the same
-     * cursor. On open failure the `request_id` deferred resolves to
-     * `null` so control-plane callers surface [StreamAlreadyClosed]
-     * rather than hanging.
-     */
-    suspend fun open(): OutletStreamCursor {
-        if (opened.compareAndSet(false, true)) {
+        /**
+         * Scope owning the eager open + receiver-side revocation re-check
+         * loop. Held so the consuming coroutine can cancel it via
+         * [stopRecheck] once the stream reaches its terminal chunk (normal
+         * end) — otherwise the `delay`-driven loop would outlive the stream
+         * and leak a coroutine.
+         */
+        private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        /**
+         * Kicks off the §5.4.5 stream open EAGERLY — once, at handle build
+         * time — so the `request_id` deferred and the revocation re-check
+         * loop resolve independent of stream consumption. This matches the
+         * Swift / TypeScript / Python factories, all of which open in a
+         * background task at `invoke()` time: a caller may `grantCredit` /
+         * `cancel` BEFORE (or without) consuming the chunk stream and still
+         * unblock on the runtime `request_id`. Idempotent — the
+         * compareAndSet guard means a later [open] call reuses the same
+         * cursor rather than opening twice.
+         */
+        fun eagerOpen() {
+            scope.launch { runOpen() }
+        }
+
+        /**
+         * Awaits the shared cursor, triggering the open if [eagerOpen] has
+         * not already done so (defensive — the production path always calls
+         * [eagerOpen] first). The open runs exactly once.
+         */
+        suspend fun open(): OutletStreamCursor {
+            runOpen()
+            return cursorDeferred.await()
+        }
+
+        /**
+         * Performs the one-shot §5.4.5 open. On open failure the
+         * `request_id` deferred resolves to `null` so control-plane callers
+         * surface [StreamAlreadyClosed] rather than hanging, and the cursor
+         * deferred completes exceptionally so consumers see the open error.
+         */
+        @Suppress("TooGenericExceptionCaught") // any open failure must resolve the deferred to null
+        private suspend fun runOpen() {
+            if (!opened.compareAndSet(false, true)) return
             try {
-                val cursor = bridge.invokeStream(
-                    handle,
-                    outletId,
-                    inputJson,
-                    identity,
-                    ucanToken,
-                    caveatsBindingHex,
-                    streamEpoch,
-                    proofTokens,
-                    creditWindow,
-                    estimatedChunkCount,
-                    spendingUcan,
-                )
+                val cursor =
+                    bridge.invokeStream(
+                        handle,
+                        outletId,
+                        inputJson,
+                        identity,
+                        ucanToken,
+                        caveatsBindingHex,
+                        streamEpoch,
+                        proofTokens,
+                        creditWindow,
+                        estimatedChunkCount,
+                        spendingUcan,
+                    )
                 requestIdDeferred.complete(cursor.requestId())
                 cursorDeferred.complete(cursor)
                 launchRecheckLoop(cursor.requestId())
             } catch (e: Throwable) {
                 requestIdDeferred.complete(null)
                 cursorDeferred.completeExceptionally(e)
-                throw e
             }
         }
-        return cursorDeferred.await()
-    }
 
-    /**
-     * §5.4.5 receiver-side revocation re-check. Per spec the SDK
-     * framework MUST periodically re-check the opening UCAN's revocation
-     * status during the stream's active lifetime, every
-     * `stream_ucan_recheck_secs`, and on observed revocation MUST
-     * terminate the stream with `RevokedMidStream` / `SCP-TOOL-6110`.
-     * Mirrors the Python / TypeScript / Swift recheck loops.
-     */
-    private fun launchRecheckLoop(requestIdHex: String) {
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val capability = "tool_invoke:$outletId"
-        val intervalMs = recheckSecs.coerceAtLeast(1u).toLong() * 1000L
-        scope.launch {
-            try {
+        /**
+         * §5.4.5 receiver-side revocation re-check. Per spec the SDK
+         * framework MUST periodically re-check the opening UCAN's revocation
+         * status during the stream's active lifetime, every
+         * `stream_ucan_recheck_secs`, and on observed revocation MUST
+         * terminate the stream with `RevokedMidStream` / `SCP-TOOL-6110`.
+         * Mirrors the Python / TypeScript / Swift recheck loops.
+         */
+        private fun launchRecheckLoop(requestIdHex: String) {
+            val capability = "tool_invoke:$outletId"
+            val intervalMs = recheckSecs.coerceAtLeast(1u).toLong() * 1000L
+            scope.launch {
+                // Loop exits via the guard only — `terminated` flips on
+                // revocation (below) or on `stopRecheck()` (stream end), so
+                // no in-body `break` is needed.
                 while (isActive && !terminated.get()) {
                     delay(intervalMs)
-                    if (terminated.get()) break
+                    if (terminated.get()) continue
                     try {
                         bridge.ucanValidate(handle, ucanToken, capability, null, proofTokens)
                     } catch (_: Throwable) {
@@ -529,7 +654,9 @@ private class StreamOpener(
                         // longer authorized — terminate with the spec's
                         // RevokedMidStream reason. Terminate is idempotent
                         // on the runtime side, so AlreadyTerminated /
-                        // AlreadyPending stop the loop either way.
+                        // AlreadyPending stop the loop either way. Flipping
+                        // `terminated` makes the `while` guard exit on the
+                        // next iteration.
                         terminated.set(true)
                         runCatching {
                             bridge.streamTerminate(
@@ -539,14 +666,84 @@ private class StreamOpener(
                                 "ucan revoked or invalid mid-stream",
                             )
                         }
-                        break
                     }
                 }
+            }
+        }
+
+        /**
+         * Stops the receiver-side revocation re-check loop. Called from the
+         * consuming coroutine's `finally` once the stream reaches its
+         * terminal chunk (or the collector is cancelled) so the loop does
+         * not outlive the stream. Idempotent — safe to call when the loop
+         * was never launched (open failed) or already torn down.
+         */
+        fun stopRecheck() {
+            terminated.set(true)
+            scope.cancel()
+        }
+    }
+
+/**
+ * Assembles the streaming-mode production [InvocationHandle] from the
+ * cdylib-independent primitives: a lazy stream [open] (resolving the
+ * cursor + `request_id` exactly once), a [stopRecheck] teardown, the
+ * deferred `request_id` carrier, the pinned [invokerDid], and the
+ * injectable [grantCreditFn] / [cancelFn] control-plane calls.
+ *
+ * Extracted from [BridgeBackedOutletNamespace.makeStreamingHandle] so
+ * the production control plane (deferred-`request_id` threading +
+ * `grantCredit` / `cancel` reaching the bridge + recheck teardown) is
+ * unit-testable against a fake cursor and fake control-plane functions
+ * without the compiled UniFFI `ContextHandle` / `Identity`. Both
+ * consumer paths wrap consumption in `try { … } finally { stopRecheck() }`
+ * so the §5.4.5 revocation re-check loop never outlives the stream.
+ */
+@Suppress("LongParameterList")
+internal fun buildStreamingInvocationHandle(
+    open: suspend () -> OutletStreamCursor,
+    stopRecheck: () -> Unit,
+    requestIdDeferred: kotlinx.coroutines.Deferred<String?>,
+    invokerDid: String,
+    aggregateSchemaJson: String?,
+    grantCreditFn: suspend (requestIdHex: String, callerDid: String, grant: UInt) -> UInt,
+    cancelFn: suspend (requestIdHex: String, callerDid: String) -> ULong?,
+): InvocationHandle {
+    val flowFn: () -> Flow<OutletStreamChunk> = {
+        channelFlow {
+            try {
+                val cursor = open()
+                outletStreamFlowFromNext { cursor.next() }.collect { data ->
+                    send(data.toSdkChunk())
+                }
             } finally {
-                scope.cancel()
+                // Stream consumption ended (terminal chunk, abnormal
+                // closure, or collector cancellation) — tear down the
+                // receiver-side revocation re-check loop so it does not
+                // outlive the stream. Mirrors the Swift
+                // `defer { recheckTask.cancel() }` and the Python loop's
+                // `handle.is_terminated` exit condition.
+                stopRecheck()
             }
         }
     }
+    val aggregateFn: suspend () -> Aggregate = {
+        try {
+            drainToAggregate(open())
+        } finally {
+            stopRecheck()
+        }
+    }
+    return InvocationHandle(
+        aggregateFn = aggregateFn,
+        flowFn = flowFn,
+        requestIdHex = null,
+        invokerDid = invokerDid,
+        aggregateSchemaJson = aggregateSchemaJson,
+        requestIdDeferred = requestIdDeferred,
+        grantCreditFn = grantCreditFn,
+        cancelFn = cancelFn,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -558,7 +755,11 @@ private class BridgeBackedOutletSessionsNamespace(
     private val identity: Identity,
     private val bridge: OutletBridgeFns,
 ) : OutletSessionsNamespace {
-    override suspend fun open(outletId: String, sourceContextId: String, ttlSeconds: ULong?): SessionId {
+    override suspend fun open(
+        outletId: String,
+        sourceContextId: String,
+        ttlSeconds: ULong?,
+    ): SessionId {
         val raw = bridge.sessionOpen(handle, outletId, sourceContextId, ttlSeconds)
         // Validate only when the bridge returns a canonical UUIDv7; accept
         // legacy non-UUIDv7 ids transparently (mirrors the Swift SDK).
@@ -584,8 +785,11 @@ private class BridgeBackedOutletOffersNamespace(
     private val handle: ContextHandle,
     private val bridge: OutletBridgeFns,
 ) : OutletOffersNamespace {
-    override suspend fun propose(outletId: String, targetContextId: String, rateLimitJson: String?): String =
-        bridge.interfaceOffer(handle, outletId, targetContextId, rateLimitJson)
+    override suspend fun propose(
+        outletId: String,
+        targetContextId: String,
+        rateLimitJson: String?,
+    ): String = bridge.interfaceOffer(handle, outletId, targetContextId, rateLimitJson)
 
     override suspend fun accept(interfaceJson: String): String = bridge.interfaceAccept(handle, interfaceJson)
 
@@ -612,60 +816,69 @@ private class BridgeBackedOutletOffersNamespace(
  * returned [InvocationHandle]'s `grantCredit` / `cancel` reach the
  * runtime control plane.
  */
-fun outletNamespace(handle: ContextHandle, identity: Identity): OutletNamespace =
-    BridgeBackedOutletNamespace(handle, identity)
+fun outletNamespace(
+    handle: ContextHandle,
+    identity: Identity,
+): OutletNamespace = BridgeBackedOutletNamespace(handle, identity)
 
 /** Maps a UniFFI chunk record to the SDK-shaped sealed [OutletStreamChunk]. */
-private fun OutletStreamChunkData.toSdkChunk(): OutletStreamChunk = when (payloadType) {
-    "data" -> OutletStreamChunk.Data(
-        requestId = requestId,
-        sequence = sequence.toLong(),
-        valueJson = valueJson ?: "null",
-    )
-    "progress" -> OutletStreamChunk.Progress(
-        requestId = requestId,
-        sequence = sequence.toLong(),
-        pct = pct ?: 0u,
-        note = note,
-    )
-    "end" -> OutletStreamChunk.End(
-        requestId = requestId,
-        sequence = sequence.toLong(),
-        aggregateJson = aggregateJson ?: "null",
-        executionTimeMs = (executionTimeMs ?: 0u).toLong(),
-    )
-    "error" -> OutletStreamChunk.Error(
-        requestId = requestId,
-        sequence = sequence.toLong(),
-        code = code ?: "SCP-TOOL-6200",
-        message = message ?: "",
-        terminal = terminal ?: false,
-    )
-    else -> OutletStreamChunk.Error(
-        requestId = requestId,
-        sequence = sequence.toLong(),
-        code = "SCP-TOOL-6200",
-        message = "unknown chunk payload type: $payloadType",
-        terminal = true,
-    )
-}
+private fun OutletStreamChunkData.toSdkChunk(): OutletStreamChunk =
+    when (payloadType) {
+        "data" ->
+            OutletStreamChunk.Data(
+                requestId = requestId,
+                sequence = sequence.toLong(),
+                valueJson = valueJson ?: "null",
+            )
+        "progress" ->
+            OutletStreamChunk.Progress(
+                requestId = requestId,
+                sequence = sequence.toLong(),
+                pct = pct ?: 0u,
+                note = note,
+            )
+        "end" ->
+            OutletStreamChunk.End(
+                requestId = requestId,
+                sequence = sequence.toLong(),
+                aggregateJson = aggregateJson ?: "null",
+                executionTimeMs = (executionTimeMs ?: 0u).toLong(),
+            )
+        "error" ->
+            OutletStreamChunk.Error(
+                requestId = requestId,
+                sequence = sequence.toLong(),
+                code = code ?: "SCP-TOOL-6200",
+                message = message ?: "",
+                terminal = terminal ?: false,
+            )
+        else ->
+            OutletStreamChunk.Error(
+                requestId = requestId,
+                sequence = sequence.toLong(),
+                code = "SCP-TOOL-6200",
+                message = "unknown chunk payload type: $payloadType",
+                terminal = true,
+            )
+    }
 
 /** Maps a UniFFI chunk record to the abnormal-closure flow source shape. */
-private fun OutletStreamChunkRecord.toSource(): StreamChunkSource = StreamChunkSource(
-    requestId = requestId,
-    sequence = sequence,
-    sig = sig,
-    payloadType = payloadType,
-    valueJson = valueJson,
-    pct = pct,
-    note = note,
-    aggregateJson = aggregateJson,
-    provenanceJson = provenanceJson,
-    executionTimeMs = executionTimeMs,
-    code = code,
-    message = message,
-    terminal = terminal,
-)
+private fun OutletStreamChunkRecord.toSource(): StreamChunkSource =
+    StreamChunkSource(
+        requestId = requestId,
+        sequence = sequence,
+        sig = sig,
+        payloadType = payloadType,
+        valueJson = valueJson,
+        pct = pct,
+        note = note,
+        aggregateJson = aggregateJson,
+        provenanceJson = provenanceJson,
+        executionTimeMs = executionTimeMs,
+        code = code,
+        message = message,
+        terminal = terminal,
+    )
 
 /**
  * Drains the cursor to its terminal chunk, returning the End aggregate.
@@ -675,18 +888,21 @@ private fun OutletStreamChunkRecord.toSource(): StreamChunkSource = StreamChunkS
  */
 private suspend fun drainToAggregate(cursor: OutletStreamCursor): Aggregate {
     var aggregate: Aggregate? = null
-    outletStreamFlowFromNext { cursor.next()?.toSource() }.collect { data ->
+    outletStreamFlowFromNext { cursor.next() }.collect { data ->
         when (data.payloadType) {
-            "end" -> aggregate = Aggregate(
-                valueJson = data.aggregateJson ?: "null",
-                executionTimeMs = (data.executionTimeMs ?: 0u).toLong(),
-            )
-            "error" -> if (data.terminal == true) {
-                throw ExecutionError(
-                    message = data.message ?: "stream terminated with error",
-                    code = data.code ?: "SCP-TOOL-6130",
-                )
-            }
+            "end" ->
+                aggregate =
+                    Aggregate(
+                        valueJson = data.aggregateJson ?: "null",
+                        executionTimeMs = (data.executionTimeMs ?: 0u).toLong(),
+                    )
+            "error" ->
+                if (data.terminal == true) {
+                    throw ExecutionError(
+                        message = data.message ?: "stream terminated with error",
+                        code = data.code ?: "SCP-TOOL-6130",
+                    )
+                }
             else -> Unit
         }
     }
@@ -701,20 +917,26 @@ private suspend fun drainToAggregate(cursor: OutletStreamCursor): Aggregate {
  * `(kind, definitionJson)` register surface. The JSON body carries the
  * non-kind fields; `kind` comes from the typed argument (SCP-OUT-017).
  */
-private fun outletDefinitionFromJson(kind: OutletKind, definitionJson: String): uniffi.scp.OutletDefinition {
-    val obj: JsonObject = runCatching { Json.parseToJsonElement(definitionJson).jsonObject }
-        .getOrElse {
-            throw OutletError.Validation(
-                "outlet definition must be a JSON object, got: $definitionJson",
-                "SCP-VALID-7010",
-            )
-        }
+private fun outletDefinitionFromJson(
+    kind: OutletKind,
+    definitionJson: String,
+): uniffi.scp.OutletDefinition {
+    val obj: JsonObject =
+        runCatching { Json.parseToJsonElement(definitionJson).jsonObject }
+            .getOrElse {
+                throw OutletError.Validation(
+                    "outlet definition must be a JSON object, got: $definitionJson",
+                    "SCP-VALID-7010",
+                )
+            }
 
     fun str(key: String): String? = (obj[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+
     fun rawJson(key: String): String? = obj[key]?.toString()
 
-    val name = str("name")
-        ?: throw OutletError.Validation("outlet definition missing required field 'name'", "SCP-VALID-7010")
+    val name =
+        str("name")
+            ?: throw OutletError.Validation("outlet definition missing required field 'name'", "SCP-VALID-7010")
 
     return uniffi.scp.OutletDefinition(
         name = name,
@@ -730,7 +952,8 @@ private fun outletDefinitionFromJson(kind: OutletKind, definitionJson: String): 
 }
 
 /** Maps the SDK [OutletKind] to the UniFFI-generated enum. */
-private fun OutletKind.toUniffi(): uniffi.scp.OutletKind = when (this) {
-    OutletKind.QUERY -> uniffi.scp.OutletKind.QUERY
-    OutletKind.ACTION -> uniffi.scp.OutletKind.ACTION
-}
+private fun OutletKind.toUniffi(): uniffi.scp.OutletKind =
+    when (this) {
+        OutletKind.QUERY -> uniffi.scp.OutletKind.QUERY
+        OutletKind.ACTION -> uniffi.scp.OutletKind.ACTION
+    }
