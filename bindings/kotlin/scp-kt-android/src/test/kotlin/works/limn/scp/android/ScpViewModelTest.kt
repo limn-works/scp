@@ -300,7 +300,17 @@ private class TestNativeBindings : NativeBindings {
         presentingAgentDid: String?,
         proofTokens: List<String>?,
     ) { /* no-op */ }
-    override fun ucanMint(contextHandle: Long, memberDid: String, capabilitiesJson: String): String = ""
+    override fun ucanMint(
+        contextHandle: Long,
+        memberDid: String,
+        capabilitiesJson: String,
+        caveatsJson: String?,
+    ): String = ""
+    override fun ucanNarrow(
+        contextHandle: Long,
+        parentToken: String,
+        childCaveatsJson: String,
+    ): String = ""
     override fun ucanRevoke(contextHandle: Long, token: String, revokerDid: String) { /* no-op */ }
     override fun ucanDelegate(
         contextHandle: Long,
