@@ -893,7 +893,7 @@ Here `identity_key_material` is the 32-byte `pseudonym_secret` (NOT the public k
 
 ```
 pseudonym_secret = HKDF-SHA256(
-  ikm  = ed25519_private_key_bytes,
+  ikm  = ed25519_private_seed,  // the 32-byte RFC-8032 seed
   salt = "scp-pseudonym-secret-v1",
   info = "",
   len  = 32
