@@ -356,7 +356,7 @@ class AndroidKeyCustody internal constructor(
         }
 
         // Derive pseudonym_secret: HKDF for software keys, TEE-sign for hardware keys.
-        // Both approaches prevent the membership enumeration oracle (#1494):
+        // Both approaches prevent the membership enumeration oracle (spec §9.10.4.A):
         // only the key holder can compute pseudonyms.
         val pseudonymSecret = derivePseudonymSecret(keyHandle)
 
