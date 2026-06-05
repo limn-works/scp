@@ -8,14 +8,17 @@
 // determinism with the canonical Rust reference implementation
 // (`InMemoryKeyCustody` in `scp-platform/src/testing/key_custody.rs`).
 //
-// ## ADR-027 Amendment
+// ## Pseudonym derivation (spec §9.10.4.A)
 //
-// Pseudonym derivation uses Ed25519 **public** key bytes as the HMAC key,
-// not private key bytes. This ensures cross-platform determinism with
-// hardware TEE adapters (e.g., Android Keystore) that cannot export
-// private key material.
+// The HMAC key is a private-derived `pseudonym_secret`, NEVER the public key
+// (public-key keying would be a membership-enumeration oracle). For software
+// custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+// salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic; for
+// hardware custody (Secure Enclave) it is a device-local secret and the
+// pseudonym is device-local by design. The earlier ADR-027 amendment proposing
+// public-key keying was rejected.
 //
-// See ADR-025 (Apple Platform Adapter) and ADR-006 (KeyCustody trait).
+// See spec §9.10.4.A, ADR-025 (Apple Platform Adapter), and ADR-006 (KeyCustody trait).
 
 #if os(iOS) || os(macOS)
 
