@@ -176,18 +176,29 @@ class AndroidKeyCustody : KeyCustodyProvider {
     }
 
     override fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle {
-        // Algorithm: seed = HMAC-SHA256(ed25519_public_key_bytes, contextId || "scp-pseudonym")
-        // pseudonym_keypair = Ed25519_keygen(seed[0..32])
-        // identity_key_material is the 32-byte public key for ALL adapter types (ADR-006 amendment,
-        // ADR-027): Android Keystore TEE on API 33+ cannot export private bytes. Using the public
-        // key as the HMAC key ensures cross-platform determinism across hardware and software adapters.
-        val keyMaterial = publicKey(keyHandle)  // 32-byte Ed25519 public key (canonical for all adapters)
+        // Algorithm: seed = HMAC-SHA256(pseudonymSecret, contextId || "scp-pseudonym")
+        // pseudonym_keypair = Ed25519_keygen(seed[0..32])   // seed is an RFC-8032 Ed25519 seed
+        //
+        // The HMAC key is the 32-byte pseudonymSecret, NEVER the public key — public key
+        // bytes would be a membership-enumeration oracle (§9.10.4.A).
+        //
+        // SOFTWARE keys (Bouncy Castle, API 26-32): pseudonymSecret = HKDF-SHA256(
+        //   ikm = ed25519_private_seed, salt = "scp-pseudonym-secret-v1", info = "", len = 32).
+        //   This matches Rust `derive_pseudonym_secret()` exactly, so software pseudonyms are
+        //   cross-platform deterministic (pinned by §25.19 vectors).
+        //
+        // HARDWARE keys (Keystore TEE, API 33+): private bytes are non-exportable, so
+        //   pseudonymSecret = SHA-256(TEE_sign("scp-pseudonym-secret-v1")) — a device-local
+        //   secret computed inside the TEE. Hardware pseudonyms are device-local BY DESIGN
+        //   and are NOT expected to match other devices or the software vectors.
+        val pseudonymSecret = derivePseudonymSecret(keyHandle)  // HKDF (software) or TEE-sign (hardware)
         val mac = Mac.getInstance("HmacSHA256").apply {
-            init(SecretKeySpec(keyMaterial, "HmacSHA256"))
+            init(SecretKeySpec(pseudonymSecret, "HmacSHA256"))
             update(contextId)
             update("scp-pseudonym".toByteArray())
         }
         val seed = mac.doFinal()
+        pseudonymSecret.fill(0)  // zeroize secret after use
         val pseudonymKeypair = Ed25519KeyPairGenerator().apply {
             init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
         }.generateKeyPair()
@@ -426,9 +437,9 @@ dependencies {
    - X25519 key must have been generated with `KeyType.X25519`.
 
 6. **`AndroidKeyCustody.derivePseudonym(keyHandle, contextId)`:**
-   - Computes `HMAC-SHA256(key_material, contextId || "scp-pseudonym")`. Derives Ed25519 keypair from first 32 bytes.
-   - Returns `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE`.
-   - **key_material definition (IMPORTANT):** For hardware-backed keys (API 33+), private key bytes are inaccessible inside the TEE and cannot be used as HMAC key material. `key_material` is therefore defined as the **raw 32-byte Ed25519 public key** for ALL adapters (hardware and software alike). This ensures cross-platform determinism: a given SCP identity always derives the same pseudonym for a given contextId regardless of whether the key is TEE-backed or software-backed. ADR-006 acceptance criterion 6 must be updated to reflect this definition. All adapters (Apple, Android, in-memory) MUST use `publicKey(keyHandle)` bytes as the HMAC key, not private key bytes. Cross-platform test vectors are defined using public key bytes.
+   - Computes `HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`. Derives an Ed25519 keypair from the first 32 bytes (interpreted as an RFC-8032 seed).
+   - Returns `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE` (the derived pseudonym keypair is always software-managed, even for a hardware identity key).
+   - **pseudonym_secret definition (IMPORTANT):** The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes are public and would be a membership-enumeration oracle (§9.10.4.A). For **software** keys (API 26-32, Bouncy Castle), `pseudonym_secret = HKDF-SHA256(ed25519_private_seed, salt="scp-pseudonym-secret-v1", info="", len=32)`, byte-identical to Rust `derive_pseudonym_secret()`, so software pseudonyms are cross-platform deterministic (pinned by §25.19 vectors). For **hardware** keys (API 33+, Keystore TEE), private key bytes are non-exportable, so `pseudonym_secret = SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` — a device-local secret computed inside the TEE. **Hardware pseudonyms are device-local by design** and are intentionally NOT identical across devices or to the software vectors; cross-device pseudonym identity is not a protocol requirement, since the TEE key never leaves the device. This matches ADR-006 acceptance criterion 6 (§9.10.4.A).
 
 7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
    - Calls Play Integrity Standard API via `IntegrityManagerFactory.create(context).requestIntegrityToken(...)`.
