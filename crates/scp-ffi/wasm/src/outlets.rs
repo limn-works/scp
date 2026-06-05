@@ -2377,4 +2377,87 @@ mod tests {
         assert!(interface["rate_limit"].is_object());
         assert_eq!(interface["rate_limit"]["max_calls"], 20);
     }
+
+    // -----------------------------------------------------------------------
+    // enforce_single_shot_caveats — §7.3.8 single-shot caveat parity (WASM
+    // subset). These tests cover the caveats WASM is capable of enforcing
+    // from the validated nb: max_calls (taken FROM the validated nb), the
+    // narrowed input_schema, and allowed_target_dids.
+    // -----------------------------------------------------------------------
+
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    #[test]
+    fn single_shot_caveats_admits_empty() {
+        // No caveats → nothing to enforce, admit.
+        let caveats = InvocationCaveats::empty();
+        enforce_single_shot_caveats(&caveats, &serde_json::json!({})).expect("empty caveats admit");
+    }
+
+    #[test]
+    fn single_shot_caveats_max_calls_zero_rejects() {
+        // max_calls=0 forbids the single call.
+        let caveats = InvocationCaveats {
+            max_calls: Some(0),
+            ..InvocationCaveats::empty()
+        };
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}))
+            .expect_err("max_calls=0 must reject the single call");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("max_calls"),
+            "expected max_calls rejection: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_shot_caveats_max_calls_one_admits() {
+        // max_calls>=1 admits the one single-shot call.
+        let caveats = InvocationCaveats {
+            max_calls: Some(1),
+            ..InvocationCaveats::empty()
+        };
+        enforce_single_shot_caveats(&caveats, &serde_json::json!({}))
+            .expect("max_calls=1 admits the single call");
+    }
+
+    #[test]
+    fn single_shot_caveats_input_schema_rejects_nonconforming() {
+        // Narrowed input_schema requires integer `n` >= 10.
+        let caveats = InvocationCaveats {
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "n": { "type": "integer", "minimum": 10 } },
+                "required": ["n"]
+            })),
+            ..InvocationCaveats::empty()
+        };
+        enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 10 }))
+            .expect("conforming input admitted");
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 1 }))
+            .expect_err("input below narrowed minimum must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("PERM-3000") || msg.to_lowercase().contains("caveat"),
+            "expected input_schema caveat rejection: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_shot_caveats_allowed_target_dids_rejects_when_set() {
+        // allowed_target_dids is a cross-context caveat; single-shot
+        // intra-context passes no target_did, so a token that restricts
+        // targets cannot be satisfied by a no-target single-shot invoke.
+        let caveats = InvocationCaveats {
+            allowed_target_dids: Some(vec!["did:key:allowed".into()]),
+            ..InvocationCaveats::empty()
+        };
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}))
+            .expect_err("allowed_target_dids set + no target must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("PERM-3000") || msg.to_lowercase().contains("caveat"),
+            "expected allowed_target_dids caveat rejection: {msg}"
+        );
+    }
 }
