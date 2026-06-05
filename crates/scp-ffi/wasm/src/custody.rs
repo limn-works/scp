@@ -109,4 +109,32 @@ extern "C" {
         key_id: &str,
         context_id: &[u8],
     ) -> Result<JsValue, JsValue>;
+
+    /// Derive a rotatable (epoch-versioned) pseudonym keypair.
+    ///
+    /// Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the injected JS custody
+    /// MUST use
+    ///   seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")
+    ///   Ed25519_keygen(seed[0..32])   // seed is an RFC-8032 Ed25519 seed
+    /// where pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+    /// salt="scp-pseudonym-secret-v1", info="", len=32). The HMAC key is the
+    /// private-derived pseudonym_secret, NEVER the public key (public key bytes
+    /// would be a membership-enumeration oracle, §9.10.4.A). The `v2` domain
+    /// separator differs from `v1`'s `"scp-pseudonym"` so epoch 0 does not
+    /// collide with the unversioned pseudonym. Returns a JS object:
+    /// { publicKeyBytes: Uint8Array, keyId: string }.
+    ///
+    /// HONEST NOTE: like `derivePseudonym`, this extern has NO runtime caller in
+    /// the WASM bridge — identity keys are generated Rust-side (`identity.rs` via
+    /// `OsRng`), and `JsKeyCustody` is an injection-point surface (ADR-022). This
+    /// method exists for extern-surface parity with the other three callback
+    /// bridges, so a future JS custody injection can supply canonical rotatable
+    /// pseudonyms without a signature change.
+    #[wasm_bindgen(method, catch, js_name = "deriveRotatablePseudonym")]
+    pub fn derive_rotatable_pseudonym(
+        this: &JsKeyCustody,
+        key_id: &str,
+        context_id: &[u8],
+        pseudonym_epoch: u64,
+    ) -> Result<JsValue, JsValue>;
 }

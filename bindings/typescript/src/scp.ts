@@ -292,6 +292,18 @@ export interface KeyCustodyProvider {
    */
   derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array;
   /**
+   * Derive a rotatable (epoch-versioned) context-scoped pseudonym keypair.
+   * Identical layout to {@link derivePseudonym} — returns
+   * `publicKey(32) || keyIdUtf8` — but the derivation mixes the big-endian
+   * 64-bit `pseudonymEpoch` and a distinct domain separator so rotating the
+   * epoch yields an unlinkable new keypair (spec §9.10.4.A).
+   */
+  deriveRotatablePseudonym(
+    keyId: string,
+    contextId: Uint8Array,
+    pseudonymEpoch: bigint,
+  ): Uint8Array;
+  /**
    * Return the 32 raw Ed25519 private-seed bytes for `keyId`. Required for
    * governance vote signing; hardware-bound custody should throw.
    */
@@ -470,10 +482,10 @@ export class SCP {
    */
   async identityCreateWithCustody(provider: KeyCustodyProvider): Promise<Identity> {
     // Validate provider completeness up front. The byte-converting adapter
-    // below always supplies all eight closures, so a provider missing a method
+    // below always supplies all nine closures, so a provider missing a method
     // would otherwise surface only later as a cryptic native "oneshot canceled"
     // failure. Checking here makes the returned promise reject early with a
-    // clear, actionable error. Mirrors the eight methods on KeyCustodyProvider.
+    // clear, actionable error. Mirrors the nine methods on KeyCustodyProvider.
     const REQUIRED = [
       "generateKeypair",
       "sign",
@@ -481,6 +493,7 @@ export class SCP {
       "destroyKey",
       "dhAgree",
       "derivePseudonym",
+      "deriveRotatablePseudonym",
       "exportSigningKeyBytes",
       "custodyType",
     ] as const;
@@ -516,6 +529,11 @@ export class SCP {
         Array.from(provider.dhAgree(keyId, Uint8Array.from(peerPublic))),
       derivePseudonym: ([keyId, contextId]: [string, number[]]): number[] =>
         Array.from(provider.derivePseudonym(keyId, Uint8Array.from(contextId))),
+      // The Rust `(String, Vec<u8>, u64)` tuple likewise arrives as a single
+      // `[keyId, contextId, epoch]` array; the `u64` epoch crosses as a JS
+      // `bigint` (the field's declared `ts_type`).
+      deriveRotatablePseudonym: ([keyId, contextId, epoch]: [string, number[], bigint]): number[] =>
+        Array.from(provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch)),
       exportSigningKeyBytes: (keyId: string): number[] =>
         Array.from(provider.exportSigningKeyBytes(keyId)),
       custodyType: (keyId: string): string => provider.custodyType(keyId),

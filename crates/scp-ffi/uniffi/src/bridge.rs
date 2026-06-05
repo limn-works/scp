@@ -334,19 +334,16 @@ impl KeyCustody for CallbackKeyCustody {
         context_id: &[u8],
         pseudonym_epoch: u64,
     ) -> Result<PseudonymKeypair, PlatformError> {
-        // Rotatable pseudonyms append the epoch to the context_id before
-        // delegating to derive_pseudonym. The canonical byte layout
-        // (`context_id || epoch_BE(8) || "scp-pseudonym-v2"`) lives in
-        // `scp_ffi_common::custody_parse::extend_context_id_for_rotation`,
-        // shared across all callback bridges so the wire format cannot drift.
-        let extended = scp_ffi_common::custody_parse::extend_context_id_for_rotation(
-            context_id,
-            pseudonym_epoch,
-        );
-
+        // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the provider performs
+        // the rotatable derivation itself — seed = HMAC-SHA256(pseudonym_secret,
+        // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); keypair =
+        // Ed25519_keygen(seed[0..32]). The epoch is threaded through to the
+        // provider rather than synthesized into the context_id bridge-side, so
+        // the v1 platform adapter does not re-append its own "scp-pseudonym"
+        // domain separator (which would corrupt the v2 domain).
         let result_bytes = self
             .provider
-            .derive_pseudonym(key.id().to_string(), extended)
+            .derive_rotatable_pseudonym(key.id().to_string(), context_id.to_vec(), pseudonym_epoch)
             .await
             .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
 

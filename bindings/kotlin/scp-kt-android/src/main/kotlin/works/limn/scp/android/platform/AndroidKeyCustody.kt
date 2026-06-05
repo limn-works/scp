@@ -27,6 +27,8 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.Signature
@@ -143,7 +145,7 @@ class AndroidKeyCustody internal constructor(
      *
      * Used to enforce type safety in [sign] and [dhAgree] operations.
      */
-    private val softwareKeyTypes = ConcurrentHashMap<String, KeyType>()
+    internal val softwareKeyTypes = ConcurrentHashMap<String, KeyType>()
 
     /**
      * Delegate for Bouncy Castle software key operations.
@@ -344,7 +346,7 @@ class AndroidKeyCustody internal constructor(
      * @throws ScpException with code `SCP-CRYPTO-4003` if the identity key is not Ed25519.
      */
     override fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle {
-        // Enforce Ed25519 type for the source identity key
+        // Enforce Ed25519 type for the source identity key.
         if (keyHandle.custodyType == CustodyType.SOFTWARE) {
             val storedType = softwareKeyTypes[keyHandle.id]
             if (storedType != null && storedType != KeyType.ED25519) {
@@ -360,11 +362,94 @@ class AndroidKeyCustody internal constructor(
         // only the key holder can compute pseudonyms.
         val pseudonymSecret = derivePseudonymSecret(keyHandle)
 
+        // v1 HMAC body: contextId || "scp-pseudonym".
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(pseudonymSecret, "HmacSHA256"))
         pseudonymSecret.fill(0) // zeroize after use
         mac.update(contextId)
         mac.update("scp-pseudonym".toByteArray(Charsets.UTF_8))
+        val seed = mac.doFinal()
+
+        // Derive Ed25519 keypair from seed using FixedSecureRandom for determinism.
+        val pseudonymKeypair = Ed25519KeyPairGenerator().apply {
+            init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
+        }.generateKeyPair()
+        seed.fill(0) // zeroize after use
+
+        val pseudonymId = UUID.randomUUID().toString()
+        softwareKeys[pseudonymId] = pseudonymKeypair
+        softwareKeyTypes[pseudonymId] = KeyType.ED25519
+
+        return PseudonymKeyHandle(
+            id = pseudonymId,
+            custodyType = CustodyType.SOFTWARE,
+        )
+    }
+
+    /**
+     * Derives a deterministic, context-scoped, epoch-rotatable Ed25519 pseudonym keypair.
+     *
+     * Identical to [derivePseudonym] except the big-endian u64 epoch and the v2 domain
+     * separator are folded into the HMAC body, yielding an independent, unlinkable
+     * pseudonym per epoch for the same identity and context.
+     *
+     * ## Algorithm (spec section 9.10.4.A, rotatable variant):
+     *
+     *   1. Derive `pseudonymSecret` exactly as in [derivePseudonym] (HKDF for software
+     *      keys, TEE-sign for hardware keys).
+     *   2. Compute `seed = HMAC-SHA256(pseudonymSecret, contextId || BE64(epoch) ||
+     *      "scp-pseudonym-v2")`. The `BE64(epoch)` term is the 8-byte big-endian encoding
+     *      of [pseudonymEpoch].
+     *   3. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
+     *
+     * The `"scp-pseudonym-v2"` separator differs from v1's `"scp-pseudonym"`, so a v2
+     * pseudonym at any epoch never collides with the v1 [derivePseudonym] output.
+     *
+     * Matches the Rust `derive_rotatable_pseudonym()` in `scp-platform/src/pseudonym.rs`
+     * (and the file/sqlite custody backends) so software-custody pseudonyms are identical
+     * across platforms. The hardware (TEE) path is device-local by design.
+     *
+     * @param keyHandle Handle to the identity Ed25519 key (source for derivation).
+     * @param contextId Raw context ID bytes.
+     * @param pseudonymEpoch Rotation epoch counter, mixed in as a big-endian u64.
+     * @return [PseudonymKeyHandle] referencing the derived signing key.
+     * @throws ScpException with code `SCP-CRYPTO-4001` if the identity key is not found.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if the identity key is not Ed25519.
+     */
+    override fun deriveRotatablePseudonym(
+        keyHandle: KeyHandle,
+        contextId: ByteArray,
+        pseudonymEpoch: Long,
+    ): PseudonymKeyHandle {
+        // Enforce Ed25519 type for the source identity key.
+        if (keyHandle.custodyType == CustodyType.SOFTWARE) {
+            val storedType = softwareKeyTypes[keyHandle.id]
+            if (storedType != null && storedType != KeyType.ED25519) {
+                throw ScpException(
+                    "deriveRotatablePseudonym requires an Ed25519 key; " +
+                        "handle '${keyHandle.id}' is X25519",
+                    "SCP-CRYPTO-4003",
+                )
+            }
+        }
+
+        // Derive pseudonym_secret: HKDF for software keys, TEE-sign for hardware keys.
+        // Both approaches prevent the membership enumeration oracle (spec §9.10.4.A):
+        // only the key holder can compute pseudonyms.
+        val pseudonymSecret = derivePseudonymSecret(keyHandle)
+
+        // v2 HMAC body: contextId || BE64(epoch) || "scp-pseudonym-v2". The distinct domain
+        // separator means v2 at any epoch never collides with the v1 derivePseudonym output.
+        val epochBe = ByteBuffer.allocate(Long.SIZE_BYTES)
+            .order(ByteOrder.BIG_ENDIAN)
+            .putLong(pseudonymEpoch)
+            .array()
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(pseudonymSecret, "HmacSHA256"))
+        pseudonymSecret.fill(0) // zeroize after use
+        mac.update(contextId)
+        mac.update(epochBe)
+        mac.update("scp-pseudonym-v2".toByteArray(Charsets.UTF_8))
         val seed = mac.doFinal()
 
         // Derive Ed25519 keypair from seed using FixedSecureRandom for determinism.
