@@ -2188,9 +2188,8 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
 pub fn shutdown_all_contexts_sync(supervisor: &crate::context::supervisor::Supervisor) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            tokio::task::block_in_place(|| {
-                handle.block_on(shutdown_all_contexts(supervisor));
-            });
+            // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown allowlist — the bridge's blocking shutdown path cannot .await.
+            tokio::task::block_in_place(|| handle.block_on(shutdown_all_contexts(supervisor))); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
         }
         Err(e) => {
             tracing::warn!(

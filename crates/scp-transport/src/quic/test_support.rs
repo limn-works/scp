@@ -237,7 +237,7 @@ pub fn conformance_quic_adapter() -> QuicAdapter {
             let _keep_listener = handle;
             let _keep_storage = storage;
             std::future::pending::<()>().await;
-        });
+        }); // ci-allow: block-on: QUIC test harness — synchronous fixture drives an async listener
     });
 
     rx.recv()
