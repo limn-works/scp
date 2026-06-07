@@ -784,7 +784,7 @@ Processing order (dependencies first):
 16. **Define all key derivation operations**:
     - Routing ID from context key (HKDF)
     - DID routing ID (SHA-256("scp:did:" || did_string))
-    - Metadata routing ID (SHA-256(context_id || "scp-metadata"))
+    - Metadata routing ID (HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2"), §9.10.4.B)
     - Broadcast routing ID (SHA-256(context_id))
     - Sender key wrapping (HPKE, domain "scp-sender-key-v1")
     - Content key wrapping (AES-256-KW)
