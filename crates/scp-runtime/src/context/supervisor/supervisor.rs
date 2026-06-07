@@ -210,17 +210,23 @@ pub struct Supervisor {
     pub(in crate::context::supervisor) persistence: Arc<dyn ContextPersistence>,
     /// Single-producer-multi-read write lock — plan §"Write path".
     pub(crate) write_lock: tokio::sync::Mutex<()>,
-    /// Serializes the whole `import_context` replace sequence
-    /// (`lookup → PrepareForReplace → despawn → build → spawn`). The
-    /// actor mailbox only serializes the `PrepareForReplace` turn; the
-    /// despawn→respawn tail and the crypto restore run outside it, so two
-    /// concurrent imports of the SAME context id could otherwise leave the
-    /// registered actor paired with the other import's crypto state. Held
-    /// across the entire import so same-id imports run one at a time. Imports
-    /// are infrequent, so a single supervisor-wide lock is acceptable; this is
-    /// a DIFFERENT lock from `write_lock` to avoid re-entrancy with
+    /// Serializes the whole bootstrap-spawn sequence of ALL three lifecycle
+    /// bootstrap variants — `create_context`, `import_context`, and
+    /// `restore_context` — each of which writes per-context crypto state and
+    /// then spawns an owned-state actor for the same context id in two
+    /// non-atomic steps. The actor mailbox only serializes the
+    /// `PrepareForReplace` turn; the crypto-write→spawn tail runs outside it,
+    /// so two concurrent bootstrap ops for the SAME id (import vs import, OR
+    /// import vs create/restore) could otherwise leave the registered actor
+    /// paired with the other op's crypto state, or discard the import's
+    /// floor-guarded crypto behind a fresh create. Held across each bootstrap
+    /// op so same-id bootstraps run one at a time. Bootstrap is not a hot path,
+    /// so a single supervisor-wide lock is acceptable; this is a DIFFERENT lock
+    /// from `write_lock` to avoid re-entrancy with
     /// `spawn_actor_with_state`/`despawn_actor` (which take `write_lock`).
-    pub(crate) import_lock: tokio::sync::Mutex<()>,
+    /// Lock order is always `bootstrap_spawn_lock` → `write_lock`, never the
+    /// reverse.
+    pub(crate) bootstrap_spawn_lock: tokio::sync::Mutex<()>,
     /// Pending sagas keyed by saga ID; projection of the durable
     /// journal for fast lookup.
     // Operational in Phase 2 of post-review-round-1 plan (saga FSM real
@@ -372,7 +378,7 @@ impl Supervisor {
             wrapping_keys: DashMap::new(),
             persistence,
             write_lock: tokio::sync::Mutex::new(()),
-            import_lock: tokio::sync::Mutex::new(()),
+            bootstrap_spawn_lock: tokio::sync::Mutex::new(()),
             pending_sagas: DashMap::new(),
             saga_journal,
             key_package_stores: DashMap::new(),
@@ -1180,6 +1186,12 @@ impl Supervisor {
             LifecycleCommand::CreateContext { payload, reply } => {
                 let p = *payload;
                 let context_id = p.context_id.clone();
+                // Serialize this bootstrap-spawn (crypto-init → spawn) against
+                // every other same-id bootstrap so a concurrent import/restore
+                // for the same id cannot interleave its crypto write between
+                // this op's crypto-init and actor registration. See
+                // `bootstrap_spawn_lock`.
+                let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
                 // ADR-049 Phase 2A finalization: bootstrap now builds the
                 // actor-shape `ActorDeps` (self-sourced from the
                 // supervisor's provider slots, scoped to the creator's
@@ -1264,15 +1276,12 @@ impl Supervisor {
                         return Outcome::err_mutated(sketch);
                     }
                 };
-                // Serialize the whole import replace sequence across the
-                // supervisor: the actor mailbox only serializes the
-                // `PrepareForReplace` turn, but the despawn→respawn tail +
-                // crypto restore run outside it, so two concurrent same-id
-                // imports could pair the registered actor with the other
-                // import's crypto. Held across the entire `import_context`
-                // future. Distinct from `write_lock` (which spawn/despawn take)
-                // to avoid re-entrancy.
-                let _import_guard = self.import_lock.lock().await;
+                // Serialize the whole import replace sequence against every
+                // other same-id bootstrap (import/create/restore): the actor
+                // mailbox only serializes the `PrepareForReplace` turn, but the
+                // crypto-restore→spawn tail runs outside it. Held across the
+                // entire `import_context` future. See `bootstrap_spawn_lock`.
+                let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
                 // Box::pin — the per-variant import future crosses
                 // clippy's 16 KB stack budget (ContextExport ~2 KB +
                 // the full PerContextState-construction locals inside
@@ -1302,6 +1311,9 @@ impl Supervisor {
             LifecycleCommand::RestoreContext { payload, reply } => {
                 let p = *payload;
                 let context_id = p.context_id.clone();
+                // Serialize this bootstrap-spawn against every other same-id
+                // bootstrap (see `bootstrap_spawn_lock`).
+                let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
                 let handle = crate::context::ContextHandle::new(p.context_id.clone(), p.params);
                 if let Err(e) = handle
                     .transition_to(&scp_protocol::context::ContextState::Active)
