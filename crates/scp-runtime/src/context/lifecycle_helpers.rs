@@ -1240,26 +1240,73 @@ fn generate_initial_access_key_store(
 // 12. import_context (bootstrap; constructs fresh PerContextState)
 // ---------------------------------------------------------------------------
 
+/// §23.17 Invariant 3/4 — the SINGLE floor-guarded crypto-restore path for
+/// import. Captures per-sender epoch floors BEFORE teardown, tears down the
+/// old crypto, restores the incoming `mls_state` (if any), then validates that
+/// no per-sender floor regresses and merges the local floors back (max-merge).
+/// Rolls the restored crypto back on a regression so no half-restored or
+/// floor-regressed state persists. EVERY import crypto-restore site — the
+/// actor-side `PrepareForReplace` handler AND the supervisor-side fresh /
+/// stale-handle branches of `import_context` — routes through here so the
+/// replay (floor-regression) guard cannot be bypassed by any path.
+///
+/// # Errors
+///
+/// Returns `ContextError::PersistenceFailed` if `restore_crypto_state` fails,
+/// or `ContextError::SnapshotFloorRegression` (the §23.17 replay-protection
+/// rejection — whatever `validate_and_merge_epoch_floors` returns) if a
+/// per-sender floor regresses; the restored crypto is rolled back first.
+pub(in crate::context) fn restore_crypto_state_with_floor_guard(
+    deps: &ActorDeps,
+    ctx_id_bytes: &[u8; 32],
+    mls_state: &[u8],
+) -> Result<(), ContextError> {
+    // §23.17 Inv 3: capture floors BEFORE destroying crypto state.
+    let local_epoch_floors = deps.crypto.export_sender_key_epochs(ctx_id_bytes);
+
+    let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
+    let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
+
+    if !mls_state.is_empty() {
+        deps.crypto
+            .restore_crypto_state(ctx_id_bytes, mls_state)
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!("import: crypto state restore failed: {e}"))
+            })?;
+    }
+
+    // §23.17 Inv 3/4: reject any per-sender floor regression (replay guard) and
+    // max-merge local floors back. Roll back the restored crypto on failure.
+    if let Err(e) = deps.crypto.validate_and_merge_epoch_floors(
+        ctx_id_bytes,
+        local_epoch_floors,
+        crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
+    ) {
+        let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
+        let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Imports a previously exported context.
 ///
 /// Validates the export, performs the C3 per-instance wipe policy,
-/// restores crypto state with epoch-floor regression guard, builds a
-/// fresh `PerContextState` from the snapshot, and registers it
-/// through
-/// [`SupervisorHandle::replace_context`](crate::context::supervisor::handle::SupervisorHandle::replace_context).
+/// restores crypto state with the epoch-floor regression guard
+/// ([`restore_crypto_state_with_floor_guard`]), builds a fresh
+/// `PerContextState` from the snapshot, and spawns an owned-state actor.
 /// Re-spawns the TTL timer if the export carried `ttl_remaining_secs`.
 ///
 /// # Errors
 ///
-/// - [`ContextError::MembershipFailed`] if the existing context is not
-///   replaceable (only Closing/Closed/Expired/Tombstoned are
-///   replaceable on import).
-/// - [`ContextError::PersistenceFailed`] if any validation /
-///   sanitization step rejects the imported snapshot (HRL, velocity,
-///   pricing, MLS state restore).
-/// - [`ContextError::InvalidState`] if the snapshot's lifecycle state
-///   is anything other than `Active` or `Creating`.
-/// - Crypto / event-log failures during state restore are propagated.
+/// Returns `ContextError::MembershipFailed` if the existing context is not
+/// replaceable (only Closing/Closed/Expired/Tombstoned are replaceable on
+/// import); `ContextError::SnapshotFloorRegression` if the incoming snapshot
+/// regresses a per-sender epoch floor (replay guard); `ContextError::
+/// PersistenceFailed` if any validation/sanitization step rejects the snapshot
+/// (HRL, velocity, pricing, MLS state restore); `ContextError::InvalidState` if
+/// the snapshot lifecycle state is anything other than `Active`/`Creating`;
+/// crypto/event-log failures during restore are propagated.
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)] // Bootstrap entry — see `create_context` rationale.
 pub async fn import_context(
@@ -1297,45 +1344,38 @@ pub async fn import_context(
             .await
         {
             Ok(()) => {
-                // Prior actor tore down + restored crypto and is exiting.
-                // Remove its handle so the respawn slot is vacant.
+                // Prior actor tore down + restored crypto (floor-guarded,
+                // inside the handler) and is exiting. Remove its handle so the
+                // respawn slot is vacant.
                 let _ = deps.supervisor.despawn_actor(&context_id).await;
             }
-            // Live (non-replaceable) context, or a concurrent replace
-            // already claimed it — propagate the reject.
-            Err(e @ ContextError::MembershipFailed(_)) => return Err(e),
-            // Crypto teardown / epoch-floor merge failure — propagate.
-            Err(e @ (ContextError::PersistenceFailed(_) | ContextError::CryptoFailed(_))) => {
-                return Err(e);
-            }
-            // Stale handle: the prior actor already exited before we could
-            // reach it. Re-check; if still registered, a concurrent
-            // operation owns the slot — fail. If now vacant, fall through
-            // to the fresh path and restore crypto directly.
-            Err(_stale) => {
+            // ONLY a stale/unreachable handle routes to recovery. The prior
+            // actor exited (or dropped its reply) before we reached it. ALL
+            // other errors — `MembershipFailed` (live / already-claimed),
+            // `SnapshotFloorRegression` (the §23.17 replay-guard rejection),
+            // `PersistenceFailed`, `CryptoFailed`, etc. — MUST propagate
+            // unchanged: routing a floor-regression rejection into the
+            // recovery branch below would re-restore the replayed snapshot and
+            // silently bypass the replay guard.
+            Err(ContextError::ContextNotRegistered(_)) => {
                 if deps.supervisor.lookup(&context_id).is_some() {
+                    // A concurrent operation already owns the slot — refuse to
+                    // overwrite it.
                     return Err(ContextError::MembershipFailed(format!(
                         "context '{context_id}' import: existing actor unreachable"
                     )));
                 }
-                if !export.mls_state.is_empty() {
-                    deps.crypto
-                        .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
-                        .map_err(|e| {
-                            ContextError::PersistenceFailed(format!(
-                                "import: crypto state restore failed: {e}"
-                            ))
-                        })?;
-                }
+                // Slot vacant — restore crypto through the SAME floor-guarded
+                // path the actor handler uses, so the replay guard still runs.
+                restore_crypto_state_with_floor_guard(deps, &ctx_id_bytes, &export.mls_state)?;
             }
+            Err(other) => return Err(other),
         }
-    } else if !export.mls_state.is_empty() {
-        // Fresh import (no existing actor): restore crypto state directly.
-        deps.crypto
-            .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
-            .map_err(|e| {
-                ContextError::PersistenceFailed(format!("import: crypto state restore failed: {e}"))
-            })?;
+    } else {
+        // Fresh import (no existing actor): floor-guarded crypto restore (the
+        // empty-`mls_state` case is a no-op restore + floor merge inside the
+        // helper).
+        restore_crypto_state_with_floor_guard(deps, &ctx_id_bytes, &export.mls_state)?;
     }
 
     // 3. Import event log data if present.

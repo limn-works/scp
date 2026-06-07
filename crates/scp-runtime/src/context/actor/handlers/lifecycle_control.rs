@@ -114,35 +114,18 @@ fn handle_prepare_for_replace(
         return Outcome::ok(());
     }
 
-    // §23.17 Invariant 3: capture per-sender epoch floors BEFORE
-    // destroying crypto state so they can be validated against the
-    // incoming snapshot (replay-based floor regression guard).
-    let local_epoch_floors = deps.crypto.export_sender_key_epochs(&ctx_id_bytes);
-
-    // Clean up old crypto state before reimport.
-    let _ = deps.crypto.destroy_mls_group(&ctx_id_bytes);
-    let _ = deps.crypto.destroy_sender_key(&ctx_id_bytes);
-
-    // Restore incoming crypto state (if the export carries any).
-    if !mls_state.is_empty()
-        && let Err(e) = deps.crypto.restore_crypto_state(&ctx_id_bytes, mls_state)
-    {
-        let _ = reply.send(Err(ContextError::PersistenceFailed(format!(
-            "import: crypto state restore failed: {e}"
-        ))));
-        return Outcome::ok(());
-    }
-
-    // §23.17 Invariant 3/4: validate that no per-sender epoch floor
-    // regresses, and merge local floors back (max-merge). On failure,
-    // roll back the restored crypto state.
-    if let Err(e) = deps.crypto.validate_and_merge_epoch_floors(
+    // §23.17 Invariant 3/4: capture-before-teardown + restore + validate/merge
+    // the per-sender epoch floors (replay-regression guard), via the SINGLE
+    // floor-guarded helper shared with the supervisor-side import branches so
+    // no path can bypass the guard. On any failure (e.g. a
+    // `SnapshotFloorRegression` replay rejection) the helper has already rolled
+    // back the crypto; surface the error and leave the actor live (NO terminal
+    // claim) so a rejected/replayed import cannot terminate a live context.
+    if let Err(e) = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+        deps,
         &ctx_id_bytes,
-        local_epoch_floors,
-        crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
+        mls_state,
     ) {
-        let _ = deps.crypto.destroy_mls_group(&ctx_id_bytes);
-        let _ = deps.crypto.destroy_sender_key(&ctx_id_bytes);
         let _ = reply.send(Err(e));
         return Outcome::ok(());
     }

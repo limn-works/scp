@@ -2255,9 +2255,16 @@ pub enum LifecycleControlCommand {
         /// crypto state) — the only handler-side payload import needs.
         mls_state: Vec<u8>,
         /// `Ok(())` iff the context was replaceable AND crypto teardown +
-        /// epoch-floor validate/merge succeeded; `Err(MembershipFailed)`
-        /// if the context is live or already claimed by a prior
-        /// `PrepareForReplace`.
+        /// epoch-floor validate/merge succeeded. On failure the actor stays
+        /// live (no terminal claim) and surfaces the reason: `MembershipFailed`
+        /// (live / already-claimed by a prior `PrepareForReplace`),
+        /// `SnapshotFloorRegression` (the §23.17 replay-guard rejection — a
+        /// per-sender epoch floor regressed; the import caller MUST propagate
+        /// it, never route it to a recovery/re-restore path), or
+        /// `PersistenceFailed` (`restore_crypto_state` failed). The
+        /// supervisor-side `dispatch_prepare_for_replace` additionally maps a
+        /// dropped reply / unreachable actor to `ContextNotRegistered` — the
+        /// ONLY error the import caller treats as a stale-handle retry.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 }
