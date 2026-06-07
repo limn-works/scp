@@ -593,7 +593,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
    - Delivery receipt. Client acknowledges receipt of a blob.
    - The relay MAY use ACKs from all known subscribers to garbage-collect blobs before TTL expiry.
 
-**Context metadata retrieval:** Contexts publish their parameters (capability ceiling, governance policy, roles, TTL, memory scope, etc.) to a publicly derivable routing ID: `metadata_routing_id = SHA-256(context_id || "scp-metadata")`. Any participant can SUBSCRIBE or QUERY this routing ID to inspect a context's parameters before joining. The metadata blob is a signed, unencrypted envelope containing the context's `ContextParameters` struct (spec §5.3). This enables the "legibility before opt-in" tenet — informed consent is mechanical, not social.
+**Context metadata retrieval:** Contexts publish their parameters (capability ceiling, governance policy, roles, TTL, memory scope, etc.) to a keyed routing ID: `metadata_routing_id = HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")` (§9.10.4.B). Holders of the context's `context_metadata_key` can SUBSCRIBE or QUERY this routing ID to inspect a context's parameters before joining; the key is distributed per §9.10.4.B (creation, invitations, and discoverable-context entries), so non-discoverable contexts are not enumerable. The metadata blob is a signed, unencrypted envelope containing the context's `ContextParameters` struct (spec §5.3). This enables the "legibility before opt-in" tenet — informed consent is mechanical, not social.
 
 **Relay server requirements:**
 
