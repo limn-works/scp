@@ -318,15 +318,15 @@ When a template ID is present, the joining party can evaluate the context with a
 
 ### 5.7.1 Metadata Publication and Retrieval
 
-Contexts publish their parameters to a publicly derivable routing address, enabling pre-join inspection per the legibility principle (§1). The metadata routing address is derived deterministically from the context ID:
+Contexts publish their parameters to a metadata routing address that authorized parties can derive, enabling pre-join inspection per the legibility principle (§1). The address uses a keyed construction (§9.10.4.B) so it is NOT publicly derivable from the context ID alone — preventing context enumeration — while remaining derivable by members and authorized prospective members who hold the context's `context_metadata_key`:
 
 ```
-metadata_routing_id = SHA-256(context_id || "scp-metadata")
+metadata_routing_id = HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")
 ```
 
 Published metadata includes structural fields (always) and operational fields filtered by `MetadataVisibilityPolicy`. Fields with `MemberOnly` visibility are omitted from the published metadata record. Members retrieve full metadata through the context's internal state, not the public metadata record.
 
-Prospective members retrieve context parameters by subscribing to the `metadata_routing_id` on the relay without joining the context. The metadata record is signed by a current context admin, enabling verification of authenticity without membership. This makes the legibility guarantee mechanical — any identity with the context ID can derive the metadata address and inspect the context's visible parameters before deciding whether to join.
+Prospective members retrieve context parameters by subscribing to the `metadata_routing_id` on the relay without joining the context. The metadata record is signed by a current context admin, enabling verification of authenticity without membership. This makes the legibility guarantee mechanical for authorized parties: any holder of the `context_metadata_key` can derive the metadata address and inspect the context's visible parameters before deciding whether to join. The `context_metadata_key` is distributed per §9.10.4.B — generated at context creation, included (encrypted) in invitations, and published in the context entry for discoverable contexts. Non-discoverable contexts keep the key private, so their existence and metadata are not enumerable by parties who merely know or guess the context ID.
 
 Metadata updates (e.g., governance-driven ceiling modifications in `governed` contexts) are republished to the same routing address. Relays treat metadata records as standard relay messages — no special relay-side logic is required.
 

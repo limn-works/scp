@@ -5,7 +5,7 @@
 //! The `"scp:did:"` domain separator prevents collision with other routing ID
 //! derivation schemes: encrypted context routing IDs (HKDF, §9.10.4), broadcast
 //! context routing IDs (`SHA-256(context_id)`, §5.14), and context metadata
-//! routing IDs (`SHA-256(context_id || "scp-metadata")`, §5.7).
+//! routing IDs (`HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")`, §9.10.4.B).
 //!
 //! # Relay-Based Resolution (SCP-240)
 //!
@@ -35,7 +35,7 @@ use crate::{IdentityError, cache::Clock};
 ///
 /// Prevents collision with context routing IDs (HKDF from identity key material,
 /// §9.10.4), broadcast routing IDs (`SHA-256(context_id)`, §5.14), and context
-/// metadata routing IDs (`SHA-256(context_id || "scp-metadata")`, §5.7).
+/// metadata routing IDs (`HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")`, §9.10.4.B).
 const DID_ROUTING_DOMAIN_SEPARATOR: &[u8] = b"scp:did:";
 
 /// Derives the relay routing ID for a DID string.

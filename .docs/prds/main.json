@@ -1229,7 +1229,7 @@
       ],
       "details": {
         "relayOperatorConfig": "Published out-of-band. Defaults: max_blob_size 262144, max_blob_ttl 604800, max_subscriptions_per_connection 100, max_query_limit 1000, rate_limit_publish 60/min, rate_limit_subscribe 20/min, idle_timeout 90s.",
-        "contextMetadata": "Contexts publish parameters to publicly derivable routing ID: metadata_routing_id = SHA-256(context_id || \"scp-metadata\"). Any participant can SUBSCRIBE or QUERY to inspect context parameters before joining. Metadata blob is signed, unencrypted envelope containing ContextParameters struct (spec §5.3). Enables legibility-before-opt-in tenet.",
+        "contextMetadata": "Contexts publish parameters to publicly derivable routing ID: metadata_routing_id = HMAC-SHA256(context_metadata_key, context_id || \"scp-metadata-v2\") (§9.10.4.B). Holders of the context_metadata_key can SUBSCRIBE or QUERY to inspect context parameters before joining; non-discoverable contexts are not publicly enumerable. Metadata blob is signed, unencrypted envelope containing ContextParameters struct (spec §5.3). Enables legibility-before-opt-in tenet.",
         "connectionRecovery": "Client-side: reconnect with exponential backoff (1s, 2s, 4s, 8s, 16s, 30s cap). Re-issue SUBSCRIBE with since = last received stored_at minus 5-second overlap. Deduplicate via blob_id. Relay maintains no per-client state across connections."
       },
       "result": "Implemented relay server (storage.rs + server.rs) with WebSocket handling, subscription registry, TTL expiry, backfill, PING/PONG. 30 tests."
