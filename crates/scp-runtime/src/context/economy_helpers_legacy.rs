@@ -23,31 +23,20 @@
 //! [`crate::context::governance_helpers`] (12c.3), and
 //! [`crate::context::trust_recovery_helpers`] (12c.3).
 //!
-//! # Behavior preservation
-//!
-//! [`verify_payment_receipts`] is **behavior-preserving by construction**.
-//! Its body is a verbatim copy of the legacy inherent method's body with
-//! `self.payment_adapter` replaced by
-//! `supervisor.payment_adapter_ref()` (ADR-049 commit 12).
-//!
-//! The legacy inherent method on
-//! [`Supervisor`](crate::context::supervisor::Supervisor) remains as
-//! a one-line forwarder; it is deleted alongside the outer shim in a later
-//! ADR-049 commit when the actor handler body owns the economy path
-//! directly.
-//!
 //! # Supervisor receiver (ADR-049 commit 12)
 //!
-//! [`verify_payment_receipts`] takes `supervisor: &Supervisor`. The
+//! The remaining escrow helpers take `supervisor: &Supervisor`. The
 //! payment adapter is lifted onto the supervisor by
-//! `Supervisor::with_providers` (commit 12c.9a). The legacy
-//! forwarder on `ContextManager` threads `self.supervisor()` into the
-//! helper through the `Weak<Supervisor>` back-pointer installed at
-//! attach time.
+//! `Supervisor::with_providers` (commit 12c.9a).
 //!
-//! # Top-level method hoisted (actor-handler entry point)
-//!
-//! [`verify_payment_receipts`].
+//! The top-level `verify_payment_receipts` entry point that previously
+//! lived here was supervisor-/payment-adapter-scoped only (no per-context
+//! read); its sole live caller — `Supervisor::dispatch_economy_direct` —
+//! now inlines the adapter-only verification loop directly, and the
+//! actor-shape twin [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)
+//! serves the per-actor path. This module retains only the three escrow
+//! primitives below, reached exclusively from
+//! [`crate::context::lifecycle_helpers_legacy`].
 //!
 //! # Escrow primitives hoisted (ADR-049 commit 12)
 //!
@@ -75,55 +64,11 @@ use crate::context::economy_logic::PaidActionAuthorization;
 use crate::context::supervisor::Supervisor;
 use crate::economy::adapter::{PaymentMetadata, PaymentReceipt};
 use crate::economy::integration;
-use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
 
 // Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
 // `ATTACHED_EXPECT` constants consolidated to the single
 // `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`.
 use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
-
-// ---------------------------------------------------------------------------
-// verify_payment_receipts (top-level, actor-handler entry point)
-// ---------------------------------------------------------------------------
-
-/// Verifies payment receipts using the configured payment adapter
-/// (hoisted body of the legacy
-/// [`ContextManager::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)).
-///
-/// For each receipt whose `adapter_id` matches the configured adapter,
-/// calls `verify_dyn` directly. Receipts whose `adapter_id` does not
-/// match the configured adapter return
-/// [`ReceiptVerificationError::NoVerifierForAdapter`].
-///
-/// If no payment adapter is configured, all receipts return
-/// [`ReceiptVerificationError::NoVerifierForAdapter`].
-pub async fn verify_payment_receipts_legacy(
-    supervisor: &Supervisor,
-    receipts: &[PaymentReceipt],
-) -> Vec<Result<ReceiptVerification, ReceiptVerificationError>> {
-    let mut results = Vec::with_capacity(receipts.len());
-    for receipt in receipts {
-        let result = match supervisor.payment_adapter_ref() {
-            Some(adapter) if adapter.adapter_id() == receipt.adapter_id => adapter
-                .verify_dyn(receipt)
-                .await
-                .map(|r| ReceiptVerification {
-                    receipt_id: receipt.receipt_id,
-                    result: r,
-                })
-                .map_err(|e| ReceiptVerificationError::VerificationFailed {
-                    receipt_id: receipt.receipt_id,
-                    error: e,
-                }),
-            _ => Err(ReceiptVerificationError::NoVerifierForAdapter {
-                receipt_id: receipt.receipt_id,
-                adapter_id: receipt.adapter_id.clone(),
-            }),
-        };
-        results.push(result);
-    }
-    results
-}
 
 // ---------------------------------------------------------------------------
 // authorize_paid_action (escrow phase 1; ADR-049 commit 12c.9g.1)

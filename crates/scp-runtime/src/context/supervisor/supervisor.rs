@@ -1840,19 +1840,21 @@ impl Supervisor {
     /// handler shape (plan §"Transport timeouts inside actor handlers")
     /// and relays the typed reply on the variant's oneshot.
     ///
-    /// `VerifyPaymentReceipts` delegates to
-    /// [`economy_helpers_legacy::verify_payment_receipts_legacy`](crate::context::economy_helpers_legacy::verify_payment_receipts_legacy)
-    /// which iterates over the batch and dispatches to the configured
-    /// payment adapter from the supervisor's lifted provider slot. The
-    /// legacy body already handles mixed-context batches correctly
-    /// (verification depends only on `adapter_id`, not `context_id`); a
-    /// per-context fan-out would yield identical results because the
-    /// payment adapter lookup is supervisor-scoped, not actor-scoped.
-    /// The direct method therefore stays a thin wrapper around the
-    /// legacy body until Phase 2B refines the economy actor surface.
+    /// `VerifyPaymentReceipts` verifies each receipt against the
+    /// supervisor's lifted payment-adapter slot. The work depends only on
+    /// `adapter_id`, not `context_id`, so this direct path handles
+    /// mixed-context, empty, and relay-level (`None`) batches identically
+    /// to the per-actor path: a per-context fan-out would yield the same
+    /// results because the payment-adapter lookup is supervisor-scoped,
+    /// not actor-scoped. The actor-shape twin
+    /// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)
+    /// runs the identical loop over `deps.payment_adapter`; the two paths
+    /// are observably equivalent and differ only in the serialization
+    /// point. Batches with no single owning actor have no per-context
+    /// `ActorDeps`/`PerContextState` to borrow, so the verification is
+    /// inlined here against `self.payment_adapter_ref()` directly.
     async fn dispatch_economy_direct(&self, cmd: EconomyCommand) -> Outcome<()> {
-        use crate::context::economy_helpers_legacy;
-        use crate::economy::receipt::ReceiptVerificationError;
+        use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
         const ECONOMY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
@@ -1864,8 +1866,30 @@ impl Supervisor {
             }
             EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
                 let receipts = *receipts;
-                let verify_fut =
-                    economy_helpers_legacy::verify_payment_receipts_legacy(self, &receipts);
+                let verify_fut = async {
+                    let mut results = Vec::with_capacity(receipts.len());
+                    for receipt in &receipts {
+                        let result = match self.payment_adapter_ref() {
+                            Some(adapter) if adapter.adapter_id() == receipt.adapter_id => adapter
+                                .verify_dyn(receipt)
+                                .await
+                                .map(|r| ReceiptVerification {
+                                    receipt_id: receipt.receipt_id,
+                                    result: r,
+                                })
+                                .map_err(|e| ReceiptVerificationError::VerificationFailed {
+                                    receipt_id: receipt.receipt_id,
+                                    error: e,
+                                }),
+                            _ => Err(ReceiptVerificationError::NoVerifierForAdapter {
+                                receipt_id: receipt.receipt_id,
+                                adapter_id: receipt.adapter_id.clone(),
+                            }),
+                        };
+                        results.push(result);
+                    }
+                    results
+                };
                 let results = match tokio::time::timeout(ECONOMY_TIMEOUT, verify_fut).await {
                     Ok(vec) => vec,
                     Err(_elapsed) => receipts
