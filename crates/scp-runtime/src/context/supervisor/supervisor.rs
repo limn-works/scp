@@ -3561,6 +3561,28 @@ impl Supervisor {
         let context_id =
             crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did);
 
+        // Serialize this get-or-create against every other same-id
+        // bootstrap (the `CreateContext` / `ImportContext` /
+        // `RestoreContext` dispatch arms, and concurrent
+        // `standing_context` calls for the same deterministic id) by
+        // holding `bootstrap_spawn_lock` across the probe-through-create
+        // span. `standing_context` is the 4th bootstrap entry point; the
+        // dispatch arms acquire this lock but the standing path previously
+        // did not, so two racing standing creates (or a standing create
+        // racing a `CreateContext` for the same id) could both pass the
+        // step-2 probe and both call `create_context` → the loser's
+        // `create_mls_group` would clobber the winner's live MLS group
+        // with fresh keys (crypto desync). The lock makes the
+        // probe-create-recheck sequence atomic w.r.t. other bootstraps.
+        //
+        // Deadlock-free: `standing_context`'s only caller chain
+        // (`dispatch_standing_command` → `dispatch_standing_direct`) does
+        // NOT hold this lock, and `create_context` below does not
+        // re-acquire it. Lock order is always
+        // `bootstrap_spawn_lock` → `write_lock` (see
+        // `track_standing_peer` / `spawn_actor_with_state`).
+        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+
         // Step 1/2: existence + liveness probe. `read_context_state`
         // returns `None` when no actor exists (create path) and
         // `Some(state)` for a live actor. Only Active/Creating short-

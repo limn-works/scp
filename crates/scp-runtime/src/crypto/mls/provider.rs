@@ -701,10 +701,37 @@ impl MlsCryptoProvider {
     /// Called only when `mode == Encrypted`. The provider stores the group
     /// state internally, keyed by `context_id`.
     ///
+    /// Refuses to overwrite an existing entry: if a group is already
+    /// registered for `context_id`, returns
+    /// [`ContextCreationError::CreationFailed`] and leaves the existing
+    /// state untouched. An unconditional insert here would let a racing
+    /// second bootstrap for the same deterministic id clobber a live
+    /// MLS group with fresh keys (crypto desync — the actor still
+    /// references group #1 while the provider holds group #2). The
+    /// supervisor serializes same-id bootstraps via `bootstrap_spawn_lock`,
+    /// but this is the crypto layer's own defense-in-depth invariant so
+    /// no future caller path can silently overwrite a live group.
+    ///
     /// # Errors
     ///
-    /// Returns [`ContextCreationError`] if MLS group creation fails.
+    /// Returns [`ContextCreationError::CreationFailed`] if a group already
+    /// exists for `context_id`, or [`ContextCreationError::CryptoFailed`]
+    /// if MLS group creation fails.
     pub fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        use dashmap::mapref::entry::Entry;
+
+        // Reserve the slot up front via `entry`: this is an atomic
+        // check-and-occupy on the `DashMap` shard, so two concurrent
+        // creates for the same id cannot both pass the existence check.
+        // The vacant guard is held across the crypto-init below; the
+        // shard lock it implies is scoped to this one key.
+        let Entry::Vacant(slot) = self.contexts.entry(*context_id) else {
+            return Err(ContextCreationError::CreationFailed(format!(
+                "MLS group already exists for context '{}' — refusing to overwrite a live group",
+                hex::encode(context_id)
+            )));
+        };
+
         let credential = self.make_credential()?;
         // Load through ArcSwap; the returned guard is dropped before
         // the create_group call because we copy the bytes into a stack
@@ -728,8 +755,9 @@ impl MlsCryptoProvider {
             recv_sequence_tracker: HashMap::new(),
         };
 
-        // ADR-049 commit 12c.9f: lock-free `DashMap::insert`.
-        self.contexts.insert(*context_id, state);
+        // Occupy the reserved vacant slot. No overwrite is possible: if
+        // the entry had been occupied we returned `CreationFailed` above.
+        slot.insert(state);
         Ok(())
     }
 
@@ -2849,6 +2877,61 @@ mod tests {
         }
 
         assert!(provider.remove_member_sender_key(&ctx_id, TEST_DID).is_ok());
+    }
+
+    #[test]
+    fn create_mls_group_refuses_to_overwrite_existing_group() {
+        // Defense-in-depth: a second `create_mls_group` for the same
+        // context id must FAIL with `CreationFailed` and leave the first
+        // group's state byte-for-byte intact — never clobber a live MLS
+        // group with fresh keys (the crypto-desync clobber that the
+        // standing-context bootstrap-lock gap could trigger).
+        const SENTINEL_SEQ: u64 = 0xDEAD_BEEF;
+
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+
+        provider
+            .create_mls_group(&ctx_id)
+            .expect("first create_mls_group succeeds");
+
+        // Stamp a sentinel onto the live group's mutable state. A fresh
+        // group (the clobber we are guarding against) constructs
+        // `send_sequence: 0`, so a surviving sentinel proves no overwrite
+        // occurred and the SAME `ContextCryptoState` instance is intact.
+        {
+            let mut entry = provider
+                .contexts
+                .get_mut(&ctx_id)
+                .expect("first group is registered");
+            entry.value_mut().send_sequence = SENTINEL_SEQ;
+        }
+
+        // Second create for the SAME id is rejected.
+        match provider.create_mls_group(&ctx_id) {
+            Err(ContextCreationError::CreationFailed(msg)) => {
+                assert!(
+                    msg.contains("already exists"),
+                    "error must explain the duplicate, got: {msg}"
+                );
+            }
+            other => panic!("second create_mls_group must return CreationFailed, got {other:?}"),
+        }
+
+        // The first group's state is byte-for-byte intact — the sentinel
+        // survived, so no clobber with fresh keys occurred.
+        let after_seq = {
+            let entry = provider
+                .contexts
+                .get(&ctx_id)
+                .expect("first group still registered after rejected duplicate");
+            entry.value().send_sequence
+        };
+        assert_eq!(
+            after_seq, SENTINEL_SEQ,
+            "the live group's state must be unchanged after a rejected duplicate create \
+             (a clobber would reset send_sequence to 0)"
+        );
     }
 
     #[test]
