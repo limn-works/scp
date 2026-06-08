@@ -3978,45 +3978,226 @@ impl Supervisor {
         })?
     }
 
+    /// Async hard-rate-limit consume routed through the per-context
+    /// actor mailbox.
+    ///
+    /// Builds a [`ToolsCommand::TryConsumeHardRateLimit`], dispatches it
+    /// through [`Self::dispatch_tools_command`] (which routes to the
+    /// target context's actor — the actor owns its
+    /// [`PerContextState`](crate::context::actor::state::PerContextState)
+    /// hard-rate-limit bucket), and awaits the embedded reply oneshot.
+    ///
+    /// Returns `true` if a token was consumed OR if the context is not
+    /// registered. The unknown-context pass-through (`true`) preserves the
+    /// legacy `try_consume_hard_rate_limit_from_any_context` contract: a
+    /// tool invoked against a context with no live actor is not rate-
+    /// limited here (the absence of a bucket means "no per-context cap to
+    /// enforce"). Returns `false` only when the context IS registered AND
+    /// the sender is over budget.
+    pub(crate) async fn try_consume_hard_rate_limit(
+        &self,
+        context_id: &str,
+        did: &DID,
+        now_secs: u64,
+    ) -> bool {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = ToolsCommand::TryConsumeHardRateLimit {
+            context_id: context_id.to_owned(),
+            did: did.clone(),
+            now_secs,
+            reply: reply_tx,
+        };
+        // Dispatch returns the dispatch-level Outcome; the typed answer
+        // arrives on `reply_rx`. An unregistered context replies
+        // `Err(ContextNotRegistered)` (see `reply_tools_not_registered`)
+        // which we fold to the legacy `true` pass-through.
+        if self.dispatch_tools_command(cmd).await.is_err() {
+            return true;
+        }
+        match reply_rx.await {
+            Ok(Ok(consumed)) => consumed,
+            // Unknown context / channel dropped: legacy pass-through.
+            Ok(Err(_)) | Err(_) => true,
+        }
+    }
+
+    /// Async hard-rate-limit refund routed through the per-context actor
+    /// mailbox. No-op when the target context has no live actor (legacy
+    /// unknown-context contract).
+    ///
+    /// Mirrors [`Self::try_consume_hard_rate_limit`]; builds a
+    /// [`ToolsCommand::RefundHardRateLimit`], dispatches it to the actor,
+    /// and awaits the reply. The reply error (e.g. `ContextNotRegistered`)
+    /// is swallowed — a refund against an absent bucket is a no-op, not a
+    /// failure the caller can act on.
+    pub(crate) async fn refund_hard_rate_limit(&self, context_id: &str, did: &DID) {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = ToolsCommand::RefundHardRateLimit {
+            context_id: context_id.to_owned(),
+            did: did.clone(),
+            reply: reply_tx,
+        };
+        if self.dispatch_tools_command(cmd).await.is_err() {
+            return;
+        }
+        let _ = reply_rx.await;
+    }
+
     /// Runtime-agnostic hard-rate-limit consumption used by FFI
     /// callers that may run inside or outside a tokio runtime.
     ///
     /// Returns `false` if the bucket is empty.
     ///
-    /// # Sync-shape exception
+    /// # Sync-shape exception (ADR-049 §7)
     ///
-    /// Stays on the legacy `tools_helpers_legacy::*` path because the
-    /// method signature is `fn`, not `async fn` — FFI callers that
-    /// invoke it from outside a tokio runtime (Python's
-    /// gil-bound bridge in particular) cannot `.await`. Migrating it to
-    /// the actor mailbox would require an `async` signature change
-    /// that ripples through every bridge's sync rate-limit path. Phase
-    /// 2A leaves this on the legacy direct-call path as the lone sync
-    /// exception.
+    /// The method signature is `fn`, not `async fn` — FFI callers
+    /// (the MCP `invoke_tool` sync trait method in particular) invoke
+    /// it from outside a tokio task and cannot `.await`. The body
+    /// bridges sync → async exactly like
+    /// [`Self::shutdown_all_contexts_sync`]: it inspects the ambient
+    /// runtime and either `blocking`-bridges into the async
+    /// [`Self::try_consume_hard_rate_limit`] actor-mailbox path, or
+    /// spawns a dedicated current-thread runtime when neither
+    /// `blocking_lock` nor `block_in_place` is safe (current-thread
+    /// runtime regime). No DashMap is touched — the actor owns the
+    /// bucket.
     #[must_use]
+    #[allow(clippy::option_if_let_else)]
     pub fn try_consume_hard_rate_limit_from_any_context(
         self: &Arc<Self>,
         context_id: &str,
         did: &DID,
         now_secs: u64,
     ) -> bool {
-        crate::context::tools_helpers_legacy::try_consume_hard_rate_limit_from_any_context(
-            self, context_id, did, now_secs,
-        )
+        match tokio::runtime::Handle::try_current() {
+            // No ambient runtime (sync `#[test]`, GIL-bound bridge call
+            // off any executor): borrow the global multi-thread runtime
+            // via a dedicated current-thread runtime on a fresh thread so
+            // we never `block_on` the calling thread's (absent) runtime.
+            Err(_) => Self::run_rate_limit_on_dedicated_thread(
+                Arc::clone(self),
+                context_id.to_owned(),
+                did.clone(),
+                now_secs,
+                /* refund = */ false,
+            ),
+            Ok(handle) => {
+                use tokio::runtime::RuntimeFlavor;
+                match handle.runtime_flavor() {
+                    // Multi-thread runtime: `block_in_place` is valid;
+                    // re-enter the runtime to await the actor reply.
+                    RuntimeFlavor::MultiThread => {
+                        // ADR-049 §7 FFI sync rate-limit allowlist — the MCP `invoke_tool`
+                        // sync trait method cannot `.await`; the actor-mailbox consume is
+                        // awaited on the ambient multi-thread runtime.
+                        let fut = self.try_consume_hard_rate_limit(context_id, did, now_secs);
+                        tokio::task::block_in_place(|| handle.block_on(fut)) // ci-allow: block-on: ADR-049 §7 FFI sync rate-limit allowlist (MCP invoke_tool consume)
+                    }
+                    // Current-thread runtime: neither `blocking_lock` nor
+                    // `block_in_place` is safe. Spawn a dedicated thread
+                    // with its own runtime and block on the actor reply
+                    // there.
+                    _ => Self::run_rate_limit_on_dedicated_thread(
+                        Arc::clone(self),
+                        context_id.to_owned(),
+                        did.clone(),
+                        now_secs,
+                        /* refund = */ false,
+                    ),
+                }
+            }
+        }
     }
 
     /// Refund a hard-rate-limit token from any context (no-op on
     /// missing context).
     ///
-    /// # Sync-shape exception
+    /// # Sync-shape exception (ADR-049 §7)
     ///
     /// See the doc on
     /// [`Self::try_consume_hard_rate_limit_from_any_context`] — the
     /// sync FFI path constraint applies here too.
+    #[allow(clippy::option_if_let_else)]
     pub fn refund_hard_rate_limit_from_any_context(self: &Arc<Self>, context_id: &str, did: &DID) {
-        crate::context::tools_helpers_legacy::refund_hard_rate_limit_from_any_context(
-            self, context_id, did,
-        );
+        match tokio::runtime::Handle::try_current() {
+            Err(_) => {
+                let _ = Self::run_rate_limit_on_dedicated_thread(
+                    Arc::clone(self),
+                    context_id.to_owned(),
+                    did.clone(),
+                    0,
+                    /* refund = */ true,
+                );
+            }
+            Ok(handle) => {
+                use tokio::runtime::RuntimeFlavor;
+                match handle.runtime_flavor() {
+                    RuntimeFlavor::MultiThread => {
+                        // ADR-049 §7 FFI sync rate-limit allowlist — the MCP `invoke_tool`
+                        // refund path is sync and cannot `.await`; the actor-mailbox refund
+                        // is awaited on the ambient multi-thread runtime.
+                        let fut = self.refund_hard_rate_limit(context_id, did);
+                        tokio::task::block_in_place(|| handle.block_on(fut)); // ci-allow: block-on: ADR-049 §7 FFI sync rate-limit allowlist (MCP invoke_tool refund)
+                    }
+                    _ => {
+                        let _ = Self::run_rate_limit_on_dedicated_thread(
+                            Arc::clone(self),
+                            context_id.to_owned(),
+                            did.clone(),
+                            0,
+                            /* refund = */ true,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dedicated-thread escape hatch for the no-runtime and
+    /// current-thread-runtime regimes, where both `blocking_lock` and
+    /// `block_in_place` panic. Spawns a `std::thread`, builds a
+    /// current-thread tokio runtime there, awaits the actor-mailbox
+    /// consume/refund, and returns the answer via mpsc.
+    ///
+    /// Returns `true` for the consume path (token consumed or unknown
+    /// context); always `true` for the refund path (refund result is
+    /// not observable). On runtime build failure the consume path fails
+    /// closed (`false`).
+    fn run_rate_limit_on_dedicated_thread(
+        supervisor: Arc<Self>,
+        context_id: String,
+        did: DID,
+        now_secs: u64,
+        refund: bool,
+    ) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "dedicated rate-limit runtime build failed; failing closed"
+                    );
+                    let _ = tx.send(false);
+                    return;
+                }
+            };
+            // ADR-049 §7 FFI sync rate-limit allowlist — dedicated current-thread
+            // runtime for the no-runtime / current-thread-runtime regime; the sync
+            // FFI caller cannot `.await` the actor-mailbox consume/refund.
+            let result = if refund {
+                rt.block_on(supervisor.refund_hard_rate_limit(&context_id, &did)); // ci-allow: block-on: ADR-049 §7 FFI sync rate-limit allowlist (dedicated-thread refund)
+                true
+            } else {
+                rt.block_on(supervisor.try_consume_hard_rate_limit(&context_id, &did, now_secs)) // ci-allow: block-on: ADR-049 §7 FFI sync rate-limit allowlist (dedicated-thread consume)
+            };
+            let _ = tx.send(result);
+        });
+        rx.recv().unwrap_or(false)
     }
 
     /// Invoke a tool under the full economy pipeline.
