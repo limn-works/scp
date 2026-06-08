@@ -53,6 +53,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
@@ -184,6 +185,78 @@ fn commit_tool_economy_ticket(mut ticket: ToolEconomyTicket) -> Option<Amount> {
     ticket.deducted_cost
 }
 
+impl ToolEconomyTicket {
+    /// Test-only constructor for an escrow-free ticket carrying a budget
+    /// deduction. Used by supervisor-level settle tests that cannot reach
+    /// the private ticket fields. No payment escrow ⇒
+    /// `void_external_and_consume` is a pure consume.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_for_test_no_escrow(actor_did: DID) -> Self {
+        let tracker = scp_protocol::economy::antispam::SenderVelocityTracker::new(60);
+        let velocity_token = tracker.record_message(&actor_did, 0);
+        Self {
+            actor_did,
+            deducted_cost: Some(Amount::new(20)),
+            velocity_token,
+            escrow: None,
+            policy_for_capture: None,
+            metrics_for_capture: ObservableMetrics::default(),
+            needs_hard_rate_limit_refund: true,
+            consumed: false,
+        }
+    }
+
+    /// Reverse the EXTERNAL side of a reservation when the owning actor
+    /// is unreachable (despawned / replaced) and the per-context settle
+    /// can therefore never run.
+    ///
+    /// Voids any payment-escrow hold via the supplied adapter and marks
+    /// the ticket consumed so its `Drop` invariant does not fire. The
+    /// internal budget / velocity / hard-rate-limit state lived in the
+    /// (now gone) actor's `PerContextState` and was dropped with it, so
+    /// there is nothing context-local left to refund — voiding the
+    /// external escrow is the only reversal still possible and required
+    /// (otherwise the external payment hold leaks). Idempotent: a ticket
+    /// with no escrow simply consumes.
+    pub async fn void_external_and_consume(
+        mut self,
+        payment_adapter: Option<&Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
+    ) {
+        if let (Some(adapter), Some(prepared)) = (payment_adapter, self.escrow.as_ref()) {
+            invoke::void_tool_escrow(adapter.as_ref(), prepared).await;
+        }
+        // The context-local budget/velocity/rate-limit bookkeeping is
+        // gone with the actor; mark consumed so the unbalanced-ticket
+        // Drop guard does not fire.
+        self.consumed = true;
+        self.needs_hard_rate_limit_refund = false;
+    }
+
+    /// Synchronous last-resort consume for a sync, deps-less reply path
+    /// (the [`reply_tools_not_registered`] backstop) that cannot `.await`
+    /// to void the escrow. Marks the ticket consumed so its Drop balance
+    /// guard does not fire, and logs at ERROR if an external escrow hold
+    /// is being abandoned without a void. This path is unreachable for
+    /// `SettleToolEconomy` through `dispatch_tools_command` (which voids
+    /// the escrow async before reaching the sync reply); it exists only
+    /// as defense-in-depth so no future caller can resurrect the
+    /// ticket-drop panic.
+    ///
+    /// [`reply_tools_not_registered`]: crate::context::supervisor::Supervisor
+    pub fn consume_abandoning_escrow(mut self) {
+        if self.escrow.is_some() {
+            tracing::error!(
+                actor_did = %self.actor_did,
+                "tool-economy ticket consumed on a sync no-actor reply path that cannot void \
+                 payment escrow — an external payment hold may leak. This backstop should be \
+                 unreachable; the async settle path voids escrow first."
+            );
+        }
+        self.consumed = true;
+        self.needs_hard_rate_limit_refund = false;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ToolEconomyReservation — the Send payload that crosses the mailbox
 // ---------------------------------------------------------------------------
@@ -203,6 +276,14 @@ pub struct ToolEconomyReservation {
     /// Role-state snapshot for the capability re-check inside the
     /// off-lock executor path.
     pub role_state: ContextRoleState,
+    /// Spawn-generation of the actor instance this reservation was made
+    /// against (`PerContextState::generation`). The Phase-3 settle
+    /// rejects if the live actor's generation no longer matches — the
+    /// actor was despawned and a new instance respawned for the same
+    /// `context_id` between reserve and settle, so capturing/refunding
+    /// against the new instance's owned state would be a confused-deputy
+    /// write to the WRONG context instance.
+    pub generation: u64,
     /// In-flight economy bookkeeping carried through the executor.
     pub ticket: ToolEconomyTicket,
 }
@@ -455,6 +536,7 @@ pub async fn reserve_tool_economy(
     Ok(ToolEconomyReservation {
         handle,
         role_state,
+        generation: state.generation,
         ticket,
     })
 }
@@ -663,6 +745,7 @@ where
     let ToolEconomyReservation {
         handle,
         role_state,
+        generation,
         ticket,
     } = reserve().await?;
 
@@ -684,7 +767,23 @@ where
         Ok(o) => o,
         Err(err) => {
             // Phase 3 (rollback) — reverse the reservation in the actor.
-            let _ = settle(ToolSettleRequest::Rollback { ticket }).await;
+            // Inspect the result rather than discarding it: if the settle
+            // is unreachable (the actor was despawned during the off-
+            // mailbox executor window) the closure is responsible for
+            // voiding the external escrow + consuming the ticket (see
+            // `settle_tool_economy_via_actor`), but we still surface the
+            // failure to logs — a settle that cannot run is an economy
+            // anomaly the operator must see.
+            if let Err(settle_err) =
+                settle(ToolSettleRequest::Rollback { generation, ticket }).await
+            {
+                tracing::error!(
+                    rollback_error = %settle_err,
+                    executor_error = %err,
+                    "tool-economy rollback settle failed after executor error; the settle \
+                     closure must have voided any external escrow and consumed the ticket"
+                );
+            }
             return Err(invocation_error_to_context(err));
         }
     };
@@ -701,7 +800,7 @@ where
         consequences,
         payment_receipt,
         cost,
-    } = settle(ToolSettleRequest::Capture { ticket }).await?;
+    } = settle(ToolSettleRequest::Capture { generation, ticket }).await?;
 
     let event = build_tool_event(
         tool_id,
@@ -728,15 +827,43 @@ pub enum ToolSettleRequest {
     /// Executor succeeded — capture payment + run post-invocation
     /// bookkeeping.
     Capture {
+        /// Spawn-generation of the actor instance the reservation was
+        /// made against. The settle handler rejects if the live actor's
+        /// generation no longer matches.
+        generation: u64,
         /// The in-flight economy ticket from Phase 1.
         ticket: ToolEconomyTicket,
     },
     /// Executor failed — void escrow + reverse budget / velocity /
     /// rate-limit.
     Rollback {
+        /// Spawn-generation of the actor instance the reservation was
+        /// made against. The settle handler rejects if the live actor's
+        /// generation no longer matches.
+        generation: u64,
         /// The in-flight economy ticket from Phase 1.
         ticket: ToolEconomyTicket,
     },
+}
+
+impl ToolSettleRequest {
+    /// The spawn-generation the reservation was made against.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        match self {
+            Self::Capture { generation, .. } | Self::Rollback { generation, .. } => *generation,
+        }
+    }
+
+    /// Consume the request and hand back the inner ticket. Used by the
+    /// supervisor orchestrator when the actor is unreachable so it can
+    /// void the external escrow and consume the ticket locally rather
+    /// than dropping it (escrow leak + unbalanced-ticket panic).
+    pub fn into_ticket(self) -> ToolEconomyTicket {
+        match self {
+            Self::Capture { ticket, .. } | Self::Rollback { ticket, .. } => ticket,
+        }
+    }
 }
 
 /// Phase-3 capture outcome returned by the supervisor-supplied `settle`
@@ -768,8 +895,32 @@ pub async fn settle_tool_economy(
     invoker_did: &DID,
     request: ToolSettleRequest,
 ) -> Result<ToolSettleOutcome, ContextError> {
+    // Confused-deputy guard: the reservation was made against a specific
+    // actor-instance generation. If this actor's generation differs, the
+    // original instance was despawned and a NEW instance respawned for
+    // the same `context_id` between reserve and settle (e.g. an import
+    // replace). Capturing or refunding against THIS instance's owned
+    // budget / velocity / rate-limit would corrupt the wrong context's
+    // economy state. Reject without touching this state — void only the
+    // EXTERNAL escrow (a real payment hold from the prior instance's
+    // reserve) and consume the ticket so it does not leak or trip the
+    // unbalanced-Drop guard.
+    if request.generation() != state.generation {
+        let expected = request.generation();
+        let actual = state.generation;
+        let ticket = request.into_ticket();
+        ticket
+            .void_external_and_consume(deps.payment_adapter.as_ref())
+            .await;
+        return Err(ContextError::ContextNotRegistered(format!(
+            "SCP-TOOL-6088: tool-economy settle for context '{context_id}' landed on a replaced \
+             actor instance (reserved generation {expected}, live generation {actual}); escrow \
+             voided, reservation not captured"
+        )));
+    }
+
     match request {
-        ToolSettleRequest::Capture { ticket } => {
+        ToolSettleRequest::Capture { ticket, .. } => {
             // Read the committed cost before the ticket is consumed by
             // the capture path so it can be threaded into the event.
             let cost = ticket.deducted_cost;
@@ -781,7 +932,7 @@ pub async fn settle_tool_economy(
                 cost,
             })
         }
-        ToolSettleRequest::Rollback { ticket } => {
+        ToolSettleRequest::Rollback { ticket, .. } => {
             rollback_tool_economy(state, deps, ticket).await;
             Ok(ToolSettleOutcome::default())
         }
@@ -855,5 +1006,48 @@ mod tests {
         assert!(!try_consume_hard_rate_limit(&mut state, &did, 10));
         refund_hard_rate_limit(&mut state, &did);
         assert!(try_consume_hard_rate_limit(&mut state, &did, 10));
+    }
+
+    fn ticket_with_budget(did: &DID) -> ToolEconomyTicket {
+        ToolEconomyTicket::new_for_test_no_escrow(did.clone())
+    }
+
+    /// `ToolSettleRequest::generation()` reports the reservation's
+    /// generation for both variants, and `into_ticket()` hands the inner
+    /// ticket back so the orchestrator can reverse it on an unreachable
+    /// settle.
+    #[test]
+    fn settle_request_exposes_generation_and_ticket() {
+        let did = test_did();
+
+        let capture = ToolSettleRequest::Capture {
+            generation: 42,
+            ticket: ticket_with_budget(&did),
+        };
+        assert_eq!(capture.generation(), 42);
+        // Consume the reclaimed ticket so its Drop balance guard does not
+        // fire (no escrow ⇒ pure consume).
+        capture.into_ticket().consume_abandoning_escrow();
+
+        let rollback = ToolSettleRequest::Rollback {
+            generation: 7,
+            ticket: ticket_with_budget(&did),
+        };
+        assert_eq!(rollback.generation(), 7);
+        rollback.into_ticket().consume_abandoning_escrow();
+    }
+
+    /// The unreachable-actor reversal path
+    /// (`ToolEconomyTicket::void_external_and_consume`) must consume the
+    /// ticket so its `#[must_use]` Drop balance guard does not fire — a
+    /// dropped unbalanced ticket would `debug_assert!`-panic. With no
+    /// payment adapter there is no external escrow to void, so this is a
+    /// pure consume; reaching the end without a panic is the assertion.
+    #[tokio::test]
+    async fn void_external_and_consume_consumes_ticket_without_panic() {
+        let did = test_did();
+        let ticket = ticket_with_budget(&did);
+        ticket.void_external_and_consume(None).await;
+        // No panic on Drop ⇒ the ticket was consumed.
     }
 }

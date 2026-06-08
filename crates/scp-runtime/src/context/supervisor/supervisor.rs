@@ -308,6 +308,20 @@ pub struct Supervisor {
     /// `false`) and cleared when the saga reaches a terminal state
     /// (Committed, Aborted, NeedsRepair).
     saga_pending_guard: std::sync::atomic::AtomicBool,
+
+    // -----------------------------------------------------------------
+    /// Monotonic spawn-generation counter. Incremented once per
+    /// [`Self::spawn_actor_with_state`] and stamped onto the spawned
+    /// actor's [`PerContextState::generation`](crate::context::actor::state::PerContextState::generation).
+    /// A tool-economy reservation captures the generation of the actor
+    /// instance it reserved against; the Phase-3 settle rejects if the
+    /// generation no longer matches (the actor was despawned and a new
+    /// instance respawned for the same `context_id` between reserve and
+    /// settle), preventing a settle from capturing or refunding against a
+    /// DIFFERENT context instance's owned state (the confused-deputy
+    /// guard the legacy `ContextGeneration` / `relock_context` provided
+    /// before the reserve→execute→settle split removed it).
+    spawn_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Supervisor {
@@ -369,6 +383,11 @@ impl Supervisor {
             task_set: OnceLock::new(),
             mls_storage: OnceLock::new(),
             saga_pending_guard: std::sync::atomic::AtomicBool::new(false),
+            // Generation 0 is never stamped onto a live actor (the first
+            // spawn increments to 1 before stamping), so a default
+            // `PerContextState::generation == 0` can never collide with a
+            // real spawn generation.
+            spawn_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2146,10 +2165,22 @@ impl Supervisor {
     /// so the slot is vacant by the time it reaches here.
     pub(in crate::context) async fn spawn_actor_with_state(
         &self,
-        state: crate::context::actor::state::PerContextState,
+        mut state: crate::context::actor::state::PerContextState,
         deps: crate::context::actor::deps::ActorDeps,
         mailbox_capacity: Option<usize>,
     ) -> Result<ContextActorHandle, ContextError> {
+        // Stamp a fresh monotonic spawn-generation onto the owned state
+        // before it crosses into the actor task. Each spawned actor
+        // instance gets a distinct generation; a tool-economy reservation
+        // captures this value and the Phase-3 settle rejects if the live
+        // actor's generation no longer matches (the instance was replaced
+        // between reserve and settle). `fetch_add` returns the prior
+        // value, so the first spawn stamps 1 (never the default 0).
+        state.generation = self
+            .spawn_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+
         let capacity = mailbox_capacity.unwrap_or(ACTOR_MAILBOX_CAPACITY);
         let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(capacity);
 
@@ -2395,6 +2426,39 @@ impl Supervisor {
         {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Tools(cmd)).await;
         }
+
+        // No-actor settle backstop: a `SettleToolEconomy` carries an
+        // in-flight `ToolEconomyTicket` (held external payment escrow +
+        // the `#[must_use]`/Drop balance invariant). The sync
+        // `reply_tools_not_registered` cannot `.await` to void the escrow
+        // and would DROP the ticket. The primary defense is the no-actor
+        // pre-check in `settle_tool_economy_via_actor`; this handles the
+        // residual TOCTOU where the actor is despawned between that
+        // pre-check and here. Reclaim the ticket, void its external
+        // escrow, consume it, and reply with the typed error.
+        if let ToolsCommand::SettleToolEconomy {
+            context_id,
+            request,
+            reply,
+            ..
+        } = cmd
+        {
+            let request = *request;
+            let generation = request.generation();
+            request
+                .into_ticket()
+                .void_external_and_consume(self.payment_adapter_ref())
+                .await;
+            let err = ContextError::ContextNotRegistered(format!(
+                "SCP-TOOL-6089: tool-economy settle for context '{context_id}' found no \
+                 registered actor (reserved generation {generation}); escrow voided, \
+                 reservation not captured"
+            ));
+            let sketch = standing_outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            return Ok(Outcome::err(sketch));
+        }
+
         Ok(Self::reply_tools_not_registered(cmd))
     }
 
@@ -2435,8 +2499,18 @@ impl Supervisor {
                 Outcome::err(sketch)
             }
             ToolsCommand::SettleToolEconomy {
-                context_id, reply, ..
+                context_id,
+                request,
+                reply,
+                ..
             } => {
+                // Defense-in-depth backstop: `dispatch_tools_command`
+                // voids the escrow async before reaching this sync path,
+                // so this arm is unreachable for a real settle. If a
+                // future caller does route here, consume the ticket so
+                // its Drop balance guard does not panic (escrow cannot be
+                // voided synchronously — logged inside `consume_*`).
+                (*request).into_ticket().consume_abandoning_escrow();
                 let err = ContextError::ContextNotRegistered(context_id);
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
@@ -4254,6 +4328,30 @@ impl Supervisor {
         invoker_did: &DID,
         request: crate::context::tools_helpers::ToolSettleRequest,
     ) -> Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError> {
+        // No-actor pre-check: the reserve→execute→settle split runs the
+        // executor OFF the actor mailbox, so the owning actor can be
+        // despawned (shutdown / node teardown / import replace) during
+        // that window. If no actor is registered now, the per-context
+        // settle can never run, and routing the command through
+        // `dispatch_tools_command` would hand the ticket to
+        // `reply_tools_not_registered`, which DROPS it — leaking the
+        // external payment escrow and tripping the ticket's unbalanced-
+        // Drop guard. Instead, reclaim the ticket here (supervisor-side,
+        // where the payment adapter is reachable), void the external
+        // escrow, consume the ticket, and surface a typed error.
+        if self.lookup(context_id).is_none() {
+            let generation = request.generation();
+            let ticket = request.into_ticket();
+            ticket
+                .void_external_and_consume(self.payment_adapter_ref())
+                .await;
+            return Err(ContextError::ContextNotRegistered(format!(
+                "SCP-TOOL-6089: tool-economy settle for context '{context_id}' found no \
+                 registered actor (reserved generation {generation}); escrow voided, \
+                 reservation not captured"
+            )));
+        }
+
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let cmd = ToolsCommand::SettleToolEconomy {
             context_id: context_id.to_owned(),
@@ -5917,6 +6015,87 @@ mod tests {
             supervisor_arc.lookup(&key_b).is_none(),
             "context B must not be discoverable after shutdown"
         );
+    }
+
+    /// A Phase-3 tool-economy settle that finds NO registered actor for
+    /// its context (the actor was despawned during the off-mailbox
+    /// executor window) must NOT silently drop the in-flight ticket:
+    /// `settle_tool_economy_via_actor` reclaims the ticket, voids its
+    /// external escrow (none here), consumes it so the `#[must_use]` Drop
+    /// balance guard does not `debug_assert!`-panic, and returns a typed
+    /// `ContextNotRegistered`. Reaching the assertions without a panic
+    /// proves the ticket was consumed rather than leaked.
+    #[tokio::test]
+    async fn settle_with_no_registered_actor_voids_and_consumes_ticket() {
+        let supervisor_arc = supervisor_with_providers();
+        let invoker = DID("did:example:invoker".to_owned());
+
+        // A settle request for a context that has no actor registered.
+        let ticket = crate::context::tools_helpers::ToolEconomyTicket::new_for_test_no_escrow(
+            invoker.clone(),
+        );
+        let request = crate::context::tools_helpers::ToolSettleRequest::Rollback {
+            generation: 1,
+            ticket,
+        };
+
+        let result = supervisor_arc
+            .settle_tool_economy_via_actor("ctx-never-registered", &invoker, request)
+            .await;
+
+        match result {
+            Err(ContextError::ContextNotRegistered(msg)) => {
+                assert!(
+                    msg.contains("registered actor"),
+                    "error must explain the missing actor, got: {msg}"
+                );
+            }
+            other => panic!(
+                "settle with no registered actor must return ContextNotRegistered, got {other:?}"
+            ),
+        }
+        // No panic ⇒ the ticket was consumed, not dropped unbalanced.
+    }
+
+    /// Each spawn pulls a DISTINCT monotonic spawn-generation from the
+    /// supervisor's `spawn_generation` counter, starting at 1 (never the
+    /// default 0 a fresh `PerContextState` carries). This is the token
+    /// stamped onto the actor's state and compared by the tool-economy
+    /// settle to detect a settle landing on a replaced instance.
+    #[tokio::test]
+    async fn spawn_stamps_distinct_monotonic_generations() {
+        use std::sync::atomic::Ordering;
+
+        let supervisor_arc = supervisor_with_providers();
+
+        // The counter starts at 0; the first spawn stamps 1.
+        assert_eq!(
+            supervisor_arc.spawn_generation.load(Ordering::Acquire),
+            0,
+            "a fresh supervisor's spawn-generation counter starts at 0"
+        );
+
+        for i in 0..3u8 {
+            let ctx_id_bytes = [0x30 + i; 32];
+            let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+                ctx_id_bytes,
+                1_700_000_000,
+                DID("did:example:admin".to_owned()),
+            );
+            assert_eq!(state.generation, 0, "fresh test state defaults to gen 0");
+            let deps = test_actor_deps(&supervisor_arc).await;
+            supervisor_arc
+                .spawn_actor_with_state(state, deps, None)
+                .await
+                .expect("spawn registers");
+            // After n spawns the counter has advanced to n, and the nth
+            // spawn stamped generation n (>0, strictly increasing).
+            assert_eq!(
+                supervisor_arc.spawn_generation.load(Ordering::Acquire),
+                u64::from(i) + 1,
+                "spawn-generation counter must advance once per spawn"
+            );
+        }
     }
 
     /// Security invariant (import): `PrepareForReplace` MUST reject a
