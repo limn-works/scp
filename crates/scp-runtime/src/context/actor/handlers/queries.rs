@@ -68,6 +68,15 @@ pub(crate) async fn dispatch(
     cmd: QueriesCommand,
 ) -> Outcome<()> {
     match cmd {
+        QueriesCommand::ReadContextState {
+            context_id: _,
+            reply,
+        } => {
+            let answer = queries_helpers::read_context_state(&mut *state).await;
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
         QueriesCommand::LocalPseudonym {
             context_id: _,
             reply,

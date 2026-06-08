@@ -158,6 +158,33 @@ pub fn member_count(state: &PerContextState) -> usize {
     state.membership.count()
 }
 
+/// Reads this actor's current lifecycle
+/// [`ContextState`](scp_protocol::context::ContextState).
+///
+/// Read-only — borrows the owned `state.handle` and awaits its interior
+/// read lock. The actor's dispatch loop owns `state` exclusively, so the
+/// only writer of the handle's interior state is the actor itself (via a
+/// lifecycle transition processed on the same single-threaded mailbox).
+/// No concurrent writer can be mid-transition while this read runs, so
+/// the definitive async `state()` read is used rather than the
+/// non-blocking `try_read_state()` the legacy `Mutex<PerContextState>`
+/// path required to dodge a cross-task TOCTOU.
+///
+/// `state` is taken as `&mut` even though the read only borrows the
+/// handle immutably, so the resulting future is `Send`: an
+/// `&PerContextState` borrow makes the captured future non-`Send`
+/// because `PerContextState` is not `Sync` (its event callback is `dyn
+/// FnMut + Send`, not `Send + Sync`). The actor's run loop owns `state`
+/// exclusively so the upgraded borrow does not race — this matches the
+/// `&mut` convention every read helper on the [`queries`](crate::context::actor::handlers::queries)
+/// dispatch path already uses.
+#[allow(clippy::needless_pass_by_ref_mut)]
+pub async fn read_context_state(
+    state: &mut PerContextState,
+) -> scp_protocol::context::ContextState {
+    state.handle.state().await
+}
+
 /// Returns `true` if the given DID is a member of the context.
 #[must_use]
 pub fn is_member(state: &PerContextState, did: &str) -> bool {

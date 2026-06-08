@@ -2159,6 +2159,18 @@ impl Supervisor {
     /// on the variant's oneshot, not the method-level outcome.
     fn dispatch_queries_direct(cmd: QueriesCommand) -> Outcome<()> {
         match cmd {
+            // `ReadContextState` is never routed here in production — the
+            // standing get-or-create path resolves the no-actor case to
+            // `None` via `Self::read_context_state` (lookup → no actor →
+            // no mailbox dispatch) before this method runs. Left as an
+            // explicit arm so the lifecycle-state read has a definitive
+            // unknown-context reply (`ContextNotRegistered`) rather than a
+            // fabricated lifecycle state.
+            QueriesCommand::ReadContextState { reply, context_id } => {
+                let _ = reply.send(Err(ContextError::ContextNotRegistered(format!(
+                    "context not registered: {context_id}"
+                ))));
+            }
             // Hard-error variants — legacy `local_pseudonym` /
             // `get_broadcast_key_for_local_author` return
             // `ContextError::ContextNotRegistered` on unknown context.
@@ -3496,6 +3508,46 @@ impl Supervisor {
     // calls.
     // -------------------------------------------------------------------
 
+    /// Reads the current lifecycle
+    /// [`ContextState`](scp_protocol::context::ContextState) for
+    /// `context_id`, or `None` if no per-context actor exists.
+    ///
+    /// Unlike the other query passthroughs, this does NOT route through
+    /// [`Self::dispatch_query`]: that method falls through to
+    /// [`Self::dispatch_queries_direct`] (which fabricates the legacy
+    /// unknown-context default) when no actor is registered. The standing
+    /// get-or-create path needs to distinguish "actor exists and is in
+    /// state X" from "no actor at all", so this helper does the
+    /// [`Self::lookup`] explicitly: a missing actor resolves to `None`
+    /// (no mailbox, no reply), and a present actor's mailbox reply is
+    /// surfaced as `Some(state)`.
+    ///
+    /// Close / TTL does NOT despawn the per-context actor, so
+    /// `lookup(id).is_some()` alone cannot tell a live context from a
+    /// terminal one — this query is the read-only lifecycle probe that
+    /// makes that distinction without a `Mutex<PerContextState>`. A
+    /// dropped reply or mailbox-send failure (actor shutting down)
+    /// resolves to `None`, treated by callers as "no live context".
+    #[must_use]
+    pub async fn read_context_state(
+        &self,
+        context_id: &str,
+    ) -> Option<scp_protocol::context::ContextState> {
+        let actor = self.lookup(context_id)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Queries(QueriesCommand::ReadContextState {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        });
+        if Self::dispatch_via_mailbox(&actor, cmd).await.is_err() {
+            return None;
+        }
+        match rx.await {
+            Ok(Ok(state)) => Some(state),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
     /// Returns the current member count for `context_id`, or `None` if
     /// the context is not registered. Routes through the actor mailbox
     /// via [`Self::dispatch_query`].
@@ -4530,7 +4582,8 @@ impl Supervisor {
     /// supervisor's inline event-log path.
     const fn queries_command_context_id(cmd: &QueriesCommand) -> Option<&str> {
         match cmd {
-            QueriesCommand::LocalPseudonym { context_id, .. }
+            QueriesCommand::ReadContextState { context_id, .. }
+            | QueriesCommand::LocalPseudonym { context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { context_id, .. }
             | QueriesCommand::MemberCount { context_id, .. }
             | QueriesCommand::IsMember { context_id, .. }
@@ -4711,6 +4764,18 @@ impl SagaJournal for NoopSagaJournal {
 #[allow(clippy::cognitive_complexity)] // flat variant dispatch
 fn reply_with_soft_default(cmd: QueriesCommand) {
     match cmd {
+        // `ReadContextState` has no soft default — its reply is a bare
+        // `ContextState`, not an `Option`. It is dispatched explicitly in
+        // `dispatch_queries_direct` and never routes through the
+        // soft-default / error fallbacks. Reply `ContextNotRegistered` so
+        // a future classification bug surfaces a real error rather than
+        // hanging the caller's oneshot.
+        QueriesCommand::ReadContextState { reply, context_id } => {
+            debug_assert!(false, "ReadContextState routed through soft-default path");
+            let _ = reply.send(Err(ContextError::ContextNotRegistered(format!(
+                "context not registered: {context_id}"
+            ))));
+        }
         // Hard-error variants never route here — they use
         // `reply_with_error` instead. Left unreachable so a future
         // dispatch-classification change trips a compile-time match.

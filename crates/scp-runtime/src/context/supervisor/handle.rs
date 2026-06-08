@@ -192,6 +192,28 @@ impl SupervisorHandle {
             .cloned()
     }
 
+    /// Read-only lifecycle-state probe for `context_id`. Returns `None`
+    /// if no per-context actor is registered (close / TTL does not
+    /// despawn the actor, so `Some(state)` reflects the live lifecycle
+    /// state — `Active` / `Creating` vs a terminal state — and `None`
+    /// means the actor genuinely does not exist).
+    ///
+    /// Capability-reduced surface over
+    /// [`Supervisor::read_context_state`](crate::context::supervisor::supervisor::Supervisor::read_context_state):
+    /// handler / standing-domain code can probe lifecycle state without
+    /// receiving `&Supervisor` directly.
+    // First in-tree caller is the actor-native standing get-or-create
+    // rewrite in the immediately-following commit; `Supervisor::read_context_state`
+    // (the body this wraps) is already exercised by the supervisor's
+    // `pub` surface and the bridge passthroughs.
+    #[allow(dead_code)]
+    pub(crate) async fn read_context_state(
+        &self,
+        context_id: &str,
+    ) -> Option<scp_protocol::context::ContextState> {
+        self.supervisor.read_context_state(context_id).await
+    }
+
     /// Return or create the standing context for `local_did` and `peer_did`.
     ///
     /// Transitional Phase 2A surface for the standing actor handler:

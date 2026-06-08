@@ -2037,6 +2037,34 @@ pub enum ToolsCommand {
 /// here and continue to route through the legacy `ContextManager` until
 /// their respective handler commits (8-11).
 pub enum QueriesCommand {
+    /// Current lifecycle [`ContextState`](scp_protocol::context::ContextState)
+    /// for this actor's context. Read-only — the handler reads the
+    /// owned `state.handle` lifecycle field and replies without mutating
+    /// any per-context state.
+    ///
+    /// Used by the standing get-or-create path
+    /// ([`Supervisor::read_context_state`](crate::context::supervisor::supervisor::Supervisor))
+    /// to distinguish a live (`Active` / `Creating`) context from a
+    /// terminal one (`Closed` / `Expired` / …) when deciding whether to
+    /// reuse the deterministic standing context id or create a fresh
+    /// context. Close / TTL does NOT despawn the per-context actor, so
+    /// `Supervisor::lookup(id).is_some()` proves only that an actor
+    /// EXISTS — this query is the only way to observe the live-vs-terminal
+    /// lifecycle distinction without a `Mutex<PerContextState>`.
+    ///
+    /// `Ok(state)` always — the actor only receives this command when it
+    /// owns the named context, so the reply is unconditional. Unknown
+    /// contexts never reach the actor: the supervisor helper resolves the
+    /// no-actor case to `None` before dispatch (no actor → no mailbox →
+    /// no reply).
+    ReadContextState {
+        /// Context identifier string (matches the routing shape of the
+        /// other read variants; the actor owns exactly one context so the
+        /// id is carried only for routing symmetry).
+        context_id: String,
+        /// Oneshot reply channel carrying the current lifecycle state.
+        reply: oneshot::Sender<Result<scp_protocol::context::ContextState, ContextError>>,
+    },
     /// Pseudonym routing ID for the local member (§9.10.4).
     /// `Ok(None)` iff no pseudonym is set. Read-only.
     LocalPseudonym {

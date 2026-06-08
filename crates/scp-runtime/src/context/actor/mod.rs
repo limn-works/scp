@@ -781,6 +781,9 @@ impl ContextActor {
             ))));
         }
         match q {
+            QueriesCommand::ReadContextState { reply, .. } => {
+                ack_not_impl(reply, "queries::read_context_state");
+            }
             QueriesCommand::LocalPseudonym { reply, .. } => {
                 ack_not_impl(reply, "queries::local_pseudonym");
             }
