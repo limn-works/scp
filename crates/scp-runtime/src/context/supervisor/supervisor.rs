@@ -2213,12 +2213,11 @@ impl Supervisor {
     /// [`SupervisorHandle::despawn_actor`](crate::context::supervisor::handle::SupervisorHandle::despawn_actor)
     /// so lifecycle bootstrap (`import_context`) can perform the
     /// despawn-then-respawn dance without holding `&Supervisor`
-    /// directly.
-    ///
-    /// `dead_code` allow: the first production caller is the Phase
-    /// 2A finalization keystone wiring of
-    /// [`crate::context::lifecycle_helpers::import_context`].
-    #[allow(dead_code)]
+    /// directly. Called directly (on `&Supervisor`) by
+    /// [`crate::context::lifecycle_helpers::shutdown_all_contexts`] to
+    /// remove each actor's handle after `ShutdownSelf`, so the inbox
+    /// closes and the actor task exits rather than lingering as a
+    /// zombie.
     pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
         let _guard = self.write_lock.lock().await;
         self.actors.remove(context_id).is_some()
@@ -5843,6 +5842,59 @@ mod tests {
 
         // Shut down the survivor to avoid a leaked task.
         let _ = h1.send_shutdown().await;
+    }
+
+    /// `shutdown_all_contexts` must DEREGISTER every actor, not just
+    /// dispatch `ShutdownSelf` to it. `ShutdownSelf` tears down the
+    /// per-context crypto/log/timers but does NOT break the actor
+    /// `run()` loop, and nothing else despawns the handle — so without
+    /// the explicit `despawn_actor` the contexts stay discoverable via
+    /// `lookup` / `actor_ids` and the spawned tasks linger as zombies
+    /// (the regression introduced when the lock-step `contexts.remove`
+    /// mirror was deleted). Asserts the registry is empty afterwards.
+    #[tokio::test]
+    async fn shutdown_all_contexts_deregisters_every_actor() {
+        let supervisor_arc = supervisor_with_providers();
+
+        // Spawn two distinct contexts.
+        let ctx_a = [0x1Au8; 32];
+        let ctx_b = [0x2Bu8; 32];
+        let key_a = hex::encode(ctx_a);
+        let key_b = hex::encode(ctx_b);
+        for ctx_id_bytes in [ctx_a, ctx_b] {
+            let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+                ctx_id_bytes,
+                1_700_000_000,
+                DID("did:example:admin".to_owned()),
+            );
+            let deps = test_actor_deps(&supervisor_arc).await;
+            supervisor_arc
+                .spawn_actor_with_state(state, deps, None)
+                .await
+                .expect("fresh context id registers");
+        }
+        assert_eq!(
+            supervisor_arc.actor_ids().len(),
+            2,
+            "both actors must be registered before shutdown"
+        );
+
+        crate::context::lifecycle_helpers::shutdown_all_contexts(&supervisor_arc).await;
+
+        // Every actor must be deregistered: no zombie handles remain.
+        assert!(
+            supervisor_arc.actor_ids().is_empty(),
+            "actor_ids must be empty after shutdown_all_contexts, got {:?}",
+            supervisor_arc.actor_ids()
+        );
+        assert!(
+            supervisor_arc.lookup(&key_a).is_none(),
+            "context A must not be discoverable after shutdown"
+        );
+        assert!(
+            supervisor_arc.lookup(&key_b).is_none(),
+            "context B must not be discoverable after shutdown"
+        );
     }
 
     /// Security invariant (import): `PrepareForReplace` MUST reject a

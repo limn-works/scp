@@ -2178,10 +2178,18 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
             continue;
         }
         let _ = rx.await;
-        // No DashMap cleanup needed: the actor owns its `PerContextState`
-        // and drops it (along with every per-context resource destroyed
-        // by `ShutdownSelf` above) when its task exits. The legacy
-        // lock-step `contexts.remove(ctx_id)` mirror is gone.
+        // `ShutdownSelf` tears down the per-context resources (sender
+        // keys, MLS group, event log, timers) but does NOT break the
+        // actor's `run()` loop — only `LifecycleControlCommand::Shutdown`
+        // and a claimed `PrepareForReplace` do, and neither is sent here.
+        // We must explicitly despawn the actor: `despawn_actor` removes
+        // the handle from `actors` under the write lock, dropping the
+        // last `mpsc::Sender`. That closes the inbox, so the actor's
+        // `run()` loop exits on its inbox-closed (`None`) arm and the
+        // spawned task releases its `PerContextState`. Without this the
+        // handle leaks (context stays discoverable via `lookup` /
+        // `actor_ids` after "shutdown") and the task never exits.
+        supervisor.despawn_actor(ctx_id).await;
     }
 
     // Supervisor-level state clear. Acquired under the write_lock once
