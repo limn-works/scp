@@ -155,7 +155,7 @@ These issues exist but don't cover spec gaps found by the audit. Expand acceptan
 | #303 | Event log summary only | Pruning/checkpoint specification |
 | #316 | Compromise recovery | Total key loss recovery (social/device recovery — different scenario) |
 | #319 | UCAN tool invocation bypass | Root issuer trust gap in multi-admin |
-| #366 | Pseudonym rotation | Pseudonym HMAC public key derivation concern |
+| #366 | Pseudonym rotation | Pseudonym HMAC public key derivation concern (RESOLVED: keyed on private-derived pseudonym_secret per spec §9.10.4.A) |
 | #347 | No deser size limits | Relay storage quota per client |
 | #349 | f64 basis points | Systemic f64 usage across multiple ADRs (not just min_participation) |
 

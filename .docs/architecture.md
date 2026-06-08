@@ -717,7 +717,7 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - Private key material never leaves the custody boundary. Callers receive opaque `KeyHandle` values.
 - `generate_keypair` returns a new handle; implementations may back this with hardware (Secure Enclave, Keystore) or software.
 - `sign` and `dh_agree` enforce `KeyType` correctness (Ed25519 for signing, X25519 for agreement). Wrong type returns `PlatformError::WrongKeyType`.
-- `derive_pseudonym` MUST produce deterministic output: `HMAC-SHA256(key_material, context_id || "scp-pseudonym")` seeded into Ed25519 keygen. All implementations produce identical output for identical inputs. See ADR-006.
+- `derive_pseudonym` keys the HMAC with a private-derived `pseudonym_secret` (never the public key — that would be a membership-enumeration oracle): `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")` seeded into Ed25519 keygen (RFC-8032 seed). Software custody derives `pseudonym_secret` via HKDF-SHA256 over the Ed25519 private seed and is cross-platform deterministic; hardware custody uses a device-local secret and is device-local by design. See spec §9.10.4.A (and ADR-006).
 - `destroy_key` irrevocably removes material. Subsequent operations on the handle return `PlatformError::KeyNotFound`.
 
 **`Storage`** (scp-platform) — `Send + Sync`, async methods.

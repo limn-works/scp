@@ -24,6 +24,13 @@ import hashlib
 
 import pytest
 
+from .pseudonym_recipe import (
+    canonical_pseudonym_blob,
+    canonical_pseudonym_seed,
+    canonical_rotatable_pseudonym_blob,
+    canonical_rotatable_pseudonym_seed,
+)
+
 # ---------------------------------------------------------------------------
 # Minimal pure-Python Ed25519 (RFC 8032) — stdlib only.
 # Reference implementation (SUPERCOP-derived). Used solely to back the test
@@ -149,11 +156,27 @@ class _FakeKeychain:
         return hashlib.sha256(self._seeds[key_id] + bytes(peer_public)).digest()
 
     def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
-        seed = hashlib.sha256(self._seeds[key_id] + bytes(context_id)).digest()
+        # Canonical v1 recipe (§9.10.4.A): HKDF-derived secret, then
+        # HMAC(context_id || "scp-pseudonym"). Register the derived signing
+        # key under a fresh id and return ``public_key (32) || key_id_utf8``.
+        seed = canonical_pseudonym_seed(self._seeds[key_id], context_id)
         kid = str(self._next)
         self._next += 1
         self._seeds[kid] = seed
-        return ed25519_publickey(seed) + kid.encode("utf-8")
+        return canonical_pseudonym_blob(self._seeds[key_id], context_id, kid)
+
+    def derive_rotatable_pseudonym(
+        self, key_id: str, context_id: bytes, pseudonym_epoch: int
+    ) -> bytes:
+        # Canonical v2 recipe (§9.10.4.A): HMAC(context_id || epoch_BE ||
+        # "scp-pseudonym-v2"). Same blob shape as the v1 path.
+        seed = canonical_rotatable_pseudonym_seed(self._seeds[key_id], context_id, pseudonym_epoch)
+        kid = str(self._next)
+        self._next += 1
+        self._seeds[kid] = seed
+        return canonical_rotatable_pseudonym_blob(
+            self._seeds[key_id], context_id, pseudonym_epoch, kid
+        )
 
     def export_signing_key_bytes(self, key_id: str) -> bytes:
         return self._seeds[key_id]

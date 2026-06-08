@@ -231,13 +231,14 @@ impl PyKeyCustodyProvider {
     /// up-front by [`Self::validate`] so a malformed provider fails fast at
     /// the FFI boundary with a clear `ValidationError` rather than deep
     /// inside an async DID-creation flow.
-    const REQUIRED_METHODS: [&'static str; 8] = [
+    const REQUIRED_METHODS: [&'static str; 9] = [
         "sign",
         "get_public_key",
         "destroy_key",
         "generate_keypair",
         "dh_agree",
         "derive_pseudonym",
+        "derive_rotatable_pseudonym",
         "export_signing_key_bytes",
         "custody_type",
     ];
@@ -315,6 +316,34 @@ impl PyKeyCustodyProvider {
         })
     }
 
+    /// Calls `method_name(key_id, payload, epoch)` (payload as Python `bytes`,
+    /// epoch as a Python `int`) on the Python object under a fresh GIL and
+    /// extracts the result as `T`. Used by the rotatable-pseudonym path, which
+    /// must thread the epoch through to the provider so the provider performs
+    /// the canonical v2 derivation itself (no bridge-side preimage synthesis).
+    fn call_str_bytes_u64<T>(
+        &self,
+        method_name: &str,
+        key_id: &str,
+        payload: &[u8],
+        epoch: u64,
+    ) -> Result<T, PlatformError>
+    where
+        T: for<'py> pyo3::FromPyObject<'py>,
+    {
+        Python::with_gil(|py| {
+            let bytes = PyBytes::new(py, payload);
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1(method_name, (key_id, bytes, epoch))
+                .map_err(|e| Self::call_err(method_name, &e))?;
+            result
+                .extract::<T>()
+                .map_err(|e| Self::type_err(method_name, &e))
+        })
+    }
+
     /// Calls `method_name(key_id)` for its side effect only, discarding the
     /// Python return value. Used for `destroy_key`, which returns `None`.
     fn call_str_void(&self, method_name: &str, key_id: &str) -> Result<(), PlatformError> {
@@ -384,6 +413,10 @@ impl FfiKeyCustody {
 /// - `dh_agree(key_id: str, peer_public: bytes) -> bytes` — 32 shared bytes.
 /// - `derive_pseudonym(key_id: str, context_id: bytes) -> bytes` —
 ///   `[public_key (32) || key_id_utf8]`.
+/// - `derive_rotatable_pseudonym(key_id: str, context_id: bytes, pseudonym_epoch: int) -> bytes`
+///   — `[public_key (32) || key_id_utf8]`. The provider performs the canonical
+///   v2 derivation (HMAC key is the private-derived `pseudonym_secret`, domain
+///   `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
 /// - `export_signing_key_bytes(key_id: str) -> bytes` — 32 private seed bytes.
 /// - `custody_type(key_id: str) -> str` — `"hardware"` / `"software"` /
 ///   `"in_memory"`.
@@ -402,48 +435,6 @@ impl PyCallbackKeyCustody {
     #[must_use]
     pub const fn new(provider: PyKeyCustodyProvider) -> Self {
         Self { provider }
-    }
-
-    /// Parses a numeric key-id string into a [`KeyHandle`].
-    fn parse_handle(method: &str, key_id: &str) -> Result<KeyHandle, PlatformError> {
-        key_id.parse::<u64>().map(KeyHandle::new).map_err(|_| {
-            PlatformError::CustodyError(format!(
-                "KeyCustodyProvider.{method} returned a non-numeric key_id: {key_id}"
-            ))
-        })
-    }
-
-    /// Coerces a 32-byte custody return into a fixed array.
-    fn expect_32(method: &str, bytes: &[u8]) -> Result<[u8; 32], PlatformError> {
-        bytes.try_into().map_err(|_| {
-            PlatformError::CustodyError(format!(
-                "KeyCustodyProvider.{method} returned {} bytes, expected 32",
-                bytes.len()
-            ))
-        })
-    }
-
-    /// Unpacks a `derive_pseudonym`-style return (`[pubkey(32) || key_id_utf8]`)
-    /// into a [`PseudonymKeypair`].
-    fn unpack_pseudonym(method: &str, bytes: &[u8]) -> Result<PseudonymKeypair, PlatformError> {
-        if bytes.len() < 33 {
-            return Err(PlatformError::CustodyError(format!(
-                "KeyCustodyProvider.{method} returned {} bytes, expected at least 33 \
-                 (32 public key + key_id)",
-                bytes.len()
-            )));
-        }
-        let public_key_bytes = &bytes[..32];
-        let key_id_str = std::str::from_utf8(&bytes[32..]).map_err(|_| {
-            PlatformError::CustodyError(format!(
-                "KeyCustodyProvider.{method} key_id portion is not valid UTF-8"
-            ))
-        })?;
-        let key_id = Self::parse_handle(method, key_id_str)?;
-        Ok(PseudonymKeypair {
-            public_key: PublicKey::new(public_key_bytes.to_vec()),
-            key_handle: key_id,
-        })
     }
 
     /// Exports the raw Ed25519 signing key via the provider's
@@ -468,7 +459,10 @@ impl PyCallbackKeyCustody {
             self.provider
                 .call_str("export_signing_key_bytes", &handle.id().to_string())?,
         );
-        let arr = zeroize::Zeroizing::new(Self::expect_32("export_signing_key_bytes", &bytes)?);
+        let arr = zeroize::Zeroizing::new(scp_ffi_common::custody_parse::expect_32(
+            "export_signing_key_bytes",
+            &bytes,
+        )?);
         Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
     }
 }
@@ -480,7 +474,7 @@ impl KeyCustody for PyCallbackKeyCustody {
             KeyType::X25519 => "x25519".to_owned(),
         };
         let key_id: String = self.provider.call_str("generate_keypair", &type_str)?;
-        Self::parse_handle("generate_keypair", &key_id)
+        scp_ffi_common::custody_parse::parse_handle("generate_keypair", &key_id)
     }
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
@@ -514,7 +508,9 @@ impl KeyCustody for PyCallbackKeyCustody {
             self.provider
                 .call_str_bytes("dh_agree", &key.id().to_string(), peer_public)?,
         );
-        Ok(SharedSecret::new(Self::expect_32("dh_agree", &shared)?))
+        Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
+            "dh_agree", &shared,
+        )?))
     }
 
     async fn derive_pseudonym(
@@ -525,7 +521,7 @@ impl KeyCustody for PyCallbackKeyCustody {
         let bytes: Vec<u8> =
             self.provider
                 .call_str_bytes("derive_pseudonym", &key.id().to_string(), context_id)?;
-        Self::unpack_pseudonym("derive_pseudonym", &bytes)
+        scp_ffi_common::custody_parse::unpack_pseudonym("derive_pseudonym", &bytes)
     }
 
     async fn derive_rotatable_pseudonym(
@@ -534,30 +530,23 @@ impl KeyCustody for PyCallbackKeyCustody {
         context_id: &[u8],
         pseudonym_epoch: u64,
     ) -> Result<PseudonymKeypair, PlatformError> {
-        // Match the UniFFI CallbackKeyCustody contract: the rotatable variant
-        // is synthesized by extending the context_id with the big-endian epoch
-        // and the v2 domain separator, then delegating to derive_pseudonym.
-        // Keeps the Python protocol surface to a single pseudonym method.
-        //
-        // Layout: `context_id || epoch_BE(8) || "scp-pseudonym-v2"`. This is the
-        // canonical recipe defined in `scp-platform` `KeyCustody::derive_rotatable_pseudonym`
-        // (traits.rs) — "all implementations MUST produce identical output" — so
-        // the byte ordering is fixed by the protocol, not by this bridge. There is
-        // deliberately NO length separator between `context_id` and the epoch: the
-        // epoch is always exactly 8 big-endian bytes appended directly after the
-        // caller-supplied `context_id`, and the trailing domain separator is a
-        // fixed 16-byte literal. A length prefix would change the produced bytes
-        // and is therefore a wire-format change that must originate upstream in the
-        // spec/ADR and `scp-platform` (and be applied identically across all four
-        // bridges and the native custody backends) — it cannot be introduced here
-        // without breaking cross-bridge and over-time pseudonym derivation parity.
-        let mut extended = context_id.to_vec();
-        extended.extend_from_slice(&pseudonym_epoch.to_be_bytes());
-        extended.extend_from_slice(b"scp-pseudonym-v2");
-        let bytes: Vec<u8> =
-            self.provider
-                .call_str_bytes("derive_pseudonym", &key.id().to_string(), &extended)?;
-        Self::unpack_pseudonym("derive_rotatable_pseudonym", &bytes)
+        // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
+        // private-derived `pseudonym_secret` (HKDF over the Ed25519 private
+        // seed), NEVER the public key. The provider performs the canonical
+        // derivation itself — seed = HMAC-SHA256(pseudonym_secret, context_id ||
+        // BE64(pseudonym_epoch) || "scp-pseudonym-v2"); keypair =
+        // Ed25519_keygen(seed[0..32]). The epoch is passed through directly
+        // rather than synthesized into the context_id bridge-side, so the v1
+        // platform adapter does not re-append its own "scp-pseudonym" domain
+        // separator (which would corrupt the v2 domain). Mirrors the UniFFI /
+        // napi CallbackKeyCustody contract.
+        let bytes: Vec<u8> = self.provider.call_str_bytes_u64(
+            "derive_rotatable_pseudonym",
+            &key.id().to_string(),
+            context_id,
+            pseudonym_epoch,
+        )?;
+        scp_ffi_common::custody_parse::unpack_pseudonym("derive_rotatable_pseudonym", &bytes)
     }
 
     async fn ed25519_to_x25519_agree(
@@ -577,7 +566,7 @@ impl KeyCustody for PyCallbackKeyCustody {
                 &ed25519_handle.id().to_string(),
                 peer_x25519_public,
             )?);
-        Ok(SharedSecret::new(Self::expect_32(
+        Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
             "ed25519_to_x25519_agree",
             &shared,
         )?))
@@ -688,6 +677,17 @@ class FakeCustody:
         self._seeds[kid] = d
         return d + kid.encode('utf-8')
 
+    def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
+        # Canonical v2 preimage: context_id || BE64(epoch) || 'scp-pseudonym-v2'.
+        # The bridge passes the epoch through unmodified and does NOT append the
+        # v1 'scp-pseudonym' separator, so this provider owns the full recipe.
+        preimage = bytes(context_id) + pseudonym_epoch.to_bytes(8, 'big') + b'scp-pseudonym-v2'
+        d = hmac.new(self._seeds[key_id], preimage, hashlib.sha256).digest()
+        kid = str(self._next)
+        self._next += 1
+        self._seeds[kid] = d
+        return d + kid.encode('utf-8')
+
     def export_signing_key_bytes(self, key_id):
         return self._seeds[key_id]
 
@@ -763,6 +763,60 @@ class FakeCustody:
             .sign(&pseudo.key_handle, b"as pseudonym")
             .await
             .expect("sign with derived pseudonym handle");
+        assert_eq!(sig.as_bytes().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn ffi_custody_callback_rotatable_pseudonym_threads_epoch() {
+        // The rotatable path must call the provider's
+        // `derive_rotatable_pseudonym(key_id, context_id, epoch)` directly,
+        // passing the RAW context_id and the epoch as a separate argument — NOT
+        // a bridge-synthesized `context_id || BE64(epoch) || "scp-pseudonym-v2"`
+        // preimage fed into v1 `derive_pseudonym`. The fake provider computes
+        // the canonical v2 preimage itself; this test reproduces that preimage
+        // out-of-band and confirms the bridge delivered the exact same inputs.
+        let custody = fake_callback_custody();
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("callback generate keypair");
+
+        let context_id = b"context-xyz";
+        let epoch: u64 = 7;
+        let pseudo = custody
+            .derive_rotatable_pseudonym(&handle, context_id, epoch)
+            .await
+            .expect("callback derive_rotatable_pseudonym");
+        assert_eq!(
+            pseudo.public_key.as_bytes().len(),
+            32,
+            "rotatable pseudonym public key is 32 bytes"
+        );
+
+        // Reproduce the fake provider's canonical v2 preimage. handle id 1 is the
+        // first generate_keypair; its seed is SHA-256("1").
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        let seed = Sha256::digest(handle.id().to_string().as_bytes());
+        let mut preimage = context_id.to_vec();
+        preimage.extend_from_slice(&epoch.to_be_bytes());
+        preimage.extend_from_slice(b"scp-pseudonym-v2");
+        let mut mac =
+            <Hmac<Sha256> as Mac>::new_from_slice(&seed).expect("HMAC accepts any key length");
+        mac.update(&preimage);
+        let expected_pubkey = mac.finalize().into_bytes();
+        assert_eq!(
+            pseudo.public_key.as_bytes(),
+            expected_pubkey.as_slice(),
+            "bridge must pass raw context_id + epoch (canonical v2), not a \
+             double-domain-appended preimage"
+        );
+
+        // The unpacked handle must be usable for a follow-up sign.
+        let sig = custody
+            .sign(&pseudo.key_handle, b"as rotatable pseudonym")
+            .await
+            .expect("sign with derived rotatable pseudonym handle");
         assert_eq!(sig.as_bytes().len(), 64);
     }
 

@@ -1244,6 +1244,24 @@ fn wasm_bridge_covers_core_operations() {
         required_missing.len(),
         required_missing
     );
+
+    // Stale-exemptions guard (parity with uniffi/napi covers-core tests):
+    // an exemption for an operation that IS implemented is stale and should
+    // be removed from the JSON. WASM lacked this check, so a WASM op could be
+    // wired up while its exemption silently lingered, masking future drift.
+    let exempt = exemptions_for("wasm");
+    let missing_ops: BTreeSet<&str> = coverage.missing.iter().map(|(_, op)| *op).collect();
+    let stale_exemptions: Vec<&str> = exempt
+        .iter()
+        .copied()
+        .filter(|e| !missing_ops.contains(e))
+        .collect();
+    assert!(
+        stale_exemptions.is_empty(),
+        "WASM has stale exemption(s) in bridge-aliases.json (operation is \
+         implemented but still listed as exempt): {stale_exemptions:?}. \
+         Remove them from exemptions.wasm."
+    );
 }
 
 /// Cross-bridge parity matrix: builds and prints a matrix of all operations
@@ -1541,7 +1559,19 @@ fn discovery_and_provenance_coverage() {
 // paths, so no new parity operation was added in its place. This is a
 // legitimate removal; the ratchet is reset to the new floor. See commit
 // 2291102.
-const MIN_PARITY_OPERATIONS: usize = 97;
+//
+// Subsequently RAISED 97 -> 104 by the reverse-coverage gate: seven operations
+// were exported across bridges but absent from the alias table (the
+// hide-by-omission class). They are now registered, expanding coverage. The
+// seven: `metadata_record_to_json` (spec §5.7.2, the to_json counterpart of
+// the already-registered `metadata_record_from_json`); `commit_deploy` /
+// `rollback_deploy` (ADR-037; spec §10.14.3 site-projection deploy, wasm-exempt
+// server ops); and the four transport relay-management ops
+// `transport_add_relay` / `transport_assign_relay_set` /
+// `transport_adapter_count` / `transport_reliability` (ADR-013 transport
+// adapter set, wasm-exempt — WASM has no scp-platform per ADR-034). This is a
+// pure coverage expansion, not a swap for the removed `economy_adjust_relay_price`.
+const MIN_PARITY_OPERATIONS: usize = 104;
 
 /// Named set of operations that must have `wasm_required=true`.
 /// This is a named set, not a count — swapping one operation for another is
@@ -3026,4 +3056,789 @@ fn pure_helpers_detector_accepts_self_type_references() {
             "detector failed to recognize Self-type reference in: {src}"
         );
     }
+}
+
+// ===========================================================================
+// F2: Reverse-coverage — every exported FFI fn is registered or allowlisted
+//
+// The forward tests (`*_bridge_covers_core_operations`) ask: "is every
+// canonical operation in bridge-aliases.json backed by a real exported fn?"
+// They are blind in the OTHER direction: a bridge can export a function that
+// no canonical operation references at all. If that function is genuinely a
+// cross-bridge parity op (it exists in the other bridges too) but simply
+// never got an alias entry, the forward tests stay green while the operation
+// silently lacks parity tracking. That is exactly how an unregistered op can
+// hide — e.g. an op exported in all four bridges but absent from the alias
+// table is invisible to every forward gate.
+//
+// This reverse gate enumerates EVERY exported fn under each bridge crate's
+// `src/` (via a real filesystem walk + the strict `syn` scanner — NOT the
+// curated `*_sources()` include lists, which are themselves incomplete) and
+// requires each name to be either:
+//   • registered  — appears as a Rust name for some canonical op in
+//     bridge-aliases.json under that bridge, OR
+//   • allowed      — listed in scripts/ffi-export-allowlist.json as a
+//     legitimately-non-parity export (getter, lifecycle, dunder, etc.), OR
+//   • pending      — listed in the allowlist's pending_registration block as
+//     a known-unregistered cross-bridge parity op awaiting an alias entry.
+//
+// `leaked = exported − registered − allowed − pending`. A non-empty `leaked`
+// set is a finding: a brand-new export that is neither tracked for parity nor
+// justified as non-parity.
+// ===========================================================================
+
+const FFI_EXPORT_ALLOWLIST_JSON: &str =
+    include_str!("../../../../scripts/ffi-export-allowlist.json");
+
+#[derive(Debug, Deserialize)]
+struct FfiExportAllowlistFile {
+    #[serde(default)]
+    pyo3: Vec<AllowlistEntry>,
+    #[serde(default)]
+    uniffi: Vec<AllowlistEntry>,
+    #[serde(default)]
+    napi: Vec<AllowlistEntry>,
+    #[serde(default)]
+    wasm: Vec<AllowlistEntry>,
+    #[serde(default)]
+    pending_registration: PendingRegistration,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PendingRegistration {
+    #[serde(default)]
+    pyo3: Vec<AllowlistEntry>,
+    #[serde(default)]
+    uniffi: Vec<AllowlistEntry>,
+    #[serde(default)]
+    napi: Vec<AllowlistEntry>,
+    #[serde(default)]
+    wasm: Vec<AllowlistEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AllowlistEntry {
+    name: String,
+    /// Workspace-relative path of the source file that defines this exported
+    /// fn, e.g. `crates/scp-ffi/src/identity.rs`. The qualified key
+    /// `<path>::<name>` is what the reverse gate matches on — mirroring the
+    /// `path::fn` discipline of `scripts/pure-helpers-allowlist.txt`. A bare
+    /// `name` match would silently exempt ANY future export sharing the name
+    /// (e.g. a genuine op named `tools`, which collides with the `tools`
+    /// getter), recreating the hide-by-omission class this gate exists to kill.
+    path: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    reason: String,
+}
+
+impl AllowlistEntry {
+    /// The `<workspace-relative-path>::<name>` qualified key, matching the
+    /// convention in `scripts/pure-helpers-allowlist.txt`.
+    fn qualified_key(&self) -> String {
+        format!("{}::{}", self.path, self.name)
+    }
+}
+
+fn ffi_export_allowlist() -> &'static FfiExportAllowlistFile {
+    static CELL: OnceLock<FfiExportAllowlistFile> = OnceLock::new();
+    CELL.get_or_init(|| {
+        serde_json::from_str(FFI_EXPORT_ALLOWLIST_JSON)
+            .expect("scripts/ffi-export-allowlist.json is valid JSON")
+    })
+}
+
+/// The four bridges, paired with the `src/` root each one's exports live under
+/// and the closure that selects that bridge's Rust names from an alias op.
+/// Order mirrors `ffi_bridge_roots()`.
+fn bridge_export_targets() -> Vec<(&'static str, PathBuf)> {
+    let root = workspace_root();
+    vec![
+        ("pyo3", root.join("crates/scp-ffi/src")),
+        ("uniffi", root.join("crates/scp-ffi/uniffi/src")),
+        ("napi", root.join("crates/scp-ffi/napi/src")),
+        ("wasm", root.join("crates/scp-ffi/wasm/src")),
+    ]
+}
+
+/// The set of Rust fn names a given bridge is expected to export because a
+/// canonical operation in `bridge-aliases.json` names them. This is the
+/// "registered" set the reverse gate measures exported fns against.
+fn registered_names_for(bridge: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (_, canonical, _) in parity_operations() {
+        let names: &[String] = match bridge {
+            "pyo3" => pyo3_names(canonical),
+            "uniffi" => uniffi_names(canonical),
+            "napi" => napi_names(canonical),
+            "wasm" => wasm_names(canonical),
+            other => panic!("registered_names_for: unknown bridge '{other}'"),
+        };
+        for n in names {
+            out.insert(n.clone());
+        }
+    }
+    out
+}
+
+/// Per-bridge entries from the allowlist's per-bridge arrays.
+fn per_bridge_entries(bridge: &str) -> &'static [AllowlistEntry] {
+    let file = ffi_export_allowlist();
+    match bridge {
+        "pyo3" => &file.pyo3,
+        "uniffi" => &file.uniffi,
+        "napi" => &file.napi,
+        "wasm" => &file.wasm,
+        other => panic!("per_bridge_entries: unknown bridge '{other}'"),
+    }
+}
+
+/// Per-bridge entries from the allowlist's `pending_registration` block.
+fn pending_entries(bridge: &str) -> &'static [AllowlistEntry] {
+    let file = ffi_export_allowlist();
+    match bridge {
+        "pyo3" => &file.pending_registration.pyo3,
+        "uniffi" => &file.pending_registration.uniffi,
+        "napi" => &file.pending_registration.napi,
+        "wasm" => &file.pending_registration.wasm,
+        other => panic!("pending_entries: unknown bridge '{other}'"),
+    }
+}
+
+/// Allowlist QUALIFIED keys (`<path>::<name>`, the legitimately-non-parity
+/// exports) for a bridge. Path-qualified per Finding 1: an entry exempts only
+/// the specific fn in the specific file it was written for.
+fn allowed_keys_for(bridge: &str) -> BTreeSet<String> {
+    per_bridge_entries(bridge)
+        .iter()
+        .map(AllowlistEntry::qualified_key)
+        .collect()
+}
+
+/// Pending-registration QUALIFIED keys (known-unregistered cross-bridge parity
+/// ops awaiting an alias entry) for a bridge.
+fn pending_keys_for(bridge: &str) -> BTreeSet<String> {
+    pending_entries(bridge)
+        .iter()
+        .map(AllowlistEntry::qualified_key)
+        .collect()
+}
+
+/// Every exported fn under a bridge crate's `src/`, as `<path>::<name>`
+/// qualified keys, via a filesystem walk and the strict `syn` scanner. `path`
+/// is workspace-relative (e.g. `crates/scp-ffi/src/identity.rs`) so the key
+/// matches the `path::fn` discipline of `scripts/pure-helpers-allowlist.txt`
+/// and the `path`+`name` pair an allowlist entry carries. Reads each `*.rs`
+/// file fresh (these are NOT the `include_str!`-interned `*_sources()` lists,
+/// which are incomplete — the walk is authoritative).
+///
+/// Qualification is what closes the bypass a reviewer proved: a bare-name
+/// allowlist (`tools` as a getter) would silently swallow a genuinely-new op
+/// that happens to share the name but lives in a different file. Keyed on the
+/// full path, an entry exempts ONLY the specific fn it was written for.
+fn exported_qualified_under(root: &Path) -> BTreeSet<String> {
+    let ws = workspace_root();
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    let mut out = BTreeSet::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(&ws)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for name in collect_ffi_exported_fns(&text) {
+            out.insert(format!("{rel}::{name}"));
+        }
+    }
+    out
+}
+
+/// RESIDUAL-B remediation: registered-name multi-path allowlist.
+///
+/// The reverse gate qualifies the "registered" match by PATH (below). The
+/// canonical export path of a registered name is DERIVED from the scan — there
+/// is intentionally no `path` field in bridge-aliases.json (aliases are
+/// path-agnostic), so the only ground truth for "where is this op actually
+/// exported?" is the syn scan itself. A registered name that the scan finds at
+/// EXACTLY ONE path is unambiguous: that path is its canonical export site, and
+/// an export of that name at any OTHER path is a rogue duplicate (the proven
+/// RESIDUAL-B exploit: a `#[pyfunction] fn context_close` planted in a second
+/// file rides the registered name to stay green).
+///
+/// A registered name found at >1 path cannot have its canonical site derived
+/// unambiguously. STEP-1 empirical scan of all four bridges found ZERO such
+/// names (every registered name maps to exactly one export path), so this
+/// allowlist starts EMPTY. It exists so that IF a legitimate multi-path
+/// registered name ever appears (e.g. a getter name that genuinely collides
+/// with a registered op across two files, or a macro that emits the same export
+/// name from sibling modules), it can be acknowledged explicitly — keyed on the
+/// exact `<workspace-relative-path>::<name>` and accompanied by a reason — WITHOUT
+/// blanket-accepting all duplicates of that name. Each entry exempts ONLY the
+/// one `(path, name)` it names; the sibling path must ALSO be listed (or it
+/// leaks). Do NOT add an entry to silence a real rogue export — that is the
+/// exact class this gate exists to catch.
+const REGISTERED_NAME_MULTIPATH_ALLOWLIST: &[(&str, &str)] = &[
+    // (qualified "<path>::<name>" key, reason). EMPTY by STEP-1 evidence:
+    // no registered name currently maps to more than one export path in any
+    // bridge. Add ONLY genuine, reviewed collisions here — never a rogue export.
+];
+
+/// Path-qualify the registered set for one bridge.
+///
+/// Derives, from the export scan, the set of QUALIFIED `<path>::<name>` keys
+/// that count as "covered by registration", plus any registered names that
+/// resolve to MORE than one export path (the RESIDUAL-B condition).
+///
+/// Returns `(covered_qualified, multipath_leaks)`:
+///   • `covered_qualified` — for each registered name that the scan finds at
+///     exactly one path, the single `<path>::<name>` key. An export NOT in this
+///     set (because it carries a registered name at a DIFFERENT path) is no
+///     longer silently masked — it falls through to the allowlist/pending/leak
+///     logic exactly like any unregistered export.
+///   • `multipath_leaks` — `<path>::<name>` keys for registered names found at
+///     >1 path that are NOT in `REGISTERED_NAME_MULTIPATH_ALLOWLIST`. These are
+///     hard leaks: a registered name has been duplicated across files and its
+///     canonical site can no longer be derived, so every occurrence is reported
+///     until the duplication is resolved (or each occurrence is explicitly
+///     allowlisted with a reason).
+fn registered_qualified_for(
+    bridge: &str,
+    exported: &BTreeSet<String>,
+) -> (BTreeSet<String>, Vec<String>) {
+    use std::collections::BTreeMap;
+    let registered = registered_names_for(bridge);
+
+    // name -> the export paths the scan finds it at (restricted to registered
+    // names — unregistered exports are handled by the allowlist/pending logic).
+    let mut name_to_paths: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for qualified in exported {
+        if let Some((path, name)) = qualified.rsplit_once("::")
+            && registered.contains(name)
+        {
+            name_to_paths.entry(name).or_default().push(path);
+        }
+    }
+
+    let multipath_allow: BTreeSet<&str> = REGISTERED_NAME_MULTIPATH_ALLOWLIST
+        .iter()
+        .map(|(key, _)| *key)
+        .collect();
+
+    let mut covered = BTreeSet::new();
+    let mut multipath_leaks = Vec::new();
+    for (name, paths) in name_to_paths {
+        if paths.len() == 1 {
+            // Unambiguous canonical site: this exact (path, name) is covered.
+            covered.insert(format!("{}::{name}", paths[0]));
+        } else {
+            // Registered name duplicated across files. Canonical site is no
+            // longer derivable — every occurrence leaks unless explicitly
+            // acknowledged in the multi-path allowlist.
+            for path in paths {
+                let key = format!("{path}::{name}");
+                if multipath_allow.contains(key.as_str()) {
+                    covered.insert(key);
+                } else {
+                    multipath_leaks.push(key);
+                }
+            }
+        }
+    }
+    (covered, multipath_leaks)
+}
+
+/// Reverse-coverage gate. See the section header above for the full rationale.
+#[test]
+fn every_exported_ffi_fn_is_registered_or_allowlisted() {
+    let mut all_leaks: Vec<String> = Vec::new();
+    for (bridge, root) in bridge_export_targets() {
+        let exported = exported_qualified_under(&root);
+        // `registered_qualified` is keyed on the QUALIFIED `<path>::<name>`,
+        // with the canonical path DERIVED from the scan (RESIDUAL-B fix). A
+        // registered op is covered ONLY at the file the bridge actually defines
+        // it in — a second export reusing a registered NAME at a different path
+        // no longer rides the bare name to stay green.
+        let (registered_qualified, multipath_leaks) = registered_qualified_for(bridge, &exported);
+        // `allowed` / `pending` are keyed on the QUALIFIED `<path>::<name>` key
+        // so an allowlist entry exempts ONLY the specific fn in its file.
+        let allowed = allowed_keys_for(bridge);
+        let pending = pending_keys_for(bridge);
+        // Multi-path duplicates are reported separately (with a clearer
+        // message) — exclude them here so each is named exactly once.
+        let multipath_set: BTreeSet<&String> = multipath_leaks.iter().collect();
+
+        let leaked: Vec<&String> = exported
+            .iter()
+            .filter(|qualified| {
+                !registered_qualified.contains(*qualified)
+                    && !allowed.contains(*qualified)
+                    && !pending.contains(*qualified)
+                    && !multipath_set.contains(*qualified)
+            })
+            .collect();
+
+        if !leaked.is_empty() {
+            eprintln!("{bridge}: {} leaked export(s): {leaked:?}", leaked.len());
+            for q in leaked {
+                all_leaks.push(format!("{bridge}::{q}"));
+            }
+        }
+        if !multipath_leaks.is_empty() {
+            eprintln!(
+                "{bridge}: {} registered-name multi-path duplicate(s): {multipath_leaks:?}",
+                multipath_leaks.len()
+            );
+            for q in multipath_leaks {
+                all_leaks.push(format!(
+                    "{bridge}::{q} (registered-name duplicated across files)"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        all_leaks.is_empty(),
+        "{} FFI export(s) are neither registered as a parity operation (at \
+         their derived canonical path) in scripts/bridge-aliases.json nor \
+         justified in scripts/ffi-export-allowlist.json:\n  {}\n\
+         Each leaked name is either (a) a legitimately-non-parity export — add \
+         it to the bridge's array in ffi-export-allowlist.json with the right \
+         `kind` + `reason`; or (b) a genuine cross-bridge parity operation that \
+         lacks an alias entry — add it to the pending_registration block (with \
+         cross-bridge evidence) and register it in bridge-aliases.json. An entry \
+         tagged `(registered-name duplicated across files)` means a registered \
+         op name now appears in more than one source file: resolve the \
+         duplication (the rogue export is almost certainly the bug) or, if both \
+         are legitimate, list each `<path>::<name>` in \
+         REGISTERED_NAME_MULTIPATH_ALLOWLIST with a reason.",
+        all_leaks.len(),
+        all_leaks.join("\n  ")
+    );
+}
+
+/// Guard (a): no dead allowlist entries. Every name listed in
+/// ffi-export-allowlist.json (both the per-bridge arrays AND the
+/// pending_registration block) must correspond to an actually-exported fn in
+/// that bridge — otherwise the allowlist accumulates stale entries that hide
+/// nothing and rot silently.
+#[test]
+fn ffi_export_allowlist_has_no_stale_entries() {
+    let mut stale: Vec<String> = Vec::new();
+    for (bridge, root) in bridge_export_targets() {
+        // QUALIFIED keys: an entry is stale unless its EXACT `<path>::<name>`
+        // is an actual export. This also catches a `path` that drifted (file
+        // renamed/moved) — the bare name might still exist elsewhere, but the
+        // entry no longer describes a real export and must be corrected.
+        let exported = exported_qualified_under(&root);
+        let entries = per_bridge_entries(bridge)
+            .iter()
+            .chain(pending_entries(bridge));
+        for entry in entries {
+            if !exported.contains(&entry.qualified_key()) {
+                stale.push(format!("{bridge}::{}", entry.qualified_key()));
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "ffi-export-allowlist.json has {} stale entry(ies) (the qualified \
+         <path>::<name> is not an exported fn in that bridge): {stale:?}. \
+         Remove them or correct the `path`.",
+        stale.len()
+    );
+}
+
+/// The capability-matrix artifact a `bridge-specific` allowlist reason must
+/// reference: it asserts an export is one-bridge BY DESIGN, so the matrix that
+/// records which bridges implement which op is the auditable justification.
+const CAPABILITY_MATRIX_REF: &str = "sdk-capability-matrix.json";
+
+// ---------------------------------------------------------------------------
+// Known residual limitations of the `bridge-specific` reverse-coverage gate
+//
+// These are recorded honestly rather than fixed: each is either contrived,
+// structural, or already backstopped by the forward-coverage gates (the
+// registration/pending checks that require a real op to exist). They are LOW
+// severity and listed so they are not silently ignored.
+//
+//   • Intra-file same-name shadowing. A rogue exported fn sharing a
+//     registered/getter name IN THE SAME FILE as the canonical export is
+//     deduped by the per-file symbol set — path-qualification distinguishes
+//     same-name fns ACROSS files but cannot see intra-file name reuse.
+//     Mitigation: forward coverage + code review; low likelihood, since it
+//     requires editing the canonical export's own file to add the shadow.
+//
+//   • `#[cfg(test)]`-gated canonical. If a canonical export is `#[cfg(test)]`
+//     and thus dropped from the scan, a rogue same-name export could become the
+//     sole surviving path. Self-limiting: a `#[cfg(test)]` canonical does not
+//     ship, so the forward-coverage tests catch the missing real op. NOTE: only
+//     `#[cfg(test)]` drops fns from the scan — `#[cfg(feature = "...")]` does
+//     NOT, so feature-gated canonicals are unaffected.
+//
+//   • Near-name dodge. The matrix-op matcher (`matrix_ops_named_in`) is
+//     whole-word, so `createX` does NOT match the op `create`. A reason that
+//     paraphrases the op name evades the matrix-contradiction check.
+//     Mitigation: the registration/forward gates still require the genuine op
+//     to exist, so a paraphrase cannot conjure coverage it doesn't have.
+//
+//   • napi/wasm SDK-column collapse. `bridge_to_sdks` maps BOTH `napi` and
+//     `wasm` to `typescript`, so a genuine napi+wasm two-bridge op declared
+//     `bridge-specific` on only one of them is not flagged by the matrix check
+//     alone (the other TS bridge looks "inside" the same SDK set). Backstopped
+//     by the OTHER bridge's own reverse gate: the second bridge's export must
+//     still be registered or carry its own justified allowlist entry.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RESIDUAL-C remediation: the capability matrix is PARSED, not substring-matched
+//
+// A `bridge-specific` allowlist reason that cites the capability matrix asserts
+// "this export is one-bridge BY DESIGN, not a parity gap." The previous guard
+// only checked that the reason CONTAINED the string `sdk-capability-matrix.json`
+// — zero verification that the named op is actually in the matrix as one-bridge.
+// A fabricated `bridge-specific` entry for a real cross-bridge (4-SDK) op slid
+// through. Now: when a `bridge-specific` reason names a matrix op, we parse the
+// matrix and ASSERT that op is available ONLY on the claiming bridge's SDK(s).
+// If the matrix shows it on any SDK OUTSIDE the claiming bridge's set, the
+// op is genuinely multi-bridge → the `bridge-specific` classification is FALSE
+// (it must be registered or pending-registration instead) → fail.
+// ---------------------------------------------------------------------------
+
+const CAPABILITY_MATRIX_JSON: &str =
+    include_str!("../../../../.docs/standards/sdk-capability-matrix.json");
+
+#[derive(Debug, Deserialize)]
+struct CapabilityMatrixFile {
+    capabilities: Vec<CapabilityDomain>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityDomain {
+    operations: Vec<RawCapabilityOp>,
+}
+
+/// Raw per-op row as it appears in the matrix JSON. The per-SDK availability
+/// flags (`python` / `typescript` / `kotlin` / `swift`, plus any future SDK
+/// columns) are captured via `#[serde(flatten)]` into a map rather than four
+/// named `bool` fields — both to avoid a long-lived 4-bool struct and so a new
+/// SDK column added to the matrix is picked up without editing this test. Only
+/// the four SDK identifiers the gate knows how to map to a bridge
+/// (`bridge_to_sdks`) are consulted; other flattened keys (e.g. `name` is the
+/// only non-flattened field) are ignored when collapsing to the SDK set.
+#[derive(Debug, Deserialize)]
+struct RawCapabilityOp {
+    name: String,
+    #[serde(flatten)]
+    flags: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// SDK identifiers the matrix-vs-bridge check understands, matching the keys
+/// produced by `bridge_to_sdks`.
+const MATRIX_SDK_KEYS: &[&str] = &["python", "typescript", "kotlin", "swift"];
+
+impl RawCapabilityOp {
+    /// The SDK identifiers (matching `bridge_to_sdks`) this op is available on:
+    /// every known SDK key whose flattened flag is JSON `true`.
+    fn available_sdks(&self) -> BTreeSet<&'static str> {
+        MATRIX_SDK_KEYS
+            .iter()
+            .filter(|sdk| self.flags.get(**sdk).and_then(serde_json::Value::as_bool) == Some(true))
+            .copied()
+            .collect()
+    }
+}
+
+/// `op-name -> set of SDKs the op is available on`. If the same op name appears
+/// under more than one domain (it does not today, but defensively), the UNION
+/// of availability is taken so a multi-SDK op is never under-reported as
+/// one-bridge.
+fn capability_matrix_ops() -> &'static std::collections::BTreeMap<String, BTreeSet<&'static str>> {
+    static CELL: OnceLock<std::collections::BTreeMap<String, BTreeSet<&'static str>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| {
+        let file: CapabilityMatrixFile = serde_json::from_str(CAPABILITY_MATRIX_JSON)
+            .expect(".docs/standards/sdk-capability-matrix.json is valid JSON");
+        let mut map: std::collections::BTreeMap<String, BTreeSet<&'static str>> =
+            std::collections::BTreeMap::new();
+        for domain in file.capabilities {
+            for op in domain.operations {
+                map.entry(op.name.clone())
+                    .or_default()
+                    .extend(op.available_sdks());
+            }
+        }
+        assert!(
+            !map.is_empty(),
+            "capability matrix parsed to zero ops — the bridge-specific matrix \
+             check cannot function; has the schema changed?"
+        );
+        map
+    })
+}
+
+/// Maps an FFI bridge to the developer-facing SDK identifier(s) it powers, in
+/// the same vocabulary the capability matrix uses (`python` / `typescript` /
+/// `kotlin` / `swift`). A `bridge-specific` export is "one-bridge" iff the
+/// matrix op it names is available ONLY within this set.
+///   • pyo3   → python
+///   • napi   → typescript (the Node/Bun NAPI path)
+///   • wasm   → typescript (the browser WASM path; shares the TS SDK with napi)
+///   • uniffi → kotlin + swift
+fn bridge_to_sdks(bridge: &str) -> BTreeSet<&'static str> {
+    let mut s = BTreeSet::new();
+    match bridge {
+        "pyo3" => {
+            s.insert("python");
+        }
+        "napi" | "wasm" => {
+            s.insert("typescript");
+        }
+        "uniffi" => {
+            s.insert("kotlin");
+            s.insert("swift");
+        }
+        other => panic!("bridge_to_sdks: unknown bridge '{other}'"),
+    }
+    s
+}
+
+/// Returns true if `ch` can appear inside a matrix op identifier (snake_case).
+const fn is_op_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+/// Every capability-matrix op name that appears in `reason` as a WHOLE-WORD
+/// token (not as a substring of a longer identifier). E.g. a reason naming
+/// `register_tool_handler` matches that op, but a reason naming
+/// `mcp_register_tool_handler` (a different, longer identifier) does NOT match
+/// the bare `register` op. This is what lets a `bridge-specific` reason name
+/// the precise matrix op it relies on for its one-bridge claim.
+fn matrix_ops_named_in(reason: &str) -> Vec<&'static str> {
+    let ops = capability_matrix_ops();
+    let bytes = reason.as_bytes();
+    let mut out = Vec::new();
+    for name in ops.keys() {
+        let mut start = 0;
+        while let Some(rel) = reason[start..].find(name.as_str()) {
+            let i = start + rel;
+            let before_ok = i == 0
+                || !reason[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_op_ident_char);
+            let after_idx = i + name.len();
+            let after_ok = after_idx >= bytes.len()
+                || !reason[after_idx..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_op_ident_char);
+            if before_ok && after_ok {
+                // Leak the &'static str borrowed from the OnceLock-backed map.
+                let key: &'static str = capability_matrix_ops()
+                    .get_key_value(name)
+                    .map(|(k, _)| k.as_str())
+                    .expect("op name is a key of the matrix map");
+                out.push(key);
+                break;
+            }
+            start = i + name.len();
+        }
+    }
+    out
+}
+
+/// For a `bridge-specific` entry on `bridge` whose `reason` cites the matrix:
+/// returns a non-empty error string if any matrix op named in the reason is
+/// available on an SDK OUTSIDE the claiming bridge's SDK set (i.e. it is a
+/// genuine multi-bridge op and `bridge-specific` is a FALSE classification).
+fn bridge_specific_matrix_violation(bridge: &str, name: &str, reason: &str) -> Option<String> {
+    let claim = bridge_to_sdks(bridge);
+    let ops = capability_matrix_ops();
+    for op_name in matrix_ops_named_in(reason) {
+        let avail = ops.get(op_name).expect("named op is in the matrix map");
+        let outside: Vec<&str> = avail.difference(&claim).copied().collect();
+        if !outside.is_empty() {
+            return Some(format!(
+                "{bridge}::{name} (kind 'bridge-specific') cites capability-matrix \
+                 op '{op_name}', but the matrix shows it available on SDK(s) \
+                 {outside:?} OUTSIDE this bridge's SDK set {claim:?} — it is a \
+                 genuine multi-bridge parity op, not one-bridge. Register it in \
+                 bridge-aliases.json (or add to pending_registration) instead of \
+                 classifying it 'bridge-specific'."
+            ));
+        }
+    }
+    None
+}
+
+/// Records any ADR-/SCP- token in `reason` that does NOT exist in its
+/// corpus. Shape (`cites_durable_provenance`) is necessary but not sufficient:
+/// this is the SAME existence check `every_exemption_reason_cites_durable_provenance`
+/// runs, so a fabricated `ADR-999` / `SCP-9999` cannot substantiate an
+/// allowlist entry. Spec `§` sections stay shape-only (section numbers are not
+/// single greppable tokens against the multi-file spec).
+fn fabricated_provenance_in(reason: &str) -> Vec<String> {
+    let mut bad: Vec<String> = cited_tokens(reason, "ADR-")
+        .into_iter()
+        .filter(|t| !adrs_in_repo().contains(t))
+        .collect();
+    bad.extend(
+        cited_tokens(reason, "SCP-")
+            .into_iter()
+            .filter(|t| !scp_stories_in_repo().contains(t)),
+    );
+    bad
+}
+
+/// Guard (b): every allowlist entry's `kind` is valid and its `reason` is
+/// non-empty.
+///
+/// Per Finding 2 the reason is EXISTENCE-checked, not merely shape-checked:
+///   • `wasm-only` and `pending-registration` must cite a durable artifact
+///     (ADR / §spec / SCP story) AND every cited ADR/SCP token must actually
+///     EXIST in the repo corpus — a fabricated `ADR-999` no longer passes.
+///   • `bridge-specific` must reference the capability-matrix justification
+///     (`sdk-capability-matrix.json`) OR an existing ADR/§/SCP that explains
+///     the one-bridge status — its prose justification is now ENFORCED, not
+///     optional. This is the artifact that records which bridges implement an
+///     op; a `bridge-specific` claim ("one-bridge by design, not a gap") is
+///     only auditable against it.
+///   • getter / lifecycle / dunder / constructor / test-fixture /
+///     introspection remain kind-tag-only (a non-empty reason suffices): the
+///     kind tag itself is the justification.
+#[test]
+fn ffi_export_allowlist_reasons_are_justified() {
+    const VALID_KINDS: &[&str] = &[
+        "getter",
+        "lifecycle",
+        "dunder",
+        "wasm-only",
+        "test-fixture",
+        "introspection",
+        "constructor",
+        "bridge-specific",
+        "pending-registration",
+    ];
+    let file = ffi_export_allowlist();
+    let mut offenders: Vec<String> = Vec::new();
+
+    let mut check = |bridge: &str, entry: &AllowlistEntry, force_provenance: bool| {
+        if !VALID_KINDS.contains(&entry.kind.as_str()) {
+            offenders.push(format!(
+                "{bridge}::{} has invalid kind '{}' (valid: {VALID_KINDS:?})",
+                entry.name, entry.kind
+            ));
+            return;
+        }
+        if entry.reason.trim().is_empty() {
+            offenders.push(format!("{bridge}::{} has an empty reason", entry.name));
+            return;
+        }
+        // `bridge-specific` requires the capability-matrix justification OR a
+        // durable ADR/§/SCP artifact explaining the one-bridge status.
+        if entry.kind == "bridge-specific" {
+            let cites_matrix = entry.reason.contains(CAPABILITY_MATRIX_REF);
+            if !cites_matrix && !cites_durable_provenance(&entry.reason) {
+                offenders.push(format!(
+                    "{bridge}::{} (kind 'bridge-specific') must reference the \
+                     capability-matrix justification ('{CAPABILITY_MATRIX_REF}') \
+                     or an existing ADR-NNN / §N / SCP-NNN explaining the \
+                     one-bridge status; got: {:?}",
+                    entry.name, entry.reason
+                ));
+            }
+            // Whatever ADR/SCP it DOES cite must exist.
+            let fabricated = fabricated_provenance_in(&entry.reason);
+            if !fabricated.is_empty() {
+                offenders.push(format!(
+                    "{bridge}::{} (kind 'bridge-specific') cites non-existent \
+                     artifact(s) {fabricated:?}",
+                    entry.name
+                ));
+            }
+            // RESIDUAL-C / NEW-C1: the matrix-vs-claim check runs UNCONDITIONALLY,
+            // decoupled from which justification path the entry took above. The
+            // matrix is PARSED and any matrix op NAMED in the reason — whether or
+            // not the reason also contains the literal `sdk-capability-matrix.json`
+            // string — must be available ONLY on this bridge's SDK(s). A reason
+            // naming a multi-SDK (cross-bridge) op exposes a FALSE `bridge-specific`
+            // classification regardless of how it dressed up its justification.
+            //
+            // The earlier gate ran this only when `cites_matrix` was true, so an
+            // entry that justified itself via a real ADR/§/SCP (the alternative
+            // path) while naming a cross-bridge matrix op — e.g. "Per ADR-023 the
+            // create operation is implemented only on PyO3 here" — skipped the
+            // contradiction check entirely and buried a 4-SDK op as one-bridge.
+            // "Is this entry justified at all" (cites matrix OR real ADR/§/SCP,
+            // checked above) is now independent of "does the reason name a matrix
+            // op that contradicts the bridge-specific claim" (checked here, always).
+            //
+            // Reasons that name no matrix op (e.g. they cite the matrix only to
+            // say an export is "not among" the tracked ops) produce no violation
+            // and are backstopped by the ADR/§/SCP existence check above.
+            if let Some(violation) =
+                bridge_specific_matrix_violation(bridge, &entry.name, &entry.reason)
+            {
+                offenders.push(violation);
+            }
+            return;
+        }
+        let needs_provenance =
+            force_provenance || entry.kind == "wasm-only" || entry.kind == "pending-registration";
+        if needs_provenance {
+            if !cites_durable_provenance(&entry.reason) {
+                offenders.push(format!(
+                    "{bridge}::{} (kind '{}') must cite a durable artifact \
+                     (ADR-NNN / §N / SCP-NNN) in its reason; got: {:?}",
+                    entry.name, entry.kind, entry.reason
+                ));
+                return;
+            }
+            // Shape is not enough: the cited ADR/SCP must EXIST in the corpus.
+            let fabricated = fabricated_provenance_in(&entry.reason);
+            if !fabricated.is_empty() {
+                offenders.push(format!(
+                    "{bridge}::{} (kind '{}') cites non-existent artifact(s) \
+                     {fabricated:?} (no matching file/heading under .docs/)",
+                    entry.name, entry.kind
+                ));
+            }
+        }
+    };
+
+    for (bridge, entries) in [
+        ("pyo3", &file.pyo3),
+        ("uniffi", &file.uniffi),
+        ("napi", &file.napi),
+        ("wasm", &file.wasm),
+    ] {
+        for entry in entries {
+            check(bridge, entry, false);
+        }
+    }
+    // pending_registration entries always require durable provenance: they are
+    // assertions that a real parity op exists across bridges but is not yet
+    // registered, so the evidence must be auditable.
+    for (bridge, entries) in [
+        ("pyo3", &file.pending_registration.pyo3),
+        ("uniffi", &file.pending_registration.uniffi),
+        ("napi", &file.pending_registration.napi),
+        ("wasm", &file.pending_registration.wasm),
+    ] {
+        for entry in entries {
+            check(bridge, entry, true);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "ffi-export-allowlist.json has {} unjustified entry(ies):\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
+    );
 }

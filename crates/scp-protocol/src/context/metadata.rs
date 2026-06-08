@@ -36,7 +36,7 @@ pub type Ed25519Signature = Vec<u8>;
 /// A signed context metadata record published for pre-join inspection.
 ///
 /// Metadata records are published to the context's metadata routing address
-/// (`SHA-256(context_id || "scp-metadata")`, spec §5.7.1). They carry both
+/// (`HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")`, spec §9.10.4.B). They carry both
 /// structural fields (always visible) and operational fields (filtered by
 /// `MetadataVisibilityPolicy`).
 ///

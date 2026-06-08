@@ -795,8 +795,10 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
     //
     // All 7 KeyCustody trait methods are exposed (SCP-214). dh_agree,
     // derive_pseudonym, generate_keypair, and custody_type were added.
-    // ADR-027 amendment: derive_pseudonym uses public key bytes as HMAC key
-    // for cross-platform TEE determinism (hardware TEE cannot export private bytes).
+    // derive_pseudonym uses the 32-byte pseudonym_secret as the HMAC key, NEVER
+    // the public key (public key would be a membership-enumeration oracle, §9.10.4.A).
+    // Software custody derives pseudonym_secret from the private seed via HKDF
+    // (cross-platform deterministic); hardware TEE uses a device-local secret.
     // identity_create_platform() accepts a KeyCustodyProvider and creates a
     // did:dht identity using it; the adapter must be retained on the Identity
     // handle struct for subsequent crypto operations (context creation, signing).
@@ -816,9 +818,11 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
         [Throws=ScpError]
         bytes dh_agree(string key_id, bytes peer_public);
 
-        // Returns [public_key_bytes(32) || key_id_utf8_bytes].
-        // Algorithm: seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym"),
-        // Ed25519_keygen(seed[0..32]). Public key bytes used as HMAC key per ADR-027.
+        // Returns [pseudonym_public_key_bytes(32) || key_id_utf8_bytes].
+        // Algorithm: seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym"),
+        // Ed25519_keygen(seed[0..32]). The HMAC key is the pseudonym_secret, NOT the
+        // public key: software derives it from the private seed via HKDF (cross-platform
+        // deterministic); hardware TEE uses a device-local secret (§9.10.4.A).
         [Throws=ScpError]
         bytes derive_pseudonym(string key_id, bytes context_id);
 

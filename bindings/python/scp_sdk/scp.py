@@ -101,11 +101,46 @@ class KeyCustodyProvider(Protocol):
         ...
 
     def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
-        """Derive a context-scoped pseudonym keypair.
+        """Derive a context-scoped pseudonym keypair (v1, static).
 
         Returns ``public_key_bytes (32) || key_id_utf8`` — the 32-byte
         pseudonym public key concatenated with the UTF-8 numeric id of the
         derived signing key.
+
+        Canonical recipe (all custody backends MUST produce identical bytes)::
+
+            pseudonym_secret = HKDF-SHA256(
+                ikm=ed25519_private_seed, salt=b"scp-pseudonym-secret-v1",
+                info=b"", length=32)
+            seed = HMAC-SHA256(pseudonym_secret, context_id + b"scp-pseudonym")
+            pseudonym_keypair = Ed25519_keygen(seed[:32])
+        """
+        ...
+
+    def derive_rotatable_pseudonym(
+        self, key_id: str, context_id: bytes, pseudonym_epoch: int
+    ) -> bytes:
+        """Derive a rotatable, epoch-scoped pseudonym keypair (v2).
+
+        Returns the same ``public_key_bytes (32) || key_id_utf8`` shape as
+        :meth:`derive_pseudonym`. Including the rotation epoch in the HMAC
+        derivation produces a different pseudonym per epoch within the same
+        context, mitigating relay-side pseudonym correlation.
+
+        Canonical recipe (all custody backends MUST produce identical bytes)::
+
+            pseudonym_secret = HKDF-SHA256(
+                ikm=ed25519_private_seed, salt=b"scp-pseudonym-secret-v1",
+                info=b"", length=32)
+            seed = HMAC-SHA256(
+                pseudonym_secret,
+                context_id + pseudonym_epoch.to_bytes(8, "big")
+                + b"scp-pseudonym-v2")
+            pseudonym_keypair = Ed25519_keygen(seed[:32])
+
+        The ``"scp-pseudonym-v2"`` domain separator differs from the v1
+        ``"scp-pseudonym"`` so epoch 0 produces a distinct pseudonym from the
+        static v1 derivation.
         """
         ...
 

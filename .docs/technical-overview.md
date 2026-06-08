@@ -411,7 +411,7 @@ context_keypair = Ed25519_keygen(context_seed[0..32])
 context_pseudonym = context_keypair.public_key
 ```
 
-Same identity + same context = same pseudonym. Different context = different pseudonym. Relays cannot correlate activity across contexts. The HMAC computation happens inside the HSM custody boundary.
+Same identity + same context = same pseudonym. Different context = different pseudonym. Relays cannot correlate activity across contexts. The HMAC computation happens inside the HSM custody boundary. See spec §9.10.4.A for the full derivation and privacy model (the HMAC key is a private-derived pseudonym_secret, never the public key).
 
 Additional protections:
 - **Bucket padding** — 256B/1KB/4KB/16KB/64KB/256KB buckets prevent message size analysis

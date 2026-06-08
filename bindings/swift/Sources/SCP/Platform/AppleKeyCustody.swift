@@ -751,7 +751,7 @@ public extension AppleKeyCustody {
 
     /// Derives a deterministic, context-scoped Ed25519 pseudonym keypair.
     ///
-    /// ## Algorithm (ADR-006, spec section 9.10.4A):
+    /// ## Algorithm (ADR-006, spec section 9.10.4.A):
     /// 1. Retrieve the Ed25519 private key bytes for `keyHandle` from Keychain.
     /// 2. Derive `pseudonym_secret = HKDF-SHA256(ikm: private_key_bytes,
     ///    salt: "scp-pseudonym-secret-v1", info: "", len: 32)`.
@@ -760,7 +760,7 @@ public extension AppleKeyCustody {
     /// 5. Store the derived private key in Keychain under a deterministic handle.
     /// 6. Return a ``PseudonymResult`` with the 32-byte public key and the handle.
     ///
-    /// **CRITICAL:** Using public key bytes as the HMAC key (pre-#1494) would
+    /// **CRITICAL:** Using public key bytes as the HMAC key would
     /// be a membership enumeration oracle — anyone who knows a member's public
     /// key could compute their pseudonym for any context ID and check relay
     /// subscriptions. The `pseudonym_secret` is derived from private key bytes
@@ -783,7 +783,7 @@ public extension AppleKeyCustody {
     ///   ``PlatformError/custodyError(_:)`` for HMAC or keygen failures.
     ///
     /// See ADR-025 Key custody, ADR-006 `derive_pseudonym`, spec section
-    /// 9.10.4A, and `InMemoryKeyCustody.derive_pseudonym` in
+    /// 9.10.4.A, and `InMemoryKeyCustody.derive_pseudonym` in
     /// `scp-platform/src/testing/key_custody.rs` for the canonical Rust
     /// reference implementation.
     @concurrent
@@ -803,7 +803,7 @@ public extension AppleKeyCustody {
 
         do {
             // Derive pseudonym_secret from private key via HKDF-SHA256 (spec
-            // section 9.10.4A). This prevents membership enumeration attacks:
+            // section 9.10.4.A). This prevents membership enumeration attacks:
             // only the key holder can compute pseudonyms.
             let pseudonymSecret = HKDF<SHA256>.deriveKey(
                 inputKeyMaterial: SymmetricKey(data: privateKeyBytes),
@@ -843,6 +843,125 @@ public extension AppleKeyCustody {
         } catch {
             throw PlatformError.custodyError(
                 "Ed25519 pseudonym key derivation failed: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    // MARK: deriveRotatablePseudonym
+
+    /// Derives a deterministic, context-scoped, epoch-rotatable Ed25519
+    /// pseudonym keypair.
+    ///
+    /// This is the v2 (rotatable) counterpart to ``derivePseudonym(_:contextId:)``.
+    /// It binds an additional 64-bit `pseudonymEpoch` into the derivation so a
+    /// member can rotate their context pseudonym (e.g. on a re-key event)
+    /// without changing their identity key.
+    ///
+    /// ## Algorithm (spec §9.10.4.1):
+    /// 1. Retrieve the Ed25519 private key bytes for `keyHandle` from Keychain.
+    /// 2. Derive `pseudonym_secret = HKDF-SHA256(ikm: private_key_bytes,
+    ///    salt: "scp-pseudonym-secret-v1", info: "", len: 32)` — identical to
+    ///    the v1 secret, so a single identity key feeds both derivations.
+    /// 3. Compute `seed = HMAC-SHA256(pseudonym_secret,
+    ///    contextId || BE64(pseudonymEpoch) || "scp-pseudonym-v2")`. The epoch is
+    ///    serialized as 8 big-endian bytes and the `"-v2"` domain separator keeps
+    ///    v2 outputs disjoint from v1 (`"scp-pseudonym"`).
+    /// 4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
+    /// 5. Store the derived private key in Keychain under a deterministic handle
+    ///    that also binds the epoch + `"v2"`, so it occupies a distinct slot from
+    ///    the v1 handle and from other epochs.
+    /// 6. Return a ``PseudonymResult`` with the 32-byte public key and the handle.
+    ///
+    /// **CRITICAL:** As in v1, the HMAC key is the private-derived
+    /// `pseudonym_secret`, never the public key — public-key keying would be a
+    /// membership-enumeration oracle. The `pseudonym_secret` is unknowable
+    /// without the identity private key.
+    ///
+    /// The derivation is deterministic: the same `keyHandle` + `contextId` +
+    /// `pseudonymEpoch` triple always produces the same pseudonym public key.
+    ///
+    /// - Parameters:
+    ///   - keyHandle: The UUID handle for the **identity** Ed25519 key (source
+    ///     key material for the derivation).
+    ///   - contextId: The raw context ID bytes used as the first HMAC message
+    ///     segment.
+    ///   - pseudonymEpoch: The rotation epoch, serialized as 8 big-endian bytes.
+    /// - Returns: A ``PseudonymResult`` containing the 32-byte pseudonym public
+    ///   key and an opaque handle to the derived signing key in Keychain.
+    /// - Throws: ``PlatformError/wrongKeyType(_:)`` if `keyHandle` is X25519,
+    ///   ``PlatformError/keyNotFound(_:)`` if the handle is unknown,
+    ///   ``PlatformError/biometricAuthenticationFailed(_:)`` if biometric
+    ///   gating is active and authentication fails,
+    ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
+    ///   ``PlatformError/custodyError(_:)`` for HMAC or keygen failures.
+    ///
+    /// See ADR-025 Key custody, spec §9.10.4.1, and
+    /// `derive_pseudonym_keypair` in `scp-platform/src/pseudonym.rs` for the
+    /// canonical Rust reference implementation.
+    @concurrent
+    func deriveRotatablePseudonym(
+        _ keyHandle: String,
+        contextId: Data,
+        pseudonymEpoch: UInt64
+    ) async throws -> PseudonymResult {
+        let storedType = try fetchKeyType(for: keyHandle)
+        guard storedType == .ed25519 else {
+            throw PlatformError.wrongKeyType(
+                "deriveRotatablePseudonym requires an Ed25519 key; handle '\(keyHandle)' is X25519"
+            )
+        }
+
+        var privateKeyBytes = try fetchPrivateKeyBytes(for: keyHandle)
+        defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
+
+        // Epoch serialized as 8 big-endian bytes (matches Rust `u64::to_be_bytes`).
+        let epochBytes = withUnsafeBytes(of: pseudonymEpoch.bigEndian) { Data($0) }
+
+        do {
+            // Derive pseudonym_secret from private key via HKDF-SHA256 (identical
+            // to the v1 secret). This prevents membership enumeration attacks:
+            // only the key holder can compute pseudonyms.
+            let pseudonymSecret = HKDF<SHA256>.deriveKey(
+                inputKeyMaterial: SymmetricKey(data: privateKeyBytes),
+                salt: Data("scp-pseudonym-secret-v1".utf8),
+                info: Data(),
+                outputByteCount: 32
+            )
+
+            // HMAC-SHA256(pseudonym_secret, contextId || BE64(epoch) || "scp-pseudonym-v2")
+            var hmac = HMAC<SHA256>(key: pseudonymSecret)
+            hmac.update(data: contextId)
+            hmac.update(data: epochBytes)
+            hmac.update(data: Data("scp-pseudonym-v2".utf8))
+            let seed = Data(hmac.finalize())
+
+            // Derive Ed25519 keypair from the 32-byte HMAC-SHA256 output.
+            let pseudonymKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed.prefix(32))
+            let pseudonymPublicKey = pseudonymKey.publicKey.rawRepresentation
+
+            // Deterministic handle bound to epoch + "v2" so it occupies a distinct
+            // Keychain slot from the v1 handle and from other epochs:
+            // HMAC-SHA256(key_handle_utf8, contextId || BE64(epoch) || "scp-pseudonym-handle-v2")
+            let handleHmacKey = SymmetricKey(data: Data(keyHandle.utf8))
+            var handleHmac = HMAC<SHA256>(key: handleHmacKey)
+            handleHmac.update(data: contextId)
+            handleHmac.update(data: epochBytes)
+            handleHmac.update(data: Data("scp-pseudonym-handle-v2".utf8))
+            let pseudonymHandle = Data(handleHmac.finalize()).map { String(format: "%02x", $0) }.joined()
+
+            try storePrivateKeyBytes(
+                pseudonymKey.rawRepresentation,
+                for: pseudonymHandle,
+                keyType: .ed25519,
+                publicKeyBytes: pseudonymPublicKey
+            )
+
+            return PseudonymResult(publicKey: pseudonymPublicKey, handle: pseudonymHandle)
+        } catch let platformErr as PlatformError {
+            throw platformErr
+        } catch {
+            throw PlatformError.custodyError(
+                "Ed25519 rotatable pseudonym key derivation failed: \(error.localizedDescription)"
             )
         }
     }

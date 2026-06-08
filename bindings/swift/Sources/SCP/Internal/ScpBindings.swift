@@ -12066,17 +12066,58 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     /**
      * Derive a deterministic, context-scoped Ed25519 pseudonym keypair.
      *
-     * Algorithm (all implementations MUST produce identical output):
-     * 1. `seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")`
-     * 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+     * The actual derivation runs inside the injected platform `KeyCustody`
+     * callback (Swift Keychain/Secure Enclave, Kotlin Keystore). Algorithm:
+     * 1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+     * 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // seed is an RFC-8032 Ed25519 seed
      *
-     * ADR-027 amendment: use public key bytes as HMAC key for cross-platform
-     * determinism with hardware TEE keys.
+     * The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key —
+     * public key bytes would be a membership-enumeration oracle (§9.10.4.A).
+     * For software custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+     * salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic
+     * (§25.19 vectors). For hardware custody (Secure Enclave, Keystore TEE) the
+     * private key is non-exportable, so `pseudonym_secret` is a device-local value
+     * computed inside the secure boundary, and those pseudonyms are device-local
+     * by design.
      *
-     * Returns a two-element list: `[public_key_bytes (32), key_id (string as UTF-8)]`.
+     * Returns a two-element list: `[pseudonym_public_key_bytes (32), key_id (string as UTF-8)]`.
      * The bridge unpacks this into a `PseudonymKeypair`.
      */
     func derivePseudonym(keyId: String, contextId: Data) async throws  -> Data
+    
+    /**
+     * Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
+     *
+     * Canonical recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
+     * private-derived `pseudonym_secret` (HKDF over the Ed25519 private seed),
+     * NEVER the public key.
+     * `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
+     * `keypair = Ed25519_keygen(seed[0..32])` (RFC-8032 seed). Returns
+     * `[pseudonym_public_key_bytes (32) || key_id_utf8]`.
+     *
+     * The `pseudonym_epoch` is passed through to the provider so it performs
+     * the canonical v2 derivation itself. Bridges MUST NOT synthesize a
+     * `context_id || BE64(epoch) || "scp-pseudonym-v2"` preimage and feed it to
+     * the v1 `derive_pseudonym` — that double-appends the v1 domain separator
+     * (`"scp-pseudonym"`) and diverges from the Rust reference.
+     *
+     * # Default
+     *
+     * Rust-side providers that do not rotate return `ScpError::Context`
+     * (SCP-CTX-2050) indicating the method is not implemented. Platform SDK
+     * adapters (Swift `AppleKeyCustody`, Kotlin `AndroidKeyCustody`) override
+     * this with real implementations.
+     *
+     * **Note:** `UniFFI` callback interfaces require foreign implementations to
+     * define all methods. The generated Swift protocol / Kotlin interface will
+     * include this method. The default here applies only to Rust-side callers.
+     *
+     * # Errors
+     *
+     * Returns `ScpError` if the key is not found, is not an Ed25519 key, or the
+     * provider does not support rotatable pseudonyms.
+     */
+    func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> Data
     
     /**
      * Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
@@ -12355,6 +12396,53 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 return try await uniffiObj.derivePseudonym(
                      keyId: try FfiConverterString.lift(keyId),
                      contextId: try FfiConverterData.lift(contextId)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Data) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: FfiConverterData.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeScpError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
+        deriveRotatablePseudonym: { (
+            uniffiHandle: UInt64,
+            keyId: RustBuffer,
+            contextId: RustBuffer,
+            pseudonymEpoch: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> Data in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.deriveRotatablePseudonym(
+                     keyId: try FfiConverterString.lift(keyId),
+                     contextId: try FfiConverterData.lift(contextId),
+                     pseudonymEpoch: try FfiConverterUInt64.lift(pseudonymEpoch)
                 )
             }
 
@@ -15409,13 +15497,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 52565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 45052) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 38646) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 26569) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 25367) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 59116) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 55617) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_messagelistener_on_message() != 11557) {

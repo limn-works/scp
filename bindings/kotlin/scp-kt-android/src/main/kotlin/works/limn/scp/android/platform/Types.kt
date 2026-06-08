@@ -268,9 +268,16 @@ interface KeyCustodyProvider {
     /**
      * Derive a deterministic, context-scoped pseudonym keypair.
      *
-     * Algorithm (all implementations MUST produce identical output):
-     *   1. `seed = HMAC-SHA256(identity_key_material, contextId || "scp-pseudonym")`
-     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+     * Algorithm (spec §9.10.4.A). The HMAC key is a private-derived
+     * `pseudonym_secret`, NEVER the public key (public-key keying would be a
+     * membership-enumeration oracle):
+     *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`
+     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
+     *
+     * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+     * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Hardware
+     * custody: a device-local secret inside the secure boundary — device-local
+     * by design (not identical across devices).
      *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.
@@ -279,6 +286,38 @@ interface KeyCustodyProvider {
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
      */
     fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle
+
+    /**
+     * Derive a deterministic, context-scoped, epoch-rotatable pseudonym keypair.
+     *
+     * Identical to [derivePseudonym] except the per-epoch domain separator and the
+     * big-endian epoch counter are mixed into the HMAC body, so each epoch yields an
+     * independent, unlinkable pseudonym for the same identity and context (spec
+     * §9.10.4.A). The HMAC key is the private-derived `pseudonym_secret`, NEVER the
+     * public key (public-key keying would be a membership-enumeration oracle):
+     *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || BE64(epoch) || "scp-pseudonym-v2")`
+     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
+     *
+     * The `"scp-pseudonym-v2"` domain separator differs from v1's `"scp-pseudonym"`,
+     * so v2 at any epoch never collides with the v1 [derivePseudonym] output.
+     *
+     * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
+     * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Hardware
+     * custody: a device-local secret inside the secure boundary — device-local
+     * by design (not identical across devices).
+     *
+     * @param keyHandle Handle to the identity Ed25519 key.
+     * @param contextId Raw context ID bytes.
+     * @param pseudonymEpoch Rotation epoch counter, mixed in as a big-endian u64.
+     * @return A [PseudonymKeyHandle] to the derived signing key.
+     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
+     */
+    fun deriveRotatablePseudonym(
+        keyHandle: KeyHandle,
+        contextId: ByteArray,
+        pseudonymEpoch: Long,
+    ): PseudonymKeyHandle
 
     /**
      * Export the raw Ed25519 private key bytes (32 bytes) for a key handle.

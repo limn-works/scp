@@ -941,13 +941,15 @@ context_keypair = Ed25519_keygen(context_seed[0..32])
 context_pseudonym = context_keypair.public_key
 ```
 
+Here `identity_key_material` is the 32-byte `pseudonym_secret` (NOT the public key) defined in §9.10.4.A — a value that is not publicly derivable. `Ed25519_keygen(context_seed[0..32])` interprets the 32 bytes as an **RFC-8032 Ed25519 seed**: the keygen applies the standard expansion (SHA-512 of the seed, then clamp the lower 32 bytes to form the scalar) internally. Implementations MUST NOT treat `context_seed` as an already-clamped scalar. This single interpretation is what makes software pseudonyms agree byte-for-byte across platforms (see §25.19 for known-answer vectors).
+
 - **Per-DID, not per-VM.** The pseudonym is derived from `identity_key_material` (the DID's `#0` key), so human and agent share one pseudonym per context regardless of which signing key (`#active` or `#agent`) is used for individual messages (ADR-039). This prevents pseudonym divergence from leaking the human/agent distinction to relays.
 - **Deterministic:** Same identity + same context = same pseudonym.
 - **Unlinkable across contexts:** Different context_id = different pseudonym. Relays cannot correlate activity across contexts.
 - **Verification:** Sender includes full DID inside MLS-encrypted payload. Group members verify pseudonym-to-DID mapping on first encounter and cache the association.
 - **No ZK proofs** — unnecessary complexity since only group members need to verify the mapping.
 - The SDK handles derivation, caching, and verification transparently.
-- **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HMAC internally using an associated symmetric key derived during `generate_keypair`. For software keys, the HMAC uses a symmetric pseudonym secret derived during key generation (see below). All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
+- **Custody compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves it. For software keys, the HMAC key is the `pseudonym_secret` derived deterministically from the private seed via HKDF (see §9.10.4.A). For hardware-backed keys (Secure Enclave, Android Keystore TEE, HSM), the `pseudonym_secret` is a device-local value held inside the hardware boundary. **Output equivalence is therefore custody-dependent:** software custody produces identical output for the same identity seed and `context_id` across all platforms (cross-platform deterministic); hardware custody produces a device-local pseudonym that is intentionally not identical across devices, because the underlying key is non-exportable by design (see §9.10.4.A). See §9.10.4.A for the authoritative pseudonym derivation specification (ADR-002 criterion 1 as a secondary cross-reference).
 
 #### 9.10.4.A Pseudonym Derivation Privacy Model
 
@@ -957,7 +959,7 @@ context_pseudonym = context_keypair.public_key
 
 ```
 pseudonym_secret = HKDF-SHA256(
-  ikm  = ed25519_private_key_bytes,
+  ikm  = ed25519_private_seed,  // the 32-byte RFC-8032 seed
   salt = "scp-pseudonym-secret-v1",
   info = "",
   len  = 32
@@ -966,15 +968,9 @@ pseudonym_secret = HKDF-SHA256(
 
 For **software custody**, the pseudonym secret is derived from the Ed25519 private key bytes during key generation and cached in the `KeyCustody` store. The private key bytes are the only input — the public key is never used.
 
-For **hardware custody** (Secure Enclave, Android Keystore, HSM), where private key bytes cannot be exported, the pseudonym secret is generated as a separate 32-byte random value during `generate_keypair` and stored as an associated symmetric key within the hardware boundary. The hardware computes the HMAC internally using this associated key.
+For **hardware custody** (Secure Enclave, Android Keystore TEE, HSM), where private key bytes cannot be exported, the `pseudonym_secret` is a **device-local** value computed inside the hardware boundary. It is derived from the non-exportable identity key in a way the hardware can reproduce deterministically on that device — for example `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` (Android Keystore), or an associated 32-byte symmetric key generated during `generate_keypair` and stored within the secure boundary (HSM). The hardware computes the HMAC internally using this device-local secret.
 
-**Cross-platform determinism:** Software implementations derive the pseudonym secret deterministically from the private key, ensuring identical pseudonyms across platforms for the same identity. Hardware implementations use a stored random value — since hardware keys cannot be exported and re-imported, cross-platform identity migration uses the social/device recovery protocol (§3.3), which provisions a new pseudonym secret at the destination.
-
-**Migration from public-key-based derivation:** SDKs that previously used public key bytes MUST re-derive pseudonyms using the pseudonym secret on upgrade. The SDK:
-1. Derives the pseudonym secret from the private key (software) or generates one (hardware).
-2. Subscribes to both old and new routing IDs for a grace period (2x blob TTL).
-3. Announces the new pseudonym to group members via an MLS application message (same mechanism as §9.10.4.1 pseudonym rotation).
-4. After the grace period, unsubscribes from the old routing ID.
+**Stance — software is cross-platform deterministic; hardware is device-local by design:** Software custody derives the `pseudonym_secret` deterministically from the private seed, so the same identity seed and `context_id` produce identical pseudonyms on every platform (Rust, Swift, Kotlin, TypeScript). This is a designed property and is pinned by known-answer vectors (§25.19). Hardware custody is **device-local by design**: the identity key never leaves the device, so its `pseudonym_secret` — and therefore its per-context pseudonyms — are bound to that device and are intentionally NOT identical across devices. Cross-device pseudonym identity is not a requirement of the protocol; a participant who moves to a new device uses the social/device recovery protocol (§3.3), which provisions a fresh identity (and thus a fresh device-local `pseudonym_secret`) at the destination. This is not a limitation worked around — it is the direct consequence of hardware keys being non-exportable, which is the security property hardware custody exists to provide.
 
 - **Pre-join context inspection.** Prospective members who know a `context_id` but have not joined the context can retrieve its publicly visible parameters (capability ceiling, governance model, roles, TTL, memory scope — see §5.7) from relays without joining. The relay indexes context metadata under a keyed identifier (see §9.10.4.B below) that does not reveal member identities or message content. It enables the "legibility before opt-in" tenet: any agent evaluating whether to join a context can inspect its parameters by querying the metadata routing ID on the context's relays.
 
@@ -998,7 +994,7 @@ The `context_metadata_key` is a 32-byte symmetric key distributed as follows:
 - **In contexts with discovery tools:** Public or discoverable contexts publish their `context_metadata_key` in their context entry. This preserves the "legibility before opt-in" property for contexts that want to be found, while keeping non-discoverable contexts invisible to probing.
 - **Rotation:** The `context_metadata_key` MAY be rotated via a governance action. On rotation, the context re-publishes metadata under the new routing ID and maintains the old routing ID for a grace period (2x blob TTL).
 
-**Backward compatibility:** Contexts created before this change use the legacy `SHA-256(context_id || "scp-metadata")` derivation. SDKs MUST support both derivation schemes during the migration period. New contexts MUST use the keyed derivation.
+**Derivation rule:** Contexts use the keyed `HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")` derivation. The unkeyed `SHA-256(context_id || "scp-metadata")` form is NOT used — it is publicly derivable and would reintroduce the enumeration oracle described above.
 
 #### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)
 
@@ -1014,8 +1010,8 @@ where `epoch_BE` is a 64-bit big-endian pseudonym rotation epoch (distinct from 
 - **Domain separation:** The v2 domain separator `"scp-pseudonym-v2"` differs from v1's `"scp-pseudonym"`, so v2 epoch 0 produces a different pseudonym than v1. This prevents accidental domain confusion.
 - **Rotation trigger:** Context governance policy determines rotation frequency (e.g., daily, weekly, on membership change). The SDK manages rotation timing.
 - **Transition protocol:** During rotation, the client subscribes to BOTH the old and new `routing_id` for a grace period (recommended: 2x the context's blob TTL) to avoid missing messages from peers who have not yet learned the new pseudonym. The sender announces the new `routing_id` to group members via an MLS application message containing `{ pseudonym_epoch: N, routing_id: <new_routing_id> }`.
-- **Backward compatibility:** Contexts that do not opt into rotation continue using v1 derivation with static pseudonyms. The existing mitigations (cover traffic, padding, relay partitioning) provide substantial protection for these contexts.
-- **HSM compatibility:** Same as v1 — `KeyCustody::derive_rotatable_pseudonym(identity_key_handle, context_id, pseudonym_epoch)` delegates the HMAC to the custody boundary.
+- **Rotation is opt-in:** Contexts that do not opt into rotation use v1 derivation with static pseudonyms. The existing mitigations (cover traffic, padding, relay partitioning) provide substantial protection for these contexts. This is a per-context configuration choice, not a compatibility shim.
+- **Custody compatibility:** Same as v1 — `KeyCustody::derive_rotatable_pseudonym(identity_key_handle, context_id, pseudonym_epoch)` delegates the HMAC to the custody boundary, so software custody is cross-platform deterministic and hardware custody is device-local (§9.10.4.A).
 
 ### 9.10.5 Connection Privacy
 

@@ -13,6 +13,8 @@
 package works.limn.scp.android.platform
 
 import android.content.SharedPreferences
+import org.bouncycastle.crypto.AsymmetricCipherKeyPair
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.junit.jupiter.api.Assertions.assertArrayEquals
@@ -771,5 +773,92 @@ class AndroidKeyCustodyTest {
             assertTrue(prefs.contains(identityPrefsKey))
             assertTrue(!prefs.contains(pseudonymPrefsKey))
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Known-answer tests for pseudonym derivation (spec §25.19)
+    //
+    // Pins the software-custody Ed25519 pseudonym public key bytes for fixed
+    // identity seeds and context "context-alpha", proving the Kotlin adapter
+    // matches the cross-platform recipe shared with the Rust core and the other
+    // SDK bindings:
+    //   pseudonym_secret = HKDF-SHA256(seed, salt="scp-pseudonym-secret-v1")
+    //   v1 seed          = HMAC-SHA256(secret, ctx || "scp-pseudonym")
+    //   v2 seed          = HMAC-SHA256(secret, ctx || BE64(epoch) || "scp-pseudonym-v2")
+    //   pseudonym_pubkey = Ed25519_keygen(seed[0..32]).public_key
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class PseudonymKnownAnswerVectors {
+
+        @Test
+        fun `vector 30 static and rotatable pseudonyms match spec bytes`() {
+            assertVectorMatches(
+                seed = ByteArray(32) { 0x01 },
+                expectedV1 = "fddc04882a48aa39888f6dbec622f9c5aa6f06b2e40820a69a2e0e89b5f09ac2",
+                expectedV2Epoch1 = "43e50a947c4b2be44f871e309c7edc64afaf4207b9a589c9b01f61c01158090f",
+            )
+        }
+
+        @Test
+        fun `vector 31 static and rotatable pseudonyms match spec bytes`() {
+            // seed = 0x9d, then 0x01, 0x02, ... 0x1f (31 ascending bytes after the lead).
+            val seed = ByteArray(32) { i -> if (i == 0) 0x9d.toByte() else i.toByte() }
+            assertVectorMatches(
+                seed = seed,
+                expectedV1 = "ff6e2e909a008318f97bb2c26c1d787ceb9aa2996f746766335e10ba7e2213cc",
+                expectedV2Epoch1 = "edd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639",
+            )
+        }
+
+        /**
+         * Injects a fixed identity seed, then asserts that v1 [derivePseudonym] and v2
+         * [AndroidKeyCustody.deriveRotatablePseudonym] (epoch 1) over context "context-alpha"
+         * produce the spec-pinned public key bytes, and that v1 and v2 are distinct.
+         */
+        private fun assertVectorMatches(
+            seed: ByteArray,
+            expectedV1: String,
+            expectedV2Epoch1: String,
+        ) {
+            val identityHandle = injectSoftwareEd25519(seed)
+            val contextAlpha = "context-alpha".toByteArray(Charsets.UTF_8)
+
+            val v1Pseudonym = custody.derivePseudonym(identityHandle, contextAlpha)
+            val v1Hex = pseudonymPublicKeyHex(v1Pseudonym)
+            assertEquals(expectedV1, v1Hex)
+
+            val v2Pseudonym = custody.deriveRotatablePseudonym(identityHandle, contextAlpha, 1L)
+            val v2Hex = pseudonymPublicKeyHex(v2Pseudonym)
+            assertEquals(expectedV2Epoch1, v2Hex)
+
+            assertNotEquals(v1Hex, v2Hex)
+        }
+
+        /**
+         * Inserts a deterministic software Ed25519 identity key built from [seed] directly
+         * into the custody's internal software-key maps, returning a [KeyHandle] for it.
+         *
+         * Bypasses [AndroidKeyCustody.generateKeypair] (which uses a random seed) so the KAT
+         * can pin a known identity seed (§25.19 vectors). Software path only — JVM unit tests
+         * cannot reach the Android Keystore hardware path.
+         */
+        private fun injectSoftwareEd25519(seed: ByteArray): KeyHandle {
+            val privateParams = Ed25519PrivateKeyParameters(seed, 0)
+            val publicParams = privateParams.generatePublicKey()
+            val keyId = "kat-${seed.toHexString().take(8)}"
+            custody.softwareKeys[keyId] = AsymmetricCipherKeyPair(publicParams, privateParams)
+            custody.softwareKeyTypes[keyId] = KeyType.ED25519
+            return KeyHandle(id = keyId, custodyType = CustodyType.SOFTWARE)
+        }
+
+        /** Resolves a derived pseudonym handle to its lowercase-hex public key bytes. */
+        private fun pseudonymPublicKeyHex(pseudonym: PseudonymKeyHandle): String =
+            custody.publicKey(
+                KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType),
+            ).toHexString()
+
+        private fun ByteArray.toHexString(): String =
+            joinToString("") { byte -> "%02x".format(byte) }
     }
 }
