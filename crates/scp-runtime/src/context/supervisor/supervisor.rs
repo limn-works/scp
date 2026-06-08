@@ -68,7 +68,7 @@ use zeroize::Zeroizing;
 /// the supervisor (ADR-049 commit 12), and spawned background
 /// tasks all hold equivalent clones of the same `DashMap`. The
 /// per-entry `Arc<Mutex<PerContextState>>` is the contract the manager
-/// exposes via `ContextManager::contexts_arc`; the alias is
+/// exposes via `Supervisor::contexts_ref`; the alias is
 /// introduced here so the supervisor-side accessor can return a
 /// readable type (avoids `clippy::type_complexity` on the nested
 /// generics).
@@ -540,7 +540,7 @@ impl Supervisor {
     // leaves them empty (used by saga + spawn unit tests that don't
     // touch providers).
     //
-    // Direct-state accessors (`contexts_ref`, `contexts_arc`,
+    // Direct-state accessors (`contexts_ref`,
     // `local_dids_ref`, `standing_contexts_ref`)
     // return non-Option references — the underlying fields are eagerly
     // initialized in [`Self::new`] and always populated.
@@ -649,13 +649,6 @@ impl Supervisor {
     #[must_use]
     pub(crate) const fn contexts_ref(&self) -> &Arc<ContextsMap> {
         &self.contexts
-    }
-
-    /// Returns a freshly-cloned `Arc` to the per-context state map for
-    /// callers that need to move the `Arc` into a spawned task.
-    #[must_use]
-    pub(crate) fn contexts_arc(&self) -> Arc<ContextsMap> {
-        Arc::clone(&self.contexts)
     }
 
     /// Cheap reference to the supervisor's local-DID registry.
@@ -1762,25 +1755,125 @@ impl Supervisor {
         }
     }
 
+    /// Actor-native cross-context recovery-notification fan-out
+    /// (spec §9.12 step 5 — target context not yet known).
+    ///
+    /// Finds a context where both the recovering DID and the contact DID
+    /// are members, then dispatches a `RecoverySendNotification`
+    /// (sequence 4 — contact notification) through that context's actor
+    /// mailbox. The shared-context lookup is a lock-free fan-out over the
+    /// actor registry: [`Self::actor_ids`] yields a snapshot of every
+    /// registered context id and [`Self::is_member`] reads each
+    /// membership predicate through the per-context actor mailbox. No
+    /// `contexts` DashMap access and no `Mutex<PerContextState>` lock —
+    /// the actor that owns each context is the sole authority for its
+    /// membership.
+    ///
+    /// This is the supervisor-direct twin of
+    /// [`SupervisorHandle::find_shared_context`](crate::context::supervisor::handle::SupervisorHandle::find_shared_context)
+    /// +
+    /// [`SupervisorHandle::dispatch_recovery_send_notification`](crate::context::supervisor::handle::SupervisorHandle::dispatch_recovery_send_notification):
+    /// the handle pair serves the actor-shape helper
+    /// [`crate::context::trust_recovery_helpers::recovery_notify_contact`]
+    /// (called from a context actor's `run()` loop via the
+    /// capability-reduced `deps.supervisor`), whereas this method serves
+    /// `dispatch_trust_recovery_direct`'s `RecoveryNotifyContact` arm,
+    /// which holds `&Supervisor` directly (the cross-context variant
+    /// carries no `context_id`, so it always routes supervisor-direct).
+    /// Both paths share identical semantics.
+    ///
+    /// # Ordering
+    ///
+    /// `actor_ids()` rebuilds its snapshot per call, so the iteration
+    /// order is the registry's shard order — unspecified but stable for
+    /// the duration of a single call. "First shared context" carries the
+    /// same order-unspecified semantics the legacy DashMap fan-out had.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::TransportFailed`] if no context is shared
+    ///   between the recovering DID and the contact DID.
+    /// - Any [`ContextError`] surfaced through the dispatched
+    ///   [`Self::dispatch_trust_recovery_command`] call or the per-actor
+    ///   reply oneshot (e.g. [`ContextError::NotInitialized`] if no
+    ///   providers attached, or a closed reply channel surfacing as
+    ///   [`ContextError::TransportFailed`]).
+    async fn recovery_notify_contact(
+        &self,
+        recovering_did: &str,
+        contact_did: &str,
+        payload: &[u8],
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::{
+            RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
+        };
+
+        // Lock-free actor-registry fan-out: the first context where BOTH
+        // members are present wins. No DashMap, no PerContextState lock.
+        let mut shared_context_id = None;
+        for context_id in self.actor_ids() {
+            if self.is_member(&context_id, recovering_did).await
+                && self.is_member(&context_id, contact_did).await
+            {
+                shared_context_id = Some(context_id);
+                break;
+            }
+        }
+
+        match shared_context_id {
+            Some(context_id) => {
+                // Contact notifications use sequence=4 (step 5 in recovery).
+                let send_payload = RecoverySendNotificationPayload {
+                    context_id,
+                    sender_did: recovering_did.to_owned(),
+                    payload: payload.to_vec(),
+                    sequence: 4,
+                    signing_key: SigningKeyBytes::from_signing_key(signing_key),
+                };
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let cmd = TrustRecoveryCommand::RecoverySendNotification {
+                    payload: Box::new(send_payload),
+                    reply: reply_tx,
+                };
+                self.dispatch_trust_recovery_command(cmd).await?;
+                reply_rx.await.map_err(|_| {
+                    ContextError::TransportFailed(
+                        "recovery_notify_contact: oneshot reply channel closed".to_owned(),
+                    )
+                })?
+            }
+            None => Err(ContextError::TransportFailed(format!(
+                "no shared context found between {recovering_did} and {contact_did}"
+            ))),
+        }
+    }
+
     /// Direct supervisor-scoped dispatch for [`TrustRecoveryCommand`]
     /// variants that have no per-context actor target (`Placeholder`,
-    /// `RecoveryNotifyContact`) or whose actor is not yet spawned
+    /// `RecoveryNotifyContact`) or whose actor is not registered
     /// (`CreateGovernanceCheckpoint` / `AddCheckpointCosignature` /
-    /// `RecoveryAdvanceEpoch` / `RecoverySendNotification` fallback).
+    /// `RecoveryAdvanceEpoch` / `RecoverySendNotification` —
+    /// unregistered-context fallback).
     ///
-    /// Mirrors the standing/queries/lifecycle direct precedents: each
-    /// arm wraps the supervisor-scoped body in a 30s timeout matching
-    /// the actor-handler shape (plan §"Transport timeouts inside actor
-    /// handlers") and relays the typed reply on the variant's oneshot.
-    /// `RecoveryNotifyContact` is intrinsically cross-context — it
-    /// scans the supervisor's per-context `Mutex<PerContextState>`
-    /// map to find a shared context and then dispatches a
-    /// `RecoverySendNotification` through this supervisor; the thin-
-    /// wrapper around `recovery_notify_contact_legacy` preserves that
-    /// fan-out semantics verbatim.
+    /// Mirrors the standing/queries/lifecycle direct precedents.
+    /// `RecoveryNotifyContact` is intrinsically cross-context (it carries
+    /// no `context_id`, so it always reaches this path): its arm wraps
+    /// the actor-native [`Self::recovery_notify_contact`] fan-out in a
+    /// 30s timeout matching the actor-handler shape (plan §"Transport
+    /// timeouts inside actor handlers") and relays the typed reply on the
+    /// variant's oneshot.
+    ///
+    /// The per-context variants reach this path only for a context with
+    /// no registered actor. Post-Step-B every valid context has an actor
+    /// and these variants are mailbox-dispatched to the per-context
+    /// actor-shape handlers; the supervisor-direct arm is therefore
+    /// reached ONLY for an unregistered context, which is by definition
+    /// not registered — it surfaces a typed
+    /// [`ContextError::ContextNotRegistered`] on the reply oneshot
+    /// (mirrors the gutted `dispatch_lifecycle_direct` per-context arms).
     #[allow(clippy::too_many_lines)] // flat match over every trust-recovery variant
     async fn dispatch_trust_recovery_direct(&self, cmd: TrustRecoveryCommand) -> Outcome<()> {
-        use crate::context::trust_recovery_helpers_legacy as helpers;
         const TRUST_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
@@ -1793,16 +1886,12 @@ impl Supervisor {
             TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
                 let recovering_did = payload.recovering_did.clone();
                 let signing_key = payload.signing_key.to_signing_key();
-                let notify_fut = async {
-                    helpers::recovery_notify_contact_legacy(
-                        self,
-                        &payload.recovering_did,
-                        &payload.contact_did,
-                        &payload.payload,
-                        &signing_key,
-                    )
-                    .await
-                };
+                let notify_fut = self.recovery_notify_contact(
+                    &payload.recovering_did,
+                    &payload.contact_did,
+                    &payload.payload,
+                    &signing_key,
+                );
                 let (outcome, reply_result) = match tokio::time::timeout(
                     TRUST_RECOVERY_TIMEOUT,
                     notify_fut,
@@ -1821,133 +1910,41 @@ impl Supervisor {
                 let _ = reply.send(reply_result);
                 outcome
             }
+            // Per-context variants reach this arm only when no actor is
+            // registered for the target context. Post-Step-B every valid
+            // context has a registered actor and these variants are
+            // mailbox-dispatched to the per-context actor-shape handlers
+            // in `actor/handlers/trust_recovery.rs`. The supervisor-side
+            // direct path is therefore reached ONLY for an unregistered
+            // context, which is by definition not registered — surface a
+            // typed `ContextNotRegistered` on the reply oneshot and
+            // return a matching error `Outcome` (mirrors the gutted
+            // `dispatch_lifecycle_direct` per-context arms).
             TrustRecoveryCommand::CreateGovernanceCheckpoint { payload, reply } => {
-                let p = *payload;
-                let context_id = p.context_id.clone();
-                let create_fut = helpers::create_governance_checkpoint_legacy(
-                    self,
-                    &p.context_id,
-                    p.checkpoint_seq,
-                    p.merkle_root,
-                    p.event_count,
-                    p.last_event_hash,
-                    p.state_snapshot_hash,
-                    &p.creator_did,
-                    p.creator_signature,
-                );
-                let (outcome, reply_result) = match tokio::time::timeout(
-                    TRUST_RECOVERY_TIMEOUT,
-                    create_fut,
-                )
-                .await
-                {
-                    Ok(Ok(checkpoint)) => (Outcome::ok_mutated(()), Ok(checkpoint)),
-                    Ok(Err(e)) => (
-                        Outcome::err_mutated(standing_outcome_error_sketch(&e)),
-                        Err(e),
-                    ),
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "create_governance_checkpoint exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        (
-                            Outcome::err_mutated(standing_outcome_error_sketch(&err)),
-                            Err(err),
-                        )
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err_mutated(sketch)
             }
             TrustRecoveryCommand::AddCheckpointCosignature {
-                context_id,
-                checkpoint,
-                cosignature,
-                reply,
+                context_id, reply, ..
             } => {
-                let mut checkpoint = *checkpoint;
-                let add_fut = helpers::add_checkpoint_cosignature_legacy(
-                    self,
-                    &context_id,
-                    &mut checkpoint,
-                    *cosignature,
-                );
-                let (outcome, reply_result) = match tokio::time::timeout(
-                    TRUST_RECOVERY_TIMEOUT,
-                    add_fut,
-                )
-                .await
-                {
-                    Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok((checkpoint, status))),
-                    Ok(Err(e)) => (Outcome::err(standing_outcome_error_sketch(&e)), Err(e)),
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "add_checkpoint_cosignature exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        (Outcome::err(standing_outcome_error_sketch(&err)), Err(err))
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
             }
             TrustRecoveryCommand::RecoveryAdvanceEpoch { context_id, reply } => {
-                let advance_fut = helpers::recovery_advance_epoch_legacy(self, &context_id);
-                let (outcome, reply_result) = match tokio::time::timeout(
-                    TRUST_RECOVERY_TIMEOUT,
-                    advance_fut,
-                )
-                .await
-                {
-                    Ok(Ok(epoch)) => (Outcome::ok_mutated(()), Ok(epoch)),
-                    Ok(Err(e)) => (
-                        Outcome::err_mutated(standing_outcome_error_sketch(&e)),
-                        Err(e),
-                    ),
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "recovery_advance_epoch exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        (
-                            Outcome::err_mutated(standing_outcome_error_sketch(&err)),
-                            Err(err),
-                        )
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err_mutated(sketch)
             }
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
-                let p = *payload;
-                let context_id = p.context_id.clone();
-                let signing_key = p.signing_key.to_signing_key();
-                let send_fut = async {
-                    helpers::recovery_send_notification_legacy(
-                        self,
-                        &p.context_id,
-                        &p.sender_did,
-                        &p.payload,
-                        p.sequence,
-                        &signing_key,
-                    )
-                    .await
-                };
-                let (outcome, reply_result) = match tokio::time::timeout(
-                    TRUST_RECOVERY_TIMEOUT,
-                    send_fut,
-                )
-                .await
-                {
-                    Ok(Ok(())) => (Outcome::ok(()), Ok(())),
-                    Ok(Err(e)) => (Outcome::err(standing_outcome_error_sketch(&e)), Err(e)),
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "recovery_send_notification exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        (Outcome::err(standing_outcome_error_sketch(&err)), Err(err))
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
             }
         }
     }

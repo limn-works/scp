@@ -72,7 +72,7 @@
 //!
 //! - `standing_contexts` — supervisor-scoped state reachable through
 //!   `SupervisorHandle::standing_peer()` per ADR §2.
-//! - `contexts` / `contexts_arc` — cross-actor reads are banned by the
+//! - `contexts` — cross-actor reads are banned by the
 //!   capability contract (ADR §2: "Never ContextActor → ContextActor
 //!   directly"). Cross-context work goes through
 //!   `SupervisorHandle::start_saga`.
