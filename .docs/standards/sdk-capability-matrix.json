@@ -389,7 +389,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.4): ContextExport carries an Ed25519 snapshot_signature over canonical_snapshot_hash (domain SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge using the exporter's custody key (PyO3 resolve_signing_key; NAPI resolve_napi_signing_key under allow_in_memory_custody, fail-closed otherwise; UniFFI resolve_uniffi_signing_key via callback/in-memory custody). WASM signs SHA-256(domain || snapshot_jcs) with the creator's #active key (WASM_EXPORT_VERSION=4). No direct SDK call site \u2014 invoked transitively from context_export.",
+          "notes": "Internal (spec \u00a723.16.8): ContextExport carries an Ed25519 snapshot_signature over canonical_snapshot_hash (domain SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge using the exporter's custody key (PyO3 resolve_signing_key; NAPI resolve_napi_signing_key under allow_in_memory_custody, fail-closed otherwise; UniFFI resolve_uniffi_signing_key via callback/in-memory custody). WASM signs SHA-256(domain || snapshot_jcs) with the creator's #active key (WASM_EXPORT_VERSION=4). No direct SDK call site \u2014 invoked transitively from context_export.",
           "exemptions": {
             "python": "internal wiring inside context_export, not a separate SDK operation",
             "typescript": "internal wiring inside context_export, not a separate SDK operation",
@@ -403,7 +403,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.4): ContextManager::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI) or the WASM identity registry, failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. No direct SDK call site \u2014 invoked transitively from context_import.",
+          "notes": "Internal (spec \u00a723.16.8): ContextManager::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI) or the WASM identity registry, failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. No direct SDK call site \u2014 invoked transitively from context_import.",
           "exemptions": {
             "python": "internal wiring inside context_import, not a separate SDK operation",
             "typescript": "internal wiring inside context_import, not a separate SDK operation",

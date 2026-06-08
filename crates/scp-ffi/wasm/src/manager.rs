@@ -5276,8 +5276,9 @@ impl WasmContextManager {
         // equal the snapshot's `creator_did`. The verifying key is always
         // resolved from `creator_did` (never from the envelope), so a mismatch
         // means a non-creator re-wrapped the snapshot under their own claimed
-        // identity — reject it. Distinct from a signature failure: this is an
-        // authorization/version-class rejection (CTX_2032).
+        // identity — reject it. Treated as a snapshot signature failure: the
+        // signing authority does not match the verifying key (SCP-CTX-2093),
+        // matching the runtime and the other three bridges.
         if envelope.exporter_did != envelope.snapshot.creator_did {
             return Err(ScpWasmError::Context {
                 message: format!(
@@ -5285,7 +5286,7 @@ impl WasmContextManager {
                      only the context creator may sign an export (§23.16.8)",
                     envelope.exporter_did, envelope.snapshot.creator_did
                 ),
-                code: codes::CTX_2032.to_owned(),
+                code: codes::CTX_2093.to_owned(),
             });
         }
 
