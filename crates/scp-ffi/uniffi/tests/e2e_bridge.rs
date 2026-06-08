@@ -1216,3 +1216,125 @@ async fn transport_connect_returns_error_on_unreachable_relay() {
         "Connecting to an unreachable relay must return an error, not a fictional success"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Signed context export — round-trip + tamper rejection (§23.16.8, ADR-050)
+// ---------------------------------------------------------------------------
+
+/// Self-export → close → self-import round-trip on the same instance.
+///
+/// This is the case the previous resolver-only verifying-key path could NOT
+/// satisfy: an in-memory identity is never auto-published to the DHT, so the
+/// `IdentityBackedDidResolver` cannot resolve its `creator_did`, and import
+/// verification failed before the new local-custody-first path (§23.16.8
+/// step 1) derived the verifying key directly from the creator's retained
+/// `#active` custody key. The absence of this test is what hid the bug.
+///
+/// The load-bearing assertion: a *valid* export NEVER fails with the
+/// signature-failure code `SCP-CTX-2093`. The verifying key resolves via local
+/// custody (the creator is a local in-memory identity on this instance) before
+/// any DID resolver is configured, so verification passes. Any *other*
+/// lifecycle outcome on import (e.g. the "already exists" guard, since the
+/// bridge close transitions an ephemeral handle rather than the manager's
+/// stored handle) is acceptable — what matters is that signature verification
+/// is reached and succeeds. Mirrors the `PyO3` reference round-trip test.
+#[tokio::test]
+async fn context_export_self_import_round_trip_succeeds() {
+    let scp = Scp::new();
+    // In-memory identity — deliberately NOT published to any DID resolver, so
+    // verification can ONLY succeed via the local-custody-first leg.
+    let alice = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .expect("identity_create");
+
+    // full_capability_params() includes `context:close`, exercised by the
+    // close step below.
+    let handle = scp
+        .context_create(alice.clone(), full_capability_params())
+        .await
+        .expect("context_create");
+    let context_id = handle.context_id();
+
+    // Export BEFORE close — export needs the live signing key on the handle.
+    let exported = scp
+        .context_export(handle.clone())
+        .await
+        .expect("context_export");
+
+    scp.context_close(handle.clone(), alice)
+        .await
+        .expect("context_close");
+
+    // Self-import on the SAME instance. The creator's custody is in this
+    // instance's registry, so the verifying key resolves via local custody
+    // even though the DID was never published — exercising §23.16.8 step 1.
+    // A valid signature MUST pass verification (no SCP-CTX-2093); a residual
+    // lifecycle rejection is acceptable, a signature rejection is NOT.
+    match scp.context_import(exported).await {
+        Ok(imported_id) => assert_eq!(
+            imported_id, context_id,
+            "imported context id must match the exported context id"
+        ),
+        Err(scp_ffi_uniffi::ScpError::Context { code, msg }) => assert_ne!(
+            code, "SCP-CTX-2093",
+            "valid export must not fail signature verification \
+             (local-custody-first did not resolve the creator key): {msg}"
+        ),
+        Err(other) => panic!("unexpected non-context error on self-import: {other:?}"),
+    }
+}
+
+/// A tampered export (signature corrupted after signing) MUST be rejected on
+/// import with the dedicated `SCP-CTX-2093` code, NOT a generic context error
+/// (§23.16.8 step 3). Run on the same instance so the creator key resolves and
+/// verification actually executes — the rejection is a genuine signature
+/// failure, not an unresolvable-key failure.
+#[tokio::test]
+async fn context_import_rejects_tampered_signature_with_2093() {
+    let scp = Scp::new();
+    let alice = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .expect("identity_create");
+    let handle = scp
+        .context_create(alice.clone(), full_capability_params())
+        .await
+        .expect("context_create");
+
+    let exported = scp
+        .context_export(handle.clone())
+        .await
+        .expect("context_export");
+
+    // Close so the slot is replaceable — otherwise import would short-circuit
+    // on "already exists" AFTER the signature check, but we want the signature
+    // check itself to be the rejection cause. (Signature verification runs
+    // first in import_context, so this ordering is robust either way.)
+    scp.context_close(handle.clone(), alice)
+        .await
+        .expect("context_close");
+
+    // Tamper: flip one bit of the Ed25519 snapshot signature. The snapshot
+    // digest stays valid, so deserialization succeeds and the failure is a
+    // genuine signature mismatch (SnapshotSignatureInvalid → SCP-CTX-2093),
+    // not a structural/version error.
+    let mut export = scp_core::context::export_import::deserialize_export(&exported)
+        .expect("valid export must deserialize");
+    export.snapshot_signature[0] ^= 0x01;
+    let tampered = scp_core::context::export_import::serialize_export(&export)
+        .expect("re-serialize tampered export");
+
+    let err = scp
+        .context_import(tampered)
+        .await
+        .expect_err("tampered signature must be rejected");
+
+    match err {
+        scp_ffi_uniffi::ScpError::Context { ref code, .. } => assert_eq!(
+            code, "SCP-CTX-2093",
+            "tampered export must surface the dedicated signature-failure code"
+        ),
+        other => panic!("expected ScpError::Context with SCP-CTX-2093, got {other:?}"),
+    }
+}

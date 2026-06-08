@@ -625,6 +625,17 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2092.to_owned(),
             },
+            // §23.16.8 / ADR-050: signed-context-export signature verification
+            // failure (forged/tampered snapshot, exporter_did != creator_did,
+            // or unresolvable creator key). Surface the dedicated SCP-CTX-2093
+            // contract instead of falling through to the catch-all CTX_2001 so
+            // Swift / Kotlin callers can distinguish a forged export from a
+            // generic context error. The version gate is reported separately
+            // (a distinct version error, not this arm), per §23.16.8 / §17.5.
+            CE::SnapshotSignatureInvalid { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2093.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
@@ -4636,37 +4647,100 @@ async fn resolve_uniffi_signing_key(
     })
 }
 
-/// Resolves the exporter DID's Ed25519 verification key for snapshot-signature
-/// verification on context import (§23.16.4, ADR-039).
+/// Resolves the snapshot creator's Ed25519 verification key for
+/// snapshot-signature verification on context import (§23.16.8, ADR-050,
+/// ADR-039).
 ///
-/// Tries `#active` then `#agent` (ADR-039 shared-DID model). Fails closed with
-/// [`codes::CTX_2093`] if no resolver is configured or neither key resolves —
-/// an unverifiable export is never imported.
-fn resolve_uniffi_exporter_verifying_key(
+/// Per §23.16.8 step 1 the verifying key is derived from the snapshot's
+/// `creator_did` (`role_state.creator_did`), never from the unauthenticated
+/// envelope `exporter_did`. The runtime separately asserts
+/// `exporter_did == creator_did` (§23.16.8 step 2), so the bridge MUST resolve
+/// from the creator identity.
+///
+/// Resolution order (local-custody-first, then DID resolver) is shared across
+/// all non-WASM bridges via
+/// [`scp_ffi_common::export_verify::resolve_export_verifying_key`]:
+/// 1. **Local identity custody** — if the creator is a local identity (the
+///    common self-export case: a device importing a context it exported), the
+///    verifying key is derived directly from its `#active` custody signing key
+///    held in this instance's [`identity_custody_registry`]. This works even
+///    when the DID document has not been published to the DHT (in-memory
+///    identities are not auto-published), which is exactly the self-import
+///    round-trip the previous resolver-only path could not satisfy.
+/// 2. **DID resolver** — otherwise resolve the creator DID's `#active` (then
+///    `#agent`, ADR-039 shared-DID model) verification-method key.
+///
+/// Fails closed: if the creator is neither local nor resolvable, the import is
+/// rejected with [`codes::CTX_2093`] rather than proceeding unverified.
+///
+/// This is `async` because the local-custody public-key export is `async`. The
+/// custody lookup is awaited up front and fed to the (synchronous) shared
+/// helper closure as a pre-resolved `Option<VerifyingKey>`.
+async fn resolve_uniffi_creator_verifying_key(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-    exporter_did: &str,
+    creator_did: &str,
 ) -> Result<ed25519_dalek::VerifyingKey, ScpError> {
-    use scp_core::crypto::ucan::validate::DidResolver;
+    // Local custody: if the creator is a local in-memory identity, derive the
+    // public verifying key from its retained `#active` custody key. Awaited up
+    // front so the shared helper's synchronous closure just returns the
+    // already-resolved key. Only the public key leaves custody — private key
+    // material never crosses this boundary. Returns `None` when the creator is
+    // not a local identity (or when in-memory custody is not compiled in), so
+    // resolution falls through to the DID resolver.
+    let local_verifying_key = resolve_local_custody_verifying_key(bi, creator_did).await;
 
-    let resolver = bi.did_resolver().ok_or_else(|| ScpError::Context {
-        msg: "no DID resolver configured — cannot verify exporter snapshot signature".to_owned(),
-        code: codes::CTX_2093.to_owned(),
-    })?;
+    let resolver = bi.did_resolver();
 
-    let key_bytes = resolver
-        .resolve_public_key_by_kid(exporter_did, "active")
-        .or_else(|_| resolver.resolve_public_key_by_kid(exporter_did, "agent"))
-        .map_err(|e| ScpError::Context {
-            msg: format!(
-                "failed to resolve exporter '{exporter_did}' verification key (#active/#agent): {e}"
-            ),
-            code: codes::CTX_2093.to_owned(),
-        })?;
-
-    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| ScpError::Context {
-        msg: format!("exporter '{exporter_did}' verification key is not valid Ed25519: {e}"),
+    scp_ffi_common::export_verify::resolve_export_verifying_key(
+        resolver.as_deref(),
+        |_did| local_verifying_key,
+        creator_did,
+    )
+    .map_err(|e| ScpError::Context {
+        msg: format!("{}: {e}", codes::CTX_2093),
         code: codes::CTX_2093.to_owned(),
     })
+}
+
+/// Derives the `#active` Ed25519 verifying key for `did` from this instance's
+/// in-memory identity custody, if `did` is a local in-memory identity.
+///
+/// Returns `None` when `did` is not registered locally, when the custody key
+/// cannot be exported, or when the in-memory custody feature is not compiled
+/// in. The returned key is the *public* verifying key only — private key
+/// material never leaves custody.
+///
+/// This backs the local-custody-first leg of
+/// [`resolve_uniffi_creator_verifying_key`] (§23.16.8 step 1), enabling a
+/// self-export → self-import round-trip before any DID resolver is configured.
+#[cfg(feature = "allow_in_memory_custody")]
+async fn resolve_local_custody_verifying_key(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    did: &str,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    // Clone the custody Arc and key handle out of the registry under a short
+    // guard scope so no DashMap reference is held across the `.await`.
+    let (custody, key_handle) = {
+        let registry = identity_custody_registry(bi);
+        let entry = registry.get(did)?;
+        let (custody, handle) = entry.value();
+        (Arc::clone(custody), *handle)
+    };
+
+    let public_key = custody.0.public_key(&key_handle).await.ok()?;
+    let key_bytes: [u8; 32] = public_key.as_bytes().try_into().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).ok()
+}
+
+/// No-custody build: local identities are never resolvable from in-memory
+/// custody, so the local-custody leg always yields `None` and resolution
+/// falls through to the DID resolver.
+#[cfg(not(feature = "allow_in_memory_custody"))]
+async fn resolve_local_custody_verifying_key(
+    _bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    _did: &str,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    None
 }
 
 /// Parses a hex-encoded proposal ID into a 32-byte array.
@@ -14794,10 +14868,15 @@ impl Scp {
                 validate_did(&export.exporter_did.0)?;
                 bi.init_context_manager_with_did(&export.exporter_did.0);
 
-                // Resolve the exporter's verification key to verify the snapshot
-                // signature (§23.16.4). Fail-closed: never import unverified.
-                let verifying_key =
-                    resolve_uniffi_exporter_verifying_key(&bi, &export.exporter_did.0)?;
+                // Resolve the snapshot creator's verification key to verify the
+                // snapshot signature (§23.16.8 step 1, ADR-050). The key is
+                // derived from the snapshot `creator_did` — NOT the
+                // unauthenticated envelope `exporter_did`. The runtime
+                // separately asserts `exporter_did == creator_did` (§23.16.8
+                // step 2). Fail-closed: if no key resolves, the import is
+                // rejected — never imported unverified.
+                let creator_did = export.snapshot.role_state.creator_did.clone();
+                let verifying_key = resolve_uniffi_creator_verifying_key(&bi, &creator_did).await?;
 
                 let manager = bi.context_manager_or_error()?;
                 manager
