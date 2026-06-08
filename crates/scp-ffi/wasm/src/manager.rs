@@ -5149,6 +5149,19 @@ impl WasmContextManager {
             hard_rate_limit_config: ctx.hard_rate_limit_config.clone(),
         };
 
+        // Canonicalize every set/map-derived array to sorted order before
+        // signing (§23.16.8 "Set/Map canonicalization"). The snapshot fields
+        // above are collected from `HashSet`/`HashMap` sources in incidental
+        // iteration order, which is non-deterministic across runs. JCS fixes
+        // object-key ordering but NOT array element ordering, so any array
+        // derived from a set MUST be emitted sorted or the digest — and thus
+        // the signature — would differ across runs and implementations. The
+        // verifier applies the identical sort before re-serializing, so the
+        // producer and verifier always agree regardless of incoming order.
+        let mut snapshot = snapshot;
+        canonicalize_snapshot_sets(&mut snapshot);
+        let snapshot = snapshot;
+
         // Serialize snapshot to RFC 8785 JCS canonical JSON for HMAC
         // computation. The HMAC is computed over this stable serialization —
         // NOT the full envelope — to avoid a circular dependency (envelope
@@ -5207,7 +5220,7 @@ impl WasmContextManager {
     fn deserialize_and_verify_envelope(
         data: &[u8],
     ) -> Result<WasmContextExportEnvelope, ScpWasmError> {
-        let envelope: WasmContextExportEnvelope =
+        let mut envelope: WasmContextExportEnvelope =
             serde_json::from_slice(data).map_err(|e| ScpWasmError::Context {
                 message: format!("invalid export data: {e}"),
                 code: codes::CTX_2032.to_owned(),
@@ -5242,6 +5255,15 @@ impl WasmContextManager {
         // Re-serialize the snapshot to RFC 8785 JCS canonical JSON. This MUST
         // happen before any state reconstruction to prevent an attacker from
         // crafting payloads that grant them admin of a context.
+        //
+        // Apply the identical set/map canonicalization the exporter applied
+        // (§23.16.8): sort every set-derived array to a deterministic order
+        // before re-serializing, so the verifier reconstructs the exact bytes
+        // the signer hashed regardless of the array ordering present in the
+        // received envelope. Without this, a re-ordered (but otherwise
+        // faithful) envelope would fail verification, and the signing/verifying
+        // sides would not be guaranteed to agree.
+        canonicalize_snapshot_sets(&mut envelope.snapshot);
         let snapshot_json = serde_json_canonicalizer::to_vec(&envelope.snapshot).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("snapshot re-serialization failed: {e}"),
@@ -5249,7 +5271,25 @@ impl WasmContextManager {
             }
         })?;
 
-        // 1. Ed25519 snapshot signature (§23.16.4). The exporter signs
+        // 0. Bind the signing authority to the creator identity (§23.16.8
+        // import requirement #2): the envelope's declared `exporter_did` MUST
+        // equal the snapshot's `creator_did`. The verifying key is always
+        // resolved from `creator_did` (never from the envelope), so a mismatch
+        // means a non-creator re-wrapped the snapshot under their own claimed
+        // identity — reject it. Distinct from a signature failure: this is an
+        // authorization/version-class rejection (CTX_2032).
+        if envelope.exporter_did != envelope.snapshot.creator_did {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "export exporter_did '{}' does not match snapshot creator_did '{}' — \
+                     only the context creator may sign an export (§23.16.8)",
+                    envelope.exporter_did, envelope.snapshot.creator_did
+                ),
+                code: codes::CTX_2032.to_owned(),
+            });
+        }
+
+        // 1. Ed25519 snapshot signature (§23.16.8). The exporter signs
         // SHA-256(domain || snapshot_jcs) with its #active key; verify against
         // the creator DID's resolved #active (then #agent) verification key.
         // Fail closed: an empty or invalid signature rejects the import.
@@ -5946,6 +5986,56 @@ struct WasmExportMember {
     sequence_number: u64,
 }
 
+/// Canonicalizes every set/map-derived array in an export snapshot to a
+/// deterministic sorted order (§23.16.8 "Set/Map canonicalization").
+///
+/// The export builder collects these arrays from `HashSet`/`HashMap` sources
+/// in incidental iteration order, which is non-deterministic across runs and
+/// implementations. RFC 8785 JCS canonicalizes JSON *object* member ordering
+/// (so the `HashMap`-backed fields serialized as JSON objects —
+/// `suspended_capabilities`, `resolved_proposals_json`, `cooldown_until`, and
+/// the broadcast `author_block_lists`/`key_epochs` maps — are already
+/// deterministic by key), but JCS does NOT reorder JSON *array* elements.
+/// Every array whose elements derive from a set MUST therefore be sorted here
+/// before the snapshot is serialized for signing and before it is re-serialized
+/// for verification, so the signed digest is byte-identical across runs and the
+/// producer and verifier always agree.
+///
+/// Fields that originate from an ordered `Vec` in `PerContextState`
+/// (`threshold_signers`, `tool_interfaces`, `consequence_rules`) carry a
+/// producer-defined order and are intentionally left untouched.
+fn canonicalize_snapshot_sets(snapshot: &mut WasmContextExportSnapshot) {
+    // Plain `Vec<String>` fields derived directly from a `HashSet`.
+    snapshot.ceiling_strings.sort_unstable();
+    snapshot.read_exclusion_list.sort_unstable();
+    snapshot.revoked_tokens.sort_unstable();
+
+    // Arrays of struct entries derived from `HashMap` iteration: sort by the
+    // logical map key so the array order matches the canonical key order.
+    snapshot.members.sort_unstable_by(|a, b| a.did.cmp(&b.did));
+    snapshot
+        .seen_nonces_v3
+        .sort_unstable_by(|a, b| a.nonce.cmp(&b.nonce));
+    snapshot
+        .executed_proposals
+        .sort_unstable_by(|a, b| a.proposal_id.cmp(&b.proposal_id));
+
+    // Map-of-set field: keys are canonicalized by JCS, but each value array is
+    // collected from an inner `HashSet` and must be sorted element-wise.
+    for caps in snapshot.suspended_capabilities.values_mut() {
+        caps.sort_unstable();
+    }
+
+    // Broadcast sub-structure: the subscriber list comes from a `HashMap` and
+    // each author block list comes from an inner `HashSet`.
+    if let Some(broadcast) = snapshot.broadcast.as_mut() {
+        broadcast.subscribers.sort_unstable();
+        for block_list in broadcast.author_block_lists.values_mut() {
+            block_list.sort_unstable();
+        }
+    }
+}
+
 /// Serializable broadcast state for export.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WasmExportBroadcast {
@@ -6614,8 +6704,13 @@ mod tests {
     }
 
     #[test]
-    fn export_version_is_three() {
-        assert_eq!(WASM_EXPORT_VERSION, 3);
+    fn export_version_matches_signed_constant() {
+        // The WASM JSON-envelope version is an independent per-serializer
+        // integer (§23.16.8): it need NOT equal the native MessagePack
+        // export version. It is currently 4 — the version that introduced the
+        // Ed25519 full-snapshot signature. This test pins the constant so a
+        // change is deliberate.
+        assert_eq!(WASM_EXPORT_VERSION, 4);
     }
 
     // -----------------------------------------------------------------------
@@ -7141,6 +7236,178 @@ mod tests {
     fn validate_antispam_minimal_snapshot_accepted() {
         let snap = make_minimal_valid_snapshot();
         assert!(validate_imported_antispam_state(&snap).is_ok());
+    }
+
+    // =======================================================================
+    // §23.16.8 set/map canonicalization tests
+    // =======================================================================
+
+    /// Computes the signed digest the way `export_context` /
+    /// `verify_snapshot_signature` do: canonicalize set-derived arrays, JCS,
+    /// then `SHA-256(domain || jcs)`.
+    fn signed_digest(snapshot: &WasmContextExportSnapshot) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut snap = snapshot.clone();
+        canonicalize_snapshot_sets(&mut snap);
+        let json = serde_json_canonicalizer::to_vec(&snap).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(WASM_SNAPSHOT_SIGN_DOMAIN);
+        hasher.update(&json);
+        hasher.finalize().into()
+    }
+
+    /// Builds a snapshot populated across every set/map-derived field, with
+    /// each array supplied in the caller-chosen order so the test can vary it.
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_with_sets(
+        ceiling: &[&str],
+        read_excl: &[&str],
+        revoked: &[&str],
+        members: &[&str],
+        nonces: &[&str],
+        executed: &[&str],
+        suspended: &[(&str, &[&str])],
+        subscribers: &[&str],
+        block_list: &[&str],
+    ) -> WasmContextExportSnapshot {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.ceiling_strings = ceiling.iter().map(|s| (*s).to_owned()).collect();
+        snap.read_exclusion_list = read_excl.iter().map(|s| (*s).to_owned()).collect();
+        snap.revoked_tokens = revoked.iter().map(|s| (*s).to_owned()).collect();
+        snap.members = members
+            .iter()
+            .map(|d| WasmExportMember {
+                did: (*d).to_owned(),
+                role: "member".to_owned(),
+                sequence_number: 1,
+            })
+            .collect();
+        snap.seen_nonces_v3 = nonces
+            .iter()
+            .map(|n| WasmExportNonceEntry {
+                nonce: (*n).to_owned(),
+                inserted_at_ms: 1.0,
+            })
+            .collect();
+        snap.executed_proposals = executed
+            .iter()
+            .map(|p| WasmExportExecutedProposalEntry {
+                proposal_id: (*p).to_owned(),
+                executed_at_ms: 1.0,
+            })
+            .collect();
+        snap.suspended_capabilities = suspended
+            .iter()
+            .map(|(member, caps)| {
+                (
+                    (*member).to_owned(),
+                    caps.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        snap.broadcast = Some(WasmExportBroadcast {
+            author_block_lists: std::iter::once((
+                "author-a".to_owned(),
+                block_list
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect::<Vec<_>>(),
+            ))
+            .collect(),
+            key_epochs: std::iter::once(("author-a".to_owned(), 0u64)).collect(),
+            subscribers: subscribers.iter().map(|s| (*s).to_owned()).collect(),
+            admission: "open".to_owned(),
+        });
+        snap
+    }
+
+    /// **§23.16.8:** the signed digest MUST be invariant under the insertion
+    /// order of every set/map-derived array. Two logically-identical snapshots
+    /// whose set-derived arrays are supplied in reversed order MUST produce a
+    /// byte-identical digest.
+    #[test]
+    fn snapshot_digest_invariant_under_set_insertion_order() {
+        let forward = snapshot_with_sets(
+            &["messages:read", "messages:write", "tools:invoke"],
+            &["did:test:x", "did:test:y", "did:test:z"],
+            &["cid-a", "cid-b", "cid-c"],
+            &["did:test:m1", "did:test:m2", "did:test:m3"],
+            &["nonce-1", "nonce-2", "nonce-3"],
+            &["prop-1", "prop-2", "prop-3"],
+            &[("did:test:m1", &["a:1", "b:2", "c:3"])],
+            &["sub-1", "sub-2", "sub-3"],
+            &["blk-1", "blk-2", "blk-3"],
+        );
+        let reversed = snapshot_with_sets(
+            &["tools:invoke", "messages:write", "messages:read"],
+            &["did:test:z", "did:test:y", "did:test:x"],
+            &["cid-c", "cid-b", "cid-a"],
+            &["did:test:m3", "did:test:m2", "did:test:m1"],
+            &["nonce-3", "nonce-2", "nonce-1"],
+            &["prop-3", "prop-2", "prop-1"],
+            &[("did:test:m1", &["c:3", "b:2", "a:1"])],
+            &["sub-3", "sub-2", "sub-1"],
+            &["blk-3", "blk-2", "blk-1"],
+        );
+
+        assert_eq!(
+            signed_digest(&forward),
+            signed_digest(&reversed),
+            "signed digest must be invariant under set/map insertion order (§23.16.8)"
+        );
+
+        let raw_forward = serde_json_canonicalizer::to_vec(&forward).unwrap();
+        let raw_reversed = serde_json_canonicalizer::to_vec(&reversed).unwrap();
+        assert_ne!(
+            raw_forward, raw_reversed,
+            "test inputs must differ in array order before canonicalization"
+        );
+    }
+
+    /// **§23.16.8 tamper-reject:** `suspended_capabilities` is restored verbatim
+    /// and now covered by the full-snapshot signature. Mutating it MUST change
+    /// the signed digest.
+    #[test]
+    fn snapshot_digest_changes_when_suspended_capabilities_tampered() {
+        let base = snapshot_with_sets(
+            &["messages:read"],
+            &[],
+            &[],
+            &["did:test:m1"],
+            &[],
+            &[],
+            &[("did:test:m1", &["messages:write"])],
+            &[],
+            &[],
+        );
+        let mut tampered = base.clone();
+        tampered.suspended_capabilities.clear();
+
+        assert_ne!(
+            signed_digest(&base),
+            signed_digest(&tampered),
+            "tampering with a signed-but-previously-unenumerated field must change the digest"
+        );
+    }
+
+    /// **§23.16.8 tamper-reject:** the broadcast author block list is a
+    /// set-derived field now covered by the signature.
+    #[test]
+    fn snapshot_digest_changes_when_block_list_tampered() {
+        let base = snapshot_with_sets(&[], &[], &[], &[], &[], &[], &[], &["sub-1"], &["blk-1"]);
+        let mut tampered = base.clone();
+        if let Some(b) = tampered.broadcast.as_mut() {
+            b.author_block_lists
+                .get_mut("author-a")
+                .unwrap()
+                .push("blk-2".to_owned());
+        }
+
+        assert_ne!(
+            signed_digest(&base),
+            signed_digest(&tampered),
+            "tampering with the broadcast block list must change the digest"
+        );
     }
 
     /// **E1-1:** `seen_nonces_v3.len() > WASM_NONCE_CAP` → rejected.
