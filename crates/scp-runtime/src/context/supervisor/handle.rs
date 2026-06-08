@@ -98,34 +98,28 @@ impl SupervisorHandle {
     ///
     /// # Implementation
     ///
-    /// During Phase 2A migration the per-context `Mutex<PerContextState>`
-    /// map is the authoritative membership store. Once Phase 2A
-    /// finalization deletes the map and replaces it with one
-    /// `ContextActor` per context, this method becomes a fan-out over
-    /// the actor map asking each actor's mailbox for membership state
-    /// (or reads a supervisor-scoped membership index maintained by
-    /// the actors). The signature here is stable across that
-    /// transition.
+    /// Fan-out over the actor registry: [`Supervisor::actor_ids`] yields
+    /// a lock-free snapshot of every registered context id, and for each
+    /// id the membership predicate is read through the per-context actor
+    /// mailbox via [`Supervisor::is_member`]. The first context where
+    /// BOTH members are present wins; `None` if none qualifies. No
+    /// `Mutex<PerContextState>` lock and no `contexts` DashMap access —
+    /// the actor that owns each context is the sole authority for its
+    /// membership.
     ///
-    /// # Lock discipline
+    /// # Ordering
     ///
-    /// Collects `(key, Arc)` pairs under DashMap's shard locks first,
-    /// then drops the shard locks before locking individual per-context
-    /// `Mutex`es. Holding a DashMap `Ref` across `.await` would deadlock
-    /// any concurrent shard access.
+    /// `actor_ids()` rebuilds its snapshot per call, so the iteration
+    /// order is the registry's shard order — unspecified but stable for
+    /// the duration of a single call. The legacy DashMap iteration was
+    /// likewise order-unspecified, so "first shared context" carries the
+    /// same (non-deterministic across registry mutations) semantics it
+    /// always did.
     pub async fn find_shared_context(&self, member_a: &str, member_b: &str) -> Option<String> {
-        let entries: Vec<(
-            String,
-            Arc<tokio::sync::Mutex<crate::context::state::PerContextState>>,
-        )> = self
-            .supervisor
-            .contexts_arc()
-            .iter()
-            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
-            .collect();
-        for (context_id, arc) in entries {
-            let ctx = arc.lock().await;
-            if ctx.membership.contains(member_a) && ctx.membership.contains(member_b) {
+        for context_id in self.supervisor.actor_ids() {
+            if self.supervisor.is_member(&context_id, member_a).await
+                && self.supervisor.is_member(&context_id, member_b).await
+            {
                 return Some(context_id);
             }
         }
