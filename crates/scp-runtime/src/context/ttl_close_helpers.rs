@@ -235,9 +235,8 @@ pub async fn start_ttl_timer(
 
 /// Spawns (or respawns) the per-context TTL timer on actor-owned state.
 ///
-/// Replaces `ttl_close_helpers_legacy::spawn_ttl_timer_legacy`: the new
-/// task holds no `&Supervisor` and reads no `contexts` `DashMap`. On wake
-/// it resolves the owning actor via
+/// The actor-shape TTL timer holds no `&Supervisor` and reads no
+/// `contexts` `DashMap`. On wake it resolves the owning actor via
 /// [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
 /// and mailboxes
 /// [`TtlCloseCommand::FireTimer`](crate::context::actor::commands::TtlCloseCommand::FireTimer),

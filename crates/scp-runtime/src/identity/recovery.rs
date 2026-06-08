@@ -726,8 +726,7 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32]) -> Option<Vec<u8>> 
 /// When the target context has a registered actor the command runs in
 /// that actor's mailbox turn against owned `&mut PerContextState`; the
 /// backend never reaches the supervisor's per-context state map directly.
-/// This replaced the earlier direct calls into
-/// `trust_recovery_helpers_legacy::*_legacy(&self.manager, …)` that read
+/// This replaced the earlier direct supervisor-scoped calls that read
 /// the `contexts` `DashMap` outside the actor mailbox.
 ///
 /// # Construction
@@ -817,10 +816,9 @@ impl ProductionRecoveryBackend {
     /// through to the supervisor-scoped direct path. Either way the typed
     /// result returns on `reply`.
     ///
-    /// This replaces the previous direct calls into
-    /// `trust_recovery_helpers_legacy::*_legacy(&self.manager, …)` that
-    /// read the supervisor's per-context `Mutex<PerContextState>` map
-    /// outside the actor mailbox.
+    /// This replaces the previous direct supervisor-scoped calls that
+    /// read the supervisor's per-context state map outside the actor
+    /// mailbox.
     ///
     /// The dispatch error (the `Outcome` channel) and the command's own
     /// typed reply are folded into a single `Result`: a closed reply

@@ -856,9 +856,6 @@ pub fn join_context_membership(
     );
 
     // Emit WelcomeGenerated event if the add produced a Welcome message.
-    // Mirrors `state::push_welcome_event` body inline because that helper
-    // takes legacy `state::PerContextState` and we operate on the
-    // actor-shape struct here.
     if !add_output.welcome_bytes.is_empty() {
         state::emit_event_into(
             &mut state.receive_buffer,

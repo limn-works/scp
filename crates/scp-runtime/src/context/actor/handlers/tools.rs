@@ -43,7 +43,6 @@ use crate::context::actor::commands::ToolsCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::PerContextState;
-use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for tools handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -59,14 +58,6 @@ pub async fn dispatch(
     dispatch_inner(state, cmd).await
 }
 
-/// Shim-callable dispatch. Used by
-/// [`Supervisor::dispatch_tools_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_tools_command).
-///
-/// # Supervisor receiver (ADR-049 commit 12)
-pub(crate) async fn dispatch_from_shim(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<()> {
-    dispatch_from_shim_inner(supervisor, cmd).await
-}
-
 async fn dispatch_inner(state: &mut PerContextState, cmd: ToolsCommand) -> Outcome<()> {
     match cmd {
         ToolsCommand::Placeholder { reply } => reply_not_implemented(reply),
@@ -79,29 +70,6 @@ async fn dispatch_inner(state: &mut PerContextState, cmd: ToolsCommand) -> Outco
         ToolsCommand::RefundHardRateLimit { did, reply, .. } => {
             handle_refund_hard_rate_limit(state, &did, reply).await
         }
-        ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
-            reply_saga_deferred(reply)
-        }
-    }
-}
-
-async fn dispatch_from_shim_inner(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<()> {
-    match cmd {
-        ToolsCommand::Placeholder { reply } => reply_not_implemented(reply),
-        ToolsCommand::TryConsumeHardRateLimit {
-            context_id,
-            did,
-            now_secs,
-            reply,
-        } => {
-            shim_handle_try_consume_hard_rate_limit(supervisor, &context_id, &did, now_secs, reply)
-                .await
-        }
-        ToolsCommand::RefundHardRateLimit {
-            context_id,
-            did,
-            reply,
-        } => shim_handle_refund_hard_rate_limit(supervisor, &context_id, &did, reply).await,
         ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
             reply_saga_deferred(reply)
         }
@@ -168,64 +136,6 @@ async fn handle_refund_hard_rate_limit(
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "refund_hard_rate_limit exceeded {HANDLER_TIMEOUT:?} budget"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_try_consume_hard_rate_limit(
-    supervisor: &Supervisor,
-    context_id: &str,
-    did: &scp_identity::DID,
-    now_secs: u64,
-    reply: oneshot::Sender<Result<bool, ContextError>>,
-) -> Outcome<()> {
-    let consume_fut = crate::context::tools_helpers_legacy::try_consume_hard_rate_limit_legacy(
-        supervisor, context_id, did, now_secs,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, consume_fut).await {
-        Ok(consumed) => {
-            let outcome = if consumed {
-                Outcome::ok_mutated(())
-            } else {
-                Outcome::ok(())
-            };
-            (outcome, Ok(consumed))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "try_consume_hard_rate_limit exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_refund_hard_rate_limit(
-    supervisor: &Supervisor,
-    context_id: &str,
-    did: &scp_identity::DID,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    let refund_fut = crate::context::tools_helpers_legacy::refund_hard_rate_limit_legacy(
-        supervisor, context_id, did,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, refund_fut).await {
-        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "refund_hard_rate_limit exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))

@@ -34,11 +34,7 @@
 //!   [`Supervisor`](crate::context::supervisor::Supervisor), or
 //! - `supervisor.X_ref()` accessor calls for the provider slots already
 //!   lifted to [`Supervisor`](crate::context::supervisor::Supervisor) in
-//!   ADR-049 commit 12c.9a/9b, or
-//! - `mgr.next_generation_ref()` for the `AtomicU64` generation counter
-//!   that has not yet been lifted to the supervisor (the
-//!   `next_generation` field disappears in 12c.9g.4 alongside
-//!   `ContextManager` itself).
+//!   ADR-049 commit 12c.9a/9b.
 //!
 //! The legacy inherent methods on
 //! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
@@ -57,7 +53,6 @@
 //! - [`get_context_arc_pub`] — `pub(crate)` variant for the query shim.
 //!
 //! Per-context map mutations:
-//! - [`insert_context`] — register a fresh context (stamps generation).
 //! - [`remove_context`] — drop a context from the map.
 //!
 //! Persistence shortcuts:
@@ -69,10 +64,8 @@
 //! Broadcast bootstrapping:
 //! - [`init_broadcast_context`] — create + persist initial broadcast state.
 //!
-//! Operational metrics + audit:
+//! Operational metrics:
 //! - [`update_context_gauges`] — refresh active-contexts + buffer-occupancy gauges.
-//! - [`record_payment_capture_failure`] — append `PaymentCaptureFailed` to the
-//!   event log + push the corresponding `ContextEvent`.
 
 use std::sync::Arc;
 
@@ -84,7 +77,6 @@ use scp_protocol::context::broadcast::{
     BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
 };
 use scp_protocol::context::builder::ContextCreationError;
-use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::{ContextMode, TemplateId};
 use tokio::sync::Mutex;
 
@@ -202,47 +194,6 @@ pub fn get_context_arc(
         .get(context_id)
         .map(|entry| Arc::clone(entry.value()))
         .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))
-}
-
-// ---------------------------------------------------------------------------
-// 4. insert_context
-// ---------------------------------------------------------------------------
-
-/// Insert a new context, stamping a fresh generation ID.
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::insert_context`](crate::context::supervisor::Supervisor::insert_context)
-/// (ADR-049 commit 12). Byte-identical behavior.
-///
-/// The `next_generation` counter is still owned by `ContextManager`
-/// (it disappears in 12c.9g.4 alongside the manager itself), so the
-/// hoisted body reaches it via `mgr.next_generation_ref()`.
-///
-/// # Errors
-///
-/// Returns [`ContextCreationError::CreationFailed`] if `context_id` is
-/// already registered.
-#[allow(clippy::needless_pass_by_value)] // DashMap::entry takes ownership
-pub fn insert_context(
-    supervisor: &Supervisor,
-    context_id: String,
-    mut state: PerContextState,
-) -> Result<(), ContextCreationError> {
-    use dashmap::mapref::entry::Entry;
-    let contexts = supervisor.contexts_ref();
-    let generation = supervisor
-        .next_generation_ref()
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state.generation = generation;
-    match contexts.entry(context_id.clone()) {
-        Entry::Occupied(_) => Err(ContextCreationError::CreationFailed(format!(
-            "context '{context_id}' already registered"
-        ))),
-        Entry::Vacant(v) => {
-            v.insert(Arc::new(Mutex::new(state)));
-            Ok(())
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,71 +429,6 @@ pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: 
         if let Some(ref bcs) = bc_snapshot {
             persist_broadcast_snapshot(supervisor, context_id, bcs);
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 13. record_payment_capture_failure
-// ---------------------------------------------------------------------------
-
-/// Appends a `PaymentCaptureFailed` entry to the event log and pushes a
-/// matching [`ContextEvent::PaymentCaptureFailed`] to the receive buffer.
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::record_payment_capture_failure`](crate::context::supervisor::Supervisor::record_payment_capture_failure)
-/// (ADR-049 commit 12). Byte-identical behavior.
-///
-/// Called by `capture_send_payment` and `capture_join_payment` when the
-/// payment adapter returns an error after a successful action (H19 audit
-/// trail). The budget deduction is NOT reversed — service was rendered
-/// (H8).
-///
-/// # Errors on event-log append
-///
-/// If the event log append fails, a warning is logged but the method
-/// does not propagate the error (best-effort, same as the outer capture).
-pub async fn record_payment_capture_failure(
-    supervisor: &Supervisor,
-    context_id: &str,
-    action: &str,
-    actor_did: &DID,
-    error_msg: &str,
-    cost: Option<scp_protocol::economy::types::Amount>,
-) {
-    let Some(event_log) = supervisor.event_log_ref() else {
-        tracing::error!(
-            context_id,
-            "record_payment_capture_failure: Supervisor has no event log; skipping"
-        );
-        return;
-    };
-    let context_id_bytes = context_id_to_bytes(context_id);
-    let payload = serde_json::json!({
-        "action": action,
-        "error": error_msg,
-        "cost": cost.map(scp_protocol::economy::types::Amount::value),
-    });
-    if let Err(log_err) = event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        "PaymentCaptureFailed",
-        actor_did.as_ref(),
-        Some(&payload),
-    ) {
-        tracing::warn!(
-            context_id,
-            "failed to append PaymentCaptureFailed to event log: {log_err}"
-        );
-    }
-    if let Ok(arc) = get_context_arc(supervisor, context_id) {
-        let mut ctx = arc.lock().await;
-        ctx.checkpoint_events_since += 1;
-        let event = ContextEvent::PaymentCaptureFailed {
-            action: action.to_owned(),
-            actor_did: actor_did.clone(),
-            error: error_msg.to_owned(),
-            cost: cost.map(scp_protocol::economy::types::Amount::value),
-        };
-        ctx.emit_event(event, context_id, supervisor.event_tx_ref());
     }
 }
 

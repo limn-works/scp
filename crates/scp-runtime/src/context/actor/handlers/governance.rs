@@ -11,10 +11,9 @@
 //! helpers in
 //! [`crate::context::governance_helpers`](crate::context::governance_helpers).
 //! The migration-window shim — `dispatch_from_shim` and the
-//! supervisor-shape `handle_*` helpers that delegated to
-//! `crate::context::governance_helpers_legacy::*_legacy` — has been
-//! deleted at Phase 2A finalization. The `Placeholder` variant remains
-//! as the mailbox-test handshake target.
+//! supervisor-shape `handle_*` helpers — has been deleted at Phase 2A
+//! finalization. The `Placeholder` variant remains as the mailbox-test
+//! handshake target.
 //!
 //! # Transport-timeout budget
 //!
@@ -1144,7 +1143,7 @@ async fn handle_evaluate_timeouts_actor(
     );
 
     // Phase 2: translate timeout events.
-    let ctx_events = crate::context::governance_helpers_legacy::translate_timeout_events_legacy(
+    let ctx_events = crate::context::governance_helpers::translate_timeout_events(
         &result.events,
         mls_epoch,
         &conditions,

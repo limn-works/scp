@@ -225,43 +225,6 @@ pub struct CommitFaultMarker {
 }
 
 // ---------------------------------------------------------------------------
-// Welcome event helper
-// ---------------------------------------------------------------------------
-
-/// Pushes a [`ContextEvent::WelcomeGenerated`] event to the receive buffer
-/// if the `AddMemberOutput` contains a non-empty Welcome message.
-///
-/// Used by both `join_context` and `execute_add_member` to avoid
-/// duplicating the emission logic.
-pub(crate) fn push_welcome_event(
-    ctx: &mut PerContextState,
-    context_id: &str,
-    creator_did: &DID,
-    member_did: &DID,
-    add_output: scp_protocol::context::builder::AddMemberOutput,
-    event_tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
-) {
-    if !add_output.welcome_bytes.is_empty() {
-        emit_event_into(
-            &mut ctx.receive_buffer,
-            ContextEvent::WelcomeGenerated {
-                context_id: context_id.to_owned(),
-                creator_did: creator_did.clone(),
-                member_did: member_did.clone(),
-                welcome_bytes: scp_protocol::context::membership::RedactedBytes(
-                    add_output.welcome_bytes,
-                ),
-                commit_bytes: scp_protocol::context::membership::RedactedBytes(
-                    add_output.commit_bytes,
-                ),
-            },
-            context_id,
-            event_tx,
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // PendingCeilingModification (M7)
 // ---------------------------------------------------------------------------
 

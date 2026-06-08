@@ -474,8 +474,9 @@ pub fn enforce_economy(
 
 /// Bundle of per-DID economy state that Phase 1 of a paid action took
 /// ownership of. Every ticket **must** be consumed by either
-/// [`commit_economy_ticket`] (success path) or [`rollback_economy_ticket`]
-/// (failure path). Dropping a ticket without consuming it leaks budget
+/// [`commit_economy_ticket`] (success path) or
+/// [`rollback_economy_ticket_inline`] (failure path). Dropping a ticket
+/// without consuming it leaks budget
 /// deduction, a velocity entry, and a hard-rate-limit token — the
 /// `#[must_use]` attribute makes this a compile-time warning, and the
 /// `Drop` impl logs + debug-asserts so unit tests fail loudly.
@@ -567,50 +568,6 @@ pub fn rollback_economy_ticket_inline(
     }
 }
 
-/// Rolls back every piece of state the ticket represents: the budget
-/// deduction, the velocity entry (via its rollback token, so we do not
-/// race concurrent senders), and the hard-rate-limit token (when the
-/// Phase 1 path consumed one).
-///
-/// Re-acquires the `contexts` lock internally so this is safe to call
-/// from Phase 2 (off-lock) error paths. If the context has been
-/// deregistered between Phase 1 and rollback (unusual), the rollback
-/// is a best-effort no-op — the ticket is still marked consumed so
-/// the `Drop` guard does not fire.
-///
-/// Verifies the generation counter to detect confused-deputy scenarios
-/// where the context was removed and recreated between Phase 1 and
-/// rollback (Phase B).
-#[allow(clippy::significant_drop_tightening)]
-pub async fn rollback_economy_ticket(
-    supervisor: &crate::context::supervisor::Supervisor,
-    context_id: &str,
-    mut ticket: EconomyTicket,
-    ctx_gen: &super::state::ContextGeneration,
-) {
-    ticket.consumed = true;
-    if let Ok(mut guard) =
-        crate::context::manager_methods::relock_context(supervisor, ctx_gen).await
-    {
-        let ctx = &mut *guard;
-        ctx.governance
-            .velocity_tracker
-            .rollback(&ticket.actor_did, ticket.velocity_token);
-        if ticket.needs_hard_rate_limit_refund {
-            ctx.governance.hard_rate_limit.refund(&ticket.actor_did);
-        }
-        if let Some(cost) = ticket.deducted_cost {
-            ctx.governance
-                .budget_tracker
-                .reverse_spend(&ticket.actor_did, cost);
-        }
-    } else {
-        tracing::warn!(
-            context_id,
-            "rollback_economy_ticket: generation mismatch — skipping rollback"
-        );
-    }
-}
 pub fn rand_idempotency_key() -> [u8; 16] {
     *uuid::Uuid::new_v4().as_bytes()
 }

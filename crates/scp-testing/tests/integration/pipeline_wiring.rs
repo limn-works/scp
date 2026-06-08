@@ -34,20 +34,15 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/governance_logic.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers_legacy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/governance_helpers_legacy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/standing_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/tools_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/tools_helpers_legacy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers_legacy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/queries_helpers_legacy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/trust_recovery_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/ttl_close_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/ttl_close_helpers_legacy.rs"),
 );
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");

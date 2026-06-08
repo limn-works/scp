@@ -167,14 +167,9 @@ pub const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
 // translate_timeout_events (pure)
 // ---------------------------------------------------------------------------
 
-// `translate_timeout_events` (the actor-shape twin of
-// `governance_helpers_legacy::translate_timeout_events_legacy`) is
-// intentionally NOT migrated yet. The only production caller is the
-// supervisor-scoped governance timeout task
-// (`start_governance_timeout_task_legacy`), which inherently iterates
-// the contexts `DashMap` and stays legacy-shape until the per-context
-// actor periodic-tick lands in Phase 2A.9. When that migration lands,
-// the actor-shape twin can be re-introduced here next to its consumer.
+// `translate_timeout_events` (the actor-shape timeout-event translator)
+// is defined at the bottom of this module and driven by the per-context
+// actor's governance timeout handler.
 
 // ---------------------------------------------------------------------------
 // Read entry points
@@ -956,9 +951,7 @@ pub fn execute_add_member(
         deps,
     );
 
-    // push_welcome_event still works on legacy `state::PerContextState`,
-    // but the actor `PerContextState` and legacy share `receive_buffer`,
-    // `emit_event`-equivalent paths. Do the equivalent inline.
+    // Emit the WelcomeGenerated event inline against actor-owned state.
     if !add_output.welcome_bytes.is_empty() {
         emit(
             state,
@@ -2603,16 +2596,10 @@ pub async fn propose_governance_action_inner(
         ));
     }
 
-    // Eligibility check (#1530). check_proposer_eligibility takes legacy
-    // `&mut PerContextState`; the actor `PerContextState` shares the
-    // same `governance` field so we can construct an inline check via
-    // the same field set. To avoid a cross-state-type call, inline the
-    // logic by calling participation/pending-removal helpers from the
-    // governance crate. For Phase 2A.8 we keep the eligibility check
-    // through a split-borrow construction by reaching into governance
-    // helpers directly — but `check_proposer_eligibility` is the only
-    // entry point for the composite check. Provide an actor-shape
-    // adaptation by inlining the body here.
+    // Eligibility check (#1530). The composite proposer-eligibility gate
+    // (pending-removal + participation threshold + earned-capacity rate
+    // limit) runs against actor-owned `&mut PerContextState` via
+    // `actor_check_proposer_eligibility`.
     actor_check_proposer_eligibility(state, proposer_did, deps.clock.now_secs(), &*deps.event_log)?;
 
     // SCP-272: Check and auto-resolve expired governance freezes.
@@ -2715,13 +2702,9 @@ pub async fn propose_governance_action_inner(
     Ok((proposal, events, execution_result))
 }
 
-/// Actor-shape adaptation of
-/// [`crate::context::governance_logic::check_proposer_eligibility`].
-/// The shared helper takes `&mut crate::context::state::PerContextState`,
-/// which the actor cannot construct from its own
-/// `actor::state::PerContextState`. Inline the same composite
-/// pending-removal + `SingleAdmin` bypass + participation gate +
-/// earned-capacity gate against the actor-owned fields.
+/// Composite proposer-eligibility gate running against actor-owned
+/// `PerContextState`: pending-removal defense-in-depth, `SingleAdmin`
+/// bypass, participation-threshold gate, and earned-capacity rate limit.
 #[allow(clippy::too_many_lines)]
 fn actor_check_proposer_eligibility(
     state: &mut PerContextState,
@@ -2846,9 +2829,8 @@ fn actor_check_proposer_eligibility(
 // propose_governance_action (entry point — unchecked) — NOT MIGRATED
 // ---------------------------------------------------------------------------
 //
-// Unchecked actor-shape twin of
-// `governance_helpers_legacy::propose_governance_action_legacy` is not
-// migrated here yet. Production callers always route through
+// The unchecked actor-shape twin of `propose_governance_action` is not
+// provided here. Production callers always route through
 // `propose_governance_action_checked` because spec §5.9 capability
 // suspension overlays must apply on the propose path. The unchecked
 // variant exists in the legacy module for the supervisor passthrough
@@ -3016,9 +2998,8 @@ pub async fn vote_on_proposal_inner(
     Ok((status, events))
 }
 
-// `vote_on_proposal` (the unchecked actor-shape twin of
-// `governance_helpers_legacy::vote_on_proposal_legacy`) is not
-// migrated here yet. Production callers always route through
+// The unchecked actor-shape twin of `vote_on_proposal` is not provided
+// here. Production callers always route through
 // `approve_governance_proposal` / `reject_governance_proposal` because
 // spec §5.9 suspension overlays must apply on the vote path. The
 // unchecked variant exists in the legacy module for the supervisor
@@ -4120,4 +4101,82 @@ pub async fn start_governance_timeout_task(
             "start_governance_timeout_task: actor reported timeout-task install failure"
         );
     }
+}
+
+/// Translates governance timeout events into [`ContextEvent`]s for the
+/// receive buffer.
+///
+/// Pure transform over the timeout-processing outputs: it reads only the
+/// resolved [`GovernanceEvent`] slice, the MLS epoch, the detected
+/// deadlock conditions, and the current recovery flag, and produces the
+/// [`ContextEvent`]s to emit. No actor state or supervisor handle is
+/// touched, so it is shared verbatim by the actor-shape timeout path.
+pub fn translate_timeout_events(
+    result_events: &[GovernanceEvent],
+    mls_epoch: u64,
+    conditions: &[crate::context::governance::timeout::DeadlockCondition],
+    recovery_in_progress: bool,
+) -> Vec<ContextEvent> {
+    let mut ctx_events = Vec::new();
+    for event in result_events {
+        let ctx_event = match event {
+            GovernanceEvent::ProposalResolved {
+                proposal_id,
+                status,
+            } => ContextEvent::ProposalTimedOut {
+                proposal_id: *proposal_id,
+                resolution_summary: format!("ProposalResolved({status:?})"),
+                resulting_epoch: Some(mls_epoch),
+            },
+            GovernanceEvent::VoteWithdrawn {
+                proposal_id,
+                voter_did,
+            } => ContextEvent::VoteWithdrawn {
+                proposal_id: *proposal_id,
+                voter_did: voter_did.clone(),
+            },
+            GovernanceEvent::GovernanceActionExecuted {
+                proposal_id,
+                action,
+                executor_did,
+                resulting_epoch,
+            } => ContextEvent::GovernanceActionExecuted {
+                proposal_id: *proposal_id,
+                action_summary: action.variant_name().to_owned(),
+                executor_did: executor_did.clone(),
+                resulting_epoch: *resulting_epoch,
+                target_did: action.target_did().cloned(),
+            },
+            // These variants are not expected from timeout processing;
+            // listed explicitly so the compiler warns on new variants.
+            GovernanceEvent::ProposalCreated { .. }
+            | GovernanceEvent::VoteCast { .. }
+            | GovernanceEvent::DeadlockRecovery { .. }
+            | GovernanceEvent::ConflictDetected { .. }
+            | GovernanceEvent::ConflictResolved { .. } => continue,
+        };
+        ctx_events.push(ctx_event);
+    }
+
+    if !conditions.is_empty() && !recovery_in_progress {
+        for condition in conditions {
+            let summary = match condition {
+                crate::context::governance::timeout::DeadlockCondition::ThresholdInsufficient {
+                    ..
+                } => "ThresholdInsufficient",
+                crate::context::governance::timeout::DeadlockCondition::MajorityUnresponsive {
+                    ..
+                } => "MajorityUnresponsive",
+                crate::context::governance::timeout::DeadlockCondition::UnanimityOffline {
+                    ..
+                } => "UnanimityOffline",
+            };
+            ctx_events.push(ContextEvent::DeadlockDetected {
+                condition_summary: summary.to_owned(),
+                resulting_epoch: Some(mls_epoch),
+            });
+        }
+    }
+
+    ctx_events
 }

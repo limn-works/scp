@@ -3,15 +3,11 @@
 //! in ADR-049 commit 12.
 
 use scp_identity::DID;
-use scp_protocol::context::ContextError;
-use scp_protocol::context::governance::GovernanceAction;
 use scp_protocol::context::membership::{ContextEvent, MembershipState, ReceiveBuffer};
-use scp_protocol::context::params::{Capability, GovernanceModel};
+use scp_protocol::context::params::Capability;
 use scp_protocol::context::roles;
 use scp_protocol::context::roles::ContextRoleState;
-use scp_protocol::trust::consequence::{
-    ConsequenceRule, TriggeredConsequence, evaluate_consequence_rules,
-};
+use scp_protocol::trust::consequence::{ConsequenceRule, TriggeredConsequence};
 
 use super::state::{GovernanceState, PerContextState, context_id_to_bytes, emit_event_into};
 
@@ -23,65 +19,6 @@ use super::state::{GovernanceState, PerContextState, context_id_to_bytes, emit_e
 // lived here for a legacy forwarder are gone — the active definitions are in
 // `governance_helpers.rs` (the `process_pending_commits` retry pipeline).
 // Removed in the post-review-round-1 phase 1 fix-up of ADR-049.
-
-/// Evaluates consequence rules against a member and dispatches enforcement
-/// actions (capability suspension, access revocation, role demotion).
-///
-/// Emits `ConsequenceTriggered` and `ConsequenceEnforced` events to the
-/// receive buffer for SDK observability (ADR-017, #1531).
-///
-/// This is a convenience entry point that evaluates rules and enforces the
-/// results. For callers that need the evaluate step visible in their own
-/// file (pipeline wiring gates), use [`evaluate_consequence_rules`] +
-/// [`enforce_triggered_consequences`] directly.
-///
-/// Time-based consequences (rules that should trigger after a duration of
-/// inactivity) are also evaluated by the governance timeout task's periodic
-/// tick (Phase 4 in [`start_governance_timeout_task`](ContextManager::start_governance_timeout_task)),
-/// so they fire even when no user action occurs (#1531).
-pub fn dispatch_consequences(
-    ctx: &mut PerContextState,
-    context_id: &str,
-    member_did: &DID,
-    now: u64,
-    clock: &dyn scp_primitives::Clock,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-    event_tx: Option<
-        &tokio::sync::broadcast::Sender<(String, scp_protocol::context::membership::ContextEvent)>,
-    >,
-) {
-    if ctx.governance.consequence_rules.is_empty() {
-        return;
-    }
-
-    // Clone rules to release the borrow on ctx before mutating it.
-    let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
-
-    // Collect event log entries for consequence evaluation (ADR-017).
-    let events =
-        event_log_entries_for_consequences(&ctx.receive_buffer, context_id, now, event_log);
-
-    // Evaluate which consequences are triggered.
-    let triggered: Vec<TriggeredConsequence> =
-        evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
-
-    // Enforce the triggered consequences, passing the already-cloned rules
-    // to avoid cloning again inside enforce_triggered_consequences.
-    let mut split = ConsequenceStateSplit::from_state(ctx);
-    enforce_triggered_consequences(
-        &mut split,
-        &EnforceConsequencesCtx {
-            context_id,
-            member_did,
-            now,
-            triggered: &triggered,
-            rules: &rules,
-            clock,
-            event_log,
-            event_tx,
-        },
-    );
-}
 
 /// Synthetic actor DID recorded for durable consequence event log entries
 /// (H4, PR #1606). Consequence enforcement is performed by the local node's
@@ -871,152 +808,4 @@ pub fn event_log_entries_for_consequences(
         });
     }
     events
-}
-
-/// Checks whether a proposer is eligible to submit a governance proposal.
-///
-/// Composite gate combining independent eligibility signals:
-/// 1. **Pending removal** — defense-in-depth: members with an approved
-///    `RemoveMember` proposal targeting them cannot submit new proposals.
-/// 2. **Participation threshold** — members whose participation record
-///    shows a net-negative governance ratio (more actions against than by)
-///    are blocked. See [`scp_protocol::trust::participation::meets_threshold`].
-///
-/// Refreshes the participation cache before checking by calling
-/// `compute_participation_record` with recent events from the receive buffer.
-///
-/// Note: "standing" in the spec refers to persistent bilateral contact-graph
-/// contexts (§5.12.4-6), which is unrelated to this check. Do not reuse the
-/// word for the participation/eligibility model.
-pub fn check_proposer_eligibility(
-    ctx: &mut PerContextState,
-    proposer_did: &DID,
-    now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-) -> Result<(), ContextError> {
-    // Check for pending ejection (existing defense-in-depth).
-    for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
-        if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
-            && did == proposer_did
-        {
-            return Err(ContextError::PermissionDenied(
-                "member has a pending ejection — cannot propose governance actions".into(),
-            ));
-        }
-    }
-
-    // SingleAdmin: the sole authority is always eligible. Participation
-    // thresholds and earned capacity limits are multi-party governance
-    // concepts — rate-limiting the only admin is nonsensical.
-    if matches!(ctx.handle.params().governance, GovernanceModel::SingleAdmin) {
-        return Ok(());
-    }
-
-    // Refresh participation record from recent events before checking the
-    // participation threshold (#1530). Skip recomputation if a cached record
-    // already exists — the cache is populated on first check and updated when
-    // participation events occur (messaging, governance, tools, lifecycle).
-    let context_id = ctx.handle.context_id().to_owned();
-    if !ctx
-        .governance
-        .participation_cache
-        .contains_key(proposer_did.as_ref())
-    {
-        let context_id_bytes = context_id_to_bytes(&context_id);
-        let merkle_root = event_log
-            .event_log_merkle_root(&context_id_bytes)
-            .unwrap_or([0u8; 32]);
-        let events =
-            event_log_entries_for_consequences(&ctx.receive_buffer, &context_id, now, event_log);
-        if !events.is_empty() {
-            match scp_protocol::trust::participation::compute_participation_record(
-                &events,
-                proposer_did.as_ref(),
-                &context_id,
-                merkle_root,
-                now,
-            ) {
-                Err(e) => {
-                    // Fail-closed: if participation record computation fails,
-                    // log a warning and deny the proposal. This prevents
-                    // silently passing members with corrupted participation data.
-                    tracing::warn!(
-                        proposer = %proposer_did,
-                        error = %e,
-                        "compute_participation_record failed — denying proposal"
-                    );
-                    return Err(ContextError::PermissionDenied(
-                    "SCP-GOV-11021: participation record computation failed — cannot verify proposer eligibility"
-                        .into(),
-                ));
-                }
-                Ok(record) => {
-                    // Participation evaluation uses participation_count and
-                    // governance_actions to determine eligibility (#1530).
-                    // Only cache records with actual participation — new members
-                    // with zero participation should not be blocked before they
-                    // participate.
-                    if record.participation_count > 0 {
-                        tracing::trace!(
-                            participation_count = record.participation_count,
-                            governance_actions_by = record.governance_actions_by.len(),
-                            governance_actions_against = record.governance_actions_against.len(),
-                            "participation evaluation for proposer"
-                        );
-                        ctx.governance
-                            .participation_cache
-                            .insert(proposer_did.to_string(), record);
-                    }
-                }
-            }
-        }
-    } // end if !participation_cache.contains_key
-
-    // Check participation records for eligibility (#1530).
-    if let Some(record) = ctx
-        .governance
-        .participation_cache
-        .get(proposer_did.as_ref())
-        && !scp_protocol::trust::participation::meets_threshold(record)
-    {
-        return Err(ContextError::PermissionDenied(
-            "member participation below threshold — cannot propose governance actions (SCP-GOV-11020)"
-                .into(),
-        ));
-    }
-
-    // Earned capacity enforcement (§9.3): when the context has a sybil_policy,
-    // evaluate the proposer's identity depth to determine their governance
-    // proposal rate limit, then check recent proposals against that limit.
-    if let Some(sybil_policy) = ctx.handle.params().sybil_policy.as_ref() {
-        let assessment =
-            super::lifecycle_logic::build_identity_assessment(proposer_did, &ctx.governance, now);
-        let (_level, capacity) =
-            scp_protocol::trust::sybil::evaluate_earned_capacity(&assessment, sybil_policy, now);
-
-        let window_secs = capacity.governance_proposal_window_secs;
-        let max_proposals = capacity.max_governance_proposals_per_window;
-        let window_start = now.saturating_sub(window_secs);
-
-        // Count proposals within the sliding window for this member.
-        let timestamps = ctx
-            .governance
-            .proposal_timestamps
-            .entry(proposer_did.to_string())
-            .or_default();
-
-        // Evict stale entries outside the window.
-        timestamps.retain(|&ts| ts > window_start);
-
-        #[allow(clippy::cast_possible_truncation)]
-        let recent_count = timestamps.len() as u32;
-        if recent_count >= max_proposals {
-            return Err(ContextError::PermissionDenied(format!(
-                "earned capacity limit reached: {recent_count}/{max_proposals} governance proposals \
-                 in {window_secs}s window (SCP-GOV-11030)"
-            )));
-        }
-    }
-
-    Ok(())
 }

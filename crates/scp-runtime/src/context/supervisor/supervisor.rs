@@ -48,7 +48,6 @@ use crate::context::actor::commands::{
     TtlCloseCommand,
 };
 use crate::context::actor::handle::ContextActorHandle;
-use crate::context::actor::handlers;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
@@ -264,7 +263,7 @@ pub struct Supervisor {
     // helpers that consult them either soft-fallback or surface
     // `ContextError::NotInitialized`. The supervisor-authoritative
     // direct fields below (`contexts`, `local_dids`,
-    // `standing_contexts`, `next_generation`) are eagerly initialized
+    // `standing_contexts`) are eagerly initialized
     // in [`Self::new`] and their accessors do not return `Option`.
     // -----------------------------------------------------------------
     /// Shared crypto provider. Populated by [`Self::with_providers`].
@@ -315,16 +314,10 @@ pub struct Supervisor {
     // [`Self::new`].
     // -----------------------------------------------------------------
     /// Shared per-context state map. Eagerly initialized in
-    /// [`Self::new`] as an empty `Arc<DashMap>`; subsequent inserts
-    /// land via [`crate::context::manager_methods::insert_context`].
+    /// [`Self::new`] as an empty `Arc<DashMap>`. Retained for the
+    /// designated-legacy sync-FFI tools rate-limit path
+    /// (`tools_helpers_legacy`) until the tools migration lands.
     contexts: Arc<ContextsMap>,
-    /// Global monotonic counter for assigning generation IDs to
-    /// contexts. Starts at 1 so generation 0 (the `#[serde(default)]`
-    /// value for legacy snapshots) is never actively assigned.
-    /// Incremented with `Relaxed` ordering — uniqueness is guaranteed
-    /// by the `fetch_add` atomicity, and no other memory accesses
-    /// depend on the ordering.
-    next_generation: std::sync::atomic::AtomicU64,
 
     /// Concurrent-saga guard. `true` iff a saga is currently in flight
     /// (Initiated / PreparingA / PreparingB / Committing). A second
@@ -398,7 +391,6 @@ impl Supervisor {
             mls_storage: OnceLock::new(),
             // ADR-049 commit 12 — direct authoritative state.
             contexts: Arc::new(DashMap::new()),
-            next_generation: std::sync::atomic::AtomicU64::new(1),
             saga_pending_guard: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -549,7 +541,7 @@ impl Supervisor {
     // touch providers).
     //
     // Direct-state accessors (`contexts_ref`, `contexts_arc`,
-    // `local_dids_ref`, `standing_contexts_ref`, `next_generation_ref`)
+    // `local_dids_ref`, `standing_contexts_ref`)
     // return non-Option references — the underlying fields are eagerly
     // initialized in [`Self::new`] and always populated.
     //
@@ -686,13 +678,6 @@ impl Supervisor {
     #[must_use]
     pub(crate) const fn standing_contexts_ref(&self) -> &ArcSwap<HashMap<String, DID>> {
         &self.standing_contexts
-    }
-
-    /// Cheap reference to the supervisor's monotonic generation
-    /// counter. Always populated (initialized to 1 in [`Self::new`]).
-    #[must_use]
-    pub(crate) const fn next_generation_ref(&self) -> &std::sync::atomic::AtomicU64 {
-        &self.next_generation
     }
 
     // -------------------------------------------------------------------
@@ -1173,7 +1158,6 @@ impl Supervisor {
     /// method only when no actor is registered for the target context.
     #[allow(clippy::too_many_lines)] // flat match over every lifecycle variant
     async fn dispatch_lifecycle_direct(self: &Arc<Self>, cmd: LifecycleCommand) -> Outcome<()> {
-        use crate::context::lifecycle_helpers_legacy;
         const LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
@@ -1370,247 +1354,58 @@ impl Supervisor {
                 let _ = reply.send(reply_result);
                 outcome
             }
-            // Per-context variants reach this arm only when no actor
-            // is registered for the target context. The remaining legacy
-            // bootstrap caller (`governance_helpers_legacy::execute_create_child_context_legacy`)
-            // creates contexts via `create_context_legacy` which inserts
-            // into the supervisor's contexts `DashMap` but does NOT
-            // spawn an actor — that caller will be migrated to the
-            // actor-shape bootstrap in a subsequent finalization
-            // session. Until then, this arm uses the designated-legacy
-            // per-context helpers to operate on the DashMap-borrowed
-            // state directly. Each variant carries the same 30s
-            // timeout as the actor path.
+            // Per-context variants reach this arm only when no actor is
+            // registered for the target context. Post-Step-B, every valid
+            // context has a registered actor and these variants are
+            // mailbox-dispatched to the per-context actor-shape handlers
+            // (Join/Leave/Close/Export/access-key all exist on the actor).
+            // The supervisor-side direct path is therefore reached ONLY for
+            // an unregistered context, which is by definition not registered
+            // — surface a typed `ContextNotRegistered` on the reply oneshot
+            // and return a matching error `Outcome` (mirrors the
+            // `FlushSnapshot`/`ShutdownSelf` never-should-reach arms).
             LifecycleCommand::JoinContext { payload, reply } => {
-                let p = *payload;
-                let context_id = p.context_id.clone();
-                let handle = crate::context::ContextHandle::new(p.context_id, p.params);
-                if let Err(e) = handle
-                    .transition_to(&scp_protocol::context::ContextState::Active)
-                    .await
-                {
-                    let sketch = standing_outcome_error_sketch(&e);
-                    let _ = reply.send(Err(e));
-                    return Outcome::err(sketch);
-                }
-                let fut = lifecycle_helpers_legacy::join_context_legacy(
-                    self,
-                    &handle,
-                    p.key_package,
-                    p.spending_ucan.as_ref(),
-                    p.local_pseudonym,
-                );
-                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
-                    .await
-                {
-                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
-                    Ok(Err(e)) => {
-                        let sketch = standing_outcome_error_sketch(&e);
-                        (Outcome::err_mutated(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "join_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = standing_outcome_error_sketch(&err);
-                        (Outcome::err_mutated(sketch), Err(err))
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
             }
             LifecycleCommand::LeaveContext { payload, reply } => {
-                let p = *payload;
-                let context_id = p.context_id.clone();
-                let handle = crate::context::ContextHandle::new(p.context_id, p.params);
-                if let Err(e) = handle
-                    .transition_to(&scp_protocol::context::ContextState::Active)
-                    .await
-                {
-                    let sketch = standing_outcome_error_sketch(&e);
-                    let _ = reply.send(Err(e));
-                    return Outcome::err(sketch);
-                }
-                let fut = lifecycle_helpers_legacy::leave_context_legacy(
-                    self,
-                    &handle,
-                    &p.caller_did,
-                    &p.member_did,
-                );
-                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
-                    .await
-                {
-                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
-                    Ok(Err(e)) => {
-                        let sketch = standing_outcome_error_sketch(&e);
-                        (Outcome::err_mutated(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "leave_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = standing_outcome_error_sketch(&err);
-                        (Outcome::err_mutated(sketch), Err(err))
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
             }
             LifecycleCommand::CloseContext { payload, reply } => {
-                let p = *payload;
-                let context_id = p.context_id.clone();
-                let handle = crate::context::ContextHandle::new(p.context_id, p.params);
-                if let Err(e) = handle
-                    .transition_to(&scp_protocol::context::ContextState::Active)
-                    .await
-                {
-                    let sketch = standing_outcome_error_sketch(&e);
-                    let _ = reply.send(Err(e));
-                    return Outcome::err(sketch);
-                }
-                let fut =
-                    lifecycle_helpers_legacy::close_context_legacy(self, &handle, &p.initiator_did);
-                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
-                    .await
-                {
-                    Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
-                    Ok(Err(e)) => {
-                        let sketch = standing_outcome_error_sketch(&e);
-                        (Outcome::err_mutated(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "close_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = standing_outcome_error_sketch(&err);
-                        (Outcome::err_mutated(sketch), Err(err))
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
             }
             LifecycleCommand::ExportContext {
-                context_id,
-                exporter_did,
-                reply,
+                context_id, reply, ..
             } => {
-                let fut = lifecycle_helpers_legacy::export_context_legacy(
-                    self,
-                    &context_id,
-                    exporter_did,
-                );
-                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
-                    .await
-                {
-                    Ok(Ok(export)) => (Outcome::ok(()), Ok(export)),
-                    Ok(Err(e)) => {
-                        let sketch = standing_outcome_error_sketch(&e);
-                        (Outcome::err(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "export_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = standing_outcome_error_sketch(&err);
-                        (Outcome::err(sketch), Err(err))
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
             }
+            // The access-key trio shares the same `{ context_id, reply, .. }`
+            // shape and the same `Result<(), _>` reply, so they collapse
+            // into one arm.
             LifecycleCommand::GenerateContextAccessKey {
-                context_id,
-                member_did,
-                caller_did,
-                reply,
-            } => {
-                let fut =
-                    crate::context::queries_helpers_legacy::generate_context_access_key_legacy(
-                        self,
-                        &context_id,
-                        &member_did,
-                        &caller_did,
-                    );
-                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
-                    .await
-                {
-                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
-                    Ok(Err(e)) => {
-                        let sketch = standing_outcome_error_sketch(&e);
-                        (Outcome::err_mutated(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "generate_context_access_key exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = standing_outcome_error_sketch(&err);
-                        (Outcome::err_mutated(sketch), Err(err))
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                context_id, reply, ..
             }
-            LifecycleCommand::RevokeContextAccessKey {
-                context_id,
-                member_did,
-                caller_did,
-                reply,
-            } => {
-                let fut = crate::context::queries_helpers_legacy::revoke_context_access_key_legacy(
-                    self,
-                    &context_id,
-                    &member_did,
-                    &caller_did,
-                );
-                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
-                    .await
-                {
-                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
-                    Ok(Err(e)) => {
-                        let sketch = standing_outcome_error_sketch(&e);
-                        (Outcome::err_mutated(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "revoke_context_access_key exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = standing_outcome_error_sketch(&err);
-                        (Outcome::err_mutated(sketch), Err(err))
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+            | LifecycleCommand::RevokeContextAccessKey {
+                context_id, reply, ..
             }
-            LifecycleCommand::RestoreContextAccessKey {
-                context_id,
-                member_did,
-                caller_did,
-                reply,
+            | LifecycleCommand::RestoreContextAccessKey {
+                context_id, reply, ..
             } => {
-                let fut = crate::context::queries_helpers_legacy::restore_context_access_key_legacy(
-                    self,
-                    &context_id,
-                    &member_did,
-                    &caller_did,
-                );
-                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
-                    .await
-                {
-                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
-                    Ok(Err(e)) => {
-                        let sketch = standing_outcome_error_sketch(&e);
-                        (Outcome::err_mutated(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "restore_context_access_key exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = standing_outcome_error_sketch(&err);
-                        (Outcome::err_mutated(sketch), Err(err))
-                    }
-                };
-                let _ = reply.send(reply_result);
-                outcome
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
             }
             // Sweep variants are dispatched per-actor by the iterating
             // entry points in `lifecycle_helpers` — they should never
@@ -2617,18 +2412,178 @@ impl Supervisor {
         &self,
         cmd: ToolsCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
+        // Try the actor mailbox first. Post-Step-B every valid context
+        // has a registered actor, so the per-context tools handlers run
+        // on the actor. Reaching the fallback means no actor is
+        // registered for the target context — surface a typed
+        // `ContextNotRegistered` on the command's reply oneshot.
         if let Some(ctx_id) = Self::tools_command_context_id(&cmd)
             && let Some(actor) = self.lookup(ctx_id)
         {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Tools(cmd)).await;
         }
-        // Direct-shim fallback.
-        Ok(handlers::tools::dispatch_from_shim(self, cmd).await)
+        Ok(Self::reply_tools_not_registered(cmd))
     }
 
-    /// Dispatch a [`BroadcastCommand`] through the migration shim
-    /// (ADR-049 commit 11 / plan row 11) for every non-publish variant.
+    /// Reply to a [`ToolsCommand`] whose target context has no registered
+    /// actor with a typed [`ContextError::ContextNotRegistered`] on the
+    /// variant's reply oneshot. Saga-initiator / placeholder variants keep
+    /// their own typed replies.
+    fn reply_tools_not_registered(cmd: ToolsCommand) -> Outcome<()> {
+        match cmd {
+            ToolsCommand::Placeholder { reply } => {
+                const MSG: &str =
+                    "ToolsCommand::Placeholder — handshake target; no production work";
+                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
+                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+            }
+            ToolsCommand::TryConsumeHardRateLimit {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            ToolsCommand::RefundHardRateLimit {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
+                const MSG: &str = "tools::initiate_cross_context_tool_invocation — saga wiring \
+                     deferred to commit 11.5 per 5 enumerated spec gaps; see \
+                     .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 2: cross-context \
+                     tool invocation transport)";
+                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
+                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+            }
+        }
+    }
+
+    /// Reply to a [`BroadcastCommand`] whose target context has no
+    /// registered actor.
+    ///
+    /// Per-context variants (subscribe/unsubscribe/block/unblock/key
+    /// request/queries) get a typed [`ContextError::ContextNotRegistered`]
+    /// on their reply oneshot. The custody-bound publish variants, the
+    /// two-phase reserve/apply/release variants, the saga-initiator
+    /// variant, and the placeholder keep their own typed replies (these
+    /// never reach a per-context actor through this no-custody router).
+    fn reply_broadcast_not_registered(cmd: BroadcastCommand) -> Outcome<()> {
+        match cmd {
+            BroadcastCommand::Placeholder { reply } => {
+                const MSG: &str =
+                    "BroadcastCommand::Placeholder — handshake target; no production work";
+                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
+                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+            }
+            BroadcastCommand::SubscribeBroadcast { payload, reply } => {
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            BroadcastCommand::UnsubscribeBroadcast { payload, reply } => {
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            BroadcastCommand::BlockBroadcastSubscriber { payload, reply } => {
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            BroadcastCommand::UnblockBroadcastSubscriber { payload, reply } => {
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            BroadcastCommand::HandleBroadcastKeyRequest {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            BroadcastCommand::BroadcastSubscriberCount { context_id, reply } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            BroadcastCommand::IsBroadcastSubscriber {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            BroadcastCommand::BroadcastAdmission { context_id, reply } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            // Publish variants require a `KeyCustody` reference that cannot
+            // cross the actor mailbox — route through
+            // `dispatch_broadcast_command_with_custody`. Reaching here means
+            // a caller took the wrong path; surface a typed error.
+            BroadcastCommand::PublishBroadcast { reply, .. } => {
+                const MSG: &str = "BroadcastCommand::PublishBroadcast requires a KeyCustody \
+                     reference; route through \
+                     Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
+                let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
+                Outcome::err(ContextError::InvalidState(MSG.to_owned()))
+            }
+            BroadcastCommand::PublishBroadcastContent { reply, .. } => {
+                const MSG: &str = "BroadcastCommand::PublishBroadcastContent requires a KeyCustody \
+                     reference; route through \
+                     Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
+                let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
+                Outcome::err(ContextError::InvalidState(MSG.to_owned()))
+            }
+            // Two-phase publish requires a per-context actor (the
+            // reservation lives in actor-owned state). No actor → typed
+            // not-registered.
+            BroadcastCommand::ReserveBroadcastPublish { payload, reply } => {
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            BroadcastCommand::ApplyBroadcastPublish { payload, reply } => {
+                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            // No actor → no reservation could have been issued. Idempotent
+            // release: reply Ok so an abort path never errors spuriously.
+            BroadcastCommand::ReleaseBroadcastReservation { reply, .. } => {
+                let _ = reply.send(Ok(()));
+                Outcome::ok(())
+            }
+            BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => {
+                const MSG: &str = "broadcast::initiate_broadcast_hosting_handshake — saga wiring \
+                     deferred to commit 11.5 per 5 enumerated spec gaps; see \
+                     .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 3: broadcast \
+                     hosting handshake protocol)";
+                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
+                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+            }
+        }
+    }
+
+    /// Dispatch a [`BroadcastCommand`] for every non-publish variant.
     ///
     /// Publish variants require a
     /// [`KeyCustody`](scp_platform::KeyCustody) reference that cannot
@@ -2648,14 +2603,17 @@ impl Supervisor {
         &self,
         cmd: BroadcastCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
+        // Try the actor mailbox first. Post-Step-B every valid context
+        // has a registered actor, so the per-context broadcast handlers
+        // run on the actor. Reaching the fallback means no actor is
+        // registered for the target context — surface a typed
+        // `ContextNotRegistered` on the command's reply oneshot.
         if let Some(ctx_id) = Self::broadcast_command_context_id(&cmd)
             && let Some(actor) = self.lookup(ctx_id)
         {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd)).await;
         }
-        // Direct-shim fallback.
-        Ok(Box::pin(handlers::broadcast::dispatch_from_shim(self, cmd)).await)
+        Ok(Self::reply_broadcast_not_registered(cmd))
     }
 
     /// Dispatch a [`BroadcastCommand`] with an explicit key custody
@@ -2745,11 +2703,11 @@ impl Supervisor {
                     return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(other))
                         .await;
                 }
-                // No registered actor — fall through to the no-custody
-                // shim so the typed not-registered error is surfaced.
-                // (Publish variants are handled above and never reach
-                // here; non-publish variants need no custody.)
-                Ok(Box::pin(handlers::broadcast::dispatch_from_shim(self, other)).await)
+                // No registered actor — surface a typed not-registered
+                // error on the command's reply oneshot. (Publish variants
+                // are handled above and never reach here; non-publish
+                // variants need no custody.)
+                Ok(Self::reply_broadcast_not_registered(other))
             }
         }
     }

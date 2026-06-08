@@ -7,8 +7,10 @@
 //! The handler's primary entry point [`dispatch`] takes
 //! `(&mut PerContextState, &ActorDeps, BroadcastCommand)` and routes
 //! non-publish variants through [`crate::context::broadcast_helpers`].
-//! The shim entry points remain during Phase 2A and route through
-//! [`crate::context::broadcast_helpers_legacy`].
+//! Every valid context has a registered per-context actor, so a command
+//! that finds no actor is replied to with a typed
+//! [`ContextError::ContextNotRegistered`](scp_protocol::context::ContextError::ContextNotRegistered)
+//! by the supervisor's no-actor fallback.
 //!
 //! # Publish + key-custody plumbing (two-phase reservation)
 //!
@@ -55,7 +57,6 @@ use crate::context::actor::commands::{
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::PerContextState;
-use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for broadcast handlers.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -75,15 +76,6 @@ pub async fn dispatch(
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
     Box::pin(dispatch_inner(state, deps, cmd)).await
-}
-
-/// Shim-callable dispatch for NON-publish broadcast variants. See the
-/// publish-specific entry points below.
-pub(crate) async fn dispatch_from_shim(
-    supervisor: &Supervisor,
-    cmd: BroadcastCommand,
-) -> Outcome<()> {
-    Box::pin(shim_dispatch_inner_no_custody(supervisor, cmd)).await
 }
 
 async fn dispatch_inner(
@@ -152,95 +144,6 @@ async fn dispatch_inner(
         }
         BroadcastCommand::ReleaseBroadcastReservation { payload, reply } => {
             handle_release_broadcast_reservation(state, *payload, reply)
-        }
-        BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => {
-            reply_saga_deferred(reply)
-        }
-    }
-}
-
-async fn shim_dispatch_inner_no_custody(
-    supervisor: &Supervisor,
-    cmd: BroadcastCommand,
-) -> Outcome<()> {
-    match cmd {
-        BroadcastCommand::Placeholder { reply } => reply_not_implemented(reply),
-        BroadcastCommand::SubscribeBroadcast { payload, reply } => {
-            shim_handle_subscribe_broadcast(supervisor, *payload, reply).await
-        }
-        BroadcastCommand::UnsubscribeBroadcast { payload, reply } => {
-            shim_handle_unsubscribe_broadcast(supervisor, *payload, reply).await
-        }
-        BroadcastCommand::BlockBroadcastSubscriber { payload, reply } => {
-            shim_handle_block_broadcast_subscriber(supervisor, *payload, reply).await
-        }
-        BroadcastCommand::UnblockBroadcastSubscriber { payload, reply } => {
-            shim_handle_unblock_broadcast_subscriber(supervisor, *payload, reply).await
-        }
-        BroadcastCommand::HandleBroadcastKeyRequest {
-            context_id,
-            author_did,
-            requester_did,
-            reply,
-        } => {
-            shim_handle_handle_broadcast_key_request(
-                supervisor,
-                &context_id,
-                &author_did,
-                &requester_did,
-                reply,
-            )
-            .await
-        }
-        BroadcastCommand::BroadcastSubscriberCount { context_id, reply } => {
-            shim_handle_broadcast_subscriber_count(supervisor, &context_id, reply).await
-        }
-        BroadcastCommand::IsBroadcastSubscriber {
-            context_id,
-            did,
-            reply,
-        } => shim_handle_is_broadcast_subscriber(supervisor, &context_id, &did, reply).await,
-        BroadcastCommand::BroadcastAdmission { context_id, reply } => {
-            shim_handle_broadcast_admission(supervisor, &context_id, reply).await
-        }
-        BroadcastCommand::PublishBroadcast { reply, .. } => {
-            // Publish variants require a custody reference that cannot
-            // cross the actor mailbox — route through the `_with_custody`
-            // shim. This arm catches callers who took the wrong path
-            // and surfaces a typed error.
-            const MSG: &str = "BroadcastCommand::PublishBroadcast requires a KeyCustody reference; \
-                 route through Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-            let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-            Outcome::err(ContextError::InvalidState(MSG.to_owned()))
-        }
-        BroadcastCommand::PublishBroadcastContent { reply, .. } => {
-            const MSG: &str = "BroadcastCommand::PublishBroadcastContent requires a KeyCustody reference; \
-                 route through Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-            let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-            Outcome::err(ContextError::InvalidState(MSG.to_owned()))
-        }
-        BroadcastCommand::ReserveBroadcastPublish { payload, reply } => {
-            // Two-phase publish requires a per-context actor (the
-            // reservation lives in actor-owned state). Reaching the shim
-            // means no actor is registered — surface a typed error rather
-            // than fall back to a DashMap read.
-            const MSG: &str = "ReserveBroadcastPublish requires a registered per-context actor";
-            let _ = (&payload.context_id, &payload.author_did);
-            let _ = reply.send(Err(ContextError::ContextNotRegistered(MSG.to_owned())));
-            Outcome::err(ContextError::ContextNotRegistered(MSG.to_owned()))
-        }
-        BroadcastCommand::ApplyBroadcastPublish { payload, reply } => {
-            const MSG: &str = "ApplyBroadcastPublish requires a registered per-context actor";
-            let _ = &payload.context_id;
-            let _ = reply.send(Err(ContextError::ContextNotRegistered(MSG.to_owned())));
-            Outcome::err(ContextError::ContextNotRegistered(MSG.to_owned()))
-        }
-        BroadcastCommand::ReleaseBroadcastReservation { payload, reply } => {
-            // No actor → no reservation could have been issued. Idempotent
-            // release: reply Ok so an abort path never errors spuriously.
-            let _ = &payload.context_id;
-            let _ = reply.send(Ok(()));
-            Outcome::ok(())
         }
         BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => {
             reply_saga_deferred(reply)
@@ -507,87 +410,6 @@ async fn handle_broadcast_admission(
     outcome
 }
 
-async fn shim_handle_subscribe_broadcast(
-    supervisor: &Supervisor,
-    p: SubscribeBroadcastPayload,
-    reply: SubscribeBroadcastReply,
-) -> Outcome<()> {
-    let context_id = p.context_id.clone();
-
-    // Pass `None` for the validation-context generic — gated
-    // broadcasts still validate inline via the inline UCAN token
-    // path. The full validation context is plumbed through the
-    // FFI bridges' own UCAN registry and not carried through the
-    // mailbox. The no-op turbofish types satisfy the helper's
-    // generic bounds; passing `None` for the optional
-    // `validation_ctx` argument short-circuits the full pipeline.
-    let subscribe_fut = crate::context::broadcast_helpers_legacy::subscribe_broadcast_legacy::<
-        NoopDidResolver,
-        NoopNonceTracker,
-        NoopRevocationChecker,
-        NoopProofResolver,
-        std::collections::hash_map::RandomState,
-    >(
-        supervisor,
-        &p.context_id,
-        &p.subscriber_did,
-        p.ucan.as_ref(),
-        p.timestamp,
-        None,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, subscribe_fut).await {
-        Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "subscribe_broadcast exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_unsubscribe_broadcast(
-    supervisor: &Supervisor,
-    p: UnsubscribeBroadcastPayload,
-    reply: UnsubscribeBroadcastReply,
-) -> Outcome<()> {
-    let context_id = p.context_id.clone();
-
-    let unsub_fut = crate::context::broadcast_helpers_legacy::unsubscribe_broadcast_legacy(
-        supervisor,
-        &p.context_id,
-        &p.subscriber_did,
-        p.rotate_keys,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unsub_fut).await {
-        Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "unsubscribe_broadcast exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
 async fn handle_reserve_broadcast_publish(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -672,181 +494,9 @@ fn handle_release_broadcast_reservation(
     Outcome::ok_mutated(())
 }
 
-async fn shim_handle_block_broadcast_subscriber(
-    supervisor: &Supervisor,
-    p: BroadcastBlockPayload,
-    reply: BlockBroadcastSubscriberReply,
-) -> Outcome<()> {
-    let context_id = p.context_id.clone();
-
-    let block_fut = crate::context::broadcast_helpers_legacy::block_broadcast_subscriber_legacy(
-        supervisor,
-        &p.context_id,
-        &p.author_did,
-        &p.subscriber_did,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, block_fut).await {
-        Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "block_broadcast_subscriber exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_unblock_broadcast_subscriber(
-    supervisor: &Supervisor,
-    p: BroadcastBlockPayload,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    let context_id = p.context_id.clone();
-
-    let unblock_fut = crate::context::broadcast_helpers_legacy::unblock_broadcast_subscriber_legacy(
-        supervisor,
-        &p.context_id,
-        &p.author_did,
-        &p.subscriber_did,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unblock_fut).await {
-        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "unblock_broadcast_subscriber exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_handle_broadcast_key_request(
-    supervisor: &Supervisor,
-    context_id: &str,
-    author_did: &scp_identity::DID,
-    requester_did: &scp_identity::DID,
-    reply: HandleBroadcastKeyRequestReply,
-) -> Outcome<()> {
-    let key_req_fut = crate::context::broadcast_helpers_legacy::handle_broadcast_key_request_legacy(
-        supervisor,
-        context_id,
-        author_did,
-        requester_did,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, key_req_fut).await {
-        Ok(Ok(decision)) => (Outcome::ok(()), Ok(decision)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "handle_broadcast_key_request exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_broadcast_subscriber_count(
-    supervisor: &Supervisor,
-    context_id: &str,
-    reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
-) -> Outcome<()> {
-    let count_fut = crate::context::broadcast_helpers_legacy::broadcast_subscriber_count_legacy(
-        supervisor, context_id,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
-        Ok(count) => (Outcome::ok(()), Ok(count)),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "broadcast_subscriber_count exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_is_broadcast_subscriber(
-    supervisor: &Supervisor,
-    context_id: &str,
-    did: &str,
-    reply: oneshot::Sender<Result<bool, ContextError>>,
-) -> Outcome<()> {
-    let is_fut = crate::context::broadcast_helpers_legacy::is_broadcast_subscriber_legacy(
-        supervisor, context_id, did,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, is_fut).await {
-        Ok(is) => (Outcome::ok(()), Ok(is)),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "is_broadcast_subscriber exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_broadcast_admission(
-    supervisor: &Supervisor,
-    context_id: &str,
-    reply: BroadcastAdmissionReply,
-) -> Outcome<()> {
-    let admission_fut = crate::context::broadcast_helpers_legacy::broadcast_admission_legacy(
-        supervisor, context_id,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, admission_fut).await {
-        Ok(admission) => (Outcome::ok(()), Ok(admission)),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "broadcast_admission exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
 // ---------------------------------------------------------------------------
 // No-op UCAN validation trait impls — satisfy the generic bounds on
-// [`ContextManager::subscribe_broadcast`](crate::context::broadcast_helpers_legacy::subscribe_broadcast_legacy)
+// [`crate::context::broadcast_helpers::subscribe_broadcast`]
 // when the caller passes `None` for `validation_ctx`. No method is
 // actually invoked; the types exist only as compile-time witnesses so
 // the turbofish has something to bind to. Mirrors the

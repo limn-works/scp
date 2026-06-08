@@ -1508,7 +1508,8 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
 /// surface of [`crate::context::economy_helpers`] currently consists
 /// of a single method, [`verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts);
 /// all other economy methods (`authorize_paid_action`,
-/// `complete_paid_action`, `void_paid_action`, `rollback_economy_ticket`)
+/// `complete_paid_action`, `void_paid_action`,
+/// `rollback_economy_ticket_inline`)
 /// are `pub(super)` helpers invoked by the messaging path. Commit 12
 /// rewires the sender-side pipeline to construct economy commands
 /// internally rather than calling the helpers directly; commit 10
@@ -1877,9 +1878,9 @@ pub enum TtlCloseCommand {
     },
 
     /// Spawns (or respawns) the TTL timer for the given context with a
-    /// caller-supplied duration. Mirrors the legacy `ContextManager`'s
-    /// [`spawn_ttl_timer_legacy`](crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy)
-    /// call path used at `create_context` / `restore_context` time.
+    /// caller-supplied duration. Installed on actor-owned state by
+    /// `ttl_close_helpers::spawn_ttl_timer` at `create_context` /
+    /// `restore_context` time.
     ///
     /// `Ok(())` once the timer has been successfully installed.
     StartTtlTimer {

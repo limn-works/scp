@@ -30,19 +30,15 @@
 pub mod actor;
 pub mod app_sandbox;
 pub(crate) mod broadcast_helpers;
-pub(crate) mod broadcast_helpers_legacy;
 pub mod builder;
 pub(crate) mod economy_helpers;
-pub(crate) mod economy_helpers_legacy;
 pub(crate) mod economy_logic;
 pub mod export_import;
 pub mod governance;
 pub(crate) mod governance_helpers;
-pub(crate) mod governance_helpers_legacy;
 pub(crate) mod governance_logic;
 pub mod key_destruction;
 pub(crate) mod lifecycle_helpers;
-pub(crate) mod lifecycle_helpers_legacy;
 pub(crate) mod lifecycle_logic;
 pub(crate) mod manager_methods;
 pub(crate) mod messaging_helpers;
@@ -50,7 +46,6 @@ pub mod persistence;
 pub mod policy;
 pub mod providers;
 pub(crate) mod queries_helpers;
-pub(crate) mod queries_helpers_legacy;
 pub(crate) mod standing_helpers;
 pub mod state;
 pub mod supervisor;
@@ -60,7 +55,6 @@ pub(crate) mod trust_recovery_helpers;
 pub(crate) mod trust_recovery_helpers_legacy;
 pub mod ttl;
 pub(crate) mod ttl_close_helpers;
-pub(crate) mod ttl_close_helpers_legacy;
 
 pub mod tools;
 
