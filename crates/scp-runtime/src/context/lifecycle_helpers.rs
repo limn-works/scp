@@ -2150,10 +2150,10 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 /// Destroys per-context sender keys + MLS groups + event logs in that
 /// order (zeroize secrets before tearing down structure) by dispatching
 /// [`LifecycleCommand::ShutdownSelf`](crate::context::actor::commands::LifecycleCommand::ShutdownSelf)
-/// to each actor; then removes each context from the legacy
-/// `Supervisor::contexts` `DashMap` (kept in lock-step with the actor
-/// registry by the bootstrap dual-write) and clears supervisor-level
-/// state (standing contexts, local DIDs, wrapping keys, task set).
+/// to each actor (each actor owns its `PerContextState` and drops it when
+/// its task exits — no `DashMap` cleanup needed), then clears
+/// supervisor-level state (standing contexts, local DIDs, wrapping keys,
+/// task set).
 ///
 /// Relocates the legacy `shutdown_all_contexts_legacy` off the
 /// `Supervisor::contexts` `DashMap` iteration (the legacy body is now
@@ -2181,12 +2181,10 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
             continue;
         }
         let _ = rx.await;
-        // Remove from the legacy contexts DashMap to keep it in
-        // lock-step with the actor registry. The bootstrap dual-write
-        // inserts in both; the shutdown sweep removes from both. The
-        // DashMap dissolves entirely in a subsequent finalization
-        // session.
-        supervisor.contexts_ref().remove(ctx_id);
+        // No DashMap cleanup needed: the actor owns its `PerContextState`
+        // and drops it (along with every per-context resource destroyed
+        // by `ShutdownSelf` above) when its task exits. The legacy
+        // lock-step `contexts.remove(ctx_id)` mirror is gone.
     }
 
     // Supervisor-level state clear. Acquired under the write_lock once
