@@ -572,6 +572,10 @@ pub struct ContextSnapshot {
     /// The role state (ceiling, definitions, assignments, capabilities).
     pub role_state: ContextRoleState,
     /// Proposal IDs that have already been executed (replay protection).
+    ///
+    /// Serialized in a deterministic (content-sorted) order so the signed
+    /// context-export digest is reproducible (§23.16.8, ADR-050).
+    #[serde(with = "scp_protocol::serde_util::serde_sorted_set")]
     pub executed_proposals: HashSet<ProposalId>,
     /// Remaining TTL in seconds, if a TTL timer was active. `None` if no
     /// TTL was configured or the timer was not running.
@@ -582,7 +586,10 @@ pub struct ContextSnapshot {
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`).
     /// These members won't receive new content keys but retain access to
     /// historical content encrypted before the revocation (ADR-038, §9.17).
-    #[serde(default)]
+    ///
+    /// Serialized in a deterministic (content-sorted) order so the signed
+    /// context-export digest is reproducible (§23.16.8, ADR-050).
+    #[serde(default, with = "scp_protocol::serde_util::serde_sorted_set")]
     pub read_exclusion_list: HashSet<DID>,
     /// Established cross-context tool interfaces (§6.2).
     #[serde(default)]
@@ -625,7 +632,13 @@ pub struct ContextSnapshot {
     /// - `approved_at_unix_secs` — the wall-clock Unix timestamp at
     ///   approval, retained for audit / event-emission purposes only.
     ///   Never used for conflict ordering.
-    #[serde(default)]
+    ///
+    /// Serialized as a hex-keyed object (the `ProposalId = [u8; 32]` key
+    /// cannot be a JSON object key directly) so the whole snapshot survives
+    /// RFC 8785 JCS canonicalization for the signed context export
+    /// (§23.16.8, ADR-050). JCS sorts the hex keys, making the digest
+    /// deterministic regardless of `HashMap` iteration order.
+    #[serde(default, with = "scp_protocol::serde_util::serde_hex_keyed_map_32")]
     pub approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
     /// Monotonic counter for assigning proposal sequence numbers to
     /// approved proposals (H10, ADR-031 §7).

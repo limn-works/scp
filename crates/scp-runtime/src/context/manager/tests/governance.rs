@@ -16971,7 +16971,10 @@ async fn h10_import_context_resets_next_proposal_seq() {
     // by hand so we can sneak the tampered field in past `create_export`.
     // The snapshot signature must still verify — the C3 wipe is a defense
     // applied AFTER signature verification, against a validly-signed but
-    // adversarial exporter (the exporter signs its own forged state).
+    // adversarial exporter. Under §23.16.8 the signer is bound to the
+    // snapshot creator (`exporter_did == creator_did`), so the realistic
+    // threat is the CREATOR itself exporting forged anti-abuse state; the
+    // wipe defends regardless. The snapshot creator is `did:key:admin`.
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
     let verifying_key = signing_key.verifying_key();
     let mut export = crate::context::export_import::ContextExport {
@@ -16980,7 +16983,7 @@ async fn h10_import_context_resets_next_proposal_seq() {
         mls_state: Vec::new(),
         version: crate::context::export_import::CURRENT_EXPORT_VERSION,
         exported_at: 1_700_000_000,
-        exporter_did: "did:key:malicious-exporter".into(),
+        exporter_did: "did:key:admin".into(),
         merkle_root: [0u8; 32],
         scope: crate::context::export_import::ExportScope::Full,
         snapshot_signature: [0u8; 64],

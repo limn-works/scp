@@ -3174,7 +3174,8 @@ fn c3_export_from_snapshot(
         snapshot,
         Vec::new(), // empty event log — C3 wipe paths don't depend on it
         Vec::new(),
-        DID::from("did:key:c3-exporter"),
+        // §23.16.8: exporter_did MUST equal the snapshot creator_did.
+        DID::from("did:key:c3-creator"),
         crate::context::export_import::ExportScope::Full,
         &scp_primitives::SystemClock,
         sign_export,
@@ -3752,7 +3753,9 @@ fn make_epoch_test_export(context_id: &str) -> crate::context::export_import::Co
         mls_state: b"trigger-restore".to_vec(),
         version: crate::context::export_import::CURRENT_EXPORT_VERSION,
         exported_at: 0,
-        exporter_did: DID::from("did:key:test-exporter"),
+        // §23.16.8: exporter_did MUST equal the snapshot creator_did
+        // (the snapshot's role_state was built with "did:key:test-creator").
+        exporter_did: DID::from("did:key:test-creator"),
         merkle_root: [0u8; 32], // valid for empty event log
         scope: crate::context::export_import::ExportScope::Full,
         snapshot_signature: [0u8; 64],

@@ -898,12 +898,15 @@ impl ContextManager {
     ///
     /// The exported snapshot is integrity-protected by an Ed25519 signature
     /// over [`ContextExport::canonical_snapshot_hash`](crate::context::export_import::ContextExport::canonical_snapshot_hash)
-    /// (spec §23.16.4). The runtime holds no custody/signing key — only a
-    /// `KeyResolver` (which is `None` under FFI) — so the caller supplies a
-    /// `sign` closure that produces the signature using the exporter's custody
-    /// key. The FFI bridge implements this via `resolve_signing_key`, mirroring
-    /// the governance signing path. The closure receives the canonical hash
-    /// computed over the final (post–public-stripping) export contents.
+    /// = `SHA-256("SCP-CONTEXT-SNAPSHOT-V1:" || JCS(snapshot))`, covering the
+    /// entire snapshot (spec §23.16.8). The runtime holds no custody/signing
+    /// key — only a `KeyResolver` (which is `None` under FFI) — so the caller
+    /// supplies a `sign` closure that produces the signature using the
+    /// exporter's custody key. The exporter MUST be the snapshot `creator_did`
+    /// (the importer enforces `exporter_did == creator_did`). The FFI bridge
+    /// implements this via `resolve_signing_key`, mirroring the governance
+    /// signing path. The closure receives the canonical digest computed over
+    /// the final (post–public-stripping) snapshot.
     #[instrument(skip_all, fields(context_id))]
     pub async fn export_context<F, E>(
         &self,
@@ -1000,10 +1003,12 @@ impl ContextManager {
     ///
     /// Imports come from an UNTRUSTED source. Before any state is restored, the
     /// embedded snapshot's Ed25519 signature is verified against
-    /// `verifying_key` — the exporter DID's resolved `#active`/`#agent`
-    /// verification-method key (spec §23.16.4, ADR-039). The FFI bridge resolves
-    /// this key from `export.exporter_did` via `IdentityBackedDidResolver`. A
-    /// signature failure rejects the import with
+    /// `verifying_key` — the snapshot `creator_did`'s resolved
+    /// `#active`/`#agent` verification-method key (spec §23.16.8, ADR-039).
+    /// The importer also enforces `exporter_did == creator_did`. The FFI
+    /// bridge resolves this key from the snapshot `creator_did` via
+    /// `IdentityBackedDidResolver`. A signature failure (or signer-binding
+    /// mismatch) rejects the import with
     /// [`ContextError::SnapshotSignatureInvalid`], distinct from the event-log
     /// Merkle failure and from the version gate.
     #[instrument(skip_all)]

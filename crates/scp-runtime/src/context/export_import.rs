@@ -18,7 +18,6 @@ use super::manager::ContextSnapshot;
 use crate::store::StoredValue;
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
-use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,15 +34,31 @@ use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 ///   — the embedded snapshot was not integrity-protected, so a tampered export
 ///   could forge membership/roles/params. Distinguished from a signature
 ///   failure by a dedicated `version` error.
-/// - `2`: signed export. The embedded snapshot is covered by
-///   `snapshot_signature` (Ed25519 over [`ContextExport::canonical_snapshot_hash`],
-///   domain `SCP-CONTEXT-SNAPSHOT-V1:` per spec §23.16.4), produced by the
-///   exporter's custody key and verified on import against the exporter DID's
-///   resolved verification-method key (`#active`/`#agent`, ADR-039).
-pub const CURRENT_EXPORT_VERSION: u32 = 2;
+/// - `2`: signed export over an **enumerated subset** of the snapshot
+///   (membership / role-definitions / params / tool-names + Merkle root +
+///   exporter DID + version), the §23.16.4 sync-delta hash recipe.
+///   **Rejected on import** — the subset left the trusted governance,
+///   economic, access-key, and ceiling fields that `import_context` restores
+///   verbatim *unsigned*, so a tampered v2 export could forge them under a
+///   valid signature (ADR-050). Distinguished from a signature failure by the
+///   dedicated `version` error.
+/// - `3`: signed export over the **full canonical snapshot**. The embedded
+///   snapshot is covered by `snapshot_signature` (Ed25519 over
+///   [`ContextExport::canonical_snapshot_hash`] =
+///   `SHA-256("SCP-CONTEXT-SNAPSHOT-V1:" || JCS(snapshot))`, the RFC 8785
+///   canonical-JSON serialization of the *entire* [`ContextSnapshot`], per
+///   spec §23.16.8). Produced by the exporter's custody key and verified on
+///   import against the snapshot `creator_did`'s resolved verification-method
+///   key (`#active`/`#agent`, ADR-039). Signing the whole snapshot is total
+///   by construction: every field the importer trusts is in the preimage, so
+///   no field is forgeable.
+pub const CURRENT_EXPORT_VERSION: u32 = 3;
 
-/// Domain separator for the signed `ContextExport` snapshot hash (spec §23.16.4,
-/// §9.18.2). Shared with [`super::super::sync::days_offline`].
+/// Domain separator for the signed `ContextExport` snapshot hash.
+///
+/// Registered in spec §9.18.2 and used by §23.16.8: prefixed (no separator
+/// byte) to the JCS bytes of the snapshot before the SHA-256 digest. Shared
+/// with [`super::super::sync::days_offline`].
 pub const CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-SNAPSHOT-V1:";
 
 // ---------------------------------------------------------------------------
@@ -98,12 +113,15 @@ pub struct ContextExport {
     /// The scope of data included in this export.
     pub scope: ExportScope,
     /// Ed25519 signature over [`ContextExport::canonical_snapshot_hash`],
-    /// produced by the exporter's custody key (spec §23.16.4).
+    /// produced by the exporter's custody key (spec §23.16.8).
     ///
-    /// Binds the embedded [`ContextSnapshot`] (membership, roles, params, tool
-    /// set) together with the event-log Merkle root, exporter DID, and export
-    /// version, so a tampered export is rejected on import. Verified against the
-    /// exporter DID's resolved `#active`/`#agent` verification-method key.
+    /// Covers the **entire** embedded [`ContextSnapshot`] via
+    /// `SHA-256("SCP-CONTEXT-SNAPSHOT-V1:" || JCS(snapshot))`, so every field
+    /// the importer restores verbatim (membership, roles, ceiling, governance,
+    /// economic policy, access-key store, consequence rules, …) is in the
+    /// signed preimage and a tampered export is rejected on import. Verified
+    /// against the snapshot `creator_did`'s resolved `#active`/`#agent`
+    /// verification-method key (ADR-039).
     ///
     /// For [`ExportScope::Public`] exports the signature is computed over the
     /// stripped snapshot (after [`strip_snapshot_for_public`]); a verifier must
@@ -125,167 +143,67 @@ pub enum ExportScope {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical snapshot hash (spec §23.16.4)
+// Canonical snapshot hash (spec §23.16.8)
 // ---------------------------------------------------------------------------
 
 impl ContextExport {
-    /// Computes the canonical hash signed by the exporter and verified on
-    /// import (spec §23.16.4).
+    /// Computes the canonical digest signed by the exporter and verified on
+    /// import (spec §23.16.8).
     ///
-    /// Domain separator `SCP-CONTEXT-SNAPSHOT-V1:`. The hash binds the embedded
-    /// snapshot's integrity-relevant state together with the export envelope:
+    /// The digest is
     ///
-    /// `members_hash || role_definitions_hash || params_hash || tool_names_hash
-    ///  || merkle_root || BE32(len(exporter_did)) || exporter_did || version`
+    /// `SHA-256("SCP-CONTEXT-SNAPSHOT-V1:" || JCS(self.snapshot))`
     ///
-    /// Composite fields are first reduced to a deterministic 32-byte digest
-    /// (key-ordered, length-prefixed) following the §23.16.4 recipe, then folded
-    /// into the canonical hash as fixed-32 fields. Because the hash is computed
-    /// over the *current* contents of `self.snapshot`, a `Public` export (whose
-    /// snapshot has already been stripped) is signed and verified over the
-    /// stripped bytes — the verifier sees exactly what was transmitted.
+    /// where `JCS(self.snapshot)` is the RFC 8785 (JSON Canonicalization
+    /// Scheme) canonical-JSON serialization of the **entire** embedded
+    /// [`ContextSnapshot`] — every field, not a subset (ADR-050). The domain
+    /// separator is prefixed to the snapshot bytes with no separator byte.
+    /// This is the construction shared with the WASM reference bridge
+    /// (`crates/scp-ffi/wasm/src/manager.rs`).
+    ///
+    /// Signing the whole snapshot is total by construction: every field the
+    /// importer restores verbatim — membership, role definitions, ceiling,
+    /// per-member and suspended capabilities, threshold set/value, governance
+    /// model configuration, economic policy, consequence rules,
+    /// read-exclusion list, access-key store, pending ceiling modification,
+    /// and tool registrations — is in the signed preimage, so none of them is
+    /// forgeable. The earlier v2 enumerated-subset recipe (§23.16.4) left
+    /// those fields unsigned; it is no longer used for export.
+    ///
+    /// # Determinism
+    ///
+    /// RFC 8785 JCS canonicalizes JSON *object* member order (so every
+    /// string-keyed `HashMap` in the snapshot is stable) but NOT *array*
+    /// element order. Every set-derived field in the snapshot is therefore
+    /// serialized in a deterministic, content-sorted order at the source: the
+    /// `ContextSnapshot` fields `executed_proposals`, `read_exclusion_list`,
+    /// and `approved_proposals` (hex-keyed so its `[u8; 32]` keys are valid
+    /// JSON object keys), plus the `ContextRoleState` fields `members`,
+    /// `member_capabilities`, and `suspended_capabilities`, plus
+    /// `CapabilityCeiling::capabilities` and `RoleDefinition::capabilities`
+    /// (reached via `role_state` and `context_params.roles`). See
+    /// [`scp_protocol::serde_util`]. Producer ([`create_export`]) and verifier
+    /// ([`validate_export_for_import`]) both call this method, so they always
+    /// agree on the digest. Because the digest is computed over the *current*
+    /// contents of `self.snapshot`, a `Public` export (whose snapshot has
+    /// already been stripped) is signed and verified over the stripped bytes —
+    /// the verifier sees exactly what was transmitted.
     ///
     /// # Errors
     ///
-    /// Returns [`scp_protocol::crypto::canonical::CanonicalError`] if a
-    /// variable-length field exceeds `u32::MAX` bytes (unreachable in practice).
-    pub fn canonical_snapshot_hash(
-        &self,
-    ) -> Result<[u8; 32], scp_protocol::crypto::canonical::CanonicalError> {
-        let members_hash = self.hash_members();
-        let role_defs_hash = self.hash_role_definitions();
-        let params_hash = self.hash_params();
-        let tool_names_hash = self.hash_tool_names();
-
-        let exporter_did = self.exporter_did.as_ref().as_bytes();
-
-        let fields = [
-            CanonicalField::Fixed32(&members_hash),
-            CanonicalField::Fixed32(&role_defs_hash),
-            CanonicalField::Fixed32(&params_hash),
-            CanonicalField::Fixed32(&tool_names_hash),
-            CanonicalField::Fixed32(&self.merkle_root),
-            CanonicalField::VarBytes(exporter_did),
-            CanonicalField::U32(self.version),
-        ];
-
-        canonical_hash(CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR, &fields)
-    }
-
-    /// Deterministic hash of the snapshot membership roster (§23.16.4 recipe).
-    ///
-    /// Members are emitted in DID key order: for each `(did, info)`,
-    /// `BE32(len(did)) || did || BE32(len(role_name)) || role_name
-    ///  || sequence_number (8-byte BE u64)`.
-    fn hash_members(&self) -> [u8; 32] {
-        // BTreeMap gives deterministic key ordering regardless of the source
-        // HashMap's iteration order.
-        let ordered: std::collections::BTreeMap<
-            &str,
-            &scp_protocol::context::membership::MemberInfo,
-        > = self
-            .snapshot
-            .membership
-            .members()
-            .map(|info| (info.did.as_ref(), info))
-            .collect();
-
-        let mut hasher = Sha256::new();
-        for (did, info) in ordered {
-            let did_len = u32::try_from(did.len()).unwrap_or(u32::MAX);
-            hasher.update(did_len.to_be_bytes());
-            hasher.update(did.as_bytes());
-            let role_len = u32::try_from(info.role_name.len()).unwrap_or(u32::MAX);
-            hasher.update(role_len.to_be_bytes());
-            hasher.update(info.role_name.as_bytes());
-            hasher.update(info.sequence_number.to_be_bytes());
-        }
-        hasher.finalize().into()
-    }
-
-    /// Deterministic hash of the snapshot role definitions (§23.16.4 recipe).
-    ///
-    /// Roles are emitted in role-name key order. Each role's capabilities are
-    /// reduced to their UCAN capability-name strings, sorted, then emitted:
-    /// `BE32(len(role)) || role || BE32(count) || [BE32(len(cap)) || cap ...]`.
-    fn hash_role_definitions(&self) -> [u8; 32] {
-        let ordered: std::collections::BTreeMap<&str, Vec<String>> = self
-            .snapshot
-            .role_state
-            .role_definitions
-            .iter()
-            .map(|(name, def)| {
-                let mut caps: Vec<String> = def
-                    .capabilities
-                    .iter()
-                    .map(scp_protocol::context::roles::Capability::ucan_capability_name)
-                    .collect();
-                caps.sort();
-                (name.as_str(), caps)
-            })
-            .collect();
-
-        let mut hasher = Sha256::new();
-        for (role, caps) in ordered {
-            let role_len = u32::try_from(role.len()).unwrap_or(u32::MAX);
-            hasher.update(role_len.to_be_bytes());
-            hasher.update(role.as_bytes());
-            let count = u32::try_from(caps.len()).unwrap_or(u32::MAX);
-            hasher.update(count.to_be_bytes());
-            for cap in &caps {
-                let cap_len = u32::try_from(cap.len()).unwrap_or(u32::MAX);
-                hasher.update(cap_len.to_be_bytes());
-                hasher.update(cap.as_bytes());
+    /// Returns [`ContextError::SnapshotSignatureInvalid`] if the snapshot
+    /// cannot be canonicalized to JCS (e.g. a non-string, non-hex map key).
+    /// This cannot occur for a well-formed snapshot.
+    pub fn canonical_snapshot_hash(&self) -> Result<[u8; 32], ContextError> {
+        let snapshot_json = scp_protocol::jcs::to_vec(&self.snapshot).map_err(|e| {
+            ContextError::SnapshotSignatureInvalid {
+                reason: format!("snapshot canonical-JSON (JCS) serialization failed: {e}"),
             }
-        }
-        hasher.finalize().into()
-    }
-
-    /// SHA-256 over the canonical (RFC 8785 JCS) encoding of the snapshot's
-    /// context parameters (§23.16.4 `params_hash`).
-    ///
-    /// Uses JSON canonicalization (the project-wide canonical hashing format)
-    /// so the digest is stable across implementations. Falls back to a fixed
-    /// sentinel only if canonicalization fails, which cannot occur for a
-    /// well-formed `ContextParams`.
-    fn hash_params(&self) -> [u8; 32] {
-        let canonical =
-            scp_protocol::jcs::to_vec(&self.snapshot.context_params).unwrap_or_default();
-        Sha256::digest(&canonical).into()
-    }
-
-    /// Deterministic hash of the registered tool-name set (§23.16.4 recipe).
-    ///
-    /// Tool identifiers are gathered from both the immutable
-    /// `context_params.tools` and the dynamically `registered_tools`, then
-    /// deduplicated and sorted for order-independence:
-    /// `BE32(count) || [BE32(len(name)) || name ...]`.
-    fn hash_tool_names(&self) -> [u8; 32] {
-        let mut names: Vec<&str> = self
-            .snapshot
-            .context_params
-            .tools
-            .iter()
-            .map(|t| t.tool_id.as_str())
-            .chain(
-                self.snapshot
-                    .registered_tools
-                    .iter()
-                    .map(|t| t.tool_id.as_str()),
-            )
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-
+        })?;
         let mut hasher = Sha256::new();
-        let count = u32::try_from(names.len()).unwrap_or(u32::MAX);
-        hasher.update(count.to_be_bytes());
-        for name in names {
-            let name_len = u32::try_from(name.len()).unwrap_or(u32::MAX);
-            hasher.update(name_len.to_be_bytes());
-            hasher.update(name.as_bytes());
-        }
-        hasher.finalize().into()
+        hasher.update(CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR.as_bytes());
+        hasher.update(&snapshot_json);
+        Ok(hasher.finalize().into())
     }
 }
 
@@ -439,71 +357,99 @@ fn compute_entry_hash(
     hash
 }
 
-/// Validates a [`ContextExport`] for import readiness, including snapshot
-/// signature verification (spec §23.16.4).
+/// Validates a [`ContextExport`] for import readiness, including the
+/// full-snapshot signature verification (spec §23.16.8).
 ///
 /// Checks, in order:
-/// 1. Export version is **exactly** supported. Versions above
-///    [`CURRENT_EXPORT_VERSION`] are rejected as unsupported; the pre-signing
-///    version (`1`) is rejected with a distinct *version* error because such
-///    exports carry no integrity-protected snapshot and MUST NOT be trusted.
-/// 2. Snapshot signature: the exporter's Ed25519 signature over
-///    [`ContextExport::canonical_snapshot_hash`] must verify (`verify_strict`)
-///    against `verifying_key` (the exporter DID's resolved
-///    `#active`/`#agent` key). Failure yields the distinct
+/// 1. Export version is **exactly** [`CURRENT_EXPORT_VERSION`]. Versions below
+///    it (the unsigned `1` and the enumerated-subset-signed `2`) and any
+///    future version are rejected with a distinct *version* error, because a
+///    sub-current export does not carry a full-snapshot signature and MUST NOT
+///    be trusted. The version error is distinct from the signature error so
+///    callers can tell "wrong format" apart from "signature forged"
+///    (§17.5 / `SCP-CTX-2093`).
+/// 2. Signer binding (§23.16.8 step 2): the envelope's `exporter_did` MUST
+///    equal the snapshot's `role_state.creator_did`. An export whose declared
+///    exporter is not the snapshot creator is rejected with
+///    [`ContextError::SnapshotSignatureInvalid`]. This binds the signing
+///    authority to the creator identity and prevents a non-creator from
+///    re-wrapping a snapshot under their own key. Checked before the
+///    cryptographic verification so a mis-bound export is rejected regardless
+///    of whether its signature happens to verify.
+/// 3. Snapshot signature: the Ed25519 signature over
+///    [`ContextExport::canonical_snapshot_hash`] =
+///    `SHA-256(domain || JCS(snapshot))` must verify (`verify_strict`) against
+///    `verifying_key` — the snapshot `creator_did`'s resolved
+///    `#active`/`#agent` key (resolved by the caller, never from an
+///    unauthenticated envelope field). Failure yields the distinct
 ///    [`ContextError::SnapshotSignatureInvalid`].
-/// 3. Merkle chain integrity of event log entries.
-/// 4. Merkle root matches the stored root hash.
+/// 4. Merkle chain integrity of event log entries.
+/// 5. Merkle root matches the stored root hash.
 ///
-/// The signature is checked before the Merkle chain so that an export with a
+/// Verification happens entirely before any caller reads a field of the
+/// snapshot into authoritative state ([`super::manager::ContextManager::import_context`]
+/// calls this first), preserving verify-before-restore (ADR-050). The
+/// signature is checked before the Merkle chain so that an export with a
 /// forged snapshot is rejected with the signature error regardless of whether
 /// its event log happens to be internally consistent.
 ///
 /// # Errors
 ///
-/// - [`ContextError::EventLogFailed`] — unsupported/legacy version, broken
-///   Merkle chain, or Merkle root mismatch.
-/// - [`ContextError::SnapshotSignatureInvalid`] — the snapshot signature does
-///   not authenticate the embedded snapshot under `verifying_key`.
+/// - [`ContextError::EventLogFailed`] — unsupported/sub-current version,
+///   broken Merkle chain, or Merkle root mismatch.
+/// - [`ContextError::SnapshotSignatureInvalid`] — `exporter_did` does not
+///   match the snapshot `creator_did`, the snapshot could not be
+///   canonicalized, or the signature does not authenticate the embedded
+///   snapshot under `verifying_key`.
 pub fn validate_export_for_import(
     export: &ContextExport,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<(), ContextError> {
     // 1. Version check. Reject anything that is not the current signed format.
-    // Legacy v1 exports (unsigned) and future versions are both rejected here
-    // — distinct from a signature failure so callers can tell "too old / too
-    // new" apart from "signature forged".
+    // Pre-3 exports (unsigned v1, enumerated-subset-signed v2) and future
+    // versions are all rejected here — distinct from a signature failure so
+    // callers can tell "wrong format" apart from "signature forged".
     if export.version != CURRENT_EXPORT_VERSION {
         return Err(ContextError::EventLogFailed(format!(
             "unsupported export version: {}, required: {CURRENT_EXPORT_VERSION} \
-             (versions below {CURRENT_EXPORT_VERSION} predate snapshot signing and \
-             are rejected as unverifiable)",
+             (versions below {CURRENT_EXPORT_VERSION} predate the full-snapshot \
+             signature and are rejected as unverifiable)",
             export.version
         )));
     }
 
-    // 2. Snapshot signature verification (§23.16.4). Recompute the canonical
-    // hash over the received bytes and verify against the exporter's key.
-    let hash =
-        export
-            .canonical_snapshot_hash()
-            .map_err(|e| ContextError::SnapshotSignatureInvalid {
-                reason: format!("canonical snapshot hash construction failed: {e}"),
-            })?;
+    // 2. Signer binding (§23.16.8 step 2): exporter_did == creator_did. The
+    // signing authority is bound to the snapshot creator; a non-creator
+    // re-wrapping the snapshot under their own key is rejected here, before
+    // the signature is checked.
+    let creator_did = export.snapshot.role_state.creator_did.as_str();
+    if export.exporter_did.as_ref() != creator_did {
+        return Err(ContextError::SnapshotSignatureInvalid {
+            reason: format!(
+                "exporter_did ({}) does not match snapshot creator_did ({creator_did}); \
+                 only the context creator may sign an export",
+                export.exporter_did
+            ),
+        });
+    }
+
+    // 3. Snapshot signature verification (§23.16.8). Recompute the canonical
+    // digest SHA-256(domain || JCS(snapshot)) over the received bytes and
+    // verify against the creator's resolved key.
+    let hash = export.canonical_snapshot_hash()?;
     let signature = ed25519_dalek::Signature::from_bytes(&export.snapshot_signature);
     verifying_key
         .verify_strict(&hash, &signature)
         .map_err(|e| ContextError::SnapshotSignatureInvalid {
             reason: format!(
-                "exporter signature over snapshot did not verify (exporter_did={}): {e}",
-                export.exporter_did
+                "creator signature over snapshot did not verify (creator_did={creator_did}): {e}"
             ),
         })?;
 
-    // 3. Merkle chain verification.
+    // 4. Merkle chain verification.
     let computed_root = verify_merkle_chain(&export.event_log_data)?;
 
-    // 4. Root hash comparison (constant-time to avoid timing side-channels).
+    // 5. Root hash comparison (constant-time to avoid timing side-channels).
     if !bool::from(computed_root.ct_eq(&export.merkle_root)) {
         return Err(ContextError::EventLogFailed(
             "Merkle root mismatch: computed root does not match exported root — \
@@ -530,11 +476,18 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
     use std::collections::{HashMap, HashSet};
 
     // Build a minimal role state with only the default ceiling.
-    // Use the snapshot's context_id and an empty creator DID.
+    //
+    // The real `creator_did` is RETAINED (not blanked): it is public
+    // information — the root UCAN issuer, visible in the context's DID
+    // document and role tokens — and the signed-export contract binds the
+    // signer to `role_state.creator_did` (§23.16.8 step 2,
+    // `exporter_did == creator_did`). Blanking it would break that binding for
+    // public-scope exports and prevent the verifier from resolving the
+    // signing key.
     let ceiling = default_ceiling();
     let role_state = ContextRoleState::new(
         &snapshot.context_id,
-        "",
+        snapshot.role_state.creator_did.as_str(),
         ceiling,
         Vec::new(),
         &scp_primitives::SystemClock,
@@ -621,12 +574,13 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
 /// For [`ExportScope::Full`], includes all data. For [`ExportScope::Public`],
 /// strips sensitive data from the snapshot and omits event log entries.
 ///
-/// The export's [`ContextExport::canonical_snapshot_hash`] is computed over the
-/// **final** export contents (after public stripping, with the resolved Merkle
-/// root and `version`) and passed to `sign`, which must return an Ed25519
-/// signature produced by the exporter's custody key (spec §23.16.4). Signing
-/// happens at the FFI boundary because the runtime holds no custody key — see
-/// the module-level architecture note.
+/// The export's [`ContextExport::canonical_snapshot_hash`] =
+/// `SHA-256(domain || JCS(snapshot))` is computed over the **final** snapshot
+/// (after public stripping) and passed to `sign`, which must return an Ed25519
+/// signature produced by the exporter's custody key (spec §23.16.8). The
+/// exporter MUST be the snapshot `creator_did` (the verifier enforces
+/// `exporter_did == creator_did`). Signing happens at the FFI boundary because
+/// the runtime holds no custody key — see the module-level architecture note.
 ///
 /// # Errors
 ///
@@ -673,9 +627,10 @@ where
         snapshot_signature: [0u8; 64],
     };
 
-    let hash = export.canonical_snapshot_hash().map_err(|e| {
-        ContextError::EventLogFailed(format!("export snapshot hash construction failed: {e}"))
-    })?;
+    // SHA-256(domain || JCS(snapshot)) over the final snapshot bytes; the
+    // signature field is [0u8; 64] here and is NOT part of the hash (it lives
+    // on the envelope, not the snapshot).
+    let hash = export.canonical_snapshot_hash()?;
 
     export.snapshot_signature = sign(&hash).map_err(|e| {
         ContextError::EventLogFailed(format!("export snapshot signing failed: {e}"))
@@ -720,12 +675,17 @@ mod tests {
         test_signing_key().verifying_key()
     }
 
+    /// The creator DID embedded in every [`test_snapshot`]. §23.16.8 requires
+    /// `exporter_did == role_state.creator_did`, so exports built in these
+    /// tests use this DID as the exporter unless a mismatch is being tested.
+    const TEST_CREATOR_DID: &str = "did:key:test-creator";
+
     /// Helper to build a test snapshot.
     fn test_snapshot(context_id: &str) -> ContextSnapshot {
         let ceiling = default_ceiling();
         let role_state = ContextRoleState::new(
             context_id,
-            "did:key:test-creator",
+            TEST_CREATOR_DID,
             ceiling,
             vec![],
             &scp_primitives::SystemClock,
@@ -804,7 +764,7 @@ mod tests {
             snapshot,
             Vec::new(),
             Vec::new(),
-            DID::from("did:key:exporter-1"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -816,7 +776,7 @@ mod tests {
 
         assert_eq!(decoded.snapshot.context_id, "ctx-roundtrip-1");
         assert_eq!(decoded.version, CURRENT_EXPORT_VERSION);
-        assert_eq!(decoded.exporter_did.as_ref(), "did:key:exporter-1");
+        assert_eq!(decoded.exporter_did.as_ref(), TEST_CREATOR_DID);
         assert_eq!(decoded.merkle_root, [0u8; 32]);
         assert!(decoded.event_log_data.is_empty());
         assert!(decoded.mls_state.is_empty());
@@ -835,7 +795,7 @@ mod tests {
             snapshot,
             event_log_data,
             vec![0xDE, 0xAD],
-            DID::from("did:key:exporter-2"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -867,7 +827,7 @@ mod tests {
             snapshot,
             event_log_data,
             vec![1, 2, 3],
-            DID::from("did:key:exporter-3"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -880,7 +840,7 @@ mod tests {
         assert_eq!(decoded.snapshot.ttl_remaining_secs, Some(3600));
         assert_eq!(decoded.snapshot.threshold_value, 42);
         assert_eq!(decoded.scope, ExportScope::Full);
-        assert_eq!(decoded.exporter_did.as_ref(), "did:key:exporter-3");
+        assert_eq!(decoded.exporter_did.as_ref(), TEST_CREATOR_DID);
     }
 
     // -------------------------------------------------------------------
@@ -967,7 +927,7 @@ mod tests {
             snapshot,
             event_log_data,
             Vec::new(),
-            DID::from("did:key:validator-1"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -986,7 +946,7 @@ mod tests {
             mls_state: Vec::new(),
             version: 99,
             exported_at: 1_000_000,
-            exporter_did: DID::from("did:key:validator-2"),
+            exporter_did: DID::from(TEST_CREATOR_DID),
             merkle_root: [0u8; 32],
             scope: ExportScope::Full,
             snapshot_signature: [0u8; 64],
@@ -1009,7 +969,7 @@ mod tests {
             snapshot,
             event_log_data,
             Vec::new(),
-            DID::from("did:key:validator-3"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -1059,7 +1019,7 @@ mod tests {
             mls_state: Vec::new(),
             version: CURRENT_EXPORT_VERSION,
             exported_at: 1_000_000,
-            exporter_did: DID::from("did:key:validator-4"),
+            exporter_did: DID::from(TEST_CREATOR_DID),
             merkle_root,
             scope: ExportScope::Full,
             // Sign over the tampered contents so the signature check (step 2)
@@ -1094,7 +1054,7 @@ mod tests {
             snapshot,
             Vec::new(),
             vec![1, 2, 3],
-            DID::from("did:key:public-1"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Public,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -1120,7 +1080,7 @@ mod tests {
             snapshot,
             event_log_data,
             vec![0xFF],
-            DID::from("did:key:full-1"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -1156,7 +1116,7 @@ mod tests {
             snapshot,
             event_log_data,
             Vec::new(),
-            DID::from("did:key:pipeline-1"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -1186,7 +1146,7 @@ mod tests {
             snapshot,
             Vec::new(),
             Vec::new(),
-            DID::from("did:key:version-test"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -1221,7 +1181,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Snapshot signature tampering (spec §23.16.4)
+    // Snapshot signature tampering (spec §23.16.8)
     // -------------------------------------------------------------------
 
     /// Core security property: mutating the embedded snapshot's membership
@@ -1246,7 +1206,7 @@ mod tests {
             snapshot,
             event_log_data,
             Vec::new(),
-            DID::from("did:key:tamper-exporter"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -1290,7 +1250,7 @@ mod tests {
                 snapshot,
                 Vec::new(),
                 Vec::new(),
-                DID::from("did:key:rt-exporter"),
+                DID::from(TEST_CREATOR_DID),
                 scope,
                 &scp_primitives::SystemClock,
                 sign_with_test_key,
@@ -1313,7 +1273,7 @@ mod tests {
             snapshot,
             Vec::new(),
             Vec::new(),
-            DID::from("did:key:ws-exporter"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -1413,7 +1373,7 @@ mod tests {
             snapshot,
             data.clone(),
             Vec::new(),
-            DID::from("did:key:prune-test"),
+            DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
             &scp_primitives::SystemClock,
             sign_with_test_key,
@@ -1443,5 +1403,302 @@ mod tests {
         assert_eq!(final_entries.len(), 4);
         assert_eq!(final_entries[3].prev_hash, final_entries[2].hash);
         assert!(new_provider.verify_chain(&ctx_id_bytes));
+    }
+
+    // -------------------------------------------------------------------
+    // Full-snapshot signing construction (spec §23.16.8, ADR-050)
+    // -------------------------------------------------------------------
+
+    /// Tampering `read_exclusion_list` — a field that the OLD §23.16.4 subset
+    /// hash did NOT sign — is now rejected with the signature error. This is
+    /// the core gap ADR-050 closes: the full-JCS digest covers every field.
+    #[test]
+    fn tampered_read_exclusion_list_rejected() {
+        let mut snapshot = test_snapshot("ctx-tamper-readexcl");
+        snapshot
+            .read_exclusion_list
+            .insert(DID::from("did:key:excluded-1"));
+
+        let mut export = create_export(
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+            DID::from(TEST_CREATOR_DID),
+            ExportScope::Full,
+            &scp_primitives::SystemClock,
+            sign_with_test_key,
+        )
+        .unwrap();
+
+        // Valid export imports cleanly.
+        validate_export_for_import(&export, &test_verifying_key()).unwrap();
+
+        // Attacker injects another exclusion WITHOUT re-signing.
+        export
+            .snapshot
+            .read_exclusion_list
+            .insert(DID::from("did:key:forged-exclusion"));
+
+        let err = validate_export_for_import(&export, &test_verifying_key())
+            .expect_err("tampered read_exclusion_list must be rejected");
+        assert!(
+            matches!(err, ContextError::SnapshotSignatureInvalid { .. }),
+            "must fail with SnapshotSignatureInvalid, got: {err:?}"
+        );
+        assert!(!format!("{err}").contains("Merkle root mismatch"));
+    }
+
+    /// Tampering a role's capability ceiling — also unsigned under the old
+    /// subset recipe — is rejected. A forged ceiling expansion (privilege
+    /// escalation) no longer survives a valid signature.
+    #[test]
+    fn tampered_role_ceiling_rejected() {
+        use scp_protocol::context::roles::Capability;
+
+        let snapshot = test_snapshot("ctx-tamper-ceiling");
+        let mut export = create_export(
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+            DID::from(TEST_CREATOR_DID),
+            ExportScope::Full,
+            &scp_primitives::SystemClock,
+            sign_with_test_key,
+        )
+        .unwrap();
+
+        validate_export_for_import(&export, &test_verifying_key()).unwrap();
+
+        // Attacker raises the ceiling by injecting a capability that is NOT in
+        // the default ceiling (so the insertion genuinely changes the set)
+        // into the signed snapshot without re-signing.
+        assert!(
+            !export
+                .snapshot
+                .role_state
+                .ceiling
+                .capabilities
+                .contains(&Capability::MediaVoice),
+            "precondition: MediaVoice must not already be in the default ceiling"
+        );
+        export
+            .snapshot
+            .role_state
+            .ceiling
+            .capabilities
+            .insert(Capability::MediaVoice);
+
+        let err = validate_export_for_import(&export, &test_verifying_key())
+            .expect_err("tampered role ceiling must be rejected");
+        assert!(
+            matches!(err, ContextError::SnapshotSignatureInvalid { .. }),
+            "must fail with SnapshotSignatureInvalid, got: {err:?}"
+        );
+    }
+
+    /// The signed digest is INDEPENDENT of the iteration order of the
+    /// snapshot's `HashSet`/`HashMap` fields. This is the structural guard
+    /// against a future set/map field leaking into the digest unsorted.
+    ///
+    /// The signed digest MUST be a pure function of the snapshot *value*,
+    /// independent of the iteration order of any `HashSet`/`HashMap` it
+    /// contains. We take ONE snapshot value (so its random-nonce role tokens
+    /// are fixed) and build a structurally-identical copy whose set-backed
+    /// fields have been cleared and re-inserted in reverse order — forcing a
+    /// different `HashSet` iteration order while preserving identical content.
+    /// The two canonical digests MUST be byte-identical. If a future set/map
+    /// field is added without a deterministic serializer, the reversed
+    /// iteration order will diverge here and fail this test.
+    #[test]
+    fn digest_is_deterministic_across_set_insertion_order() {
+        use scp_protocol::context::roles::Capability;
+        use std::collections::HashSet;
+
+        // Rebuilds a set from its elements inserted in reverse order, forcing a
+        // different `HashSet` iteration order while preserving identical
+        // content.
+        fn reinsert_reversed<T, S>(set: &mut HashSet<T, S>)
+        where
+            T: Eq + std::hash::Hash,
+            S: std::hash::BuildHasher + Default,
+        {
+            let mut items: Vec<T> = std::mem::take(set).into_iter().collect();
+            items.reverse();
+            *set = items.into_iter().collect();
+        }
+
+        // Base snapshot with every non-deterministic collection populated.
+        let mut base = test_snapshot("ctx-determinism");
+        for d in ["did:key:e1", "did:key:e2", "did:key:e3"] {
+            base.read_exclusion_list.insert(DID::from(d));
+        }
+        for p in [[1u8; 32], [2u8; 32], [9u8; 32]] {
+            base.executed_proposals.insert(p);
+        }
+        // MediaVoice / MediaVideo are NOT in default_ceiling, so these are
+        // genuine additions exercising the ceiling set serializer.
+        base.role_state
+            .ceiling
+            .capabilities
+            .insert(Capability::MediaVoice);
+        base.role_state
+            .ceiling
+            .capabilities
+            .insert(Capability::MediaVideo);
+        base.role_state.members.insert("did:key:m-a".to_owned());
+        base.role_state.members.insert("did:key:m-b".to_owned());
+
+        // Structurally-identical copy whose set fields are rebuilt in reverse
+        // iteration order.
+        let mut shuffled = base.clone();
+        reinsert_reversed(&mut shuffled.read_exclusion_list);
+        reinsert_reversed(&mut shuffled.executed_proposals);
+        reinsert_reversed(&mut shuffled.role_state.ceiling.capabilities);
+        reinsert_reversed(&mut shuffled.role_state.members);
+
+        let sign = sign_with_test_key;
+        let a = create_export(
+            base,
+            Vec::new(),
+            Vec::new(),
+            DID::from(TEST_CREATOR_DID),
+            ExportScope::Full,
+            &scp_primitives::SystemClock,
+            sign,
+        )
+        .unwrap();
+        let b = create_export(
+            shuffled,
+            Vec::new(),
+            Vec::new(),
+            DID::from(TEST_CREATOR_DID),
+            ExportScope::Full,
+            &scp_primitives::SystemClock,
+            sign,
+        )
+        .unwrap();
+
+        // Same canonical digest regardless of set iteration order.
+        assert_eq!(
+            a.canonical_snapshot_hash().unwrap(),
+            b.canonical_snapshot_hash().unwrap(),
+            "canonical digest must be independent of set iteration order"
+        );
+        // And therefore the same signature.
+        assert_eq!(a.snapshot_signature, b.snapshot_signature);
+    }
+
+    /// §23.16.8 step 2: an export whose `exporter_did` is not the snapshot
+    /// `creator_did` is rejected — even when the signature itself would verify
+    /// — because the signing authority must be bound to the creator.
+    #[test]
+    fn exporter_not_creator_rejected() {
+        let snapshot = test_snapshot("ctx-exporter-mismatch");
+        // Build with a NON-creator exporter; signature is still produced by the
+        // test key, so this isolates the binding check from the crypto check.
+        let export = create_export(
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+            DID::from("did:key:not-the-creator"),
+            ExportScope::Full,
+            &scp_primitives::SystemClock,
+            sign_with_test_key,
+        )
+        .unwrap();
+
+        let err = validate_export_for_import(&export, &test_verifying_key())
+            .expect_err("exporter != creator must be rejected");
+        assert!(
+            matches!(err, ContextError::SnapshotSignatureInvalid { .. }),
+            "must fail with SnapshotSignatureInvalid, got: {err:?}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not match snapshot creator_did"),
+            "expected creator-binding message, got: {msg}"
+        );
+    }
+
+    /// The enumerated-subset v2 format is rejected on import with a VERSION
+    /// error distinct from the signature error — a v2 export does not carry a
+    /// full-snapshot signature and must not be trusted.
+    #[test]
+    fn version_2_rejected_distinct_from_signature() {
+        let snapshot = test_snapshot("ctx-v2-reject");
+        let mut export = create_export(
+            snapshot,
+            Vec::new(),
+            Vec::new(),
+            DID::from(TEST_CREATOR_DID),
+            ExportScope::Full,
+            &scp_primitives::SystemClock,
+            sign_with_test_key,
+        )
+        .unwrap();
+        export.version = 2;
+
+        let err = validate_export_for_import(&export, &test_verifying_key())
+            .expect_err("v2 export must be rejected");
+        assert!(
+            format!("{err}").contains("unsupported export version"),
+            "v2 must fail at the version gate, got: {err}"
+        );
+        assert!(
+            !matches!(err, ContextError::SnapshotSignatureInvalid { .. }),
+            "v2 rejection must be a version error, not a signature error"
+        );
+    }
+
+    /// A `ContextSnapshot` carrying every non-deterministic collection
+    /// (the two `HashSet`s, the `[u8; 32]`-keyed `approved_proposals` map, and
+    /// nested role-state capability sets) round-trips through `MessagePack`
+    /// persistence unchanged, proving the deterministic serializers do not
+    /// break the persistence path (serialize -> deserialize is value-stable).
+    #[test]
+    fn snapshot_persistence_roundtrip_with_populated_sets() {
+        use scp_protocol::context::roles::Capability;
+
+        let mut snapshot = test_snapshot("ctx-persist-roundtrip");
+        snapshot
+            .read_exclusion_list
+            .insert(DID::from("did:key:rx-1"));
+        snapshot
+            .read_exclusion_list
+            .insert(DID::from("did:key:rx-2"));
+        snapshot.executed_proposals.insert([7u8; 32]);
+        snapshot.executed_proposals.insert([8u8; 32]);
+        snapshot
+            .role_state
+            .ceiling
+            .capabilities
+            .insert(Capability::MemberInvite);
+        snapshot.role_state.members.insert("did:key:m1".to_owned());
+        snapshot.role_state.members.insert("did:key:m2".to_owned());
+
+        // MessagePack persistence round-trip (the path used by
+        // ContextPersistence::persist_context / load).
+        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let decoded: ContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            decoded.read_exclusion_list.len(),
+            snapshot.read_exclusion_list.len()
+        );
+        assert!(decoded.read_exclusion_list.contains("did:key:rx-1"));
+        assert!(decoded.read_exclusion_list.contains("did:key:rx-2"));
+        assert_eq!(
+            decoded.executed_proposals.len(),
+            snapshot.executed_proposals.len()
+        );
+        assert!(decoded.executed_proposals.contains(&[7u8; 32]));
+        assert!(decoded.role_state.members.contains("did:key:m1"));
+        assert!(
+            decoded
+                .role_state
+                .ceiling
+                .capabilities
+                .contains(&Capability::MemberInvite)
+        );
     }
 }
