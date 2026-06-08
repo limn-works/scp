@@ -3144,7 +3144,7 @@ fn c3_test_snapshot(context_id: &str) -> super::ContextSnapshot {
     }
 }
 
-/// Deterministic test signing key for export snapshot signatures (§23.16.4).
+/// Deterministic test signing key for export snapshot signatures (§23.16.8).
 fn test_export_signing_key() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
 }
