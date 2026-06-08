@@ -2427,7 +2427,7 @@ impl crate::scp::PyScp {
                 scp_identity::DID::from,
             );
 
-        // Resolve the exporter's custody signing key up front (§23.16.4). The
+        // Resolve the exporter's custody signing key up front (§23.16.8). The
         // runtime holds no key material — signing happens here at the bridge,
         // mirroring the governance signing path. The closure produces an
         // Ed25519 signature over the canonical snapshot hash.

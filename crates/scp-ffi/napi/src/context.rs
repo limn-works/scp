@@ -2909,7 +2909,7 @@ pub(crate) async fn context_reset_ttl_timer_on(
 
 /// Per-bridge-instance implementation of [`context_export`].
 ///
-/// Signs the exported snapshot with the exporter's custody key (§23.16.4),
+/// Signs the exported snapshot with the exporter's custody key (§23.16.8),
 /// mirroring the governance signing path: signing requires key custody and is
 /// therefore only available under `allow_in_memory_custody`; without it the
 /// export is rejected fail-closed rather than emitting an unsigned (and thus
@@ -2945,7 +2945,7 @@ pub(crate) async fn context_export_on(
         let _ = (manager, exporter_did);
         return Err(NapiError::from(ScpNapiError::Permission {
             message: "context export requires key custody to sign the snapshot \
-                      (§23.16.4) — in_memory custody feature is not enabled"
+                      (§23.16.8) — in_memory custody feature is not enabled"
                 .to_owned(),
             code: codes::CTX_2093.to_owned(),
         }));

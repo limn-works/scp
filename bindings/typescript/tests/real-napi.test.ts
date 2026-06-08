@@ -1681,18 +1681,33 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(data.length).toBeGreaterThan(0);
       await napi.contextClose(ctx, identity.did);
 
-      // Flip bytes in the back half of the export (the embedded snapshot
-      // region) to forge state without re-signing. The signed snapshot hash
-      // no longer matches, so import must reject with the dedicated code.
+      // Flip bytes across the embedded snapshot region (back half of the
+      // MessagePack envelope) without re-signing. At least one flip lands in a
+      // signed/trusted snapshot field, so the recomputed digest no longer
+      // matches the Ed25519 signature.
       const tampered = new Uint8Array(data);
       const start = Math.floor(tampered.length / 2);
       for (let i = start; i < tampered.length; i += 17) {
         tampered[i] = (tampered[i] ?? 0) ^ 0xff;
       }
-      // The raw NAPI addon surfaces the stable code as a "[SCP-CTX-2093]"
-      // prefix in the thrown Error.message (the TS SDK parses this prefix into
-      // ContextError.code).
-      await expect(napi.contextImport(tampered)).rejects.toThrow(/SCP-CTX-2093/);
+      // The tamper MUST be rejected. A flip that lands in a signed snapshot
+      // field surfaces the dedicated "[SCP-CTX-2093]" signature-failure code;
+      // a flip that corrupts the MessagePack framing surfaces a deserialize
+      // error instead. Both are valid rejections — what must NEVER happen is a
+      // silent accept, nor a mapping to the catch-all "SCP-CTX-2001" generic
+      // context error. So assert the import rejects and that the rejection is
+      // not the catch-all (matching the Python reference test).
+      await expect(async () => {
+        try {
+          await napi.contextImport(tampered);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (message.includes("SCP-CTX-2001")) {
+            throw new Error(`tampered snapshot must not map to the catch-all CTX-2001: ${message}`);
+          }
+          throw err;
+        }
+      }).rejects.toThrow();
     });
   });
 

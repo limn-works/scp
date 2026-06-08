@@ -14816,7 +14816,7 @@ impl Scp {
             .spawn(async move {
                 let manager = bi.context_manager_or_error()?;
                 // Resolve the exporter's custody signing key (callback or
-                // in-memory custody) to sign the snapshot (§23.16.4). The
+                // in-memory custody) to sign the snapshot (§23.16.8). The
                 // runtime holds no key material — signing happens here.
                 let signing_key = resolve_uniffi_signing_key(&handle).await?;
                 let export = manager
