@@ -179,7 +179,7 @@ pub fn member_count(state: &PerContextState) -> usize {
 /// `&mut` convention every read helper on the [`queries`](crate::context::actor::handlers::queries)
 /// dispatch path already uses.
 #[allow(clippy::needless_pass_by_ref_mut)]
-pub async fn read_context_state(
+pub(in crate::context) async fn read_context_state(
     state: &mut PerContextState,
 ) -> scp_protocol::context::ContextState {
     state.handle.state().await
