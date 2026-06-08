@@ -318,9 +318,10 @@ pub struct Supervisor {
     /// generation no longer matches (the actor was despawned and a new
     /// instance respawned for the same `context_id` between reserve and
     /// settle), preventing a settle from capturing or refunding against a
-    /// DIFFERENT context instance's owned state (the confused-deputy
-    /// guard the legacy `ContextGeneration` / `relock_context` provided
-    /// before the reserve→execute→settle split removed it).
+    /// DIFFERENT context instance's owned state. This is the confused-deputy
+    /// guard for the reserve→execute→settle split: the executor runs
+    /// supervisor-side (non-`Send`) outside the actor's serialized mailbox,
+    /// so the actor instance identity must be re-verified at settle time.
     spawn_generation: std::sync::atomic::AtomicU64,
 }
 
