@@ -1371,12 +1371,11 @@ impl Supervisor {
                 outcome
             }
             // Per-context variants reach this arm only when no actor
-            // is registered for the target context. The legacy
-            // bootstrap callers (`standing_helpers_legacy::standing_context_legacy`,
-            // `governance_helpers_legacy::execute_create_child_context_legacy`)
-            // create contexts via `create_context_legacy` which inserts
+            // is registered for the target context. The remaining legacy
+            // bootstrap caller (`governance_helpers_legacy::execute_create_child_context_legacy`)
+            // creates contexts via `create_context_legacy` which inserts
             // into the supervisor's contexts `DashMap` but does NOT
-            // spawn an actor — those callers will be migrated to the
+            // spawn an actor — that caller will be migrated to the
             // actor-shape bootstrap in a subsequent finalization
             // session. Until then, this arm uses the designated-legacy
             // per-context helpers to operate on the DashMap-borrowed
@@ -2463,9 +2462,9 @@ impl Supervisor {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Standing(cmd)).await;
         }
         // Direct supervisor-scoped dispatch. No shim — every variant is
-        // handled inline via the supervisor's standing-index methods
-        // (`standing_context_legacy` / `reconnect_all_standing_legacy`
-        // remain as production survivors).
+        // handled inline via the supervisor's actor-native standing
+        // methods (`standing_context` / `reconnect_all_standing`) and the
+        // lock-free standing-index reads/mutations.
         Ok(Box::pin(self.dispatch_standing_direct(cmd)).await)
     }
 
@@ -2479,7 +2478,6 @@ impl Supervisor {
     /// timeouts inside actor handlers"). Reply channels carry the typed
     /// per-variant result.
     async fn dispatch_standing_direct(self: &Arc<Self>, cmd: StandingCommand) -> Outcome<()> {
-        use crate::context::standing_helpers_legacy;
         const STANDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
@@ -2542,7 +2540,7 @@ impl Supervisor {
                 Outcome::ok_mutated(())
             }
             StandingCommand::ReconnectAllStanding { reply } => {
-                let fut = standing_helpers_legacy::reconnect_all_standing_legacy(self);
+                let fut = self.reconnect_all_standing();
                 let (outcome, reply_result) =
                     match tokio::time::timeout(STANDING_TIMEOUT, fut).await {
                         Ok(Ok(count)) => (Outcome::ok_mutated(()), Ok(count)),
@@ -3658,6 +3656,137 @@ impl Supervisor {
         let mut updated: HashMap<String, DID> = (*snapshot).clone();
         updated.insert(peer_did.to_string(), peer_did.clone());
         self.standing_contexts.store(Arc::new(updated));
+    }
+
+    /// Reconnects transport for all active standing contexts. Actor-native
+    /// — resolves per-context lifecycle + params through the actor
+    /// registry + mailbox (no `contexts` DashMap, no
+    /// `Mutex<PerContextState>`).
+    ///
+    /// Called during SDK initialization. Iterates the supervisor standing
+    /// index, resolves each `(local_did, peer_did)` pair to its
+    /// deterministic standing context id, and for every context whose
+    /// per-context actor reports
+    /// [`Active`](scp_protocol::context::ContextState::Active) republishes
+    /// the context blob to transport. Contexts in terminal states
+    /// (`Closed` / `Expired` / `Tombstoned`) are evicted from the standing
+    /// index to bound its growth; transient states (`Creating` /
+    /// `Closing` / `MigratingOut`) are kept and skipped.
+    ///
+    /// # Returns
+    ///
+    /// The number of contexts successfully reconnected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if any reconnection
+    /// fails (or [`ContextError::NotInitialized`] if no transport provider
+    /// is attached). Contexts reconnected before the failure remain
+    /// connected — the publish loop applies eagerly.
+    pub async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
+        use scp_protocol::context::ContextState;
+
+        // Phase 1: lock-free snapshots of the standing index + local DIDs
+        // (ADR-049 §Decision 12). No per-context lock is held — every
+        // per-context read below routes through the actor mailbox.
+        let standing_entries: Vec<(String, DID)> = self
+            .standing_contexts
+            .load()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let local_did_list: Vec<DID> = self.local_dids.load().iter().cloned().collect();
+
+        // Phase 2: resolve each standing pair to its context id, probe the
+        // owning actor's lifecycle state, and republish the Active ones.
+        // `read_context_state` returns `None` when no actor owns the id —
+        // the same "no live context, skip" outcome the legacy
+        // `get_context_arc` miss produced.
+        let mut reconnected = 0_usize;
+        let mut terminal_context_ids: Vec<String> = Vec::new();
+        for (_key, peer_did) in &standing_entries {
+            for local_did in &local_did_list {
+                let context_id = crate::context::standing_helpers::generate_standing_context_id(
+                    local_did, peer_did,
+                );
+                let Some(state) = self.read_context_state(&context_id).await else {
+                    // No actor for this (local, peer) id — try the next
+                    // local DID, matching the legacy break-on-first-hit
+                    // scan only when an actor is actually found.
+                    continue;
+                };
+                match state {
+                    ContextState::Active => {
+                        // Fetch params through the actor mailbox; `None`
+                        // means the actor vanished between the state probe
+                        // and this read (raced close) — treat as not
+                        // reconnectable and move on.
+                        if let Some(params) = self.context_params(&context_id).await {
+                            let context_id_bytes =
+                                scp_protocol::context::context_id_bytes(&context_id);
+                            self.transport_ref()
+                                .ok_or_else(|| {
+                                    ContextError::NotInitialized(
+                                        crate::context::manager_methods::PROVIDER_NOT_INITIALIZED
+                                            .to_owned(),
+                                    )
+                                })?
+                                .publish_context(&context_id_bytes, &params)
+                                .map_err(|e| {
+                                    ContextError::TransportFailed(format!(
+                                        "reconnection failed for context {context_id}: {e}"
+                                    ))
+                                })?;
+                            reconnected += 1;
+                        }
+                    }
+                    // Standing contexts in terminal states are eviction
+                    // candidates (Phase 3) to bound the index.
+                    ContextState::Closed | ContextState::Expired | ContextState::Tombstoned => {
+                        terminal_context_ids.push(context_id.clone());
+                    }
+                    // Creating / Closing / MigratingOut — transient, keep.
+                    ContextState::Creating | ContextState::Closing | ContextState::MigratingOut => {
+                    }
+                }
+                // An actor was found for this peer under `local_did`; the
+                // standing id is deterministic per pair, so stop scanning
+                // the remaining local DIDs (matches the legacy break).
+                break;
+            }
+        }
+
+        // Phase 3: evict standing entries whose context resolved to a
+        // terminal state. `generate_standing_context_id` hashes the DID
+        // pair, so re-derive each entry's id and compare. ArcSwap +
+        // write_lock mutation (ADR-049 §Decision 12).
+        if !terminal_context_ids.is_empty() {
+            let local_did_set: std::collections::HashSet<DID> =
+                self.local_dids.load().iter().cloned().collect();
+            let _guard = self.write_lock.lock().await;
+            let snapshot = self.standing_contexts.load_full();
+            let to_remove: Vec<String> = snapshot
+                .iter()
+                .filter(|(_key, peer_did)| {
+                    local_did_set.iter().any(|local_did| {
+                        let cid = crate::context::standing_helpers::generate_standing_context_id(
+                            local_did, peer_did,
+                        );
+                        terminal_context_ids.contains(&cid)
+                    })
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            if !to_remove.is_empty() {
+                let mut updated: HashMap<String, DID> = (*snapshot).clone();
+                for key in &to_remove {
+                    updated.remove(key);
+                }
+                self.standing_contexts.store(Arc::new(updated));
+            }
+        }
+
+        Ok(reconnected)
     }
 
     /// Returns the current member count for `context_id`, or `None` if

@@ -10,18 +10,22 @@
 //! # Phase 2A.2 migration
 //!
 //! The standing domain is supervisor-scoped: the standing index lives on
-//! the supervisor, and standing-pair creation still delegates to the
-//! legacy `create_context` flow until Phase 2C decomposes it into a
-//! saga. These helpers therefore take [`ActorDeps`] without
-//! `PerContextState`: they do not read or mutate per-context state and
-//! route supervisor-scoped work through the capability-reduced
+//! the supervisor. The count / has / register helpers here take
+//! [`ActorDeps`] without `PerContextState` — they do not read or mutate
+//! per-context state and route supervisor-scoped work through the
+//! capability-reduced
 //! [`SupervisorHandle`](crate::context::supervisor::SupervisorHandle)
 //! embedded in `deps`.
 //!
-//! The legacy lock-shaped bodies live in
-//! [`crate::context::standing_helpers_legacy`] for the supervisor shim
-//! fallback. Phase 2A finalization removes that module after every
-//! domain routes through actor-owned state.
+//! Get-or-create (`standing_context`) and `reconnect_all_standing` are
+//! NOT exposed here: both are actor-native methods on the supervisor
+//! ([`Supervisor::standing_context`](crate::context::supervisor::supervisor::Supervisor::standing_context),
+//! [`Supervisor::reconnect_all_standing`](crate::context::supervisor::supervisor::Supervisor::reconnect_all_standing))
+//! that resolve per-context lifecycle and params through the actor
+//! registry and mailbox. Get-or-create may CREATE the target actor, so
+//! routing it through a per-context actor handler would risk a
+//! non-`Send` actor-spawns-actor recursion; it therefore dispatches
+//! supervisor-direct.
 
 use scp_identity::DID;
 use scp_protocol::context::ContextError;

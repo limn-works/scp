@@ -52,7 +52,6 @@ pub mod providers;
 pub(crate) mod queries_helpers;
 pub(crate) mod queries_helpers_legacy;
 pub(crate) mod standing_helpers;
-pub(crate) mod standing_helpers_legacy;
 pub mod state;
 pub mod supervisor;
 pub(crate) mod tools_helpers;

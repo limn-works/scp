@@ -250,14 +250,15 @@ impl SupervisorHandle {
             .store(std::sync::Arc::new(updated));
     }
 
-    /// Reconnect all standing contexts through the supervisor fallback.
+    /// Reconnect all standing contexts.
     ///
-    /// Transitional Phase 2A surface; the legacy helper still scans the
-    /// supervisor context map because standing commands are not keyed to
-    /// a single actor until the standing-pair saga lands.
+    /// Capability-reduced surface over the actor-native
+    /// [`Supervisor::reconnect_all_standing`](crate::context::supervisor::supervisor::Supervisor::reconnect_all_standing),
+    /// which resolves per-context lifecycle + params through the actor
+    /// registry + mailbox (no `contexts` DashMap, no
+    /// `Mutex<PerContextState>`).
     pub(crate) async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
-        crate::context::standing_helpers_legacy::reconnect_all_standing_legacy(&self.supervisor)
-            .await
+        self.supervisor.reconnect_all_standing().await
     }
 
     /// Look up this identity's wrapping public key. Returns `None` if
