@@ -1590,6 +1590,31 @@ pub fn close_receive_channel(bi: &PyBridgeInstance, context_id: &str) -> Result<
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found, has no
 /// active receive channel, or if the channel is closed.
+/// The sender + shared-receiver pair backing a context's receive channel.
+/// Cloned out of [`FfiBridgeState`] so an event can be delivered after the
+/// owning bridge state has been removed from the registry (the close
+/// teardown removes the FFI state BEFORE the actor despawn to fail closed,
+/// then still delivers the `SystemClose` event through these handles).
+pub type ReceiveChannelHandles = (
+    mpsc::Sender<PyMessage>,
+    Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
+);
+
+/// Clone a context's receive-channel handles out of the FFI state
+/// registry, if a receive channel is active. Returns `None` when the
+/// context is unregistered or has no open channel.
+#[must_use]
+pub fn clone_receive_channel_handles(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Option<ReceiveChannelHandles> {
+    with_ffi_state(bi, context_id, |st| {
+        Ok(st.message_tx.clone().zip(st.message_rx.clone()))
+    })
+    .ok()
+    .flatten()
+}
+
 pub fn deliver_message(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1607,7 +1632,27 @@ pub fn deliver_message(
         })?;
         Ok((tx, rx))
     })?;
+    deliver_message_with_handles(bi, context_id, &tx, &rx_arc, message)
+}
 
+/// Deliver a message through pre-captured channel handles.
+///
+/// Bypasses the FFI state registry (oldest-drop on overflow). Used by the
+/// close teardown to deliver the `SystemClose` event AFTER the bridge
+/// state has been removed (fail-closed ordering). Same overflow semantics
+/// as [`deliver_message`].
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the channel is closed or a send
+/// fails after an overflow drop.
+pub fn deliver_message_with_handles(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    tx: &mpsc::Sender<PyMessage>,
+    rx_arc: &Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
+    message: PyMessage,
+) -> Result<(), ScpPyError> {
     match tx.try_send(message.clone()) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -2325,6 +2370,64 @@ mod tests {
         init_context_manager_for_test(bi);
         let result = with_ffi_state(bi, "nonexistent-ctx-id", |_| Ok(()));
         assert!(result.is_err());
+    }
+
+    /// The close-teardown fail-closed ordering: once the FFI bridge state
+    /// is removed (which `context_close` now does BEFORE the actor
+    /// despawn, so a fail-open rate-limit can't gate unthrottled tool
+    /// dispatch), `with_context`/`with_ffi_state` tool lookups fail
+    /// closed — yet the receive-channel handles captured BEFORE removal
+    /// still deliver the `SystemClose` event to an active receiver.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_channel_handles_survive_ffi_state_removal() {
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let ctx_id = unique_ctx_id("close-fail-closed");
+        register_context(bi, &ctx_id, "did:dht:z6MkCloseFailClosed", &[]).unwrap();
+
+        // Open a receive channel on the FFI state (as `context_receive`
+        // would).
+        let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+        with_ffi_state(bi, &ctx_id, |st| {
+            st.message_tx = Some(tx);
+            st.message_rx = Some(Arc::clone(&rx_arc));
+            Ok(())
+        })
+        .unwrap();
+
+        // Capture the channel handles BEFORE removing the FFI state — this
+        // is what the close teardown does so it can still deliver the
+        // close event after failing the tool path closed.
+        let handles =
+            clone_receive_channel_handles(bi, &ctx_id).expect("an open channel yields handles");
+
+        // Fail closed: remove the FFI bridge state.
+        remove_context(bi, &ctx_id);
+        assert!(
+            with_ffi_state(bi, &ctx_id, |_| Ok(())).is_err(),
+            "tool dispatch lookup must fail closed once FFI state is removed"
+        );
+
+        // Delivery through the captured handles still works after removal.
+        let (tx2, rx2) = handles;
+        let msg = PyMessage::new(
+            bi,
+            "scp:system".to_owned(),
+            b"SystemClose".to_vec(),
+            0.0,
+            ctx_id.clone(),
+        );
+        deliver_message_with_handles(bi, &ctx_id, &tx2, &rx2, msg)
+            .expect("captured handles still deliver after FFI-state removal");
+
+        // The receiver observes the delivered close event.
+        let received = rx_arc.lock().await.try_recv();
+        assert!(
+            received.is_ok(),
+            "the SystemClose event must reach the receiver via the captured handles"
+        );
     }
 
     /// User-provided ceiling strings in colon format (e.g. `"tool:invoke:*"`)

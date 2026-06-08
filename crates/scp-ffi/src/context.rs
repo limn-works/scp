@@ -1071,6 +1071,48 @@ fn drain_and_deliver(bi: &crate::runtime::PyBridgeInstance, context_id: &str) {
     }
 }
 
+/// Drain a context's pending events from the supervisor and deliver them
+/// through pre-captured channel handles, instead of resolving the channel
+/// via the FFI state registry.
+///
+/// Used by [`Self::context_close`] (the close teardown): the FFI bridge
+/// state is removed BEFORE the actor despawn so tool dispatch fails closed
+/// during the despawn window, but the `SystemClose` event the close
+/// produces must still reach an active receiver. The receive-channel
+/// handles are cloned out before the FFI-state removal and threaded here.
+/// No-op (events drained, delivery skipped) when no channel was open.
+fn drain_and_deliver_via_sender(
+    bi: &crate::runtime::PyBridgeInstance,
+    context_id: &str,
+    channel: Option<crate::runtime::ReceiveChannelHandles>,
+) {
+    let Ok(rt) = crate::runtime() else {
+        return;
+    };
+    let sup = match crate::runtime::supervisor(bi) {
+        Ok(sup) => sup.clone(),
+        Err(_) => return,
+    };
+
+    let events = rt.block_on(sup.drain_events(context_id));
+
+    // No receiver was subscribed — drain the supervisor buffer (above) so
+    // it does not leak, but there is nowhere to deliver. Matches the
+    // subscription model where events without an active receiver are lost.
+    let Some((tx, rx)) = channel else {
+        return;
+    };
+
+    for event in events {
+        let (sender_did, payload, timestamp) = convert_context_event(event);
+
+        let msg = PyMessage::new(bi, sender_did, payload, timestamp, context_id.to_owned());
+        // Best-effort delivery through the captured handles (same
+        // oldest-drop overflow semantics as `deliver_message`).
+        let _ = crate::runtime::deliver_message_with_handles(bi, context_id, &tx, &rx, msg);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ContextManager delegation helpers
 // ---------------------------------------------------------------------------
@@ -2081,10 +2123,37 @@ impl crate::scp::PyScp {
         // auth check — the ContextManager is authoritative.
         let context_id = handle.context_id.clone();
 
-        // Delegate close to the shared ContextManager FIRST. If it fails with a
-        // real error (not "context not found" which is idempotent), propagate
-        // before cleaning up FFI state. This prevents the scenario where FFI
-        // state is destroyed but the ContextManager still holds the context.
+        // ----------------------------------------------------------------
+        // Teardown ordering (fail-closed). The supervisor actor despawn
+        // (inside the `CloseContext` dispatch below) makes the per-context
+        // hard-rate-limit unavailable, and
+        // `try_consume_hard_rate_limit_from_any_context` fails OPEN
+        // (returns `true`) for a context with no live actor. If the FFI
+        // bridge state still existed in that window, a concurrent MCP
+        // `invoke_tool` for the same id would pass the (fail-open) rate
+        // limit AND find live bridge-side tool state via `with_context`,
+        // executing UNTHROTTLED. To make the bridge fail CLOSED first, the
+        // FFI state (which backs `with_context` tool dispatch) is removed
+        // BEFORE the actor despawn — once it is gone, `with_context`
+        // returns `not found` and the tool cannot dispatch regardless of
+        // the rate-limit fail-open.
+        //
+        // The receive channel lives inside the same `FfiBridgeState`, so
+        // capture its sender BEFORE removal and use it to deliver the
+        // drained `SystemClose` event AFTER the close completes (the close
+        // is what produces that event).
+        let close_channel = crate::runtime::clone_receive_channel_handles(bi, &handle.context_id);
+
+        // Remove FFI bridge state first → tool dispatch fails closed.
+        crate::runtime::remove_context(bi, &handle.context_id);
+
+        // Delegate close to the shared ContextManager. A real error (not
+        // the idempotent "context not found") still propagates; the FFI
+        // state has already been removed, but a failing close is either an
+        // authorization rejection (the caller may not close — no security
+        // exposure: the actor stays alive and rate-limited) or an
+        // idempotent re-close. There is no path where unthrottled tool
+        // execution survives this ordering.
         {
             let initiator_did = scp_identity::DID(identity_did.to_owned());
             let rt = crate::runtime()?;
@@ -2139,12 +2208,12 @@ impl crate::scp::PyScp {
         "closed".clone_into(&mut state);
         drop(state);
 
-        // Bridge: drain events (SystemClose) from ContextManager before
-        // removing FFI state, so any active receiver gets the close event (#332).
-        drain_and_deliver(bi, &handle.context_id);
-
-        // Remove context from the FFI state registry to free resources.
-        crate::runtime::remove_context(bi, &handle.context_id);
+        // Bridge: drain the `SystemClose` event the close produced and
+        // deliver it through the channel sender captured before FFI-state
+        // removal, so an active receiver still observes the close (#332).
+        // The FFI state is already gone, so delivery cannot go through
+        // `with_context`; it uses the captured sender directly.
+        drain_and_deliver_via_sender(bi, &handle.context_id, close_channel);
 
         Ok(())
     }
