@@ -1633,10 +1633,41 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await expect(napi.contextImport(invalidData)).rejects.toThrow();
     });
 
-    // Spec §23.16.4: the exported snapshot is Ed25519-signed by the exporter.
-    // Tampering with the exported bytes after signing must cause import to be
-    // rejected — a forged snapshot cannot be imported.
-    test("import rejects a tampered export (snapshot signature, §23.16.4)", async () => {
+    // Spec §23.16.8: the verifying key is resolved from the snapshot's
+    // creator_did via local custody first (then DID resolver). A self-export of
+    // an in-memory (unpublished) identity must round-trip on import — the
+    // creator's verifying key is derived from its own #active custody key, so
+    // no published DID document is required. This is the regression guard for
+    // the prior bug where import went straight to the DID resolver and failed
+    // for unpublished self-exports.
+    test("self-export round-trips via local-custody key resolution (§23.16.8)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read", "context:close"],
+          memoryScope: "ephemeral",
+        }),
+      );
+
+      const data = await napi.contextExport(ctx);
+      expect(data.length).toBeGreaterThan(0);
+
+      // Close so import_context sees a terminal state and allows reimport.
+      await napi.contextClose(ctx, identity.did);
+
+      // Untampered self-export must verify and import: the snapshot signature
+      // checks against the creator's local-custody #active key.
+      const importedContextId = await napi.contextImport(data);
+      expect(typeof importedContextId).toBe("string");
+      expect(importedContextId.length).toBeGreaterThan(0);
+    });
+
+    // Spec §23.16.8 / ADR-050: the exported snapshot is Ed25519-signed over the
+    // full canonical snapshot. Tampering with the exported bytes after signing
+    // must cause import to be rejected with SCP-CTX-2093 (the dedicated
+    // signed-export verification code), not a generic context error.
+    test("import rejects a tampered export with SCP-CTX-2093 (§23.16.8)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -1652,13 +1683,16 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
       // Flip bytes in the back half of the export (the embedded snapshot
       // region) to forge state without re-signing. The signed snapshot hash
-      // no longer matches, so import must reject.
+      // no longer matches, so import must reject with the dedicated code.
       const tampered = new Uint8Array(data);
       const start = Math.floor(tampered.length / 2);
       for (let i = start; i < tampered.length; i += 17) {
         tampered[i] = (tampered[i] ?? 0) ^ 0xff;
       }
-      await expect(napi.contextImport(tampered)).rejects.toThrow();
+      // The raw NAPI addon surfaces the stable code as a "[SCP-CTX-2093]"
+      // prefix in the thrown Error.message (the TS SDK parses this prefix into
+      // ContextError.code).
+      await expect(napi.contextImport(tampered)).rejects.toThrow(/SCP-CTX-2093/);
     });
   });
 

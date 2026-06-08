@@ -2177,47 +2177,87 @@ async fn resolve_napi_signing_key(
         })
 }
 
-/// Resolves the exporter DID's Ed25519 verification key for snapshot-signature
-/// verification on context import (§23.16.4, ADR-039).
+/// Resolves the snapshot creator's Ed25519 verification key for
+/// snapshot-signature verification on context import (spec §23.16.8, ADR-050,
+/// ADR-039).
 ///
-/// Tries `#active` then `#agent` (ADR-039 shared-DID model). Fails closed with
-/// [`codes::CTX_2093`] if no resolver is configured or neither key resolves —
-/// an unverifiable export is never imported.
-fn resolve_napi_exporter_verifying_key(
+/// Per §23.16.8 step 1 the verifying key is derived from the snapshot's
+/// `creator_did` (`role_state.creator_did`), never from the unauthenticated
+/// envelope `exporter_did`. The runtime separately asserts
+/// `exporter_did == creator_did` (§23.16.8 step 2), so the bridge MUST resolve
+/// from the creator identity.
+///
+/// Resolution order (local-custody-first, then DID resolver) is shared across
+/// all non-WASM bridges via
+/// [`scp_ffi_common::export_verify::resolve_export_verifying_key`]:
+/// 1. **Local identity custody** — if the creator is a local identity (the
+///    common self-export case: a device importing a context it exported), the
+///    verifying key is derived directly from its `#active` custody signing key.
+///    This works even when the DID document has not been published to the DHT
+///    (in-memory identities are not auto-published) — fixing the prior bug
+///    where a self-export of an unpublished identity failed because the bridge
+///    went straight to the DID resolver.
+/// 2. **DID resolver** — otherwise resolve the creator DID's `#active` (then
+///    `#agent`, ADR-039 shared-DID model) verification-method key.
+///
+/// Fails closed: if the creator is neither local nor resolvable, the import is
+/// rejected with [`codes::CTX_2093`] rather than proceeding unverified.
+///
+/// `async` because deriving the verifying key from local custody requires an
+/// async `export_ed25519_signing_key` call (the shared helper's `local_custody`
+/// closure is sync, so the local key is resolved up front and handed to the
+/// closure as a pre-computed value).
+async fn resolve_napi_creator_verifying_key(
     bi: &NapiBridgeInstance,
-    exporter_did: &str,
+    creator_did: &str,
 ) -> napi::Result<ed25519_dalek::VerifyingKey> {
-    use scp_core::crypto::ucan::validate::DidResolver;
+    let resolver = crate::runtime::did_resolver(bi).map(std::convert::AsRef::as_ref);
 
-    let resolver = crate::runtime::did_resolver(bi).ok_or_else(|| {
+    // Pre-resolve the local verifying key (async) so the shared helper's sync
+    // `local_custody` closure can return it without blocking. Only the public
+    // verifying key is derived — private key material never leaves custody
+    // (ADR-006). When the feature is disabled there is no local registry, so
+    // the local key is always `None` and resolution relies on the DID resolver.
+    #[cfg(feature = "allow_in_memory_custody")]
+    let local_key = resolve_napi_local_verifying_key(bi, creator_did).await;
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    let local_key: Option<ed25519_dalek::VerifyingKey> = None;
+
+    scp_ffi_common::export_verify::resolve_export_verifying_key(
+        resolver,
+        |_did| local_key,
+        creator_did,
+    )
+    .map_err(|e| {
         NapiError::from(ScpNapiError::Context {
-            message: "no DID resolver configured — cannot verify exporter snapshot signature"
-                .to_owned(),
-            code: codes::CTX_2093.to_owned(),
-        })
-    })?;
-
-    let key_bytes = resolver
-        .resolve_public_key_by_kid(exporter_did, "active")
-        .or_else(|_| resolver.resolve_public_key_by_kid(exporter_did, "agent"))
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!(
-                    "failed to resolve exporter '{exporter_did}' verification key \
-                     (#active/#agent): {e}"
-                ),
-                code: codes::CTX_2093.to_owned(),
-            })
-        })?;
-
-    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!(
-                "exporter '{exporter_did}' verification key is not valid Ed25519: {e}"
-            ),
+            message: format!("{e}"),
             code: codes::CTX_2093.to_owned(),
         })
     })
+}
+
+/// Derives the public Ed25519 verifying key for a DID from local key custody,
+/// or `None` when the DID is not a local identity on this bridge instance.
+///
+/// Uses the creator identity's `#active` signing-key handle
+/// ([`scp_identity::ScpIdentity::active_signing_key`]) — the verification
+/// method §23.16.8 designates as the export signer. Only the public verifying
+/// key crosses out of custody (ADR-006).
+#[cfg(feature = "allow_in_memory_custody")]
+async fn resolve_napi_local_verifying_key(
+    bi: &NapiBridgeInstance,
+    did: &str,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    let custody_and_key = crate::runtime::with_identity(bi, did, |e| {
+        Ok((e.custody.clone(), e.identity.active_signing_key))
+    })
+    .ok()?;
+    let (custody, key_handle) = custody_and_key;
+    custody
+        .export_ed25519_signing_key(&key_handle)
+        .await
+        .ok()
+        .map(|sk| sk.verifying_key())
 }
 
 /// Parses a hex-encoded proposal ID into a 32-byte array.
@@ -2937,11 +2977,19 @@ pub(crate) async fn context_import_on(
     // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1294).
     crate::runtime::init_context_manager(bi, &export.exporter_did.0);
 
-    // Resolve the exporter's verification key to verify the snapshot signature
-    // (§23.16.4). Fail-closed: an unverifiable export is never imported.
-    let verifying_key = resolve_napi_exporter_verifying_key(bi, &export.exporter_did.0)?;
+    // Resolve the snapshot creator's verification-method key to verify the
+    // snapshot signature (§23.16.8 step 1, ADR-050). The key is derived from
+    // the snapshot `creator_did` — NOT the unauthenticated envelope
+    // `exporter_did`. The runtime separately asserts
+    // `exporter_did == creator_did` (§23.16.8 step 2). Fail-closed: if no key
+    // resolves, the import is rejected — never imported unverified.
+    let creator_did = export.snapshot.role_state.creator_did.clone();
+    let verifying_key = resolve_napi_creator_verifying_key(bi, &creator_did).await?;
 
     let manager = context_manager(bi)?;
+    // Route the import error through ScpNapiError so the typed
+    // ContextError::SnapshotSignatureInvalid arm surfaces SCP-CTX-2093
+    // (signature/version forgery) rather than the catch-all SCP-CTX-2001.
     manager
         .import_context(export, &verifying_key)
         .await
