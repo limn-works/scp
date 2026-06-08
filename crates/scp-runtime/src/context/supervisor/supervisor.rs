@@ -2184,11 +2184,19 @@ impl Supervisor {
         let capacity = mailbox_capacity.unwrap_or(ACTOR_MAILBOX_CAPACITY);
         let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(capacity);
 
-        // Derive the supervisor-registry string key from the state's
-        // canonical 32-byte context ID. `hex::encode` matches the
-        // string form used throughout the legacy shim (see
-        // `ContextManager::contexts`, keyed by `String`).
-        let ctx_id_str = hex::encode(state.context_id);
+        // Register under the context's ORIGINAL id string (the one the
+        // `ContextHandle` carries and that every per-context dispatch /
+        // `lookup` uses), NOT `hex(state.context_id)`. `state.context_id`
+        // is `SHA256(original_id)` (`context_id_to_bytes`), so keying by
+        // its hex would diverge from the original-string id callers pass
+        // to `lookup` — the legacy `contexts` DashMap was keyed by the
+        // original string, and per-context dispatch (incl. the cross-
+        // context recovery flow) still is. For the test fixtures the
+        // handle id IS `hex(context_id_bytes)`, so this is identical
+        // there; for production `create_context` it is the caller's
+        // original id, which is what makes per-context dispatch resolve
+        // the actor.
+        let ctx_id_str = state.handle.context_id().to_owned();
 
         let handle = ContextActorHandle::from_sender(tx);
         {
