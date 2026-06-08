@@ -1218,57 +1218,49 @@ fn resolve_signing_key(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
-/// Resolves the exporter DID's Ed25519 verification key for snapshot-signature
-/// verification on context import (spec §23.16.4, ADR-039).
+/// Resolves the snapshot creator's Ed25519 verification key for
+/// snapshot-signature verification on context import (spec §23.16.8, ADR-050,
+/// ADR-039).
 ///
-/// Resolution order:
-/// 1. **Local identity custody** — if the exporter is a local identity (the
+/// Per §23.16.8 step 1 the verifying key is derived from the snapshot's
+/// `creator_did` (`role_state.creator_did`), never from the unauthenticated
+/// envelope `exporter_did`. The runtime separately asserts
+/// `exporter_did == creator_did` (§23.16.8 step 2), so the bridge MUST resolve
+/// from the creator identity.
+///
+/// Resolution order (local-custody-first, then DID resolver) is shared across
+/// all non-WASM bridges via
+/// [`scp_ffi_common::export_verify::resolve_export_verifying_key`]:
+/// 1. **Local identity custody** — if the creator is a local identity (the
 ///    common self-export case: a device importing a context it exported), the
 ///    verifying key is derived directly from its `#active` custody signing key.
 ///    This works even when the DID document has not been published to the DHT
 ///    (in-memory identities are not auto-published).
-/// 2. **DID resolver** — otherwise resolve the exporter DID's `#active` (then
+/// 2. **DID resolver** — otherwise resolve the creator DID's `#active` (then
 ///    `#agent`, ADR-039 shared-DID model) verification-method key.
 ///
-/// Fails closed: if the exporter is neither local nor resolvable, the import is
-/// rejected with [`error_codes::CTX_2093`] rather than proceeding unverified.
-fn resolve_exporter_verifying_key(
+/// Fails closed: if the creator is neither local nor resolvable, the import is
+/// rejected with [`scp_ffi_common::error_codes::CTX_2093`] rather than
+/// proceeding unverified.
+fn resolve_creator_verifying_key(
     bi: &crate::runtime::PyBridgeInstance,
-    exporter_did: &str,
+    creator_did: &str,
 ) -> PyResult<ed25519_dalek::VerifyingKey> {
-    use scp_core::crypto::ucan::validate::DidResolver;
+    let resolver = crate::runtime::did_resolver(bi).map(std::convert::AsRef::as_ref);
 
-    // 1. Local identity: derive the verifying key from the custody signing key.
-    if let Ok(signing_key) = resolve_signing_key(bi, exporter_did) {
-        return Ok(signing_key.verifying_key());
-    }
-
-    // 2. Remote exporter: resolve via the DID resolver (#active then #agent).
-    let resolver = crate::runtime::did_resolver(bi).ok_or_else(|| {
-        PyRuntimeError::new_err(format!(
-            "{}: exporter '{exporter_did}' is not a local identity and no DID resolver \
-             is configured — cannot verify exporter snapshot signature",
-            scp_ffi_common::error_codes::CTX_2093
-        ))
-    })?;
-
-    let key_bytes = resolver
-        .resolve_public_key_by_kid(exporter_did, "active")
-        .or_else(|_| resolver.resolve_public_key_by_kid(exporter_did, "agent"))
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!(
-                "{}: failed to resolve exporter '{exporter_did}' verification key \
-                 (#active/#agent): {e}",
-                scp_ffi_common::error_codes::CTX_2093
-            ))
-        })?;
-
-    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| {
-        PyRuntimeError::new_err(format!(
-            "{}: exporter '{exporter_did}' verification key is not a valid Ed25519 key: {e}",
-            scp_ffi_common::error_codes::CTX_2093
-        ))
-    })
+    scp_ffi_common::export_verify::resolve_export_verifying_key(
+        resolver,
+        // Local custody: derive the public verifying key from the custody
+        // signing key when the DID is a local identity. Private key material
+        // never leaves the bridge — only the public key is returned.
+        |did| {
+            resolve_signing_key(bi, did)
+                .ok()
+                .map(|sk| sk.verifying_key())
+        },
+        creator_did,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", scp_ffi_common::error_codes::CTX_2093)))
 }
 
 /// Validates all user-controlled string fields on a governance action.
@@ -2498,13 +2490,20 @@ impl crate::scp::PyScp {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mgr = mgr.clone();
 
-        // Resolve the exporter DID's verification-method key to verify the
-        // snapshot signature (§23.16.4). Fail-closed: if no key resolves, the
-        // import is rejected — never imported unverified.
-        let verifying_key = resolve_exporter_verifying_key(bi, &export.exporter_did.0)?;
+        // Resolve the snapshot creator's verification-method key to verify the
+        // snapshot signature (§23.16.8 step 1, ADR-050). The key is derived
+        // from the snapshot `creator_did` — NOT the unauthenticated envelope
+        // `exporter_did`. The runtime separately asserts
+        // `exporter_did == creator_did` (§23.16.8 step 2). Fail-closed: if no
+        // key resolves, the import is rejected — never imported unverified.
+        let creator_did = export.snapshot.role_state.creator_did.clone();
+        let verifying_key = resolve_creator_verifying_key(bi, &creator_did)?;
 
+        // Route the import error through ScpPyError so the typed
+        // ContextError::SnapshotSignatureInvalid arm surfaces SCP-CTX-2093
+        // (signature/version forgery) rather than the catch-all SCP-CTX-2001.
         rt.block_on(mgr.import_context(export, &verifying_key))
-            .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
+            .map_err(crate::error::ScpPyError::from)?;
 
         Ok(context_id)
     }
