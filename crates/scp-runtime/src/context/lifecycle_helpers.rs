@@ -1852,7 +1852,11 @@ pub async fn restore_context(
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
-        generation: ctx_snapshot.generation, // SupervisorHandle stamps fresh if 0.
+        // Placeholder — `spawn_actor_with_state` overwrites this
+        // unconditionally with a fresh monotonic `spawn_generation`
+        // (AtomicU64; first spawn = 1) before the state crosses into the
+        // actor task. The snapshot value is never the live generation.
+        generation: ctx_snapshot.generation,
         handle: handle.clone(),
         membership: ctx_snapshot.membership,
         members: actor_members,

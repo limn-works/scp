@@ -1075,12 +1075,14 @@ fn drain_and_deliver(bi: &crate::runtime::PyBridgeInstance, context_id: &str) {
 /// through pre-captured channel handles, instead of resolving the channel
 /// via the FFI state registry.
 ///
-/// Used by [`Self::context_close`] (the close teardown): the FFI bridge
-/// state is removed BEFORE the actor despawn so tool dispatch fails closed
-/// during the despawn window, but the `SystemClose` event the close
-/// produces must still reach an active receiver. The receive-channel
-/// handles are cloned out before the FFI-state removal and threaded here.
-/// No-op (events drained, delivery skipped) when no channel was open.
+/// Used by [`Self::context_close`] (the close teardown): on a successful
+/// close the FFI bridge state is removed (so bridge tool dispatch fails
+/// closed for the id — defense in depth; close itself is non-terminal for
+/// the supervisor actor and does not despawn it), but the `SystemClose`
+/// event the close produces must still reach an active receiver. The
+/// receive-channel handles are cloned out before the FFI-state removal and
+/// threaded here. No-op (events drained, delivery skipped) when no channel
+/// was open.
 fn drain_and_deliver_via_sender(
     bi: &crate::runtime::PyBridgeInstance,
     context_id: &str,
@@ -2124,36 +2126,45 @@ impl crate::scp::PyScp {
         let context_id = handle.context_id.clone();
 
         // ----------------------------------------------------------------
-        // Teardown ordering (fail-closed). The supervisor actor despawn
-        // (inside the `CloseContext` dispatch below) makes the per-context
-        // hard-rate-limit unavailable, and
-        // `try_consume_hard_rate_limit_from_any_context` fails OPEN
-        // (returns `true`) for a context with no live actor. If the FFI
-        // bridge state still existed in that window, a concurrent MCP
-        // `invoke_tool` for the same id would pass the (fail-open) rate
-        // limit AND find live bridge-side tool state via `with_context`,
-        // executing UNTHROTTLED. To make the bridge fail CLOSED first, the
-        // FFI state (which backs `with_context` tool dispatch) is removed
-        // BEFORE the actor despawn — once it is gone, `with_context`
-        // returns `not found` and the tool cannot dispatch regardless of
-        // the rate-limit fail-open.
+        // Teardown ordering (close-auth-honoring, fail-closed on success).
         //
-        // The receive channel lives inside the same `FfiBridgeState`, so
-        // capture its sender BEFORE removal and use it to deliver the
-        // drained `SystemClose` event AFTER the close completes (the close
-        // is what produces that event).
+        // The `CloseContext` dispatch enforces close authorization: the
+        // actor close handler runs `ttl::close_context`, which gates on the
+        // initiator's `ContextClose` capability and the governance model and
+        // can reject with `PermissionDenied` (or other non-idempotent
+        // errors). Close is NON-terminal for the supervisor actor — it
+        // transitions the context lifecycle to Closed but does NOT despawn
+        // the actor (see `handle_close_context_actor`). Because the actor
+        // stays alive, its per-context hard-rate-limit bucket remains live
+        // and `try_consume_hard_rate_limit_from_any_context` stays
+        // fail-CLOSED throughout; there is no despawn window in which the
+        // rate limit fails open.
+        //
+        // The defense-in-depth value of removing the FFI bridge state (which
+        // backs `with_context` tool dispatch) is that, on a SUCCESSFUL
+        // close, the bridge tool-dispatch lookup fails closed first — once
+        // the state is gone, `with_context` returns `not found` and the tool
+        // cannot dispatch. To make that property honor close authorization,
+        // the dispatch runs BEFORE removal: an unauthorized or otherwise
+        // failing close (anything but the idempotent `ContextNotRegistered`)
+        // returns early WITHOUT removing the FFI state, leaving the context
+        // fully usable through this bridge instance. Restoring an already-
+        // removed `FfiBridgeState` is not viable: it holds non-reconstructible
+        // live state (channel senders, registered tool handlers, sessions,
+        // the accumulated event log, nonce tracker, revocation list) that
+        // `register_ffi_state` cannot rebuild — so the ordering is what
+        // preserves the prior state on failure.
+        //
+        // The receive channel lives inside the `FfiBridgeState`, so capture
+        // a clone of its sender BEFORE any removal and use it to deliver the
+        // drained `SystemClose` event AFTER the close completes (the close is
+        // what produces that event). The clone keeps the receiver alive even
+        // once the registry entry is dropped.
         let close_channel = crate::runtime::clone_receive_channel_handles(bi, &handle.context_id);
 
-        // Remove FFI bridge state first → tool dispatch fails closed.
-        crate::runtime::remove_context(bi, &handle.context_id);
-
-        // Delegate close to the shared ContextManager. A real error (not
-        // the idempotent "context not found") still propagates; the FFI
-        // state has already been removed, but a failing close is either an
-        // authorization rejection (the caller may not close — no security
-        // exposure: the actor stays alive and rate-limited) or an
-        // idempotent re-close. There is no path where unthrottled tool
-        // execution survives this ordering.
+        // Delegate close to the shared supervisor FIRST so close
+        // authorization (and any other precondition) is honored before the
+        // FFI bridge state is touched.
         {
             let initiator_did = scp_identity::DID(identity_did.to_owned());
             let rt = crate::runtime()?;
@@ -2189,7 +2200,9 @@ impl crate::scp::PyScp {
             });
             // Propagate errors unless the context was already removed from the
             // supervisor (idempotent — e.g. all members left). The
-            // ContextNotRegistered error is safe to ignore.
+            // ContextNotRegistered error is safe to ignore: in that case the
+            // close already happened, so teardown proceeds. Any other error
+            // returns BEFORE FFI-state removal, leaving the context usable.
             match dispatch_outcome {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
@@ -2202,6 +2215,10 @@ impl crate::scp::PyScp {
                 Err(py_err) => return Err(py_err),
             }
         }
+
+        // Close succeeded (or was idempotently already closed). Remove the
+        // FFI bridge state → bridge tool dispatch fails closed for this id.
+        crate::runtime::remove_context(bi, &handle.context_id);
 
         // Transition directly to "closed" (skipping "closing" for the bridge
         // layer -- the full runtime will implement the cooperative closing window).
@@ -5634,6 +5651,74 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // context_close teardown ordering (close auth honored before FFI removal)
+    // -----------------------------------------------------------------------
+
+    /// A `context_close` that fails authorization (the initiator lacks the
+    /// `ContextClose` capability) MUST return an error AND leave the FFI
+    /// bridge state intact, so the context remains usable through this bridge
+    /// instance. The `CloseContext` dispatch is performed BEFORE the FFI
+    /// state is removed; only a successful (or idempotently already-closed)
+    /// close removes the state.
+    #[test]
+    fn unauthorized_close_leaves_ffi_state_intact() {
+        crate::init_runtime().ok();
+        let ctx_id = format!("close-auth-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkCloseCreator1";
+        let intruder = "did:key:z6MkCloseIntruder1";
+
+        // Use the SAME bridge instance for FFI-state registration, actor
+        // creation, the handle stamp, and the `context_close` call — the
+        // handle-affinity check rejects a mismatched instance.
+        let scp = crate::scp::PyScp::new();
+        let bi = scp.inner.clone();
+
+        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let sup = crate::runtime::supervisor(&bi).unwrap();
+        let rt = crate::runtime().unwrap();
+        rt.block_on(sup.create_context(
+            ctx_id.clone(),
+            scp_core::context::ContextParams::default(),
+            scp_identity::DID(creator.to_owned()),
+            None,
+        ))
+        .unwrap();
+
+        // Mint the handle off the same instance and mark it active so the
+        // close passes the bridge-side state gate and reaches the dispatch.
+        let handle =
+            PyContextHandle::new(&bi, ctx_id.clone(), creator.to_owned(), default_params());
+        "active".clone_into(&mut handle.state.lock().unwrap());
+
+        // The intruder is not a member and holds no `ContextClose`
+        // capability → the actor close handler rejects with
+        // `PermissionDenied` (not the idempotent `ContextNotRegistered`).
+        let result = scp.context_close(&handle, intruder);
+        assert!(
+            result.is_err(),
+            "unauthorized close must be rejected by the supervisor"
+        );
+
+        // The FFI bridge state must still be present — the context is usable
+        // through the bridge. `with_context` succeeding proves the state was
+        // not torn down by the failed close.
+        crate::runtime::with_context(&bi, &ctx_id, |st| {
+            assert_eq!(
+                st.creator_did, creator,
+                "FFI bridge state must survive a failed close"
+            );
+            Ok(())
+        })
+        .expect("FFI bridge state must remain registered after a failed close");
+
+        // The bridge handle state must also remain "active" (the failed
+        // close returned before the transition to "closed").
+        assert_eq!(*handle.state.lock().unwrap(), "active");
+
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
