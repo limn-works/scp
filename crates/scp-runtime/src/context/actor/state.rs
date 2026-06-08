@@ -16,7 +16,7 @@
 //! The legacy `ContextManager` carries its own `pub(crate)
 //! PerContextState` in the deleted `crate::context::manager` module —
 //! that type was consumed through
-//! the `Mutex<PerContextState>` lock-based model that ADR-049 deletes.
+//! the `per-context-state Mutex` lock-based model that ADR-049 deletes.
 //! The actor's state type here is a SUPERSET-COMPATIBLE shape: every field
 //! the legacy struct owns is represented here (so commit 12b+ handler-body
 //! migrations move calls mechanically off `manager.field` onto
@@ -583,7 +583,7 @@ impl ContextModeState {
 /// `state.foo`. The new-per-actor fields at the bottom of the struct
 /// (`send_tracker`, `recv_tracker`, `saga_pending`, `welcome_scratchpad`,
 /// `lifecycle_state`, `mode`) have no legacy equivalent — they replace
-/// the `Mutex<PerContextState>` lock-based model.
+/// the `per-context-state Mutex` lock-based model.
 ///
 /// # Dead-code in commit 12a
 ///

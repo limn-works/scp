@@ -812,8 +812,8 @@ impl ProductionRecoveryBackend {
     /// the fully-constructed command. Routing decision lives entirely in
     /// [`Supervisor::dispatch_trust_recovery_command`]: when a context
     /// actor is registered the command runs against that actor's owned
-    /// `&mut PerContextState` (no `get_context_arc`); otherwise it falls
-    /// through to the supervisor-scoped direct path. Either way the typed
+    /// `&mut PerContextState` (no per-context map lookup); otherwise it
+    /// falls through to the supervisor-scoped direct path. Either way the typed
     /// result returns on `reply`.
     ///
     /// This replaces the previous direct supervisor-scoped calls that

@@ -1220,6 +1220,14 @@ impl ContextActor {
                 reply,
                 "tools::refund_hard_rate_limit (use Supervisor::dispatch_tools_command during commit 11)",
             ),
+            ToolsCommand::ReserveToolEconomy { reply, .. } => ack_not_impl(
+                reply,
+                "tools::reserve_tool_economy (use Supervisor::invoke_tool_with_economy / dispatch_tools_command)",
+            ),
+            ToolsCommand::SettleToolEconomy { reply, .. } => ack_not_impl(
+                reply,
+                "tools::settle_tool_economy (use Supervisor::invoke_tool_with_economy / dispatch_tools_command)",
+            ),
             ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => ack_not_impl(
                 reply,
                 "tools::initiate_cross_context_tool_invocation (saga wiring deferred to commit 11.5 — see DEFERRED-commit-11-saga-use-cases.md)",

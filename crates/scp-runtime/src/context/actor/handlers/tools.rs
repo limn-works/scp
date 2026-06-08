@@ -2,14 +2,16 @@
 //! [`ToolsCommand`](crate::context::actor::commands::ToolsCommand)
 //! and spec §5.16 / §19.7.
 //!
-//! # Phase 2A.4 -- actor-shape dispatch
+//! # Phase 2A.4 + Phase 2A finalization -- actor-shape dispatch
 //!
 //! The handler's primary entry point [`dispatch`] takes
 //! `(&mut PerContextState, &ActorDeps, ToolsCommand)` and routes the
-//! actor-owned hard-rate-limit helpers through
-//! [`crate::context::tools_helpers`]. The shim entry point remains for
-//! missing-actor fallback and routes through
-//! [`crate::context::tools_helpers_legacy`].
+//! actor-owned hard-rate-limit helpers plus the tool-economy reserve /
+//! settle phases through [`crate::context::tools_helpers`]. The economy
+//! pipeline's non-`Send` executor runs supervisor-side between the
+//! [`ToolsCommand::ReserveToolEconomy`] and [`ToolsCommand::SettleToolEconomy`]
+//! mailbox round-trips (see
+//! [`crate::context::tools_helpers::invoke_tool_with_economy`]).
 //!
 //! # SAGA WIRING DEFERRED — see
 //! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
@@ -27,12 +29,14 @@
 //!     the target's event log.
 //!
 //! Until those land, the saga-initiator path returns
-//! `ContextError::NotImplemented`. Non-saga commands are fully migrated
-//! in this commit (ADR-049 commit 11). Note:
-//! [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
-//! takes a generic executor closure that cannot cross the actor
-//! mailbox; it is not migrated to a command variant and continues to
-//! run on the direct manager surface (FFI bridges invoke it inline).
+//! `ContextError::NotImplemented`. All other tool commands run on the
+//! actor:
+//! [`Supervisor::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
+//! takes a generic non-`Send` executor closure that cannot cross the
+//! actor mailbox, so its economy bookkeeping is split into the
+//! [`ToolsCommand::ReserveToolEconomy`] / [`ToolsCommand::SettleToolEconomy`]
+//! mailbox commands (which run on owned state) while the executor itself
+//! runs supervisor-side between the two round-trips.
 
 use std::time::Duration;
 
@@ -52,13 +56,9 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// capability-reduced dependencies.
 pub async fn dispatch(
     state: &mut PerContextState,
-    _deps: &ActorDeps,
+    deps: &ActorDeps,
     cmd: ToolsCommand,
 ) -> Outcome<()> {
-    dispatch_inner(state, cmd).await
-}
-
-async fn dispatch_inner(state: &mut PerContextState, cmd: ToolsCommand) -> Outcome<()> {
     match cmd {
         ToolsCommand::Placeholder { reply } => reply_not_implemented(reply),
         ToolsCommand::TryConsumeHardRateLimit {
@@ -69,6 +69,33 @@ async fn dispatch_inner(state: &mut PerContextState, cmd: ToolsCommand) -> Outco
         } => handle_try_consume_hard_rate_limit(state, &did, now_secs, reply).await,
         ToolsCommand::RefundHardRateLimit { did, reply, .. } => {
             handle_refund_hard_rate_limit(state, &did, reply).await
+        }
+        ToolsCommand::ReserveToolEconomy {
+            context_id,
+            invoker_did,
+            spending_ucan,
+            now_secs,
+            reply,
+        } => {
+            handle_reserve_tool_economy(
+                state,
+                deps,
+                &context_id,
+                &invoker_did,
+                spending_ucan.as_deref(),
+                now_secs,
+                reply,
+            )
+            .await
+        }
+        ToolsCommand::SettleToolEconomy {
+            context_id,
+            invoker_did,
+            request,
+            reply,
+        } => {
+            handle_settle_tool_economy(state, deps, &context_id, &invoker_did, *request, reply)
+                .await
         }
         ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
             reply_saga_deferred(reply)
@@ -136,6 +163,94 @@ async fn handle_refund_hard_rate_limit(
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "refund_hard_rate_limit exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`ToolsCommand::ReserveToolEconomy`] — Phase 1 of the tool
+/// economy pipeline. Delegates to
+/// [`tools_helpers::reserve_tool_economy`](crate::context::tools_helpers::reserve_tool_economy)
+/// on owned state under a 30s timeout. On success replies with the
+/// `Send` reservation the supervisor carries across the executor.
+#[allow(clippy::too_many_arguments)]
+async fn handle_reserve_tool_economy(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    invoker_did: &scp_identity::DID,
+    spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    now_secs: u64,
+    reply: oneshot::Sender<
+        Result<Box<crate::context::tools_helpers::ToolEconomyReservation>, ContextError>,
+    >,
+) -> Outcome<()> {
+    let reserve_fut = crate::context::tools_helpers::reserve_tool_economy(
+        state,
+        deps,
+        context_id,
+        invoker_did,
+        spending_ucan,
+        now_secs,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reserve_fut).await {
+        Ok(Ok(reservation)) => (Outcome::ok_mutated(()), Ok(Box::new(reservation))),
+        Ok(Err(err)) => {
+            // A rejected reservation refunds/rolls back inline, but the
+            // observable state (rate-limit bucket touched then refunded)
+            // is mutated during the attempt — flag mutated so the actor
+            // persists if persistence is wired.
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "reserve_tool_economy exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`ToolsCommand::SettleToolEconomy`] — Phase 3 of the tool
+/// economy pipeline. Delegates to
+/// [`tools_helpers::settle_tool_economy`](crate::context::tools_helpers::settle_tool_economy)
+/// on owned state under a 30s timeout.
+async fn handle_settle_tool_economy(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    invoker_did: &scp_identity::DID,
+    request: crate::context::tools_helpers::ToolSettleRequest,
+    reply: oneshot::Sender<Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError>>,
+) -> Outcome<()> {
+    let settle_fut = crate::context::tools_helpers::settle_tool_economy(
+        state,
+        deps,
+        context_id,
+        invoker_did,
+        request,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, settle_fut).await {
+        Ok(Ok(settle_outcome)) => (Outcome::ok_mutated(()), Ok(settle_outcome)),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "settle_tool_economy exceeded {HANDLER_TIMEOUT:?} budget"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))

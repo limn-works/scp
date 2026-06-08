@@ -1261,18 +1261,6 @@ pub(crate) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
     }
 }
 
-/// Helper type for generation tokens captured during Phase 1 lock acquisition.
-///
-/// Captures the `context_id` and the `generation` counter at the time the
-/// per-context lock was first acquired. Passed to `ContextManager::relock_context`
-/// to verify the context was not removed and recreated between lock release
-/// and reacquire (confused-deputy detection, Phase B).
-#[must_use]
-pub(crate) struct ContextGeneration {
-    pub context_id: String,
-    pub generation: u64,
-}
-
 /// Creates a governance engine from a [`GovernanceModel`] selector and
 /// the context creator's DID.
 ///

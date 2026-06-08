@@ -46,14 +46,12 @@
 //!
 //! # Hoisted methods
 //!
-//! Per-context lock primitives:
-//! - [`lock_context`] — lock + capture generation token.
-//! - [`relock_context`] — reacquire under generation guard.
-//! - [`get_context_arc`] — clone the per-context `Arc<Mutex<...>>`.
-//! - [`get_context_arc_pub`] — `pub(crate)` variant for the query shim.
-//!
-//! Per-context map mutations:
-//! - [`remove_context`] — drop a context from the map.
+//! The per-context lock primitives and the `contexts` `DashMap` they read
+//! were deleted in the ADR-049 Phase 2A finalization once the last
+//! `&Supervisor` caller (the legacy tools economy wrapper) moved to the
+//! actor-split economy reserve/settle path. Per-context state now lives
+//! only inside the per-context actor; the helpers below remain because
+//! they mailbox the actors or touch supervisor-scoped provider slots.
 //!
 //! Persistence shortcuts:
 //! - [`has_persistence`] — predicate for skipping snapshot work.
@@ -67,10 +65,7 @@
 //! Operational metrics:
 //! - [`update_context_gauges`] — refresh active-contexts + buffer-occupancy gauges.
 
-use std::sync::Arc;
-
 use scp_identity::DID;
-use scp_protocol::context::ContextError;
 use scp_protocol::context::ContextParams;
 use scp_protocol::context::ContextState;
 use scp_protocol::context::broadcast::{
@@ -78,12 +73,8 @@ use scp_protocol::context::broadcast::{
 };
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::params::{ContextMode, TemplateId};
-use tokio::sync::Mutex;
 
-use crate::context::state::{
-    ContextGeneration, ContextSnapshot, PerContextState, VelocityTrackerSnapshot,
-    context_id_to_bytes,
-};
+use crate::context::state::{ContextSnapshot, PerContextState, VelocityTrackerSnapshot};
 use crate::context::supervisor::Supervisor;
 
 // ---------------------------------------------------------------------------
@@ -103,101 +94,7 @@ pub const PROVIDER_NOT_INITIALIZED: &str =
     "Supervisor providers not initialized — call Supervisor::with_providers";
 
 // ---------------------------------------------------------------------------
-// 1. lock_context
-// ---------------------------------------------------------------------------
-
-/// Locks the per-context `Mutex` and returns an owned guard plus a
-/// generation token for confused-deputy detection on later reacquire.
-///
-/// Hoisted body of the legacy `ContextManager::lock_context` method
-/// (deleted in commit 12 of the ADR-049 ladder). Byte-identical
-/// behavior.
-///
-/// # Errors
-///
-/// Returns [`ContextError::ContextNotRegistered`] if `context_id` is not
-/// in the map.
-pub async fn lock_context(
-    supervisor: &Supervisor,
-    context_id: &str,
-) -> Result<
-    (
-        tokio::sync::OwnedMutexGuard<PerContextState>,
-        ContextGeneration,
-    ),
-    ContextError,
-> {
-    let arc = get_context_arc(supervisor, context_id)?;
-    let guard = arc.lock_owned().await;
-    let token = ContextGeneration {
-        context_id: context_id.to_owned(),
-        generation: guard.generation,
-    };
-    Ok((guard, token))
-}
-
-// ---------------------------------------------------------------------------
-// 2. relock_context
-// ---------------------------------------------------------------------------
-
-/// Reacquires the per-context `Mutex` and verifies the generation counter
-/// matches `token`. Detects the confused-deputy scenario where the context
-/// was removed and recreated between lock release and reacquire.
-///
-/// Hoisted body of the legacy `ContextManager::relock_context` method
-/// (deleted in commit 12 of the ADR-049 ladder). Byte-identical
-/// behavior.
-///
-/// # Errors
-///
-/// - [`ContextError::ContextNotRegistered`] if the context is gone.
-/// - [`ContextError::PermissionDenied`] if the generation changed.
-pub async fn relock_context(
-    supervisor: &Supervisor,
-    token: &ContextGeneration,
-) -> Result<tokio::sync::OwnedMutexGuard<PerContextState>, ContextError> {
-    let arc = get_context_arc(supervisor, &token.context_id)?;
-    let guard = arc.lock_owned().await;
-    if guard.generation != token.generation {
-        return Err(ContextError::PermissionDenied(format!(
-            "context {} was removed and recreated (generation {} != {})",
-            token.context_id, guard.generation, token.generation,
-        )));
-    }
-    Ok(guard)
-}
-
-// ---------------------------------------------------------------------------
-// 3. get_context_arc
-// ---------------------------------------------------------------------------
-
-/// Clones the `Arc<Mutex<PerContextState>>` for a context without locking
-/// the per-context mutex. Used when the caller needs the `Arc` but will
-/// lock it later.
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::get_context_arc`](crate::context::supervisor::Supervisor::get_context_arc)
-/// (ADR-049 commit 12). Byte-identical behavior.
-///
-/// # Errors
-///
-/// Returns [`ContextError::ContextNotRegistered`] if the context is not
-/// in the map, OR [`ContextError::NotInitialized`] if the supervisor's
-/// per-context map slot has not been populated by
-/// `Supervisor::with_providers`.
-pub fn get_context_arc(
-    supervisor: &Supervisor,
-    context_id: &str,
-) -> Result<Arc<Mutex<PerContextState>>, ContextError> {
-    supervisor
-        .contexts_ref()
-        .get(context_id)
-        .map(|entry| Arc::clone(entry.value()))
-        .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))
-}
-
-// ---------------------------------------------------------------------------
-// 6. has_persistence
+// has_persistence
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if a persistence provider is configured.
@@ -270,70 +167,7 @@ pub async fn update_context_gauges(supervisor: &Supervisor) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. persist_context_snapshot
-// ---------------------------------------------------------------------------
-
-/// Persists a context snapshot if a persistence provider is configured.
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::persist_context_snapshot`](crate::context::supervisor::Supervisor::persist_context_snapshot)
-/// (ADR-049 commit 12). Byte-identical behavior.
-///
-/// Best-effort: logs errors but does not propagate them to callers. On a
-/// detached supervisor the call is a no-op (no provider to persist to).
-pub fn persist_context_snapshot(
-    supervisor: &Supervisor,
-    context_id: &str,
-    mut snapshot: ContextSnapshot,
-) {
-    let Some(persistence) = supervisor.persistence_ref() else {
-        return;
-    };
-    let Some(crypto) = supervisor.crypto_ref() else {
-        return;
-    };
-    // Export MLS crypto state alongside the context snapshot (#645).
-    // Populate `mls_crypto_state` in-place on the owned snapshot (#711).
-    //
-    // AC3 bug 2 fix: on export failure, mark the snapshot
-    // `needs_reconnect = true` and persist an empty crypto blob.
-    // Previously the error branch silently persisted a snapshot with
-    // a default (empty) `mls_crypto_state` and no reconnect signal
-    // — the restore path would then load the context, attempt to
-    // resume MLS encryption against an empty state, and fail in a
-    // way that required manual operator intervention. With the
-    // flag set, the restore path fires the §23.11 reconnection
-    // pipeline exactly as it would for any other unrecoverable
-    // crypto state, so the context heals automatically.
-    let ctx_id_bytes = context_id_to_bytes(context_id);
-    match crypto.export_crypto_state(&ctx_id_bytes) {
-        Ok(state) => snapshot.mls_crypto_state = state,
-        Err(e) => {
-            snapshot.needs_reconnect = true;
-            snapshot.mls_crypto_state = Vec::new();
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to export MLS crypto state for persistence; \
-                 snapshot marked needs_reconnect=true so restore \
-                 fires the §23.11 reconnection pipeline"
-            );
-        }
-    }
-    if let Err(e) = persistence.persist_context(context_id, &snapshot) {
-        // Best-effort persistence: log but don't fail the operation.
-        // In-memory state remains authoritative.
-        crate::metrics::record_persistence_failure();
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist context snapshot"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 10. persist_broadcast_snapshot
+// persist_broadcast_snapshot
 // ---------------------------------------------------------------------------
 
 /// Persists a broadcast context snapshot if a persistence provider is
@@ -408,28 +242,40 @@ pub fn init_broadcast_context(
 // 12. persist_context_and_broadcast
 // ---------------------------------------------------------------------------
 
-/// Persists context and broadcast state if a persistence provider is
-/// configured.
+/// Persists context and broadcast state for a single context if a
+/// persistence provider is configured.
 ///
-/// Hoisted body of the legacy
-/// [`ContextManager::persist_context_and_broadcast`](crate::context::supervisor::Supervisor::persist_context_and_broadcast)
-/// (ADR-049 commit 12). Byte-identical behavior.
+/// ADR-049 Phase 2A finalization (`DashMap` removal): the snapshot is no
+/// longer read from the legacy `contexts` `DashMap`. Instead this mailboxes
+/// [`LifecycleCommand::FlushSnapshot`](crate::context::actor::commands::LifecycleCommand::FlushSnapshot)
+/// to the single target context's actor — the actor builds the snapshot
+/// (context + crypto export + broadcast) from its owned
+/// [`PerContextState`] and persists it via `deps.persistence`. The
+/// per-context body is identical to the per-actor slice
+/// [`flush_all_contexts`](crate::context::lifecycle_helpers::flush_all_contexts)
+/// fans out to.
+///
+/// Best-effort: a missing actor, a closed mailbox, or a send timeout is a
+/// silent skip (the actor persists on its own lifecycle paths too).
 pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: &str) {
-    if has_persistence(supervisor)
-        && let Ok(arc) = get_context_arc(supervisor, context_id)
-    {
-        let ctx = arc.lock().await;
-        let snapshot = snapshot_context(&ctx);
-        let bc_snapshot = ctx
-            .broadcast_context
-            .as_ref()
-            .map(BroadcastContext::to_snapshot);
-        drop(ctx);
-        persist_context_snapshot(supervisor, context_id, snapshot);
-        if let Some(ref bcs) = bc_snapshot {
-            persist_broadcast_snapshot(supervisor, context_id, bcs);
-        }
+    use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
+
+    if !has_persistence(supervisor) {
+        return;
     }
+    let Some(actor) = supervisor.lookup(context_id) else {
+        return;
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { reply: tx });
+    if actor
+        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = rx.await;
 }
 
 // ---------------------------------------------------------------------------

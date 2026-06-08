@@ -15,8 +15,8 @@
 //! Actor-owned state collapses the legacy lock dance: each command is
 //! serialized through the per-context actor's mailbox, so per-context
 //! mutations happen with `state` directly borrowed. The legacy
-//! `lock_context` / `relock_context` confused-deputy generation guard
-//! is no longer required because each actor IS its own generation.
+//! lock-then-relock confused-deputy generation guard is no longer
+//! required because each actor IS its own generation.
 //!
 //! # Helpers
 //!
@@ -1156,7 +1156,7 @@ pub async fn create_context(
     // `Supervisor::spawn_actor_with_state`, which derives the registry
     // key from `state.context_id`, registers the handle under the
     // write lock, and spawns an actor that OWNS its state (no
-    // `Arc<Mutex<PerContextState>>` proxy, no DashMap divergence).
+    // `Arc<per-context-state Mutex>` proxy, no DashMap divergence).
     // Bootstrap keeps its `&ActorDeps` borrow alive for `finalize_create`
     // below; `clone_for_spawn` hands the actor task an owned bundle
     // without disturbing that borrow.
@@ -1954,7 +1954,7 @@ pub async fn restore_context(
     // `Supervisor::spawn_actor_with_state`. The actor OWNS its state;
     // the registry key is derived from `state.context_id` and the handle
     // is registered under the write lock. No legacy contexts DashMap
-    // write, no `Arc<Mutex<PerContextState>>` proxy.
+    // write, no `Arc<per-context-state Mutex>` proxy.
     let owned_deps = deps.clone_for_spawn();
     deps.supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)

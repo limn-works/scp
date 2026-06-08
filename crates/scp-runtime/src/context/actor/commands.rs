@@ -723,7 +723,7 @@ pub enum LifecycleCommand {
     /// produce the `buffer_occupancy` gauge.
     ///
     /// Replaces the legacy gauge path that iterated the `contexts`
-    /// DashMap and `try_lock`ed each `Arc<Mutex<PerContextState>>` to read
+    /// DashMap and `try_lock`ed each `Arc<per-context-state Mutex>` to read
     /// `receive_buffer.len()` (ADR-049 Phase 2A finalization — DashMap
     /// removal). The actor owns its state, so the handler reads
     /// `state.receive_buffer.len()` directly with no cross-actor lock.
@@ -2003,6 +2003,53 @@ pub enum ToolsCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// Phase 1 of the tool economy pipeline — economy reserve on
+    /// actor-owned state. Mirrors the first lock phase of the legacy
+    /// `invoke_tool_with_economy`: consume the hard rate limit, record
+    /// the velocity entry, run the economy pre-check, deduct budget,
+    /// authorize the payment escrow. Replies with a `Send`
+    /// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)
+    /// that the supervisor carries across the non-`Send` executor.
+    ///
+    /// See [`crate::context::tools_helpers::reserve_tool_economy`].
+    ReserveToolEconomy {
+        /// Context identifier string.
+        context_id: String,
+        /// Invoker DID.
+        invoker_did: scp_identity::DID,
+        /// Optional spending UCAN for paid actions (§19.5). Boxed so the
+        /// variant payload stays pointer-sized.
+        spending_ucan: Option<Box<scp_protocol::crypto::ucan::UcanToken>>,
+        /// Current Unix time in seconds — caller supplies to keep the
+        /// handler deterministic.
+        now_secs: u64,
+        /// Oneshot reply channel carrying the Phase-1 reservation.
+        reply: oneshot::Sender<
+            Result<Box<crate::context::tools_helpers::ToolEconomyReservation>, ContextError>,
+        >,
+    },
+
+    /// Phase 3 of the tool economy pipeline — settle on actor-owned
+    /// state. On executor success runs post-invocation bookkeeping +
+    /// consequence enforcement + payment capture; on executor failure
+    /// voids the escrow and reverses budget / velocity / rate-limit.
+    ///
+    /// See [`crate::context::tools_helpers::settle_tool_economy_capture`]
+    /// and [`crate::context::tools_helpers::rollback_tool_economy`].
+    SettleToolEconomy {
+        /// Context identifier string.
+        context_id: String,
+        /// Invoker DID.
+        invoker_did: scp_identity::DID,
+        /// Capture-or-rollback request carrying the in-flight ticket.
+        /// Boxed so the variant payload stays pointer-sized.
+        request: Box<crate::context::tools_helpers::ToolSettleRequest>,
+        /// Oneshot reply channel carrying the Phase-3 settle outcome
+        /// (consequences + receipt + committed cost).
+        reply:
+            oneshot::Sender<Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError>>,
+    },
+
     /// Saga-initiator path for cross-context tool invocation. Returns
     /// [`ContextError::NotImplemented`] in commit 11 — the cross-context
     /// invoke transport protocol (caller→target context forwarding,
@@ -2051,7 +2098,7 @@ pub enum QueriesCommand {
     /// context. Close / TTL does NOT despawn the per-context actor, so
     /// `Supervisor::lookup(id).is_some()` proves only that an actor
     /// EXISTS — this query is the only way to observe the live-vs-terminal
-    /// lifecycle distinction without a `Mutex<PerContextState>`.
+    /// lifecycle distinction without a `per-context-state Mutex`.
     ///
     /// `Ok(state)` always — the actor only receives this command when it
     /// owns the named context, so the reply is unconditional. Unknown

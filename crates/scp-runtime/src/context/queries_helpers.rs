@@ -167,7 +167,7 @@ pub fn member_count(state: &PerContextState) -> usize {
 /// lifecycle transition processed on the same single-threaded mailbox).
 /// No concurrent writer can be mid-transition while this read runs, so
 /// the definitive async `state()` read is used rather than the
-/// non-blocking `try_read_state()` the legacy `Mutex<PerContextState>`
+/// non-blocking `try_read_state()` the legacy `per-context-state Mutex`
 /// path required to dodge a cross-task TOCTOU.
 ///
 /// `state` is taken as `&mut` even though the read only borrows the

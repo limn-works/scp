@@ -16,8 +16,8 @@
 //! lock dance (under-lock → off-lock → relock) into a single linear
 //! flow: the actor's mailbox already serializes per-context commands,
 //! so encryption and transport fan-out happen with `state` still
-//! borrowed. No `relock_context` / `ContextGeneration` confused-deputy
-//! dance is needed because each actor is its own generation.
+//! borrowed. No relock / generation-token confused-deputy dance is
+//! needed because each actor is its own generation.
 //!
 //! # Helpers
 //!

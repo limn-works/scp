@@ -103,7 +103,7 @@ impl SupervisorHandle {
     /// id the membership predicate is read through the per-context actor
     /// mailbox via [`Supervisor::is_member`]. The first context where
     /// BOTH members are present wins; `None` if none qualifies. No
-    /// `Mutex<PerContextState>` lock and no `contexts` DashMap access —
+    /// `per-context-state Mutex` lock and no `contexts` DashMap access —
     /// the actor that owns each context is the sole authority for its
     /// membership.
     ///
@@ -250,7 +250,7 @@ impl SupervisorHandle {
     /// [`Supervisor::reconnect_all_standing`](crate::context::supervisor::supervisor::Supervisor::reconnect_all_standing),
     /// which resolves per-context lifecycle + params through the actor
     /// registry + mailbox (no `contexts` DashMap, no
-    /// `Mutex<PerContextState>`).
+    /// `per-context-state Mutex`).
     pub(crate) async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
         self.supervisor.reconnect_all_standing().await
     }

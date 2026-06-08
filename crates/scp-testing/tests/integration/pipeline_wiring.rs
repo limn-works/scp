@@ -37,7 +37,6 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/standing_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/tools_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/tools_helpers_legacy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
@@ -603,13 +602,17 @@ fn propose_governance_checks_proposer_eligibility() {
 
 #[test]
 fn governance_dispatch_calls_evaluate_consequences() {
+    // ADR-049 actor migration relocated the post-delivery consequence
+    // dispatch from the legacy `dispatch_consequences` wrapper into the
+    // actor-shape `run_buffered_post_delivery` (messaging_helpers.rs),
+    // which evaluates consequence rules against the buffered events.
     assert!(
         fn_body_contains(
             MANAGER_SRC,
-            "dispatch_consequences",
+            "run_buffered_post_delivery",
             "evaluate_consequence_rules"
         ),
-        "dispatch_consequences must call evaluate_consequence_rules"
+        "run_buffered_post_delivery must call evaluate_consequence_rules"
     );
 }
 
@@ -652,63 +655,73 @@ fn governance_enforces_economic_policy() {
 
 #[test]
 fn invoke_tool_with_economy_wires_escalation_and_rollback() {
-    // The manager wrapper must (a) call the free invoke_tool, (b) record the
-    // new velocity entry so compute_escalated_cost sees it, (c) thread the
-    // per-context velocity_tracker and message_pricing into ToolEconomyContext,
-    // and (d) roll back the velocity entry on invocation failure.
+    // ADR-049 actor split: the Phase-1 economy reserve runs on actor-owned
+    // state in `reserve_tool_economy`. It must (a) record the new velocity
+    // entry so compute_escalated_cost sees it, (b) thread the per-context
+    // velocity_tracker and message_pricing into ToolEconomyContext, and the
+    // Phase-3 `rollback_tool_economy` must roll back the velocity entry on
+    // executor failure. The orchestrator `invoke_tool_with_economy` runs the
+    // tool executor between the two phases.
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "invoke_tool"),
-        "invoke_tool_with_economy must delegate to invoke_tool"
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "record_message"),
+        "reserve_tool_economy must record the invocation for velocity tracking"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "record_message"),
-        "invoke_tool_with_economy must record the invocation for velocity tracking"
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "velocity_tracker"),
+        "reserve_tool_economy must thread velocity_tracker into ToolEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "velocity_tracker"),
-        "invoke_tool_with_economy must thread velocity_tracker into ToolEconomyContext"
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "message_pricing"),
+        "reserve_tool_economy must thread message_pricing into ToolEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "message_pricing"),
-        "invoke_tool_with_economy must thread message_pricing into ToolEconomyContext"
-    );
-    assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", ".rollback("),
-        "invoke_tool_with_economy must roll back the velocity entry on failure \
+        fn_body_contains(MANAGER_SRC, "rollback_tool_economy", ".rollback("),
+        "rollback_tool_economy must roll back the velocity entry on executor failure \
          via the F5 identity-based `rollback(token)` API"
+    );
+    // The orchestrator runs the tool executor between reserve and settle.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "invoke_tool_with_economy",
+            "invoke_tool_execute_and_validate"
+        ),
+        "invoke_tool_with_economy must run the executor via invoke_tool_execute_and_validate \
+         between the reserve (Phase 1) and settle (Phase 3) mailbox round-trips"
     );
 }
 
-/// D4: `invoke_tool_with_economy` must reference the hard rate limit.
-/// Enforced structurally so a future refactor cannot silently drop
-/// the Matrix Synapse–style defense-in-depth cap on the tool path.
+/// D4: the Phase-1 reserve (`reserve_tool_economy`) must reference the
+/// hard rate limit. Enforced structurally so a future refactor cannot
+/// silently drop the Matrix Synapse–style defense-in-depth cap on the
+/// tool path.
 #[test]
 fn invoke_tool_with_economy_enforces_hard_rate_limit() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "hard_rate_limit"),
-        "invoke_tool_with_economy must reference hard_rate_limit so the Matrix Synapse–style \
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "hard_rate_limit"),
+        "reserve_tool_economy must reference hard_rate_limit so the Matrix Synapse–style \
          defense-in-depth cap is enforced on the tool path (D4)"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "try_consume"),
-        "invoke_tool_with_economy must call try_consume on the hard rate limit token bucket \
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "try_consume"),
+        "reserve_tool_economy must call try_consume on the hard rate limit token bucket \
          before any Phase 1 bookkeeping — mirrors enforce_send_economy at messaging.rs:346"
     );
 }
 
-/// D4: every Phase 1 failure branch in `invoke_tool_with_economy`
-/// MUST refund the hard rate limit token. We expect at least 3 inline
-/// refund sites: `economy_pre_check` failure, `record_spend` failure,
-/// and `authorize_tool_payment` failure. Dropping any branch leaks a
+/// D4: every Phase 1 failure branch in `reserve_tool_economy` MUST refund
+/// the hard rate limit token. We expect at least 3 inline refund sites:
+/// `economy_pre_check` failure, `record_spend` failure, and
+/// `authorize_tool_payment` failure. Dropping any branch leaks a
 /// rate-limit token on failure.
 #[test]
 fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
-    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
-        .expect("invoke_tool_with_economy body must exist");
+    let body = extract_fn_body(MANAGER_SRC, "reserve_tool_economy")
+        .expect("reserve_tool_economy body must exist");
     let refund_sites = body.matches("hard_rate_limit.refund").count();
     assert!(
         refund_sites >= 3,
-        "invoke_tool_with_economy must have at least 3 inline hard_rate_limit.refund sites \
+        "reserve_tool_economy must have at least 3 inline hard_rate_limit.refund sites \
          (economy_pre_check failure, record_spend failure, authorize_tool_payment failure); \
          found {refund_sites}. Dropping any branch leaks a rate-limit token on failure."
     );
@@ -716,30 +729,38 @@ fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
 
 #[test]
 fn invoke_tool_with_economy_releases_lock_before_executor() {
-    // F1-F3 lock-split invariant: the caller-supplied executor must run
-    // WITHOUT holding the `ContextManager.contexts` mutex. The wrapper
-    // must explicitly release the Phase-1 lock before dispatching the
-    // executor. A mis-behaving tool executor blocked every concurrent
-    // manager call until this refactor landed; regressions here reintroduce
-    // a process-wide stall bug.
+    // ADR-049 actor-split invariant (supersedes the legacy lock_context /
+    // relock_context generation-guard mechanism, which is gone with the
+    // `contexts` DashMap): the caller-supplied non-Send executor must run
+    // OUTSIDE the per-context actor — between the Phase-1 economy reserve and
+    // the Phase-3 settle. The economy bookkeeping that mutates per-context
+    // state lives entirely in `reserve_tool_economy` / `settle_tool_economy`
+    // (which run on `&mut PerContextState` inside the actor); the executor
+    // never crosses the actor mailbox and never holds per-context state
+    // exclusively. A mis-behaving tool executor blocked every concurrent
+    // manager call until the original lock-split landed; the actor split
+    // preserves the same off-state-executor guarantee.
     //
-    // We assert:
-    //   (1) The function body contains an explicit `drop(contexts)` call.
-    //       This is the exit boundary of Phase 1.
-    //   (2) The function body acquires `self.contexts.lock()` at least
-    //       twice — once in Phase 1 (pre-check / record_spend / escrow
-    //       authorize) and once in Phase 3 (post-invocation bookkeeping).
-    //       A single lock acquisition would imply the lock is held across
-    //       the executor future.
-    // Phase B: invoke_tool_with_economy uses lock_context (Phase 1) and
-    // relock_context (Phase 3) instead of bare self.contexts.lock().await.
-    // The lock is dropped between phases so the executor future runs unlocked.
+    // We assert the orchestrator:
+    //   (1) hands the reserve closure to the helper (Phase 1),
+    //   (2) hands the settle closure to the helper (Phase 3), and
+    //   (3) runs the executor (Phase 2) between them.
     let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
         .expect("invoke_tool_with_economy body must exist");
     assert!(
-        body.contains("lock_context") && body.contains("relock_context"),
-        "invoke_tool_with_economy must use lock_context (Phase 1) and \
-         relock_context (Phase 3) for per-context locking with generation check"
+        body.contains("reserve()")
+            && body.contains("settle(")
+            && body.contains("invoke_tool_execute_and_validate"),
+        "invoke_tool_with_economy must run the reserve (Phase 1) and settle (Phase 3) \
+         mailbox round-trips around the off-actor executor (Phase 2) so the non-Send tool \
+         executor never holds per-context state exclusively"
+    );
+    // Defense in depth: the settle path must cover BOTH the success
+    // (Capture) and failure (Rollback) branches.
+    assert!(
+        body.contains("Capture") && body.contains("Rollback"),
+        "invoke_tool_with_economy must settle via Capture on executor success and Rollback \
+         on executor failure"
     );
 }
 

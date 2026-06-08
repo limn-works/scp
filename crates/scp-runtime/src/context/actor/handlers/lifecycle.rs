@@ -588,7 +588,7 @@ fn handle_shutdown_self_actor(
 /// receive-buffer occupancy directly from owned `&state` and replies
 /// with the length. Mirrors the per-context body of the legacy
 /// `update_context_gauges`, which iterated `Supervisor::contexts` and
-/// `try_lock`ed each `Arc<Mutex<PerContextState>>` to read
+/// `try_lock`ed each `Arc<per-context-state Mutex>` to read
 /// `receive_buffer.len()` (ADR-049 Phase 2A finalization — DashMap
 /// removal). The actor owns its state, so no cross-actor lock is taken.
 ///

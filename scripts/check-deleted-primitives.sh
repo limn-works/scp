@@ -89,14 +89,29 @@ fi
 #
 # INITIALLY EMPTY. Commit 12 of the actor refactor populates this.
 # ---------------------------------------------------------------------------
-BAN_ENTRIES=()
+# ADR-049 Phase 2A finalization: the last `&Supervisor` caller of the
+# per-context `contexts` DashMap lock primitives (the legacy tools economy
+# wrapper `invoke_tool_with_economy`) moved to the actor-split economy
+# reserve/settle path. The DashMap, its `Arc<Mutex<PerContextState>>`
+# entries, and the lock/relock/get-arc accessors are deleted. Per-context
+# state now lives ONLY inside the per-context actor; these bans stop any
+# future refactor from reintroducing supervisor-side per-context locking.
+#
+# `contexts_ref` uses a leading non-`_` guard so it bans the deleted
+# `.contexts_ref()` accessor without false-matching the legitimate
+# `standing_contexts_ref` / `local_dids_ref` supervisor accessors.
+BAN_ENTRIES=(
+    "Mutex<PerContextState>|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context Mutex; state is actor-owned"
+    "get_context_arc|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the contexts DashMap accessor"
+    "lock_context|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context lock/relock primitives"
+    "relock_context|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context lock/relock primitives"
+    "[^_]contexts_ref|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the contexts DashMap accessor"
+)
 
-# Example of the activated form (commented out until commit 12):
-# BAN_ENTRIES=(
-#     "relock_context|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
+# Example of the activated form for follow-on sessions:
+# BAN_ENTRIES+=(
 #     "ContextGeneration|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
 #     "next_generation|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
-#     "Mutex<PerContextState>|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
 #     "RwLock<ContextInner>|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
 #     "pending_joins|crates/scp-runtime/src/crypto|*.rs|Actor-per-context refactor deleted this (ADR-049)"
 # )

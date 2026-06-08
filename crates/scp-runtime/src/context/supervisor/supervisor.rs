@@ -52,27 +52,12 @@ use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::persistence::ContextPersistence;
-use crate::context::state::PerContextState;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
 use crate::economy::adapter::PaymentAdapterDyn;
 use zeroize::Zeroizing;
-
-// ---------------------------------------------------------------------------
-// Type aliases
-// ---------------------------------------------------------------------------
-
-/// The shared per-context state map — `Arc`-wrapped so the manager,
-/// the supervisor (ADR-049 commit 12), and spawned background
-/// tasks all hold equivalent clones of the same `DashMap`. The
-/// per-entry `Arc<Mutex<PerContextState>>` is the contract the manager
-/// exposes via `Supervisor::contexts_ref`; the alias is
-/// introduced here so the supervisor-side accessor can return a
-/// readable type (avoids `clippy::type_complexity` on the nested
-/// generics).
-type ContextsMap = DashMap<String, Arc<tokio::sync::Mutex<PerContextState>>>;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -313,12 +298,6 @@ pub struct Supervisor {
     // supervisor now owns them directly; eagerly initialized in
     // [`Self::new`].
     // -----------------------------------------------------------------
-    /// Shared per-context state map. Eagerly initialized in
-    /// [`Self::new`] as an empty `Arc<DashMap>`. Retained for the
-    /// designated-legacy sync-FFI tools rate-limit path
-    /// (`tools_helpers_legacy`) until the tools migration lands.
-    contexts: Arc<ContextsMap>,
-
     /// Concurrent-saga guard. `true` iff a saga is currently in flight
     /// (Initiated / PreparingA / PreparingB / Committing). A second
     /// concurrent `start_saga` while the flag is `true` returns
@@ -389,8 +368,6 @@ impl Supervisor {
             event_tx: OnceLock::new(),
             task_set: OnceLock::new(),
             mls_storage: OnceLock::new(),
-            // ADR-049 commit 12 — direct authoritative state.
-            contexts: Arc::new(DashMap::new()),
             saga_pending_guard: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -540,8 +517,7 @@ impl Supervisor {
     // leaves them empty (used by saga + spawn unit tests that don't
     // touch providers).
     //
-    // Direct-state accessors (`contexts_ref`,
-    // `local_dids_ref`, `standing_contexts_ref`)
+    // Direct-state accessors (`local_dids_ref`, `standing_contexts_ref`)
     // return non-Option references — the underlying fields are eagerly
     // initialized in [`Self::new`] and always populated.
     //
@@ -643,13 +619,6 @@ impl Supervisor {
     // -------------------------------------------------------------------
     // ADR-049 commit 12 — direct-state accessors (always populated).
     // -------------------------------------------------------------------
-
-    /// Cheap reference to the supervisor's per-context state map.
-    /// Always populated — eagerly initialized in [`Self::new`].
-    #[must_use]
-    pub(crate) const fn contexts_ref(&self) -> &Arc<ContextsMap> {
-        &self.contexts
-    }
 
     /// Cheap reference to the supervisor's local-DID registry.
     ///
@@ -1765,7 +1734,7 @@ impl Supervisor {
     /// actor registry: [`Self::actor_ids`] yields a snapshot of every
     /// registered context id and [`Self::is_member`] reads each
     /// membership predicate through the per-context actor mailbox. No
-    /// `contexts` DashMap access and no `Mutex<PerContextState>` lock —
+    /// `contexts` DashMap access and no `per-context-state Mutex` lock —
     /// the actor that owns each context is the sole authority for its
     /// membership.
     ///
@@ -2451,6 +2420,22 @@ impl Supervisor {
                 Outcome::err(sketch)
             }
             ToolsCommand::RefundHardRateLimit {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            ToolsCommand::ReserveToolEconomy {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            ToolsCommand::SettleToolEconomy {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
@@ -3509,7 +3494,7 @@ impl Supervisor {
     /// Close / TTL does NOT despawn the per-context actor, so
     /// `lookup(id).is_some()` alone cannot tell a live context from a
     /// terminal one — this query is the read-only lifecycle probe that
-    /// makes that distinction without a `Mutex<PerContextState>`. A
+    /// makes that distinction without a `per-context-state Mutex`. A
     /// dropped reply or mailbox-send failure (actor shutting down)
     /// resolves to `None`, treated by callers as "no live context".
     #[must_use]
@@ -3534,7 +3519,7 @@ impl Supervisor {
 
     /// Returns an existing standing context or creates a new one
     /// (contact graph). Actor-native get-or-create — no `contexts`
-    /// DashMap, no `Mutex<PerContextState>`, no
+    /// DashMap, no `per-context-state Mutex`, no
     /// `create_context_legacy`.
     ///
     /// # Algorithm
@@ -3648,7 +3633,7 @@ impl Supervisor {
     /// Reconnects transport for all active standing contexts. Actor-native
     /// — resolves per-context lifecycle + params through the actor
     /// registry + mailbox (no `contexts` DashMap, no
-    /// `Mutex<PerContextState>`).
+    /// `per-context-state Mutex`).
     ///
     /// Called during SDK initialization. Iterates the supervisor standing
     /// index, resolves each `(local_did, peer_did)` pair to its
@@ -3688,7 +3673,7 @@ impl Supervisor {
         // owning actor's lifecycle state, and republish the Active ones.
         // `read_context_state` returns `None` when no actor owns the id —
         // the same "no live context, skip" outcome the legacy
-        // `get_context_arc` miss produced.
+        // per-context-map miss produced.
         let mut reconnected = 0_usize;
         let mut terminal_context_ids: Vec<String> = Vec::new();
         for (_key, peer_did) in &standing_entries {
@@ -4200,25 +4185,86 @@ impl Supervisor {
         rx.recv().unwrap_or(false)
     }
 
-    /// Invoke a tool under the full economy pipeline.
-    ///
-    /// # Closure-shape exception
-    ///
-    /// Stays on the legacy `tools_helpers_legacy::*` path because the
-    /// `executor` parameter is a non-`Send`-bound generic `FnOnce`
-    /// closure (and its returned `Future`) that cannot cross an actor
-    /// mailbox. Migrating would require either erasing the closure to
-    /// a `Box<dyn FnOnce + Send>` (incompatible with several existing
-    /// FFI bridges that supply non-Send executor closures) or
-    /// reshaping the API so the executor runs on the supervisor side
-    /// before the mailbox handoff. Phase 2A leaves this on the legacy
-    /// direct-call path as the lone closure-shape exception.
+    /// Dispatch the Phase-1 [`ToolsCommand::ReserveToolEconomy`] to the
+    /// target context's actor and await the `Send` reservation.
     ///
     /// # Errors
     ///
-    /// Propagates every error variant the helper emits
-    /// (`ContextNotRegistered`, `PermissionDenied`, `RateLimited`,
-    /// schema/economy/UCAN failures).
+    /// [`ContextError::ContextNotRegistered`] when no actor is registered
+    /// for `context_id`; otherwise any error the reserve handler emits.
+    async fn reserve_tool_economy_via_actor(
+        &self,
+        context_id: &str,
+        invoker_did: &DID,
+        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        now_secs: u64,
+    ) -> Result<crate::context::tools_helpers::ToolEconomyReservation, ContextError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = ToolsCommand::ReserveToolEconomy {
+            context_id: context_id.to_owned(),
+            invoker_did: invoker_did.clone(),
+            spending_ucan: spending_ucan.map(|u| Box::new(u.clone())),
+            now_secs,
+            reply: reply_tx,
+        };
+        self.dispatch_tools_command(cmd).await?;
+        reply_rx
+            .await
+            .map_err(|_| {
+                ContextError::TransportFailed(
+                    "Supervisor::reserve_tool_economy_via_actor — actor reply channel closed"
+                        .to_owned(),
+                )
+            })?
+            .map(|boxed| *boxed)
+    }
+
+    /// Dispatch the Phase-3 [`ToolsCommand::SettleToolEconomy`] to the
+    /// target context's actor and await the settle outcome.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ContextNotRegistered`] when no actor is registered
+    /// for `context_id`; otherwise any error the settle handler emits
+    /// (payment-capture failure).
+    async fn settle_tool_economy_via_actor(
+        &self,
+        context_id: &str,
+        invoker_did: &DID,
+        request: crate::context::tools_helpers::ToolSettleRequest,
+    ) -> Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = ToolsCommand::SettleToolEconomy {
+            context_id: context_id.to_owned(),
+            invoker_did: invoker_did.clone(),
+            request: Box::new(request),
+            reply: reply_tx,
+        };
+        self.dispatch_tools_command(cmd).await?;
+        reply_rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::settle_tool_economy_via_actor — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Invoke a tool under the full economy pipeline (actor model).
+    ///
+    /// Orchestrates the three-phase split through
+    /// [`crate::context::tools_helpers::invoke_tool_with_economy`]: the
+    /// economy reserve (Phase 1) and settle (Phase 3) run inside the
+    /// per-context actor on owned state via the
+    /// [`ToolsCommand::ReserveToolEconomy`] / [`ToolsCommand::SettleToolEconomy`]
+    /// mailbox commands; the non-`Send` `executor` closure (Phase 2) runs
+    /// here, supervisor-side, BETWEEN the two mailbox round-trips. No
+    /// per-context lock is held across the executor — the actor is free
+    /// to process other commands while a tool executes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every error variant the reserve / settle handlers and
+    /// the executor emit (`ContextNotRegistered`, `PermissionDenied`,
+    /// `RateLimited`, schema/economy/UCAN failures).
     #[allow(clippy::too_many_arguments)] // matches legacy signature 1:1
     pub async fn invoke_tool_with_economy<F, Fut>(
         &self,
@@ -4235,15 +4281,32 @@ impl Supervisor {
         F: FnOnce(serde_json::Value) -> Fut,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
     {
-        crate::context::tools_helpers_legacy::invoke_tool_with_economy(
-            self,
-            context_id,
+        let now_secs = self
+            .clock_ref()
+            .ok_or_else(|| {
+                ContextError::NotInitialized(
+                    crate::context::manager_methods::PROVIDER_NOT_INITIALIZED.to_owned(),
+                )
+            })?
+            .now_secs();
+
+        crate::context::tools_helpers::invoke_tool_with_economy(
             registry,
             tool_id,
             input,
             invoker_did,
-            spending_ucan,
             timeout_ms,
+            // Phase 1 — reserve via the actor mailbox.
+            || {
+                self.reserve_tool_economy_via_actor(
+                    context_id,
+                    invoker_did,
+                    spending_ucan,
+                    now_secs,
+                )
+            },
+            // Phase 3 — settle (capture / rollback) via the actor mailbox.
+            |request| self.settle_tool_economy_via_actor(context_id, invoker_did, request),
             executor,
         )
         .await
@@ -4987,7 +5050,9 @@ impl Supervisor {
     const fn tools_command_context_id(cmd: &ToolsCommand) -> Option<&str> {
         match cmd {
             ToolsCommand::TryConsumeHardRateLimit { context_id, .. }
-            | ToolsCommand::RefundHardRateLimit { context_id, .. } => Some(context_id.as_str()),
+            | ToolsCommand::RefundHardRateLimit { context_id, .. }
+            | ToolsCommand::ReserveToolEconomy { context_id, .. }
+            | ToolsCommand::SettleToolEconomy { context_id, .. } => Some(context_id.as_str()),
             _ => None,
         }
     }
