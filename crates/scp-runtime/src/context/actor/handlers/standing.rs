@@ -56,11 +56,24 @@ pub async fn dispatch(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
 async fn dispatch_inner(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
     match cmd {
         StandingCommand::Placeholder { reply } => reply_not_implemented(reply),
-        StandingCommand::StandingContext {
-            local_did,
-            peer_did,
-            reply,
-        } => handle_standing_context(deps, local_did, peer_did, reply).await,
+        StandingCommand::StandingContext { reply, .. } => {
+            // `StandingContext` get-or-create is supervisor-scoped and is
+            // ALWAYS dispatched supervisor-direct through
+            // `Supervisor::dispatch_standing_direct` →
+            // `Supervisor::standing_context` (see
+            // `Supervisor::standing_command_context_id`, which returns
+            // `None` for this variant). It never lands on a per-context
+            // actor mailbox: the actor-native get-or-create body may CREATE
+            // the target actor, and routing it here would make this actor's
+            // own `run()` loop recursively spawn another actor — a non-`Send`
+            // call graph. Reply with a routing error so a future
+            // misrouting surfaces a typed error rather than a hang.
+            const MSG: &str = "StandingCommand::StandingContext is supervisor-scoped; \
+                               dispatch through Supervisor::dispatch_standing_command, not the \
+                               per-context actor mailbox";
+            let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
+            Outcome::err(ContextError::InvalidState(MSG.to_owned()))
+        }
         StandingCommand::StandingContextCount { reply } => {
             handle_standing_context_count(deps, reply).await
         }
@@ -75,38 +88,6 @@ async fn dispatch_inner(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
         }
         StandingCommand::InitiateStandingPairCreate { reply, .. } => reply_saga_deferred(reply),
     }
-}
-
-/// Handle [`StandingCommand::StandingContext`] — delegates to
-/// [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context)
-/// under a 30s timeout.
-async fn handle_standing_context(
-    deps: &ActorDeps,
-    local_did: scp_identity::DID,
-    peer_did: scp_identity::DID,
-    reply: oneshot::Sender<Result<String, ContextError>>,
-) -> Outcome<()> {
-    let standing_fut = async {
-        crate::context::standing_helpers::standing_context(deps, &local_did, &peer_did).await
-    };
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, standing_fut).await {
-        Ok(Ok(ctx_id)) => (Outcome::ok_mutated(()), Ok(ctx_id)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "standing_context exceeded {HANDLER_TIMEOUT:?} budget"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
 }
 
 /// Handle [`StandingCommand::StandingContextCount`] — read-only.

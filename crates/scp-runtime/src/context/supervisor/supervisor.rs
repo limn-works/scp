@@ -2448,7 +2448,7 @@ impl Supervisor {
     ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_standing_command(
-        &self,
+        self: &Arc<Self>,
         cmd: StandingCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A finalization — try the actor mailbox first
@@ -2478,7 +2478,7 @@ impl Supervisor {
     /// budget matching the actor-handler shape (plan §"Transport
     /// timeouts inside actor handlers"). Reply channels carry the typed
     /// per-variant result.
-    async fn dispatch_standing_direct(&self, cmd: StandingCommand) -> Outcome<()> {
+    async fn dispatch_standing_direct(self: &Arc<Self>, cmd: StandingCommand) -> Outcome<()> {
         use crate::context::standing_helpers_legacy;
         const STANDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -2494,8 +2494,7 @@ impl Supervisor {
                 peer_did,
                 reply,
             } => {
-                let fut =
-                    standing_helpers_legacy::standing_context_legacy(self, &local_did, &peer_did);
+                let fut = self.standing_context(&local_did, &peer_did);
                 let (outcome, reply_result) =
                     match tokio::time::timeout(STANDING_TIMEOUT, fut).await {
                         Ok(Ok(ctx_id)) => (Outcome::ok_mutated(()), Ok(ctx_id)),
@@ -3548,6 +3547,119 @@ impl Supervisor {
         }
     }
 
+    /// Returns an existing standing context or creates a new one
+    /// (contact graph). Actor-native get-or-create — no `contexts`
+    /// DashMap, no `Mutex<PerContextState>`, no
+    /// `create_context_legacy`.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Derive the deterministic standing context id from the DID pair.
+    /// 2. Liveness check via [`Self::read_context_state`]: if a
+    ///    per-context actor exists AND its lifecycle state is
+    ///    [`Active`](scp_protocol::context::ContextState::Active) or
+    ///    [`Creating`](scp_protocol::context::ContextState::Creating),
+    ///    track the peer and return the existing id. A terminal state
+    ///    (`Closed` / `Expired` / `Closing` / `MigratingOut` /
+    ///    `Tombstoned`) or a missing actor (`None`) falls through to
+    ///    create — a dead standing context is never reused.
+    /// 3. Create a fresh bilateral-persistent context through the
+    ///    actor-shape [`lifecycle_helpers::create_context`](crate::context::lifecycle_helpers::create_context)
+    ///    (membership, roles, governance, owned-state actor spawn), with
+    ///    `local_did` as creator — mirroring the
+    ///    [`LifecycleCommand::CreateContext`](crate::context::actor::commands::LifecycleCommand::CreateContext)
+    ///    deps build in [`Self::dispatch_lifecycle_direct`].
+    /// 4. TOCTOU: a concurrent caller may have created the context
+    ///    between the step-2 check and the step-3 create. On create
+    ///    error, re-probe [`Self::read_context_state`]; if it is now
+    ///    `Active` / `Creating`, treat the create as idempotently
+    ///    successful. Otherwise propagate
+    ///    [`ContextError::TransportFailed`].
+    /// 5. Track the peer in the supervisor standing index (ArcSwap +
+    ///    `write_lock`, ADR-049 §Decision 12) and return the id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if context creation
+    /// fails and no concurrent creation resolved the id.
+    pub(in crate::context) async fn standing_context(
+        self: &Arc<Self>,
+        local_did: &DID,
+        peer_did: &DID,
+    ) -> Result<String, ContextError> {
+        use scp_protocol::context::ContextState;
+
+        let context_id =
+            crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did);
+
+        // Step 1/2: existence + liveness probe. `read_context_state`
+        // returns `None` when no actor exists (create path) and
+        // `Some(state)` for a live actor. Only Active/Creating short-
+        // circuits to reuse; every terminal state falls through so a
+        // dead standing context is replaced rather than resurrected.
+        if matches!(
+            self.read_context_state(&context_id).await,
+            Some(ContextState::Active | ContextState::Creating)
+        ) {
+            self.track_standing_peer(peer_did).await;
+            return Ok(context_id);
+        }
+
+        // Step 3: create a new bilateral-persistent context via the
+        // actor-shape create flow. Mirrors the `CreateContext` arm of
+        // `dispatch_lifecycle_direct`: build deps scoped to the creator,
+        // then `lifecycle_helpers::create_context`.
+        let params = scp_protocol::context::templates::template_params(
+            &scp_protocol::context::TemplateId::BilateralPersistent,
+        );
+        let create_result = match self.build_actor_deps(local_did).await {
+            Ok(deps) => Box::pin(crate::context::lifecycle_helpers::create_context(
+                &deps,
+                context_id.clone(),
+                params,
+                local_did.clone(),
+                None,
+            ))
+            .await
+            .map(|_handle| ())
+            .map_err(|e| ContextError::TransportFailed(e.to_string())),
+            Err(e) => Err(ContextError::TransportFailed(e.to_string())),
+        };
+
+        // Step 4: TOCTOU re-check. A concurrent caller may have created
+        // the context between our step-2 probe and the step-3 create. If
+        // the context is now Active/Creating, treat the create as
+        // idempotently successful; otherwise surface the create error.
+        if let Err(create_err) = create_result
+            && !matches!(
+                self.read_context_state(&context_id).await,
+                Some(ContextState::Active | ContextState::Creating)
+            )
+        {
+            return Err(create_err);
+        }
+
+        // Step 5: track the standing peer and return.
+        self.track_standing_peer(peer_did).await;
+        Ok(context_id)
+    }
+
+    /// Insert `peer_did` into the supervisor standing index.
+    ///
+    /// ArcSwap + `write_lock` mutation (ADR-049 §Decision 12): the index
+    /// is read lock-free on the hot path; mutations serialize through the
+    /// `write_lock` and store a fresh `Arc` snapshot. Keyed by the peer
+    /// DID's `to_string()` form, matching every other standing-index
+    /// writer (`RegisterStandingContext`,
+    /// `SupervisorHandle::register_standing_context`).
+    async fn track_standing_peer(&self, peer_did: &DID) {
+        let _guard = self.write_lock.lock().await;
+        let snapshot = self.standing_contexts.load_full();
+        let mut updated: HashMap<String, DID> = (*snapshot).clone();
+        updated.insert(peer_did.to_string(), peer_did.clone());
+        self.standing_contexts.store(Arc::new(updated));
+    }
+
     /// Returns the current member count for `context_id`, or `None` if
     /// the context is not registered. Routes through the actor mailbox
     /// via [`Self::dispatch_query`].
@@ -4545,19 +4657,28 @@ impl Supervisor {
     /// no backing string to borrow.
     fn standing_command_context_id(cmd: &StandingCommand) -> Option<String> {
         match cmd {
-            StandingCommand::StandingContext {
-                local_did,
-                peer_did,
-                ..
-            }
-            | StandingCommand::InitiateStandingPairCreate {
+            // The saga-initiator variant targets the per-context actor for
+            // the derived standing id (Prepare/Commit lands on that actor).
+            StandingCommand::InitiateStandingPairCreate {
                 local_did,
                 peer_did,
                 ..
             } => Some(
                 crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did),
             ),
-            StandingCommand::Placeholder { .. }
+            // `StandingContext` get-or-create is supervisor-scoped, NOT
+            // per-context: the actor-native body
+            // ([`Self::standing_context`]) may CREATE the target actor (it
+            // builds deps + spawns an owned-state actor via
+            // `lifecycle_helpers::create_context`). Routing it through the
+            // per-context mailbox would make the per-context actor's own
+            // `run()` loop recursively spawn another actor — a non-`Send`
+            // call graph the runtime cannot spawn. It therefore always
+            // routes supervisor-direct through `dispatch_standing_direct`,
+            // exactly like the other supervisor-scoped standing-index
+            // variants below.
+            StandingCommand::StandingContext { .. }
+            | StandingCommand::Placeholder { .. }
             | StandingCommand::StandingContextCount { .. }
             | StandingCommand::HasStandingContext { .. }
             | StandingCommand::RegisterStandingContext { .. }

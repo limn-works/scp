@@ -19,159 +19,33 @@
 //! `has_standing_context_legacy`, `register_standing_context_legacy`)
 //! were deleted with that shim.
 //!
-//! Two functions survive:
+//! The get-or-create `standing_context_legacy` survivor was deleted when
+//! the standing get-or-create path migrated to the actor-native
+//! [`Supervisor::standing_context`](crate::context::supervisor::supervisor::Supervisor::standing_context)
+//! (no `contexts` `DashMap`, no `Mutex<PerContextState>`,
+//! no `create_context_legacy`).
 //!
-//! - [`standing_context_legacy`] — get-or-create standing context, called
-//!   from [`crate::context::supervisor::handle::SupervisorHandle::standing_context`]
-//!   (which is what the actor-shape `standing_helpers::standing_context`
-//!   delegates to) and from `Supervisor::dispatch_standing_direct`. The
-//!   creation path still routes through
-//!   [`crate::context::lifecycle_helpers_legacy::create_context_legacy`]
-//!   until standing-pair sagas land (deferred per
-//!   `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`).
+//! One function survives:
+//!
 //! - [`reconnect_all_standing_legacy`] — fan-out reconnect across the
 //!   supervisor's standing index, called from
 //!   [`crate::context::supervisor::handle::SupervisorHandle::reconnect_all_standing`]
-//!   and from `Supervisor::dispatch_standing_direct`.
+//!   and from `Supervisor::dispatch_standing_direct`. It still resolves
+//!   per-context handles through the `contexts` `DashMap`
+//!   (`manager_methods::get_context_arc`); its actor-native re-expression
+//!   lands in the standing `reconnect` migration.
 
 use scp_identity::DID;
-use scp_protocol::context::templates::template_params;
-use scp_protocol::context::{ContextError, ContextState, TemplateId};
+use scp_protocol::context::{ContextError, ContextState};
 
 use crate::context::ContextHandle;
+use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
-use crate::context::{lifecycle_helpers_legacy, manager_methods};
 
 // Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
 // `ATTACHED_EXPECT` constants consolidated to the single
 // `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`.
 use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
-
-// ---------------------------------------------------------------------------
-// standing_context_legacy (top-level, production survivor)
-// ---------------------------------------------------------------------------
-
-/// Returns an existing standing context or creates a new one (contact graph).
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context).
-/// See the legacy method's doc comment for the full semantics.
-/// Byte-identical behavior.
-///
-/// # Errors
-///
-/// Returns [`ContextError`] if context creation fails.
-pub async fn standing_context_legacy(
-    supervisor: &Supervisor,
-    local_did: &DID,
-    peer_did: &DID,
-) -> Result<String, ContextError> {
-    let context_id =
-        crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did);
-
-    // Step 1: Check if the context exists and is Active/Creating.
-    //
-    // Lock ordering: `contexts` -> `standing_contexts` (see module docs).
-    //
-    // The handle's interior `RwLock` is read via the synchronous
-    // `try_read_state()` to avoid awaiting on it while holding the
-    // `contexts` mutex. Awaiting `state()` here would form a deadlock
-    // cycle with any task that holds the handle's `RwLock` as writer
-    // (e.g. `transition_to`) and is waiting on `contexts.lock()`.
-    //
-    // If `try_read_state()` returns `None` (writer currently holds the
-    // lock), we treat the context as transient/terminal and fall through
-    // to the create-new-context path; the TOCTOU re-check below will
-    // resolve any race idempotently.
-    {
-        if let Ok(arc) = manager_methods::get_context_arc(supervisor, &context_id) {
-            let ctx = arc.lock().await;
-            let state = ctx.handle.try_read_state();
-            match state {
-                // Step 2: Active or still being set up -- return immediately.
-                Some(ContextState::Active | ContextState::Creating) => {
-                    drop(ctx);
-                    // ArcSwap+write_lock pattern (ADR-049 §Decision 12).
-                    let _guard = supervisor.write_lock.lock().await;
-                    let snapshot = supervisor.standing_contexts_ref().load_full();
-                    let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
-                    updated.insert(peer_did.to_string(), peer_did.clone());
-                    supervisor
-                        .standing_contexts_ref()
-                        .store(std::sync::Arc::new(updated));
-                    return Ok(context_id);
-                }
-                // Step 4: Peer has left, context ended, or the handle's
-                // state lock is currently contended -- fall through to
-                // create a new one. The post-create TOCTOU re-check
-                // handles any race with concurrent callers.
-                Some(
-                    ContextState::Closed
-                    | ContextState::Expired
-                    | ContextState::Closing
-                    | ContextState::MigratingOut
-                    | ContextState::Tombstoned,
-                )
-                | None => {
-                    // Will create a new context below.
-                }
-            }
-        }
-    }
-
-    // Step 3/4: Create a new bilateral-persistent context via the full
-    // create_context flow (membership, roles, governance).
-    let params = template_params(&TemplateId::BilateralPersistent);
-    match lifecycle_helpers_legacy::create_context_legacy(
-        supervisor,
-        context_id.clone(),
-        params,
-        local_did.clone(),
-        None,
-    )
-    .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            // TOCTOU: a concurrent call may have created the context
-            // between our check and this create attempt. If the context
-            // now exists and is Active/Creating, use it idempotently.
-            // Otherwise propagate the original error.
-            //
-            // Use `try_read_state()` (sync) to avoid awaiting on the
-            // handle's `RwLock` while holding `contexts.lock()`. A
-            // contended state lock is treated as "not idempotent" and
-            // surfaces the original create error rather than masking it.
-            if let Ok(arc) = manager_methods::get_context_arc(supervisor, &context_id) {
-                let ctx = arc.lock().await;
-                if matches!(
-                    ctx.handle.try_read_state(),
-                    Some(ContextState::Active | ContextState::Creating)
-                ) {
-                    drop(ctx);
-                    // Concurrent creation succeeded — fall through.
-                } else {
-                    return Err(ContextError::TransportFailed(e.to_string()));
-                }
-            } else {
-                return Err(ContextError::TransportFailed(e.to_string()));
-            }
-        }
-    }
-
-    // Track the standing context (ArcSwap+write_lock, ADR-049 §Decision 12).
-    {
-        let _guard = supervisor.write_lock.lock().await;
-        let snapshot = supervisor.standing_contexts_ref().load_full();
-        let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
-        updated.insert(peer_did.to_string(), peer_did.clone());
-        supervisor
-            .standing_contexts_ref()
-            .store(std::sync::Arc::new(updated));
-    }
-
-    Ok(context_id)
-}
 
 // ---------------------------------------------------------------------------
 // reconnect_all_standing (top-level, production survivor)

@@ -214,29 +214,15 @@ impl SupervisorHandle {
         self.supervisor.read_context_state(context_id).await
     }
 
-    /// Return or create the standing context for `local_did` and `peer_did`.
-    ///
-    /// Transitional Phase 2A surface for the standing actor handler:
-    /// the helper can route through the capability-reduced handle
-    /// without receiving `&Supervisor` directly. The implementation
-    /// delegates to the legacy lock-shaped helper until standing-pair
-    /// creation is decomposed into a saga in Phase 2C.
-    pub(crate) async fn standing_context(
-        &self,
-        local_did: &DID,
-        peer_did: &DID,
-    ) -> Result<String, ContextError> {
-        let expected_context_id =
-            crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did);
-        let context_id = crate::context::standing_helpers_legacy::standing_context_legacy(
-            &self.supervisor,
-            local_did,
-            peer_did,
-        )
-        .await?;
-        debug_assert_eq!(context_id, expected_context_id);
-        Ok(context_id)
-    }
+    // No `SupervisorHandle::standing_context` get-or-create wrapper: that
+    // operation is supervisor-scoped (it may CREATE the target per-context
+    // actor) and is dispatched supervisor-direct through
+    // [`Supervisor::dispatch_standing_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_standing_command)
+    // → `Supervisor::standing_context`. Exposing it on the
+    // capability-reduced handle (reachable from the per-context actor's
+    // `run()` loop) would invite the non-`Send` actor-spawns-actor
+    // recursion the routing in `Supervisor::standing_command_context_id`
+    // explicitly avoids.
 
     /// Number of supervisor-tracked standing peers.
     #[must_use]

@@ -55,25 +55,21 @@ pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 1. standing_context
+// standing_context — get-or-create is supervisor-scoped
 // ---------------------------------------------------------------------------
-
-/// Returns an existing standing context or creates a new one.
-///
-/// The standing index and context creation flow are supervisor-scoped
-/// during Phase 2A, so the actor-shaped helper delegates through
-/// `deps.supervisor` rather than accepting `&Supervisor` directly.
-///
-/// # Errors
-///
-/// Returns [`ContextError`] if context creation fails.
-pub async fn standing_context(
-    deps: &ActorDeps,
-    local_did: &DID,
-    peer_did: &DID,
-) -> Result<String, ContextError> {
-    deps.supervisor.standing_context(local_did, peer_did).await
-}
+//
+// There is intentionally no actor-shape `standing_context(deps, ..)`
+// helper here. Get-or-create is supervisor-scoped: the actor-native body
+// ([`Supervisor::standing_context`](crate::context::supervisor::supervisor::Supervisor::standing_context))
+// may CREATE the target per-context actor (build deps + spawn an
+// owned-state actor via `lifecycle_helpers::create_context`). Wrapping
+// that behind an `&ActorDeps` helper invoked from the per-context actor
+// handler would make the actor's own `run()` loop recursively spawn
+// another actor — a non-`Send` call graph the runtime cannot spawn. The
+// two production entry points
+// ([`SupervisorHandle::standing_context`](crate::context::supervisor::handle::SupervisorHandle)
+// and `Supervisor::dispatch_standing_direct`'s `StandingContext` arm)
+// therefore call `Supervisor::standing_context` directly.
 
 // ---------------------------------------------------------------------------
 // 2. standing_context_count
