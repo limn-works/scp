@@ -412,9 +412,14 @@ async fn handle_propose_governance_action_actor(
     let proposer_did = p.proposer_did.clone();
     let action = p.action;
 
-    // Phase 1 fix-up of ADR-049 (post-review-round-1): the propose path
-    // MUST run the suspension-aware capability check (check=true) because
-    // engine-side enforcement does not see suspension overlays.
+    // Actor-shape twin of the legacy unchecked
+    // `Supervisor::propose_governance_action` entry point: `check=false`.
+    // Role-based eligibility (admin status, the threshold/majority signer
+    // set) is enforced by the governance engine, which returns
+    // `GovernanceFailed` for ineligible proposers. The suspension overlay
+    // inside `propose_governance_action_inner` still applies unconditionally.
+    // The checked `GovernancePropose` capability path is reached through the
+    // dedicated `ProposeGovernanceActionChecked` command.
     let propose_fut = async move {
         Box::pin(
             crate::context::governance_helpers::propose_governance_action_inner(
@@ -424,7 +429,7 @@ async fn handle_propose_governance_action_actor(
                 &proposer_did,
                 action,
                 &signing_key,
-                true,
+                false,
             ),
         )
         .await
@@ -499,6 +504,15 @@ async fn handle_propose_governance_action_checked_actor(
 }
 
 /// Handle [`GovernanceCommand::VoteOnProposal`] (actor-shape).
+///
+/// This is the actor-shape twin of the legacy unchecked
+/// `Supervisor::vote_on_proposal` entry point, so `check_vote_capability`
+/// is `false`: role-based eligibility (the threshold/majority signer set,
+/// admin status) is enforced by the governance engine itself, which returns
+/// `GovernanceFailed` for non-eligible voters. The suspension overlay inside
+/// `vote_on_proposal_inner` still applies unconditionally. The checked
+/// `GovernanceVote` capability path is reached through the dedicated
+/// `ApproveGovernanceProposal` / `RejectGovernanceProposal` commands.
 async fn handle_vote_on_proposal_actor(
     state: &mut crate::context::actor::state::PerContextState,
     deps: &ActorDeps,
@@ -520,7 +534,7 @@ async fn handle_vote_on_proposal_actor(
             &voter_did,
             approve,
             &signing_key,
-            true,
+            false,
         ))
         .await
     };

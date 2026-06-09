@@ -2061,6 +2061,27 @@ mod tests {
         }
     }
 
+    /// Seeds the MLS group for an identity-scoped recovery pseudo-context
+    /// directly in the supervisor's crypto provider.
+    ///
+    /// PSK rotation (spec §9.12 step 6) seals its recovery notification
+    /// against a synthetic `identity-private-state` context that is never
+    /// registered as a per-context actor and never flows through
+    /// `create_context`. The real `MlsCryptoProvider` that backs
+    /// [`test_context_manager`] still requires an existing MLS group for
+    /// that id before [`MlsCryptoProvider::seal`] will succeed, so tests
+    /// exercising `rotate_psk` (directly or through `execute_recovery`)
+    /// must establish the group up front — exactly as the production
+    /// create-context path does for ordinary contexts.
+    fn seed_identity_private_state_group(manager: &Arc<crate::context::supervisor::Supervisor>) {
+        let context_id_bytes = crate::context::state::context_id_to_bytes("identity-private-state");
+        manager
+            .crypto_ref()
+            .expect("crypto provider attached to test supervisor")
+            .create_mls_group(&context_id_bytes)
+            .expect("failed to seed identity-private-state MLS group");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_mls_update_succeeds() {
         let manager = test_context_manager();
@@ -2162,6 +2183,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_rotate_psk_succeeds() {
         let manager = test_context_manager();
+        seed_identity_private_state_group(&manager);
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         let params = PskRotationParams {
@@ -2176,6 +2198,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_rotate_psk_excludes_compromised_device() {
         let manager = test_context_manager();
+        seed_identity_private_state_group(&manager);
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         let params = PskRotationParams {
@@ -2251,6 +2274,9 @@ mod tests {
         // Set up a context with alice and bob as members so contact
         // notification can find a shared context.
         setup_context_with_members(&manager, context_id, &alice, &[&bob]).await;
+        // ActiveSigning recovery rotates the PSK, which seals against the
+        // synthetic identity-private-state context — seed its MLS group.
+        seed_identity_private_state_group(&manager);
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
@@ -2290,6 +2316,9 @@ mod tests {
         // Set up a context with alice, bob, and carol as members so
         // contact notification can find shared contexts.
         setup_context_with_members(&manager, context_id, &alice, &[&bob, &carol]).await;
+        // IdentityKey recovery rotates the PSK, which seals against the
+        // synthetic identity-private-state context — seed its MLS group.
+        seed_identity_private_state_group(&manager);
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);

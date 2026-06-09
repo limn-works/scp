@@ -1870,13 +1870,23 @@ impl Supervisor {
     /// variant's oneshot.
     ///
     /// The per-context variants reach this path only for a context with
-    /// no registered actor. Post-Step-B every valid context has an actor
-    /// and these variants are mailbox-dispatched to the per-context
-    /// actor-shape handlers; the supervisor-direct arm is therefore
-    /// reached ONLY for an unregistered context, which is by definition
-    /// not registered — it surfaces a typed
+    /// no registered actor. Post-Step-B every valid *registered* context
+    /// has an actor and those variants are mailbox-dispatched to the
+    /// per-context actor-shape handlers. The state-dependent variants
+    /// (`RecoveryAdvanceEpoch`, `CreateGovernanceCheckpoint`,
+    /// `AddCheckpointCosignature`) therefore reach the supervisor-direct
+    /// arm ONLY for an unregistered context and surface a typed
     /// [`ContextError::ContextNotRegistered`] on the reply oneshot
     /// (mirrors the gutted `dispatch_lifecycle_direct` per-context arms).
+    ///
+    /// `RecoverySendNotification` is the exception: identity-scoped
+    /// recovery steps (notably PSK rotation, §9.12 step 6) deliberately
+    /// target a synthetic `identity-private-state` pseudo-context that is
+    /// never registered as an actor. Its arm seals and sends through the
+    /// supervisor-shared providers via
+    /// [`Self::recovery_send_notification_direct`] (epoch 0), rather than
+    /// erroring — this is a supported operation, not an unknown-context
+    /// fault.
     #[allow(clippy::too_many_lines)] // flat match over every trust-recovery variant
     async fn dispatch_trust_recovery_direct(&self, cmd: TrustRecoveryCommand) -> Outcome<()> {
         const TRUST_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1945,13 +1955,124 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err_mutated(sketch)
             }
+            // Unlike the other per-context recovery variants, a
+            // `RecoverySendNotification` to an unregistered context is a
+            // legitimate, supported operation: identity-scoped recovery
+            // steps (notably PSK rotation, spec §9.12 step 6) target a
+            // synthetic identity-private-state pseudo-context that is
+            // deliberately never registered as a per-context actor. Those
+            // notifications need only the supervisor-shared crypto +
+            // transport providers and an epoch of 0 (no MLS group exists
+            // for the synthetic context) — no per-context membership,
+            // governance, or MLS group state. Seal and send directly
+            // through the shared providers, matching the registered-actor
+            // handler's `recovery_send_notification` semantics with
+            // `mls_epoch == 0`.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+                let signing_key = payload.signing_key.to_signing_key();
+                let send_result = self.recovery_send_notification_direct(
+                    &payload.context_id,
+                    &payload.sender_did,
+                    &payload.payload,
+                    payload.sequence,
+                    &signing_key,
+                );
+                match send_result {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                        Outcome::ok(())
+                    }
+                    Err(e) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        let _ = reply.send(Err(e));
+                        Outcome::err(sketch)
+                    }
+                }
             }
         }
+    }
+
+    /// Seals and sends a recovery notification for a context with no
+    /// registered actor, using only the supervisor-shared crypto and
+    /// transport providers (ADR-049 §9.12).
+    ///
+    /// This is the supervisor-direct twin of the per-context actor's
+    /// [`recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification)
+    /// helper, reached when the target context has no registered actor.
+    /// It is used by identity-scoped recovery steps — chiefly PSK
+    /// rotation (step 6) — whose synthetic `identity-private-state`
+    /// pseudo-context is never registered as a per-context actor. Because
+    /// no MLS group exists for that synthetic context, the envelope is
+    /// constructed with `epoch == 0`, exactly as the registered-actor
+    /// handler does when `state.epoch.mls_epoch` is its default 0.
+    ///
+    /// The seal keys off `SHA256(context_id)` (`context_id_to_bytes`) and
+    /// the relay routing ID off the domain-separated
+    /// [`context_routing_id`](scp_protocol::context::context_routing_id),
+    /// so neither requires per-context state.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no crypto / transport / clock
+    ///   provider has been attached to the supervisor.
+    /// - [`ContextError::CryptoFailed`] if envelope signing or sealing
+    ///   fails.
+    /// - Any [`ContextError`] surfaced by the transport's `send_message`.
+    fn recovery_send_notification_direct(
+        &self,
+        context_id: &str,
+        sender_did: &str,
+        payload: &[u8],
+        sequence: u64,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), ContextError> {
+        let not_init = || {
+            ContextError::NotInitialized(
+                "recovery_send_notification_direct: providers not attached".to_owned(),
+            )
+        };
+        let crypto = self.crypto_ref().ok_or_else(not_init)?;
+        let transport = self.transport_ref().ok_or_else(not_init)?;
+        let clock = self.clock_ref().ok_or_else(not_init)?;
+
+        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+
+        // No MLS group exists for an unregistered context, so the epoch is
+        // 0 — matching the registered-actor handler's behaviour when
+        // `state.epoch.mls_epoch` holds its default value.
+        let current_epoch = 0;
+
+        let timestamp = clock.now_millis();
+        let params = scp_protocol::envelope::inner::InnerEnvelopeParams {
+            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+            context_id,
+            sender_did,
+            epoch: current_epoch,
+            generation: 0,
+            sequence,
+            timestamp,
+            message_type: scp_protocol::envelope::inner::MessageType::Recovery,
+            payload,
+            provenance: None,
+            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+        };
+
+        let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // Domain-separated routing ID for relay routing, distinct from the
+        // raw `context_id_bytes` used for MLS crypto keying.
+        let routing_id = scp_protocol::context::context_routing_id(context_id);
+        let encrypted = crypto.seal(
+            &context_id_bytes,
+            &inner,
+            &routing_id,
+            300, // 5 minute blob TTL
+        )?;
+
+        transport.send_message(&routing_id, &encrypted)?;
+
+        Ok(())
     }
 
     /// Direct supervisor-scoped dispatch for [`QueriesCommand`] variants
