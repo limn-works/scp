@@ -1697,17 +1697,24 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // silent accept, nor a mapping to the catch-all "SCP-CTX-2001" generic
       // context error. So assert the import rejects and that the rejection is
       // not the catch-all (matching the Python reference test).
-      await expect(async () => {
-        try {
-          await napi.contextImport(tampered);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          if (message.includes("SCP-CTX-2001")) {
-            throw new Error(`tampered snapshot must not map to the catch-all CTX-2001: ${message}`);
+      // `expect(...).rejects` takes a promise, so invoke the async wrapper to
+      // hand `expect` the promise it returns (matching the promise-first
+      // `rejects.toThrow()` idiom used elsewhere in this file).
+      await expect(
+        (async () => {
+          try {
+            await napi.contextImport(tampered);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            if (message.includes("SCP-CTX-2001")) {
+              throw new Error(
+                `tampered snapshot must not map to the catch-all CTX-2001: ${message}`,
+              );
+            }
+            throw err;
           }
-          throw err;
-        }
-      }).rejects.toThrow();
+        })(),
+      ).rejects.toThrow();
     });
   });
 
