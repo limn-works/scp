@@ -636,6 +636,15 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2093.to_owned(),
             },
+            // §23.16.8 / §17.5: signed-context-export format-version gate.
+            // The snapshot carries an export-format version this build does not
+            // support. This is a distinct contract from CTX_2093 (signature
+            // verification failure) so a caller can tell "old/unsupported
+            // export format" apart from "forged/tampered snapshot".
+            CE::ExportVersionUnsupported { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2094.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.

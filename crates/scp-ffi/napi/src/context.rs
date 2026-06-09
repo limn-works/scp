@@ -3787,7 +3787,12 @@ pub(crate) async fn context_export_on(
             message: "context export requires key custody to sign the snapshot \
                       (§23.16.8) — in_memory custody feature is not enabled"
                 .to_owned(),
-            code: codes::CTX_2093.to_owned(),
+            // This is a build/config permission condition (the signing capability
+            // is unavailable in this bundle), NOT a snapshot-signature failure.
+            // CTX_2093 is reserved for §23.16.8 signature verification rejection;
+            // tagging this config gate with it would make a caller catching 2093
+            // to detect a forged export misfire on a feature-disabled build.
+            code: codes::PERM_3001.to_owned(),
         }));
     }
 
