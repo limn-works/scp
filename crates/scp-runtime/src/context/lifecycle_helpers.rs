@@ -128,6 +128,14 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 /// or Merkle-verification failure surfaces later in
 /// [`create_export`](crate::context::export_import::create_export) at the
 /// dispatch boundary.
+///
+/// Crate-internal: this lives in the `pub(crate) mod lifecycle_helpers`
+/// module, so it is unreachable outside `scp-runtime` regardless of this
+/// `pub` keyword (a plain `pub` here, not `pub(crate)`, only because clippy's
+/// `redundant_pub_crate` forbids `pub(crate)` inside an already-restricted
+/// module). The only caller is the actor lifecycle handler within
+/// `scp-runtime`; it is not part of the FFI surface and carries no
+/// cross-layer export obligation.
 pub fn export_context_blocks(
     state: &PerContextState,
     deps: &ActorDeps,

@@ -742,7 +742,11 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
 ///
 /// Returns [`ContextError`] if Merkle root computation fails, if canonical hash
 /// construction fails, or if `sign` returns an error.
-pub fn create_export<F, E>(
+///
+/// Crate-internal: the only producer is `Supervisor::export_context` (the
+/// authoritative path FFI bridges reach through `Supervisor`). It is not part
+/// of the FFI surface, so it carries no cross-layer export obligation.
+pub(crate) fn create_export<F, E>(
     snapshot: ContextSnapshot,
     event_log_data: Vec<u8>,
     exporter_did: DID,
