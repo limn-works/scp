@@ -1280,6 +1280,27 @@ impl Supervisor {
                 reply,
             } => {
                 let context_id = export.snapshot.context_id.clone();
+                // Verify BEFORE building any actor deps (verify-before-side-effect).
+                // `Supervisor::import_context` is a public runtime API — FFI
+                // bridges pre-verify, but this dispatch arm must be safe on its
+                // own. `build_actor_deps` below derives `owning_did` from the
+                // UNVERIFIED `export.snapshot.membership` and get-or-spawns a
+                // `KeyPackageStoreActor` keyed on that DID, inserting a permanent
+                // entry into the unbounded `key_package_stores` map. Without this
+                // gate a forged export — keyed on an attacker-chosen DID — would
+                // leak a spawned actor + map entry even though `import_context`
+                // (which re-validates authoritatively) rejects it. The cheap
+                // duplicate check here is the same verify-before-init pattern the
+                // bridges already apply; `import_context` remains the
+                // authoritative verifier.
+                if let Err(e) = crate::context::export_import::validate_export_for_import(
+                    &export,
+                    &verifying_key,
+                ) {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    return Outcome::err_mutated(sketch);
+                }
                 // ADR-049 Phase 2A finalization: scope the actor-shape
                 // deps to a deterministic member of the imported roster
                 // (the lexicographically-minimum member DID). The import
@@ -1289,7 +1310,10 @@ impl Supervisor {
                 // actor is touched; picking the min member DID keeps it
                 // deterministic and a genuine context participant rather
                 // than fabricating one. An empty roster falls back to the
-                // context id so deps construction never panics.
+                // context id so deps construction never panics. The roster
+                // is now trusted: the snapshot signature verified above, so
+                // `owning_did` is an authenticated member, not an
+                // attacker-chosen value.
                 let owning_did = export
                     .snapshot
                     .membership
@@ -1297,9 +1321,21 @@ impl Supervisor {
                     .map(|m| m.did.clone())
                     .min()
                     .unwrap_or_else(|| DID(context_id.clone()));
+                // Defense in depth: track whether `build_actor_deps` will
+                // newly spawn this identity's key-package store, so a
+                // post-verification import failure (e.g. epoch-floor
+                // rejection, refusing to overwrite a live context) does not
+                // leave an orphaned actor + map entry behind. Eviction is
+                // safe only for an entry this op created: a pre-existing
+                // entry is shared with other contexts/identities and must
+                // not be torn down on our failure.
+                let kp_store_newly_spawned = !self.key_package_stores.contains_key(&owning_did);
                 let deps = match self.build_actor_deps(&owning_did).await {
                     Ok(deps) => deps,
                     Err(e) => {
+                        if kp_store_newly_spawned {
+                            self.key_package_stores.remove(&owning_did);
+                        }
                         let sketch = standing_outcome_error_sketch(&e);
                         let _ = reply.send(Err(e));
                         return Outcome::err_mutated(sketch);
@@ -1325,10 +1361,20 @@ impl Supervisor {
                 {
                     Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
                     Ok(Err(e)) => {
+                        // Import failed after deps were built (e.g. epoch-floor
+                        // rejection, refusing to overwrite a live context).
+                        // Evict the key-package-store entry if this op spawned
+                        // it, so a rejected import leaves no orphaned actor.
+                        if kp_store_newly_spawned {
+                            self.key_package_stores.remove(&owning_did);
+                        }
                         let sketch = standing_outcome_error_sketch(&e);
                         (Outcome::err_mutated(sketch), Err(e))
                     }
                     Err(_elapsed) => {
+                        if kp_store_newly_spawned {
+                            self.key_package_stores.remove(&owning_did);
+                        }
                         let err = ContextError::TransportTimeout(format!(
                             "import_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
                         ));
@@ -3727,6 +3773,17 @@ impl Supervisor {
         export: crate::context::export_import::ContextExport,
         verifying_key: &ed25519_dalek::VerifyingKey,
     ) -> Result<crate::context::ContextHandle, ContextError> {
+        // Verify-before-side-effect at the public API boundary: reject a
+        // forged or malformed export before it is ever dispatched onto the
+        // actor channel. The `ImportContext` dispatch arm re-checks this
+        // (so a direct command sender is equally guarded) and the
+        // `lifecycle_helpers::import_context` helper re-validates
+        // authoritatively before restoring any state — the layering is
+        // intentional: validation is cheap relative to a full import, and
+        // each layer that could otherwise produce a side effect
+        // (channel send, key-package-store spawn, state restore) is
+        // gated independently (§23.16.8, ADR-050).
+        crate::context::export_import::validate_export_for_import(&export, verifying_key)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = LifecycleCommand::ImportContext {
             export: Box::new(export),
@@ -6515,6 +6572,156 @@ mod tests {
 
         // Handle is still registered until the import path despawns it.
         assert!(supervisor_arc.lookup(&ctx_key).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // Verify-before-side-effect on the import dispatch path.
+    //
+    // `Supervisor::import_context` is a public runtime API. The
+    // `ImportContext` dispatch arm must verify the snapshot signature
+    // BEFORE deriving `owning_did` from the (otherwise unverified)
+    // roster and calling `build_actor_deps` → `key_package_store_for`,
+    // which would otherwise spawn a `KeyPackageStoreActor` and insert a
+    // permanent entry into the unbounded `key_package_stores` map keyed
+    // on an attacker-chosen DID. This test drives a forged export (valid
+    // structure, wrong verifying key) and asserts (a) it is rejected and
+    // (b) no key-package-store entry leaked.
+    // -----------------------------------------------------------------
+
+    /// Minimal active-context snapshot whose `creator_did` is `creator`.
+    fn import_test_snapshot(
+        context_id: &str,
+        creator: &str,
+    ) -> crate::context::state::ContextSnapshot {
+        use scp_protocol::context::ContextState;
+        use scp_protocol::context::membership::MembershipState;
+        use scp_protocol::context::params::ContextParams;
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+
+        let role_state = ContextRoleState::new(
+            context_id,
+            creator,
+            default_ceiling(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        crate::context::state::ContextSnapshot {
+            context_id: context_id.to_owned(),
+            state: ContextState::Active,
+            context_params: ContextParams::default(),
+            membership: MembershipState::new(),
+            role_state,
+            event_log_merkle_root: [0u8; 32],
+            executed_proposals: HashSet::new(),
+            ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
+            read_exclusion_list: HashSet::new(),
+            approved_proposals: HashMap::new(),
+            next_proposal_seq: 0,
+            governance_freeze: None,
+            pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
+            mls_epoch: 0,
+            epoch_coordination_records: Vec::new(),
+            grace_entries: Vec::new(),
+            needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
+            migration_state: None,
+            access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+            consequence_rules: Vec::new(),
+            participation_cache: HashMap::new(),
+            velocity_tracker: None,
+            velocity_tracker_state: None,
+            cooldown_until: HashMap::new(),
+            proposal_timestamps: HashMap::new(),
+            message_pricing: None,
+            hard_rate_limit_config: None,
+            hard_rate_limit_state: HashMap::new(),
+            spending_nonce_tracker_state: HashMap::new(),
+            pending_commits: std::collections::VecDeque::new(),
+            commit_fault: None,
+            checkpoint_events_since: 0,
+            checkpoint_last_time_secs: 0,
+            generation: 0,
+            local_pseudonym: None,
+            pseudonym_registry: HashMap::new(),
+        }
+    }
+
+    /// A forged export — structurally valid and signed by the creator's
+    /// key, but presented with a DIFFERENT verifying key on import — must
+    /// be rejected WITHOUT leaking a key-package-store actor/entry.
+    #[tokio::test]
+    async fn import_rejects_forged_export_before_building_actor_deps() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let supervisor = supervisor_with_providers();
+        // Providers ARE wired here, so `build_actor_deps` would succeed and
+        // spawn a key-package store if it were reached — the verify gate is
+        // what must keep it from being reached.
+        assert!(
+            supervisor.key_package_stores.is_empty(),
+            "fixture starts with no key-package stores"
+        );
+
+        let creator = "did:key:forge-test-creator";
+        let snapshot = import_test_snapshot("forge-ctx", creator);
+        let event_log_data = create_event_log_data(&[0x11u8; 32], &["ContextCreated"]);
+
+        // Sign with the real creator key so the export is internally
+        // consistent (exporter_did == creator_did, signature authentic
+        // under `signing_key`).
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_primitives::SystemClock,
+            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+        )
+        .expect("build a valid signed export");
+
+        // Present a DIFFERENT verifying key — simulating a forgery / a
+        // resolver returning the wrong creator key. Verification must fail.
+        let wrong_key = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+
+        let result = supervisor.import_context(export, &wrong_key).await;
+
+        assert!(
+            matches!(result, Err(ContextError::SnapshotSignatureInvalid { .. })),
+            "forged export must be rejected with a signature error, got {result:?}"
+        );
+        // The verify-before-side-effect gate must have short-circuited
+        // BEFORE `build_actor_deps`/`key_package_store_for`: no actor and
+        // no permanent map entry may have leaked.
+        assert!(
+            supervisor.key_package_stores.is_empty(),
+            "rejected forged import must not leak a key-package-store entry"
+        );
+    }
+
+    /// Helper mirroring `export_import::tests::create_event_log_data` —
+    /// builds a Merkle event log byte payload via the provider.
+    fn create_event_log_data(context_id_bytes: &[u8; 32], event_names: &[&str]) -> Vec<u8> {
+        use crate::context::builder::ContextEventLogProvider;
+        let provider = crate::context::providers::event_log::MerkleEventLogProvider::new();
+        provider.init_event_log(context_id_bytes).unwrap();
+        for name in event_names {
+            provider
+                .append_event(context_id_bytes, name, "", None)
+                .unwrap();
+        }
+        provider.export_event_log_entries(context_id_bytes).unwrap()
     }
 
     // -----------------------------------------------------------------

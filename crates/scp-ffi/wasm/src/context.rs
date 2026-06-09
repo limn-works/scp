@@ -1726,11 +1726,10 @@ pub fn context_get_economic_policy(handle: &WasmContextHandle) -> Option<String>
 #[wasm_bindgen]
 pub fn context_export(handle: &WasmContextHandle) -> Promise {
     let context_id = handle.context_id();
-    let exporter_did = handle.creator_did();
 
     future_to_promise(async move {
-        let bytes = with_manager(|mgr| mgr.export_context(&context_id, &exporter_did))
-            .map_err(ScpWasmError::into_js)?;
+        let bytes =
+            with_manager(|mgr| mgr.export_context(&context_id)).map_err(ScpWasmError::into_js)?;
 
         let len = u32::try_from(bytes.len()).map_err(|_| {
             ScpWasmError::Context {
