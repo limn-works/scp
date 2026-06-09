@@ -606,19 +606,16 @@ pub(crate) async fn context_create_on(
             })
         })?;
 
-    // §9.10.4: The creator's per-context pseudonym routing ID is already passed
-    // into `create_context` above (via `local_pseudonym`). A freshly created
-    // context has exactly one member (the creator), so there is nobody to
-    // announce the routing ID to — the announcement would be a guaranteed
-    // no-op. The PyO3 reference bridge (`py_context_create`) likewise sends no
-    // announcement on create; the routing ID is announced on `join` (where
-    // existing members must learn it). Sending it here additionally forced a
-    // raw signing-key export (`export_ed25519_signing_key`), which a sign-only
-    // custody backend (OS keychain / HSM / secure enclave) legitimately refuses
-    // — surfacing the refusal as a hard error on every `context_create`. Not
-    // exporting the key on create keeps `context_create` compatible with
-    // sign-only custody and matches the reference bridge. The genuine
-    // announcement remains on `context_join`, where recipients exist.
+    // §9.10.4: a freshly created context has exactly one member, so the
+    // pseudonym routing-ID announcement has no recipients and is a guaranteed
+    // no-op on create. The routing ID is already registered with the
+    // ContextManager via `local_pseudonym` in the create payload, and is
+    // announced on `context_join` where existing members must learn it.
+    // Emitting it here would also require resolving the signing key (a raw
+    // `export_ed25519_signing_key`), which a sign-only keychain/HSM custody
+    // (ADR-006) cannot satisfy. PyO3's `py_context_create` still emits this
+    // no-op announcement; not replicating it here is intentional. Converging
+    // the reference bridge is tracked separately.
 
     let handle = NapiContextHandle {
         context_id,
