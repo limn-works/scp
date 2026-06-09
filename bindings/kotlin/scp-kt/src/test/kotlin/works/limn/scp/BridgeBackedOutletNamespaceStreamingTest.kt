@@ -27,6 +27,7 @@ import org.junit.jupiter.api.Test
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 @Suppress("StringLiteralDuplication")
@@ -221,5 +222,118 @@ class BridgeBackedOutletNamespaceStreamingTest {
             assertEquals(1, chunks.size)
             assertTrue(chunks[0] is OutletStreamChunk.End)
             assertTrue(recheckStopped.get(), "stopRecheck must run after flow collection")
+        }
+
+    // ------------------------------------------------------------------
+    // Bug 1 — control-plane-only handle must not leak the recheck loop.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `close on an unconsumed streaming handle tears down the recheck loop`() =
+        runTest {
+            // A legal control-plane-only use: open → grantCredit → close,
+            // WITHOUT ever consuming the chunk stream. Before the fix the
+            // recheck loop's only teardown was the consumer paths'
+            // `finally { stopRecheck() }`, so this pattern polled
+            // `ucanValidate` for the process lifetime. `close()` must run
+            // the same teardown without any consumption.
+            val rid = "e9".repeat(16)
+            val recorder = ControlPlaneRecorder()
+            val requestIdDeferred = CompletableDeferred<String?>().apply { complete(rid) }
+            val recheckStopped = AtomicBoolean(false)
+            // Mirrors `makeStreamingHandle`'s shared HANDLE terminal flag
+            // that the real `StreamOpener` recheck loop polls as its exit
+            // condition.
+            val handleTerminated = AtomicBoolean(false)
+
+            val handle =
+                buildStreamingInvocationHandle(
+                    // `open` is never invoked because the chunk stream is
+                    // never consumed — exactly the leak scenario.
+                    open = { error("stream must not be opened for a control-plane-only handle") },
+                    stopRecheck = { recheckStopped.set(true) },
+                    requestIdDeferred = requestIdDeferred,
+                    invokerDid = invokerDid,
+                    aggregateSchemaJson = null,
+                    grantCreditFn = recorder.grant,
+                    cancelFn = recorder.cancel,
+                    onTerminalObserved = { handleTerminated.set(true) },
+                )
+
+            // Use the control plane only, then abandon-with-close.
+            val granted = handle.grantCredit(Credit(3u))
+            assertEquals(3u, granted)
+            assertEquals(rid, recorder.grantRid)
+            assertFalse(recheckStopped.get(), "recheck must still be live before close")
+            assertFalse(handleTerminated.get(), "handle must not be terminated before close")
+
+            handle.close()
+
+            // `close()` runs the recheck teardown (scope cancel — i.e.
+            // ucanValidate stops) AND flips the shared terminal flag the
+            // loop polls. Both prove the loop cannot outlive the handle.
+            assertTrue(recheckStopped.get(), "close() must tear down the recheck loop")
+            assertTrue(handleTerminated.get(), "close() must flip the shared HANDLE terminal flag")
+            assertTrue(handle.isTerminated, "close() marks the handle terminated")
+        }
+
+    @Test
+    fun `close is idempotent and tears down recheck exactly once`() =
+        runTest {
+            val rid = "fa".repeat(16)
+            val recorder = ControlPlaneRecorder()
+            val requestIdDeferred = CompletableDeferred<String?>().apply { complete(rid) }
+            var stopCount = 0
+            var terminalCount = 0
+
+            val handle =
+                buildStreamingInvocationHandle(
+                    open = { error("not consumed") },
+                    stopRecheck = { stopCount += 1 },
+                    requestIdDeferred = requestIdDeferred,
+                    invokerDid = invokerDid,
+                    aggregateSchemaJson = null,
+                    grantCreditFn = recorder.grant,
+                    cancelFn = recorder.cancel,
+                    onTerminalObserved = { terminalCount += 1 },
+                )
+
+            handle.close()
+            handle.close()
+            handle.close()
+
+            assertEquals(1, stopCount, "onClose/stopRecheck must run exactly once")
+            assertEquals(1, terminalCount, "onTerminalObserved must run exactly once")
+            // After close the control plane fail-closes.
+            assertFailsWith<StreamAlreadyClosed> { handle.grantCredit(Credit(1u)) }
+        }
+
+    @Test
+    fun `use block closes the handle and tears down recheck`() =
+        runTest {
+            // `AutoCloseable` makes `handle.use { }` the idiomatic
+            // control-plane-only pattern — the recheck loop is released on
+            // block exit even though the chunk stream is never consumed.
+            val rid = "0b".repeat(16)
+            val recorder = ControlPlaneRecorder()
+            val requestIdDeferred = CompletableDeferred<String?>().apply { complete(rid) }
+            val recheckStopped = AtomicBoolean(false)
+
+            val handle =
+                buildStreamingInvocationHandle(
+                    open = { error("not consumed") },
+                    stopRecheck = { recheckStopped.set(true) },
+                    requestIdDeferred = requestIdDeferred,
+                    invokerDid = invokerDid,
+                    aggregateSchemaJson = null,
+                    grantCreditFn = recorder.grant,
+                    cancelFn = recorder.cancel,
+                )
+
+            handle.use {
+                it.grantCredit(Credit(2u))
+            }
+
+            assertTrue(recheckStopped.get(), "use { } must tear down the recheck loop on exit")
         }
 }
