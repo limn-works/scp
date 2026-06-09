@@ -471,6 +471,15 @@ internal class BridgeBackedOutletNamespace internal constructor(
         // even when the caller never consumes the chunk stream.
         val cursorDeferred = CompletableDeferred<OutletStreamCursor>()
         val requestIdDeferred = CompletableDeferred<String?>()
+        // Shared terminal flag observed by BOTH the handle (which flips it
+        // on terminal consumption / `close()`) and the receiver-side
+        // revocation re-check loop (which polls it as an exit condition).
+        // This binds the re-check scope's lifetime to the HANDLE terminal
+        // state, not only to a consumer's `finally` — mirroring the
+        // TypeScript loop's `while (!sdkHandle.isTerminated)` so an
+        // unconsumed-then-closed handle stops the loop without ever
+        // collecting the chunk stream.
+        val handleTerminated = java.util.concurrent.atomic.AtomicBoolean(false)
         val opener =
             StreamOpener(
                 bridge = bridge,
@@ -489,6 +498,7 @@ internal class BridgeBackedOutletNamespace internal constructor(
                 recheckSecs = ucanRecheckSecs,
                 cursorDeferred = cursorDeferred,
                 requestIdDeferred = requestIdDeferred,
+                handleTerminated = handleTerminated,
             )
         // Open eagerly (background) so `grantCredit` / `cancel` and the
         // revocation re-check loop resolve independent of chunk
@@ -503,6 +513,7 @@ internal class BridgeBackedOutletNamespace internal constructor(
             aggregateSchemaJson = aggregateSchemaJson,
             grantCreditFn = bridge.streamGrantCredit,
             cancelFn = bridge.streamCancel,
+            onTerminalObserved = { handleTerminated.set(true) },
         )
     }
 
@@ -558,6 +569,16 @@ private class StreamOpener
         private val recheckSecs: UInt,
         private val cursorDeferred: CompletableDeferred<OutletStreamCursor>,
         private val requestIdDeferred: CompletableDeferred<String?>,
+        /**
+         * Shared HANDLE terminal flag — flipped by the handle on terminal
+         * consumption or `close()`. The receiver-side revocation re-check
+         * loop polls it as an exit condition so the loop's lifetime binds
+         * to the handle terminal state rather than to a consumer's
+         * `finally` (mirrors the TypeScript `while (!sdkHandle.isTerminated)`
+         * loop). A handle opened for its control plane only and then
+         * `close()`d stops the loop without ever collecting chunks.
+         */
+        private val handleTerminated: java.util.concurrent.atomic.AtomicBoolean,
     ) {
         private val opened = java.util.concurrent.atomic.AtomicBoolean(false)
         private val terminated = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -641,12 +662,19 @@ private class StreamOpener
             val capability = "tool_invoke:$outletId"
             val intervalMs = recheckSecs.coerceAtLeast(1u).toLong() * 1000L
             scope.launch {
-                // Loop exits via the guard only — `terminated` flips on
-                // revocation (below) or on `stopRecheck()` (stream end), so
-                // no in-body `break` is needed.
-                while (isActive && !terminated.get()) {
+                // Loop exits when EITHER the opener's own `terminated`
+                // flag flips (revocation below, or `stopRecheck()`) OR the
+                // shared HANDLE terminal flag flips (terminal consumption
+                // or `close()`). Polling `handleTerminated` binds the loop
+                // to the handle terminal state independent of any
+                // consumer's `finally`, mirroring the TypeScript loop's
+                // `while (!sdkHandle.isTerminated)` exit condition — a
+                // control-plane-only handle that is `close()`d (but never
+                // consumed) stops the loop here without ever collecting
+                // the chunk stream.
+                while (isActive && !terminated.get() && !handleTerminated.get()) {
                     delay(intervalMs)
-                    if (terminated.get()) continue
+                    if (terminated.get() || handleTerminated.get()) continue
                     try {
                         bridge.ucanValidate(handle, ucanToken, capability, null, proofTokens)
                     } catch (_: Throwable) {
@@ -708,6 +736,7 @@ internal fun buildStreamingInvocationHandle(
     aggregateSchemaJson: String?,
     grantCreditFn: suspend (requestIdHex: String, callerDid: String, grant: UInt) -> UInt,
     cancelFn: suspend (requestIdHex: String, callerDid: String) -> ULong?,
+    onTerminalObserved: () -> Unit = {},
 ): InvocationHandle {
     val flowFn: () -> Flow<OutletStreamChunk> = {
         channelFlow {
@@ -743,6 +772,18 @@ internal fun buildStreamingInvocationHandle(
         requestIdDeferred = requestIdDeferred,
         grantCreditFn = grantCreditFn,
         cancelFn = cancelFn,
+        // Wire AutoCloseable teardown to the receiver-side revocation
+        // re-check scope. A control-plane-only caller (open → grantCredit
+        // → abandon) that never consumes the chunk stream can release the
+        // re-check loop via `handle.close()` / `handle.use { }`; the
+        // consumer paths' `finally { stopRecheck() }` still covers the
+        // consumed case (both are idempotent).
+        onClose = stopRecheck,
+        // Surface every terminal transition (consumption, terminal chunk,
+        // or `close()`) to the shared flag the re-check loop polls, so the
+        // loop exits on the HANDLE terminal state — not only on a
+        // consumer's `finally`.
+        onTerminalObserved = onTerminalObserved,
     )
 }
 

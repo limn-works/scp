@@ -420,6 +420,17 @@ sealed class OutletError(message: String, val code: String) : RuntimeException(m
  *
  * Implementations MUST buffer chunks so both APIs see the same stream;
  * a handle is expected to be consumed by only one API per invocation.
+ *
+ * Lifecycle / resource ownership ([AutoCloseable]): a streaming handle
+ * owns a background coroutine scope running the §5.4.5 receiver-side
+ * UCAN revocation re-check loop. Consuming the handle (via [aggregate]
+ * or [asFlow]) tears that scope down on terminal observation. A caller
+ * that opens a streaming handle for its CONTROL PLANE ONLY — e.g.
+ * `invoke(...)` → `grantCredit(...)` → abandon, without ever consuming
+ * the chunk stream — MUST [close] the handle (idiomatically via
+ * `handle.use { ... }`) so the re-check scope and its `delay`-driven
+ * polling do not leak for the process lifetime. [close] is idempotent
+ * and safe to call alongside normal consumption.
  */
 class InvocationHandle
     @Suppress("LongParameterList")
@@ -470,8 +481,40 @@ class InvocationHandle
          */
         private val cancelFn: suspend (requestIdHex: String, callerDid: String) -> ULong? =
             ::outletStreamCancel,
-    ) {
+        /**
+         * Teardown callback invoked exactly once by [close] (idempotent).
+         * For streaming handles the production namespace wires this to the
+         * [StreamOpener.stopRecheck] teardown so a caller that never
+         * consumes the chunk stream can still release the receiver-side
+         * revocation re-check scope. Defaults to a no-op for handles with
+         * no background resource (the degenerate single-shot path and the
+         * in-memory test namespace).
+         */
+        private val onClose: () -> Unit = {},
+        /**
+         * Invoked the first time the handle observes a terminal state —
+         * via [aggregate], [asFlow] terminal-chunk observation, or
+         * [close]. The production streaming namespace wires this to a
+         * shared flag the receiver-side revocation re-check loop polls, so
+         * the loop's lifetime binds to the HANDLE terminal state (parity
+         * with the TypeScript `while (!sdkHandle.isTerminated)` loop)
+         * rather than to a consumer's `finally`. Runs at most once.
+         */
+        private val onTerminalObserved: () -> Unit = {},
+    ) : AutoCloseable {
         private val terminatedFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+        private val closedFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /**
+         * Flips the terminal flag and, on the first transition, fires
+         * [onTerminalObserved]. Idempotent — the callback runs at most
+         * once regardless of how many paths observe the terminal state.
+         */
+        private fun markTerminated() {
+            if (terminatedFlag.compareAndSet(false, true)) {
+                onTerminalObserved()
+            }
+        }
 
         /**
          * Tracks the consumption mode chosen by the caller — one of
@@ -507,13 +550,34 @@ class InvocationHandle
         val isTerminated: Boolean
             get() = terminatedFlag.get()
 
+        /**
+         * Releases the handle's background resources — for a streaming
+         * handle, the §5.4.5 receiver-side revocation re-check scope.
+         * Idempotent: the first call runs [onClose]; subsequent calls are
+         * no-ops. Also flips the terminal flag so any later control-plane
+         * call fail-closes with [StreamAlreadyClosed].
+         *
+         * A control-plane-only caller (open → `grantCredit` → abandon)
+         * MUST call this — idiomatically `handle.use { ... }` — so the
+         * re-check loop does not poll `ucanValidate` for the process
+         * lifetime. Normal consumption (`aggregate()` / `asFlow()`) tears
+         * the scope down on terminal observation, so calling [close]
+         * afterward is harmless.
+         */
+        override fun close() {
+            if (closedFlag.compareAndSet(false, true)) {
+                markTerminated()
+                onClose()
+            }
+        }
+
         /** Suspends until the terminal `End` chunk and returns the aggregate.
          *  Throws [OutletProtocolError] (slug `protocol.handle-double-consumed`)
          *  when the handle has already been iterated via [asFlow]. */
         suspend fun aggregate(): Aggregate {
             guard("aggregate")
             val agg = aggregateFn()
-            terminatedFlag.set(true)
+            markTerminated()
             validateAggregate(agg)
             return agg
         }
@@ -537,7 +601,7 @@ class InvocationHandle
                     if (chunk is OutletStreamChunk.End ||
                         (chunk is OutletStreamChunk.Error && chunk.terminal)
                     ) {
-                        terminatedFlag.set(true)
+                        markTerminated()
                     }
                     emit(chunk)
                 }
