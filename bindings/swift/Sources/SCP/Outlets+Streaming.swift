@@ -121,10 +121,26 @@ extension Context {
 /// Returns the spawned `Task` so the caller (the streaming pump) can
 /// cancel it via `defer { recheckTask.cancel() }` when the parent pump
 /// resolves naturally — once the stream emits a terminal chunk, the
-/// recheck loop has nothing more to do. Spec: "Already-emitted chunks
-/// remain authorized; the stream closes at or before
-/// `stream_ucan_recheck_secs` after the revocation event regardless of
-/// executor behavior."
+/// recheck loop has nothing more to do — OR via
+/// `InvocationHandle.close()` for an UNBOUNDED, never-consumed stream
+/// whose eager pump never reaches a terminal chunk. Spec:
+/// "Already-emitted chunks remain authorized; the stream closes at or
+/// before `stream_ucan_recheck_secs` after the revocation event
+/// regardless of executor behavior."
+///
+/// `validate` and `terminate` are injectable closures defaulting to the
+/// real UniFFI `ucanValidate` / `OutletsStreaming.terminate`. The defaults
+/// are the production path; the injectable seam lets tests drive the loop
+/// against a synthetic validator (e.g. counting calls) without the
+/// XCFramework binary, so a test can assert that `close()` /
+/// `recheckTask.cancel()` actually stops the polling.
+/// `validate` / `terminate` default to `nil`, in which case the loop binds
+/// the production UniFFI `ucanValidate` / `OutletsStreaming.terminate`
+/// (using the captured `contextHandle` / `requestIdHex` / `invokerDid`).
+/// A non-`nil` closure overrides the default — the injectable seam tests
+/// use to drive the loop against a synthetic validator without the
+/// XCFramework binary, so a test can assert that `recheckTask.cancel()`
+/// (the mechanism `InvocationHandle.close()` invokes) stops the polling.
 @Sendable
 func makeRevocationRecheckTask(
     contextHandle: ContextHandle,
@@ -133,9 +149,36 @@ func makeRevocationRecheckTask(
     proofTokens: [String]?,
     recheckSecs: UInt32,
     requestIdHex: String,
-    invokerDid: String
+    invokerDid: String,
+    validate: (@Sendable (
+        _ token: String,
+        _ capability: String,
+        _ proofTokens: [String]?
+    ) async throws -> Void)? = nil,
+    terminate: (@Sendable () async -> Void)? = nil
 ) -> Task<Void, Never> {
-    Task { [weak contextHandle] in
+    // Production bindings used when the caller does not inject a seam.
+    // `ucanValidate` is a UniFFI free function generated at module scope.
+    let effectiveValidate: @Sendable (String, String, [String]?) async throws -> Void =
+        validate ?? { token, capability, proof in
+            try await ucanValidate(
+                handle: contextHandle,
+                token: token,
+                capability: capability,
+                presentingAgentDid: nil,
+                proofTokens: proof
+            )
+        }
+    let effectiveTerminate: @Sendable () async -> Void =
+        terminate ?? {
+            _ = try? await OutletsStreaming.terminate(
+                requestIdHex: requestIdHex,
+                callerDid: invokerDid,
+                reason: .revokedMidStream,
+                messageOverride: "ucan revoked or invalid mid-stream"
+            )
+        }
+    return Task { [weak contextHandle] in
         guard contextHandle != nil else { return }
         let capability = "tool_invoke:\(outletId)"
         let interval = max(UInt64(1), UInt64(recheckSecs))
@@ -143,26 +186,15 @@ func makeRevocationRecheckTask(
             try? await Task.sleep(nanoseconds: interval * 1_000_000_000)
             if Task.isCancelled { return }
             do {
-                guard let ctxHandle = contextHandle else { return }
-                try await ucanValidate(
-                    handle: ctxHandle,
-                    token: ucanToken,
-                    capability: capability,
-                    presentingAgentDid: nil,
-                    proofTokens: proofTokens
-                )
+                guard contextHandle != nil else { return }
+                try await effectiveValidate(ucanToken, capability, proofTokens)
             } catch {
                 // UCAN no longer valid — terminate the stream with
                 // the spec slug + code. Recoverable failures
                 // (already terminated / pending) stop the loop
                 // naturally because outletStreamTerminate's contract
                 // is idempotent on the runtime side.
-                _ = try? await OutletsStreaming.terminate(
-                    requestIdHex: requestIdHex,
-                    callerDid: invokerDid,
-                    reason: .revokedMidStream,
-                    messageOverride: "ucan revoked or invalid mid-stream"
-                )
+                await effectiveTerminate()
                 return
             }
         }
@@ -198,6 +230,113 @@ func pumpStreamingChunks(
         resolveAggregate: resolveAggregate,
         rejectAggregate: rejectAggregate
     )
+}
+
+/// Captured configuration for the streaming-mode pump closure. Bundles
+/// the §5.4.5 open parameters plus the shared `RequestIdBox` /
+/// `CancelRegistry` so `makeStreamingPump` can be a module-scope free
+/// function (keeping `OutletNamespace.makeStreamingHandle`'s body within
+/// SwiftLint's `function_body_length`). All fields are `Sendable`.
+struct StreamingPumpConfig: @unchecked Sendable {
+    let handle: ContextHandle
+    let identity: Identity
+    let invokerDid: String
+    let outletId: String
+    let inputJson: String
+    let ucanToken: String
+    let caveatsBindingHex: String
+    let streamEpoch: UInt64
+    let proofTokens: [String]?
+    let creditWindow: UInt32?
+    let estimatedChunkCount: UInt32?
+    let spendingUcan: String?
+    let ucanRecheckSecs: UInt32
+    let requestIdBox: RequestIdBox
+    let cancelRegistry: CancelRegistry
+}
+
+/// Builds the streaming-mode pump closure for `InvocationHandle` — opens
+/// the §5.4.5 stream, resolves the `request_id` box, spawns the
+/// receiver-side revocation re-check task, and drains chunks. The chunk-
+/// pump `Task` and the recheck `Task` cancels are registered into the
+/// shared `CancelRegistry` so `InvocationHandle.close()` can tear them
+/// down for an UNBOUNDED, never-consumed stream whose eager pump never
+/// reaches a terminal chunk on its own.
+///
+/// Module-scope (not a method) so the calling factory's body stays short;
+/// mirrors `pumpStreamingChunks` living at module scope for the same
+/// reason.
+func makeStreamingPump(
+    _ config: StreamingPumpConfig
+) -> @Sendable (
+    @Sendable @escaping (OutletStreamChunk) -> Void,
+    @Sendable @escaping (Aggregate) -> Void,
+    @Sendable @escaping (Error) -> Void
+) -> Void {
+    { yieldChunk, resolveAggregate, rejectAggregate in
+        let pumpTask = Task {
+            do {
+                let raw = try await outletInvokeStream(
+                    handle: config.handle,
+                    outletId: config.outletId,
+                    inputJson: config.inputJson,
+                    identity: config.identity,
+                    ucanToken: config.ucanToken,
+                    caveatsBindingHex: config.caveatsBindingHex,
+                    streamEpoch: config.streamEpoch,
+                    proofTokens: config.proofTokens,
+                    creditWindow: config.creditWindow,
+                    estimatedChunkCount: config.estimatedChunkCount,
+                    spendingUcan: config.spendingUcan
+                )
+                // Thread the real §5.4.5 `request_id` into the handle as
+                // soon as the open resolves — BEFORE pumping chunks — so
+                // control-plane callers that raced to `grantCredit` /
+                // `cancel` immediately after `invoke()` unblock with a
+                // valid id.
+                let requestIdHex = raw.requestId()
+                await config.requestIdBox.resolve(requestIdHex)
+                let recheckTask = makeRevocationRecheckTask(
+                    contextHandle: config.handle,
+                    outletId: config.outletId,
+                    ucanToken: config.ucanToken,
+                    proofTokens: config.proofTokens,
+                    recheckSecs: config.ucanRecheckSecs,
+                    requestIdHex: requestIdHex,
+                    invokerDid: config.invokerDid
+                )
+                // Register the recheck `Task` cancel so `close()` can stop
+                // the §5.4.5 revocation-recheck loop for an UNBOUNDED,
+                // never-consumed stream. The `defer` below still covers
+                // the normal path (pump reaches a terminal chunk). Both
+                // are idempotent — `Task.cancel()` is safe to call more
+                // than once. If `close()` already ran, the registry fires
+                // this immediately so the just-spawned task is cancelled
+                // at once.
+                config.cancelRegistry.register { recheckTask.cancel() }
+                defer { recheckTask.cancel() }
+                try await pumpStreamingChunks(
+                    from: raw,
+                    yieldChunk: yieldChunk,
+                    resolveAggregate: resolveAggregate,
+                    rejectAggregate: rejectAggregate
+                )
+            } catch {
+                // Open failed before a `request_id` was known — resolve
+                // the box to `nil` so awaiting control-plane callers
+                // unblock and surface `streamAlreadyClosed` (no streaming
+                // session) rather than hanging forever.
+                await config.requestIdBox.resolve(nil)
+                rejectAggregate(error)
+            }
+        }
+        // Register the outer pump `Task` cancel so `close()` tears down
+        // the open + chunk drain too (not only the recheck loop). The open
+        // (`outletInvokeStream`) and `pumpStreamingChunks` observe
+        // cancellation and unwind, which also runs the `defer` that
+        // cancels the recheck task.
+        config.cancelRegistry.register { pumpTask.cancel() }
+    }
 }
 
 /// Injectable test-seam variant of `pumpStreamingChunks` — accepts a

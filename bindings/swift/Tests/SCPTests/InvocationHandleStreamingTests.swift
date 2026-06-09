@@ -515,6 +515,159 @@ struct AggregateSchemaValidationTests {
     }
 }
 
+// MARK: - close(): teardown parity for unbounded / abandoned streams
+
+//
+// An unbounded streaming handle used control-plane-only (open →
+// grantCredit → abandon) has no terminal chunk to self-terminate the
+// eager pump, so the §5.4.5 revocation re-check loop would poll
+// `ucanValidate` forever. `close()` is the deterministic escape hatch: it
+// cancels the registered background `Task`s and flips the terminal flag.
+//
+// These tests use the injectable `makeRevocationRecheckTask` seam (a
+// synthetic counting validator) so the loop runs without the XCFramework
+// binary, and exercise `InvocationHandle.close()` directly via the
+// registered-teardown mechanism.
+
+/// Thread-safe call counter for the injected recheck validator.
+private final class ValidateCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() {
+        lock.lock()
+        defer { lock.unlock() }
+        value += 1
+    }
+
+    func get() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+struct CloseTeardownTests {
+    @Test("cancelling the recheck task (the close() mechanism) stops ucanValidate polling")
+    func recheckTaskCancelStopsValidation() async {
+        let counter = ValidateCounter()
+        // 1-second recheck interval (the floor) — fast enough for the test
+        // to observe several polls, deterministic enough to assert the
+        // count stops climbing after cancel.
+        let task = makeRevocationRecheckTask(
+            contextHandle: ContextHandle(noPointer: .init()),
+            outletId: "outlet-x",
+            ucanToken: "ucan-token",
+            proofTokens: nil,
+            recheckSecs: 1,
+            requestIdHex: String(repeating: "a1", count: 16),
+            invokerDid: "did:dht:invoker",
+            validate: { _, _, _ in
+                counter.increment()
+            },
+            terminate: {}
+        )
+        // Let the loop poll a couple of times.
+        try? await Task.sleep(nanoseconds: 2_300_000_000)
+        let countAtCancel = counter.get()
+        #expect(countAtCancel >= 1, "recheck loop should have polled at least once")
+
+        // Cancel — this is exactly what `InvocationHandle.close()` runs via
+        // the registered teardown handler.
+        task.cancel()
+        // Give any in-flight tick a beat to settle, then snapshot.
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        let countAfterCancel = counter.get()
+        // The loop must have stopped — allow at most ONE extra in-flight
+        // poll that was already mid-sleep when cancel landed.
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        let countLater = counter.get()
+        #expect(countLater == countAfterCancel, "validator must not be called after cancel")
+    }
+
+    @Test("close() is idempotent and runs each registered teardown exactly once")
+    func closeIdempotentRunsTeardownOnce() {
+        let counter = ValidateCounter()
+        let handle = InvocationHandle(
+            requestIdHex: String(repeating: "b2", count: 16)
+        ) { _, _, _ in
+            // No terminal chunk — simulates an unbounded stream that never
+            // self-terminates, so only close() can release it.
+        }
+        handle.registerCloseHandler { counter.increment() }
+        handle.registerCloseHandler { counter.increment() }
+
+        #expect(handle.isTerminated == false)
+        handle.close()
+        #expect(handle.isTerminated, "close() flips the terminal flag")
+        #expect(counter.get() == 2, "each registered teardown runs once on first close")
+
+        // Repeated close() is a no-op — no extra teardown runs.
+        handle.close()
+        handle.close()
+        #expect(counter.get() == 2, "repeated close() must not re-run teardown")
+    }
+
+    @Test("teardown registered AFTER close() fires immediately (no leak on late open)")
+    func lateRegistrationFiresImmediately() {
+        let counter = ValidateCounter()
+        let handle = InvocationHandle(
+            requestIdHex: String(repeating: "c3", count: 16)
+        ) { _, _, _ in }
+        handle.close()
+        // A task spawned by a late-resolving streaming open registers its
+        // cancel after close() already ran — it must fire at once so the
+        // task is not leaked past the close.
+        handle.registerCloseHandler { counter.increment() }
+        #expect(counter.get() == 1, "late-registered teardown fires immediately after close()")
+    }
+
+    @Test("grantCredit and cancel throw streamAlreadyClosed after close()")
+    func controlPlaneThrowsAfterClose() async throws {
+        let handle = InvocationHandle(
+            requestIdHex: String(repeating: "d4", count: 16),
+            invokerDid: "did:dht:invoker"
+        ) { _, _, _ in
+            // Unbounded stream — never emits a terminal chunk.
+        }
+        handle.close()
+        #expect(handle.isTerminated)
+
+        do {
+            _ = try await handle.grantCredit(Credit(5))
+            #expect(Bool(false), "expected grantCredit to throw after close()")
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            #expect(env.code == "SCP-TOOL-6101")
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+
+        do {
+            _ = try await handle.cancel()
+            #expect(Bool(false), "expected cancel to throw after close()")
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            #expect(env.code == "SCP-TOOL-6101")
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+
+    @Test("close() usable in a defer block (structured-teardown idiom)")
+    func closeUsableInDefer() {
+        let counter = ValidateCounter()
+        func scope() {
+            let handle = InvocationHandle(
+                requestIdHex: String(repeating: "e5", count: 16)
+            ) { _, _, _ in }
+            defer { handle.close() }
+            handle.registerCloseHandler { counter.increment() }
+            // ... control-plane-only use would happen here ...
+        }
+        scope()
+        #expect(counter.get() == 1, "defer { handle.close() } releases the handle on scope exit")
+    }
+}
+
 // MARK: - Compile-time: Credit is REQUIRED for grantCredit
 
 /// The block below is never executed; it exists purely so that any drift

@@ -612,6 +612,18 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     /// shape (code `SCP-TOOL-6020`, slug `protocol.handle-double-consumed`).
     private let consumedModeBox = ConsumedModeBox()
 
+    /// Idempotent teardown registry for the streaming path's background
+    /// `Task`s (the chunk pump + the §5.4.5 receiver-side revocation
+    /// re-check loop). `close()` runs every registered cancel exactly
+    /// once. Empty for the degenerate single-shot / direct-construction
+    /// paths, whose lifecycle ends synchronously and carries no
+    /// background work to release.
+    ///
+    /// The streaming factory injects a SHARED registry it also captures in
+    /// the pump closure (so the pump can register the task cancels it
+    /// spawns); the other paths get a fresh empty registry.
+    private let cancelRegistry: CancelRegistry
+
     /// Construct a handle whose `request_id` is already known at
     /// construction time (a literal hex value, or `nil` for the
     /// non-streaming / degenerate single-shot path). The box is created
@@ -641,10 +653,16 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     /// unresolved box and resolves it from inside the pump once
     /// `outletInvokeStream` returns, while the one-shot / direct paths
     /// pass a pre-resolved box via the convenience initializers.
+    ///
+    /// `cancelRegistry` defaults to a fresh empty registry; the streaming
+    /// factory injects a registry it ALSO captures in the pump closure so
+    /// the pump can register the chunk-pump + revocation-recheck `Task`
+    /// cancels into the same registry `close()` drains.
     init(
         requestIdBox: RequestIdBox,
         invokerDid: String?,
         aggregateSchemaJson: String?,
+        cancelRegistry: CancelRegistry = CancelRegistry(),
         pump: @Sendable @escaping (
             @Sendable @escaping (OutletStreamChunk) -> Void,
             @Sendable @escaping (Aggregate) -> Void,
@@ -654,6 +672,7 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
         self.requestIdBox = requestIdBox
         self.invokerDid = invokerDid
         self.aggregateSchemaJson = aggregateSchemaJson
+        self.cancelRegistry = cancelRegistry
         var chunkCont: AsyncThrowingStream<OutletStreamChunk, Error>.Continuation?
         let stream = AsyncThrowingStream<OutletStreamChunk, Error> { cont in
             chunkCont = cont
@@ -828,6 +847,46 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
         terminatedFlag.isTerminated
     }
 
+    /// Registers a teardown closure run by `close()` (and only by
+    /// `close()`). The streaming factory registers the chunk-pump `Task`
+    /// and the §5.4.5 revocation-recheck `Task` cancels here so an
+    /// unconsumed handle can release them deterministically. Internal —
+    /// only the SDK's own factories wire teardown.
+    func registerCloseHandler(_ handler: @escaping @Sendable () -> Void) {
+        cancelRegistry.register(handler)
+    }
+
+    /// Releases the handle's background work — for a streaming handle, the
+    /// chunk pump `Task` and the §5.4.5 receiver-side revocation re-check
+    /// `Task`. Idempotent: the first call cancels the registered tasks and
+    /// flips the terminal flag; subsequent calls are no-ops.
+    ///
+    /// After `close()` the control-plane methods (`grantCredit` /
+    /// `cancel`) cleanly throw `OutletError.streamAlreadyClosed` because
+    /// the terminal flag is set.
+    ///
+    /// A control-plane-only caller — one that opens a streaming handle,
+    /// calls `grantCredit` / `cancel`, then abandons it WITHOUT consuming
+    /// the chunk stream — MUST call `close()` (idiomatically via
+    /// `defer { handle.close() }`). For an UNBOUNDED stream the eager pump
+    /// never reaches a terminal chunk on its own, so without `close()` the
+    /// revocation-recheck loop would poll `ucanValidate` for the process
+    /// lifetime. Consuming the stream to its terminal chunk already tears
+    /// the background tasks down, so calling `close()` afterward is a
+    /// harmless no-op. Mirrors the Kotlin `close()` / `use {}` and the
+    /// Python `aclose()` / `async with` teardown idioms.
+    ///
+    /// No `deinit`-based auto-teardown is provided: spawning a cancelling
+    /// `Task` from `deinit` would have to capture `self`, risking a
+    /// retain cycle, and `deinit` timing under ARC is not deterministic
+    /// enough to be a reliable resource-release point. `close()` (with
+    /// `defer`) is the explicit, deterministic escape hatch.
+    public func close() {
+        guard cancelRegistry.markClosed() else { return }
+        terminatedFlag.markTerminated()
+        cancelRegistry.runHandlers()
+    }
+
     /// SCP-OUT-038 AC12 — validate the End.aggregate payload against
     /// the registered `aggregateSchemaJson`. No-op when no schema is
     /// bound. The validator performs a structural pass-through (type
@@ -993,6 +1052,59 @@ private final class TerminatedFlag: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return flag
+    }
+}
+
+/// Internal — idempotent teardown registry for `InvocationHandle.close()`.
+/// Holds the streaming path's background-`Task` cancel closures and runs
+/// them exactly once. `NSLock`-backed (analogous to `TerminatedFlag`) so
+/// `register` (called from the pump `Task`) and `close()` (called from the
+/// caller's actor) serialize safely.
+///
+/// `markClosed()` is the single-shot latch: the first caller wins and
+/// proceeds to run handlers; later callers see `false` and no-op. A
+/// handler registered AFTER `close()` already ran is executed immediately,
+/// so a late-resolving streaming open cannot leak a task past a `close()`
+/// that raced ahead of it.
+final class CancelRegistry: @unchecked Sendable {
+    private var handlers: [@Sendable () -> Void] = []
+    private var closed = false
+    private let lock = NSLock()
+
+    /// Latch `close()` to a single winner. Returns `true` for the first
+    /// caller (which must then run handlers), `false` thereafter.
+    func markClosed() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if closed { return false }
+        closed = true
+        return true
+    }
+
+    /// Register a teardown closure. If `close()` already ran, the closure
+    /// fires immediately so a task registered after a racing close is not
+    /// leaked.
+    func register(_ handler: @escaping @Sendable () -> Void) {
+        lock.lock()
+        if closed {
+            lock.unlock()
+            handler()
+            return
+        }
+        handlers.append(handler)
+        lock.unlock()
+    }
+
+    /// Run and clear every registered handler. Called once by the winning
+    /// `close()` after `markClosed()`.
+    func runHandlers() {
+        lock.lock()
+        let pending = handlers
+        handlers = []
+        lock.unlock()
+        for handler in pending {
+            handler()
+        }
     }
 }
 
@@ -1423,59 +1535,37 @@ public actor OutletNamespace {
         // threaded into the handle — so `grantCredit` / `cancel` always
         // threw `streamAlreadyClosed`.
         let requestIdBox = RequestIdBox()
+        // Shared teardown registry: injected into the handle (so `close()`
+        // drains it) AND captured by the pump closure (so the pump can
+        // register the chunk-pump `Task` and the §5.4.5 revocation-recheck
+        // `Task` cancels). For an UNBOUNDED stream the eager pump never
+        // self-terminates, so `close()` is the only way a control-plane-
+        // only caller can stop the recheck loop.
+        let cancelRegistry = CancelRegistry()
+        let config = StreamingPumpConfig(
+            handle: handle,
+            identity: identity,
+            invokerDid: invokerDidValue,
+            outletId: outletId,
+            inputJson: inputJson,
+            ucanToken: ucanToken,
+            caveatsBindingHex: caveatsBindingHex,
+            streamEpoch: streamEpoch,
+            proofTokens: proofTokens,
+            creditWindow: creditWindow,
+            estimatedChunkCount: estimatedChunkCount,
+            spendingUcan: spendingUcan,
+            ucanRecheckSecs: ucanRecheckSecs,
+            requestIdBox: requestIdBox,
+            cancelRegistry: cancelRegistry
+        )
         return InvocationHandle(
             requestIdBox: requestIdBox,
             invokerDid: invokerDidValue,
-            aggregateSchemaJson: aggregateSchemaJson
-        ) { yieldChunk, resolveAggregate, rejectAggregate in
-            Task {
-                do {
-                    let raw = try await outletInvokeStream(
-                        handle: handle,
-                        outletId: outletId,
-                        inputJson: inputJson,
-                        identity: identity,
-                        ucanToken: ucanToken,
-                        caveatsBindingHex: caveatsBindingHex,
-                        streamEpoch: streamEpoch,
-                        proofTokens: proofTokens,
-                        creditWindow: creditWindow,
-                        estimatedChunkCount: estimatedChunkCount,
-                        spendingUcan: spendingUcan
-                    )
-                    // Thread the real §5.4.5 `request_id` into the handle
-                    // as soon as the open resolves — BEFORE pumping
-                    // chunks — so control-plane callers that raced to
-                    // `grantCredit` / `cancel` immediately after
-                    // `invoke()` unblock with a valid id.
-                    let requestIdHex = raw.requestId()
-                    await requestIdBox.resolve(requestIdHex)
-                    let recheckTask = makeRevocationRecheckTask(
-                        contextHandle: handle,
-                        outletId: outletId,
-                        ucanToken: ucanToken,
-                        proofTokens: proofTokens,
-                        recheckSecs: ucanRecheckSecs,
-                        requestIdHex: requestIdHex,
-                        invokerDid: invokerDidValue
-                    )
-                    defer { recheckTask.cancel() }
-                    try await pumpStreamingChunks(
-                        from: raw,
-                        yieldChunk: yieldChunk,
-                        resolveAggregate: resolveAggregate,
-                        rejectAggregate: rejectAggregate
-                    )
-                } catch {
-                    // Open failed before a `request_id` was known —
-                    // resolve the box to `nil` so awaiting control-plane
-                    // callers unblock and surface `streamAlreadyClosed`
-                    // (no streaming session) rather than hanging forever.
-                    await requestIdBox.resolve(nil)
-                    rejectAggregate(error)
-                }
-            }
-        }
+            aggregateSchemaJson: aggregateSchemaJson,
+            cancelRegistry: cancelRegistry,
+            pump: makeStreamingPump(config)
+        )
     }
 
     public func update(
