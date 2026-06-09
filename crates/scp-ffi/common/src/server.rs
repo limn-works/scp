@@ -531,6 +531,30 @@ impl RunningNode {
         }
     }
 
+    /// Spawns a background task forwarding local `ContextManager` events to
+    /// this node's outbound webhook dispatcher (§12.10.5).
+    ///
+    /// The `events` receiver is obtained from
+    /// `ContextManager::subscribe_events()`. The returned
+    /// [`JoinHandle`](tokio::task::JoinHandle) owns the consumer task and MUST
+    /// be retained by a lifecycle owner (e.g. the bridge instance `JoinSet`)
+    /// so it is aborted on shutdown rather than leaked.
+    ///
+    /// See [`ApplicationNode::wire_context_events`](scp_node::ApplicationNode::wire_context_events).
+    #[must_use]
+    pub fn wire_context_events(
+        &self,
+        events: tokio::sync::broadcast::Receiver<(
+            String,
+            scp_core::context::membership::ContextEvent,
+        )>,
+    ) -> tokio::task::JoinHandle<()> {
+        match self {
+            Self::InMemory(n) => n.wire_context_events(events),
+            Self::Filesystem(n) => n.wire_context_events(events),
+        }
+    }
+
     /// Signals the node to stop (relay + background tasks).
     pub fn shutdown(&self) {
         match self {

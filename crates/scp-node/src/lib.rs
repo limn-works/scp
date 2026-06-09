@@ -308,6 +308,55 @@ impl<S: Storage> ApplicationNode<S> {
         &self.state.relay_url
     }
 
+    /// Returns a clonable handle to this node's outbound webhook dispatcher.
+    ///
+    /// The dispatcher fans context events out to registered bridge webhook
+    /// endpoints (spec §12.2.1, §12.10.5). It is fed by two producers:
+    ///
+    /// 1. The inbound HTTP relay endpoint (`POST /v1/scp/bridge/webhook`),
+    ///    which reconciles platform-originated events.
+    /// 2. The local `ContextManager` event channel, wired via
+    ///    [`wire_context_events`](Self::wire_context_events).
+    #[must_use]
+    pub fn webhook_dispatcher(&self) -> Arc<crate::webhook::WebhookDispatcher> {
+        self.state.bridge_state.webhook_dispatcher()
+    }
+
+    /// Spawns a background task that forwards local `ContextManager` events to
+    /// this node's [`WebhookDispatcher`](crate::webhook::WebhookDispatcher).
+    ///
+    /// This is the production wire for SCP-to-platform webhook delivery
+    /// (§12.10.5): when a context the node hosts emits an event (message
+    /// received/sent, member joined/left, governance action), the event is
+    /// translated and dispatched to every registered webhook target matching
+    /// that context.
+    ///
+    /// The caller supplies a fresh broadcast receiver obtained from
+    /// `ContextManager::subscribe_events()`. The returned
+    /// [`JoinHandle`](tokio::task::JoinHandle) owns the consumer task; the
+    /// caller MUST retain or supervise it so the task is aborted on shutdown
+    /// (otherwise it runs until the `ContextManager` — and therefore the
+    /// broadcast sender — is dropped, which closes the channel and stops the
+    /// consumer cleanly).
+    ///
+    /// # Fail-safe
+    ///
+    /// Webhook delivery is best-effort. A slow or unreachable webhook endpoint
+    /// cannot block or crash context operations: the broadcast channel drops
+    /// the oldest events for lagging consumers (logged, never panics), and the
+    /// dispatcher performs HTTP I/O on its own spawned tasks with bounded
+    /// retries.
+    #[must_use]
+    pub fn wire_context_events(
+        &self,
+        events: tokio::sync::broadcast::Receiver<(
+            String,
+            scp_core::context::membership::ContextEvent,
+        )>,
+    ) -> tokio::task::JoinHandle<()> {
+        crate::webhook::spawn_event_consumer(events, self.webhook_dispatcher())
+    }
+
     /// Returns the TLS certificate resolver for ACME hot-reload.
     ///
     /// Returns `Some` in domain mode when TLS is active, `None` in

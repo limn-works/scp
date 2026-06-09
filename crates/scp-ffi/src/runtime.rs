@@ -1051,28 +1051,42 @@ fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogPro
     }
 }
 
+/// Bounded capacity of the `ContextManager` event broadcast channel.
+///
+/// Every production `ContextManager` built here enables this channel so that
+/// local context events can be consumed by external sinks — notably the node's
+/// outbound webhook dispatcher (§12.10.5), wired in
+/// [`crate::server::auto_wire_context_manager`]. Lagging consumers drop the
+/// oldest events (logged, never panics); `1024` matches the documented default
+/// on [`ContextManager::with_event_channel`].
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
 /// Constructs a `ContextManager` with or without persistence.
+///
+/// The event broadcast channel is always enabled (capacity
+/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — e.g. the node webhook
+/// dispatcher — can subscribe via `ContextManager::subscribe_events()`. When no
+/// consumer subscribes, emitting into the channel is a cheap no-op: the
+/// retained sender has no receivers, so `send` returns `Err` and the event is
+/// simply dropped without blocking context operations.
 fn build_context_manager(
     crypto: Box<dyn ContextCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> Arc<ContextManager> {
-    match persistence {
-        Some(p) => Arc::new(ContextManager::with_persistence(
+    let mut manager = match persistence {
+        Some(p) => ContextManager::with_persistence(
             crypto,
             transport,
             event_log,
             p,
             not_configured_key_resolver(),
-        )),
-        None => Arc::new(ContextManager::new(
-            crypto,
-            transport,
-            event_log,
-            not_configured_key_resolver(),
-        )),
-    }
+        ),
+        None => ContextManager::new(crypto, transport, event_log, not_configured_key_resolver()),
+    };
+    manager.with_event_channel(EVENT_CHANNEL_CAPACITY);
+    Arc::new(manager)
 }
 
 // ---------------------------------------------------------------------------

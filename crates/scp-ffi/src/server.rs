@@ -72,10 +72,16 @@ fn node_err(e: NodeError) -> PyErr {
 ///
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
-fn auto_wire_context_manager(
+///
+/// After the `ContextManager` is initialized, this also spawns the local
+/// event consumer that forwards `ContextManager` events to the node's outbound
+/// webhook dispatcher (§12.10.5). The consumer task is owned by the bridge
+/// instance's `JoinSet`, so it is aborted on bridge shutdown and never leaks.
+fn auto_wire_context_manager<S: scp_platform::Storage>(
     bi: &crate::runtime::PyBridgeInstance,
     py: Python<'_>,
     rt: &tokio::runtime::Runtime,
+    node: &scp_node::ApplicationNode<S>,
     did: &str,
     relay_url: &str,
     bridge_token: Zeroizing<String>,
@@ -156,6 +162,47 @@ fn auto_wire_context_manager(
         if let Ok(mgr) = crate::runtime::context_manager(bi) {
             rt.block_on(mgr.register_local_did(did_owned.into()));
         }
+    });
+
+    // Wire local ContextManager events to the node's webhook dispatcher
+    // (§12.10.5). The ContextManager built by `build_context_manager` always
+    // enables its event channel, so `subscribe_events()` yields a receiver.
+    //
+    // Lifecycle: the consumer task is supervised by the bridge instance's
+    // JoinSet AND the instance cancellation token. On shutdown the JoinSet
+    // task wakes on `cancel.cancelled()` and aborts the inner consumer handle,
+    // so the consumer is stopped deterministically rather than detached. If the
+    // ContextManager is dropped first, the broadcast channel closes and the
+    // consumer returns on its own (`RecvError::Closed`).
+    py.allow_threads(|| {
+        let Ok(mgr) = crate::runtime::context_manager(bi) else {
+            return;
+        };
+        let Some(events) = mgr.subscribe_events() else {
+            // Defensive: production managers always have the channel, but a
+            // ContextManager initialized by another path without it would
+            // return None. Skip wiring rather than panic.
+            tracing::warn!(
+                "auto_wire_context_manager: ContextManager has no event channel — \
+                 local context events will not reach the webhook dispatcher"
+            );
+            return;
+        };
+        let mut consumer = node.wire_context_events(events);
+        let cancel = bi.core.cancel_token();
+        rt.block_on(async {
+            bi.core.task_handle().await.spawn(async move {
+                tokio::select! {
+                    // The consumer task runs until the broadcast channel closes.
+                    _ = &mut consumer => {}
+                    // On bridge shutdown, abort the consumer so it does not
+                    // outlive the instance as a detached task.
+                    () = cancel.cancelled() => {
+                        consumer.abort();
+                    }
+                }
+            });
+        });
     });
 }
 
@@ -618,7 +665,7 @@ impl crate::scp::PyScp {
         let did = node.identity().did().to_owned();
         let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
         let bridge_token = node.bridge_token_hex();
-        auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
+        auto_wire_context_manager(bi, py, rt, &node, &did, &relay_url, bridge_token);
 
         let instance_id = bi.core.instance_id();
         Ok(PyNodeHandle {
@@ -673,7 +720,7 @@ impl crate::scp::PyScp {
         let did = node.identity().did().to_owned();
         let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
         let bridge_token = node.bridge_token_hex();
-        auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
+        auto_wire_context_manager(bi, py, rt, &node, &did, &relay_url, bridge_token);
 
         let instance_id = bi.core.instance_id();
         Ok(PyNodeHandle {

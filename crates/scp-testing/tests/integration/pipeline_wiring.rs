@@ -1021,6 +1021,39 @@ fn b3_webhook_dispatch_wired() {
         webhook_src.contains("validate_webhook_url"),
         "webhook module must include SSRF validation"
     );
+
+    // The consumer that bridges ContextManager events to the dispatcher must
+    // exist (§12.10.5). Without it, local context events can never reach
+    // registered webhooks — the dispatcher would only ever be fed by the
+    // inbound HTTP relay endpoint.
+    assert!(
+        webhook_src.contains("fn spawn_event_consumer"),
+        "webhook module must export spawn_event_consumer (local-event → dispatcher bridge)"
+    );
+    assert!(
+        webhook_src.contains("fn map_context_event"),
+        "webhook module must map ContextEvent variants to webhook event types"
+    );
+
+    // The consumer must be wired in production: the node exposes the wire, and
+    // the FFI node-startup path enables the ContextManager event channel and
+    // spawns the consumer. A string match here guards against the regression
+    // that reopened #1539 — the plumbing existing but never being connected.
+    assert!(
+        node_src.contains("fn wire_context_events"),
+        "ApplicationNode must expose wire_context_events to connect events to the dispatcher"
+    );
+    let ffi_server_src = include_str!("../../../../crates/scp-ffi/src/server.rs");
+    assert!(
+        ffi_server_src.contains("wire_context_events"),
+        "node startup must call wire_context_events so local events reach the webhook dispatcher"
+    );
+    let ffi_runtime_src = include_str!("../../../../crates/scp-ffi/src/runtime.rs");
+    assert!(
+        ffi_runtime_src.contains("with_event_channel"),
+        "production ContextManager construction must enable the event channel \
+         (otherwise subscribe_events yields None and no events are dispatched)"
+    );
 }
 
 // ===========================================================================
