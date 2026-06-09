@@ -389,7 +389,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.8): ContextExport carries an Ed25519 snapshot_signature over canonical_snapshot_hash (domain SCP-CONTEXT-EXPORT-V1:, distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge using the exporter's custody key (PyO3 resolve_signing_key; NAPI resolve_napi_signing_key under allow_in_memory_custody, fail-closed otherwise; UniFFI resolve_uniffi_signing_key via callback/in-memory custody). WASM signs SHA-256(domain || snapshot_jcs) with the creator's #active key (WASM_EXPORT_VERSION=4). No direct SDK call site \u2014 invoked transitively from context_export.",
+          "notes": "Internal (spec \u00a723.16.8): ContextExport carries an Ed25519 snapshot_signature over canonical_snapshot_hash (domain SCP-CONTEXT-EXPORT-V1:, distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge using the exporter's custody key (PyO3 resolve_signing_key; NAPI resolve_napi_signing_key under allow_in_memory_custody, fail-closed otherwise; UniFFI resolve_uniffi_signing_key via callback/in-memory custody). WASM signs SHA-256(domain || scope_tag || snapshot_jcs) with the creator's #active key (WASM_EXPORT_VERSION=5). No direct SDK call site \u2014 invoked transitively from context_export.",
           "exemptions": {
             "python": "internal wiring inside context_export, not a separate SDK operation",
             "typescript": "internal wiring inside context_export, not a separate SDK operation",

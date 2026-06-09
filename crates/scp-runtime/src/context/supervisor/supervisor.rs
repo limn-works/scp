@@ -3714,8 +3714,8 @@ impl Supervisor {
     /// signed HERE, at the dispatch boundary, because the runtime holds no
     /// custody key. The caller supplies a `sign` closure that produces an
     /// Ed25519 signature over the canonical snapshot digest
-    /// (`SHA-256("SCP-CONTEXT-EXPORT-V1:" || JCS(snapshot))`) using the
-    /// exporter's custody key.
+    /// (`SHA-256("SCP-CONTEXT-EXPORT-V1:" || scope-tag-byte || JCS(snapshot))`)
+    /// using the exporter's custody key.
     ///
     /// The exporter MUST be the snapshot `creator_did` (the importer enforces
     /// `exporter_did == creator_did`). The FFI bridge resolves the signing

@@ -144,7 +144,8 @@ pub const CONTEXT_EXPORT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-EXPORT-V1:";
 /// # Signed vs. unsigned fields (ADR-050)
 ///
 /// The Ed25519 `snapshot_signature` covers the **entire** embedded
-/// [`ContextSnapshot`] via `SHA-256(domain || JCS(snapshot))`. Every value the
+/// [`ContextSnapshot`] via `SHA-256(domain || scope-tag-byte || JCS(snapshot))`.
+/// Every value the
 /// importer restores into authoritative state MUST live inside that signed
 /// preimage — there are NO unsigned blobs that the importer reads into state.
 /// In particular, MLS crypto state restored on import comes from the **signed**
@@ -165,16 +166,18 @@ pub const CONTEXT_EXPORT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-EXPORT-V1:";
 /// - `merkle_root` — defense-in-depth only; step 6 requires it to equal the
 ///   **signed** `snapshot.event_log_merkle_root`, and the authoritative event-
 ///   log binding (step 5) compares the recomputed root to the signed value.
-/// - `scope` — describes what the producer included. The importer does not
-///   derive authoritative state from this tag (it restores whatever the signed
-///   snapshot actually contains), but [`validate_export_for_import`] now
-///   REJECTS any export whose `scope` is not [`ExportScope::Full`] (see
-///   `import_context`): a non-`Full` (e.g. [`ExportScope::Public`]) snapshot has
-///   had member list, governance, and event log stripped, so importing it would
-///   silently install a hollow context. A tampered `scope` is therefore caught
-///   — flipping `Full` to `Public` is rejected, and flipping `Public` to `Full`
-///   leaves the signature covering the stripped snapshot, which fails the
-///   creator-key signature check.
+/// - `scope` — the export-scope discriminant is now bound INTO the signed
+///   preimage (via [`ExportScope::tag_byte`], placed immediately after the
+///   domain separator and before the JCS bytes), so ANY scope flip changes the
+///   recomputed digest and fails `verify_strict` by construction — the importer
+///   no longer relies on the older "hollow-context" argument. The importer also
+///   does not derive authoritative state from this tag (it restores whatever the
+///   signed snapshot actually contains), and [`validate_export_for_import`]
+///   additionally REJECTS any export whose `scope` is not [`ExportScope::Full`]
+///   (see `import_context`): a non-`Full` (e.g. [`ExportScope::Public`]) snapshot
+///   has had member list, governance, and event log stripped, so importing it
+///   would silently install a hollow context. That Full-only check is a separate
+///   import-orchestration policy, distinct from the signature binding above.
 /// - `exported_at` — informational timestamp; the importer reads no state from
 ///   it.
 ///
@@ -228,7 +231,8 @@ pub struct ContextExport {
     /// produced by the exporter's custody key (spec §23.16.8).
     ///
     /// Covers the **entire** embedded [`ContextSnapshot`] via
-    /// `SHA-256("SCP-CONTEXT-EXPORT-V1:" || JCS(snapshot))`, so every field
+    /// `SHA-256("SCP-CONTEXT-EXPORT-V1:" || [scope.tag_byte()] || JCS(snapshot))`,
+    /// so every field
     /// the importer restores verbatim (membership, roles, ceiling, governance,
     /// economic policy, access-key store, consequence rules, …) is in the
     /// signed preimage and a tampered export is rejected on import. Verified
@@ -549,7 +553,8 @@ fn compute_entry_hash(
 ///    of whether its signature happens to verify.
 /// 3. Snapshot signature: the Ed25519 signature over
 ///    [`ContextExport::canonical_snapshot_hash`] =
-///    `SHA-256(domain || JCS(snapshot))` must verify (`verify_strict`) against
+///    `SHA-256(domain || scope-tag-byte || JCS(snapshot))` must verify
+///    (`verify_strict`) against
 ///    `verifying_key` — the snapshot `creator_did`'s resolved
 ///    `#active`/`#agent` key (resolved by the caller, never from an
 ///    unauthenticated envelope field). Failure yields the distinct
@@ -618,8 +623,8 @@ pub fn validate_export_for_import(
     }
 
     // 3. Snapshot signature verification (§23.16.8). Recompute the canonical
-    // digest SHA-256(domain || JCS(snapshot)) over the received bytes and
-    // verify against the creator's resolved key.
+    // digest SHA-256(domain || scope-tag-byte || JCS(snapshot)) over the
+    // received bytes and verify against the creator's resolved key.
     let hash = export.canonical_snapshot_hash()?;
     let signature = ed25519_dalek::Signature::from_bytes(&export.snapshot_signature);
     verifying_key
@@ -795,7 +800,8 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
 /// strips sensitive data from the snapshot and omits event log entries.
 ///
 /// The export's [`ContextExport::canonical_snapshot_hash`] =
-/// `SHA-256(domain || JCS(snapshot))` is computed over the **final** snapshot
+/// `SHA-256(domain || scope-tag-byte || JCS(snapshot))` is computed over the
+/// **final** snapshot
 /// (after public stripping) and passed to `sign`, which must return an Ed25519
 /// signature produced by the exporter's custody key (spec §23.16.8). The
 /// exporter MUST be the snapshot `creator_did` (the verifier enforces
@@ -860,8 +866,8 @@ where
         snapshot_signature: [0u8; 64],
     };
 
-    // SHA-256(domain || JCS(snapshot)) over the final snapshot bytes; the
-    // signature field is [0u8; 64] here and is NOT part of the hash (it lives
+    // SHA-256(domain || scope-tag-byte || JCS(snapshot)) over the final snapshot
+    // bytes; the signature field is [0u8; 64] here and is NOT part of the hash (it lives
     // on the envelope, not the snapshot).
     let hash = export.canonical_snapshot_hash()?;
 
@@ -1439,7 +1445,8 @@ mod tests {
     /// Guards the `#[serde(with = "...")]` deterministic-set/map serialization
     /// of [`ContextSnapshot`] (`serde_sorted_set`, `serde_sorted_set_map`,
     /// `serde_hex_keyed_map_32`). The signed export digest is
-    /// `SHA-256(domain || JCS(snapshot))`; JCS fixes JSON *object* key order
+    /// `SHA-256(domain || scope-tag-byte || JCS(snapshot))`; JCS fixes JSON
+    /// *object* key order
     /// but NOT *array* element order, so any `HashSet`/`HashMap` snapshot field
     /// MUST be canonicalized at the source or the digest becomes
     /// non-deterministic across insertion orders / hasher seeds — silently

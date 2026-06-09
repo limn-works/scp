@@ -505,8 +505,9 @@ pub struct ContextSnapshot {
     /// Merkle root of the exported event log, bound into the **signed**
     /// snapshot (§23.16.4, §23.16.8).
     ///
-    /// The signed context-export digest is `SHA-256(domain || JCS(snapshot))`,
-    /// so any field inside the snapshot is covered by the creator's signature.
+    /// The signed context-export digest is
+    /// `SHA-256(domain || scope-tag-byte || JCS(snapshot))`, so any field inside
+    /// the snapshot is covered by the creator's signature.
     /// The `ContextExport` envelope also carries an unsigned `merkle_root`
     /// field, but the envelope is attacker-controlled in transit: binding the
     /// root here makes it part of the signed preimage so an attacker cannot

@@ -5177,23 +5177,14 @@ impl WasmContextManager {
         // defense-in-depth for self-imports.
         let integrity_mac = crate::identity::compute_export_hmac(&ctx.creator_did, &snapshot_json)?;
 
-        // Ed25519 signature over SHA-256(domain || snapshot_jcs) by the
-        // creator's #active key (§23.16.8, ADR-034). This is the cross-party
-        // integrity proof — verifiable by anyone resolving the exporter's key.
-        let snapshot_hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(WASM_EXPORT_SIGN_DOMAIN);
-            // Bind the export-scope discriminant into the preimage so a Full-scope
-            // signature can never be replayed as a Public-scope one (or vice versa)
-            // across bridges. WASM only ever produces Full-scope exports (the
-            // envelope has no scope field), so bind the shared FULL tag — using the
-            // scp-protocol constant so native and WASM cannot drift (§23.16.8).
-            hasher.update([EXPORT_SCOPE_TAG_FULL]);
-            hasher.update(&snapshot_json);
-            let digest: [u8; 32] = hasher.finalize().into();
-            digest
-        };
+        // Ed25519 signature over SHA-256(domain || scope_tag || snapshot_jcs)
+        // by the creator's #active key (§23.16.8, ADR-034). This is the
+        // cross-party integrity proof — verifiable by anyone resolving the
+        // exporter's key. The preimage is built by the single-source
+        // `wasm_export_snapshot_digest` helper so the producer, verifier, and
+        // test cannot drift; it binds the shared FULL scope tag immediately
+        // after the domain separator (WASM only produces Full-scope exports).
+        let snapshot_hash = wasm_export_snapshot_digest(&snapshot_json);
         let signature =
             crate::identity::sign_with_identity(&ctx.creator_did, "#active", &snapshot_hash)?;
         let snapshot_signature = hex::encode(signature);
@@ -5329,9 +5320,10 @@ impl WasmContextManager {
         }
 
         // 1. Ed25519 snapshot signature (§23.16.8). The exporter signs
-        // SHA-256(domain || snapshot_jcs) with its #active key; verify against
-        // the creator DID's resolved #active (then #agent) verification key.
-        // Fail closed: an empty or invalid signature rejects the import.
+        // SHA-256(domain || scope_tag || snapshot_jcs) with its #active key;
+        // verify against the creator DID's resolved #active (then #agent)
+        // verification key. Fail closed: an empty or invalid signature rejects
+        // the import.
         if envelope.snapshot_signature.is_empty() {
             return Err(ScpWasmError::Context {
                 message: "export snapshot_signature is missing — refusing to import \
@@ -5366,8 +5358,9 @@ impl WasmContextManager {
     /// Verifies the Ed25519 snapshot signature against the creator DID's
     /// resolved verification-method key (§23.16.8, ADR-039).
     ///
-    /// Recomputes `SHA-256(SCP-CONTEXT-EXPORT-V1: || snapshot_jcs)` and
-    /// verifies the signature with `verify_strict` against the `#active` key,
+    /// Recomputes
+    /// `SHA-256(SCP-CONTEXT-EXPORT-V1: || EXPORT_SCOPE_TAG_FULL || snapshot_jcs)`
+    /// and verifies the signature with `verify_strict` against the `#active` key,
     /// falling back to `#agent`. Fails closed on any resolution or verification
     /// error.
     fn verify_snapshot_signature(
@@ -5385,17 +5378,10 @@ impl WasmContextManager {
             })?;
         let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
-        let snapshot_hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(WASM_EXPORT_SIGN_DOMAIN);
-            // Bind the FULL export-scope tag identically to the producer
-            // (§23.16.8) so a freshly-exported WASM snapshot still verifies.
-            hasher.update([EXPORT_SCOPE_TAG_FULL]);
-            hasher.update(snapshot_json);
-            let digest: [u8; 32] = hasher.finalize().into();
-            digest
-        };
+        // Recompute the digest via the single-source helper so the verifier
+        // binds the FULL export-scope tag identically to the producer
+        // (§23.16.8) and a freshly-exported WASM snapshot still verifies.
+        let snapshot_hash = wasm_export_snapshot_digest(snapshot_json);
 
         // Resolve #active, then #agent (ADR-039 shared-DID model).
         let key_bytes = crate::identity::resolve_verification_method_key(creator_did, "#active")
@@ -5831,20 +5817,22 @@ pub struct ContextMetadata {
 
 /// Current version of the WASM context export format.
 ///
-/// # Version history
+/// SCP is pre-release with no deployed exports, so there is no cross-version
+/// back-compat: `deserialize_and_verify_envelope` enforces a STRICT version gate
+/// that rejects any envelope whose `version` differs from `WASM_EXPORT_VERSION`
+/// (both newer and older) outright with `SCP-CTX-2094`, distinct from a
+/// signature failure (`SCP-CTX-2093`). The correct end state ships directly;
+/// earlier formats are never imported.
 ///
-/// - **v1**: initial format.
-/// - **v2**: added per-author broadcast state (block lists, key epochs).
-/// - **v3**: added lossless anti-replay state —
-///   `seen_nonces_v3` (full `(nonce, inserted_at_ms)` pairs),
-///   `executed_proposals` (full `(proposal_id, executed_at_ms)` pairs),
-///   `resolved_proposals_json`, `consequence_rules`, `cooldown_until`.
-///   v2 `seen_nonces: Vec<String>` is retained as `seen_nonces_legacy_v2`
-///   for back-compat so v2 exports can still be imported into v3 binaries
-///   (with the documented lossy timestamp-reset behavior for that field).
-///   v3 exports are NOT importable by v2 binaries because the version
-///   check below rejects exports with `version > WASM_EXPORT_VERSION`,
-///   which prevents silent loss of the new lossless state.
+/// # Format summary
+///
+/// The current (v5) envelope carries the lossless anti-replay state —
+/// `seen_nonces_v3` (full `(nonce, inserted_at_ms)` pairs), `executed_proposals`
+/// (full `(proposal_id, executed_at_ms)` pairs), `resolved_proposals_json`,
+/// `consequence_rules`, `cooldown_until` — alongside per-author broadcast state
+/// (block lists, key epochs) and the mandatory Ed25519 `snapshot_signature`
+/// (§23.16.8) whose preimage binds the export-scope discriminant. The byte value
+/// MUST NEVER be reused for an incompatible shape.
 const WASM_EXPORT_VERSION: u32 = 5;
 
 /// Maximum byte length of a context-export envelope accepted by
@@ -5881,8 +5869,9 @@ const WASM_EXPORT_SIGN_DOMAIN: &[u8] = b"SCP-CONTEXT-EXPORT-V1:";
 
 /// Versioned envelope for context exports.
 ///
-/// Serialized as JSON bytes. The version field enables forward-compatible
-/// deserialization: import rejects exports with version > `WASM_EXPORT_VERSION`.
+/// Serialized as JSON bytes. The `version` field drives a STRICT version gate:
+/// import rejects any envelope whose `version` is not exactly
+/// `WASM_EXPORT_VERSION` (newer or older) with `SCP-CTX-2094`.
 ///
 /// Integrity protection: the authoritative cross-party integrity proof is the
 /// mandatory Ed25519 `snapshot_signature` (§23.16.8) over
@@ -5910,16 +5899,17 @@ struct WasmContextExportEnvelope {
     /// is NOT the authoritative cross-party integrity proof — the signature is.
     integrity_mac: String,
     /// Ed25519 signature (hex-encoded, 64 bytes) by the creator's `#active`
-    /// signing key over `SHA-256(SCP-CONTEXT-EXPORT-V1: || snapshot_jcs)`
+    /// signing key over
+    /// `SHA-256(SCP-CONTEXT-EXPORT-V1: || EXPORT_SCOPE_TAG_FULL || snapshot_jcs)`
     /// (spec §23.16.8, adapted to the WASM JSON snapshot shape per ADR-034).
     ///
     /// Unlike `integrity_mac` (a symmetric HMAC verifiable only by a holder of
     /// the creator's key), this is an asymmetric signature: any importer that
     /// can resolve the exporter DID's `#active`/`#agent` verification key can
     /// verify the embedded snapshot was not tampered with — matching the
-    /// cross-bridge Ed25519 `snapshot_signature` contract. Introduced in
-    /// `WASM_EXPORT_VERSION = 4`; imports of earlier (unsigned) envelopes are
-    /// rejected fail-closed.
+    /// cross-bridge Ed25519 `snapshot_signature` contract. The strict version
+    /// gate rejects any envelope whose `version` differs from the current
+    /// `WASM_EXPORT_VERSION`, so an export must carry this signature to import.
     #[serde(default)]
     snapshot_signature: String,
     /// The context state snapshot.
@@ -6112,6 +6102,26 @@ fn canonicalize_snapshot_sets(snapshot: &mut WasmContextExportSnapshot) {
             block_list.sort_unstable();
         }
     }
+}
+
+/// Computes the WASM signed-export snapshot digest from the canonical JCS bytes.
+///
+/// Single source of truth for the preimage shared by the producer
+/// (`export_context`), the verifier (`verify_snapshot_signature`), and the
+/// unit-test helper: `SHA-256(WASM_EXPORT_SIGN_DOMAIN || [EXPORT_SCOPE_TAG_FULL]
+/// || snapshot_json)` (spec §23.16.8). The scope tag sits IMMEDIATELY after the
+/// domain separator and BEFORE the JCS bytes. WASM only ever produces Full-scope
+/// exports (the envelope carries no scope field), so the shared
+/// `EXPORT_SCOPE_TAG_FULL` constant is always bound — using the scp-protocol
+/// constant so the native runtime and the WASM bridge cannot drift. Mirrors the
+/// native single-source `ContextExport::canonical_snapshot_hash`.
+fn wasm_export_snapshot_digest(snapshot_json: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(WASM_EXPORT_SIGN_DOMAIN);
+    hasher.update([EXPORT_SCOPE_TAG_FULL]);
+    hasher.update(snapshot_json);
+    hasher.finalize().into()
 }
 
 /// Serializable broadcast state for export.
@@ -7375,15 +7385,10 @@ mod tests {
     /// `verify_snapshot_signature` do: canonicalize set-derived arrays, JCS,
     /// then `SHA-256(domain || jcs)`.
     fn signed_digest(snapshot: &WasmContextExportSnapshot) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
         let mut snap = snapshot.clone();
         canonicalize_snapshot_sets(&mut snap);
         let json = serde_json_canonicalizer::to_vec(&snap).unwrap();
-        let mut hasher = Sha256::new();
-        hasher.update(WASM_EXPORT_SIGN_DOMAIN);
-        hasher.update([EXPORT_SCOPE_TAG_FULL]);
-        hasher.update(&json);
-        hasher.finalize().into()
+        wasm_export_snapshot_digest(&json)
     }
 
     /// Builds a snapshot populated across every set/map-derived field, with

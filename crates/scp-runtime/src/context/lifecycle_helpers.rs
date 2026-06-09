@@ -1337,9 +1337,11 @@ pub async fn import_context(
     // event log stripped (see `strip_snapshot_for_public`), so importing it
     // would produce a degenerate stub context with no members and empty
     // governance. Reject it explicitly so a public summary can never silently
-    // become an authoritative context. `scope` is an unsigned envelope field
-    // (inert to signature validation by design), so this is an
-    // import-orchestration policy check, not a signature concern.
+    // become an authoritative context. `scope` is now bound into the signed
+    // preimage (a tampered scope fails signature verification by construction),
+    // so this Full-only gate is NOT a signature concern: it is a separate
+    // import-orchestration policy check, because a *legitimately-signed* Public
+    // export must still be rejected for full import.
     if export.scope != crate::context::export_import::ExportScope::Full {
         return Err(ContextError::InvalidState(format!(
             "cannot import a {:?}-scope export — only full-scope exports carry the \
