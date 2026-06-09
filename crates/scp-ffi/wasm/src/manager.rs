@@ -147,23 +147,33 @@ pub const SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN: &str = codes::ECON_12096;
 /// Returns `true` when the JSON-serialized economic policy stored in
 /// `PerContextState::economic_policy` requires payment for any action.
 ///
-/// Returns `false` for any of:
-/// - the policy is absent (`None`),
-/// - the JSON is malformed (defense in depth: TS validates schema, but a
-///   malformed policy here means we cannot positively identify it as paid,
-///   so we treat it as not-paid; `create_context` separately validates
-///   schema via the bridge layer),
-/// - the policy parses but no cost field is set and no pricing formula
-///   is configured (i.e. the canonical "free" shape).
+/// Returns `false` ONLY when:
+/// - the policy is absent (`None`) — no policy means free, the canonical
+///   default, OR
+/// - the policy parses AND no cost field is set and no pricing formula is
+///   configured (i.e. the canonical "free" shape).
 ///
-/// Mirrors `scp_protocol::economy::policy::policy_requires_payment` and
-/// matches the auto-accept guard at spec §19.3 / §19.14 invariant #9.
+/// FAILS CLOSED (`true`) when the stored JSON is present but does NOT parse
+/// as an [`EconomicPolicy`]: this gate guards the paid-context fail-closed
+/// preconditions on the WASM invoke / send / join / streaming paths, so a
+/// malformed policy that cannot be positively identified as free MUST be
+/// treated as requiring payment — never silently treated as free (which
+/// would let an unparseable policy bypass the `SCP-ECON-12096` gate). This
+/// matches the typed write-path semantics: `create_context` stores only a
+/// validated typed policy, so a parse failure here means the stored bytes
+/// were corrupted or carry an unrecognized shape — neither is safely "free".
+///
+/// Mirrors `scp_protocol::economy::policy::policy_requires_payment` (for the
+/// parseable case) and matches the auto-accept guard at spec §19.3 / §19.14
+/// invariant #9.
 fn stored_policy_requires_payment(stored: Option<&str>) -> bool {
     let Some(json) = stored else {
         return false;
     };
+    // Fail CLOSED: an unparseable stored policy is treated as requiring
+    // payment so it can never be silently admitted as free.
     let Ok(parsed) = serde_json::from_str::<EconomicPolicy>(json) else {
-        return false;
+        return true;
     };
     policy_requires_payment(&parsed)
 }
@@ -9449,6 +9459,29 @@ mod tests {
         assert!(
             stored_policy_requires_payment(Some(&paid_per_message_policy_json())),
             "paid policy must be classified as paid"
+        );
+    }
+
+    /// Fail-closed: a stored economic policy that is PRESENT but does NOT
+    /// parse as an `EconomicPolicy` MUST be treated as requiring payment, so
+    /// a corrupted / unrecognized policy can never bypass the paid-context
+    /// `SCP-ECON-12096` gate by being silently classified as free.
+    #[test]
+    fn test_wasm_stored_policy_malformed_fails_closed() {
+        // Syntactically invalid JSON.
+        assert!(
+            stored_policy_requires_payment(Some("{not valid json")),
+            "malformed JSON policy must fail closed (treated as requiring payment)"
+        );
+        // Valid JSON, but not the EconomicPolicy shape.
+        assert!(
+            stored_policy_requires_payment(Some(r#"{"unexpected":"shape"}"#)),
+            "JSON that is not an EconomicPolicy must fail closed (treated as requiring payment)"
+        );
+        // An empty string is present-but-unparseable → fail closed.
+        assert!(
+            stored_policy_requires_payment(Some("")),
+            "empty stored policy string must fail closed (treated as requiring payment)"
         );
     }
 

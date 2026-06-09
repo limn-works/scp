@@ -475,17 +475,29 @@ pub fn outlet_invoke_stream(
         let effective_credit_window =
             credit_window.unwrap_or(scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW);
 
-        // §5.4.5:758 cumulative billable-chunk ceiling (HIGH-2 / R3). The
-        // WASM bridge does NOT parse the UCAN `nb` caveats to recover a
-        // VALIDATED-NARROWED `max_calls` (no out-of-process operator /
-        // runtime `CreditTracker` per ADR-034 — honest limitation). It
-        // sources the ceiling from the SDK-declared `estimated_chunk_count`
-        // — the same value the SDK commits into the `caveats_binding`
-        // preimage via `compute_caveats_binding` — and pins it as the HARD
-        // cumulative cap on billable `Data` chunks. `None` (no declared
-        // estimate) means unbounded, matching the runtime's
-        // `max_billable = None` (no `max_calls` caveat) semantics.
-        let max_calls = estimated_chunk_count;
+        // §5.4.5:758 cumulative billable-chunk ceiling (HIGH-2 / R3) +
+        // §7.3.8 streaming caveat enforcement. The WASM bridge parses the
+        // action UCAN's VALIDATED-NARROWED `nb` caveats (same recovery as
+        // the single-shot path) and:
+        //
+        // - enforces the synchronous non-counter local set (`input_schema`
+        //   / `amount_max_per_call` / `allowed_adapters` /
+        //   `allowed_target_dids`) via `check_invocation_local`,
+        // - FAILS CLOSED on the durable-state-requiring caveats
+        //   (`rate_window` / `amount_max_cumulative`) WASM cannot enforce
+        //   without a counter store (ADR-034), and
+        // - pins the HARD billable-chunk ceiling to the VALIDATED `max_calls`
+        //   (a within-stream chunk ceiling the native path folds statelessly
+        //   via `enforce_estimated_chunk_count_bound`), REJECTING an
+        //   over-declared `estimated_chunk_count > max_calls` rather than
+        //   silently clamping it.
+        //
+        // The SDK-supplied `caveats_binding` is NOT trusted as a control
+        // here — on WASM it is an opaque value never recomputed against the
+        // validated `nb`. Enforcement comes from the parsed validated `nb`.
+        let max_calls =
+            enforce_stream_open_caveats(&ucan_token, &parsed_input, estimated_chunk_count)
+                .map_err(ScpWasmError::into_js)?;
 
         let request_id_hex = with_manager(|mgr| {
             mgr.open_outlet_stream(crate::manager::OpenOutletStreamParams {
@@ -884,6 +896,154 @@ pub fn compute_caveats_binding(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// Enforces the §7.3.8 caveat set that the WASM bridge is capable of
+/// enforcing on a STREAMING outlet open, from the action UCAN's
+/// VALIDATED-NARROWED `nb` caveat set, and returns the HARD billable-chunk
+/// ceiling (`max_billable`) the session must pin.
+///
+/// # Parity with the native streaming bridges
+///
+/// The native (`PyO3` / `NAPI` / `UniFFI`) streaming path extracts
+/// `ucan_token.payload.nb` into `effective_caveats` and hands it to the
+/// runtime's `open_outlet_stream`, which:
+///
+/// - folds `max_calls` into the EFFECTIVE billable-chunk ceiling (the
+///   runtime's `effective_max_billable_chunks` in
+///   `crates/scp-runtime/src/context/outlets/stream.rs`) and REJECTS an
+///   over-declared estimate via that module's
+///   `enforce_estimated_chunk_count_bound` (`estimated_chunk_count >
+///   min(credit_window, max_calls)` → `EstimateExceedsBound`), and
+/// - runs the synchronous [`InvocationCaveats::check_invocation_local`]
+///   gate plus the durable counter CAS for the three counter-bearing
+///   caveats (`max_calls` / `amount_max_cumulative` / `rate_window`).
+///
+/// # What the WASM bridge enforces here
+///
+/// WASM has no async runtime and NO durable counter store (ADR-034), so:
+///
+/// 1. **Synchronous non-counter caveats** (`input_schema` /
+///    `amount_max_per_call` / `allowed_adapters` / `allowed_target_dids`)
+///    are enforced via `check_invocation_local` with `estimated_cost = 0`,
+///    `negotiated_adapter = None`, and `target_did = None` — the WASM
+///    streaming open is in-context (no cross-context peer-DID parameter on
+///    the `outletInvokeStream` surface), exactly mirroring the in-context
+///    single-shot path.
+/// 2. **`max_calls`** is a WITHIN-stream chunk ceiling enforceable WITHOUT
+///    durable state — it bounds the chunk COUNT of THIS stream, not a
+///    cross-invocation counter. The bridge REJECTS an over-declared
+///    `estimated_chunk_count > max_calls` (mirroring the native
+///    `EstimateExceedsBound` reject — never a silent clamp) and pins
+///    `max_billable = min(estimated_chunk_count, max_calls)` as the HARD
+///    cumulative cap on billable `Data` chunks.
+/// 3. **`rate_window` and `amount_max_cumulative`** require durable
+///    cross-invocation state WASM does not have — they FAIL CLOSED (reject
+///    the open). `amount_max_cumulative` is doubly moot (WASM rejects paid
+///    contexts up front with `SCP-ECON-12096`), but failing closed here is
+///    what guarantees a `rate_window`-bearing token is never silently
+///    admitted on the streaming path.
+///
+/// `max_calls` is NOT lumped into the blanket
+/// [`InvocationCaveats::has_counter_bearing_caveat`] fail-closed rejection
+/// the single-shot path uses: a single-shot invocation counts as "the one
+/// call", so any `max_calls` it carries is a cross-invocation count WASM
+/// cannot track and must reject; a STREAM, by contrast, is the unit
+/// `max_calls` was authored to bound (the native streaming path enforces it
+/// statelessly as the chunk ceiling), so the bridge enforces it directly
+/// rather than rejecting.
+///
+/// Returns the `max_billable` ceiling (`Some(n)` when a `max_calls` caveat
+/// is present and was satisfied by the declared estimate; `None` when no
+/// `max_calls` caveat exists — unbounded, matching the runtime's
+/// `max_billable = None` semantics). The returned ceiling is the value the
+/// session pins; `outlet_stream_next` terminates the stream once
+/// `billed_emitted` reaches it.
+///
+/// # Errors
+///
+/// * `ScpWasmError::Permission` (`SCP-PERM-3000`) — a synchronous caveat
+///   rejected, `estimated_chunk_count > max_calls`, or a counter-bearing
+///   caveat (`rate_window` / `amount_max_cumulative`) the WASM bridge
+///   cannot enforce is present (fail-closed).
+fn enforce_stream_open_caveats(
+    ucan_token: &str,
+    input: &serde_json::Value,
+    estimated_chunk_count: Option<u32>,
+) -> Result<Option<u32>, ScpWasmError> {
+    use scp_protocol::economy::types::Amount;
+
+    // Recover the VALIDATED-NARROWED `nb`. The token was already parsed and
+    // validated by `validate_outlet_ucan_wasm` above; re-parse to read its
+    // `nb`. A token with no `nb` carries no caveats — the legacy
+    // unbounded-but-SDK-advisory behaviour (no `max_calls` → `None`).
+    let parsed = scp_protocol::crypto::ucan::validate::parse_ucan(ucan_token).map_err(|e| {
+        ScpWasmError::Permission {
+            message: format!("failed to parse action UCAN: {e}"),
+            code: codes::PERM_3000.to_owned(),
+        }
+    })?;
+    let Some(caveats) = parsed.payload.nb.as_ref() else {
+        // No caveats at all — no `max_calls` ceiling to pin (unbounded,
+        // matching the runtime's `max_billable = None`).
+        return Ok(None);
+    };
+
+    // FAIL CLOSED on the durable-state-requiring caveats WASM cannot
+    // enforce (`rate_window` / `amount_max_cumulative`). `max_calls` is
+    // deliberately EXCLUDED from this gate — it is enforceable statelessly
+    // as the within-stream chunk ceiling below.
+    if caveats.rate_window.is_some() || caveats.amount_max_cumulative.is_some() {
+        return Err(ScpWasmError::Permission {
+            message: "stream open rejected: action UCAN carries a durable counter-bearing \
+                      caveat (rate_window / amount_max_cumulative) that the WASM bridge \
+                      cannot enforce — no durable counter store (ADR-034). Failing closed \
+                      (§7.3.8 authorization.denied)."
+                .to_owned(),
+            code: codes::PERM_3000.to_owned(),
+        });
+    }
+
+    // Synchronous non-counter caveats: input_schema / amount_max_per_call /
+    // allowed_adapters / allowed_target_dids. In-context streaming open —
+    // no cross-context target DID and no negotiated adapter, parity with the
+    // in-context single-shot path (`estimated_cost: 0`).
+    caveats
+        .check_invocation_local(input, Amount::new(0), None, None)
+        .map_err(|e| ScpWasmError::Permission {
+            message: format!("stream open rejected by §7.3.8 caveat ({}): {e}", e.slug()),
+            code: codes::PERM_3000.to_owned(),
+        })?;
+
+    // `max_calls` (within-stream chunk ceiling). When present, REJECT an
+    // over-declared estimate (`estimated_chunk_count > max_calls`) rather
+    // than silently clamping — mirroring the native
+    // `enforce_estimated_chunk_count_bound` → `EstimateExceedsBound` reject.
+    // Pin `max_billable = min(estimated_chunk_count, max_calls)`; the
+    // declared estimate is NOT used as the ceiling when a validated
+    // `max_calls` exists.
+    let Some(raw_max_calls) = caveats.max_calls else {
+        // No `max_calls` caveat — unbounded ceiling (runtime parity).
+        return Ok(None);
+    };
+    // Coerce the `u64` caveat to the session's `u32` ceiling, matching the
+    // runtime's `u32::try_from(n).unwrap_or(u32::MAX)` saturation.
+    let max_calls_u32 = u32::try_from(raw_max_calls).unwrap_or(u32::MAX);
+    match estimated_chunk_count {
+        Some(declared) if declared > max_calls_u32 => Err(ScpWasmError::Permission {
+            message: format!(
+                "stream open rejected: estimated_chunk_count ({declared}) exceeds the \
+                 validated max_calls caveat ({max_calls_u32}) (§7.3.8 / §5.4.5 \
+                 input.estimate-exceeds-bound)"
+            ),
+            code: codes::PERM_3000.to_owned(),
+        }),
+        // Declared estimate within bound — pin min(estimate, max_calls).
+        Some(declared) => Ok(Some(declared.min(max_calls_u32))),
+        // No declared estimate — the validated `max_calls` IS the ceiling
+        // (runtime parity: `declared.unwrap_or(max_calls)`).
+        None => Ok(Some(max_calls_u32)),
+    }
+}
+
 /// Decodes a 64-char lowercase hex string into a 32-byte
 /// `caveats_binding`. Returns `ScpWasmError::Validation` on bad hex /
 /// length.
@@ -1048,4 +1208,196 @@ mod tests {
     /// (32) for the alphabet-branch test fixture — keeps the test
     /// self-contained without re-exporting the const through the bridge.
     const REQUEST_ID_HEX_LEN_FOR_TEST: usize = 32;
+
+    // -----------------------------------------------------------------------
+    // enforce_stream_open_caveats — §7.3.8 / §5.4.5 streaming-open caveat
+    // enforcement (WASM subset). The helper is the native-testable core of
+    // the `outlet_invoke_stream` `#[wasm_bindgen]` entry point (which returns
+    // a JS Promise and needs a JS host). It parses the VALIDATED-NARROWED
+    // `nb` from the UCAN token, enforces the synchronous non-counter caveats,
+    // clamps the billable ceiling to `max_calls` (rejecting an over-declared
+    // estimate), and FAILS CLOSED on the durable counter-bearing caveats WASM
+    // cannot enforce (`rate_window` / `amount_max_cumulative`, ADR-034).
+    // -----------------------------------------------------------------------
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
+
+    /// Builds a structurally-valid JWT-encoded UCAN carrying the given `nb`
+    /// caveats. `parse_ucan` (which `enforce_stream_open_caveats` calls)
+    /// decodes only — it does NOT verify the signature (that happens in the
+    /// separate validation pipeline `validate_outlet_ucan_wasm` runs before
+    /// this helper), so a dummy 64-byte signature is sufficient for the
+    /// parse-and-enforce path under test.
+    fn token_with_caveats(nb: Option<InvocationCaveats>) -> String {
+        let header = UcanHeader::new();
+        let payload = UcanPayload {
+            iss: "did:key:zIssuer".to_owned(),
+            aud: "did:key:zAudience".to_owned(),
+            exp: 9_999_999_999,
+            nbf: None,
+            nnc: "0-00000000000000000000000000000000".to_owned(),
+            att: vec![Attenuation {
+                with: "scp:ctx:test/outlet_call:*".to_owned(),
+                can: "*".to_owned(),
+            }],
+            prf: Vec::new(),
+            fct: None,
+            nb,
+        };
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
+        format!("{header_b64}.{payload_b64}.{sig_b64}")
+    }
+
+    #[test]
+    fn stream_open_caveats_no_nb_is_unbounded() {
+        // A token with no `nb` carries no caveats — no max_calls ceiling to
+        // pin (None = unbounded, runtime `max_billable = None` parity).
+        let token = token_with_caveats(None);
+        let ceiling =
+            enforce_stream_open_caveats(&token, &serde_json::json!({}), Some(10)).unwrap();
+        assert_eq!(ceiling, None, "no nb → unbounded ceiling");
+    }
+
+    #[test]
+    fn stream_open_caveats_empty_nb_is_unbounded() {
+        // An explicit-but-empty caveat set has no max_calls → unbounded.
+        let token = token_with_caveats(Some(InvocationCaveats::empty()));
+        let ceiling =
+            enforce_stream_open_caveats(&token, &serde_json::json!({}), Some(10)).unwrap();
+        assert_eq!(ceiling, None, "empty nb → unbounded ceiling");
+    }
+
+    #[test]
+    fn stream_open_caveats_pins_ceiling_to_max_calls() {
+        // A valid in-bounds open: estimated_chunk_count (3) <= max_calls (5).
+        // The pinned ceiling MUST be min(estimate, max_calls) = 3.
+        let token = token_with_caveats(Some(InvocationCaveats {
+            max_calls: Some(5),
+            ..InvocationCaveats::empty()
+        }));
+        let ceiling = enforce_stream_open_caveats(&token, &serde_json::json!({}), Some(3)).unwrap();
+        assert_eq!(
+            ceiling,
+            Some(3),
+            "in-bounds estimate pins min(estimate, max_calls)"
+        );
+    }
+
+    #[test]
+    fn stream_open_caveats_no_estimate_pins_max_calls() {
+        // No declared estimate: the validated max_calls IS the ceiling
+        // (runtime `declared.unwrap_or(max_calls)` parity).
+        let token = token_with_caveats(Some(InvocationCaveats {
+            max_calls: Some(7),
+            ..InvocationCaveats::empty()
+        }));
+        let ceiling = enforce_stream_open_caveats(&token, &serde_json::json!({}), None).unwrap();
+        assert_eq!(
+            ceiling,
+            Some(7),
+            "absent estimate → max_calls is the ceiling"
+        );
+    }
+
+    #[test]
+    fn stream_open_caveats_rejects_estimate_over_max_calls() {
+        // The HIGH gap: an over-declared estimate (8 > max_calls 2) MUST be
+        // REJECTED, not silently clamped — native EstimateExceedsBound parity.
+        let token = token_with_caveats(Some(InvocationCaveats {
+            max_calls: Some(2),
+            ..InvocationCaveats::empty()
+        }));
+        let err = enforce_stream_open_caveats(&token, &serde_json::json!({}), Some(8)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("estimate") && msg.contains("max_calls"),
+            "over-declared estimate must be rejected (not clamped): {msg}"
+        );
+    }
+
+    #[test]
+    fn stream_open_caveats_rate_window_fails_closed() {
+        // rate_window is a durable counter-bearing caveat WASM cannot enforce
+        // (no counter store, ADR-034) → fail closed on the open.
+        let token = token_with_caveats(Some(InvocationCaveats {
+            rate_window: Some(RateWindow {
+                max: 5,
+                window_secs: 60,
+            }),
+            ..InvocationCaveats::empty()
+        }));
+        let err = enforce_stream_open_caveats(&token, &serde_json::json!({}), Some(3)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("counter-bearing") && msg.contains("rate_window"),
+            "rate_window must fail closed on the streaming open: {msg}"
+        );
+    }
+
+    #[test]
+    fn stream_open_caveats_amount_max_cumulative_fails_closed() {
+        // amount_max_cumulative is counter-bearing → fail closed (doubly moot
+        // since WASM rejects paid contexts up front, but the gate guarantees
+        // it can never be silently admitted).
+        let token = token_with_caveats(Some(InvocationCaveats {
+            amount_max_cumulative: Some(Amount::new(1000)),
+            ..InvocationCaveats::empty()
+        }));
+        let err = enforce_stream_open_caveats(&token, &serde_json::json!({}), Some(3)).unwrap_err();
+        assert!(format!("{err:?}").contains("counter-bearing"));
+    }
+
+    #[test]
+    fn stream_open_caveats_input_schema_rejects_off_schema_input() {
+        // Synchronous input_schema caveat: narrowed schema requires integer
+        // `n` >= 10. Conforming input is admitted; off-schema input rejected.
+        let nb = InvocationCaveats {
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "n": { "type": "integer", "minimum": 10 } },
+                "required": ["n"]
+            })),
+            max_calls: Some(4),
+            ..InvocationCaveats::empty()
+        };
+        let token = token_with_caveats(Some(nb));
+        // Conforming input within bound → admitted, ceiling pinned.
+        let ceiling =
+            enforce_stream_open_caveats(&token, &serde_json::json!({ "n": 10 }), Some(2)).unwrap();
+        assert_eq!(ceiling, Some(2));
+        // Off-schema input → rejected.
+        let err = enforce_stream_open_caveats(&token, &serde_json::json!({ "n": 1 }), Some(2))
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("PERM-3000") || msg.to_lowercase().contains("caveat"),
+            "off-schema input must be rejected: {msg}"
+        );
+    }
+
+    #[test]
+    fn stream_open_caveats_allowed_target_dids_rejects_in_context_open() {
+        // allowed_target_dids on an IN-CONTEXT streaming open (target_did =
+        // None): a non-empty allow-list opts the chain into target-restricted
+        // operation, so an open with no target DID is rejected — parity with
+        // check_invocation_local's "absent target against a non-empty list is
+        // a rejection" rule.
+        let allowed = scp_event_log::DID::from("did:key:allowed".to_owned());
+        let token = token_with_caveats(Some(InvocationCaveats {
+            allowed_target_dids: Some(vec![allowed]),
+            ..InvocationCaveats::empty()
+        }));
+        let err = enforce_stream_open_caveats(&token, &serde_json::json!({}), Some(2)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("PERM-3000") || msg.to_lowercase().contains("caveat"),
+            "allowed_target_dids must bite on the in-context open: {msg}"
+        );
+    }
 }

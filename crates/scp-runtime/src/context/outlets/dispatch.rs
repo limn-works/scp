@@ -2211,11 +2211,25 @@ where
             estimated_chunk_count,
         )
         .await
-        .inspect_err(|_rejection| {
+        .inspect_err(|rejection| {
             // CAS genuinely exhausted (or storage failed): roll back the
             // admission slot this open consumed and let `pump_permit` drop
             // here (it has not yet been moved into the pump task), freeing
             // the node-level concurrent-pump slot.
+            //
+            // §7.3.8 / §5.4.5 fail-closed denial. Emit an alertable
+            // `tracing::warn!` (symmetric with the settlement-failure
+            // logging) so defenders can detect a stream open denied by a
+            // counter exhaustion or counter-store fault. ADR-049 §4: log
+            // only the registered `outlet_id` slug + `context_id` and the
+            // rejection's static slug — NEVER the UCAN token or input bytes.
+            tracing::warn!(
+                context_id = %context.context_id(),
+                outlet_id = %params.identity.outlet_id,
+                slug = rejection.slug(),
+                "outlet stream open denied: durable counter CAS exhausted or \
+                 counter-store fault — rejected fail-closed (§7.3.8 / §5.4.5)"
+            );
             release_admission(&admission, &params);
         })?,
         None => CounterCommitOutcome {

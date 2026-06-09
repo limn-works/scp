@@ -997,6 +997,18 @@ impl ContextManager {
             && enf.caveats.has_counter_bearing_caveat()
             && caveat_counter_store.is_none()
         {
+            // §7.3.8 fail-closed authorization denial. Emit an alertable
+            // `tracing::warn!` (symmetric with the settlement-failure
+            // logging) so defenders can detect counter-bearing tokens
+            // arriving at a node with no counter store. ADR-049 §4: log
+            // only the registered `outlet_id` slug + `context_id` — NEVER
+            // the UCAN token or input bytes.
+            tracing::warn!(
+                context_id,
+                outlet_id = %outlet_id,
+                "outlet invoke denied: counter-bearing caveat present but no counter \
+                 store is configured — rejected fail-closed (§7.3.8 authorization.denied)"
+            );
             rollback_outlet_economy_ticket(self, context_id, ticket).await;
             return Err(invocation_error_to_context(
                 InvocationError::CaveatViolation {
@@ -1059,6 +1071,19 @@ impl ContextManager {
         // drops the hook for an enforcement-bearing token is caught at runtime
         // instead of silently re-opening the bypass.
         if caveat_requires_post_input && caveat_hook.is_none() {
+            // §7.3.8 fail-closed authorization denial (defense-in-depth).
+            // Alertable `tracing::warn!` symmetric with the settlement
+            // path — a post-input-requiring token reaching here with no
+            // hook is a wiring regression a defender must be able to see.
+            // ADR-049 §4: log only the registered `outlet_id` slug +
+            // `context_id`, never the UCAN/input bytes.
+            tracing::warn!(
+                context_id,
+                outlet_id = %outlet_id,
+                "outlet invoke denied: leaf caveats require a §7.3.8 post-input check \
+                 but no enforcement hook is active — rejected fail-closed \
+                 (§7.3.8 authorization.denied)"
+            );
             rollback_outlet_economy_ticket(self, context_id, ticket).await;
             return Err(invocation_error_to_context(
                 InvocationError::CaveatViolation {

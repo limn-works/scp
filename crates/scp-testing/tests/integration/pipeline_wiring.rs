@@ -46,6 +46,8 @@ const WASM_MANAGER_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src
 const WASM_CONSEQUENCE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/wasm/src/consequence.rs");
 const WASM_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/outlets.rs");
+const WASM_OUTLET_STREAM_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/wasm/src/outlet_stream.rs");
 
 // Non-WASM FFI bridge sources. PR #1606 / C4 wired all 3 of these to
 // `ContextManager::invoke_outlet_with_economy` so per-invocation pricing,
@@ -884,6 +886,63 @@ fn single_shot_wasm_outlet_invoke_enforces_validated_caveats() {
         "WASM outlet_invoke_inner must read the action UCAN's validated `nb` \
          field (payload.nb) — max_calls and the local caveats come FROM the \
          validated nb, not a caller estimate"
+    );
+}
+
+// SIBLING of the WASM single-shot pin above, for the STREAMING open path.
+// Before this remediation, `outlet_invoke_stream` ran the well-formedness
+// UCAN check (`validate_outlet_ucan_wasm`) and then pinned the billable
+// ceiling from the SELF-DECLARED `estimated_chunk_count` — it never parsed
+// the validated `nb`, never ran `check_invocation_local`, and never failed
+// closed on a counter-bearing caveat. A delegate could bypass `max_calls` /
+// `allowed_target_dids` / `input_schema` / `amount_max_per_call` /
+// `rate_window` simply by opening a stream. These assertions pin the
+// streaming open to the WASM-local `enforce_stream_open_caveats` helper so
+// the bypass cannot be reintroduced by a future refactor.
+#[test]
+fn stream_open_wasm_outlet_invoke_stream_enforces_validated_caveats() {
+    // The enforcement lives in the async body of `outlet_invoke_stream`
+    // (the `#[wasm_bindgen]` entry point), which calls the helper.
+    let body = extract_fn_body(WASM_OUTLET_STREAM_SRC, "outlet_invoke_stream")
+        .expect("WASM outlet_invoke_stream body");
+    assert!(
+        body.contains("enforce_stream_open_caveats"),
+        "WASM outlet_invoke_stream must call enforce_stream_open_caveats so the \
+         action UCAN's validated-narrowed nb caveats are enforced on the streaming \
+         open — §7.3.8 / §5.4.5 parity for everything WASM is capable of enforcing \
+         (ADR-034). It MUST NOT pin the billable ceiling from the self-declared \
+         estimated_chunk_count alone."
+    );
+
+    // The helper itself must: parse the validated nb, run the synchronous
+    // check_invocation_local gate, clamp the ceiling to max_calls, and fail
+    // closed on the durable counter-bearing caveats it cannot enforce.
+    let helper = extract_fn_body(WASM_OUTLET_STREAM_SRC, "enforce_stream_open_caveats")
+        .expect("WASM enforce_stream_open_caveats body");
+    assert!(
+        helper.contains("payload.nb"),
+        "enforce_stream_open_caveats must read the action UCAN's validated `nb` \
+         field (payload.nb) — the caveats come FROM the validated nb, not the \
+         SDK-supplied caveats_binding or the caller estimate"
+    );
+    assert!(
+        helper.contains("check_invocation_local"),
+        "enforce_stream_open_caveats must run check_invocation_local for the \
+         synchronous non-counter caveats (input_schema / amount_max_per_call / \
+         allowed_adapters / allowed_target_dids)"
+    );
+    assert!(
+        helper.contains("max_calls"),
+        "enforce_stream_open_caveats must clamp the billable ceiling to the \
+         validated max_calls caveat (min(estimated, max_calls)) and reject an \
+         over-declared estimate — never use the self-declared estimate as the \
+         ceiling when a validated max_calls exists"
+    );
+    assert!(
+        helper.contains("rate_window") && helper.contains("amount_max_cumulative"),
+        "enforce_stream_open_caveats must FAIL CLOSED on the durable \
+         counter-bearing caveats WASM cannot enforce (rate_window / \
+         amount_max_cumulative) — never silently admit (ADR-034)"
     );
 }
 
