@@ -40,6 +40,7 @@ from scp_sdk.outlets import (
     InvocationHandle,
     OutletNamespace,
     OutletStreamChunk,
+    _chunk_dict_to_dataclass,
 )
 
 # ---------------------------------------------------------------------------
@@ -543,6 +544,85 @@ class TestAbnormalClosure:
         assert len(observed) == 1
         assert observed[0].payload_type == "end"
         # No OutletExecutionError raised — iteration ended cleanly.
+
+
+# ---------------------------------------------------------------------------
+# Error-chunk code parity — a no-code error chunk yields SCP-TOOL-6200 on
+# the iterate path regardless of the terminal flag, matching TS/Swift/Kotlin
+# (mirrors Kotlin OutletStreamErrorMappingTest / Swift coverage).
+# ---------------------------------------------------------------------------
+
+
+def _error_chunk_dict(seq: int, *, terminal: bool, code: str | None) -> dict[str, Any]:
+    """Build a bridge-shaped error chunk dict (as emitted by the PyO3
+    bridge) and run it through the production conversion layer — the
+    layer that owns the ``SCP-TOOL-6200`` default."""
+    d: dict[str, Any] = {
+        "request_id": b"\x11" * 16,
+        "sequence": seq,
+        "payload_type": "error",
+        "message": "synthetic error",
+        "terminal": terminal,
+    }
+    if code is not None:
+        d["code"] = code
+    return d
+
+
+class TestIteratePathErrorCodeParity:
+    """The iterate path (``async for``) yields a coded error chunk for a
+    no-code error chunk whether or not it is terminal — the non-terminal
+    case was previously broken (fell through with ``code=None``)."""
+
+    @pytest.mark.asyncio
+    async def test_iterate_terminal_no_code_error_yields_6200(self) -> None:
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        await q.put(_chunk_dict_to_dataclass(_error_chunk_dict(seq=0, terminal=True, code=None)))
+        await q.put(None)
+        handle = InvocationHandle(q, request_id="ba" * 16)
+
+        observed: list[OutletStreamChunk] = []
+        async for chunk in handle:
+            observed.append(chunk)
+        assert len(observed) == 1
+        assert observed[0].payload_type == "error"
+        assert observed[0].terminal is True
+        assert observed[0].code == "SCP-TOOL-6200"
+
+    @pytest.mark.asyncio
+    async def test_iterate_non_terminal_no_code_error_yields_6200(self) -> None:
+        # The previously-broken case: a NON-terminal informational error
+        # chunk keeps the stream open and MUST carry SCP-TOOL-6200.
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        await q.put(_chunk_dict_to_dataclass(_error_chunk_dict(seq=0, terminal=False, code=None)))
+        await q.put(_end_chunk(seq=1, aggregate={"ok": True}))
+        await q.put(None)
+        handle = InvocationHandle(q, request_id="bb" * 16)
+
+        observed: list[OutletStreamChunk] = []
+        async for chunk in handle:
+            observed.append(chunk)
+        # Non-terminal error did not close the stream — End still arrives.
+        assert len(observed) == 2
+        assert observed[0].payload_type == "error"
+        assert observed[0].terminal is False
+        assert observed[0].code == "SCP-TOOL-6200"
+        assert observed[1].payload_type == "end"
+
+    @pytest.mark.asyncio
+    async def test_iterate_error_with_code_not_clobbered(self) -> None:
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        await q.put(
+            _chunk_dict_to_dataclass(_error_chunk_dict(seq=0, terminal=True, code="SCP-TOOL-6131"))
+        )
+        await q.put(None)
+        handle = InvocationHandle(q, request_id="bc" * 16)
+
+        observed: list[OutletStreamChunk] = []
+        async for chunk in handle:
+            observed.append(chunk)
+        assert len(observed) == 1
+        assert observed[0].code == "SCP-TOOL-6131"
 
 
 # ---------------------------------------------------------------------------

@@ -410,6 +410,52 @@ class TestOutletStreamChunkSurface:
         assert chunk.code == "SCP-TOOL-6131"
         assert chunk.terminal is True
 
+    def test_chunk_dict_error_no_code_terminal_defaults_6200(self) -> None:
+        # Parity with Kotlin/Swift/TS: a terminal error chunk carrying no
+        # code defaults to ``SCP-TOOL-6200`` at conversion time.
+        d = {
+            "request_id": b"\x04" * 16,
+            "sequence": 3,
+            "payload_type": "error",
+            "message": "boom",
+            "terminal": True,
+            "sig": b"\x00" * 64,
+        }
+        chunk = outlets_mod._chunk_dict_to_dataclass(d)
+        assert chunk.code == "SCP-TOOL-6200"
+
+    def test_chunk_dict_error_no_code_non_terminal_defaults_6200(self) -> None:
+        # Regression: a NON-terminal error chunk (an informational error
+        # that keeps the stream open) with no code MUST also default to
+        # ``SCP-TOOL-6200`` — previously it fell through with code=None on
+        # the iterate path while every other SDK defaulted it.
+        d = {
+            "request_id": b"\x05" * 16,
+            "sequence": 4,
+            "payload_type": "error",
+            "message": "transient",
+            "terminal": False,
+            "sig": b"\x00" * 64,
+        }
+        chunk = outlets_mod._chunk_dict_to_dataclass(d)
+        assert chunk.code == "SCP-TOOL-6200"
+        assert chunk.terminal is False
+
+    def test_chunk_dict_error_with_code_not_clobbered(self) -> None:
+        # A chunk that DID carry a code is preserved verbatim — the
+        # conversion-time default only fills a missing code.
+        d = {
+            "request_id": b"\x06" * 16,
+            "sequence": 5,
+            "payload_type": "error",
+            "code": "SCP-TOOL-6131",
+            "message": "credit exhausted",
+            "terminal": False,
+            "sig": b"\x00" * 64,
+        }
+        chunk = outlets_mod._chunk_dict_to_dataclass(d)
+        assert chunk.code == "SCP-TOOL-6131"
+
 
 # ---------------------------------------------------------------------------
 # Streaming surface — bridge function presence

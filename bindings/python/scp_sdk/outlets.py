@@ -507,7 +507,16 @@ def _chunk_dict_to_dataclass(d: dict[str, Any]) -> OutletStreamChunk:
         aggregate=d.get("aggregate"),
         provenance=d.get("provenance"),
         execution_time_ms=d.get("execution_time_ms"),
-        code=d.get("code"),
+        # Parity with Kotlin/Swift/TS: every error chunk carries a code.
+        # A no-code error chunk (terminal OR non-terminal) defaults to
+        # ``SCP-TOOL-6200`` at conversion time so the iterate path yields a
+        # coded chunk regardless of the terminal flag, with no clobber of a
+        # chunk that already carried a code.
+        code=(
+            "SCP-TOOL-6200"
+            if d["payload_type"] == "error" and d.get("code") is None
+            else d.get("code")
+        ),
         message=d.get("message"),
         terminal=d.get("terminal"),
     )
@@ -813,13 +822,10 @@ class InvocationHandle:
             self._validate_aggregate_against_schema(item.aggregate)
             return item
         if item.payload_type == "error" and item.terminal:
+            # A terminal Error chunk closes the stream. The chunk already
+            # carries a code (defaulted to ``SCP-TOOL-6200`` at conversion
+            # time when the bridge emitted none) — matching every SDK.
             self._terminated = True
-            # Parity with Kotlin/Swift/TS: a no-code terminal Error chunk
-            # falls back to ``SCP-TOOL-6200`` (the same code the
-            # aggregate/raise path uses) so the iterate-path chunk object
-            # carries a code on every SDK.
-            if item.code is None:
-                item.code = "SCP-TOOL-6200"
             return item
         return item
 
