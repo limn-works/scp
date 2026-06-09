@@ -215,7 +215,8 @@ func makeRevocationRecheckTask(
 ///
 /// Abnormal-closure handling: if `raw.next()` returns `nil` BEFORE a
 /// terminal chunk (`End` / `Error{terminal:true}`) was observed, the
-/// pump surfaces an `execution.stream-gap` (`SCP-TOOL-6131`) error via
+/// pump surfaces an abnormal-closure error (code `SCP-TOOL-6131`, NO
+/// slug — distinct from the spec's `execution.stream-gap`) via
 /// `rejectAggregate` — a transport drop, executor crash, or bridge
 /// fault MUST NOT be reported as a successful aggregate-null outcome.
 func pumpStreamingChunks(
@@ -358,10 +359,11 @@ func pumpStreamingChunksWithNext(
     while true {
         guard let bridgeChunk = try await next() else {
             // Abnormal closure — `next()` returned `nil` before the
-            // executor emitted a terminal chunk. Surface as
-            // `execution.stream-gap` (`SCP-TOOL-6131`) per §5.4.4. A
-            // prior terminal observation means this `nil` is the
-            // normal end-of-receiver marker.
+            // executor emitted a terminal chunk. Surface as an
+            // abnormal-closure error (code `SCP-TOOL-6131`, NO slug —
+            // distinct from the spec's `execution.stream-gap`). A prior
+            // terminal observation means this `nil` is the normal
+            // end-of-receiver marker.
             if terminalObserved {
                 return
             }

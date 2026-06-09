@@ -3,7 +3,7 @@
 //! All operations delegate to [`WasmContextManager`](crate::manager::WasmContextManager)
 //! via [`with_manager`](crate::manager::with_manager). No local state management.
 //!
-//! See ADR-034 in `.docs/adrs/phase-4.md` and issue #389.
+//! See ADR-034 in `.docs/adrs/phase-4.md`.
 
 use js_sys::Promise;
 use scp_ffi_common::error_codes as codes;
@@ -577,7 +577,7 @@ pub fn outlet_register(context: &WasmContextHandle, definition_json: String) -> 
 /// chunk receiver for non-WASM callers that want streaming). When
 /// `ucan_token` is provided, validates the token before dispatch using the
 /// WASM-local UCAN validation pipeline, requiring `outlet_call:{outlet_id}`
-/// or `outlet_call:*` capability. See spec §6.2, §8, ADR-016, and issue #319.
+/// or `outlet_call:*` capability. See spec §6.2, §8, and ADR-016.
 ///
 /// # Returns
 ///
@@ -663,7 +663,7 @@ fn outlet_invoke_inner(
     ucan_token: Option<String>,
 ) -> Result<JsValue, JsValue> {
     // UCAN authorization: validate the token via the WASM-local
-    // 11-step pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+    // 11-step pipeline. See spec §6.2, §8, and ADR-016.
     // Look up the outlet's registered kind so the UCAN validator
     // checks the correct split capability stem (SCP-OUT-014).
     let outlet_kind_for_ucan =
@@ -989,7 +989,7 @@ pub fn outlet_invoke_cross_context(
     future_to_promise(async move {
         // UCAN authorization: validate the token against the TARGET context's
         // ceiling via the WASM-local 11-step pipeline.
-        // See spec §6.2, §8, ADR-016, and issue #319.
+        // See spec §6.2, §8, and ADR-016.
         if ucan_token.is_empty() {
             return Err(ScpWasmError::Validation {
                 message: "ucan_token is required for cross-context tool invocation".to_owned(),
@@ -1128,7 +1128,7 @@ pub fn outlet_session_invoke(
     future_to_promise(async move {
         // UCAN authorization: look up the outlet_id from the session, then
         // validate the token via the WASM-local 11-step pipeline.
-        // See spec §6.2, §8, ADR-016, and issue #319.
+        // See spec §6.2, §8, and ADR-016.
         if ucan_token.is_empty() {
             return Err(ScpWasmError::Validation {
                 message: "ucan_token is required for session tool invocation".to_owned(),

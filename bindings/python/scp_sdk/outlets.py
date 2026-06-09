@@ -719,10 +719,11 @@ class InvocationHandle:
                 # queue sentinel) BEFORE any terminal chunk was observed.
                 # The bridge receiver closed without the executor
                 # emitting `End` / `Error{terminal:true}` (transport
-                # drop, executor crash, bridge fault). Surface as
-                # `execution.stream-gap` (`SCP-TOOL-6131`) per §5.4.4
+                # drop, executor crash, bridge fault). Surface as an
+                # abnormal-closure error (code `SCP-TOOL-6131`, no slug —
+                # distinct from the spec's `execution.stream-gap`)
                 # instead of returning a degenerate `Aggregate(None)`
-                # that would let a caller mistake a stream gap for a
+                # that would let a caller mistake a closed stream for a
                 # successful aggregate-null outcome.
                 self._terminated = True
                 raise OutletExecutionError(
@@ -793,9 +794,10 @@ class InvocationHandle:
             #   `None` is the normal end-of-queue marker — raise
             #   `StopAsyncIteration` per the iterator protocol.
             # - Otherwise the bridge receiver closed without the
-            #   executor ever emitting a terminal chunk; surface as
-            #   `execution.stream-gap` (`SCP-TOOL-6131`) per §5.4.4 so
-            #   the caller sees a real error, not silent completion.
+            #   executor ever emitting a terminal chunk; surface as an
+            #   abnormal-closure error (code `SCP-TOOL-6131`, no slug —
+            #   distinct from the spec's `execution.stream-gap`) so the
+            #   caller sees a real error, not silent completion.
             if self._terminated:
                 raise StopAsyncIteration
             self._terminated = True
