@@ -234,67 +234,18 @@ fn fullstack_join_from_welcome_impl(
 ) -> PyResult<()> {
     crate::pyscp_check_handle!(&bi.core, node);
     let ctx_bytes = context_id_bytes(&context_id);
-    let rt = crate::runtime()?;
 
-    // Step 1: Register the context on the joiner's ContextManager.
-    let params = ContextParams {
-        mode: ContextMode::Encrypted,
-        ceiling: vec![
-            Capability::MessagesRead,
-            Capability::MessagesWrite,
-            Capability::RoleAssign,
-            Capability::MemberInvite,
-            Capability::MemberRemove,
-            Capability::ContextClose,
-        ],
-        ..ContextParams::default()
-    };
-    let handle = rt
-        .block_on(node.inner.create_context(&context_id, params))
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to register context on joiner: {e}"
-            ))
-        })?;
-
-    // Step 2: Replace the throwaway MLS group with the Welcome-derived one
-    // and pick up the adder's sender keys and access key from the exchange.
+    // ADR-049 commit 12c.9f: the joiner's MLS group, sender keys, and access
+    // keys live directly in its `E2eCryptoProvider` (the joiner has no context
+    // actor). `join_from_welcome` forms the group from the captured Welcome,
+    // picks up the inviter-minted access keys, processes the inviter's
+    // HPKE-sealed sender-key distribution, and applies any epoch-advance
+    // Commits — all real crypto.
     node.inner
         .join_from_welcome(&context_id, &ctx_bytes)
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
-        })?;
-
-    // Step 2b: Regenerate the joiner's sender key and distribute it to
-    // existing members. The key from create_context was for the throwaway
-    // MLS group and is now stale.
-    node.inner
-        .regenerate_and_distribute_sender_key(&ctx_bytes)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to distribute joiner sender key: {e}"
-            ))
-        })?;
-
-    // Step 2c: Sync all members' access keys into the ContextManager's
-    // PerContextState so that send_message wraps content for all recipients.
-    // join_from_welcome already populates E2eCryptoProvider's local store;
-    // this step ensures the ContextManager also has them.
-    rt.block_on(
-        node.inner
-            .sync_access_keys_to_manager(&context_id, &ctx_bytes),
-    );
-
-    // Step 3: Store the handle.
-    {
-        let mut handles = node
-            .handles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        handles.insert(context_id, handle);
-    }
-
-    Ok(())
+        })
 }
 
 /// Synchronises sender keys between two nodes for a given context.
