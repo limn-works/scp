@@ -377,8 +377,6 @@ object Caveats {
 sealed class OutletError(message: String, val code: String) : RuntimeException(message) {
     class NotFound(message: String, code: String = "SCP-TOOL-6100") : OutletError(message, code)
 
-    class ExecutionFailed(message: String, code: String = "SCP-TOOL-6200") : OutletError(message, code)
-
     class Validation(message: String, code: String = "SCP-VALID-7010") : OutletError(message, code)
 
     class Unauthorized(message: String, code: String = "SCP-PERM-3020") : OutletError(message, code)
@@ -649,7 +647,21 @@ class InvocationHandle
          */
         suspend fun grantCredit(grant: Credit): UInt {
             val (rid, did) = preflightControlPlane("grantCredit")
-            return grantCreditFn(rid, did, grant.raw)
+            // The runtime is the authoritative locus for the
+            // grant-after-close lifecycle violation: a grant that races the
+            // pump's terminal exit (the local `terminatedFlag` was still
+            // false in the preflight above) reaches the bridge, which
+            // rejects with `SCP-TOOL-6101` / `protocol.stream-already-closed`.
+            // Map that authoritative rejection onto the same typed
+            // [StreamAlreadyClosed] the SDK raises locally, so callers catch
+            // the lifecycle violation uniformly regardless of which side
+            // observed the close first (parity with Python
+            // `_translate_bridge_error`).
+            return try {
+                grantCreditFn(rid, did, grant.raw)
+            } catch (e: uniffi.scp.ScpException) {
+                throw mapControlPlaneError(e)
+            }
         }
 
         /**
@@ -666,7 +678,47 @@ class InvocationHandle
          */
         suspend fun cancel(): ULong? {
             val (rid, did) = preflightControlPlane("cancel")
-            return cancelFn(rid, did)
+            // See [grantCredit]: the runtime is authoritative for the
+            // cancel-after-close lifecycle violation. A cancel that races
+            // the pump's terminal exit reaches the bridge, which rejects
+            // with `SCP-TOOL-6101`; map it onto the typed
+            // [StreamAlreadyClosed].
+            return try {
+                cancelFn(rid, did)
+            } catch (e: uniffi.scp.ScpException) {
+                throw mapControlPlaneError(e)
+            }
+        }
+
+        /**
+         * Maps a control-plane bridge rejection onto the typed
+         * [StreamAlreadyClosed] when the bridge reports the
+         * runtime-authoritative grant/cancel-after-close code
+         * `SCP-TOOL-6101` (slug `protocol.stream-already-closed`). All
+         * other bridge exceptions pass through unchanged. The runtime
+         * surfaces the rejection as a `ScpException.Context` carrying the
+         * code in its `code` field and the slug in its `msg`; matching on
+         * the typed `code` (with the message as a fallback for any
+         * Display-only shape) is robust, mirroring Python's
+         * `_translate_bridge_error`.
+         */
+        private fun mapControlPlaneError(error: uniffi.scp.ScpException): Throwable {
+            val typedCode =
+                when (error) {
+                    is uniffi.scp.ScpException.Context -> error.code
+                    is uniffi.scp.ScpException.Tool -> error.code
+                    else -> null
+                }
+            val message = error.message ?: ""
+            return if (
+                typedCode == "SCP-TOOL-6101" ||
+                message.contains("SCP-TOOL-6101") ||
+                message.contains("protocol.stream-already-closed")
+            ) {
+                StreamAlreadyClosed()
+            } else {
+                error
+            }
         }
 
         /**

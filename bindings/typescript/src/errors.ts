@@ -942,6 +942,16 @@ const ERROR_CODE_OVERRIDES: ReadonlyMap<string, ScpErrorConstructor> = new Map<
 >([
   ["SCP-ECON-12095", EconomicPolicyUnsupportedOnWasm],
   ["SCP-ECON-12096", WasmCannotValidateSpendingUcan],
+  // §5.4.4:426 — the runtime is the authoritative locus for the
+  // grant-after-close lifecycle violation. When `grantCredit` / `cancel`
+  // races the pump's terminal exit (the SDK's local `terminated` flag is
+  // still false), the bridge rejects with `SCP-TOOL-6101` /
+  // `protocol.stream-already-closed`. Map that authoritative rejection onto
+  // the same typed `StreamAlreadyClosed` the SDK raises locally, so callers
+  // catch the lifecycle violation uniformly regardless of which side
+  // observed the close first. `StreamAlreadyClosed` ignores the parsed
+  // `code` argument and pins `SCP-TOOL-6101` itself.
+  ["SCP-TOOL-6101", StreamAlreadyClosed as unknown as ScpErrorConstructor],
 ]);
 
 /**

@@ -1082,3 +1082,97 @@ function makeCancelRecordingBridge(): {
   } as unknown as Bridge;
   return { bridge, cancelCalls };
 }
+
+// ---------------------------------------------------------------------------
+// Cross-SDK error mapping: a runtime SCP-TOOL-6101 rejection from a
+// control-plane bridge call (grantCredit / cancel) must surface as the typed
+// StreamAlreadyClosed — the runtime is the authoritative locus when the
+// SDK's local terminal flag has not yet flipped (it raced the pump's terminal
+// exit). Matches the Python `_translate_bridge_error` mapping and the SDK's
+// own local-terminal StreamAlreadyClosed.
+// ---------------------------------------------------------------------------
+
+/**
+ * Bridge whose control-plane methods reject with a bridge-shaped error
+ * message carrying the given SCP code, simulating the runtime-authoritative
+ * grant/cancel-after-close rejection. The SDK's local `terminated` flag is
+ * still false (no terminal chunk observed), so preflight passes and the
+ * bridge is reached.
+ */
+function makeRejectingControlPlaneBridge(message: string): Bridge {
+  return {
+    async outletStreamGrantCredit(): Promise<number> {
+      throw new Error(message);
+    },
+    async outletStreamCancel(): Promise<number | null> {
+      throw new Error(message);
+    },
+  } as unknown as Bridge;
+}
+
+describe("control-plane bridge error mapping (cross-SDK 6101 → StreamAlreadyClosed)", () => {
+  afterEach(() => {
+    _resetBridge();
+  });
+
+  test("grantCredit maps a bridge SCP-TOOL-6101 rejection to StreamAlreadyClosed", async () => {
+    const handle = new InvocationHandle(() => {}, {
+      requestIdHex: "11".repeat(16),
+      invokerDid: "did:dht:invoker",
+    });
+    _setBridge(
+      makeRejectingControlPlaneBridge(
+        "[SCP-TOOL-6101] context error: credit grant rejected (protocol.stream-already-closed)",
+      ),
+    );
+
+    let caught: unknown;
+    try {
+      await handle.grantCredit(Credit.of(10));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(StreamAlreadyClosed);
+    expect((caught as StreamAlreadyClosed).code).toBe("SCP-TOOL-6101");
+  });
+
+  test("cancel maps a bridge SCP-TOOL-6101 rejection to StreamAlreadyClosed", async () => {
+    const handle = new InvocationHandle(() => {}, {
+      requestIdHex: "22".repeat(16),
+      invokerDid: "did:dht:invoker",
+    });
+    _setBridge(
+      makeRejectingControlPlaneBridge(
+        "[SCP-TOOL-6101] context error: cancel rejected (protocol.stream-already-closed)",
+      ),
+    );
+
+    let caught: unknown;
+    try {
+      await handle.cancel();
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(StreamAlreadyClosed);
+    expect((caught as StreamAlreadyClosed).code).toBe("SCP-TOOL-6101");
+  });
+
+  test("a non-6101 bridge rejection is NOT masked as StreamAlreadyClosed", async () => {
+    const handle = new InvocationHandle(() => {}, {
+      requestIdHex: "33".repeat(16),
+      invokerDid: "did:dht:invoker",
+    });
+    _setBridge(
+      makeRejectingControlPlaneBridge("[SCP-PERM-3020] caller is not authorized for this stream"),
+    );
+
+    let caught: unknown;
+    try {
+      await handle.grantCredit(Credit.of(10));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).not.toBeInstanceOf(StreamAlreadyClosed);
+    expect((caught as { code: string }).code).toBe("SCP-PERM-3020");
+  });
+});

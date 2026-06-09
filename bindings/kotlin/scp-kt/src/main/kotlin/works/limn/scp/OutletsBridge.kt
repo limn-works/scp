@@ -961,7 +961,7 @@ private suspend fun drainToAggregate(cursor: OutletStreamCursor): Aggregate {
                 if (data.terminal == true) {
                     throw ExecutionError(
                         message = data.message ?: "stream terminated with error",
-                        code = data.code ?: "SCP-TOOL-6130",
+                        code = data.code ?: "SCP-TOOL-6200",
                     )
                 }
             else -> Unit

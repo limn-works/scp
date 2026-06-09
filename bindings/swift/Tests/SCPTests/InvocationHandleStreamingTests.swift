@@ -266,6 +266,94 @@ struct PostTerminalLifecycleTests {
     }
 }
 
+// MARK: - Control-plane bridge error mapping (cross-SDK 6101)
+
+/// The runtime is the authoritative locus for the grant/cancel-after-close
+/// lifecycle violation: when a control-plane call races the pump's terminal
+/// exit (the SDK's local `terminatedFlag` is still false), the bridge rejects
+/// with `SCP-TOOL-6101` / `protocol.stream-already-closed`. The SDK must map
+/// that authoritative rejection onto the same typed `streamAlreadyClosed` it
+/// raises locally, matching the Python `_translate_bridge_error` mapping. The
+/// injectable `grantCreditFn` / `cancelFn` seam simulates the rejection
+/// without a live runtime.
+struct ControlPlaneBridgeErrorMappingTests {
+    @Test("grantCredit maps a bridge SCP-TOOL-6101 rejection to streamAlreadyClosed")
+    func grantMaps6101() async throws {
+        let handle = InvocationHandle(
+            requestIdHex: String(repeating: "11", count: 16),
+            invokerDid: "did:dht:invoker",
+            grantCreditFn: { _, _, _ in
+                throw ScpError.Tool(
+                    msg: "[SCP-TOOL-6101] context error: credit grant rejected "
+                        + "(protocol.stream-already-closed)",
+                    code: "SCP-TOOL-6101"
+                )
+            },
+            // Non-terminating pump — the handle never observes a terminal
+            // chunk, so the local terminal flag stays false and the call
+            // reaches the injected bridge function.
+            pump: { _, _, _ in }
+        )
+        do {
+            _ = try await handle.grantCredit(Credit(10))
+            #expect(Bool(false), "expected throw")
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            #expect(env.code == "SCP-TOOL-6101")
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+
+    @Test("cancel maps a bridge SCP-TOOL-6101 rejection to streamAlreadyClosed")
+    func cancelMaps6101() async throws {
+        let handle = InvocationHandle(
+            requestIdHex: String(repeating: "22", count: 16),
+            invokerDid: "did:dht:invoker",
+            cancelFn: { _, _ in
+                throw ScpError.Tool(
+                    msg: "[SCP-TOOL-6101] context error: cancel rejected "
+                        + "(protocol.stream-already-closed)",
+                    code: "SCP-TOOL-6101"
+                )
+            },
+            pump: { _, _, _ in }
+        )
+        do {
+            _ = try await handle.cancel()
+            #expect(Bool(false), "expected throw")
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            #expect(env.code == "SCP-TOOL-6101")
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+
+    @Test("a non-6101 bridge rejection is NOT masked as streamAlreadyClosed")
+    func nonMatchingPassesThrough() async throws {
+        let handle = InvocationHandle(
+            requestIdHex: String(repeating: "33", count: 16),
+            invokerDid: "did:dht:invoker",
+            grantCreditFn: { _, _, _ in
+                throw ScpError.Tool(
+                    msg: "[SCP-PERM-3020] caller is not authorized",
+                    code: "SCP-PERM-3020"
+                )
+            },
+            pump: { _, _, _ in }
+        )
+        do {
+            _ = try await handle.grantCredit(Credit(10))
+            #expect(Bool(false), "expected throw")
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            #expect(Bool(false), "non-6101 error must NOT map to streamAlreadyClosed: \(env)")
+        } catch let ScpError.Tool(_, code) {
+            #expect(code == "SCP-PERM-3020")
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+}
+
 // MARK: - Single-shot lifecycle
 
 struct NonStreamingControlPlaneTests {

@@ -24,6 +24,7 @@
 import { Ajv, type ValidateFunction } from "ajv";
 import {
   Credit,
+  mapBridgeError,
   OutletError,
   OutletExecutionError,
   OutletProtocolError,
@@ -749,7 +750,17 @@ export class InvocationHandle
       );
     }
     const bridge = await getBridge();
-    return bridge.outletStreamGrantCredit(ridHex, this.invokerDid, grant.raw);
+    // The runtime is authoritative for the grant-after-close lifecycle
+    // violation: a grant that races the pump's terminal exit (local
+    // `terminated` still false above) reaches the bridge, which rejects with
+    // `SCP-TOOL-6101`. `mapBridgeError` routes that code onto the same typed
+    // `StreamAlreadyClosed` the SDK raises locally, so callers see one error
+    // type regardless of which side observed the close first.
+    try {
+      return await bridge.outletStreamGrantCredit(ridHex, this.invokerDid, grant.raw);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
   }
 
   /** Internal — resolves to the streaming `request_id` (32-char hex)
@@ -804,7 +815,16 @@ export class InvocationHandle
       );
     }
     const bridge = await getBridge();
-    return bridge.outletStreamCancel(ridHex, this.invokerDid);
+    // See `grantCredit`: the runtime is authoritative for the
+    // grant/cancel-after-close lifecycle violation. A cancel that races the
+    // pump's terminal exit reaches the bridge, which rejects with
+    // `SCP-TOOL-6101`; `mapBridgeError` routes it onto the typed
+    // `StreamAlreadyClosed`.
+    try {
+      return await bridge.outletStreamCancel(ridHex, this.invokerDid);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
   }
 
   /**

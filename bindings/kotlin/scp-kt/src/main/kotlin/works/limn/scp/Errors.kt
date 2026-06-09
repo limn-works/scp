@@ -4,9 +4,10 @@ package works.limn.scp
  * §5.4.4 Outlet error taxonomy — sealed Kotlin types.
  *
  * The pre-OUT-031 [OutletError] sealed class (in `Outlets.kt`) keeps its
- * legacy subclasses ([OutletError.NotFound], [OutletError.ExecutionFailed],
- * [OutletError.Validation], [OutletError.Unauthorized], [OutletError.Bridge])
- * for back-compat. SCP-OUT-031 adds the eight new sealed children for the
+ * remaining subclasses ([OutletError.NotFound], [OutletError.Validation],
+ * [OutletError.Unauthorized], [OutletError.Bridge]). The execution-failure
+ * case is the §5.4.4 [ExecutionError] (code `SCP-TOOL-6130`), not a separate
+ * legacy type. SCP-OUT-031 adds the eight new sealed children for the
  * §5.4.4 sealed-hierarchy taxonomy ([OutletProtocolError],
  * [AuthorizationError], [InputError], [ExecutionError], [OutputError],
  * [EconomicError], [OutletTransportError], [OutletGovernanceError]) plus
@@ -189,9 +190,9 @@ value class OutletId(val raw: String) {
 // New §5.4.4 OutletError subclasses (sealed children of OutletError).
 // ---------------------------------------------------------------------------
 //
-// `OutletError` (in Outlets.kt) is already a sealed class. Its old children
-// (NotFound, ExecutionFailed, Validation, Unauthorized, Bridge) are kept
-// verbatim for back-compat. The eight new children below extend it directly
+// `OutletError` (in Outlets.kt) is already a sealed class. Its remaining
+// children (NotFound, Validation, Unauthorized, Bridge) coexist with the
+// §5.4.4 taxonomy. The eight new children below extend it directly
 // — Kotlin's `sealed class` permits subclasses defined in the same Gradle
 // module (works.limn.scp), so adding these here is legal.
 

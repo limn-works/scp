@@ -607,6 +607,25 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     /// its registry's pinned identity. CRITICAL #1 fix.
     private let invokerDid: String?
 
+    /// Injectable control-plane bridge closures. Default to the real
+    /// UniFFI `outletStreamGrantCredit` / `outletStreamCancel` free
+    /// functions; tests inject closures that simulate the runtime's
+    /// authoritative grant/cancel-after-close rejection (`SCP-TOOL-6101`)
+    /// so the mapping onto `OutletError.streamAlreadyClosed` is covered
+    /// without a live runtime. Mirrors the module-wide `*Bridge`
+    /// injectable pattern (ADR-026).
+    public typealias GrantCreditFn = @Sendable (
+        _ requestIdHex: String,
+        _ callerDid: String,
+        _ grant: UInt32
+    ) async throws -> UInt32
+    public typealias CancelFn = @Sendable (
+        _ requestIdHex: String,
+        _ callerDid: String
+    ) async throws -> UInt64?
+    private let grantCreditFn: GrantCreditFn
+    private let cancelFn: CancelFn
+
     /// Optional aggregate-schema (JSON Schema-shaped) for End-chunk
     /// validation per OUT-038 AC12.
     private let aggregateSchemaJson: String?
@@ -647,6 +666,12 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
         requestIdHex: String? = nil,
         invokerDid: String? = nil,
         aggregateSchemaJson: String? = nil,
+        grantCreditFn: @escaping GrantCreditFn = { try await outletStreamGrantCredit(
+            requestIdHex: $0, callerDid: $1, grant: $2
+        ) },
+        cancelFn: @escaping CancelFn = { try await outletStreamCancel(
+            requestIdHex: $0, callerDid: $1
+        ) },
         pump: @Sendable @escaping (
             @Sendable @escaping (OutletStreamChunk) -> Void,
             @Sendable @escaping (Aggregate) -> Void,
@@ -657,6 +682,8 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
             requestIdBox: RequestIdBox(resolved: requestIdHex),
             invokerDid: invokerDid,
             aggregateSchemaJson: aggregateSchemaJson,
+            grantCreditFn: grantCreditFn,
+            cancelFn: cancelFn,
             pump: pump
         )
     }
@@ -676,6 +703,12 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
         invokerDid: String?,
         aggregateSchemaJson: String?,
         cancelRegistry: CancelRegistry = CancelRegistry(),
+        grantCreditFn: @escaping GrantCreditFn = { try await outletStreamGrantCredit(
+            requestIdHex: $0, callerDid: $1, grant: $2
+        ) },
+        cancelFn: @escaping CancelFn = { try await outletStreamCancel(
+            requestIdHex: $0, callerDid: $1
+        ) },
         pump: @Sendable @escaping (
             @Sendable @escaping (OutletStreamChunk) -> Void,
             @Sendable @escaping (Aggregate) -> Void,
@@ -686,6 +719,8 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
         self.invokerDid = invokerDid
         self.aggregateSchemaJson = aggregateSchemaJson
         self.cancelRegistry = cancelRegistry
+        self.grantCreditFn = grantCreditFn
+        self.cancelFn = cancelFn
         var chunkCont: AsyncThrowingStream<OutletStreamChunk, Error>.Continuation?
         let stream = AsyncThrowingStream<OutletStreamChunk, Error> { cont in
             chunkCont = cont
@@ -818,11 +853,20 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
                     + "caller authentication unavailable"
             )
         }
-        return try await outletStreamGrantCredit(
-            requestIdHex: ridHex,
-            callerDid: did,
-            grant: grant.raw
-        )
+        // The runtime is the authoritative locus for the
+        // grant-after-close lifecycle violation: a grant that races the
+        // pump's terminal exit (the local `terminatedFlag` was still
+        // false above) reaches the bridge, which rejects with
+        // `SCP-TOOL-6101` / `protocol.stream-already-closed`. Map that
+        // authoritative rejection onto the same typed
+        // `streamAlreadyClosed` the SDK raises locally, so callers catch
+        // the lifecycle violation uniformly regardless of which side
+        // observed the close first (parity with Python `_translate_bridge_error`).
+        do {
+            return try await grantCreditFn(ridHex, did, grant.raw)
+        } catch {
+            throw Self.mapControlPlaneError(error)
+        }
     }
 
     /// SCP-OUT-038 AC2/AC3 — cancels the active stream (§5.4.5).
@@ -852,7 +896,34 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
                     + "caller authentication unavailable"
             )
         }
-        return try await outletStreamCancel(requestIdHex: ridHex, callerDid: did)
+        // See `grantCredit`: the runtime is authoritative for the
+        // cancel-after-close lifecycle violation. A cancel that races the
+        // pump's terminal exit reaches the bridge, which rejects with
+        // `SCP-TOOL-6101`; map it onto the typed `streamAlreadyClosed`.
+        do {
+            return try await cancelFn(ridHex, did)
+        } catch {
+            throw Self.mapControlPlaneError(error)
+        }
+    }
+
+    /// Maps a control-plane bridge rejection onto the typed
+    /// `OutletError.streamAlreadyClosed` when the bridge reports the
+    /// runtime-authoritative grant/cancel-after-close code
+    /// `SCP-TOOL-6101` (slug `protocol.stream-already-closed`). All other
+    /// errors pass through unchanged. The bridge surfaces the code via a
+    /// UniFFI `ScpError.Tool(msg:code:)`; matching on the code (and the
+    /// slug embedded in the message as a fallback) is robust to the
+    /// generated error's shape.
+    private static func mapControlPlaneError(_ error: Error) -> Error {
+        if case let ScpError.Tool(_, code) = error, code == "SCP-TOOL-6101" {
+            return OutletError.streamAlreadyClosed()
+        }
+        let message = String(describing: error)
+        if message.contains("SCP-TOOL-6101") || message.contains("protocol.stream-already-closed") {
+            return OutletError.streamAlreadyClosed()
+        }
+        return error
     }
 
     /// `true` once a terminal chunk has been observed (AC13). Exposed
