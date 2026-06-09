@@ -1040,6 +1040,16 @@ impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
     }
 }
 
+/// Bounded capacity of the `ContextManager` event broadcast channel.
+///
+/// Every production `ContextManager` built here enables this channel so that
+/// local context events can be consumed by external sinks — notably the node's
+/// outbound webhook dispatcher (spec §12.10.5), wired in
+/// [`crate::server`] node startup. Lagging consumers drop the oldest events
+/// (logged, never panics); `1024` matches the documented default on
+/// [`ContextManager::with_event_channel`] and the `PyO3` reference bridge.
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
 /// Constructs a [`ContextManager`] with or without persistence.
 ///
 /// Mirrors the `PyO3` bridge's `build_context_manager` (`crates/scp-ffi/src/runtime.rs`).
@@ -1051,27 +1061,31 @@ impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
 /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
 /// so the manager and the bridge mirror share the same backend — a
 /// single `SQLite` connection, not two.
+///
+/// The event broadcast channel is always enabled (capacity
+/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — e.g. the node webhook
+/// dispatcher — can subscribe via `ContextManager::subscribe_events()`. When no
+/// consumer subscribes, emitting into the channel is a cheap no-op: the
+/// retained sender has no receivers, so `send` returns `Err` and the event is
+/// simply dropped without blocking context operations.
 fn build_context_manager(
     crypto: Box<dyn ContextCryptoProvider>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>>,
 ) -> Arc<ContextManager> {
-    match persistence {
-        Some(shared) => Arc::new(ContextManager::with_persistence(
+    let mut manager = match persistence {
+        Some(shared) => ContextManager::with_persistence(
             crypto,
             transport,
             event_log,
             Box::new(ArcContextPersistence::new(shared)),
             not_configured_key_resolver(),
-        )),
-        None => Arc::new(ContextManager::new(
-            crypto,
-            transport,
-            event_log,
-            not_configured_key_resolver(),
-        )),
-    }
+        ),
+        None => ContextManager::new(crypto, transport, event_log, not_configured_key_resolver()),
+    };
+    manager.with_event_channel(EVENT_CHANNEL_CAPACITY);
+    Arc::new(manager)
 }
 
 // Phase D (#1695): module-level `context_manager`, `context_manager_expect`,

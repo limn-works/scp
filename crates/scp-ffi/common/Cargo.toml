@@ -24,7 +24,7 @@ custody = ["dep:scp-platform"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform
 # (in-memory testing backends), and tokio. Not available for WASM (ADR-034).
-server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/testing", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tracing", "dep:thiserror"]
+server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/testing", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }

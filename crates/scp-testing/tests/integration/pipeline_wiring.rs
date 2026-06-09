@@ -1043,15 +1043,68 @@ fn b3_webhook_dispatch_wired() {
         node_src.contains("fn wire_context_events"),
         "ApplicationNode must expose wire_context_events to connect events to the dispatcher"
     );
+    // Every non-WASM bridge (PyO3 reference, NAPI, UniFFI) must independently
+    // (a) enable the ContextManager event channel at manager construction and
+    // (b) wire the consumer into the dispatcher at node startup. #1539 was first
+    // fixed only on PyO3; NAPI/UniFFI had structurally identical startup paths
+    // that were never wired, so local events never reached the dispatcher on
+    // Node/Bun/Swift/Kotlin. These per-bridge string matches guard against that
+    // drift recurring.
+    //
+    // The shared supervision seam (`spawn_supervised_event_consumer`) lives in
+    // `scp-ffi-common`; assert it exists so the consolidated wire cannot be
+    // silently inlined-and-diverged again.
+    let common_server_src = include_str!("../../../../crates/scp-ffi/common/src/server.rs");
+    assert!(
+        common_server_src.contains("fn spawn_supervised_event_consumer"),
+        "scp-ffi-common must expose the shared spawn_supervised_event_consumer \
+         supervision seam used by all bridges"
+    );
+    assert!(
+        common_server_src.contains("fn wire_and_supervise_context_events"),
+        "RunningNode must expose wire_and_supervise_context_events (shared \
+         subscribe → wire → supervise seam for NAPI + UniFFI)"
+    );
+
+    // PyO3 reference bridge.
     let ffi_server_src = include_str!("../../../../crates/scp-ffi/src/server.rs");
     assert!(
         ffi_server_src.contains("wire_context_events"),
-        "node startup must call wire_context_events so local events reach the webhook dispatcher"
+        "PyO3 node startup must call wire_context_events so local events reach \
+         the webhook dispatcher"
     );
     let ffi_runtime_src = include_str!("../../../../crates/scp-ffi/src/runtime.rs");
     assert!(
         ffi_runtime_src.contains("with_event_channel"),
-        "production ContextManager construction must enable the event channel \
+        "PyO3 production ContextManager construction must enable the event channel \
+         (otherwise subscribe_events yields None and no events are dispatched)"
+    );
+
+    // NAPI bridge (Node.js/Bun).
+    let napi_server_src = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
+    assert!(
+        napi_server_src.contains("wire_and_supervise_context_events"),
+        "NAPI node startup must wire ContextManager events into the webhook \
+         dispatcher (regression guard for #1539 on Node/Bun)"
+    );
+    let napi_runtime_src = include_str!("../../../../crates/scp-ffi/napi/src/runtime.rs");
+    assert!(
+        napi_runtime_src.contains("with_event_channel"),
+        "NAPI production ContextManager construction must enable the event channel \
+         (otherwise subscribe_events yields None and no events are dispatched)"
+    );
+
+    // UniFFI bridge (Swift/Kotlin).
+    let uniffi_server_src = include_str!("../../../../crates/scp-ffi/uniffi/src/server.rs");
+    assert!(
+        uniffi_server_src.contains("wire_and_supervise_context_events"),
+        "UniFFI node startup must wire ContextManager events into the webhook \
+         dispatcher (regression guard for #1539 on Swift/Kotlin)"
+    );
+    let uniffi_runtime_src = include_str!("../../../../crates/scp-ffi/uniffi/src/runtime.rs");
+    assert!(
+        uniffi_runtime_src.contains("with_event_channel"),
+        "UniFFI production ContextManager construction must enable the event channel \
          (otherwise subscribe_events yields None and no events are dispatched)"
     );
 }

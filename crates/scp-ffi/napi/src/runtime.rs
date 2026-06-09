@@ -757,6 +757,31 @@ impl HandleInstance for crate::testing::NapiFullStackNode {
     }
 }
 
+/// Bounded capacity of the `ContextManager` event broadcast channel.
+///
+/// Every production `ContextManager` built here enables this channel so that
+/// local context events can be consumed by external sinks — notably the node's
+/// outbound webhook dispatcher (spec §12.10.5), wired in
+/// [`crate::server`] node startup. Lagging consumers drop the oldest events
+/// (logged, never panics); `1024` matches the documented default on
+/// [`ContextManager::with_event_channel`] and the `PyO3` reference bridge.
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Enables the event broadcast channel on a freshly built `ContextManager` and
+/// wraps it in an `Arc`.
+///
+/// Mirrors the `PyO3` reference bridge's `build_context_manager`
+/// (`crates/scp-ffi/src/runtime.rs`): every production manager construction
+/// routes through here so the event channel is always present and
+/// `subscribe_events()` yields a receiver for the webhook dispatcher. When no
+/// consumer subscribes, emitting into the channel is a cheap no-op — the
+/// retained sender has no receivers, so `send` returns `Err` and the event is
+/// dropped without blocking context operations.
+fn finalize_context_manager(mut manager: ContextManager) -> Arc<ContextManager> {
+    manager.with_event_channel(EVENT_CHANNEL_CAPACITY);
+    Arc::new(manager)
+}
+
 /// Initializes the given bridge instance's [`ContextManager`] with production
 /// providers.
 ///
@@ -790,7 +815,7 @@ pub fn init_context_manager(bi: &NapiBridgeInstance, local_did: &str) {
     let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
-    let cm_arc = Arc::new(ContextManager::with_persistence(
+    let cm_arc = finalize_context_manager(ContextManager::with_persistence(
         crypto,
         transport,
         event_log,
@@ -845,7 +870,7 @@ pub fn init_context_manager_with_local_transport(bi: &NapiBridgeInstance, local_
     let transport = Box::new(scp_core::context::LocalTransportProvider);
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
-    let cm_arc = Arc::new(ContextManager::with_persistence(
+    let cm_arc = finalize_context_manager(ContextManager::with_persistence(
         crypto,
         transport,
         event_log,
@@ -897,7 +922,7 @@ pub fn init_context_manager_with_relay_transport(
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
-    let cm_arc = Arc::new(ContextManager::with_persistence(
+    let cm_arc = finalize_context_manager(ContextManager::with_persistence(
         crypto,
         transport,
         event_log,

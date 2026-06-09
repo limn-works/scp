@@ -188,20 +188,11 @@ fn auto_wire_context_manager<S: scp_platform::Storage>(
             );
             return;
         };
-        let mut consumer = node.wire_context_events(events);
+        let consumer = node.wire_context_events(events);
         let cancel = bi.core.cancel_token();
         rt.block_on(async {
-            bi.core.task_handle().await.spawn(async move {
-                tokio::select! {
-                    // The consumer task runs until the broadcast channel closes.
-                    _ = &mut consumer => {}
-                    // On bridge shutdown, abort the consumer so it does not
-                    // outlive the instance as a detached task.
-                    () = cancel.cancelled() => {
-                        consumer.abort();
-                    }
-                }
-            });
+            let mut tasks = bi.core.task_handle().await;
+            scp_ffi_common::server::spawn_supervised_event_consumer(consumer, &mut tasks, cancel);
         });
     });
 }

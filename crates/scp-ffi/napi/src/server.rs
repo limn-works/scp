@@ -144,6 +144,34 @@ async fn auto_wire_context_manager(
     }
 }
 
+/// Wires the local `ContextManager` event channel into the node's outbound
+/// webhook dispatcher and supervises the consumer under the bridge instance's
+/// lifecycle (spec §12.10.5).
+///
+/// Mirrors the `PyO3` reference bridge (`crates/scp-ffi/src/server.rs`). The
+/// production `ContextManager` built by
+/// [`crate::runtime::finalize_context_manager`] always enables its event
+/// channel, so `subscribe_events()` yields a receiver. Delegates the
+/// subscribe → wire → supervise block to the shared
+/// [`RunningNode::wire_and_supervise_context_events`] seam so all three bridges
+/// stay in lockstep. The consumer is aborted on bridge shutdown via the
+/// instance cancellation token, so it never leaks as a detached task.
+///
+/// Best-effort: if the `ContextManager` is somehow absent, logs and skips
+/// rather than failing node startup.
+async fn wire_node_webhook_events(bi: &Arc<NapiBridgeInstance>, node: &RunningNode) {
+    let Ok(manager) = crate::runtime::context_manager(bi) else {
+        tracing::warn!(
+            "wire_node_webhook_events: no ContextManager attached — local context \
+             events will not reach the webhook dispatcher"
+        );
+        return;
+    };
+    let cancel = bi.core.cancel_token();
+    let mut tasks = bi.core.task_handle().await;
+    node.wire_and_supervise_context_events(manager, &mut tasks, cancel);
+}
+
 // ---------------------------------------------------------------------------
 // NapiRelayHandle
 // ---------------------------------------------------------------------------
@@ -593,9 +621,12 @@ pub(crate) async fn node_start_in_memory_on(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
+    let inner = RunningNode::InMemory(node);
+    wire_node_webhook_events(bi, &inner).await;
+
     increment_handle_count();
     Ok(NapiNodeHandle {
-        inner: RunningNode::InMemory(node),
+        inner,
         bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     })
@@ -629,9 +660,12 @@ pub(crate) async fn node_start_local_on(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
+    let inner = RunningNode::Filesystem(node);
+    wire_node_webhook_events(bi, &inner).await;
+
     increment_handle_count();
     Ok(NapiNodeHandle {
-        inner: RunningNode::Filesystem(node),
+        inner,
         bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     })
@@ -711,6 +745,28 @@ mod tests {
         assert!(!node.is_shutdown());
         node.shutdown();
         assert!(node.is_shutdown());
+    }
+
+    /// Regression guard for #1539 on Node/Bun: after node startup the
+    /// production `ContextManager` must have its event broadcast channel
+    /// enabled, so `subscribe_events()` yields a receiver. Before the fix,
+    /// `finalize_context_manager` did not run on this bridge and the channel
+    /// was `None`, so the webhook consumer could never be wired and local
+    /// context events never reached the dispatcher.
+    #[test]
+    fn node_startup_enables_context_event_channel() {
+        let scp = crate::scp::Scp::new().unwrap();
+        let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
+
+        let manager = crate::runtime::context_manager(&scp.inner)
+            .expect("ContextManager must be attached after node startup");
+        assert!(
+            manager.subscribe_events().is_some(),
+            "node startup must enable the ContextManager event channel so the \
+             webhook dispatcher consumer can subscribe (regression: #1539)"
+        );
+
+        node.shutdown();
     }
 
     #[test]

@@ -563,6 +563,47 @@ impl RunningNode {
         }
     }
 
+    /// Subscribes to the manager's event channel, wires the consumer into this
+    /// node's webhook dispatcher, and supervises the consumer under the bridge
+    /// instance's lifecycle (spec §12.10.5).
+    ///
+    /// This is the shared seam for all three non-WASM bridges (`PyO3`, `NAPI`,
+    /// `UniFFI`). Each bridge's node-startup path calls it once, after the
+    /// `ContextManager` is attached, passing the instance's `JoinSet` guard and
+    /// cancellation token. Consolidating the subscribe → wire → supervise block
+    /// here prevents per-bridge drift (the regression that reopened #1539, where
+    /// only `PyO3` was wired).
+    ///
+    /// Behavior:
+    /// - If the manager has no event channel (`subscribe_events()` returns
+    ///   `None`), wiring is skipped with a warning rather than panicking.
+    ///   Production managers always enable the channel (see each bridge's
+    ///   `build_context_manager`/`finalize_context_manager`), so this is purely
+    ///   defensive against a manager initialized by some other path.
+    /// - The consumer task runs until the broadcast channel closes (manager
+    ///   dropped) OR the bridge instance's cancellation token fires, at which
+    ///   point the consumer is aborted. This makes the consumer deterministically
+    ///   bound to the instance lifecycle rather than leaked as a detached task.
+    pub fn wire_and_supervise_context_events(
+        &self,
+        manager: &Arc<ContextManager>,
+        tasks: &mut tokio::task::JoinSet<()>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let Some(events) = manager.subscribe_events() else {
+            // Defensive: production managers always have the channel, but a
+            // ContextManager initialized by another path without it would
+            // return None. Skip wiring rather than panic.
+            tracing::warn!(
+                "wire_and_supervise_context_events: ContextManager has no event \
+                 channel — local context events will not reach the webhook dispatcher"
+            );
+            return;
+        };
+        let consumer = self.wire_context_events(events);
+        spawn_supervised_event_consumer(consumer, tasks, cancel);
+    }
+
     /// Activates HTTP broadcast projection with optional site configuration.
     ///
     /// # Errors
@@ -664,6 +705,39 @@ impl RunningNode {
             Self::Filesystem(n) => n.http_url().await,
         }
     }
+}
+
+/// Spawns a webhook-event `consumer` (from `ApplicationNode::wire_context_events`
+/// or [`RunningNode::wire_context_events`]) under the bridge instance's
+/// `JoinSet`, bound to its cancellation token.
+///
+/// This is the single shared supervision wire for all three non-WASM bridges
+/// (`PyO3` reference, `NAPI`, `UniFFI`). Each bridge subscribes to its
+/// `ContextManager` event channel and wires the consumer via its node, then
+/// hands the resulting `JoinHandle` here so the supervision policy lives in one
+/// place and cannot drift per-bridge (the failure mode that reopened #1539,
+/// where only `PyO3` was wired).
+///
+/// Lifecycle: the spawned guard task runs until either the consumer completes
+/// (the broadcast channel closed because the `ContextManager` was dropped) or
+/// `cancel` fires on bridge shutdown, at which point the consumer is aborted so
+/// it never outlives the instance as a detached task.
+pub fn spawn_supervised_event_consumer(
+    mut consumer: tokio::task::JoinHandle<()>,
+    tasks: &mut tokio::task::JoinSet<()>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tasks.spawn(async move {
+        tokio::select! {
+            // The consumer task runs until the broadcast channel closes.
+            _ = &mut consumer => {}
+            // On bridge shutdown, abort the consumer so it does not
+            // outlive the instance as a detached task.
+            () = cancel.cancelled() => {
+                consumer.abort();
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
