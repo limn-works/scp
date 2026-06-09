@@ -23,10 +23,12 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.Test
 
 @Suppress("StringLiteralDuplication")
@@ -289,6 +291,48 @@ class InvocationHandleStreamingTest {
             handle.aggregate()
         }
         assertEquals("SCP-TOOL-6140", err.code)
+    }
+
+    // --------------------------------------------------------------------
+    // close() settlement — await after close() ERRORS, never hangs.
+    // --------------------------------------------------------------------
+
+    /** Builds an UNBOUNDED handle whose aggregate / flow producers suspend
+     *  forever (no terminal chunk). Only close() can release it. */
+    private fun makeUnboundedHandle(): InvocationHandle {
+        val never = CompletableDeferred<Aggregate>()
+        return InvocationHandle(
+            aggregateFn = { never.await() },
+            flowFn = {
+                flow {
+                    // Suspend forever — mirrors an unbounded cursor that
+                    // never yields a terminal chunk.
+                    never.await()
+                }
+            },
+            requestIdHex = "ab".repeat(16),
+            invokerDid = "did:dht:invoker",
+        )
+    }
+
+    @Test
+    fun `aggregate() after close() raises StreamAlreadyClosed and does not hang`() = runTest {
+        val handle = makeUnboundedHandle()
+        handle.close()
+        // withTimeout surfaces a hang as TimeoutCancellationException; the
+        // close-guard makes aggregate() throw StreamAlreadyClosed first.
+        assertFailsWith<StreamAlreadyClosed> {
+            withTimeout(1_000) { handle.aggregate() }
+        }
+    }
+
+    @Test
+    fun `asFlow() collection after close() raises StreamAlreadyClosed and does not hang`() = runTest {
+        val handle = makeUnboundedHandle()
+        handle.close()
+        assertFailsWith<StreamAlreadyClosed> {
+            withTimeout(1_000) { handle.asFlow().toList() }
+        }
     }
 
     // --------------------------------------------------------------------

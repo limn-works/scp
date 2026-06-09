@@ -666,6 +666,104 @@ struct CloseTeardownTests {
         scope()
         #expect(counter.get() == 1, "defer { handle.close() } releases the handle on scope exit")
     }
+
+    @Test("await handle.aggregate AFTER close() errors with streamAlreadyClosed (does not hang)")
+    func awaitAggregateAfterCloseErrorsNotHang() async {
+        // UNBOUNDED stream — the pump never resolves/rejects the aggregate,
+        // so before the close()-settlement fix `await handle.aggregate` would
+        // block on the resolver forever. close() must reject the aggregate.
+        let handle = InvocationHandle(
+            requestIdHex: String(repeating: "f6", count: 16),
+            invokerDid: "did:dht:invoker"
+        ) { _, _, _ in
+            // No terminal chunk, no resolve/reject — simulates an abandoned
+            // unbounded control-plane-only stream.
+        }
+        handle.close()
+
+        // Race the aggregate await against a short timeout. A timeout win
+        // means close() failed to settle the resolver — i.e. it HUNG.
+        let result = await raceAggregateAgainstTimeout(handle, timeoutNanos: 1_000_000_000)
+        switch result {
+        case .timedOut:
+            Issue.record("await handle.aggregate did not settle after close() — it HUNG")
+        case let .threw(error):
+            guard case let OutletError.protocol(env) = error,
+                  env.slug == "protocol.stream-already-closed"
+            else {
+                Issue.record("wrong error after close(): \(error)")
+                return
+            }
+            #expect(env.code == "SCP-TOOL-6101")
+        case .resolved:
+            Issue.record("await handle.aggregate resolved a value after close(); expected an error")
+        }
+    }
+
+    @Test("for try await over a handle closed before any terminal exits via an error (does not hang)")
+    func iterateAfterCloseErrorsNotHang() async {
+        let handle = InvocationHandle(
+            requestIdHex: String(repeating: "07", count: 16),
+            invokerDid: "did:dht:invoker"
+        ) { _, _, _ in
+            // Unbounded — never yields a terminal chunk.
+        }
+        handle.close()
+
+        // Drain the iterator under a timeout. close() finishes the chunk
+        // stream with an error, so the reader must unblock and throw rather
+        // than park forever.
+        let iterate = Task { () -> Bool in
+            do {
+                for try await _ in handle {}
+                return false // completed without throwing — unexpected
+            } catch {
+                return true // threw — the expected outcome
+            }
+        }
+        let timeout = Task { () -> Bool? in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            return nil
+        }
+        // Whichever finishes first: iterate returns Bool, timeout returns nil.
+        let threw = await iterate.value
+        timeout.cancel()
+        _ = await timeout.value
+        #expect(threw, "for try await over a closed unbounded handle must throw, not hang")
+    }
+}
+
+// MARK: - Aggregate-vs-timeout race helper
+
+private enum AggregateRaceOutcome {
+    case resolved
+    case threw(Error)
+    case timedOut
+}
+
+/// Awaits `handle.aggregate` against a timeout so a HANG is observable as a
+/// distinct outcome rather than a stuck test. Returns whichever lands first.
+private func raceAggregateAgainstTimeout(
+    _ handle: InvocationHandle,
+    timeoutNanos: UInt64
+) async -> AggregateRaceOutcome {
+    await withTaskGroup(of: AggregateRaceOutcome.self) { group in
+        group.addTask {
+            do {
+                _ = try await handle.aggregate
+                return .resolved
+            } catch {
+                return .threw(error)
+            }
+        }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: timeoutNanos)
+            return .timedOut
+        }
+        let first = await group.next() ?? .timedOut
+        group.cancelAll()
+        return first
+    }
 }
 
 // MARK: - Compile-time: Credit is REQUIRED for grantCredit
@@ -685,4 +783,115 @@ private func _swiftCompilerRejectsRawUInt32(_ handle: InvocationHandle) async {
         // ^^ would fail with "Cannot convert value of type 'UInt32' to expected argument type 'Credit'"
     }
     _ = handle
+}
+
+// MARK: - invoke() validation parity (Findings 3, 4, 5)
+
+/// `OutletNamespace.invoke` now raises at the call site for partial
+/// streaming params, malformed caveats binding, and a missing one-shot
+/// UCAN — parity with Python / TS / Kotlin. These validations run BEFORE
+/// any bridge or identity-pointer access, so a fake handle / identity is
+/// sufficient (nothing is dereferenced).
+struct InvokeValidationTests {
+    private func makeNamespace() -> OutletNamespace {
+        OutletNamespace(
+            handle: ContextHandle(noPointer: .init()),
+            identity: Identity(noPointer: .init())
+        )
+    }
+
+    @Test("invoke with only caveatsBindingHex (no streamEpoch) throws Validation (Finding 3)")
+    func partialStreamingParamsCaveatsOnly() async throws {
+        let namespace = makeNamespace()
+        do {
+            _ = try await namespace.invoke(
+                id: "outlet-x",
+                input: "{}",
+                ucanToken: "ucan",
+                caveatsBindingHex: String(repeating: "ab", count: 32)
+            )
+            Issue.record("expected Validation error for caveatsBindingHex without streamEpoch")
+        } catch let OutletError.validation(_, code) {
+            #expect(code == "SCP-VALID-7002")
+        }
+    }
+
+    @Test("invoke with only streamEpoch (no caveatsBindingHex) throws Validation (Finding 3)")
+    func partialStreamingParamsEpochOnly() async throws {
+        let namespace = makeNamespace()
+        do {
+            _ = try await namespace.invoke(
+                id: "outlet-x",
+                input: "{}",
+                ucanToken: "ucan",
+                streamEpoch: 7
+            )
+            Issue.record("expected Validation error for streamEpoch without caveatsBindingHex")
+        } catch let OutletError.validation(_, code) {
+            #expect(code == "SCP-VALID-7002")
+        }
+    }
+
+    @Test("invoke with binding+epoch but no ucanToken throws Validation (Finding 3)")
+    func streamingParamsWithoutUcan() async throws {
+        let namespace = makeNamespace()
+        do {
+            _ = try await namespace.invoke(
+                id: "outlet-x",
+                input: "{}",
+                caveatsBindingHex: String(repeating: "ab", count: 32),
+                streamEpoch: 7
+            )
+            Issue.record("expected Validation error for streaming params without ucanToken")
+        } catch let OutletError.validation(_, code) {
+            #expect(code == "SCP-VALID-7002")
+        }
+    }
+
+    @Test("invoke streaming with short caveatsBindingHex throws Validation (Finding 4)")
+    func caveatsBindingHexTooShort() async throws {
+        let namespace = makeNamespace()
+        do {
+            _ = try await namespace.invoke(
+                id: "outlet-x",
+                input: "{}",
+                ucanToken: "ucan",
+                caveatsBindingHex: String(repeating: "ab", count: 16), // 32 chars, not 64
+                streamEpoch: 7
+            )
+            Issue.record("expected Validation error for short caveatsBindingHex")
+        } catch let OutletError.validation(_, code) {
+            #expect(code == "SCP-VALID-7000")
+        }
+    }
+
+    @Test("invoke streaming with non-hex caveatsBindingHex throws Validation (Finding 4)")
+    func caveatsBindingHexNonHex() async throws {
+        let namespace = makeNamespace()
+        // 64 chars but contains non-hex characters.
+        let badHex = String(repeating: "zz", count: 32)
+        do {
+            _ = try await namespace.invoke(
+                id: "outlet-x",
+                input: "{}",
+                ucanToken: "ucan",
+                caveatsBindingHex: badHex,
+                streamEpoch: 7
+            )
+            Issue.record("expected Validation error for non-hex caveatsBindingHex")
+        } catch let OutletError.validation(_, code) {
+            #expect(code == "SCP-VALID-7000")
+        }
+    }
+
+    @Test("invoke one-shot without ucanToken throws Validation SCP-VALID-7003 (Finding 5)")
+    func oneShotWithoutUcan() async throws {
+        let namespace = makeNamespace()
+        do {
+            _ = try await namespace.invoke(id: "outlet-x", input: "{}")
+            Issue.record("expected Validation error for one-shot invoke without ucanToken")
+        } catch let OutletError.validation(_, code) {
+            #expect(code == "SCP-VALID-7003")
+        }
+    }
 }

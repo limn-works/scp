@@ -571,6 +571,19 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     private let stream: AsyncThrowingStream<OutletStreamChunk, Error>
     private let aggregateTask: Task<Aggregate, Error>
 
+    /// The aggregate resolver carrier — captured so `close()` can settle a
+    /// pending `await handle.aggregate` that the pump never resolved (an
+    /// UNBOUNDED control-plane-only stream has no terminal chunk). Without
+    /// this, awaiting after `close()` would hang forever. First outcome wins
+    /// (single-resume), so a normal terminal outcome from the pump takes
+    /// precedence and the close-time reject is a no-op.
+    private let resolverBox: AggregateResolverBox
+
+    /// The chunk-stream continuation — captured so `close()` can finish a
+    /// parked `for try await` reader. Finishing with the abnormal-closure
+    /// error mirrors the iterator's no-terminal-chunk path.
+    private let chunkContinuation: AsyncThrowingStream<OutletStreamChunk, Error>.Continuation?
+
     /// Resolves to the 32-char lowercase hex `request_id` of the
     /// underlying §5.4.5 stream once the streaming open completes, or
     /// `nil` for handles backed by the non-streaming (degenerate
@@ -678,6 +691,7 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
             chunkCont = cont
         }
         self.stream = stream
+        chunkContinuation = chunkCont
         // Resolve the aggregate continuation through a synchronized
         // one-shot carrier rather than bare captured `var`s shared
         // across two unordered Tasks. The carrier serializes the
@@ -687,6 +701,7 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
         // resolves exactly once even when the pump runs synchronously or
         // wins the schedule. See `AggregateResolverBox`.
         let resolverBox = AggregateResolverBox()
+        self.resolverBox = resolverBox
         aggregateTask = Task {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Aggregate, Error>) in
                 resolverBox.attach(cont)
@@ -884,6 +899,22 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     public func close() {
         guard cancelRegistry.markClosed() else { return }
         terminatedFlag.markTerminated()
+        // Settle the consumption channels so `await handle.aggregate` /
+        // `for try await chunk in handle` after `close()` ERROR cleanly
+        // rather than hang. An UNBOUNDED control-plane-only stream has no
+        // terminal chunk, so the pump never resolves/rejects the resolver
+        // or finishes the chunk stream. `AggregateResolverBox` /
+        // `AsyncThrowingStream.Continuation` are single-resume / idempotent,
+        // so a normal terminal outcome that already landed takes precedence
+        // and these calls are no-ops. Mirrors the TypeScript `close()`
+        // settlement (StreamAlreadyClosed for awaiters; abnormal-closure
+        // sentinel for iterator readers).
+        resolverBox.reject(OutletError.streamAlreadyClosed(
+            message: "handle closed before the stream produced a terminal chunk"
+        ))
+        chunkContinuation?.finish(throwing: OutletError.streamAlreadyClosed(
+            message: "handle closed before the stream produced a terminal chunk"
+        ))
         cancelRegistry.runHandlers()
     }
 
@@ -1439,9 +1470,9 @@ public actor OutletNamespace {
         creditWindow: UInt32? = nil,
         estimatedChunkCount: UInt32? = nil,
         aggregateSchemaJson: String? = nil
-    ) -> InvocationHandle {
+    ) throws -> InvocationHandle {
         if let cbh = caveatsBindingHex, let epoch = streamEpoch, let ucan = ucanToken {
-            return makeStreamingHandle(
+            return try makeStreamingHandle(
                 outletId: id,
                 inputJson: input,
                 ucanToken: ucan,
@@ -1454,7 +1485,22 @@ public actor OutletNamespace {
                 aggregateSchemaJson: aggregateSchemaJson
             )
         }
-        return makeOneShotHandle(
+        // Streaming-mode partial-parameter guard (parity with Python / TS /
+        // Kotlin). A streaming invocation requires BOTH caveatsBindingHex AND
+        // streamEpoch — supplying only one silently fell through to the
+        // one-shot path before, masking a caller mistake. Raise instead of
+        // degrading. The `ucanToken == nil` arm covers the case where the
+        // binding/epoch pair is present but the UCAN the streaming open
+        // re-runs through the 11-step pipeline is missing.
+        if caveatsBindingHex != nil || streamEpoch != nil {
+            throw OutletError.validation(
+                message: "streaming-mode invoke requires BOTH caveatsBindingHex (32 bytes) "
+                    + "and streamEpoch; pass them together (with ucanToken) or omit both "
+                    + "for the degenerate single-shot path",
+                code: "SCP-VALID-7002"
+            )
+        }
+        return try makeOneShotHandle(
             outletId: id,
             inputJson: input,
             ucanToken: ucanToken,
@@ -1471,7 +1517,20 @@ public actor OutletNamespace {
         proofTokens: [String]?,
         spendingUcan: String?,
         aggregateSchemaJson: String?
-    ) -> InvocationHandle {
+    ) throws -> InvocationHandle {
+        // One-shot UCAN pre-check (parity with TS `SCP-VALID-7003`). The
+        // degenerate single-shot bridge (`context_outlet_invoke`) takes a
+        // REQUIRED `ucan_token: &str` and runs `validate_ucan_token` on it —
+        // a nil/missing UCAN is rejected at the bridge. Fail at the SDK
+        // boundary so the caller gets a precise error at the call site
+        // instead of an opaque bridge rejection. Aligns Swift with the
+        // stronger TS DX across all four SDKs.
+        guard let ucan = ucanToken else {
+            throw OutletError.validation(
+                message: "ucanToken is required for ctx.outlets.invoke()",
+                code: "SCP-VALID-7003"
+            )
+        }
         let handle = self.handle
         let identity = self.identity
         return InvocationHandle(
@@ -1485,7 +1544,7 @@ public actor OutletNamespace {
                         outletId: outletId,
                         inputJson: inputJson,
                         identity: identity,
-                        ucanToken: ucanToken,
+                        ucanToken: ucan,
                         proofTokens: proofTokens,
                         spendingUcanJwt: spendingUcan
                     )
@@ -1520,7 +1579,21 @@ public actor OutletNamespace {
         spendingUcan: String?,
         aggregateSchemaJson: String?,
         ucanRecheckSecs: UInt32 = 10
-    ) -> InvocationHandle {
+    ) throws -> InvocationHandle {
+        // caveatsBindingHex is the 32-byte §5.4.5 caveat-binding rendered as
+        // 64 lowercase hex chars. Python / TS validate the 32-byte length
+        // (TS over `Uint8Array.byteLength`, Python over `len(bytes)`); Swift
+        // takes the hex string, so validate 64 hex chars + charset BEFORE
+        // forwarding to the bridge. Same `SCP-VALID-7000`-class code.
+        guard caveatsBindingHex.count == 64,
+              caveatsBindingHex.allSatisfy({ $0.isASCII && $0.isHexDigit })
+        else {
+            throw OutletError.validation(
+                message: "caveatsBindingHex must be exactly 64 hex characters "
+                    + "(32 bytes); got \(caveatsBindingHex.count) characters",
+                code: "SCP-VALID-7000"
+            )
+        }
         let handle = self.handle
         let identity = self.identity
         let invokerDidValue = identity.did()

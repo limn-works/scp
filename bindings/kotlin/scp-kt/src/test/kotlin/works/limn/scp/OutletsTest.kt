@@ -145,6 +145,20 @@ class OutletsTest {
         assertTrue(chunks.last() is OutletStreamChunk.End)
     }
 
+    @Test
+    fun `one-shot invoke without ucanToken raises Validation SCP-VALID-7003`() = runTest {
+        // Parity with the stronger TS DX (and Python / Swift): a degenerate
+        // one-shot invoke with no UCAN fails at the SDK boundary rather than
+        // deferring to the bridge.
+        val ns = InMemoryOutletNamespace()
+        val id = ns.register(OutletKind.ACTION, "{\"name\":\"calc\"}")
+        val err =
+            assertThrows(OutletError.Validation::class.java) {
+                ns.invoke(id, "{\"x\":1}")
+            }
+        assertEquals("SCP-VALID-7003", err.code)
+    }
+
     // --------------------------------------------------------------------
     // OutletNamespace shape: all verbs + sub-namespaces.
     // --------------------------------------------------------------------

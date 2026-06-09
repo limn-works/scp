@@ -630,8 +630,26 @@ class InvocationHandle:
         """
         if self._closed:
             return
+        # Capture whether a terminal outcome had already been observed
+        # BEFORE flipping the latch — a normally-completed stream already
+        # settled its consumption channel via the pump's terminal/None
+        # sentinel, so re-settling would be redundant.
+        was_terminated = self._terminated
         self._closed = True
         self._terminated = True
+        # Settle the consumption channel so ``await handle`` /
+        # ``async for chunk in handle`` AFTER aclose() ERROR cleanly rather
+        # than hang. Cancelling ``_pump_task`` below removes the only
+        # producer that would otherwise push a terminal/sentinel onto
+        # ``_chunks``; a consumer parked on ``self._chunks.get()`` would
+        # then wait forever. Pushing :class:`StreamAlreadyClosed` (a
+        # BaseException) unblocks both the awaiter (``_await_aggregate``)
+        # and the iterator (``__anext__``), each of which re-raises a
+        # queued exception. Mirrors the TS / Swift close() settlement.
+        if not was_terminated:
+            self._chunks.put_nowait(
+                StreamAlreadyClosed("handle closed before the stream produced a terminal chunk")
+            )
         for task in (self._recheck_task, self._pump_task):
             if task is None or task.done():
                 continue
@@ -1420,6 +1438,18 @@ class OutletNamespace:
         returned handle raise :class:`StreamAlreadyClosed` (OUT-038
         AC13) because the stream "ends" synchronously.
         """
+        # One-shot UCAN pre-check (parity with the stronger TS DX,
+        # ``SCP-VALID-7003``). The degenerate single-shot bridge
+        # (``context_outlet_invoke``) takes a REQUIRED ``ucan_token`` and
+        # runs ``validate_ucan_token`` on it — a ``None``/missing UCAN is
+        # rejected at the bridge. Fail at the SDK boundary so the caller
+        # gets a precise error at the call site rather than an opaque
+        # bridge rejection. Aligns Python with TS / Swift / Kotlin.
+        if ucan_token is None:
+            raise ValidationError(
+                "ucan_token is required for ctx.outlets.invoke()",
+                code="SCP-VALID-7003",
+            )
         q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
 
         async def _pump() -> None:

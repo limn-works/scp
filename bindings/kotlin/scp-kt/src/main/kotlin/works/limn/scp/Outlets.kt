@@ -585,6 +585,17 @@ class InvocationHandle
          *  when the handle has already been iterated via [asFlow]. */
         suspend fun aggregate(): Aggregate {
             guard("aggregate")
+            // Fail-closed if the handle was closed before consumption: an
+            // UNBOUNDED control-plane-only stream that is close()d has no
+            // terminal chunk, so draining it here would hang on cursor.next()
+            // forever. Surface StreamAlreadyClosed instead — parity with the
+            // TS / Swift / Python close() settlement (await after close
+            // ERRORS, never hangs).
+            if (closedFlag.get()) {
+                throw StreamAlreadyClosed(
+                    "handle closed before the stream produced a terminal chunk",
+                )
+            }
             val agg = aggregateFn()
             markTerminated()
             validateAggregate(agg)
@@ -606,6 +617,14 @@ class InvocationHandle
         fun asFlow(): Flow<OutletStreamChunk> =
             flow {
                 guard("stream")
+                // Fail-closed if the handle was closed before collection —
+                // an unbounded stream would otherwise block on cursor.next()
+                // forever. Parity with the aggregate() close-guard above.
+                if (closedFlag.get()) {
+                    throw StreamAlreadyClosed(
+                        "handle closed before the stream produced a terminal chunk",
+                    )
+                }
                 flowFn().collect { chunk ->
                     if (chunk is OutletStreamChunk.End ||
                         (chunk is OutletStreamChunk.Error && chunk.terminal)
@@ -999,6 +1018,22 @@ internal class InMemoryOutletNamespace(
                 "streaming-mode invoke requires BOTH caveatsBindingHex (64 hex chars) " +
                     "and streamEpoch; pass them together or omit both for the degenerate " +
                     "single-shot path",
+            )
+        }
+        // UCAN pre-check parity with the production namespace + the other
+        // SDKs: streaming requires ucanToken (SCP-VALID-7002); the degenerate
+        // one-shot path requires it too (SCP-VALID-7003 — the bridge's
+        // context_outlet_invoke takes a REQUIRED non-null UCAN).
+        if (caveatsBindingHex != null && streamEpoch != null) {
+            ucanToken ?: throw OutletError.Validation(
+                "streaming-mode invoke requires ucanToken (the bridge re-runs the " +
+                    "11-step ADR-016 pipeline at open)",
+                "SCP-VALID-7002",
+            )
+        } else {
+            ucanToken ?: throw OutletError.Validation(
+                "ucanToken is required for ctx.outlets.invoke()",
+                "SCP-VALID-7003",
             )
         }
         // The in-memory namespace does not run the §5.4.5 streaming

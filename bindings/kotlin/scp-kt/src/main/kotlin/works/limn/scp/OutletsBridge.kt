@@ -417,13 +417,25 @@ internal class BridgeBackedOutletNamespace internal constructor(
         spendingUcan: String?,
         aggregateSchemaJson: String?,
     ): InvocationHandle {
+        // One-shot UCAN pre-check (parity with the stronger TS DX,
+        // SCP-VALID-7003). The degenerate single-shot bridge requires a
+        // non-null UCAN and validates it; failing at the SDK boundary gives
+        // the caller a precise error at the call site rather than an opaque
+        // bridge rejection. Aligns Kotlin with TS / Python / Swift.
+        val validatedUcan =
+            ucanToken ?: throw OutletError.Validation(
+                "ucanToken is required for ctx.outlets.invoke()",
+                "SCP-VALID-7003",
+            )
         val aggregateFn: suspend () -> Aggregate = {
-            val output = bridge.invoke(handle, outletId, inputJson, identity, ucanToken, proofTokens, spendingUcan)
+            val output =
+                bridge.invoke(handle, outletId, inputJson, identity, validatedUcan, proofTokens, spendingUcan)
             Aggregate(valueJson = output, executionTimeMs = 0L)
         }
         val flowFn: () -> Flow<OutletStreamChunk> = {
             channelFlow {
-                val output = bridge.invoke(handle, outletId, inputJson, identity, ucanToken, proofTokens, spendingUcan)
+                val output =
+                    bridge.invoke(handle, outletId, inputJson, identity, validatedUcan, proofTokens, spendingUcan)
                 send(
                     OutletStreamChunk.End(
                         requestId = ByteArray(16),

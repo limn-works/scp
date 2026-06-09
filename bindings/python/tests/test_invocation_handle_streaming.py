@@ -33,6 +33,7 @@ from scp_sdk.errors import (
     OutletExecutionError,
     OutletProtocolError,
     StreamAlreadyClosed,
+    ValidationError,
 )
 from scp_sdk.outlets import (
     Aggregate,
@@ -858,3 +859,60 @@ class TestAcloseCancellationPropagation:
         # Must NOT raise — the child's own cancellation is owned by aclose.
         await handle.aclose()
         assert handle.is_terminated is True
+
+
+# ---------------------------------------------------------------------------
+# await handle AFTER aclose() must ERROR (StreamAlreadyClosed), never hang.
+# ---------------------------------------------------------------------------
+
+
+class TestAwaitAfterAclose:
+    """``aclose()`` settles the consumption channel so a later ``await
+    handle`` / ``async for`` ERRORS within a short timeout rather than
+    hanging on an empty queue whose only producer (the pump) was cancelled.
+    """
+
+    @pytest.mark.asyncio
+    async def test_await_after_aclose_raises_not_hang(self) -> None:
+        # Unbounded handle — empty queue, no pump pushing a terminal chunk.
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        handle = InvocationHandle(q, request_id="f6" * 16, invoker_did="did:dht:invoker")
+        await handle.aclose()
+
+        # wait_for surfaces a hang as TimeoutError; the fix makes the await
+        # raise StreamAlreadyClosed first.
+        with pytest.raises(StreamAlreadyClosed):
+            await asyncio.wait_for(handle, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_iterate_after_aclose_raises_not_hang(self) -> None:
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        handle = InvocationHandle(q, request_id="07" * 16, invoker_did="did:dht:invoker")
+        await handle.aclose()
+
+        async def _drain() -> None:
+            async for _chunk in handle:
+                pass
+
+        with pytest.raises(StreamAlreadyClosed):
+            await asyncio.wait_for(_drain(), timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# invoke() one-shot ucan_token pre-check parity (Finding 5, SCP-VALID-7003).
+# ---------------------------------------------------------------------------
+
+
+class TestInvokeOneShotUcanPrecheck:
+    """A degenerate single-shot ``invoke`` without ``ucan_token`` raises a
+    Validation error at the SDK boundary (``SCP-VALID-7003``) — parity with
+    the stronger TS DX across all four SDKs. The bridge's
+    ``context_outlet_invoke`` requires a non-empty UCAN, so a ``None`` is
+    invalid; failing at the call site gives a precise error.
+    """
+
+    def test_one_shot_without_ucan_raises_validation(self) -> None:
+        namespace = OutletNamespace("ctx-id", "did:dht:creator")
+        with pytest.raises(ValidationError) as exc_info:
+            namespace.invoke("outlet-x", {})
+        assert exc_info.value.code == "SCP-VALID-7003"
