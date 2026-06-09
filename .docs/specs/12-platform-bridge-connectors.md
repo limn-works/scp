@@ -706,7 +706,7 @@ This annotation is attached to the SCP message's provenance chain, making it aud
 
 **Rate limiting.** The bridge SHOULD rate-limit outbound forwarding to respect platform API limits. Rate limits are platform-specific and configured per bridge instance. The bridge MUST NOT drop messages due to rate limiting — it queues them and delivers in order when rate limit windows reset.
 
-**Local-event webhook taxonomy.** Separately from platform forwarding, a bridge node MAY expose an outbound webhook dispatcher that notifies registered HTTP targets when context events occur locally on the node. This is the SCP-to-operator-tooling channel (distinct from the SCP-to-platform forwarding above): each local `ContextEvent` emitted by a context the node hosts is mapped to a webhook event with a stable, dot-separated `event_type` and a JSON payload. Delivery is best-effort and at-least-once; signing and headers follow the same conventions as the inbound webhook endpoint (§12.10.4). The defined event types are:
+**Local-event webhook taxonomy.** Separately from platform forwarding, a bridge node MAY expose an outbound webhook dispatcher that notifies registered HTTP targets when context events occur locally on the node. This is the SCP-to-operator-tooling channel (distinct from the SCP-to-platform forwarding above): each local `ContextEvent` emitted by a context the node hosts is mapped to a webhook event with a stable, dot-separated `event_type` and a JSON payload. Signing and headers follow the same conventions as the inbound webhook endpoint (§12.10.4). The defined event types are:
 
 | `event_type` | Emitted when | Payload fields |
 |--------------|--------------|----------------|
@@ -718,6 +718,8 @@ This annotation is attached to the SCP message's provenance chain, making it aud
 | `context.event` | Any other context event (generic fallback) | `variant` (string — the event variant name) |
 
 The `context.event` generic fallback carries only the variant name so that new `ContextEvent` variants surface to webhook consumers without silent omission, while structured payloads are reserved for the explicitly enumerated, externally meaningful event types above. Payload fields contain only metadata — message content is never included in webhook payloads (export-policy enforcement and metadata stripping apply as described above).
+
+**Delivery is best-effort and lossy under load.** Local events for all contexts a node hosts pass through a single shared bounded channel before reaching the dispatcher. Under sustained load — a high-traffic context emitting faster than the consumer drains — the channel drops the **oldest** undelivered events (the consumer logs the dropped count at `error` level but cannot recover them). A slow or unreachable webhook target compounds this: dispatch is fire-and-forget with bounded retries, and a non-2xx or timed-out delivery is logged and abandoned, not queued. Consequently, webhook delivery MUST NOT be relied on as the sole channel for security-relevant audit (e.g. `member.left`, member-blocked, or `governance.action` events): a dropped or failed webhook leaves no gap-marker on the wire. The **durable Merkle event log** (ADR-011) is the authoritative, gap-detectable record of context events; operator tooling that requires completeness MUST reconcile against it rather than treating webhooks as lossless.
 
 ### 12.10.6 Bridge Node Lifecycle
 

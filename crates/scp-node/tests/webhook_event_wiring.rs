@@ -208,7 +208,7 @@ async fn context_event_reaches_webhook_dispatcher_end_to_end() {
     // Dispatcher uses a client that trusts the local cert and resolves the test
     // host to the capture server — everything else is production behavior.
     let client = trusting_client(&server.cert_pem, &server.host, server.addr);
-    let dispatcher = Arc::new(WebhookDispatcher::with_client(client));
+    let dispatcher = Arc::new(WebhookDispatcher::with_client_for_test(client));
 
     // Register a webhook target scoped to the context we will emit for.
     let signing_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -295,7 +295,7 @@ async fn context_event_reaches_webhook_dispatcher_end_to_end() {
 async fn consumer_respects_context_scoping() {
     let server = start_capture_server().await;
     let client = trusting_client(&server.cert_pem, &server.host, server.addr);
-    let dispatcher = Arc::new(WebhookDispatcher::with_client(client));
+    let dispatcher = Arc::new(WebhookDispatcher::with_client_for_test(client));
 
     let signing_key = SigningKey::from_bytes(&[9u8; 32]);
     let webhook_url = format!("https://{}:{}/hook", server.host, server.addr.port());

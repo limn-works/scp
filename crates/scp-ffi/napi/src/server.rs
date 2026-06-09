@@ -161,10 +161,26 @@ async fn auto_wire_context_manager(
 /// stay in lockstep. The consumer is aborted on bridge shutdown via the
 /// instance cancellation token, so it never leaks as a detached task.
 ///
-/// Best-effort: if the `Supervisor` is somehow absent, logs and skips rather
-/// than failing node startup.
+/// # Precondition (identical across all three bridges)
+///
+/// One-shot wiring at node startup gates on the shared
+/// [`CoreFields::check_ready`]: skip (log, never fail startup) if the instance
+/// is suspended OR shut down, then fetch the supervisor via
+/// [`CoreFields::try_supervisor`]. All three bridges (`PyO3`, `NAPI`, `UniFFI`)
+/// use this same `check_ready()` + `try_supervisor()` pair so they make the SAME
+/// decision about when to wire — rather than the general-purpose `supervisor(bi)`
+/// accessor, whose warn-on-shutdown-and-proceed semantics suit per-op dispatch
+/// but not startup wiring.
 async fn wire_node_webhook_events(bi: &Arc<NapiBridgeInstance>, node: &RunningNode) {
-    let Ok(supervisor) = crate::runtime::supervisor(bi) else {
+    if let Err(reason) = bi.core.check_ready() {
+        tracing::warn!(
+            %reason,
+            "wire_node_webhook_events: bridge not ready — skipping webhook \
+             wiring; local context events will not reach the webhook dispatcher"
+        );
+        return;
+    }
+    let Some(supervisor) = bi.core.try_supervisor() else {
         tracing::warn!(
             "wire_node_webhook_events: no Supervisor attached — local context \
              events will not reach the webhook dispatcher"

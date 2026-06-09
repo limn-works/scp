@@ -342,26 +342,48 @@ pub struct WebhookDispatcher {
 
 impl WebhookDispatcher {
     /// Creates a new empty dispatcher with a hardened HTTP client.
+    ///
+    /// The client disables redirect following (`redirect::Policy::none()`) as
+    /// an SSRF defense: a webhook target that 30x-redirects to an internal
+    /// address must not be followed. The fallback path, taken only if the
+    /// builder fails, is *also* redirect-disabled so this guarantee holds on
+    /// every path (see below).
     #[must_use]
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        // Primary: hardened client (no redirects, 10s timeout).
+        let hardened = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self::with_client(client)
+            .build();
+        // Fallback MUST also be redirect-disabled. `reqwest::Client::new()` /
+        // `Client::default()` follow redirects by default, which would
+        // silently re-enable the SSRF redirect vector if the primary build
+        // ever failed. Build a second redirect-none client; only if THAT also
+        // fails do we fall back to `Client::default()` — a degenerate path
+        // that cannot occur in practice (the builder only fails on TLS-backend
+        // initialization, which is identical for both attempts), but is kept
+        // infallible so node startup never panics.
+        let client = hardened.unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default()
+        });
+        Self::with_client_for_test(client)
     }
 
     /// Creates a new empty dispatcher with a caller-provided HTTP client.
     ///
-    /// Use this when the dispatcher must share a connection pool or a
-    /// specific TLS trust configuration with the rest of the application
-    /// (e.g. an integration harness that pins a self-signed root for a local
-    /// HTTPS webhook receiver). Production callers should prefer
-    /// [`new`](Self::new), which builds a hardened client with redirects
-    /// disabled (SSRF defense).
+    /// **Test-only.** This bypasses the SSRF hardening that [`new`](Self::new)
+    /// applies (redirect disabling): the supplied client is used verbatim. It
+    /// exists so integration tests can pin a self-signed root for a local
+    /// HTTPS webhook receiver and resolve a test hostname to loopback. No
+    /// production path constructs a dispatcher this way — production callers
+    /// MUST use [`new`](Self::new). Mirrors the established
+    /// `RelayTransportDiscovery::with_client_for_test` seam in `scp-transport`.
+    #[doc(hidden)]
     #[must_use]
-    pub fn with_client(client: reqwest::Client) -> Self {
+    pub fn with_client_for_test(client: reqwest::Client) -> Self {
         Self {
             targets: RwLock::new(HashMap::new()),
             client,
@@ -585,6 +607,10 @@ pub fn map_context_event(
         | ContextEvent::AppBound { .. }
         | ContextEvent::AppUnbound { .. }
         | ContextEvent::DegradedMode { .. }
+        // `WelcomeGenerated` is suppressed upstream in `emit_event_into`
+        // (state.rs): it carries MLS key material and is pushed to the receive
+        // buffer only, never sent on the broadcast channel. It therefore cannot
+        // reach this consumer; it is listed here solely for match exhaustiveness.
         | ContextEvent::WelcomeGenerated { .. }
         | ContextEvent::BufferOverflow { .. }
         | ContextEvent::SequenceGapDetected { .. }
@@ -628,9 +654,22 @@ pub fn spawn_event_consumer(
                         .await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    tracing::warn!(
+                    // The supervisor's event channel is a single bounded
+                    // broadcast shared across ALL contexts the node hosts. A
+                    // high-traffic context can evict another context's events
+                    // (member.left, MemberBlocked, governance.action) before
+                    // this consumer reads them — those webhook deliveries are
+                    // then silently lost. Escalate to error: security-relevant
+                    // audit events may have been dropped. Webhook delivery is
+                    // best-effort and MUST NOT be the sole audit channel; the
+                    // durable Merkle event log is authoritative (spec §12.10.5).
+                    tracing::error!(
                         count,
-                        "webhook event consumer lagged — {count} events dropped"
+                        "webhook event consumer lagged — {count} context events DROPPED \
+                         before delivery; security-relevant audit events (member.left, \
+                         MemberBlocked, governance.action) may have been lost. Webhook \
+                         delivery is lossy under load — rely on the durable Merkle event \
+                         log for audit, not webhooks (spec §12.10.5)"
                     );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
