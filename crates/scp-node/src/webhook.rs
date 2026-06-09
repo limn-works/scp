@@ -345,30 +345,24 @@ impl WebhookDispatcher {
     ///
     /// The client disables redirect following (`redirect::Policy::none()`) as
     /// an SSRF defense: a webhook target that 30x-redirects to an internal
-    /// address must not be followed. The fallback path, taken only if the
-    /// builder fails, is *also* redirect-disabled so this guarantee holds on
-    /// every path (see below).
+    /// address must not be followed.
     #[must_use]
     pub fn new() -> Self {
-        // Primary: hardened client (no redirects, 10s timeout).
-        let hardened = reqwest::Client::builder()
+        // `reqwest::Client::builder().build()` only fails on process-wide,
+        // deterministic TLS-backend initialization — not on anything specific
+        // to this builder configuration. If it fails here, no redirect-none
+        // client is constructible on this process at all, so a panic-free node
+        // startup cannot simultaneously guarantee redirect-none on that
+        // unreachable path. We accept `Client::default()` there (which DOES
+        // follow redirects) rather than panic, because reaching it means TLS
+        // is already broken process-wide and no webhook can be delivered
+        // anyway. We do not retry the builder: a second attempt fails
+        // identically, so it would be dead code, not defense in depth.
+        let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
-            .build();
-        // Fallback MUST also be redirect-disabled. `reqwest::Client::new()` /
-        // `Client::default()` follow redirects by default, which would
-        // silently re-enable the SSRF redirect vector if the primary build
-        // ever failed. Build a second redirect-none client; only if THAT also
-        // fails do we fall back to `Client::default()` — a degenerate path
-        // that cannot occur in practice (the builder only fails on TLS-backend
-        // initialization, which is identical for both attempts), but is kept
-        // infallible so node startup never panics.
-        let client = hardened.unwrap_or_else(|_| {
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap_or_default()
-        });
+            .build()
+            .unwrap_or_default();
         Self::with_client_for_test(client)
     }
 
@@ -516,7 +510,7 @@ impl Default for WebhookDispatcher {
 }
 
 // ---------------------------------------------------------------------------
-// ContextEvent → webhook event mapping (#1539 AC3)
+// ContextEvent → webhook event mapping
 // ---------------------------------------------------------------------------
 
 /// Maps a [`scp_core::context::membership::ContextEvent`] to a `(event_type, payload)`
@@ -640,6 +634,29 @@ pub fn map_context_event(
 /// The task runs until the receiver's channel is closed (all senders
 /// dropped) or the returned [`tokio::task::JoinHandle`] is aborted.
 /// Lagged events are logged and skipped.
+///
+/// # Drain-vs-dispatch decoupling
+///
+/// The supervisor's event channel is a single bounded broadcast shared across
+/// ALL contexts the node hosts. Dispatch is slow and adversary-influenced: a
+/// single unreachable or hostile webhook target walks the full retry ladder
+/// (exponential backoff plus per-attempt 10s timeouts), which can take several
+/// seconds per event. If the recv loop awaited each dispatch inline, one
+/// high-latency target on one context would stall the drain for the entire
+/// shared channel and silently evict another context's audit events
+/// (`member.left`, `MemberBlocked`, `governance.action`) before they were ever
+/// read.
+///
+/// To keep the drain running at channel speed, each event's dispatch is moved
+/// onto its own [`tokio::spawn`]ed task and the loop proceeds to the next
+/// `recv()` immediately. The dispatcher is an [`Arc`], so it is cheaply cloned
+/// into each task. These dispatch tasks are best-effort: they are not tracked
+/// and die with the runtime when the node shuts down (the consumer's own
+/// lifecycle — cancellation/abort via the supervising `JoinSet` — tears the
+/// node down). `dispatch_event` owns all of its own error handling and retries
+/// and never panics, so a detached dispatch task cannot escape a panic. The
+/// per-event spawn is bounded by the cap-1024 broadcast burst, so it does not
+/// introduce an unbounded backlog primitive.
 pub fn spawn_event_consumer(
     mut rx: tokio::sync::broadcast::Receiver<(String, scp_core::context::membership::ContextEvent)>,
     dispatcher: Arc<WebhookDispatcher>,
@@ -648,10 +665,20 @@ pub fn spawn_event_consumer(
         loop {
             match rx.recv().await {
                 Ok((context_id, event)) => {
+                    // `event_type` is a `&'static str`, so it moves into the
+                    // dispatch task without allocation.
                     let (event_type, payload) = map_context_event(&event);
-                    dispatcher
-                        .dispatch_event(&context_id, event_type, payload)
-                        .await;
+                    // Decouple the drain from dispatch latency: spawn the
+                    // per-event dispatch so the next recv() proceeds at channel
+                    // speed and a slow target on one context cannot evict
+                    // another context's audit events. Best-effort: the task
+                    // dies with the runtime on shutdown.
+                    let dispatcher = Arc::clone(&dispatcher);
+                    tokio::spawn(async move {
+                        dispatcher
+                            .dispatch_event(&context_id, event_type, payload)
+                            .await;
+                    });
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                     // The supervisor's event channel is a single bounded
@@ -1024,7 +1051,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // End-to-end webhook integration test (#1539 AC6)
+    // End-to-end webhook integration test
     // -----------------------------------------------------------------------
 
     /// Captured HTTP request data from the local webhook server.
@@ -1136,7 +1163,7 @@ mod tests {
     }
 
     /// Full HTTP roundtrip: local server receives POST with valid Ed25519
-    /// signature, correct headers, and structured JSON body (#1539 AC6).
+    /// signature, correct headers, and structured JSON body.
     #[tokio::test]
     async fn webhook_integration_end_to_end() {
         let (addr, rx, server_handle) = start_webhook_server().await;
@@ -1169,7 +1196,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // ContextEvent mapping tests (#1539 AC3)
+    // ContextEvent mapping tests
     // -------------------------------------------------------------------
 
     #[test]

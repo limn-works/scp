@@ -146,6 +146,8 @@ This is lock-free-read-compliant under §Decision 12: `subscribe()` is called **
 
 Production supervisors enable the channel **unconditionally** — each FFI bridge's `build_supervisor` passes `Some(event_tx)`, so `subscribe_events()` always yields a receiver in production. Query/test shims (e.g. `Supervisor::for_query_shim`) may construct a supervisor with no channel; for those `subscribe_events()` returns `None` and observers skip wiring rather than panic. The asymmetry is intentional: the channel exists to feed external sinks (webhooks, SDK listeners), which only matter when a node is actually running.
 
+**Scope of the current wiring.** The subscribe → map → dispatch path is wired end-to-end: a `ContextEvent` emitted by a context actor reaches the `WebhookDispatcher`. What is **not** yet wired in production is the dispatcher's *outbound target registration* — there is no operator-facing surface that registers webhook URLs/signing keys onto the dispatcher's target table. The dispatcher therefore holds zero targets at runtime, and `dispatch_event` is a no-op fan-out until such a surface exists; delivery is end-to-end only once an operator-facing target-registration API drives `WebhookDispatcher::register`. The event *plumbing* is complete and tested; actual outbound delivery is gated on that future operator-config surface. Until it lands, the only consumers exercising the full path are the integration tests, which register targets directly (see `scp-node/tests/webhook_event_wiring.rs`).
+
 ### 13. Lock-elimination validation gate (general rule)
 
 Every commit that deletes or splits a serializing primitive needs a Shuttle/stress test under realistic I/O jitter, asserting:

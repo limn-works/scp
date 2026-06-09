@@ -638,6 +638,17 @@ impl Supervisor {
     /// Message payloads on the channel are stripped of plaintext before sending
     /// (see [`crate::context::state::strip_event_payload`]) — subscribers
     /// observe metadata only, never decrypted content.
+    ///
+    /// # Delivery scope
+    ///
+    /// The subscribe → map → dispatch path is wired end-to-end, but the
+    /// outbound webhook dispatcher's *target registration* is not yet wired to
+    /// an operator-facing surface. Until such a surface registers webhook URLs
+    /// and signing keys, the dispatcher holds no targets and outbound delivery
+    /// is a no-op fan-out: events reach the dispatcher but are delivered to
+    /// nobody. End-to-end delivery is therefore gated on a future
+    /// operator-config API; this method's contract (fresh receiver, stripped
+    /// payloads, post-subscription semantics) is unaffected by that gap.
     #[must_use]
     pub fn subscribe_events(
         &self,

@@ -17,14 +17,16 @@
 //! correct event type, structured body, and a valid Ed25519 signature.
 //!
 //! The producer half (a live `Supervisor` emitting events on real context
-//! operations) is covered by the `event_channel_*` tests in `scp-runtime`; this
-//! test covers the node-side consumer wire that was previously unreachable in
-//! production.
+//! operations) is covered by
+//! `supervisor_send_emits_stripped_message_sent_to_subscriber` in
+//! `scp-runtime/tests/event_channel_producer.rs`; this test covers the
+//! node-side consumer wire that was previously unreachable in production.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use ed25519_dalek::{SigningKey, Verifier};
@@ -35,6 +37,10 @@ use scp_node::webhook::{WebhookDispatcher, WebhookTarget, spawn_event_consumer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+
+/// Monotonic counter giving each capture server a unique SAN host, so a single
+/// reqwest client can route to several servers via per-host `.resolve()`.
+static SERVER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Captured webhook request: the raw HTTP request bytes received by the server.
 struct CapturedRequest {
@@ -89,7 +95,24 @@ struct CaptureServer {
 /// not resolve to any blocked IP), while the reqwest client reaches it via an
 /// explicit `.resolve()` override to 127.0.0.1.
 async fn start_capture_server() -> CaptureServer {
-    let host = "webhook.scp-test.invalid".to_owned();
+    start_capture_server_with_delay(Duration::ZERO).await
+}
+
+/// Like [`start_capture_server`], but the server waits `response_delay` after
+/// reading the request before sending its 200 response. Used to model a slow
+/// (or unreachable-feeling) webhook target so the consumer's drain-vs-dispatch
+/// decoupling can be observed: a slow target must NOT stall delivery to a fast
+/// target on another context.
+///
+/// Each server uses a distinct, non-resolvable SAN host so a single reqwest
+/// client can route to multiple capture servers via per-host `.resolve()`
+/// overrides.
+async fn start_capture_server_with_delay(response_delay: Duration) -> CaptureServer {
+    // A unique host per server so the client can resolve each independently.
+    let host = format!(
+        "webhook-{}.scp-test.invalid",
+        SERVER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let cert = rcgen::generate_simple_self_signed(vec![host.clone()]).unwrap();
     let cert_pem = cert.cert.pem();
     let key_der = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
@@ -140,6 +163,11 @@ async fn start_capture_server() -> CaptureServer {
                             }
                         }
                     }
+                }
+                // Model a slow target: hold the response so the consumer's
+                // drain-vs-dispatch decoupling can be observed.
+                if !response_delay.is_zero() {
+                    tokio::time::sleep(response_delay).await;
                 }
                 // Respond 200 OK so dispatch reports success.
                 let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -196,6 +224,22 @@ fn trusting_client(cert_pem: &str, host: &str, addr: SocketAddr) -> reqwest::Cli
         .resolve(host, addr)
         .build()
         .unwrap()
+}
+
+/// Builds a reqwest client that trusts several capture servers' self-signed
+/// certs and resolves each server's host to its loopback address. Lets one
+/// dispatcher fan out to multiple capture servers (slow + fast targets).
+fn trusting_multi_client(servers: &[&CaptureServer]) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10));
+    for server in servers {
+        let cert = reqwest::Certificate::from_pem(server.cert_pem.as_bytes()).unwrap();
+        builder = builder
+            .add_root_certificate(cert)
+            .resolve(&server.host, server.addr);
+    }
+    builder.build().unwrap()
 }
 
 /// Full wire: a `ContextEvent` sent on the broadcast channel is consumed by the
@@ -348,4 +392,106 @@ async fn consumer_exits_cleanly_on_channel_close() {
         .await
         .expect("consumer must exit when the channel closes")
         .expect("consumer task must not panic");
+}
+
+/// The recv loop must drain at channel speed, not at dispatch speed: a slow
+/// target on one context must NOT stall delivery of a later event to a fast
+/// target on another context. Regression guard for the drain-vs-dispatch
+/// coupling that would let one high-latency webhook target silently evict
+/// another context's audit events from the shared broadcast channel.
+///
+/// Two targets share one dispatcher: a SLOW server (holds its response for
+/// `SLOW_DELAY`) scoped to `ctx-slow`, and a FAST server scoped to `ctx-fast`.
+/// The slow event is enqueued first, then the fast event. If dispatch were
+/// awaited inline in the recv loop, the fast delivery could not occur until the
+/// slow dispatch returned (>= `SLOW_DELAY`). With the per-event spawn, the fast
+/// delivery lands promptly — well under `SLOW_DELAY`.
+#[tokio::test]
+async fn consumer_drains_past_a_slow_target() {
+    const SLOW_DELAY: Duration = Duration::from_secs(3);
+
+    let slow_server = start_capture_server_with_delay(SLOW_DELAY).await;
+    let fast_server = start_capture_server_with_delay(Duration::ZERO).await;
+
+    let client = trusting_multi_client(&[&slow_server, &fast_server]);
+    let dispatcher = Arc::new(WebhookDispatcher::with_client_for_test(client));
+
+    // Slow target — scoped to ctx-slow.
+    let slow_url = format!(
+        "https://{}:{}/hook",
+        slow_server.host,
+        slow_server.addr.port()
+    );
+    dispatcher
+        .register(
+            "slow-bridge".to_owned(),
+            WebhookTarget {
+                url: slow_url,
+                signing_key: SigningKey::from_bytes(&[1u8; 32]),
+                context_ids: vec!["ctx-slow".to_owned()],
+            },
+        )
+        .await;
+
+    // Fast target — scoped to ctx-fast.
+    let fast_url = format!(
+        "https://{}:{}/hook",
+        fast_server.host,
+        fast_server.addr.port()
+    );
+    dispatcher
+        .register(
+            "fast-bridge".to_owned(),
+            WebhookTarget {
+                url: fast_url,
+                signing_key: SigningKey::from_bytes(&[2u8; 32]),
+                context_ids: vec!["ctx-fast".to_owned()],
+            },
+        )
+        .await;
+
+    let (tx, rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(1024);
+    let consumer = spawn_event_consumer(rx, Arc::clone(&dispatcher));
+
+    // Enqueue the SLOW-context event first, then the FAST-context event.
+    tx.send((
+        "ctx-slow".to_owned(),
+        ContextEvent::MemberJoined {
+            member_did: DID::from("did:key:slow"),
+            role_name: "member".to_owned(),
+        },
+    ))
+    .expect("send slow event");
+    tx.send((
+        "ctx-fast".to_owned(),
+        ContextEvent::MemberJoined {
+            member_did: DID::from("did:key:fast"),
+            role_name: "member".to_owned(),
+        },
+    ))
+    .expect("send fast event");
+
+    // The fast delivery must arrive well before the slow target would respond.
+    // Allow generous headroom (1s) for TLS + scheduling while staying far under
+    // the 3s slow delay — an inline-await consumer could not meet this bound.
+    let start = std::time::Instant::now();
+    let fast = tokio::time::timeout(Duration::from_millis(1500), fast_server.captured)
+        .await
+        .expect("fast target must be delivered without waiting on the slow target")
+        .expect("fast capture channel should yield a request");
+    let elapsed = start.elapsed();
+
+    consumer.abort();
+
+    assert!(
+        elapsed < SLOW_DELAY,
+        "fast delivery ({elapsed:?}) must complete before the slow target's {SLOW_DELAY:?} response"
+    );
+
+    // Sanity: the fast target received the fast-context event, not the slow one.
+    let body = fast.body();
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body).expect("fast body must be valid JSON");
+    assert_eq!(body_json["context_id"], "ctx-fast");
+    assert_eq!(body_json["payload"]["member_did"], "did:key:fast");
 }
