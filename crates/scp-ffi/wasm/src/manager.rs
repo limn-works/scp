@@ -867,15 +867,25 @@ pub(crate) struct WasmOutletStreamSession {
     /// stream with `execution.credit-exhausted` (`SCP-TOOL-6131`)
     /// "regardless of executor behavior" (§5.4.5).
     ///
-    /// WASM limitation (honest): the WASM bridge does NOT parse the UCAN
-    /// `nb` caveats to recover a VALIDATED-NARROWED `max_calls` (no
-    /// out-of-process operator / runtime `CreditTracker` per ADR-034). The
-    /// ceiling is sourced from the SDK-declared `estimated_chunk_count` at
-    /// open — the same value the SDK commits into the `caveats_binding`
-    /// preimage — used consistently as the cumulative billable cap. On the
-    /// native bridges the runtime coerces `max_calls` from the validated
-    /// caveats and takes `min(credit_window, max_calls)`; WASM treats the
-    /// declared estimate as the authoritative ceiling.
+    /// Sourced from the VALIDATED-NARROWED UCAN `nb` `max_calls` caveat
+    /// via [`crate::outlet_stream::enforce_stream_open_caveats`] at open —
+    /// NOT from the SDK-declared `estimated_chunk_count`. That helper parses
+    /// the already-validated action UCAN's `nb`, pins this ceiling to
+    /// `min(estimated_chunk_count, validated max_calls)`, and REJECTS an
+    /// over-declared `estimated_chunk_count > max_calls` rather than
+    /// silently clamping (mirroring the native runtime's
+    /// `enforce_estimated_chunk_count_bound` → `EstimateExceedsBound`).
+    /// `None` means the token carried no `max_calls` caveat — unbounded,
+    /// matching the runtime's `max_billable = None`.
+    ///
+    /// WASM limitation (honest): the bridge has no durable counter store
+    /// (no out-of-process operator / runtime `CreditTracker` per ADR-034),
+    /// so it cannot enforce the CROSS-invocation counter caveats
+    /// `rate_window` / `amount_max_cumulative` — `enforce_stream_open_caveats`
+    /// FAILS CLOSED (rejects the open) when either is present. `max_calls`,
+    /// by contrast, is a WITHIN-stream chunk ceiling enforceable statelessly,
+    /// so it is the one counter-bearing caveat the WASM streaming path
+    /// honours directly rather than rejecting.
     pub max_calls: Option<u32>,
     /// Count of billable `Data` chunks emitted so far. Compared against
     /// [`Self::max_calls`] by `outlet_stream_next` BEFORE popping a
@@ -1046,10 +1056,13 @@ pub struct OpenOutletStreamParams<'a> {
     /// §5.4.5:758 HARD cumulative billable-chunk ceiling — `Some(cap)`
     /// pins the maximum number of billable `Data` chunks the stream may
     /// EVER emit (no number of credit grants can raise it); `None` means
-    /// unbounded. Sourced from the SDK-declared `estimated_chunk_count`
-    /// (the WASM bridge does not parse the UCAN `nb` caveats to recover a
-    /// VALIDATED-NARROWED `max_calls` per ADR-034 — see
-    /// [`WasmOutletStreamSession::max_calls`] for the honest limitation).
+    /// unbounded. Sourced from the VALIDATED-NARROWED UCAN `nb`
+    /// `max_calls` caveat via
+    /// [`crate::outlet_stream::enforce_stream_open_caveats`]
+    /// (`min(estimated_chunk_count, validated max_calls)`, with an
+    /// over-declared estimate rejected) — NOT from the SDK-declared
+    /// `estimated_chunk_count`. See [`WasmOutletStreamSession::max_calls`]
+    /// for the full sourcing + ADR-034 fail-closed limitation note.
     pub max_calls: Option<u32>,
 }
 
@@ -3002,8 +3015,11 @@ impl WasmContextManager {
                 // do NOT consume credit.
                 remaining_credit: credit_window,
                 // §5.4.5:758 cumulative billable ceiling pinned at open
-                // from the SDK-declared estimate (WASM does not parse the
-                // UCAN `nb` caveats — see `WasmOutletStreamSession::max_calls`).
+                // from the VALIDATED-NARROWED UCAN `nb` `max_calls` caveat
+                // (`enforce_stream_open_caveats` —
+                // `min(estimated, validated max_calls)`, over-declared
+                // estimate rejected); NOT the SDK-declared estimate. See
+                // `WasmOutletStreamSession::max_calls`.
                 max_calls,
                 billed_emitted: 0,
                 invoker_did: identity_did.to_owned(),
