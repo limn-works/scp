@@ -606,44 +606,19 @@ pub(crate) async fn context_create_on(
             })
         })?;
 
-    // §9.10.4: Send pseudonym announcement to inform other members of the
-    // creator's per-context routing ID. For freshly created single-member
-    // contexts this is a no-op (no recipients), but on restored/imported
-    // contexts with existing members the announcement is needed.
-    // Best-effort: if signing key is not available, skip silently. Routes
-    // through the ADR-049 commit-8 messaging shim.
-    if local_pseudonym.is_some() {
-        #[cfg(feature = "allow_in_memory_custody")]
-        {
-            let custody_and_key = crate::runtime::with_identity(bi, &creator_did, |e| {
-                Ok((e.custody.clone(), e.identity.active_signing_key))
-            })
-            .ok();
-            if let Some((custody, key_handle)) = custody_and_key
-                && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
-            {
-                use scp_core::context::actor::commands::{
-                    MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-                };
-                let sender_did = DID(creator_did.clone());
-                let ann_ctx_id = core_handle.context_id().to_owned();
-                let ann_params = core_handle.params().clone();
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = MessagingCommand::SendPseudonymAnnouncement {
-                    payload: Box::new(SendPseudonymAnnouncementPayload {
-                        context_id: ann_ctx_id.clone(),
-                        params: ann_params,
-                        sender_did,
-                        signing_key: SigningKeyBytes::from_signing_key(&sk),
-                    }),
-                    reply: tx,
-                };
-                if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
-                    let _ = rx.await;
-                }
-            }
-        }
-    }
+    // §9.10.4: The creator's per-context pseudonym routing ID is already passed
+    // into `create_context` above (via `local_pseudonym`). A freshly created
+    // context has exactly one member (the creator), so there is nobody to
+    // announce the routing ID to — the announcement would be a guaranteed
+    // no-op. The PyO3 reference bridge (`py_context_create`) likewise sends no
+    // announcement on create; the routing ID is announced on `join` (where
+    // existing members must learn it). Sending it here additionally forced a
+    // raw signing-key export (`export_ed25519_signing_key`), which a sign-only
+    // custody backend (OS keychain / HSM / secure enclave) legitimately refuses
+    // — surfacing the refusal as a hard error on every `context_create`. Not
+    // exporting the key on create keeps `context_create` compatible with
+    // sign-only custody and matches the reference bridge. The genuine
+    // announcement remains on `context_join`, where recipients exist.
 
     let handle = NapiContextHandle {
         context_id,
