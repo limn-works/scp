@@ -942,6 +942,16 @@ where
         as Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>
 }
 
+/// Bounded capacity of the supervisor's `ContextEvent` broadcast channel.
+///
+/// Every production supervisor built here enables this channel so that local
+/// context events can be consumed by external sinks — notably the node's
+/// outbound webhook dispatcher (spec §12.10.5), wired in [`crate::server`] node
+/// startup. Lagging consumers drop the oldest events (logged, never panics);
+/// `1024` matches the documented default shared with the `PyO3` reference
+/// bridge.
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
 /// Constructs an `Arc<Supervisor>` with the given providers (ADR-049
 /// commit 12c.9g.3.6 — bridge layer no longer touches
 /// `ContextManager`). [`scp_core::context::supervisor::Supervisor::with_providers`]
@@ -952,6 +962,14 @@ where
 /// the bridge supplies it (spec §17.6 / ADR-049). It is the single chosen
 /// `Storage` erased once into the `OpenMLS` view, derived from the bridge
 /// instance's `mls_storage_ref()`.
+///
+/// The event broadcast channel is always enabled (capacity
+/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — e.g. the node webhook
+/// dispatcher — can subscribe via
+/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
+/// When no consumer subscribes, emitting into the channel is a cheap no-op: the
+/// retained sender has no receivers, so `send` returns `Err` and the event is
+/// simply dropped without blocking context operations.
 fn build_supervisor_arc(
     crypto: Arc<scp_core::crypto::mls::provider::MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
@@ -959,6 +977,10 @@ fn build_supervisor_arc(
     persistence: Box<dyn ContextPersistence>,
     mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
+    // Enable the event broadcast channel so `subscribe_events()` yields a
+    // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
+    // is dropped immediately; the retained sender keeps the channel open.
+    let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     scp_core::context::supervisor::Supervisor::with_providers(
         crypto,
         transport,
@@ -966,7 +988,7 @@ fn build_supervisor_arc(
         not_configured_key_resolver(),
         Some(persistence),
         None,
-        None,
+        Some(event_tx),
         None,
         mls_storage,
     )

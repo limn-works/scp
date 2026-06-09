@@ -706,6 +706,19 @@ This annotation is attached to the SCP message's provenance chain, making it aud
 
 **Rate limiting.** The bridge SHOULD rate-limit outbound forwarding to respect platform API limits. Rate limits are platform-specific and configured per bridge instance. The bridge MUST NOT drop messages due to rate limiting — it queues them and delivers in order when rate limit windows reset.
 
+**Local-event webhook taxonomy.** Separately from platform forwarding, a bridge node MAY expose an outbound webhook dispatcher that notifies registered HTTP targets when context events occur locally on the node. This is the SCP-to-operator-tooling channel (distinct from the SCP-to-platform forwarding above): each local `ContextEvent` emitted by a context the node hosts is mapped to a webhook event with a stable, dot-separated `event_type` and a JSON payload. Delivery is best-effort and at-least-once; signing and headers follow the same conventions as the inbound webhook endpoint (§12.10.4). The defined event types are:
+
+| `event_type` | Emitted when | Payload fields |
+|--------------|--------------|----------------|
+| `message.received` | A message is received in the context | `sender_did` (string) |
+| `message.sent` | A message is sent in the context | `sender_did` (string), `sequence_number` (integer) |
+| `member.joined` | A member joins the context | `member_did` (string), `role_name` (string) |
+| `member.left` | A member leaves the context | `member_did` (string) |
+| `governance.action` | A governance action executes | `proposal_id` (hex string), `action_summary` (string), `executor_did` (string), `resulting_epoch` (integer), `target_did` (string or null) |
+| `context.event` | Any other context event (generic fallback) | `variant` (string — the event variant name) |
+
+The `context.event` generic fallback carries only the variant name so that new `ContextEvent` variants surface to webhook consumers without silent omission, while structured payloads are reserved for the explicitly enumerated, externally meaningful event types above. Payload fields contain only metadata — message content is never included in webhook payloads (export-policy enforcement and metadata stripping apply as described above).
+
 ### 12.10.6 Bridge Node Lifecycle
 
 The bridge node mediates between the platform's HTTP API and SCP protocol operations. The lifecycle is:

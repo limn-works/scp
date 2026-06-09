@@ -168,6 +168,42 @@ fn auto_wire_context_manager(
     });
 }
 
+/// Wires the local `Supervisor` event channel into the node's outbound webhook
+/// dispatcher and supervises the consumer under the bridge instance's lifecycle
+/// (spec §12.10.5).
+///
+/// This is the `PyO3` reference bridge's node-startup wire. The production
+/// `Supervisor` built by [`crate::runtime`]'s `build_supervisor` always enables
+/// its event channel, so `subscribe_events()` yields a receiver. Delegates the
+/// subscribe → wire → supervise block to the shared
+/// [`RunningNode::wire_and_supervise_context_events`] seam so all three bridges
+/// stay in lockstep. The consumer is aborted on bridge shutdown via the instance
+/// cancellation token, so it never leaks as a detached task.
+///
+/// Best-effort: if the `Supervisor` is somehow absent, logs and skips rather
+/// than failing node startup.
+fn wire_node_webhook_events(
+    bi: &crate::runtime::PyBridgeInstance,
+    py: Python<'_>,
+    rt: &tokio::runtime::Runtime,
+    node: &RunningNode,
+) {
+    py.allow_threads(|| {
+        let Ok(supervisor) = crate::runtime::supervisor(bi) else {
+            tracing::warn!(
+                "wire_node_webhook_events: no Supervisor attached — local context \
+                 events will not reach the webhook dispatcher"
+            );
+            return;
+        };
+        let cancel = bi.core.cancel_token();
+        rt.block_on(async {
+            let mut tasks = bi.core.task_handle().await;
+            node.wire_and_supervise_context_events(supervisor, &mut tasks, cancel);
+        });
+    });
+}
+
 // ---------------------------------------------------------------------------
 // PyRelayHandle
 // ---------------------------------------------------------------------------
@@ -629,9 +665,12 @@ impl crate::scp::PyScp {
         let bridge_token = node.bridge_token_hex();
         auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
 
+        let inner = RunningNode::InMemory(node);
+        wire_node_webhook_events(bi, py, rt, &inner);
+
         let instance_id = bi.core.instance_id();
         Ok(PyNodeHandle {
-            inner: RunningNode::InMemory(node),
+            inner,
             instance_id,
             bi: Arc::clone(&self.inner),
         })
@@ -684,9 +723,12 @@ impl crate::scp::PyScp {
         let bridge_token = node.bridge_token_hex();
         auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
 
+        let inner = RunningNode::Filesystem(node);
+        wire_node_webhook_events(bi, py, rt, &inner);
+
         let instance_id = bi.core.instance_id();
         Ok(PyNodeHandle {
-            inner: RunningNode::Filesystem(node),
+            inner,
             instance_id,
             bi: Arc::clone(&self.inner),
         })

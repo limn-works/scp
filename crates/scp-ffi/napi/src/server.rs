@@ -149,6 +149,33 @@ async fn auto_wire_context_manager(
     }
 }
 
+/// Wires the local `Supervisor` event channel into the node's outbound webhook
+/// dispatcher and supervises the consumer under the bridge instance's lifecycle
+/// (spec §12.10.5).
+///
+/// Mirrors the `PyO3` reference bridge (`crates/scp-ffi/src/server.rs`). The
+/// production `Supervisor` built by [`crate::runtime`]'s `build_supervisor_arc`
+/// always enables its event channel, so `subscribe_events()` yields a receiver.
+/// Delegates the subscribe → wire → supervise block to the shared
+/// [`RunningNode::wire_and_supervise_context_events`] seam so all three bridges
+/// stay in lockstep. The consumer is aborted on bridge shutdown via the
+/// instance cancellation token, so it never leaks as a detached task.
+///
+/// Best-effort: if the `Supervisor` is somehow absent, logs and skips rather
+/// than failing node startup.
+async fn wire_node_webhook_events(bi: &Arc<NapiBridgeInstance>, node: &RunningNode) {
+    let Ok(supervisor) = crate::runtime::supervisor(bi) else {
+        tracing::warn!(
+            "wire_node_webhook_events: no Supervisor attached — local context \
+             events will not reach the webhook dispatcher"
+        );
+        return;
+    };
+    let cancel = bi.core.cancel_token();
+    let mut tasks = bi.core.task_handle().await;
+    node.wire_and_supervise_context_events(supervisor, &mut tasks, cancel);
+}
+
 // ---------------------------------------------------------------------------
 // NapiRelayHandle
 // ---------------------------------------------------------------------------
@@ -598,9 +625,12 @@ pub(crate) async fn node_start_in_memory_on(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
+    let inner = RunningNode::InMemory(node);
+    wire_node_webhook_events(bi, &inner).await;
+
     increment_handle_count();
     Ok(NapiNodeHandle {
-        inner: RunningNode::InMemory(node),
+        inner,
         bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     })
@@ -634,9 +664,12 @@ pub(crate) async fn node_start_local_on(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
+    let inner = RunningNode::Filesystem(node);
+    wire_node_webhook_events(bi, &inner).await;
+
     increment_handle_count();
     Ok(NapiNodeHandle {
-        inner: RunningNode::Filesystem(node),
+        inner,
         bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     })
@@ -716,6 +749,28 @@ mod tests {
         assert!(!node.is_shutdown());
         node.shutdown();
         assert!(node.is_shutdown());
+    }
+
+    /// Regression guard on Node/Bun: after node startup the production
+    /// `Supervisor` must have its event broadcast channel enabled, so
+    /// `subscribe_events()` yields a receiver. Before the fix,
+    /// `build_supervisor_arc` did not enable the channel on this bridge and the
+    /// channel was `None`, so the webhook consumer could never be wired and
+    /// local context events never reached the dispatcher.
+    #[test]
+    fn node_startup_enables_context_event_channel() {
+        let scp = crate::scp::Scp::new().unwrap();
+        let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
+
+        let supervisor = crate::runtime::supervisor(&scp.inner)
+            .expect("Supervisor must be attached after node startup");
+        assert!(
+            supervisor.subscribe_events().is_some(),
+            "node startup must enable the Supervisor event channel so the \
+             webhook dispatcher consumer can subscribe"
+        );
+
+        node.shutdown();
     }
 
     #[test]

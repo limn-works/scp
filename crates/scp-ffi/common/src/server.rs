@@ -539,6 +539,71 @@ impl RunningNode {
         }
     }
 
+    /// Spawns a background task forwarding local `Supervisor` events to this
+    /// node's outbound webhook dispatcher (§12.10.5).
+    ///
+    /// The `events` receiver is obtained from
+    /// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
+    /// The returned [`JoinHandle`](tokio::task::JoinHandle) owns the consumer
+    /// task and MUST be retained by a lifecycle owner (e.g. the bridge instance
+    /// `JoinSet`) so it is aborted on shutdown rather than leaked.
+    ///
+    /// See [`ApplicationNode::wire_context_events`](scp_node::ApplicationNode::wire_context_events).
+    #[must_use]
+    pub fn wire_context_events(
+        &self,
+        events: tokio::sync::broadcast::Receiver<(
+            String,
+            scp_core::context::membership::ContextEvent,
+        )>,
+    ) -> tokio::task::JoinHandle<()> {
+        match self {
+            Self::InMemory(n) => n.wire_context_events(events),
+            Self::Filesystem(n) => n.wire_context_events(events),
+        }
+    }
+
+    /// Subscribes to the supervisor's event channel, wires the consumer into
+    /// this node's webhook dispatcher, and supervises the consumer under the
+    /// bridge instance's lifecycle (spec §12.10.5).
+    ///
+    /// This is the shared seam for all three non-WASM bridges (`PyO3`, `NAPI`,
+    /// `UniFFI`). Each bridge's node-startup path calls it once, after the
+    /// `Supervisor` is attached, passing the instance's `JoinSet` guard and
+    /// cancellation token. Consolidating the subscribe → wire → supervise block
+    /// here prevents per-bridge drift (the regression that reopened the webhook
+    /// wiring, where only `PyO3` was wired).
+    ///
+    /// Behavior:
+    /// - If the supervisor has no event channel (`subscribe_events()` returns
+    ///   `None`), wiring is skipped with a warning rather than panicking.
+    ///   Production supervisors always enable the channel (see each bridge's
+    ///   `build_supervisor`), so this is purely defensive against a supervisor
+    ///   initialized by some other path.
+    /// - The consumer task runs until the broadcast channel closes (supervisor
+    ///   dropped) OR the bridge instance's cancellation token fires, at which
+    ///   point the consumer is aborted. This makes the consumer deterministically
+    ///   bound to the instance lifecycle rather than leaked as a detached task.
+    pub fn wire_and_supervise_context_events(
+        &self,
+        supervisor: &Arc<Supervisor>,
+        tasks: &mut tokio::task::JoinSet<()>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let Some(events) = supervisor.subscribe_events() else {
+            // Defensive: production supervisors always have the channel, but a
+            // Supervisor initialized by another path without it would return
+            // None. Skip wiring rather than panic.
+            tracing::warn!(
+                "wire_and_supervise_context_events: Supervisor has no event \
+                 channel — local context events will not reach the webhook dispatcher"
+            );
+            return;
+        };
+        let consumer = self.wire_context_events(events);
+        spawn_supervised_event_consumer(consumer, tasks, cancel);
+    }
+
     /// Activates HTTP broadcast projection with optional site configuration.
     ///
     /// # Errors
@@ -640,6 +705,39 @@ impl RunningNode {
             Self::Filesystem(n) => n.http_url().await,
         }
     }
+}
+
+/// Spawns a webhook-event `consumer` (from `ApplicationNode::wire_context_events`
+/// or [`RunningNode::wire_context_events`]) under the bridge instance's
+/// `JoinSet`, bound to its cancellation token.
+///
+/// This is the single shared supervision wire for all three non-WASM bridges
+/// (`PyO3` reference, `NAPI`, `UniFFI`). Each bridge subscribes to its
+/// `Supervisor` event channel and wires the consumer via its node, then hands
+/// the resulting `JoinHandle` here so the supervision policy lives in one place
+/// and cannot drift per-bridge (the failure mode that reopened the webhook
+/// wiring, where only `PyO3` was wired).
+///
+/// Lifecycle: the spawned guard task runs until either the consumer completes
+/// (the broadcast channel closed because the `Supervisor` was dropped) or
+/// `cancel` fires on bridge shutdown, at which point the consumer is aborted so
+/// it never outlives the instance as a detached task.
+pub fn spawn_supervised_event_consumer(
+    mut consumer: tokio::task::JoinHandle<()>,
+    tasks: &mut tokio::task::JoinSet<()>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tasks.spawn(async move {
+        tokio::select! {
+            // The consumer task runs until the broadcast channel closes.
+            _ = &mut consumer => {}
+            // On bridge shutdown, abort the consumer so it does not
+            // outlive the instance as a detached task.
+            () = cancel.cancelled() => {
+                consumer.abort();
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

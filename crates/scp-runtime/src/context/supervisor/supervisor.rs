@@ -622,6 +622,31 @@ impl Supervisor {
         self.event_tx.get()
     }
 
+    /// Subscribes to the supervisor's [`ContextEvent`] fan-out channel.
+    ///
+    /// Returns a fresh [`broadcast::Receiver`](tokio::sync::broadcast::Receiver)
+    /// that observes every `(context_id, ContextEvent)` emitted by the
+    /// per-context actors this supervisor owns. The receiver sees only events
+    /// produced *after* it subscribes (broadcast semantics).
+    ///
+    /// Returns `None` if no event channel was configured (the FFI bridges enable
+    /// it unconditionally for production supervisors; a supervisor built without
+    /// the `event_tx` argument — e.g. via [`Self::for_query_shim`] — yields
+    /// `None`). This is the public surface used by FFI node-startup paths to
+    /// drive the outbound webhook dispatcher (spec §12.10.5).
+    ///
+    /// Message payloads on the channel are stripped of plaintext before sending
+    /// (see [`crate::context::state::strip_event_payload`]) — subscribers
+    /// observe metadata only, never decrypted content.
+    #[must_use]
+    pub fn subscribe_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<(String, ContextEvent)>> {
+        self.event_tx
+            .get()
+            .map(tokio::sync::broadcast::Sender::subscribe)
+    }
+
     /// Cheap reference to the supervisor's shared task-set. Returns
     /// `None` if [`Self::with_providers`] was not used.
     #[must_use]

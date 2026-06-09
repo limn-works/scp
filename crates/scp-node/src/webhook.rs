@@ -349,6 +349,19 @@ impl WebhookDispatcher {
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        Self::with_client(client)
+    }
+
+    /// Creates a new empty dispatcher with a caller-provided HTTP client.
+    ///
+    /// Use this when the dispatcher must share a connection pool or a
+    /// specific TLS trust configuration with the rest of the application
+    /// (e.g. an integration harness that pins a self-signed root for a local
+    /// HTTPS webhook receiver). Production callers should prefer
+    /// [`new`](Self::new), which builds a hardened client with redirects
+    /// disabled (SSRF defense).
+    #[must_use]
+    pub fn with_client(client: reqwest::Client) -> Self {
         Self {
             targets: RwLock::new(HashMap::new()),
             client,
