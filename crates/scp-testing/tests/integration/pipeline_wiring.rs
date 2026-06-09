@@ -887,6 +887,188 @@ fn single_shot_wasm_outlet_invoke_enforces_validated_caveats() {
     );
 }
 
+// SIBLING single-shot caveat-enforcement pins for the cross-context and
+// session paths. The original single-shot pins above scoped ONLY the top-level
+// `outlet_invoke` path; the cross-context and session siblings dispatched
+// directly (PyO3/NAPI/UniFFI via `with_context`/handle, WASM via the manager)
+// and NEVER built a `CaveatEnforcement` / never enforced the validated `nb` —
+// so a delegated UCAN's `max_calls` / `amount_*` / `rate_window` /
+// `allowed_adapters` / `allowed_target_dids` / narrowed `input_schema` were all
+// skipped on these paths. Cross-context is exactly where `allowed_target_dids`
+// must bite. These assertions pin the remediation: every sibling single-shot
+// path BUILDS and FORWARDS enforcement, and the native cross-context paths set
+// a real `target_did` (not `None`) so `allowed_target_dids` is enforced.
+
+#[test]
+fn single_shot_pyo3_cross_context_builds_caveat_enforcement() {
+    let body = extract_fn_body(PYO3_OUTLETS_SRC, "py_outlet_invoke_cross_context")
+        .expect("py_outlet_invoke_cross_context body");
+    assert!(
+        body.contains("resolve_action_caveats"),
+        "PyO3 py_outlet_invoke_cross_context must resolve the action UCAN's \
+         validated-narrowed nb caveats (resolve_action_caveats)"
+    );
+    assert!(
+        body.contains("invoke_outlet_with_caveats") || body.contains("caveat_enforcement"),
+        "PyO3 py_outlet_invoke_cross_context must route through the §7.3.8 \
+         enforcement path (invoke_outlet_with_caveats / caveat_enforcement) — \
+         never a direct dispatch that skips the gate"
+    );
+    assert!(
+        body.contains("target_did_typed") || body.contains("Some(&target"),
+        "PyO3 py_outlet_invoke_cross_context must set a real cross-context \
+         target_did so allowed_target_dids is enforced — not None"
+    );
+}
+
+#[test]
+fn single_shot_pyo3_session_invoke_builds_caveat_enforcement() {
+    let body = extract_fn_body(PYO3_OUTLETS_SRC, "py_outlet_session_invoke")
+        .expect("py_outlet_session_invoke body");
+    assert!(
+        body.contains("resolve_action_caveats"),
+        "PyO3 py_outlet_session_invoke must resolve the action UCAN's \
+         validated-narrowed nb caveats (resolve_action_caveats)"
+    );
+    assert!(
+        body.contains("invoke_outlet_with_caveats") || body.contains("caveat_enforcement"),
+        "PyO3 py_outlet_session_invoke must route through the §7.3.8 \
+         enforcement path — never a direct dispatch that skips the gate"
+    );
+}
+
+#[test]
+fn single_shot_napi_cross_context_builds_caveat_enforcement() {
+    let body = extract_fn_body(NAPI_OUTLETS_SRC, "outlet_invoke_cross_context")
+        .expect("NAPI outlet_invoke_cross_context body");
+    assert!(
+        body.contains("resolve_action_caveats"),
+        "NAPI outlet_invoke_cross_context must resolve the action UCAN's \
+         validated-narrowed nb caveats (resolve_action_caveats)"
+    );
+    assert!(
+        body.contains("CaveatEnforcement {"),
+        "NAPI outlet_invoke_cross_context must construct a CaveatEnforcement \
+         bundle so the runtime runs the §7.3.8 post-input gate"
+    );
+    assert!(
+        body.contains("invoke_outlet_with_economy"),
+        "NAPI outlet_invoke_cross_context must forward enforcement to \
+         invoke_outlet_with_economy — never a direct dispatch"
+    );
+    assert!(
+        body.contains("target_did: Some"),
+        "NAPI outlet_invoke_cross_context must set a real cross-context \
+         target_did so allowed_target_dids is enforced — not None"
+    );
+}
+
+#[test]
+fn single_shot_napi_session_invoke_builds_caveat_enforcement() {
+    let body = extract_fn_body(NAPI_OUTLETS_SRC, "outlet_session_invoke")
+        .expect("NAPI outlet_session_invoke body");
+    assert!(
+        body.contains("resolve_action_caveats"),
+        "NAPI outlet_session_invoke must resolve the action UCAN's \
+         validated-narrowed nb caveats (resolve_action_caveats)"
+    );
+    assert!(
+        body.contains("CaveatEnforcement {"),
+        "NAPI outlet_session_invoke must construct a CaveatEnforcement bundle"
+    );
+    assert!(
+        body.contains("invoke_outlet_with_economy"),
+        "NAPI outlet_session_invoke must forward enforcement to \
+         invoke_outlet_with_economy — never a direct dispatch"
+    );
+}
+
+#[test]
+fn single_shot_uniffi_cross_context_builds_caveat_enforcement() {
+    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "outlet_invoke_cross_context")
+        .expect("UniFFI outlet_invoke_cross_context body");
+    assert!(
+        body.contains("resolve_action_caveats"),
+        "UniFFI outlet_invoke_cross_context must resolve the action UCAN's \
+         validated-narrowed nb caveats (resolve_action_caveats)"
+    );
+    assert!(
+        body.contains("CaveatEnforcement {"),
+        "UniFFI outlet_invoke_cross_context must construct a CaveatEnforcement \
+         bundle so the runtime runs the §7.3.8 post-input gate"
+    );
+    assert!(
+        body.contains("invoke_outlet_with_economy"),
+        "UniFFI outlet_invoke_cross_context must forward enforcement to \
+         invoke_outlet_with_economy — never a direct dispatch"
+    );
+    assert!(
+        body.contains("target_did: Some"),
+        "UniFFI outlet_invoke_cross_context must set a real cross-context \
+         target_did so allowed_target_dids is enforced — not None"
+    );
+}
+
+#[test]
+fn single_shot_uniffi_session_invoke_builds_caveat_enforcement() {
+    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "outlet_session_invoke")
+        .expect("UniFFI outlet_session_invoke body");
+    assert!(
+        body.contains("resolve_action_caveats"),
+        "UniFFI outlet_session_invoke must resolve the action UCAN's \
+         validated-narrowed nb caveats (resolve_action_caveats)"
+    );
+    assert!(
+        body.contains("CaveatEnforcement {"),
+        "UniFFI outlet_session_invoke must construct a CaveatEnforcement bundle"
+    );
+    assert!(
+        body.contains("invoke_outlet_with_economy"),
+        "UniFFI outlet_session_invoke must forward enforcement to \
+         invoke_outlet_with_economy — never a direct dispatch"
+    );
+}
+
+#[test]
+fn single_shot_wasm_cross_context_enforces_validated_caveats() {
+    let body = extract_fn_body(WASM_OUTLETS_SRC, "outlet_invoke_cross_context")
+        .expect("WASM outlet_invoke_cross_context body");
+    assert!(
+        body.contains("enforce_single_shot_caveats"),
+        "WASM outlet_invoke_cross_context must call enforce_single_shot_caveats \
+         so the validated nb caveats are enforced (and counter-bearing caps fail \
+         closed) — §7.3.8 parity (ADR-034)"
+    );
+    assert!(
+        body.contains("payload.nb"),
+        "WASM outlet_invoke_cross_context must read the action UCAN's validated \
+         `nb` field (payload.nb)"
+    );
+    assert!(
+        body.contains("creator_did"),
+        "WASM outlet_invoke_cross_context must resolve the target context's \
+         creator DID as the cross-context peer target_did so \
+         allowed_target_dids is enforced"
+    );
+}
+
+#[test]
+fn single_shot_wasm_session_invoke_enforces_validated_caveats() {
+    let body = extract_fn_body(WASM_OUTLETS_SRC, "outlet_session_invoke")
+        .expect("WASM outlet_session_invoke body");
+    assert!(
+        body.contains("enforce_single_shot_caveats"),
+        "WASM outlet_session_invoke must call enforce_single_shot_caveats so the \
+         validated nb caveats are enforced (and counter-bearing caps fail \
+         closed) — §7.3.8 parity (ADR-034)"
+    );
+    assert!(
+        body.contains("payload.nb"),
+        "WASM outlet_session_invoke must read the action UCAN's validated `nb` \
+         field (payload.nb)"
+    );
+}
+
 // R4 — interior-edge attenuation. The UCAN chain walk MUST run the per-edge
 // Step 7 (capability subset) + Step 7b (caveat narrow) check at EVERY edge of
 // the delegation chain, not only leaf -> direct-parent (§5.4.5 / §7.3.8
