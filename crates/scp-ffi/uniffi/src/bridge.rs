@@ -15140,6 +15140,68 @@ impl Scp {
         Ok(cost.value())
     }
 
+    /// Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
+    ///
+    /// Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
+    /// dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+    /// supervisor, returning a JSON `{"results":[...]}` document with one
+    /// entry per receipt. Mirrors the `PyO3` reference bridge exactly.
+    pub async fn economy_verify_payment_receipts(
+        &self,
+        receipts_json: String,
+    ) -> Result<String, ScpError> {
+        // Validate input at the FFI boundary before touching supervisor state,
+        // so a malformed payload fails fast with a `Validation` error.
+        let receipts: Vec<scp_core::economy::PaymentReceipt> = serde_json::from_str(&receipts_json)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("invalid receipts JSON: {e}"),
+                code: codes::VALID_7050.to_owned(),
+            })?;
+
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                use scp_core::context::actor::commands::EconomyCommand;
+
+                let sup = bi.context_manager_or_error()?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = EconomyCommand::VerifyPaymentReceipts {
+                    receipts: Box::new(receipts),
+                    reply: tx,
+                };
+                sup.dispatch_economy_command(cmd)
+                    .await
+                    .map_err(ScpError::from)?;
+                let results = rx.await.map_err(|e| ScpError::Context {
+                    msg: format!("verify_payment_receipts shim reply dropped: {e}"),
+                    code: codes::ECON_12091.to_owned(),
+                })?;
+
+                // Serialize results. Each entry is a
+                // `Result<ReceiptVerification, ReceiptVerificationError>`.
+                let entries: Vec<serde_json::Value> = results
+                    .into_iter()
+                    .map(|r| match r {
+                        Ok(v) => serde_json::json!({
+                            "ok": true,
+                            "receipt_id": hex::encode(v.receipt_id),
+                            "result": format!("{:?}", v.result),
+                        }),
+                        Err(e) => serde_json::json!({
+                            "ok": false,
+                            "error": format!("{e}"),
+                        }),
+                    })
+                    .collect();
+                Ok(serde_json::json!({ "results": entries }).to_string())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during verify_payment_receipts: {e}"),
+                code: codes::ECON_12091.to_owned(),
+            })?
+    }
+
     // ----- Economic policy methods -----
 
     /// Per-instance equivalent of the free-function `set_economic_policy`.
@@ -15513,6 +15575,38 @@ mod tests {
         assert!(
             !scp.inner.core.has_supervisor(),
             "a rejected DID must not leave a ContextManager attached"
+        );
+    }
+
+    /// `economy_verify_payment_receipts` with an empty receipt array and an
+    /// attached supervisor returns the empty `{"results":[]}` document.
+    #[tokio::test]
+    async fn economy_verify_payment_receipts_empty_array_returns_empty_results() {
+        let scp = scp_test();
+        // Attach a supervisor (loopback transport, no network I/O).
+        scp.configure_local_transport("did:key:z6MkVerifyReceiptsEmptyTest".to_owned())
+            .expect("valid DID should configure local transport");
+
+        let out = scp
+            .economy_verify_payment_receipts("[]".to_owned())
+            .await
+            .expect("empty receipt array must verify successfully");
+        assert_eq!(out, r#"{"results":[]}"#);
+    }
+
+    /// `economy_verify_payment_receipts` rejects a malformed payload with a
+    /// `ScpError::Validation` before any supervisor lookup (no supervisor
+    /// required to reach the validation path).
+    #[tokio::test]
+    async fn economy_verify_payment_receipts_rejects_malformed_json() {
+        let scp = scp_test();
+        let err = scp
+            .economy_verify_payment_receipts("not json".to_owned())
+            .await
+            .expect_err("malformed JSON must be rejected");
+        assert!(
+            matches!(err, ScpError::Validation { .. }),
+            "expected ScpError::Validation, got {err:?}"
         );
     }
 

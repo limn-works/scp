@@ -1785,6 +1785,10 @@ export class SCP {
     )(contextId, senderDid, now, baseCost, thresholdsJson, floor ?? null, cap ?? null);
   }
 
+  economyVerifyPaymentReceipts(receiptsJson: string): string {
+    return (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
+  }
+
   // ───────────────────────────────────────────────────────────────────────
   // Domain: Trust
   // ───────────────────────────────────────────────────────────────────────

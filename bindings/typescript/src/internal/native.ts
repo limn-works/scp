@@ -1808,6 +1808,10 @@ export function createNativeBridge(scp: SCP): Bridge {
       )(contextId, senderDid, now, baseCost, thresholdsJson, floor, cap);
     },
 
+    economyVerifyPaymentReceipts(receiptsJson: string): string {
+      return (native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
+    },
+
     // Media (ADR-024)
     mediaCheckCapability(ceiling: string[], capability: string): boolean {
       return (native.mediaCheckCapability as (c: string[], cap: string) => boolean)(

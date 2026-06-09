@@ -452,6 +452,11 @@ public extension SCP {
         try inner.economyBudgetRemaining(contextId: contextId, did: did)
     }
 
+    /// Forwards to ``Scp/economyVerifyPaymentReceipts`` on ``inner``.
+    func economyVerifyPaymentReceipts(receiptsJson: String) async throws -> String {
+        try await inner.economyVerifyPaymentReceipts(receiptsJson: receiptsJson)
+    }
+
     /// Forwards to ``Scp/evaluateInvitation`` on ``inner``.
     func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?, trustedDids: [String]) throws -> String {
         try inner.evaluateInvitation(paramsJson: paramsJson, inviterDid: inviterDid, identityDid: identityDid, policyJson: policyJson, spendingJson: spendingJson, trustedDids: trustedDids)

@@ -1338,6 +1338,21 @@
       ]
     },
     {
+      "canonical": "economy_verify_payment_receipts",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "economy_verify_payment_receipts"
+      ],
+      "uniffi": [
+        "economy_verify_payment_receipts"
+      ],
+      "napi": [
+        "economy_verify_payment_receipts"
+      ],
+      "wasm": []
+    },
+    {
       "canonical": "economy_budget_record_spend",
       "category": "economy",
       "wasm_required": false,
@@ -3516,6 +3531,10 @@
       {
         "canonical": "transport_adapter_count",
         "reason": "WASM has no scp-platform / no transport adapter set per ADR-034."
+      },
+      {
+        "canonical": "economy_verify_payment_receipts",
+        "reason": "Receipt verification dispatches EconomyCommand::VerifyPaymentReceipts to the runtime payment adapter (verify_dyn per receipt); WASM cannot link scp-runtime / the async payment adapter per ADR-034. Native-only (pyo3/napi/uniffi); the TS WASM bridge surfaces a fail-closed throw (SCP-ECON-12091)."
       },
       {
         "canonical": "transport_reliability",

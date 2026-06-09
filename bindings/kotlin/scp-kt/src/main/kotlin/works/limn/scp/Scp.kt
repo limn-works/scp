@@ -758,6 +758,10 @@ class SCP internal constructor(
             did = did,
         )
 
+    /** Forwards to [NativeScp.economyVerifyPaymentReceipts] on [inner]. */
+    suspend fun economyVerifyPaymentReceipts(receiptsJson: String): String =
+        inner.economyVerifyPaymentReceipts(receiptsJson = receiptsJson)
+
     /** Forwards to [NativeScp.evaluateInvitation] on [inner]. */
     @Suppress("LongParameterList")
     fun evaluateInvitation(

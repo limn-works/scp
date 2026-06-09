@@ -9,7 +9,8 @@ import Foundation
 /// ``SCP`` instance (ADR-048) — use ``SCP/economyBudgetRemaining``,
 /// ``SCP/economyBudgetGrant``, ``SCP/economyBudgetRecordSpend``,
 /// ``SCP/economyAntispamRecord``, ``SCP/economyAntispamVelocity``,
-/// ``SCP/economyAntispamEscalatedCost``.
+/// ``SCP/economyAntispamEscalatedCost``,
+/// ``SCP/economyVerifyPaymentReceipts``.
 ///
 /// ## Provenance
 ///

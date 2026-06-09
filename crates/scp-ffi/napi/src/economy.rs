@@ -379,6 +379,76 @@ pub(crate) fn economy_antispam_escalated_cost_on(
     Ok(cost.value() as i64)
 }
 
+/// Per-bridge-instance implementation of `economy_verify_payment_receipts`.
+///
+/// Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
+/// dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the supervisor,
+/// returning a JSON `{"results":[...]}` document with one entry per receipt.
+/// Mirrors the `PyO3` reference bridge exactly.
+///
+/// Runs synchronously on a libuv worker thread — there is no ambient tokio
+/// context, so the actual dispatch is driven via the shared runtime's
+/// `block_on`.
+///
+/// # Errors
+///
+/// Returns a `Validation` error if `receipts_json` is malformed, a suspended
+/// `Context` error if the bridge is suspended, or a `Context` error if the
+/// supervisor dispatch fails or the reply channel is dropped.
+pub(crate) fn economy_verify_payment_receipts_on(
+    bi: &NapiBridgeInstance,
+    receipts_json: String,
+) -> napi::Result<String> {
+    // Validate input at the FFI boundary before touching supervisor state,
+    // so a malformed payload fails fast with a `Validation` error rather than
+    // a misleading supervisor-state error.
+    let receipts: Vec<scp_core::economy::PaymentReceipt> = serde_json::from_str(&receipts_json)
+        .map_err(|e| validation_error(&format!("invalid receipts JSON: {e}")))?;
+
+    let rt = crate::runtime();
+    let sup = crate::runtime::supervisor(bi)?.clone();
+
+    rt.block_on(async move {
+        use scp_core::context::actor::commands::EconomyCommand;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = EconomyCommand::VerifyPaymentReceipts {
+            receipts: Box::new(receipts),
+            reply: tx,
+        };
+        sup.dispatch_economy_command(cmd).await.map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_economy_command failed: {e}"),
+                code: codes::ECON_12091.to_owned(),
+            })
+        })?;
+        let results = rx.await.map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("verify_payment_receipts shim reply dropped: {e}"),
+                code: codes::ECON_12091.to_owned(),
+            })
+        })?;
+
+        // Serialize results. Each entry is a
+        // `Result<ReceiptVerification, ReceiptVerificationError>`.
+        let entries: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|r| match r {
+                Ok(v) => serde_json::json!({
+                    "ok": true,
+                    "receipt_id": hex::encode(v.receipt_id),
+                    "result": format!("{:?}", v.result),
+                }),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "error": format!("{e}"),
+                }),
+            })
+            .collect();
+        Ok(serde_json::json!({ "results": entries }).to_string())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -494,6 +564,18 @@ mod tests {
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_payment_receipts_rejects_malformed_json() {
+        // The invalid-JSON path is reached before any supervisor lookup,
+        // so a bare `new_napi()` instance (no supervisor) suffices.
+        let bi = NapiBridgeInstance::new_napi();
+        let err = economy_verify_payment_receipts_on(&bi, "not json".to_owned()).unwrap_err();
+        assert!(
+            err.reason.contains("invalid receipts JSON"),
+            "error should mention 'invalid receipts JSON': {err:?}"
         );
     }
 

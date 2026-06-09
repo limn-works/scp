@@ -1339,6 +1339,14 @@
           "swift": true
         },
         {
+          "name": "verify_payment_receipts",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + Python/TypeScript/Kotlin/Swift SDKs. WASM cannot link the async runtime payment adapter (ADR-034); the TS WASM bridge surfaces a fail-closed throw (SCP-ECON-12091)."
+        },
+        {
           "name": "enforce_economy_send_path",
           "python": false,
           "typescript": false,

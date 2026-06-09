@@ -3339,6 +3339,17 @@ impl Scp {
         )
     }
 
+    /// Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
+    ///
+    /// Verifies a JSON array of payment receipts against the supervisor and
+    /// returns a JSON `{"results":[...]}` document with one entry per receipt.
+    /// Synchronous: the supervisor dispatch is driven on the shared runtime
+    /// inside the helper, since libuv worker threads carry no tokio context.
+    #[napi(js_name = "economyVerifyPaymentReceipts")]
+    pub fn economy_verify_payment_receipts(&self, receipts_json: String) -> napi::Result<String> {
+        crate::economy::economy_verify_payment_receipts_on(&self.inner, receipts_json)
+    }
+
     // -------------------------------------------------------------------
     // Trust
     // -------------------------------------------------------------------
