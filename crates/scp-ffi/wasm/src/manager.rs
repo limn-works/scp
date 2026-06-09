@@ -2586,6 +2586,21 @@ impl WasmContextManager {
             })
     }
 
+    /// Returns the creator DID of an active context.
+    ///
+    /// Used by the cross-context single-shot path to resolve the peer DID that
+    /// the action UCAN's `allowed_target_dids` caveat constrains (§6.2): a
+    /// delegated token may pin the set of peer contexts it is permitted to
+    /// reach, and the target context's creator is that peer DID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active.
+    pub fn creator_did(&self, context_id: &str) -> Result<String, ScpWasmError> {
+        let ctx = self.require_active_context(context_id)?;
+        Ok(ctx.creator_did.clone())
+    }
+
     /// Registers a handler function for a tool.
     ///
     /// The handler will be called when the tool is invoked. The tool must

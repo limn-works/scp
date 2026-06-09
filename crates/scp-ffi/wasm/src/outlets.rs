@@ -391,41 +391,60 @@ fn extract_outlet_kind(
 /// for the three counter-bearing caveats (`max_calls`,
 /// `amount_max_cumulative`, `rate_window`).
 ///
-/// The WASM bridge has no async runtime and no durable counter store
-/// (ADR-034), and it already rejects paid contexts up front
-/// (`SCP-ECON-12096`), so the cumulative `amount_*` / `rate_window` caps are
-/// moot here. What WASM CAN — and now does — enforce for single-shot:
+/// The WASM bridge has no async runtime and NO durable counter store
+/// (ADR-034) — there is no injectable `CaveatCounterStore` analogue in the
+/// `thread_local` `WasmContextManager`. The native bridges hand a
+/// `CaveatEnforcement` bundle to the runtime, which owns a durable counter
+/// store and consults it for the three counter-bearing caveats (`max_calls`,
+/// `amount_max_cumulative`, `rate_window`) under a CAS, failing closed when no
+/// store is wired. WASM has no equivalent layer to consult.
 ///
-/// - the full `check_invocation_local` synchronous set, with
-///   `estimated_cost = 0`, `negotiated_adapter = None`, `target_did = None`
-///   (single-shot intra-context — identical to the native bridges' bundle), and
-/// - `max_calls` taken FROM THE VALIDATED `nb`: a single-shot invoke is
-///   exactly one call, so a `max_calls` of `0` permits zero calls and MUST
-///   reject. (`max_calls >= 1` admits the one call; WASM cannot track
-///   cross-invocation cumulative counts without a durable store, an honest
-///   ADR-034 limitation — but a token that forbids ALL calls is enforced.)
+/// What WASM enforces here:
 ///
-/// This closes the single-shot bypass for the caveats WASM can enforce and
-/// removes the prior asymmetry where the WASM single-shot path dropped the
-/// validated `nb` entirely.
+/// - the full `check_invocation_local` synchronous set (`input_schema` /
+///   `amount_max_per_call` / `allowed_adapters` / `allowed_target_dids`), with
+///   `estimated_cost = 0`, `negotiated_adapter = None`, `target_did` supplied
+///   by the caller (cross-context passes the peer DID), and
+/// - a FAIL-CLOSED rejection of any counter-bearing caveat
+///   (`has_counter_bearing_caveat()` — `max_calls` / `amount_max_cumulative` /
+///   `rate_window`). WASM cannot track cross-invocation counts without a
+///   durable store, so a token carrying ANY counter-bearing cap MUST be
+///   rejected, never silently admitted. This is the explicit contract of
+///   [`InvocationCaveats::has_counter_bearing_caveat`]: a counter cap that
+///   cannot be enforced must reject. (`amount_*` caps are doubly moot — WASM
+///   rejects paid contexts up front with `SCP-ECON-12096` — but the
+///   fail-closed rejection here is what guarantees a `max_calls`/`rate_window`
+///   token is never admitted unbounded.)
+///
+/// The prior implementation rejected only `max_calls == 0` and silently
+/// ADMITTED `max_calls: Some(n)`, `amount_max_cumulative`, and `rate_window` —
+/// the opposite of the native fail-closed behavior. A delegated token capping
+/// invocations at, say, 5 calls could be replayed unbounded on WASM, each
+/// single-shot counting as "the one call." Failing closed removes that bypass.
 ///
 /// # Errors
 ///
 /// Returns `ScpWasmError::Permission` (`SCP-PERM-3000`, the same code the
 /// WASM UCAN-authorization failure uses) carrying the violated caveat's spec
-/// slug when any enforceable caveat rejects.
+/// slug when any enforceable caveat rejects, or a fail-closed message when a
+/// counter-bearing caveat is present.
 fn enforce_single_shot_caveats(
     caveats: &scp_protocol::trust::caveats::InvocationCaveats,
     input: &serde_json::Value,
+    target_did: Option<&scp_event_log::DID>,
 ) -> Result<(), ScpWasmError> {
     use scp_protocol::economy::types::Amount;
 
-    // `max_calls` from the validated nb: single-shot is one call; a cap of 0
-    // forbids it. (>=1 admits the single call.)
-    if caveats.max_calls == Some(0) {
+    // FAIL CLOSED on any counter-bearing caveat: WASM has no durable counter
+    // store to consult (ADR-034), so `max_calls` / `amount_max_cumulative` /
+    // `rate_window` cannot be enforced and MUST reject rather than admit
+    // unbounded. This is the contract of `has_counter_bearing_caveat`.
+    if caveats.has_counter_bearing_caveat() {
         return Err(ScpWasmError::Permission {
-            message: "invocation rejected: action UCAN caveat max_calls=0 permits no calls \
-                      (§7.3.8 authorization.denied)"
+            message: "invocation rejected: action UCAN carries a counter-bearing caveat \
+                      (max_calls / amount_max_cumulative / rate_window) that the WASM bridge \
+                      cannot enforce — no durable counter store (ADR-034). Failing closed \
+                      (§7.3.8 authorization.denied)."
                 .to_owned(),
             code: codes::PERM_3000.to_owned(),
         });
@@ -433,11 +452,10 @@ fn enforce_single_shot_caveats(
 
     // Synchronous non-counter caveats: input_schema / amount_max_per_call /
     // allowed_adapters / allowed_target_dids. Single-shot negotiates no
-    // adapter and has no cross-context target (parity with the native
-    // bridges, which pass `negotiated_adapter: None`, `target_did: None`,
-    // `estimated_cost: 0`).
+    // adapter; `target_did` is the cross-context peer (or `None` in-context),
+    // parity with the native bridges' `estimated_cost: 0`.
     caveats
-        .check_invocation_local(input, Amount::new(0), None, None)
+        .check_invocation_local(input, Amount::new(0), None, target_did)
         .map_err(|e| ScpWasmError::Permission {
             message: format!("invocation rejected by §7.3.8 caveat ({}): {e}", e.slug()),
             code: codes::PERM_3000.to_owned(),
@@ -688,14 +706,13 @@ fn outlet_invoke_inner(
     })?;
 
     // §7.3.8 single-shot caveat parity: enforce the action UCAN's
-    // VALIDATED-NARROWED `nb` caveats that WASM is capable of enforcing
-    // (the non-counter local set + `max_calls` from the validated nb).
-    // The prior single-shot path dropped the `nb` entirely — a delegated
-    // UCAN's narrowed `input_schema` / `allowed_target_dids` / `max_calls`
-    // were never enforced on WASM single-shot. `ucan_token` is the
-    // already-validated token (matched as non-empty above); re-parse to
-    // recover its `nb`. Parsing cannot fail here — `validate_outlet_ucan_wasm`
-    // already parsed and validated the same string.
+    // VALIDATED-NARROWED `nb` caveats — the synchronous non-counter local set
+    // (`input_schema` / `amount_max_per_call` / `allowed_adapters` /
+    // `allowed_target_dids`) plus a FAIL-CLOSED rejection of any
+    // counter-bearing cap WASM cannot enforce (no durable store, ADR-034).
+    // `ucan_token` is the already-validated token (matched as non-empty above);
+    // re-parse to recover its `nb`. Parsing cannot fail here —
+    // `validate_outlet_ucan_wasm` already parsed and validated the same string.
     if let Some(token) = ucan_token.as_deref() {
         let parsed = scp_protocol::crypto::ucan::validate::parse_ucan(token).map_err(|e| {
             ScpWasmError::Permission {
@@ -705,7 +722,8 @@ fn outlet_invoke_inner(
             .into_js()
         })?;
         if let Some(effective_caveats) = parsed.payload.nb.as_ref() {
-            enforce_single_shot_caveats(effective_caveats, &parsed_input)
+            // In-context single-shot: no cross-context target DID.
+            enforce_single_shot_caveats(effective_caveats, &parsed_input, None)
                 .map_err(ScpWasmError::into_js)?;
         }
     }
@@ -1010,6 +1028,30 @@ pub fn outlet_invoke_cross_context(
             .into_js()
         })?;
 
+        // §7.3.8 cross-context single-shot caveat parity: enforce the action
+        // UCAN's VALIDATED-NARROWED `nb` caveats. The prior cross-context path
+        // dropped the `nb` entirely — a delegated UCAN's narrowed `input_schema`
+        // / `allowed_target_dids` / counter-bearing caps were never enforced on
+        // WASM cross-context, and cross-context is exactly where
+        // `allowed_target_dids` must bite. `target_did` is the target context's
+        // creator (the cross-context peer DID `allowed_target_dids` constrains,
+        // §6.2). Counter-bearing caps fail closed (no durable store, ADR-034).
+        let parsed =
+            scp_protocol::crypto::ucan::validate::parse_ucan(&ucan_token).map_err(|e| {
+                ScpWasmError::Permission {
+                    message: format!("failed to parse action UCAN: {e}"),
+                    code: codes::PERM_3000.to_owned(),
+                }
+                .into_js()
+            })?;
+        if let Some(effective_caveats) = parsed.payload.nb.as_ref() {
+            let target_creator = crate::manager::with_manager(|mgr| mgr.creator_did(&target_id))
+                .map_err(ScpWasmError::into_js)?;
+            let target_peer_did = scp_event_log::DID::from(target_creator);
+            enforce_single_shot_caveats(effective_caveats, &input, Some(&target_peer_did))
+                .map_err(ScpWasmError::into_js)?;
+        }
+
         let result = with_manager(|mgr| {
             mgr.invoke_tool_cross_context(
                 &source_id,
@@ -1125,6 +1167,25 @@ pub fn outlet_session_invoke(
             }
             .into_js()
         })?;
+
+        // §7.3.8 session single-shot caveat parity: enforce the action UCAN's
+        // VALIDATED-NARROWED `nb` caveats. The prior session path dropped the
+        // `nb` entirely — a delegated UCAN's narrowed `input_schema` /
+        // counter-bearing caps were never enforced on WASM session invokes.
+        // Per-call session invocation has no cross-context target. Counter-
+        // bearing caps fail closed (no durable store, ADR-034).
+        let parsed =
+            scp_protocol::crypto::ucan::validate::parse_ucan(&ucan_token).map_err(|e| {
+                ScpWasmError::Permission {
+                    message: format!("failed to parse action UCAN: {e}"),
+                    code: codes::PERM_3000.to_owned(),
+                }
+                .into_js()
+            })?;
+        if let Some(effective_caveats) = parsed.payload.nb.as_ref() {
+            enforce_single_shot_caveats(effective_caveats, &input, None)
+                .map_err(ScpWasmError::into_js)?;
+        }
 
         let result =
             with_manager(|mgr| mgr.session_invoke(&context_id, &session_id, &input, &invoker_did))
@@ -2380,48 +2441,86 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // enforce_single_shot_caveats — §7.3.8 single-shot caveat parity (WASM
-    // subset). These tests cover the caveats WASM is capable of enforcing
-    // from the validated nb: max_calls (taken FROM the validated nb), the
-    // narrowed input_schema, and allowed_target_dids.
+    // subset). WASM enforces the synchronous non-counter local set
+    // (input_schema / amount_max_per_call / allowed_adapters /
+    // allowed_target_dids) and FAILS CLOSED on any counter-bearing caveat
+    // (max_calls / amount_max_cumulative / rate_window) because it has no
+    // durable counter store (ADR-034).
     // -----------------------------------------------------------------------
 
-    use scp_protocol::trust::caveats::InvocationCaveats;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
 
     #[test]
     fn single_shot_caveats_admits_empty() {
         // No caveats → nothing to enforce, admit.
         let caveats = InvocationCaveats::empty();
-        enforce_single_shot_caveats(&caveats, &serde_json::json!({})).unwrap();
+        enforce_single_shot_caveats(&caveats, &serde_json::json!({}), None).unwrap();
     }
 
     #[test]
-    fn single_shot_caveats_max_calls_zero_rejects() {
-        // max_calls=0 forbids the single call.
+    fn single_shot_caveats_max_calls_zero_fails_closed() {
+        // Gap 2: max_calls is a counter-bearing caveat WASM cannot enforce
+        // (no durable store), so it fails closed regardless of the value.
         let caveats = InvocationCaveats {
             max_calls: Some(0),
             ..InvocationCaveats::empty()
         };
-        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({})).unwrap_err();
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}), None).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("max_calls"),
-            "expected max_calls rejection: {msg}"
+            msg.contains("counter-bearing"),
+            "expected fail-closed counter-bearing rejection: {msg}"
         );
     }
 
     #[test]
-    fn single_shot_caveats_max_calls_one_admits() {
-        // max_calls>=1 admits the one single-shot call.
+    fn single_shot_caveats_max_calls_positive_fails_closed() {
+        // Gap 2 (the silent-admit bypass): a token capping calls at N>=1 was
+        // previously ADMITTED unbounded on WASM (each single-shot counted as
+        // "the one call"). It MUST now fail closed — WASM cannot track the
+        // cumulative count across invocations.
         let caveats = InvocationCaveats {
-            max_calls: Some(1),
+            max_calls: Some(5),
             ..InvocationCaveats::empty()
         };
-        enforce_single_shot_caveats(&caveats, &serde_json::json!({})).unwrap();
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}), None).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("counter-bearing"),
+            "max_calls>=1 must fail closed on WASM, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_shot_caveats_amount_max_cumulative_fails_closed() {
+        // Gap 2: amount_max_cumulative is counter-bearing → fail closed.
+        let caveats = InvocationCaveats {
+            amount_max_cumulative: Some(Amount::new(1000)),
+            ..InvocationCaveats::empty()
+        };
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}), None).unwrap_err();
+        assert!(format!("{err:?}").contains("counter-bearing"));
+    }
+
+    #[test]
+    fn single_shot_caveats_rate_window_fails_closed() {
+        // Gap 2: rate_window is counter-bearing → fail closed.
+        let caveats = InvocationCaveats {
+            rate_window: Some(RateWindow {
+                max: 5,
+                window_secs: 60,
+            }),
+            ..InvocationCaveats::empty()
+        };
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}), None).unwrap_err();
+        assert!(format!("{err:?}").contains("counter-bearing"));
     }
 
     #[test]
     fn single_shot_caveats_input_schema_rejects_nonconforming() {
-        // Narrowed input_schema requires integer `n` >= 10.
+        // Narrowed input_schema requires integer `n` >= 10 (synchronous local
+        // check, enforced on WASM).
         let caveats = InvocationCaveats {
             input_schema: Some(serde_json::json!({
                 "type": "object",
@@ -2430,9 +2529,9 @@ mod tests {
             })),
             ..InvocationCaveats::empty()
         };
-        enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 10 })).unwrap();
-        let err =
-            enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 1 })).unwrap_err();
+        enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 10 }), None).unwrap();
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({ "n": 1 }), None)
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("PERM-3000") || msg.to_lowercase().contains("caveat"),
@@ -2441,15 +2540,36 @@ mod tests {
     }
 
     #[test]
-    fn single_shot_caveats_allowed_target_dids_rejects_when_set() {
-        // allowed_target_dids is a cross-context caveat; single-shot
-        // intra-context passes no target_did, so a token that restricts
-        // targets cannot be satisfied by a no-target single-shot invoke.
+    fn single_shot_caveats_allowed_target_dids_rejects_disallowed_target() {
+        // Gap 1 (cross-context): allowed_target_dids must bite — a target DID
+        // not in the allow-list is rejected, and the allowed one is admitted.
+        let allowed = scp_event_log::DID::from("did:key:allowed".to_owned());
+        let other = scp_event_log::DID::from("did:key:other".to_owned());
+        let caveats = InvocationCaveats {
+            allowed_target_dids: Some(vec![allowed.clone()]),
+            ..InvocationCaveats::empty()
+        };
+        // Allowed target → admitted.
+        enforce_single_shot_caveats(&caveats, &serde_json::json!({}), Some(&allowed)).unwrap();
+        // Disallowed target → rejected.
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}), Some(&other))
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("PERM-3000") || msg.to_lowercase().contains("caveat"),
+            "expected allowed_target_dids rejection for disallowed target: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_shot_caveats_allowed_target_dids_rejects_when_no_target() {
+        // A token that restricts targets cannot be satisfied by a no-target
+        // (intra-context) single-shot invoke.
         let caveats = InvocationCaveats {
             allowed_target_dids: Some(vec!["did:key:allowed".into()]),
             ..InvocationCaveats::empty()
         };
-        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({})).unwrap_err();
+        let err = enforce_single_shot_caveats(&caveats, &serde_json::json!({}), None).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("PERM-3000") || msg.to_lowercase().contains("caveat"),
