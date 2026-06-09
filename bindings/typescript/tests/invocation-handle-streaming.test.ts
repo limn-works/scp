@@ -824,3 +824,100 @@ describe("Dual-consumption guard (consistency-B)", () => {
     expect((caught as OutletProtocolError).slug).toBe("protocol.handle-double-consumed");
   });
 });
+
+// ---------------------------------------------------------------------------
+// close() / [Symbol.asyncDispose] — teardown parity for unbounded /
+// abandoned streams. A control-plane-only handle (open → grantCredit →
+// abandon) on an UNBOUNDED stream has no terminal chunk to terminate the
+// detached recheck IIFE, so it would poll `ucanValidate` forever. close()
+// (and `await using`) is the deterministic escape hatch: it aborts the
+// recheck loop (via a registered AbortController.abort()) and marks the
+// handle terminated so the control plane fail-closes.
+// ---------------------------------------------------------------------------
+
+describe("close() teardown (unbounded / abandoned streams)", () => {
+  test("close() runs each registered teardown exactly once and is idempotent", () => {
+    let aborts = 0;
+    // Unbounded handle — pump never reaches a terminal chunk.
+    const handle = new InvocationHandle(() => {}, { requestIdHex: "ab".repeat(16) });
+    handle.registerCloseHandler(() => {
+      aborts += 1;
+    });
+
+    expect(handle.isTerminated).toBe(false);
+    handle.close();
+    expect(handle.isTerminated).toBe(true);
+    expect(aborts).toBe(1);
+
+    // Repeated close() — no extra teardown runs.
+    handle.close();
+    handle.close();
+    expect(aborts).toBe(1);
+  });
+
+  test("teardown registered AFTER close() fires immediately (no leak on late open)", () => {
+    let aborts = 0;
+    const handle = new InvocationHandle(() => {}, { requestIdHex: "cd".repeat(16) });
+    handle.close();
+    // A handler the detached recheck IIFE registers after a racing close()
+    // must fire at once so the loop's AbortController is still aborted.
+    handle.registerCloseHandler(() => {
+      aborts += 1;
+    });
+    expect(aborts).toBe(1);
+  });
+
+  test("grantCredit and cancel throw StreamAlreadyClosed after close()", async () => {
+    const handle = new InvocationHandle(() => {}, {
+      requestIdHex: "ef".repeat(16),
+      invokerDid: "did:dht:invoker",
+    });
+    handle.close();
+    expect(handle.isTerminated).toBe(true);
+
+    let grantErr: unknown = null;
+    try {
+      await handle.grantCredit(Credit.of(5));
+    } catch (err) {
+      grantErr = err;
+    }
+    expect(grantErr).toBeInstanceOf(StreamAlreadyClosed);
+
+    let cancelErr: unknown = null;
+    try {
+      await handle.cancel();
+    } catch (err) {
+      cancelErr = err;
+    }
+    expect(cancelErr).toBeInstanceOf(StreamAlreadyClosed);
+  });
+
+  test("AbortController registered as a close handler aborts on close() (recheck-loop seam)", () => {
+    // Mirrors the production wiring: the recheck loop owns an
+    // AbortController whose abort() is registered on the handle. close()
+    // must trigger it so the loop's `signal.aborted` guard flips and its
+    // sleep is interrupted.
+    const recheckAbort = new AbortController();
+    const handle = new InvocationHandle(() => {}, { requestIdHex: "11".repeat(16) });
+    handle.registerCloseHandler(() => recheckAbort.abort());
+
+    expect(recheckAbort.signal.aborted).toBe(false);
+    handle.close();
+    expect(recheckAbort.signal.aborted).toBe(true);
+  });
+
+  test("await using disposes the handle at block exit (Symbol.asyncDispose)", async () => {
+    let aborts = 0;
+    const captured = new InvocationHandle(() => {}, { requestIdHex: "22".repeat(16) });
+    captured.registerCloseHandler(() => {
+      aborts += 1;
+    });
+    {
+      await using handle = captured;
+      expect(handle.isTerminated).toBe(false);
+    }
+    // Block exit ran [Symbol.asyncDispose] → close().
+    expect(captured.isTerminated).toBe(true);
+    expect(aborts).toBe(1);
+  });
+});

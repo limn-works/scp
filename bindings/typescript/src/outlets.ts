@@ -423,7 +423,9 @@ function compiledAggregateValidator(schema: object): ValidateFunction {
  * path, subsequent `grantCredit` / `cancel` calls raise
  * {@link StreamAlreadyClosed}.
  */
-export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<OutletStreamChunk> {
+export class InvocationHandle
+  implements PromiseLike<Aggregate>, AsyncIterable<OutletStreamChunk>, AsyncDisposable
+{
   private consumed: "aggregate" | "stream" | null = null;
   private resolved: Aggregate | null = null;
   private rejected: unknown = null;
@@ -454,6 +456,15 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
 
   /** True once a terminal chunk has been observed (AC13). */
   private terminated = false;
+
+  /** True once {@link close} has run (idempotency latch). */
+  private closed = false;
+
+  /** Teardown closures run exactly once by {@link close}. The streaming
+   *  factory registers an `AbortController.abort()` here so an unconsumed
+   *  handle can stop the §5.4.5 revocation re-check loop deterministically.
+   *  Empty for the degenerate single-shot path (no background work). */
+  private closeHandlers: Array<() => void> = [];
 
   /** Pinned invoker DID; threaded through to every control-plane
    *  bridge call as `callerDid` so the bridge can verify against its
@@ -784,6 +795,66 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
     const bridge = await getBridge();
     return bridge.outletStreamCancel(ridHex, this.invokerDid);
   }
+
+  /**
+   * Registers a teardown closure run by {@link close} (and only by
+   * {@link close}). The streaming factory registers the §5.4.5
+   * revocation re-check loop's `AbortController.abort()` here. If the
+   * handle is already closed the closure fires immediately so a late
+   * registration cannot leak. Internal — only the SDK's own factory wires
+   * teardown.
+   */
+  registerCloseHandler(handler: () => void): void {
+    if (this.closed) {
+      handler();
+      return;
+    }
+    this.closeHandlers.push(handler);
+  }
+
+  /**
+   * Releases the handle's background work — for a streaming handle, the
+   * §5.4.5 receiver-side revocation re-check loop. Idempotent: the first
+   * call marks the handle terminated and runs each registered teardown
+   * exactly once; later calls are no-ops.
+   *
+   * After `close()` the control-plane methods (`grantCredit` / `cancel`)
+   * throw {@link StreamAlreadyClosed} because the terminal flag is set.
+   *
+   * A control-plane-only caller — one that opens a streaming handle, calls
+   * `grantCredit` / `cancel`, then abandons it WITHOUT consuming the chunk
+   * stream — MUST call `close()` (idiomatically via `await using handle =
+   * ctx.outlets.invoke(...)`). For an UNBOUNDED stream the detached recheck
+   * IIFE polls `ucanValidate` until the handle is terminated; without
+   * `close()` (or a terminal chunk) it would poll for the process lifetime.
+   * Consuming the stream to its terminal chunk already terminates the
+   * handle, so calling `close()` afterward is a harmless no-op. Mirrors the
+   * Swift `close()` / `defer`, the Kotlin `close()` / `use {}`, and the
+   * Python `aclose()` / `async with` teardown idioms.
+   */
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.terminated = true;
+    const handlers = this.closeHandlers;
+    this.closeHandlers = [];
+    for (const handler of handlers) {
+      handler();
+    }
+  }
+
+  /**
+   * Explicit-resource-management hook — enables
+   * `await using handle = ctx.outlets.invoke(...)`. Delegates to
+   * {@link close} so an unconsumed streaming handle's revocation re-check
+   * loop is released at block exit. `async` to satisfy the
+   * `AsyncDisposable` contract even though `close()` itself is synchronous.
+   */
+  async [Symbol.asyncDispose](): Promise<void> {
+    this.close();
+  }
 }
 
 /** Internal sink passed to the InvocationHandle pump closure. */
@@ -865,6 +936,33 @@ async function pumpStreamingBridge(
   } catch (err) {
     sink.error(err);
   }
+}
+
+/**
+ * Sleeps `ms` milliseconds, resolving early if `signal` aborts. Used by the
+ * §5.4.5 revocation re-check loop so `InvocationHandle.close()` interrupts
+ * the inter-tick wait immediately rather than letting the loop sleep up to
+ * `ucanRecheckSecs` before observing termination. Always resolves (never
+ * rejects) — the caller re-checks `signal.aborted` after awaiting. The
+ * abort listener is removed on resolution so a long-lived signal does not
+ * accumulate listeners across ticks.
+ */
+function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /** Translate a bridge-shaped chunk into the SDK-shaped variant. */
@@ -1261,6 +1359,14 @@ export class OutletNamespace {
       // event regardless of executor behavior.
       const ucanRecheckSecs = options?.ucanRecheckSecs ?? 10;
       const capability = `tool_invoke:${outletId}`;
+      // AbortController lets `close()` stop the recheck loop PROMPTLY — it
+      // both flips the loop's guard (via `signal.aborted`) and interrupts
+      // the in-flight `setTimeout` sleep, so a control-plane-only caller
+      // that `close()`s an UNBOUNDED handle does not wait up to
+      // `ucanRecheckSecs` for the next tick. Registered on the handle so
+      // `close()` (and `[Symbol.asyncDispose]`) trigger it.
+      const recheckAbort = new AbortController();
+      sdkHandle.registerCloseHandler(() => recheckAbort.abort());
       void (async () => {
         try {
           const rid = await requestIdPromise;
@@ -1268,11 +1374,9 @@ export class OutletNamespace {
             return;
           }
           const bridge = await getBridge();
-          while (!sdkHandle.isTerminated) {
-            await new Promise<void>((resolve) =>
-              setTimeout(resolve, Math.max(1, ucanRecheckSecs) * 1000),
-            );
-            if (sdkHandle.isTerminated) {
+          while (!sdkHandle.isTerminated && !recheckAbort.signal.aborted) {
+            await sleepUnlessAborted(Math.max(1, ucanRecheckSecs) * 1000, recheckAbort.signal);
+            if (sdkHandle.isTerminated || recheckAbort.signal.aborted) {
               break;
             }
             try {
