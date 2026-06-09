@@ -18,7 +18,7 @@
  * requiring a real native bridge build.
  */
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   Credit,
   InvalidGrant,
@@ -27,6 +27,8 @@ import {
   OutputError,
   StreamAlreadyClosed,
 } from "../src/errors";
+import type { Bridge, BridgeOutletInvocationStream } from "../src/internal/bridge";
+import { _resetBridge, _setBridge } from "../src/internal/bridge";
 import {
   type __InternalInvocationHandleSink,
   __internalPumpStreamingBridge,
@@ -652,7 +654,7 @@ describe("Abnormal closure (HIGH wave 4)", () => {
       error: (e) => calls.push({ type: "error", payload: e }),
     };
     // biome-ignore lint/suspicious/noExplicitAny: test-only synthetic bridge.
-    await __internalPumpStreamingBridge(fakeStream as any, sink);
+    await __internalPumpStreamingBridge(fakeStream as any, sink, new AbortController().signal);
 
     // Sink saw exactly one Data chunk, then an OutletExecutionError —
     // NOT a degenerate sink.end({value: null}).
@@ -679,7 +681,7 @@ describe("Abnormal closure (HIGH wave 4)", () => {
       error: (e) => calls.push({ type: "error", payload: e }),
     };
     // biome-ignore lint/suspicious/noExplicitAny: test-only synthetic bridge.
-    await __internalPumpStreamingBridge(fakeStream as any, sink);
+    await __internalPumpStreamingBridge(fakeStream as any, sink, new AbortController().signal);
 
     // Data, End-chunk, then end({value: {sum:1}}); no error sink call.
     expect(calls.filter((c) => c.type === "error").length).toBe(0);
@@ -698,7 +700,7 @@ describe("Abnormal closure (HIGH wave 4)", () => {
     ]);
     const handle = new InvocationHandle((sink) => {
       // biome-ignore lint/suspicious/noExplicitAny: test-only synthetic bridge.
-      void __internalPumpStreamingBridge(fakeStream as any, sink);
+      void __internalPumpStreamingBridge(fakeStream as any, sink, new AbortController().signal);
     });
     let caught: unknown;
     try {
@@ -722,7 +724,7 @@ describe("Abnormal closure (HIGH wave 4)", () => {
     ]);
     const handle = new InvocationHandle((sink) => {
       // biome-ignore lint/suspicious/noExplicitAny: test-only synthetic bridge.
-      void __internalPumpStreamingBridge(fakeStream as any, sink);
+      void __internalPumpStreamingBridge(fakeStream as any, sink, new AbortController().signal);
     });
     const observed: OutletStreamChunk[] = [];
     let caught: unknown;
@@ -921,3 +923,162 @@ describe("close() teardown (unbounded / abandoned streams)", () => {
     expect(aborts).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// close() settlement + pump teardown (Findings 1 & 2).
+//
+// Finding 2: `handle.close(); await handle;` (or `await using` then awaiting
+// the aggregate) must ERROR cleanly — never hang. close() rejects pending
+// aggregate awaiters with StreamAlreadyClosed and unblocks waiting iterator
+// readers via the abnormal-closure sentinel.
+//
+// Finding 1: close() on an unconsumed UNBOUNDED handle stops the eager chunk
+// pump (no further `stream.next()`; the handle's chunk buffer stays bounded)
+// and best-effort cancels the runtime stream session via outletStreamCancel.
+// ---------------------------------------------------------------------------
+
+describe("close() settlement + pump teardown (Findings 1 & 2)", () => {
+  afterEach(() => {
+    _resetBridge();
+  });
+
+  test("await handle AFTER close() rejects with StreamAlreadyClosed within a short timeout (does not hang)", async () => {
+    // Unbounded handle — the pump never produces a terminal chunk, so before
+    // this fix `await handle` would block on the deferred resolver forever.
+    const handle = new InvocationHandle(() => {}, {
+      requestIdHex: "ab".repeat(16),
+      invokerDid: "did:dht:invoker",
+    });
+    _setBridge(makeCancelRecordingBridge().bridge);
+
+    handle.close();
+
+    // Race the awaitable against a short timeout. If close() failed to settle
+    // the aggregate channel the timeout wins and the test fails — proving the
+    // hang. With the fix the awaitable rejects first.
+    const timeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("await handle did not settle — it HUNG")), 1000);
+    });
+    let caught: unknown;
+    try {
+      await Promise.race([handle, timeout]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(StreamAlreadyClosed);
+    expect((caught as StreamAlreadyClosed).code).toBe("SCP-TOOL-6101");
+  });
+
+  test("for await over a handle closed before any terminal exits via the abnormal-closure error (does not hang)", async () => {
+    const handle = new InvocationHandle(() => {}, {
+      requestIdHex: "cd".repeat(16),
+      invokerDid: "did:dht:invoker",
+    });
+    _setBridge(makeCancelRecordingBridge().bridge);
+
+    // Begin iterating; the reader parks waiting for the first chunk. close()
+    // must push the abnormal-closure sentinel so the reader unblocks.
+    const iterate = (async () => {
+      const observed: OutletStreamChunk[] = [];
+      for await (const chunk of handle) {
+        observed.push(chunk);
+      }
+      return observed;
+    })();
+    // Let the iterator attach its reader before closing.
+    await Promise.resolve();
+    handle.close();
+
+    const timeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("for await did not settle — it HUNG")), 1000);
+    });
+    let caught: unknown;
+    try {
+      await Promise.race([iterate, timeout]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(OutletExecutionError);
+    expect((caught as OutletExecutionError).code).toBe("SCP-TOOL-6131");
+  });
+
+  test("close() on an unconsumed unbounded handle stops the chunk pump and best-effort cancels the runtime stream", async () => {
+    // Infinite bridge stream — `next()` resolves a fresh Data chunk forever.
+    // The production pump would loop it for the process lifetime, growing the
+    // handle's chunk buffer without bound, until close() aborts it.
+    let nextCalls = 0;
+    let resolveGate: (() => void) | undefined;
+    const infiniteStream: BridgeOutletInvocationStream = {
+      requestId: "ef".repeat(16),
+      next: async () => {
+        nextCalls += 1;
+        // Park after the first chunk on a gate the test controls, so the pump
+        // is provably mid-`await stream.next()` when close() fires.
+        if (nextCalls >= 2) {
+          await new Promise<void>((resolve) => {
+            resolveGate = resolve;
+          });
+        }
+        return {
+          requestId: new Uint8Array(16),
+          sequence: nextCalls - 1,
+          sig: new Uint8Array(64),
+          payloadType: "data" as const,
+          valueJson: `{"i":${nextCalls - 1}}`,
+        };
+      },
+    };
+    const { bridge, cancelCalls } = makeCancelRecordingBridge();
+    _setBridge(bridge);
+
+    const pumpAbort = new AbortController();
+    const handle = new InvocationHandle(
+      (sink) => {
+        // biome-ignore lint/suspicious/noExplicitAny: synthetic infinite bridge stream.
+        void __internalPumpStreamingBridge(infiniteStream as any, sink, pumpAbort.signal);
+      },
+      { requestIdHex: "ef".repeat(16), invokerDid: "did:dht:invoker" },
+    );
+    // Mirror the production factory wiring: close() aborts the pump.
+    handle.registerCloseHandler(() => pumpAbort.abort());
+
+    // Let the pump enqueue the first chunk and park on `next()` call #2.
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    const callsBeforeClose = nextCalls;
+    expect(callsBeforeClose).toBeGreaterThanOrEqual(1);
+
+    handle.close();
+    // Release the parked `next()` so the pump's post-await abort check runs.
+    resolveGate?.();
+    // Give the pump a few ticks to observe the abort and settle.
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    // Pump stopped: no NEW `next()` calls beyond the one that was already
+    // in-flight (and parked) at close time.
+    expect(nextCalls).toBeLessThanOrEqual(callsBeforeClose + 1);
+
+    // Runtime stream session was best-effort cancelled exactly once.
+    expect(cancelCalls.length).toBe(1);
+    expect(cancelCalls[0]?.requestIdHex).toBe("ef".repeat(16));
+    expect(cancelCalls[0]?.callerDid).toBe("did:dht:invoker");
+  });
+});
+
+/**
+ * Minimal mock {@link Bridge} that records `outletStreamCancel` invocations so
+ * close()'s best-effort runtime-session release can be asserted. Every other
+ * member throws — these tests only exercise the cancel path.
+ */
+function makeCancelRecordingBridge(): {
+  bridge: Bridge;
+  cancelCalls: Array<{ requestIdHex: string; callerDid: string }>;
+} {
+  const cancelCalls: Array<{ requestIdHex: string; callerDid: string }> = [];
+  const bridge = {
+    async outletStreamCancel(requestIdHex: string, callerDid: string): Promise<number | null> {
+      cancelCalls.push({ requestIdHex, callerDid });
+      return null;
+    },
+  } as unknown as Bridge;
+  return { bridge, cancelCalls };
+}

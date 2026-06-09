@@ -533,6 +533,17 @@ export class InvocationHandle
     return this.requestIdHex;
   }
 
+  /** Internal — caches the resolved streaming `request_id` so the
+   *  synchronous {@link close} can address the runtime session for its
+   *  best-effort cancel even when no `grantCredit` / `cancel` ran first.
+   *  The streaming factory calls this the instant the bridge open yields a
+   *  request id. No-op once a value is pinned (the id never changes). */
+  setRequestIdHex(ridHex: string): void {
+    if (this.requestIdHex === null) {
+      this.requestIdHex = ridHex;
+    }
+  }
+
   /** True once a terminal chunk has been observed (AC13). */
   get isTerminated(): boolean {
     return this.terminated;
@@ -814,9 +825,9 @@ export class InvocationHandle
 
   /**
    * Releases the handle's background work — for a streaming handle, the
-   * §5.4.5 receiver-side revocation re-check loop. Idempotent: the first
-   * call marks the handle terminated and runs each registered teardown
-   * exactly once; later calls are no-ops.
+   * §5.4.5 receiver-side revocation re-check loop AND the eager chunk pump.
+   * Idempotent: the first call marks the handle terminated and runs each
+   * registered teardown exactly once; later calls are no-ops.
    *
    * After `close()` the control-plane methods (`grantCredit` / `cancel`)
    * throw {@link StreamAlreadyClosed} because the terminal flag is set.
@@ -825,19 +836,76 @@ export class InvocationHandle
    * `grantCredit` / `cancel`, then abandons it WITHOUT consuming the chunk
    * stream — MUST call `close()` (idiomatically via `await using handle =
    * ctx.outlets.invoke(...)`). For an UNBOUNDED stream the detached recheck
-   * IIFE polls `ucanValidate` until the handle is terminated; without
-   * `close()` (or a terminal chunk) it would poll for the process lifetime.
-   * Consuming the stream to its terminal chunk already terminates the
-   * handle, so calling `close()` afterward is a harmless no-op. Mirrors the
-   * Swift `close()` / `defer`, the Kotlin `close()` / `use {}`, and the
-   * Python `aclose()` / `async with` teardown idioms.
+   * IIFE polls `ucanValidate` until the handle is terminated AND the eager
+   * chunk pump loops `await stream.next()` for the process lifetime, growing
+   * `this.chunks` without bound; without `close()` (or a terminal chunk) both
+   * run forever. `close()` aborts the pump (its loop checks the registered
+   * `pumpAbort` signal after each `await`), aborts the recheck loop, and
+   * best-effort cancels the runtime stream session so the bridge stops
+   * producing chunks. Consuming the stream to its terminal chunk already
+   * terminates the handle, so calling `close()` afterward is a harmless
+   * no-op. Mirrors the Swift `close()` / `defer`, the Kotlin `close()` /
+   * `use {}`, and the Python `aclose()` / `async with` teardown idioms.
+   *
+   * Awaiters parity (Finding 2): a caller doing `handle.close(); await
+   * handle;` (or `await using` then awaiting the aggregate) must ERROR
+   * cleanly, never hang. When `close()` runs before any terminal outcome was
+   * produced it settles the consumption channels — pending aggregate
+   * awaiters reject with {@link StreamAlreadyClosed} and any waiting
+   * async-iterator reader is unblocked via the abnormal-closure sentinel —
+   * matching Swift, which rejects the aggregate continuation on close.
    */
   close(): void {
     if (this.closed) {
       return;
     }
+    // Capture whether a terminal chunk had already been observed BEFORE we
+    // flip the terminated latch. A handle that completed normally (its End /
+    // terminal Error already arrived) must NOT be cancelled again — the
+    // runtime session is gone and `cancel()` would double-cancel. Only an
+    // abandoned, still-live stream needs the best-effort runtime cancel.
+    const wasTerminal = this.terminated;
     this.closed = true;
     this.terminated = true;
+
+    // Settle the consumption channels so `await handle` / `for await` after
+    // close resolve deterministically instead of hanging. Only settle when no
+    // terminal outcome was produced — a normal completion already settled
+    // them via the End/Error sink path.
+    if (!wasTerminal && this.resolved === null && this.rejected === null) {
+      const closedErr = new StreamAlreadyClosed(
+        "handle closed before the stream produced a terminal chunk",
+      );
+      this.rejected = closedErr;
+      for (const r of this.deferredRejecters) r(closedErr);
+      this.deferredRejecters = [];
+      this.deferredResolvers = [];
+      // Push the abnormal-closure sentinel so a waiting `for await` reader
+      // exits through `iteratorStep`'s no-terminal-chunk path (SCP-TOOL-6131)
+      // rather than blocking forever.
+      this.enqueueChunk(null);
+    }
+
+    // Best-effort release of the runtime stream session for an abandoned,
+    // still-live stream. Routed through the existing cancel control-plane
+    // verb — closing an unconsumed stream is exactly "tell the runtime to
+    // stop". Skipped when the stream had already terminated (no live session)
+    // or when the handle never opened a streaming session (degenerate
+    // single-shot path, or no pinned invoker DID to authenticate the cancel).
+    if (!wasTerminal && this.requestIdHex !== null && this.invokerDid !== null) {
+      const ridHex = this.requestIdHex;
+      const callerDid = this.invokerDid;
+      void (async () => {
+        try {
+          const bridge = await getBridge();
+          await bridge.outletStreamCancel(ridHex, callerDid);
+        } catch {
+          // Best-effort — AlreadyTerminated / transport drop are fine; the
+          // stream has left the runtime control plane either way.
+        }
+      })();
+    }
+
     const handlers = this.closeHandlers;
     this.closeHandlers = [];
     for (const handler of handlers) {
@@ -888,11 +956,26 @@ interface InvocationHandleSink {
 async function pumpStreamingBridge(
   stream: BridgeOutletInvocationStream,
   sink: InvocationHandleSink,
+  pumpSignal: AbortSignal,
 ): Promise<void> {
   let terminalObserved = false;
   try {
     while (true) {
+      if (pumpSignal.aborted) {
+        // `close()` aborted the handle — stop polling the bridge so an
+        // unconsumed control-plane-only handle does not loop `stream.next()`
+        // (and grow the handle's chunk buffer) for the process lifetime. The
+        // runtime session is released separately by `close()`'s best-effort
+        // `outletStreamCancel`. Settle the IIFE without emitting anything:
+        // `close()` already settled the consumption channels.
+        return;
+      }
       const chunk: BridgeOutletStreamChunk | null = await stream.next();
+      // Re-check after the await — the abort may have fired while the bridge
+      // call was in flight.
+      if (pumpSignal.aborted) {
+        return;
+      }
       if (chunk === null) {
         if (!terminalObserved) {
           // Abnormal closure — the bridge receiver closed without the
@@ -1305,6 +1388,12 @@ export class OutletNamespace {
       requestIdPromise.catch(() => {
         /* observed lazily by control-plane methods */
       });
+      // AbortController for the eager chunk pump. `close()` aborts it so an
+      // unconsumed control-plane-only handle stops polling `stream.next()`
+      // (and stops growing the handle's chunk buffer) immediately rather than
+      // looping for the process lifetime. Distinct from the recheck loop's
+      // `recheckAbort` below, though both fire on the same `close()`.
+      const pumpAbort = new AbortController();
       const handleFactory = (sink: InvocationHandleSink): void => {
         (async () => {
           try {
@@ -1325,9 +1414,13 @@ export class OutletNamespace {
             // Resolve the request-id promise before we start pumping
             // chunks — control-plane methods that raced to grantCredit
             // immediately after `invoke()` will now unblock with a
-            // valid request id rather than a stale `null`.
+            // valid request id rather than a stale `null`. Also pin the id on
+            // the handle so the synchronous `close()` can address the runtime
+            // session for its best-effort cancel even with no prior
+            // `grantCredit` / `cancel`.
             resolveRid(stream.requestId);
-            await pumpStreamingBridge(stream, sink);
+            sdkHandle.setRequestIdHex(stream.requestId);
+            await pumpStreamingBridge(stream, sink, pumpAbort.signal);
           } catch (err) {
             // Surface the open failure on BOTH paths: control-plane
             // (via the request-id promise) and the chunk pump.
@@ -1341,6 +1434,8 @@ export class OutletNamespace {
         invokerDid,
         ...(aggregateSchema !== undefined && { aggregateSchema }),
       });
+      // `close()` (and `[Symbol.asyncDispose]`) abort the chunk pump.
+      sdkHandle.registerCloseHandler(() => pumpAbort.abort());
 
       // §5.4.5 receiver-side revocation re-check (RevokedMidStream /
       // SCP-TOOL-6110). Per spec the SDK framework MUST periodically
