@@ -4647,6 +4647,95 @@ async fn resolve_uniffi_signing_key(
     })
 }
 
+/// Signs the §23.16.8 context-export snapshot digest via the exporter
+/// identity's [`KeyCustody::sign`] — delegating to whichever backend backs the
+/// handle (platform/software callback custody OR in-memory custody) — instead
+/// of extracting a raw Ed25519 signing key.
+///
+/// This is the export-path analogue of [`resolve_uniffi_signing_key`]: the
+/// governance lifecycle paths still extract a raw key (they sign with
+/// `ed25519_dalek::Signer` directly), but context export only needs a detached
+/// signature over the canonical snapshot digest, so it can route through
+/// `custody.sign` and never materialize private key bytes. A sign-only /
+/// keychain / HSM-shaped callback custody — one that implements `sign` but
+/// intentionally does NOT implement `export_ed25519_signing_key` — can
+/// therefore still produce a verifiable signed export. Private key material
+/// never crosses the FFI boundary (ADR-006).
+///
+/// Checks `callback_custody` first (platform/software), then falls back to
+/// `in_memory_custody`, matching the resolution order of every other
+/// key-bearing `UniFFI` path.
+///
+/// Fail-closed: returns `ScpError::Context` (CTX-2040) when no signing-key
+/// handle or custody provider is present, and validates that the returned
+/// signature is exactly 64 bytes (Ed25519) — so a misbehaving custody can
+/// never yield an under-length signature that would later fail verification
+/// in a confusing place. The caller (`context_export`) never emits an
+/// unsigned export on any error path.
+async fn sign_export_snapshot_via_custody(
+    handle: &ContextHandle,
+    hash: &[u8; 32],
+) -> Result<[u8; 64], ScpError> {
+    let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
+        msg: "no signing key on context handle — context export \
+                  requires an identity with an active signing key"
+            .to_owned(),
+        code: codes::CTX_2040.to_owned(),
+    })?;
+
+    let signature = if let Some(ref cb) = handle.callback_custody {
+        cb.sign(&key_handle, hash)
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("platform custody failed to sign context export snapshot: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            })?
+    } else {
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            if let Some(ref imc) = handle.in_memory_custody {
+                imc.0
+                    .sign(&key_handle, hash)
+                    .await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!(
+                            "in-memory custody failed to sign context export snapshot: {e}"
+                        ),
+                        code: codes::CTX_2040.to_owned(),
+                    })?
+            } else {
+                return Err(ScpError::Context {
+                    msg: "no custody provider on context handle — context export \
+                              requires an identity created with custody"
+                        .to_owned(),
+                    code: codes::CTX_2040.to_owned(),
+                });
+            }
+        }
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            return Err(ScpError::Context {
+                msg: "no custody provider on context handle — context export \
+                          requires an identity created with custody"
+                    .to_owned(),
+                code: codes::CTX_2040.to_owned(),
+            });
+        }
+    };
+
+    let bytes: [u8; 64] = signature
+        .as_bytes()
+        .try_into()
+        .map_err(|_| ScpError::Context {
+            msg: format!(
+                "custody sign returned {} bytes, expected 64 (Ed25519) for context export snapshot",
+                signature.as_bytes().len()
+            ),
+            code: codes::CTX_2040.to_owned(),
+        })?;
+    Ok(bytes)
+}
+
 /// Resolves the snapshot creator's Ed25519 verification key for
 /// snapshot-signature verification on context import (§23.16.8, ADR-050,
 /// ADR-039).
@@ -14815,19 +14904,30 @@ impl Scp {
         runtime()
             .spawn(async move {
                 let manager = bi.context_manager_or_error()?;
-                // Resolve the exporter's custody signing key (callback or
-                // in-memory custody) to sign the snapshot (§23.16.8). The
-                // runtime holds no key material — signing happens here.
-                let signing_key = resolve_uniffi_signing_key(&handle).await?;
+                // Sign the §23.16.8 snapshot digest via the exporter identity's
+                // `KeyCustody::sign` (callback OR in-memory custody) rather than
+                // extracting a raw Ed25519 key. This lets a sign-only /
+                // keychain / HSM-shaped callback custody — one that signs but
+                // cannot export key bytes — produce a verifiable signed export.
+                // Private key material never crosses the FFI boundary (ADR-006).
+                //
+                // `export_context`'s `sign` closure is synchronous, but custody
+                // `sign` is async (a callback custody awaits a Swift/Kotlin
+                // `KeyCustodyProvider`). Bridge the two with `block_in_place` +
+                // `block_on` on the current multi-thread runtime — the same
+                // pattern used by `member_dids`/`get_role_state` elsewhere in
+                // this bridge. This task already runs on a `runtime()` worker
+                // (`new_multi_thread`), so a runtime handle is always present
+                // and `block_in_place` is legal here.
+                let rt = tokio::runtime::Handle::current();
                 let export = manager
                     .export_context(
                         &ctx_id,
                         scp_identity::DID::from(creator_did),
                         |hash: &[u8; 32]| {
-                            use ed25519_dalek::Signer;
-                            Ok::<[u8; 64], std::convert::Infallible>(
-                                signing_key.sign(hash).to_bytes(),
-                            )
+                            tokio::task::block_in_place(|| {
+                                rt.block_on(sign_export_snapshot_via_custody(&handle, hash))
+                            })
                         },
                     )
                     .await
@@ -15039,6 +15139,159 @@ mod tests {
             pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
             pre_rotation_custody,
         })
+    }
+
+    // ----- Context export signing via sign-only custody (§23.16.8) -----
+
+    /// A deliberately **sign-only** `KeyCustodyProvider`: it signs and exposes a
+    /// public key, but does NOT override `export_signing_key_bytes`, so the
+    /// trait default (CTX-2050 "not implemented") applies. This models a
+    /// keychain / Secure-Enclave / HSM-shaped custody whose raw private key is
+    /// non-exportable — the exact case the prior raw-key export path could not
+    /// sign a context export for. Backed by a fixed Ed25519 key so the produced
+    /// signature is independently verifiable against the public key.
+    struct SignOnlyCustody {
+        signing_key: ed25519_dalek::SigningKey,
+    }
+
+    impl SignOnlyCustody {
+        fn new() -> Self {
+            // Deterministic seed of all 9s — independent of any production key.
+            Self {
+                signing_key: ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::KeyCustodyProvider for SignOnlyCustody {
+        async fn sign(&self, _key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+            use ed25519_dalek::Signer;
+            Ok(self.signing_key.sign(&message).to_bytes().to_vec())
+        }
+
+        async fn get_public_key(&self, _key_id: String) -> Result<Vec<u8>, ScpError> {
+            Ok(self.signing_key.verifying_key().to_bytes().to_vec())
+        }
+
+        async fn destroy_key(&self, _key_id: String) -> Result<(), ScpError> {
+            Ok(())
+        }
+
+        async fn generate_keypair(&self, _key_type: String) -> Result<String, ScpError> {
+            // Single fixed key; handle id `1` is what the test wires.
+            Ok("1".to_owned())
+        }
+
+        async fn dh_agree(
+            &self,
+            _key_id: String,
+            _peer_public: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            Err(ScpError::Context {
+                msg: "dh_agree not supported by SignOnlyCustody".to_owned(),
+                code: codes::CTX_2050.to_owned(),
+            })
+        }
+
+        async fn derive_pseudonym(
+            &self,
+            _key_id: String,
+            _context_id: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            Err(ScpError::Context {
+                msg: "derive_pseudonym not supported by SignOnlyCustody".to_owned(),
+                code: codes::CTX_2050.to_owned(),
+            })
+        }
+
+        // NOTE: `export_signing_key_bytes` is intentionally NOT overridden —
+        // the trait default returns CTX-2050, which is what makes this custody
+        // "sign-only". `CallbackKeyCustody::export_ed25519_signing_key` (the old
+        // export-signing path) therefore fails for this custody.
+
+        fn custody_type(&self, _key_id: String) -> String {
+            "hardware".to_owned()
+        }
+    }
+
+    /// A sign-only custody (whose raw key cannot be exported) must still be able
+    /// to sign a context-export snapshot digest via `KeyCustody::sign`
+    /// (§23.16.8), producing a 64-byte Ed25519 signature that verifies against
+    /// the custody's public key. This is the `UniFFI` parity fix for the `NAPI`
+    /// callback-custody export path: the prior raw-key export path
+    /// (`export_ed25519_signing_key`) cannot serve this custody.
+    #[tokio::test]
+    async fn sign_only_custody_signs_export_snapshot_and_verifies() {
+        use ed25519_dalek::Verifier;
+
+        let scp = scp_test();
+        let provider = SignOnlyCustody::new();
+        let verifying_key = provider.signing_key.verifying_key();
+
+        let callback_custody = Arc::new(CallbackKeyCustody::new(Box::new(provider)));
+        let key_handle = KeyHandle::new(1);
+
+        // Sanity: the old raw-key export path must FAIL for a sign-only custody,
+        // proving the new `custody.sign` path is load-bearing (not redundant
+        // with the still-extant governance raw-key path).
+        let export_attempt = callback_custody
+            .export_ed25519_signing_key(&key_handle)
+            .await;
+        assert!(
+            export_attempt.is_err(),
+            "sign-only custody must not be able to export raw key bytes"
+        );
+
+        // Build a context handle carrying the sign-only callback custody and the
+        // `#active` key handle, exactly as `context_create` would for a
+        // platform-custody identity.
+        let handle = Arc::new(ContextHandle {
+            context_id: "ctx-sign-only".to_owned(),
+            state: tokio::sync::Mutex::new(ContextState::Active),
+            creator_did: "did:dht:z6MkSignOnly".to_owned(),
+            #[cfg(feature = "allow_in_memory_custody")]
+            in_memory_custody: None,
+            callback_custody: Some(callback_custody),
+            signing_key: Some(key_handle),
+            ceiling_strings: Vec::new(),
+            tool_registry: tokio::sync::Mutex::new(scp_core::context::tools::ToolRegistry::new()),
+            tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
+            economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
+            instance_id: scp.instance_id(),
+        });
+
+        // The §23.16.8 digest is opaque to the signer — any 32-byte hash works
+        // to prove the signing path.
+        let hash = [0x42u8; 32];
+        let signature = super::sign_export_snapshot_via_custody(&handle, &hash)
+            .await
+            .expect("sign-only custody must produce a context-export signature");
+
+        // Exactly 64 bytes (length validation in the helper) and verifiable
+        // against the custody's public key.
+        assert_eq!(signature.len(), 64, "Ed25519 signature must be 64 bytes");
+        let sig = ed25519_dalek::Signature::from_bytes(&signature);
+        verifying_key
+            .verify(&hash, &sig)
+            .expect("signature must verify against the sign-only custody public key");
+    }
+
+    /// `sign_export_snapshot_via_custody` must fail closed when the handle
+    /// carries no signing-key handle — never returning a bogus signature.
+    #[tokio::test]
+    async fn export_snapshot_signing_fails_closed_without_signing_key() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp); // signing_key: None, no custody
+        let hash = [0u8; 32];
+        let result = super::sign_export_snapshot_via_custody(&handle, &hash).await;
+        let err = result.expect_err("missing signing key must be rejected");
+        match err {
+            ScpError::Context { ref code, .. } => assert_eq!(code, codes::CTX_2040),
+            other => panic!("expected ScpError::Context CTX-2040, got {other:?}"),
+        }
     }
 
     /// `UniFFI` `tool_invoke` must reject `None` `ucan_token` with a
