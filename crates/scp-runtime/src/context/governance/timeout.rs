@@ -234,6 +234,27 @@ impl GovernanceTimeoutTask {
         self.task = Some(abort_handle);
     }
 
+    /// Installs an already-spawned timeout task's cancel signal and
+    /// abort handle, cancelling any prior task first.
+    ///
+    /// Used by the actor-shape governance-timeout spawn path (ADR-049
+    /// Phase 2A finalization), where the interval loop is spawned onto
+    /// the supervisor's tracked `task_set` via
+    /// [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn)
+    /// rather than [`start_in`](Self::start_in)'s direct `&mut JoinSet`
+    /// access. The caller builds the loop future with a
+    /// `cancel.notified()` select arm using the same `cancel` `Notify`
+    /// it passes here, so [`cancel`](Self::cancel) / drop stop the task.
+    pub fn install(&mut self, cancel: Arc<Notify>, abort: AbortHandle) {
+        // Cancel any existing task (signal + abort), same as `start_in`.
+        self.cancel.notify_one();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.cancel = cancel;
+        self.task = Some(abort);
+    }
+
     /// Returns `true` if the task is currently running.
     #[must_use]
     pub fn is_active(&self) -> bool {

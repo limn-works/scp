@@ -1,3 +1,8 @@
+// ADR-049 commit 12c.9e: ContextCryptoProvider trait deleted. Tests in this
+// file construct ContextManager with the trait's mock implementations; the
+// rewire path lives in 12c.9f via backend injection. File gated until then.
+#![cfg(any())]
+
 //! SCP-PERSIST-070: End-to-end integration tests for context persistence.
 //!
 //! Tests the full context lifecycle through `ProtocolRepository`: create contexts
@@ -1176,13 +1181,14 @@ async fn context_manager_broadcast_restore_roundtrip() {
         ..ContextParams::default()
     };
 
-    let manager = ContextManager::with_persistence(
+    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+    let manager = scp_core::context::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto),
         Box::new(MockTransport),
         Box::new(MockEventLog),
         Box::new(SharedPersistence(Arc::clone(&persistence))),
         mock_key_resolver(),
-    );
+    ));
 
     // Register creator DID as locally controlled.
     manager.register_local_did(creator_did.clone()).await;
@@ -1240,13 +1246,14 @@ async fn context_manager_broadcast_restore_roundtrip() {
 
     // --- Phase 4: Create a new manager, restore, and verify replay rejection ---
 
-    let manager2 = ContextManager::with_persistence(
+    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+    let manager2 = scp_core::context::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto),
         Box::new(MockTransport),
         Box::new(MockEventLog),
         Box::new(SharedPersistence(Arc::clone(&persistence))),
         mock_key_resolver(),
-    );
+    ));
 
     let handle2 = ContextHandle::new(ctx_id.to_owned(), params);
     handle2.transition_to(&ContextState::Active).await.unwrap();

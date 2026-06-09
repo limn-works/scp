@@ -12,7 +12,7 @@
 //!
 //! # Transport model
 //!
-//! Transport state is delegated to the default [`NapiBridgeInstance`]'s transport
+//! Transport state is delegated to the default `NapiBridgeInstance`'s transport
 //! field (#1549). The `BridgeInstance` stores an `Arc<TransportManager>` behind
 //! a `RwLock` — the `Arc` allows NAPI subscription tasks to hold a reference
 //! across `.await` points without keeping the lock guard alive.
@@ -403,18 +403,66 @@ pub(crate) async fn transport_disconnect_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`configure_local_transport`].
+/// Per-bridge-instance implementation of `configure_local_transport`.
+///
+/// Pre-configures the per-instance `Supervisor` with `LocalTransportProvider`.
+///
+/// **Must be called before any `identityCreate` → `contextCreate` sequence.**
+/// Once the supervisor is initialized (by whichever call arrives first),
+/// the transport provider is locked in for the lifetime of the instance.
+///
+/// With `LocalTransportProvider`, `contextSend` and `broadcastPublish`
+/// succeed locally without requiring a running relay. This is the correct
+/// setup for single-process E2E tests that exercise the full
+/// encrypt → sign → send pipeline.
+///
+/// The `local_did` parameter is used as the MLS credential identity for the
+/// `MlsCryptoProvider`. Pass any valid `did:dht:` string (typically the
+/// DID of the first identity you plan to create).
+///
+/// # Errors
+///
+/// Returns an error only if `local_did` fails DID format validation.
 pub(crate) fn configure_local_transport_on(
     bi: &NapiBridgeInstance,
     local_did: String,
 ) -> napi::Result<()> {
     scp_ffi_common::validate::validate_did(&local_did)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    crate::runtime::init_context_manager_with_local_transport(bi, &local_did);
+    crate::runtime::init_supervisor_with_local_transport(bi, &local_did);
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`configure_relay_transport`].
+/// Per-bridge-instance implementation of `configure_relay_transport`.
+///
+/// Pre-configures the per-instance `Supervisor` with `RelayTransportProvider`.
+///
+/// **Must be called before any `identityCreate` → `contextCreate` sequence.**
+/// Once the supervisor is initialized (by whichever call arrives first),
+/// the transport provider is locked in for the lifetime of the instance.
+///
+/// Unlike `configureLocalTransport` (which silently succeeds without reaching
+/// the relay), this function creates a **real** relay connection and wraps it
+/// in `RelayTransportProvider`. This means `contextSend` will publish
+/// encrypted payloads through the relay, enabling full end-to-end
+/// send → relay → subscribe → receive tests.
+///
+/// The `relay_url` must point to a running relay. A separate
+/// `transportConnect` call is still needed for `contextSubscribe` (which
+/// uses the `BridgeInstance` transport manager for its subscription stream).
+///
+/// # Arguments
+///
+/// * `relay_url` — The URL of the relay to connect to.
+/// * `local_did` — The DID for MLS credential identity. Pass any valid
+///   `did:dht:` string (typically the DID of the first identity you plan
+///   to create).
+///
+/// # Errors
+///
+/// - Returns an error if `relay_url` fails URL validation.
+/// - Returns an error if `local_did` fails DID format validation.
+/// - Returns an error if the relay connection fails.
 pub(crate) async fn configure_relay_transport_on(
     bi: &NapiBridgeInstance,
     relay_url: String,
@@ -445,7 +493,7 @@ pub(crate) async fn configure_relay_transport_on(
             code: codes::TRANS_5001.to_owned(),
         })?;
 
-    crate::runtime::init_context_manager_with_relay_transport(bi, &local_did, adapter);
+    crate::runtime::init_supervisor_with_relay_transport(bi, &local_did, adapter);
     Ok(())
 }
 
@@ -520,7 +568,27 @@ pub(crate) async fn transport_add_relay_on(
     Ok(count)
 }
 
-/// Per-bridge-instance implementation of [`transport_assign_relay_set`].
+/// Per-bridge-instance implementation of `transport_assign_relay_set`.
+///
+/// Assigns a relay set for the given context.
+///
+/// Delegates to `TransportManager::assign_relay_set` which selects at
+/// least `min_relays` adapters per context using round-robin spread to
+/// minimize overlap.
+///
+/// # Arguments
+///
+/// * `context_id` — The context to assign relays for.
+///
+/// # Returns
+///
+/// A list of adapter indices assigned to this context.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-TRANS-5010` if no transport manager exists.
+/// - Rejects with `SCP-VALID-7000` if `context_id` is invalid.
+/// - Rejects with `SCP-TRANS-5002` if relay set assignment fails.
 pub(crate) fn transport_assign_relay_set_on(
     bi: &NapiBridgeInstance,
     context_id: String,
@@ -930,12 +998,12 @@ mod tests {
         rt.block_on(configure_relay_transport_on(&bi, relay_url, did))
             .expect(
                 "selector-routed configure_relay_transport to a no-QUIC relay must succeed via \
-                 WS fallback and install a ContextManager",
+                 WS fallback and install a Supervisor",
             );
 
         assert!(
-            bi.core.has_context_manager(),
-            "ContextManager must be attached after configure_relay_transport routes through \
+            bi.core.has_supervisor(),
+            "Supervisor must be attached after configure_relay_transport routes through \
              the selector"
         );
 

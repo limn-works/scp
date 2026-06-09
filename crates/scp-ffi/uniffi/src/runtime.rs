@@ -25,7 +25,8 @@
 //! 2. `Scp::method(...)` delegates to methods on
 //!    `UniffiBridgeInstance` (`context_manager_expect`, `with_ucan_state`,
 //!    `ensure_ucan_registered`, `did_resolver`, etc.) — all per-instance,
-//!    no process-wide shared state.
+//!    no process-wide shared state. `context_manager_expect` returns the
+//!    instance's `Arc<Supervisor>` (ADR-049 actor migration).
 //! 3. The instance is dropped when the last `Arc` reference is released
 //!    or permanently deactivated via [`UniffiBridgeInstance::shutdown`].
 //!
@@ -36,26 +37,23 @@
 //! #1549 Phase 4 PR 4 Phase D).
 
 use async_trait::async_trait;
-use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError, ShutdownOutcome};
+use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so bridge.rs
 // and server.rs can name it in impl blocks without pulling in the full
 // path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
-use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage;
 use scp_ffi_common::error_codes as codes;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use dashmap::DashMap;
-use scp_core::context::builder::{ContextCryptoProvider, ContextEventLogProvider};
-use scp_core::context::manager::ContextManager;
+use scp_core::context::builder::ContextEventLogProvider;
+use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
-use scp_platform::encrypting_adapter::EncryptingAdapter;
 
 // ---------------------------------------------------------------------------
 // UniffiBridgeInstance — per-bridge concrete bridge instance (#1549 Phase 4 PR 1)
@@ -88,23 +86,83 @@ pub enum StorageConfig {
         /// Directory the database file is created in. Path is passed
         /// through `std::path::PathBuf` on the Rust side.
         path: String,
-        /// Raw encryption key material (typically 32 bytes).
-        key: Vec<u8>,
+        /// Encryption key material — raw bytes or a passphrase (mutually
+        /// exclusive; the [`SqliteKeyMaterial`] sum type makes "exactly
+        /// one" the only representable state).
+        key: SqliteKeyMaterial,
     },
 }
 
-/// Bridge-internal error returned by [`UniffiBridgeInstance::with_storage_uniffi`]
-/// when a persistence backend cannot be initialized.
+/// `SQLCipher` key-material selector for [`StorageConfig::Sqlite`] (spec §17.6).
 ///
-/// Converted to [`ScpError::Validation`] at the `Scp::with_storage`
-/// factory surface. Kept as a dedicated enum so the `runtime` layer
-/// does not depend on the bridge error vocabulary and so new backends
-/// (e.g. encrypted filesystem) can extend the enum without touching
-/// every caller.
+/// The caller supplies EITHER raw key material OR a passphrase — never both,
+/// never neither. The sum type makes that mutual exclusion unrepresentable as
+/// an invalid state, so there is exactly one happy path per variant. This
+/// mirrors the `PyO3` bridge's `SqliteKeyMaterial`.
+///
+/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+///   mode; the existing, unchanged path).
+/// - [`SqliteKeyMaterial::Passphrase`] feeds
+///   [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+///   key from the passphrase via the shared Argon2id parameterization with a
+///   persisted per-database salt sidecar.
+///
+/// # `UniFFI` representation
+///
+/// `#[derive(uniffi::Enum)]` exposes this to Swift and Kotlin as an
+/// associated-value enum: Swift sees `case raw(Data)` / `case
+/// passphrase(String)`; Kotlin a `sealed class SqliteKeyMaterial`. The raw
+/// `Vec<u8>` and the `String` cross the FFI boundary by value; the Rust side
+/// moves the passphrase into `Zeroizing` and zeroes the raw bytes after
+/// `SQLCipher` has consumed them. Callers cannot zero their own copy across
+/// the boundary, so they should overwrite their source buffer after the call
+/// returns.
+#[derive(Clone, uniffi::Enum)]
+pub enum SqliteKeyMaterial {
+    /// Raw encryption key material (32 bytes recommended).
+    Raw {
+        /// The raw key bytes.
+        key: Vec<u8>,
+    },
+    /// Human-chosen passphrase; the `SQLCipher` key is derived via Argon2id.
+    Passphrase {
+        /// The passphrase. Moved into `Zeroizing` at the bridge boundary.
+        passphrase: String,
+    },
+}
+
+impl std::fmt::Debug for SqliteKeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the key or passphrase bytes — only the variant and a
+        // length hint for the raw case (defense in depth). Mirrors the PyO3 /
+        // NAPI redacting impl.
+        match self {
+            Self::Raw { key } => {
+                write!(f, "SqliteKeyMaterial::Raw(<redacted {} bytes>)", key.len())
+            }
+            Self::Passphrase { .. } => write!(f, "SqliteKeyMaterial::Passphrase(<redacted>)"),
+        }
+    }
+}
+
+/// Bridge-internal error returned by
+/// [`UniffiBridgeInstance::with_storage_uniffi`] when a durable storage
+/// backend cannot be opened.
+///
+/// Surfacing this (rather than silently degrading to in-memory or no storage)
+/// is the fail-closed contract from spec §17.6: a failed durable-backend open
+/// is a terminal error the caller observes, never a condition the system
+/// recovers from by downgrading durability. Converted to [`ScpError`] (and so
+/// to a Swift `throws` / Kotlin exception) via the [`From`] impl below.
+///
+/// Mirrors the `PyO3` bridge's `StorageInitError`. The message never contains
+/// key or passphrase bytes.
 #[derive(Debug)]
 pub enum StorageInitError {
-    /// `SqliteStorage::new` failed — directory permission denied, key
-    /// mismatch on an existing DB, `SQLCipher` init error, and so on.
+    /// `SqliteStorage::new` / `SqliteStorage::with_passphrase` failed —
+    /// directory permission denied, key/passphrase rejected by `SQLCipher` on
+    /// an existing DB, salt-sidecar fail-closed condition, corrupt file, and
+    /// so on.
     SqliteOpen {
         /// The directory path the caller asked for (for the error message).
         path: String,
@@ -124,6 +182,17 @@ impl std::fmt::Display for StorageInitError {
 }
 
 impl std::error::Error for StorageInitError {}
+
+impl From<StorageInitError> for crate::ScpError {
+    fn from(err: StorageInitError) -> Self {
+        match err {
+            StorageInitError::SqliteOpen { .. } => Self::Context {
+                msg: err.to_string(),
+                code: codes::CTX_2000.to_owned(),
+            },
+        }
+    }
+}
 
 // `ProtocolRepoVariant` lives in `scp-ffi-common::bridge_runtime`. Re-exported
 // here so existing `crate::runtime::ProtocolRepoVariant` references across
@@ -232,6 +301,25 @@ pub struct UniffiBridgeInstance {
     /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) mcp_client_registry: Arc<DashMap<String, crate::bridge::McpClientEntry>>,
 
+    /// The supervisor's `OpenMLS` storage view (spec §17.6 / ADR-049).
+    ///
+    /// Holds the SAME backend the bridge chose for persistence + event log,
+    /// erased ONCE via [`SpawnBlockingStorageAdapter`]:
+    /// - in-memory path: the un-swallowed
+    ///   [`scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle`]
+    ///   returned by `build_event_log_provider`;
+    /// - `SQLCipher` path: the `Arc<SqliteStorage>` that also backs
+    ///   `CoreFields::persistence` and the event-log repository.
+    ///
+    /// `build_supervisor` reads this to satisfy the required `mls_storage`
+    /// argument of `Supervisor::with_providers`. The runtime never defaults
+    /// storage; if this is `None` at supervisor construction the
+    /// storage-before-supervisor precondition fails closed. It is `Option`
+    /// only because the field is populated at instance construction, before
+    /// the supervisor exists — every constructor sets it to `Some`.
+    pub(crate) mls_storage_backend:
+        Option<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>,
+
     /// Per-instance bridge credential store (spec §12.11).
     ///
     /// Mirrors `PyBridgeInstance::credential_store` and
@@ -253,11 +341,15 @@ impl UniffiBridgeInstance {
     /// Allocates a fresh `CoreFields` (new `instance_id`, new
     /// `CancellationToken`, empty `JoinSet`) and populates the protocol
     /// repository + typed registries. No `ContextManager` is attached —
-    /// callers attach one later via [`CoreFields::set_context_manager`].
+    /// callers attach one later via `CoreFields::set_context_manager`.
     #[must_use]
     pub fn new_uniffi() -> Self {
-        let (_event_log, protocol_repository) =
+        let (_event_log, protocol_repository, storage_handle) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
+        // The un-swallowed in-memory storage handle backs the supervisor's
+        // `mls_storage` view. The SAME store backs the event-log repository
+        // above (spec §17.6 — one chosen backend, derived consumers).
+        let mls_storage_backend = mls_storage_from_handle(storage_handle);
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
@@ -268,6 +360,7 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            mls_storage_backend: Some(mls_storage_backend),
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
@@ -275,7 +368,7 @@ impl UniffiBridgeInstance {
     }
 
     /// Constructs a new `UniffiBridgeInstance` with an explicit
-    /// [`scp_core::context::manager::ContextPersistence`] provider.
+    /// [`scp_core::context::persistence::ContextPersistence`] provider.
     ///
     /// Used by callers that already have a persistence strategy (typically
     /// unit tests; production persistence is wired through PR 3's
@@ -283,10 +376,11 @@ impl UniffiBridgeInstance {
     /// [`UniffiBridgeInstance::with_storage_uniffi`]).
     #[must_use]
     pub fn with_persistence_uniffi(
-        persistence: Box<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+        persistence: Box<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
     ) -> Self {
-        let (_event_log, protocol_repository) =
+        let (_event_log, protocol_repository, storage_handle) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
+        let mls_storage_backend = mls_storage_from_handle(storage_handle);
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
@@ -297,6 +391,7 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            mls_storage_backend: Some(mls_storage_backend),
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
@@ -306,24 +401,26 @@ impl UniffiBridgeInstance {
     /// Constructs a new `UniffiBridgeInstance` honoring a [`StorageConfig`].
     ///
     /// - [`StorageConfig::InMemory`] — equivalent to
-    ///   [`UniffiBridgeInstance::new_uniffi`]; no persistence provider is
-    ///   attached to the embedded `CoreFields`.
-    /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted
-    ///   database at `{path}/scp.db` and attaches a
-    ///   `ProtocolRepositoryContextBridge<Arc<SqliteStorage>>` to
-    ///   `CoreFields::persistence`. The subsequent
-    ///   `init_context_manager*` call picks the shared `Arc` up via
-    ///   [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
-    ///   so the `ContextManager` and the `CoreFields` mirror share a
-    ///   single `SqliteStorage` instance.
+    ///   [`UniffiBridgeInstance::new_uniffi`]; the supervisor's `mls_storage`
+    ///   view is backed by the same encrypted in-memory store as the event
+    ///   log (dev/test affordance; spec §17.6).
+    /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted database at
+    ///   `{path}/scp.db`. The raw-key path feeds [`SqliteStorage::new`]; the
+    ///   passphrase path feeds [`SqliteStorage::with_passphrase`] (Argon2id;
+    ///   spec §17.6). The ONE `Arc<SqliteStorage>` backs the context-snapshot
+    ///   persistence bridge, the Merkle event log + trust aggregation
+    ///   repository, AND the supervisor's `mls_storage` `OpenMLS` view, so
+    ///   all three consumers share a single `SQLCipher` connection.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageInitError::SqliteOpen`] when `SqliteStorage::new`
-    /// fails (permission denied, key mismatch, corrupt database). Unlike
-    /// the earlier silent-fallback behaviour, this now surfaces to the
-    /// caller so the bridge never masquerades an in-memory instance as
-    /// a SQLite-backed one.
+    /// Returns [`StorageInitError::SqliteOpen`] if the `SQLCipher` database
+    /// cannot be opened (bad key/passphrase, permission denied, corrupt file,
+    /// or a salt-sidecar fail-closed condition). FAIL CLOSED (spec §17.6):
+    /// the bridge does NOT silently degrade to in-memory or no-storage on a
+    /// failed durable-backend open. The error surfaces to Swift as `throws`
+    /// and Kotlin as a thrown exception via the [`From`] impl on
+    /// [`crate::ScpError`].
     pub fn with_storage_uniffi(config: StorageConfig) -> Result<Self, StorageInitError> {
         match config {
             StorageConfig::InMemory => Ok(Self::new_uniffi()),
@@ -337,54 +434,67 @@ impl UniffiBridgeInstance {
                         message: format!("invalid 'path' — {}", e.message),
                     }
                 })?;
-                // UniFFI's `Enum` derive cannot carry a `Zeroizing<Vec<u8>>`
-                // across the FFI boundary (no built-in `FfiConverter`), so
-                // the wire type is a plain `Vec<u8>`. The moment we own
-                // it, re-wrap it in `Zeroizing` so the drop-on-scope-exit
-                // semantics are enforced by the type system — matching
-                // `with_storage_napi` and `with_storage_py`. The earlier
-                // manual `zeroize::Zeroize::zeroize(&mut key_owned)` path
-                // was correct but relied on every exit path remembering
-                // to call it; `Zeroizing` removes that risk.
-                let key = zeroize::Zeroizing::new(key);
                 let path_buf = std::path::PathBuf::from(&path);
-                let storage = scp_platform::sqlite::SqliteStorage::new(&path_buf, &key)
-                    .map_err(|e| {
-                        tracing::error!(
-                            error = %e,
-                            path = %path,
-                            "with_storage_uniffi: SqliteStorage::new failed — returning error to caller"
-                        );
-                        StorageInitError::SqliteOpen {
-                            path: path.clone(),
-                            message: e.to_string(),
-                        }
-                    })?;
+                // Move the passphrase into `Zeroizing` at the bridge entry
+                // before any use; the raw-key bytes are zeroed after
+                // SQLCipher consumes them. Open the database ONCE — the same
+                // `Arc<SqliteStorage>` is shared across persistence, event
+                // log, and `mls_storage` (a second open would hit
+                // `SQLITE_BUSY` on first write).
+                let open_result = match &key {
+                    SqliteKeyMaterial::Raw { key: bytes } => {
+                        scp_platform::sqlite::SqliteStorage::new(&path_buf, bytes)
+                    }
+                    SqliteKeyMaterial::Passphrase { passphrase } => {
+                        let pass = zeroize::Zeroizing::new(passphrase.clone());
+                        scp_platform::sqlite::SqliteStorage::with_passphrase(
+                            &path_buf,
+                            pass.as_bytes(),
+                        )
+                    }
+                };
+                // Zero our copy of the raw key / passphrase regardless of
+                // outcome. The caller's copy crossed the UniFFI boundary by
+                // value and cannot be zeroed from here.
+                zero_key_material(key);
+
+                let storage = open_result.map_err(|e| {
+                    // FAIL CLOSED (spec §17.6): surface the error rather than
+                    // degrading to in-memory. The message never carries key
+                    // or passphrase bytes.
+                    tracing::error!(
+                        error = %e,
+                        path = %path,
+                        "with_storage_uniffi: SQLCipher open failed — failing closed, no in-memory fallback"
+                    );
+                    StorageInitError::SqliteOpen {
+                        path: path.clone(),
+                        message: e.to_string(),
+                    }
+                })?;
+
                 let arc_storage = Arc::new(storage);
-                // The same `Arc<SqliteStorage>` backs BOTH the
-                // context-snapshot persistence bridge AND the
-                // Merkle event log + trust aggregation repository.
-                // This is the fix for the split-brain where
-                // `with_storage(Sqlite)` used to persist snapshots
-                // but silently fall back to in-memory storage for
-                // event log entries.
+                // Build the persistence bridge and the event-log repository
+                // over clones of the SAME `Arc<SqliteStorage>`.
                 let persistence_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                 let persistence: Arc<
-                    dyn scp_core::context::manager::ContextPersistence + Send + Sync,
+                    dyn scp_core::context::persistence::ContextPersistence + Send + Sync,
                 > = Arc::new(
                     scp_core::store::context::ProtocolRepositoryContextBridge::new(
                         persistence_repo,
                     ),
                 );
                 let event_log_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                // Derive the supervisor's `mls_storage` view from the same
+                // `Arc<SqliteStorage>` — erased ONCE via
+                // `SpawnBlockingStorageAdapter`.
+                let mls_storage_backend = mls_storage_from_handle(Arc::clone(&arc_storage));
                 drop(arc_storage);
-                // `key` is a `Zeroizing<Vec<u8>>`, zeroed on drop here.
-                // SQLCipher has already retained its derived key
-                // internally by this point.
-                drop(key);
+
                 Ok(Self::with_persistence_uniffi_arc_and_repo(
                     persistence,
                     ProtocolRepoVariant::Sqlite(event_log_repo),
+                    mls_storage_backend,
                 ))
             }
         }
@@ -407,8 +517,9 @@ impl UniffiBridgeInstance {
     /// `Arc<SqliteStorage>`.
     #[must_use]
     fn with_persistence_uniffi_arc_and_repo(
-        persistence: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+        persistence: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
         protocol_repository: ProtocolRepoVariant,
+        mls_storage_backend: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Self {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
@@ -420,10 +531,26 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            mls_storage_backend: Some(mls_storage_backend),
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
         }
+    }
+
+    /// Returns the supervisor's `mls_storage` (`OpenMLS`) backend for this
+    /// instance, if populated.
+    ///
+    /// Every constructor populates this with `Some` (the chosen storage
+    /// erased once via [`SpawnBlockingStorageAdapter`]). `build_supervisor`
+    /// reads it to satisfy the required `mls_storage` argument of
+    /// `Supervisor::with_providers`; a `None` here is the
+    /// storage-before-supervisor precondition failing closed (spec §17.6).
+    #[must_use]
+    pub(crate) fn mls_storage_ref(
+        &self,
+    ) -> Option<&Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>> {
+        self.mls_storage_backend.as_ref()
     }
 
     /// Returns the monotonic instance id for this bridge.
@@ -551,7 +678,9 @@ impl UniffiBridgeInstance {
     /// is currently suspended, or when the instance has been permanently shut
     /// down.
     #[allow(dead_code)]
-    pub fn context_manager_expect(&self) -> Result<&Arc<ContextManager>, crate::ScpError> {
+    pub fn context_manager_expect(
+        &self,
+    ) -> Result<&Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
         if self.core.is_suspended() {
             return Err(crate::ScpError::Context {
                 msg: "bridge not ready: suspended".to_owned(),
@@ -565,7 +694,7 @@ impl UniffiBridgeInstance {
             });
         }
         self.core
-            .try_context_manager()
+            .try_supervisor()
             .ok_or_else(|| crate::ScpError::Context {
                 msg: "bridge not ready: no local DID registered".to_owned(),
                 code: codes::CTX_2000.to_owned(),
@@ -586,7 +715,9 @@ impl UniffiBridgeInstance {
     /// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the instance is
     /// currently suspended or when no `ContextManager` has been attached.
     #[allow(dead_code)]
-    pub fn context_manager_or_error(&self) -> Result<&Arc<ContextManager>, crate::ScpError> {
+    pub fn context_manager_or_error(
+        &self,
+    ) -> Result<&Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
         if self.core.is_suspended() {
             return Err(crate::ScpError::Context {
                 msg: "bridge is suspended — call resume() before performing operations".to_owned(),
@@ -599,7 +730,7 @@ impl UniffiBridgeInstance {
             );
         }
         self.core
-            .try_context_manager()
+            .try_supervisor()
             .ok_or_else(|| crate::ScpError::Context {
                 msg: "ContextManager not yet attached — call context_create, \
                       context_join, context_import, or init_context_manager first"
@@ -616,11 +747,13 @@ impl UniffiBridgeInstance {
     /// when the bridge isn't ready use this.
     #[must_use]
     #[allow(dead_code)]
-    pub fn try_context_manager_ready(&self) -> Option<&Arc<ContextManager>> {
+    pub fn try_context_manager_ready(
+        &self,
+    ) -> Option<&Arc<scp_core::context::supervisor::Supervisor>> {
         if self.core.is_suspended() || self.core.is_shutdown() {
             return None;
         }
-        self.core.try_context_manager()
+        self.core.try_supervisor()
     }
 
     /// Per-instance equivalent of the module-level
@@ -631,7 +764,7 @@ impl UniffiBridgeInstance {
     /// `ContextManager` is already attached.
     #[allow(dead_code)]
     pub fn init_context_manager_with_did(&self, local_did: &str) {
-        if self.core.has_context_manager() {
+        if self.core.has_supervisor() {
             tracing::debug!(
                 requested_did = %local_did,
                 "init_context_manager_with_did: ContextManager already attached — using existing instance"
@@ -639,17 +772,30 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
-        let cm_arc = build_context_manager(
+        // Storage-before-supervisor precondition (spec §17.6): the chosen
+        // storage must already be erased into the `mls_storage` view. The
+        // runtime never defaults storage, so a missing backend fails closed —
+        // no supervisor is attached and subsequent operations error rather
+        // than fabricating an in-memory default. Every constructor populates
+        // this, so this is a defense-in-depth guard.
+        let Some(mls_storage) = self.mls_storage_ref().map(Arc::clone) else {
+            tracing::error!(
+                "init_context_manager_with_did: storage-before-supervisor                  precondition failed — no mls_storage backend on the bridge                  instance; refusing to attach a supervisor (fail closed, spec §17.6)"
+            );
+            return;
+        };
+        let supervisor_arc = build_supervisor(
             crypto,
             Box::new(scp_core::context::NotConfiguredTransportProvider),
             event_log,
             persistence,
+            mls_storage,
         );
 
-        self.core.set_context_manager(cm_arc);
+        self.core.set_supervisor(supervisor_arc);
     }
 
     /// Per-instance equivalent of the module-level
@@ -664,7 +810,7 @@ impl UniffiBridgeInstance {
         local_did: &str,
         adapter: Box<dyn scp_transport::TransportAdapter>,
     ) {
-        if self.core.has_context_manager() {
+        if self.core.has_supervisor() {
             tracing::warn!(
                 requested_did = %local_did,
                 "init_context_manager_with_relay_transport: ContextManager already attached — ignoring"
@@ -672,13 +818,20 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
-        let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+        let Some(mls_storage) = self.mls_storage_ref().map(Arc::clone) else {
+            tracing::error!(
+                "init_context_manager_with_relay_transport: storage-before-supervisor                  precondition failed — no mls_storage backend on the bridge                  instance; refusing to attach a supervisor (fail closed, spec §17.6)"
+            );
+            return;
+        };
+        let supervisor_arc =
+            build_supervisor(crypto, transport, event_log, persistence, mls_storage);
 
-        self.core.set_context_manager(cm_arc);
+        self.core.set_supervisor(supervisor_arc);
     }
 
     /// Per-instance initializer that installs an `MlsCryptoProvider(local_did)`
@@ -692,7 +845,7 @@ impl UniffiBridgeInstance {
     /// `ContextManager` is already attached.
     #[allow(dead_code)]
     pub fn init_context_manager_with_local_transport(&self, local_did: &str) {
-        if self.core.has_context_manager() {
+        if self.core.has_supervisor() {
             tracing::warn!(
                 requested_did = %local_did,
                 "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
@@ -700,13 +853,20 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
         let transport = Box::new(scp_core::context::LocalTransportProvider);
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
-        let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+        let Some(mls_storage) = self.mls_storage_ref().map(Arc::clone) else {
+            tracing::error!(
+                "init_context_manager_with_local_transport: storage-before-supervisor                  precondition failed — no mls_storage backend on the bridge                  instance; refusing to attach a supervisor (fail closed, spec §17.6)"
+            );
+            return;
+        };
+        let supervisor_arc =
+            build_supervisor(crypto, transport, event_log, persistence, mls_storage);
 
-        self.core.set_context_manager(cm_arc);
+        self.core.set_supervisor(supervisor_arc);
     }
 
     /// Per-instance equivalent of the module-level
@@ -727,17 +887,15 @@ impl UniffiBridgeInstance {
         &self,
         context_id: &str,
     ) -> Result<(), crate::ScpError> {
-        let manager = self.context_manager_or_error()?;
-        let _role_state =
-            manager
-                .get_role_state(context_id)
-                .await
-                .ok_or_else(|| crate::ScpError::Context {
-                    msg: format!(
-                        "context '{context_id}' not found in ContextManager during role state sync"
-                    ),
-                    code: codes::CTX_2040.to_owned(),
-                })?;
+        let supervisor = self.context_manager_or_error()?;
+        let _role_state = supervisor.get_role_state(context_id).await.ok_or_else(|| {
+            crate::ScpError::Context {
+                msg: format!(
+                    "context '{context_id}' not found in Supervisor during role state sync"
+                ),
+                code: codes::CTX_2040.to_owned(),
+            }
+        })?;
         tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
         Ok(())
     }
@@ -857,30 +1015,17 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         &self.core
     }
 
-    /// `UniFFI`-specific resume: flag flip, then transport reconnect, then
-    /// persisted-context restore.
-    ///
-    /// Mirrors the `PyO3` / NAPI overrides so Swift and Kotlin callers get
-    /// the same resume semantics as Python and TypeScript.
-    async fn resume(&self) -> Result<(), scp_ffi_common::bridge_instance::LifecycleError> {
-        self.core.resume().await?;
-        // Reconnect transport BEFORE rehydrating persisted contexts so
-        // restored subscriptions can attach to a live relay connection.
-        self.core.reconnect_transport_if_pending().await?;
-        self.core.restore_all_persisted_contexts().await;
-        Ok(())
-    }
+    // `resume` inherits the `BridgeInstanceCore` default (ADR-049 §11,
+    // landed in commit 6): flag flip + transport reconnect +
+    // persisted-context restore. Overriding here would diverge from
+    // the shared contract and be caught by the cross-bridge consistency
+    // gate `scripts/check-bridge-instance-lifecycle.py`.
 
-    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-        // `bridge_specific_shutdown` MUST run even when
-        // `shutdown_core_async` returns `AlreadyShutDown` — that variant
-        // signals the sync shutdown path raced ahead; without the cleanup
-        // call, typed UniFFI registries (UCAN, identity custody) leak
-        // key material past shutdown.
-        let result = self.core.shutdown_core_async(timeout).await;
-        self.bridge_specific_shutdown();
-        result
-    }
+    // `shutdown` inherits the `BridgeInstanceCore` default (ADR-049 §11,
+    // landed in commit 6): `core.shutdown_core_async(timeout).await +
+    // bridge_specific_shutdown()`. Overriding here would diverge from
+    // the shared contract and be caught by the cross-bridge consistency
+    // gate `scripts/check-bridge-instance-lifecycle.py`.
 
     fn bridge_specific_shutdown(&self) {
         // Clear typed registries. Dropping `Arc<OpaqueInMemoryKeyCustody>`
@@ -964,12 +1109,49 @@ impl Drop for UniffiBridgeInstance {
 /// Returns a key resolver that rejects all lookups with a logged error.
 ///
 /// Delegates to [`scp_ffi_common::bridge_runtime::not_configured_key_resolver`].
+/// Erases a chosen `Storage` backend into the supervisor's required
+/// `mls_storage` (`OpenMLS`) view via [`SpawnBlockingStorageAdapter`].
+///
+/// The single chosen backend (`Arc<EncryptingAdapter<BridgeInMemoryStorage>>`
+/// for the dev/in-memory path, or `Arc<SqliteStorage>` for the durable path)
+/// is wrapped ONCE so the event log, persistence, and the `OpenMLS` view all
+/// read/write one store (spec §17.6).
+fn mls_storage_from_handle<S>(
+    handle: Arc<S>,
+) -> Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>
+where
+    S: scp_platform::Storage + 'static,
+{
+    Arc::new(scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(handle))
+        as Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>
+}
+
+/// Zeros the bridge's owned copy of `SQLCipher` key material after `SQLCipher`
+/// has consumed it internally.
+///
+/// The caller's copy crossed the `UniFFI` boundary by value and cannot be
+/// zeroed from here; this only wipes the Rust-side copy. The passphrase is
+/// already routed through `Zeroizing` during derivation — this additionally
+/// overwrites the original `String`/`Vec<u8>` carried in the enum.
+fn zero_key_material(key: SqliteKeyMaterial) {
+    match key {
+        SqliteKeyMaterial::Raw { mut key } => {
+            zeroize::Zeroize::zeroize(&mut key);
+            drop(key);
+        }
+        SqliteKeyMaterial::Passphrase { mut passphrase } => {
+            zeroize::Zeroize::zeroize(&mut passphrase);
+            drop(passphrase);
+        }
+    }
+}
+
 fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     scp_ffi_common::bridge_runtime::not_configured_key_resolver()
 }
 
 /// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
-/// consumed by [`ContextManager::with_persistence`] which requires a `Box`.
+/// consumed by `ContextManager::with_persistence` which requires a `Box`.
 ///
 /// `ContextManager::with_persistence` converts the `Box` back into an `Arc`
 /// internally, but the call-site signature is `Box`-only. Rather than
@@ -980,20 +1162,22 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 /// the same provider, so suspend/resume flush + `flush_all_contexts_sync`
 /// operate on the same underlying storage.
 struct ArcContextPersistence {
-    inner: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+    inner: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
 }
 
 impl ArcContextPersistence {
-    fn new(inner: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>) -> Self {
+    fn new(
+        inner: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
+    ) -> Self {
         Self { inner }
     }
 }
 
-impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
+impl scp_core::context::persistence::ContextPersistence for ArcContextPersistence {
     fn persist_context(
         &self,
         context_id: &str,
-        snapshot: &scp_core::context::manager::ContextSnapshot,
+        snapshot: &scp_core::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.persist_context(context_id, snapshot)
     }
@@ -1002,7 +1186,7 @@ impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
         &self,
         context_id: &str,
     ) -> Result<
-        Option<scp_core::context::manager::ContextSnapshot>,
+        Option<scp_core::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         self.inner.load_context(context_id)
@@ -1040,38 +1224,48 @@ impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
     }
 }
 
-/// Constructs a [`ContextManager`] with or without persistence.
+/// Constructs a fresh per-instance `Supervisor` with the given
+/// providers.
 ///
-/// Mirrors the `PyO3` bridge's `build_context_manager` (`crates/scp-ffi/src/runtime.rs`).
-/// When `persistence` is `Some`, wraps the shared `Arc` in
-/// [`ArcContextPersistence`] and hands it to
-/// [`ContextManager::with_persistence`]; otherwise calls
-/// [`ContextManager::new`]. Callers pull the shared persistence from the
-/// embedded `CoreFields` via
-/// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
-/// so the manager and the bridge mirror share the same backend — a
-/// single `SQLite` connection, not two.
-fn build_context_manager(
-    crypto: Box<dyn ContextCryptoProvider>,
+/// ADR-049 commit 12c.9g.3.6 — the FFI bridge no longer touches
+/// [`scp_core::context::manager::ContextManager`] at all.
+/// [`scp_core::context::supervisor::Supervisor::with_providers`] is
+/// the single entry point that constructs the supervisor + populates
+/// the lifted-provider slots. The supervisor is the only handle
+/// returned to the bridge layer.
+///
+/// When `persistence` is `Some`, the shared `Arc` is wrapped in
+/// [`ArcContextPersistence`] so the manager's internal `Arc` and the
+/// `CoreFields::persistence` mirror end up pointing at the same
+/// provider — a single `SQLite` connection, not two. Callers pull
+/// the shared persistence from the embedded `CoreFields` via
+/// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`].
+fn build_supervisor(
+    crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
-    persistence: Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>>,
-) -> Arc<ContextManager> {
-    match persistence {
-        Some(shared) => Arc::new(ContextManager::with_persistence(
-            crypto,
-            transport,
-            event_log,
-            Box::new(ArcContextPersistence::new(shared)),
-            not_configured_key_resolver(),
-        )),
-        None => Arc::new(ContextManager::new(
-            crypto,
-            transport,
-            event_log,
-            not_configured_key_resolver(),
-        )),
-    }
+    persistence: Option<Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>>,
+    mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+) -> Arc<scp_core::context::supervisor::Supervisor> {
+    let persistence_box: Option<Box<dyn scp_core::context::persistence::ContextPersistence>> =
+        persistence.map(|shared| {
+            Box::new(ArcContextPersistence::new(shared))
+                as Box<dyn scp_core::context::persistence::ContextPersistence>
+        });
+    // `mls_storage` is REQUIRED (non-Option): the runtime never defaults
+    // storage; the bridge supplies it (spec §17.6 / ADR-049). It is the
+    // single chosen Storage erased once into the `OpenMLS` view.
+    scp_core::context::supervisor::Supervisor::with_providers(
+        crypto,
+        transport,
+        event_log,
+        not_configured_key_resolver(),
+        persistence_box,
+        None,
+        None,
+        None,
+        mls_storage,
+    )
 }
 
 // Phase D (#1695): module-level `context_manager`, `context_manager_expect`,
@@ -1093,7 +1287,8 @@ fn build_context_manager(
 #[must_use]
 pub fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
-    Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+    Arc<scp_ffi_common::bridge_runtime::BridgeInMemoryRepo>,
+    scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle,
 ) {
     scp_ffi_common::bridge_runtime::build_event_log_provider()
 }
@@ -1191,15 +1386,157 @@ mod tests {
         // ephemeral in-memory repo. This asserts that the variant now
         // routes to SQLite so both paths share one database.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let bi = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+        let Ok(bi) = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
             path: tmp.path().to_string_lossy().into_owned(),
-            key: vec![0x11u8; 32],
-        })
-        .expect("sqlite storage must initialize in test");
+            key: SqliteKeyMaterial::Raw {
+                key: vec![0x11u8; 32],
+            },
+        }) else {
+            panic!("raw-key sqlite open must succeed");
+        };
         assert!(
             matches!(bi.protocol_repository(), ProtocolRepoVariant::Sqlite(_)),
             "with_storage(Sqlite) must produce ProtocolRepoVariant::Sqlite so event log \
              entries persist to the same `SQLCipher` database as context snapshots"
+        );
+        assert!(
+            bi.mls_storage_ref().is_some(),
+            "Sqlite path must populate the mls_storage backend (spec §17.6)"
+        );
+    }
+
+    #[test]
+    fn test_in_memory_populates_mls_storage_backend() {
+        // The dev/in-memory path must still populate `mls_storage` from the
+        // un-swallowed in-memory storage handle (spec §17.6 — one chosen
+        // backend, derived consumers).
+        let bi = UniffiBridgeInstance::new_uniffi();
+        assert!(
+            bi.mls_storage_ref().is_some(),
+            "in-memory dev path must populate the mls_storage backend"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_open_failure_fails_closed() {
+        // FAIL CLOSED (spec §17.6): a Sqlite open at an unwritable path must
+        // return an error, NOT silently fall back to in-memory/no storage.
+        // Point at a path whose parent is a regular file so the directory
+        // cannot be created.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let bad_dir = blocker.join("scp-data");
+        let result = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: bad_dir.to_string_lossy().into_owned(),
+            key: SqliteKeyMaterial::Raw {
+                key: vec![0x22u8; 32],
+            },
+        });
+        assert!(
+            matches!(result, Err(StorageInitError::SqliteOpen { .. })),
+            "Sqlite open failure must fail closed with SqliteOpen, but the open \
+             unexpectedly succeeded (in-memory fallback is forbidden)"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_passphrase_round_trip() {
+        // Create with a passphrase, write data, reopen the same dir with the
+        // same passphrase, and confirm the data survives — the passphrase
+        // re-derives the same SQLCipher key via the persisted salt sidecar.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_string_lossy().into_owned();
+
+        let Ok(bi) = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: dir.clone(),
+            key: SqliteKeyMaterial::Passphrase {
+                passphrase: "correct horse battery staple".to_owned(),
+            },
+        }) else {
+            panic!("passphrase sqlite open must succeed");
+        };
+        // Write through the mls_storage backend (the OpenMLS view shares the
+        // one SQLCipher connection).
+        let backend = bi
+            .mls_storage_ref()
+            .cloned()
+            .expect("passphrase path must populate mls_storage");
+        crate::runtime().block_on(async {
+            backend
+                .store("scp-test/persist", b"durable-value")
+                .await
+                .expect("store via mls_storage backend");
+        });
+        drop(backend);
+        drop(bi);
+
+        // Reopen with the SAME passphrase.
+        let Ok(bi2) = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: dir,
+            key: SqliteKeyMaterial::Passphrase {
+                passphrase: "correct horse battery staple".to_owned(),
+            },
+        }) else {
+            panic!("reopen with same passphrase must succeed");
+        };
+        let backend2 = bi2
+            .mls_storage_ref()
+            .cloned()
+            .expect("reopened passphrase path must populate mls_storage");
+        let read_back = crate::runtime().block_on(async {
+            backend2
+                .retrieve("scp-test/persist")
+                .await
+                .expect("retrieve via reopened backend")
+        });
+        assert_eq!(
+            read_back.as_deref(),
+            Some(b"durable-value".as_slice()),
+            "data written under the passphrase must survive a reopen with the same passphrase"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_wrong_passphrase_fails_closed() {
+        // Security-critical (spec §17.6): reopening an existing DB with the
+        // WRONG passphrase must fail closed — never silently open a fresh,
+        // empty database.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_string_lossy().into_owned();
+
+        let Ok(bi) = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: dir.clone(),
+            key: SqliteKeyMaterial::Passphrase {
+                passphrase: "the-right-passphrase".to_owned(),
+            },
+        }) else {
+            panic!("initial passphrase open must succeed");
+        };
+        let backend = bi
+            .mls_storage_ref()
+            .cloned()
+            .expect("mls_storage backend present");
+        crate::runtime().block_on(async {
+            backend
+                .store("scp-test/secret", b"top-secret")
+                .await
+                .expect("store secret");
+        });
+        drop(backend);
+        drop(bi);
+
+        // Reopen with the WRONG passphrase: must fail closed.
+        let result = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: dir,
+            key: SqliteKeyMaterial::Passphrase {
+                passphrase: "the-WRONG-passphrase".to_owned(),
+            },
+        });
+        assert!(
+            matches!(result, Err(StorageInitError::SqliteOpen { .. })),
+            "wrong passphrase must fail closed (no silent fresh DB), but the open \
+             unexpectedly succeeded"
         );
     }
 
@@ -1245,8 +1582,8 @@ mod tests {
         bi.init_context_manager_with_did("did:dht:ztest");
         let cm = bi.context_manager_expect()?;
         assert!(
-            Arc::ptr_eq(cm, bi.core.try_context_manager().unwrap()),
-            "instance.context_manager_expect() must be the same Arc as core.try_context_manager()"
+            Arc::ptr_eq(cm, bi.core.try_supervisor().unwrap()),
+            "instance.context_manager_expect() must be the same Arc as core.try_supervisor()"
         );
         Ok(())
     }

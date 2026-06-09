@@ -548,6 +548,10 @@ mod tests {
     /// when the grace store is at capacity and must evict old epochs.
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     fn process_commit_triggers_callback_on_grace_store_eviction() {
         use std::sync::{Arc, Mutex};
 

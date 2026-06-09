@@ -52,7 +52,7 @@ fn node_err(e: NodeError) -> NapiError {
     NapiError::from_reason("node operation failed")
 }
 
-/// Auto-wires the global [`ContextManager`] with relay transport after
+/// Auto-wires the global `ContextManager` with relay transport after
 /// node startup.
 ///
 /// Connects to the node's local relay (with bearer token authentication)
@@ -90,11 +90,11 @@ async fn auto_wire_context_manager(
             // The bearer auto-wire path stays WebSocket-only (QUIC has no
             // bearer-upgrade surface, spec §10.14.3 item 4), so it connects
             // directly via `connect_sourced_with_bearer` rather than the QUIC
-            // selector. The shared `init_context_manager_with_relay_transport`
+            // selector. The shared `init_supervisor_with_relay_transport`
             // helper now takes a `Box<dyn TransportAdapter>` (so the discovering
             // connect sites can hand it the selector's boxed adapter); box the
             // concrete bearer adapter here to match.
-            crate::runtime::init_context_manager_with_relay_transport(bi, did, Box::new(adapter));
+            crate::runtime::init_supervisor_with_relay_transport(bi, did, Box::new(adapter));
 
             // Also populate the BridgeInstance transport manager so that
             // broadcast publish, context subscribe, and discovery probing
@@ -119,7 +119,7 @@ async fn auto_wire_context_manager(
                     tracing::warn!(
                         error = %e,
                         relay_url = %relay_url,
-                        "auto_wire_context_manager: ContextManager wired but failed to \
+                        "auto_wire_supervisor: Supervisor wired but failed to \
                          populate BridgeInstance transport manager — broadcast publish and \
                          discovery may require a manual transportConnect call"
                     );
@@ -134,13 +134,18 @@ async fn auto_wire_context_manager(
                  context operations may fail until transport is configured manually"
             );
             // Fall back to initializing without transport so that at least
-            // the ContextManager exists (with NotConfiguredTransportProvider).
-            crate::runtime::init_context_manager(bi, did);
+            // the Supervisor exists (with NotConfiguredTransportProvider).
+            crate::runtime::init_supervisor(bi, did);
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
-    if let Ok(mgr) = crate::runtime::context_manager(bi) {
-        mgr.register_local_did(did.to_owned().into()).await;
+    if let Ok(supervisor) = crate::runtime::supervisor(bi)
+        && let Err(e) = supervisor.register_local_did(did.to_owned().into()).await
+    {
+        tracing::debug!(
+            error = %e,
+            "auto_wire_context_manager: register_local_did skipped (supervisor not ready)"
+        );
     }
 }
 
@@ -309,13 +314,13 @@ impl NapiNodeHandle {
             validate_did(did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
         }
 
-        // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        let mgr = crate::runtime::context_manager(&self.bi)?;
+        // Resolve broadcast key: explicit or auto-lookup via Supervisor.
+        let supervisor = crate::runtime::supervisor(&self.bi)?;
         let resolved = server::resolve_broadcast_key(
             broadcast_key_hex,
             author_did,
             self.inner.did(),
-            mgr,
+            supervisor,
             &context_id,
         )
         .await

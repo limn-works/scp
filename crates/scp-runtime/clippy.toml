@@ -1,0 +1,21 @@
+# Clippy configuration for scp-runtime.
+#
+# The actor-per-context refactor (ADR-049) moves per-context state onto
+# an actor. Actor-owned state is serialized by the actor's command loop
+# and needs no synchronization primitive. Shared state that does exist
+# (e.g. metrics, non-context caches) uses `tokio::sync::Mutex` because
+# every such lock is acquired from async code.
+#
+# `std::sync::Mutex` in async code is a deadlock hazard: holding its
+# guard across an `.await` suspends the OS thread, not the task. The
+# complementary `await_holding_lock = "deny"` at workspace level catches
+# the dynamic version; this list catches the structural version.
+#
+# Pre-existing sites outside the actor path (tests, non-actor providers,
+# and legacy `MlsCryptoProvider`) carry `#[allow(clippy::disallowed_types)]`
+# annotations with a pointer to the commit that deletes them. By the time
+# the actor refactor completes (commit 12), the only remaining
+# `std::sync::Mutex` uses are in code that is test-only.
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "Use tokio::sync::Mutex in runtime async code; actor-owned state needs no Mutex. See ADR-049." },
+]

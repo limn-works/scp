@@ -335,7 +335,7 @@ impl crate::scp::PyScp {
                 ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
             })?;
 
-        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
             local_did.to_owned(),
         ));
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
@@ -728,14 +728,14 @@ mod tests {
     fn configure_local_transport_attaches_manager_for_valid_did() {
         let scp = default_scp();
         assert!(
-            !scp.inner.core.has_context_manager(),
-            "fresh instance must not have a ContextManager attached"
+            !scp.inner.core.has_supervisor(),
+            "fresh instance must not have a Supervisor attached"
         );
         let result = scp.configure_local_transport("did:key:z6MkfreshLocalTransportTest");
         assert!(result.is_ok(), "valid DID should configure local transport");
         assert!(
-            scp.inner.core.has_context_manager(),
-            "configure_local_transport must attach a ContextManager"
+            scp.inner.core.has_supervisor(),
+            "configure_local_transport must attach a Supervisor"
         );
     }
 
@@ -746,8 +746,8 @@ mod tests {
         let result = scp.configure_local_transport("not-a-valid-did");
         assert!(result.is_err(), "invalid DID must be rejected");
         assert!(
-            !scp.inner.core.has_context_manager(),
-            "a rejected DID must not leave a ContextManager attached"
+            !scp.inner.core.has_supervisor(),
+            "a rejected DID must not leave a Supervisor attached"
         );
     }
 

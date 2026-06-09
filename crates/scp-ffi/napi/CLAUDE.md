@@ -7,12 +7,12 @@ Node.js/Bun via napi-rs `#[napi]` types and functions.
 
 ## Architecture
 
-### Shared ContextManager (issue #388)
+### Shared Supervisor (post-ADR-049 / commit 12; supersedes the prior `ContextManager`-keyed wiring tracked in #388)
 
 All context lifecycle, messaging, governance, broadcast, membership, and TTL operations
-delegate to a shared `Arc<ContextManager>` initialized once via `OnceLock` in `runtime.rs`.
+delegate to a shared `Arc<Supervisor>` held in the per-bridge `BridgeInstanceCore.supervisor` slot. The previously-shared `Arc<ContextManager>` is gone — see `.docs/adrs/ADR-049-actor-per-context.md` for the rationale.
 
-The `ContextManager` is constructed with production provider implementations:
+The `Supervisor` is constructed via `Supervisor::with_providers(...)` with production provider implementations:
 - `MlsCryptoProvider` — real OpenMLS-backed encryption, sender keys, and group management (#1294)
 - `NotConfiguredTransportProvider` (from `scp-core`) — returns descriptive errors until relay configured (#501)
 - `MerkleEventLogProvider` — persistent Merkle-chained event log backed by
@@ -23,7 +23,7 @@ The `ContextManager` is constructed with production provider implementations:
 
 A separate `DashMap<String, UcanContextState>` in `runtime.rs` stores per-context UCAN
 validation state (revocation lists, nonce trackers, capability ceilings, event logs for
-Merkle proofs). This is NOT a duplicate of `ContextManager` state — the manager does not
+Merkle proofs). This is NOT a duplicate of `Supervisor` state — the supervisor does not
 track UCAN revocation or nonces.
 
 Functions: `ensure_registered`, `with_context`, `remove_context`.
@@ -38,7 +38,7 @@ Functions: `ensure_registered`, `with_context`, `remove_context`.
 | `ucan.rs` | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
 | `event_log.rs` | `event_log_query`, `event_log_verify` |
 | `transport.rs` | `transport_connect`, `transport_disconnect`, `transport_status` |
-| `runtime.rs` | `context_manager()`, `ensure_registered`, `with_context`, `remove_context` |
+| `runtime.rs` | `supervisor()` (formerly `context_manager()`), `ensure_registered`, `with_context`, `remove_context` |
 
 ### Build
 
@@ -82,6 +82,7 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
 
 ## Gotchas
 
+- Bridge functions in `context.rs` delegate to the shared `Supervisor` (formerly the now-deleted `ContextManager`) via the per-bridge supervisor accessor. The `NapiContextHandle` stores a `core_handle: Option<ContextHandle>` for supervisor operations.
 - **Recovery / custody-migration ownership + concurrency invariants (ADR-048 §7, round-2/3).**
   `Scp::identity_execute_recovery` and `Scp::identity_execute_custody_migration` enforce three mechanical
   gates before the orchestrator runs, in order:
@@ -99,12 +100,9 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
   These methods are **sync** napi entry points — the async orchestrator is driven by
   `crate::runtime().block_on(...)`. Do not change them back to `async fn`; the
   napi-rs worker thread has no tokio context (see `3de6cbe30` / `78102c871` history).
-- Bridge functions in `context.rs` delegate to the shared `ContextManager` via
-  `crate::runtime::context_manager()`. The `NapiContextHandle` stores a `core_handle: Option<ContextHandle>`
-  for manager operations.
 - UCAN validation state (revocation lists, nonce trackers) lives in a separate `DashMap` registry,
-  NOT in the `ContextManager`. The `ensure_registered` / `with_context` pattern accesses this state.
-- `context_close` does NOT perform bridge-layer authorization — it delegates to `ContextManager::close_context` which checks the `ContextClose` capability. Removes UCAN state via `remove_context` after closing.
+  NOT in the `Supervisor`. The `ensure_registered` / `with_context` pattern accesses this state.
+- `context_close` does NOT perform bridge-layer authorization — it delegates to `Supervisor::close_context` (the hoisted `lifecycle_helpers::close_context` body) which checks the `ContextClose` capability. Removes UCAN state via `remove_context` after closing.
 - `context_create` maps all user-specified fields from params JSON to `ContextParams` (mode, ceiling, ceiling_policy, promotion_policy, memory_scope, governance, ttl).
 - The bridge event log provider uses `MerkleEventLogProvider::with_persistence` backed by
   `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). The UCAN
@@ -112,4 +110,7 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
 - `NapiUcanToken.encoded` is `#[allow(dead_code)]` because `ucan_revoke` currently returns a stub
   error. When revocation is wired to the runtime, the bridge will parse the full JWT `token`
   parameter to compute the revocation CID.
+- **Storage provider (spec §17.6)**: storage selection is per-instance via the `SCP.withStorage(configJson)` factory (`scp.rs`) → `NapiBridgeInstance::with_storage_napi(StorageConfig)`. `{"type":"in_memory"}` → encrypted in-memory; `{"type":"sqlite","path":...,"key":"<hex>"|[..]}` → raw-key `SqliteKeyMaterial::Raw`; `{"type":"sqlite","path":...,"passphrase":"..."}` → Argon2id `SqliteKeyMaterial::Passphrase`. For `sqlite`, **exactly one** of `key`/`passphrase` is required — both/neither is `SCP-VALID-7005`.
+  - **FAIL CLOSED (spec §17.6).** `with_storage_napi` returns `Result<Self, StorageInitError>`. A failed SQLCipher open (bad key/passphrase, permission denied, corrupt file, salt-sidecar fail-closed) returns `StorageInitError::SqliteOpen`; the factory surfaces it as a JS-thrown `ValidationError`. There is **no** silent degrade to in-memory; in-memory is reachable only via the explicit `{"type":"in_memory"}` selection.
+  - **`mls_storage` consumer (supervisor).** `build_supervisor_arc` takes a required `mls_storage: Arc<dyn OpenMlsStorageAdapter>` 9th arg, sourced from `bi.mls_storage_ref()`. It is the single chosen `Storage` erased once via `SpawnBlockingStorageAdapter`: the Sqlite path retains the same `Arc<SqliteStorage>` that backs persistence + event log; the in-memory path uses the un-swallowed `BridgeInMemoryStorageHandle` (3rd element of `build_event_log_provider`) — NOT `NapiBridgePersistence` (a `DashMap`, not a `Storage`). All `init_supervisor*` paths read `mls_storage_ref()` and fail closed (no supervisor attached) if unset.
 - Dependencies: `base64`, `rand`, `dashmap` in `Cargo.toml`.

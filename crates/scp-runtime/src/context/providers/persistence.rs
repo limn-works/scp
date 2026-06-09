@@ -9,12 +9,17 @@
 //! provides an additional in-memory implementation suitable for integration
 //! tests that need persistence semantics without a storage backend.
 //!
-//! [`ContextPersistence`]: crate::context::manager::ContextPersistence
+//! [`ContextPersistence`]: crate::context::persistence::ContextPersistence
 
 use std::collections::HashMap;
+#[allow(
+    clippy::disallowed_types,
+    reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 use std::sync::Mutex;
 
-use crate::context::manager::{ContextPersistence, ContextSnapshot};
+use crate::context::persistence::ContextPersistence;
+use crate::context::state::ContextSnapshot;
 use scp_protocol::context::broadcast::BroadcastContextSnapshot;
 
 // Re-export the canonical implementation.
@@ -44,10 +49,22 @@ pub use crate::store::context::ProtocolRepositoryContextBridge;
 /// );
 /// ```
 pub struct InMemoryPersistence {
+    #[allow(
+        clippy::disallowed_types,
+        reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     contexts: Mutex<HashMap<String, ContextSnapshot>>,
+    #[allow(
+        clippy::disallowed_types,
+        reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     broadcasts: Mutex<HashMap<String, BroadcastContextSnapshot>>,
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 impl InMemoryPersistence {
     /// Creates a new empty in-memory persistence provider.
     #[must_use]

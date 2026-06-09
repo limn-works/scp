@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
-use scp_core::context::ContextManager;
+use scp_core::context::supervisor::Supervisor;
 use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::{DidDocument, InMemoryDhtClient, ScpIdentity};
@@ -289,7 +289,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// portability — the same DID persists across node restarts.
 ///
 /// The relay is started during construction. The HTTP server is **not** started;
-/// call [`ApplicationNode::serve`] if HTTP endpoints are needed.
+/// call `ApplicationNode::serve` if HTTP endpoints are needed.
 ///
 /// # Errors
 ///
@@ -337,7 +337,7 @@ pub async fn start_node_in_memory(
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
 ///
 /// The relay is started during construction. The HTTP server is **not** started;
-/// call [`ApplicationNode::serve`] if HTTP endpoints are needed.
+/// call `ApplicationNode::serve` if HTTP endpoints are needed.
 ///
 /// # Identity modes
 ///
@@ -667,7 +667,7 @@ pub enum BroadcastKeyError {
     )]
     KeyWithoutAuthor,
 
-    /// Auto-resolve from the `ContextManager` failed.
+    /// Auto-resolve from the `Supervisor` failed.
     #[error("broadcast key auto-resolve failed: {0}")]
     AutoResolveFailed(String),
 }
@@ -688,7 +688,7 @@ pub struct ResolvedBroadcastKey {
 /// 1. Both `broadcast_key_hex` **and** `author_did` provided — uses the
 ///    explicit key with epoch 0.
 /// 2. Only `author_did` provided — auto-resolves the broadcast key from
-///    the `ContextManager` using that DID.
+///    the per-instance `Supervisor` using that DID.
 /// 3. Neither provided — auto-resolves using `fallback_did` (typically the
 ///    node's identity DID).
 ///
@@ -700,7 +700,10 @@ pub struct ResolvedBroadcastKey {
 /// * `author_did` — Optional DID of the broadcast key owner.
 /// * `fallback_did` — DID to use when both `broadcast_key_hex` and
 ///   `author_did` are `None` (e.g., the node's own DID).
-/// * `context_manager` — Reference to the `ContextManager` for auto-resolve.
+/// * `supervisor` — Reference to the per-instance `Supervisor` for
+///   auto-resolve via the
+///   [`Supervisor::get_broadcast_key_for_local_author`](scp_core::context::supervisor::Supervisor::get_broadcast_key_for_local_author)
+///   passthrough (ADR-049 commit 12c.9g.3).
 /// * `context_id` — The context ID to resolve the key for.
 ///
 /// # Errors
@@ -711,7 +714,7 @@ pub async fn resolve_broadcast_key(
     broadcast_key_hex: Option<String>,
     author_did: Option<String>,
     fallback_did: &str,
-    context_manager: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<ResolvedBroadcastKey, BroadcastKeyError> {
     match (broadcast_key_hex, author_did) {
@@ -734,7 +737,7 @@ pub async fn resolve_broadcast_key(
         (None, author_opt) => {
             // Auto-resolve: use provided author_did or fall back to node DID.
             let did = author_opt.unwrap_or_else(|| fallback_did.to_owned());
-            let result: Result<(Zeroizing<[u8; 32]>, u64), _> = context_manager
+            let result: Result<(Zeroizing<[u8; 32]>, u64), _> = supervisor
                 .get_broadcast_key_for_local_author(context_id, &did)
                 .await;
             let (key_bytes, epoch) = result.map_err(|e| {
@@ -751,9 +754,9 @@ pub async fn resolve_broadcast_key(
     }
 }
 
-/// Convenience: builds a [`BroadcastKey`] from a [`ResolvedBroadcastKey`].
+/// Convenience: builds a `BroadcastKey` from a [`ResolvedBroadcastKey`].
 impl ResolvedBroadcastKey {
-    /// Converts the resolved key into a [`BroadcastKey`] suitable for
+    /// Converts the resolved key into a `BroadcastKey` suitable for
     /// passing to `enable_broadcast_projection_with_site`.
     #[must_use]
     pub fn into_broadcast_key(self) -> scp_core::crypto::sender_keys::BroadcastKey {

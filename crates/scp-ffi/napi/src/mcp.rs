@@ -367,7 +367,7 @@ impl ContextProvider for McpNapiBridgeProvider {
             tracing::warn!(
                 "McpNapiBridgeProvider::agent_role returns None — \
                  wire a production ContextProvider that resolves real roles \
-                 from ContextManager before exposing MCP in production."
+                 from Supervisor before exposing MCP in production."
             );
         });
         None
@@ -400,7 +400,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         _arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         Err(
-            "tool invocation through MCP server requires ContextManager tool registry integration"
+            "tool invocation through MCP server requires Supervisor tool registry integration"
                 .to_owned(),
         )
     }

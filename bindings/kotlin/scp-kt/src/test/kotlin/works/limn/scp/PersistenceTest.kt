@@ -170,7 +170,7 @@ class PersistenceTest {
         }
 
     @Test
-    fun `withSqlite does not corrupt the original DB on mismatched-key attempt`() =
+    fun `withSqlite fails closed on mismatched key without corrupting the DB`() =
         runTest {
             val dir = Files.createTempDirectory("scp-kotlin-persist-mismatch-")
             dir.toFile().deleteOnExit()
@@ -196,5 +196,41 @@ class PersistenceTest {
             // the failed mismatched-key attempt did not corrupt or truncate
             // the encrypted database file.
             makeSqliteScp(dir.toFile())
+        }
+
+    @Test
+    fun `withSqlite passphrase round trips across two constructions`() =
+        runTest {
+            val dir = Files.createTempDirectory("scp-kotlin-persist-passphrase-")
+            dir.toFile().deleteOnExit()
+            val dbPath = dir.resolve("scp.db")
+
+            val scp1 = SCP.withSqlite(dir.toFile(), passphrase = "correct horse battery staple")
+            createdInstances += scp1
+            assertTrue(
+                dbPath.exists(),
+                "passphrase construction must create scp.db at ${dbPath.pathString}",
+            )
+
+            // Reopen with the SAME passphrase — must succeed (salt sidecar
+            // re-derives the same key).
+            val scp2 = SCP.withSqlite(dir.toFile(), passphrase = "correct horse battery staple")
+            createdInstances += scp2
+        }
+
+    @Test
+    fun `withSqlite fails closed on wrong passphrase`() =
+        runTest {
+            val dir = Files.createTempDirectory("scp-kotlin-persist-wrongpass-")
+            dir.toFile().deleteOnExit()
+
+            val scp1 = SCP.withSqlite(dir.toFile(), passphrase = "the-right-one")
+            createdInstances += scp1
+
+            // Reopen with the WRONG passphrase must fail closed — never
+            // silently open a fresh DB (spec §17.6).
+            assertFailsWith<uniffi.scp.ScpException> {
+                SCP.withSqlite(dir.toFile(), passphrase = "the-WRONG-one")
+            }
         }
 }

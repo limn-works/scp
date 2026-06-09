@@ -206,6 +206,23 @@ export function __clampShutdownMillisForTests(timeoutSecs: number): number {
  * Serializes a {@link StorageConfig} into the JSON shape accepted by
  * the NAPI `SCP.withStorage(configJson: string)` factory.
  *
+ * - `in_memory` passes through unchanged.
+ * - `sqlite` + `key` forwards `path` verbatim and normalizes `key`:
+ *   - `Uint8Array` → JSON byte array (`number[]`) — required because
+ *     `JSON.stringify` on a `Uint8Array` produces an object-with-numeric-
+ *     keys, not an array, which the Rust side would reject.
+ *   - `string` → passed through as a hex-encoded string; the NAPI layer
+ *     accepts either shape.
+ * - `sqlite` + `passphrase` forwards `path` and the `passphrase` string
+ *   verbatim; the NAPI layer derives the SQLCipher key via Argon2id
+ *   (spec §17.6). Whichever of `key`/`passphrase` is present is forwarded;
+ *   the exactly-one (XOR) decision is deferred to the NAPI layer
+ *   (SCP-VALID-7005), so a caller that supplies BOTH reaches the guard and
+ *   is rejected rather than having one field silently dropped.
+ *
+ * Exported for tests so the wire format can be asserted without a live
+ * native addon.
+ *
  * @internal
  */
 export function __serializeStorageConfigForTests(config: StorageConfig): string {
@@ -214,8 +231,32 @@ export function __serializeStorageConfigForTests(config: StorageConfig): string 
 
 function serializeStorageConfig(config: StorageConfig): string {
   if (config.type === "sqlite") {
-    const key = typeof config.key === "string" ? config.key : Array.from(config.key as Uint8Array);
-    return JSON.stringify({ type: "sqlite", path: config.path, key });
+    // Forward whichever key-material fields are present, verbatim, so the
+    // NAPI layer remains the single authority on the `key` XOR `passphrase`
+    // mutual-exclusion rule (spec §17.6, SCP-VALID-7005). We must NOT
+    // short-circuit on the presence of one field and silently drop the
+    // other: a caller that bypasses the TS union type and supplies BOTH
+    // must reach the NAPI guard so it can reject them, rather than have the
+    // serializer quietly discard one and let an ambiguous config through.
+    const out: { type: "sqlite"; path: string; key?: number[] | string; passphrase?: string } = {
+      type: "sqlite",
+      path: config.path,
+    };
+    // `key` may be absent on the passphrase arm; access via a widened view
+    // so we forward it only when actually supplied.
+    const rawKey = (config as { key?: Uint8Array | string }).key;
+    if (rawKey !== undefined) {
+      // A Uint8Array must be normalized to a number[] because
+      // `JSON.stringify(Uint8Array)` yields an object, not an array.
+      out.key = typeof rawKey === "string" ? rawKey : Array.from(rawKey);
+    }
+    const passphrase = (config as { passphrase?: string }).passphrase;
+    if (passphrase !== undefined) {
+      // Passphrase mode (spec §17.6): forward verbatim. The NAPI layer moves
+      // it into zeroizing memory and derives the SQLCipher key via Argon2id.
+      out.passphrase = passphrase;
+    }
+    return JSON.stringify(out);
   }
   return JSON.stringify(config);
 }
@@ -227,13 +268,32 @@ function serializeStorageConfig(config: StorageConfig): string {
 /**
  * Storage configuration forwarded to the native `SCP.withStorage` factory.
  *
+ * Three variants are supported today:
  * - `{ type: "in_memory" }` — encrypted in-memory storage (ephemeral).
  * - `{ type: "sqlite"; path; key }` — SQLCipher-encrypted storage on
- *   disk at `{path}/scp.db`. Closes #1260 / #1491.
+ *   disk at `{path}/scp.db`, keyed by raw encryption key material.
+ *   `key` accepts either a raw `Uint8Array` of key material or a hex-
+ *   encoded string (JSON has no native bytes type; the NAPI layer
+ *   accepts either shape). The key is consumed across the FFI boundary
+ *   and the Rust side zeroizes its internal copy on drop — callers
+ *   should zero their own copy after construction.
+ * - `{ type: "sqlite"; path; passphrase }` — SQLCipher-encrypted storage
+ *   whose key is derived from a human-chosen `passphrase` via Argon2id
+ *   (spec §17.6). The passphrase is moved into zeroizing memory on the
+ *   Rust side.
+ *
+ * For the `sqlite` type, exactly ONE of `key` or `passphrase` must be
+ * supplied — providing both, or neither, is rejected by the NAPI layer
+ * with `SCP-VALID-7005`. The two `sqlite` shapes are modeled as separate
+ * union arms so the type system enforces the mutual exclusion.
+ *
+ * Intentionally a closed union — the open `{ type: string; ... }`
+ * branch swallowed typos and drifted from the Rust-side enum.
  */
 export type StorageConfig =
   | { type: "in_memory" }
-  | { type: "sqlite"; path: string; key: Uint8Array | string };
+  | { type: "sqlite"; path: string; key: Uint8Array | string }
+  | { type: "sqlite"; path: string; passphrase: string };
 
 /** Constructor options for `new SCP(...)`. */
 export interface ScpOptions {
@@ -1742,6 +1802,27 @@ export class SCP {
         cp: number | null,
       ) => number
     )(contextId, senderDid, now, baseCost, thresholdsJson, floor ?? null, cap ?? null);
+  }
+
+  /**
+   * Verifies a batch of payment receipts against the configured payment
+   * adapter. Maximum 10,000 receipts per call.
+   *
+   * Returns a JSON object `{"all_valid": <bool>, "results": [...]}`.
+   * `all_valid` is `true` iff every entry both reached the adapter
+   * (`ok === true`) and the adapter reported the receipt valid
+   * (`result.valid === true`); it is vacuously `true` for an empty batch.
+   * Each `results` entry is either `{"receipt_id", "ok": true, "valid",
+   * "result": <structured VerificationResult>}` on success or
+   * `{"ok": false, "error"}` on failure. `ok` means the adapter *responded*
+   * — NOT that the payment is valid; scan `valid`/`all_valid` for validity.
+   *
+   * @throws EconomicPolicyUnsupportedOnWasm on the WASM bridge — receipt
+   *   verification requires a native client whose bridge runs the payment
+   *   adapter (ADR-034).
+   */
+  economyVerifyPaymentReceipts(receiptsJson: string): string {
+    return (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
   }
 
   // ───────────────────────────────────────────────────────────────────────

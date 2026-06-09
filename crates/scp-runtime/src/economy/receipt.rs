@@ -146,6 +146,64 @@ pub fn all_receipts_valid(
         .all(|r| r.as_ref().is_ok_and(|v| v.result.valid))
 }
 
+/// Serializes payment-receipt verification results to the canonical FFI JSON
+/// contract shared by all bridges.
+///
+/// Shape:
+/// `{ "all_valid": bool, "results": [ {receipt_id, ok, valid, result{valid,
+/// adapter_id, verified_amount, verified_currency, verification_timestamp}} |
+/// {ok:false, error} ] }`.
+///
+/// `verified_currency` is emitted as its string form (e.g. `"USD"`),
+/// `verified_amount` as a number.
+///
+/// `ok` = the verification CALL succeeded (adapter responded); `valid` /
+/// `all_valid` = payment validity. `all_valid` starts `true` and is cleared by
+/// any `Err` entry or any `Ok` entry with `result.valid == false`; an empty
+/// input is therefore vacuously `{"all_valid":true,"results":[]}`.
+///
+/// This is the single source of truth for the wire shape: every bridge
+/// (`PyO3`, napi, `UniFFI`) calls it rather than re-deriving the
+/// serialization, so the contract cannot drift across bridges.
+#[must_use]
+pub fn verification_results_to_json(
+    results: Vec<Result<ReceiptVerification, ReceiptVerificationError>>,
+) -> String {
+    let mut all_valid = true;
+    let entries: Vec<serde_json::Value> = results
+        .into_iter()
+        .map(|r| match r {
+            Ok(v) => {
+                if !v.result.valid {
+                    all_valid = false;
+                }
+                // Build `result` as an explicit object so `verified_currency`
+                // serializes as its string form (e.g. "USD") rather than the
+                // raw `[u8; 4]` byte array produced by `CurrencyCode`'s derived
+                // `Serialize`. `verified_amount` is an `Amount` newtype over
+                // `u64`, which already serializes as a plain number.
+                serde_json::json!({
+                    "receipt_id": hex::encode(v.receipt_id),
+                    "ok": true,
+                    "valid": v.result.valid,
+                    "result": {
+                        "valid": v.result.valid,
+                        "adapter_id": v.result.adapter_id,
+                        "verified_amount": v.result.verified_amount,
+                        "verified_currency": v.result.verified_currency.as_str(),
+                        "verification_timestamp": v.result.verification_timestamp,
+                    },
+                })
+            }
+            Err(e) => {
+                all_valid = false;
+                serde_json::json!({ "ok": false, "error": format!("{e}") })
+            }
+        })
+        .collect();
+    serde_json::json!({ "all_valid": all_valid, "results": entries }).to_string()
+}
+
 // ---------------------------------------------------------------------------
 // verify_receipts
 // ---------------------------------------------------------------------------
@@ -1074,6 +1132,97 @@ mod tests {
     fn all_receipts_valid_empty_is_vacuously_true() {
         let results: Vec<Result<ReceiptVerification, ReceiptVerificationError>> = vec![];
         assert!(all_receipts_valid(&results));
+    }
+
+    // -------------------------------------------------------------------
+    // verification_results_to_json: canonical FFI wire shape
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn verification_results_to_json_emits_currency_as_string() {
+        // One valid receipt, one invalid (Ok but valid==false), one error.
+        let valid = Ok(ReceiptVerification {
+            receipt_id: [0x01; 32],
+            result: VerificationResult {
+                valid: true,
+                adapter_id: "x402".to_string(),
+                verified_amount: Amount::new(1500),
+                verified_currency: CurrencyCode::from("USD"),
+                verification_timestamp: 1_700_000_000,
+            },
+        });
+        let invalid = Ok(ReceiptVerification {
+            receipt_id: [0x02; 32],
+            result: VerificationResult {
+                valid: false,
+                adapter_id: "lightning".to_string(),
+                verified_amount: Amount::new(0),
+                verified_currency: CurrencyCode::from("BTC"),
+                verification_timestamp: 1_700_000_001,
+            },
+        });
+        let errored: Result<ReceiptVerification, ReceiptVerificationError> =
+            Err(ReceiptVerificationError::NoVerifierForAdapter {
+                receipt_id: [0x03; 32],
+                adapter_id: "spl".to_string(),
+            });
+
+        let json = verification_results_to_json(vec![valid, invalid, errored]);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // Aggregate flag is false because of the invalid + err entries.
+        assert_eq!(parsed["all_valid"], serde_json::Value::Bool(false));
+
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+
+        // Entry 0: valid Ok. Currency MUST be the string "USD", not [85,...].
+        let e0 = &results[0];
+        assert_eq!(e0["ok"], serde_json::Value::Bool(true));
+        assert_eq!(e0["valid"], serde_json::Value::Bool(true));
+        assert_eq!(e0["receipt_id"], serde_json::json!(hex::encode([0x01; 32])));
+        let r0 = &e0["result"];
+        assert_eq!(
+            r0["verified_currency"],
+            serde_json::Value::String("USD".to_string())
+        );
+        // Currency is a string, NOT an array.
+        assert!(r0["verified_currency"].is_string());
+        assert!(!r0["verified_currency"].is_array());
+        // Amount is a plain number.
+        assert!(r0["verified_amount"].is_number());
+        assert_eq!(r0["verified_amount"], serde_json::json!(1500));
+        assert_eq!(r0["valid"], serde_json::Value::Bool(true));
+        assert_eq!(
+            r0["adapter_id"],
+            serde_json::Value::String("x402".to_string())
+        );
+        assert_eq!(
+            r0["verification_timestamp"],
+            serde_json::json!(1_700_000_000)
+        );
+
+        // Entry 1: invalid Ok — per-entry valid is false, currency still a string.
+        let e1 = &results[1];
+        assert_eq!(e1["ok"], serde_json::Value::Bool(true));
+        assert_eq!(e1["valid"], serde_json::Value::Bool(false));
+        assert_eq!(
+            e1["result"]["verified_currency"],
+            serde_json::Value::String("BTC".to_string())
+        );
+
+        // Entry 2: error — {ok:false, error:...}, no result/receipt_id.
+        let e2 = &results[2];
+        assert_eq!(e2["ok"], serde_json::Value::Bool(false));
+        assert!(e2["error"].is_string());
+        assert!(e2.get("result").is_none());
+    }
+
+    #[test]
+    fn verification_results_to_json_empty_is_vacuously_valid() {
+        let json = verification_results_to_json(vec![]);
+        // Exact wire shape the TS/Swift/Kotlin empty-batch tests assert against.
+        assert_eq!(json, r#"{"all_valid":true,"results":[]}"#);
     }
 
     // -------------------------------------------------------------------

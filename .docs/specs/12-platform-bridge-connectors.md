@@ -109,11 +109,13 @@ Two concepts share the name "bridge" in this system and MUST be kept distinct:
 
 1. **Bridge connector (this section).** A protocol-level entity that translates between an external platform and an SCP context. Every bridge connector has an operator DID (§12.2 above). This is a governed, accountable actor inside an SCP context.
 
-2. **FFI `BridgeInstance` (implementation detail).** A runtime container in the FFI layer (`scp-ffi-common`) that holds process-wide infrastructure — `ContextManager`, DID resolver, storage provider, identity registry. It is the SDK's entry point, not a protocol entity. An `FFI::BridgeInstance` has NO DID requirement; it is infrastructure that exists before any identity is created. An SDK consumer may use the FFI `BridgeInstance` purely to resolve DIDs or verify attestations without ever creating a local identity.
+2. **FFI `BridgeInstance` (implementation detail).** A runtime container in the FFI layer (`scp-ffi-common`) that holds per-instance infrastructure — the context supervisor (which owns the per-context actors; ADR-049), DID resolver, storage provider, identity registry. It is the SDK's entry point, not a protocol entity. An `FFI::BridgeInstance` has NO DID requirement; it is infrastructure that exists before any identity is created. An SDK consumer may use the FFI `BridgeInstance` purely to resolve DIDs or verify attestations without ever creating a local identity. Multiple `BridgeInstance`s may coexist in a process (ADR-048).
 
 The protocol invariant "every action traces to a human" (§04, §09) applies to **bridge connectors** (protocol entities with operator DIDs) — it does NOT apply to the FFI `BridgeInstance` container. Conflating the two produces a chicken-and-egg during SDK initialization: DID resolution is needed to verify signatures on any DID (including remote members'), and must not require a local identity to exist first.
 
 When reading protocol documents, "bridge" means bridge connector unless the context explicitly refers to FFI layer code.
+
+The FFI `BridgeInstance` is the layer that selects the storage backend and threads it into the supervisor. Storage selection at this layer MUST fail closed: if the caller selects a durable backend that cannot be opened, the `BridgeInstance` MUST return an error rather than silently falling back to in-memory or no storage. In-memory storage is reachable only via an explicit in-memory selection and is dev/test-only. The runtime never defaults storage — the `BridgeInstance` supplies it as a required parameter. These rules are normative in §17.6 ("In-Memory Storage Is Dev/Test-Only", "Storage Selection Fails Closed", "The Runtime Never Defaults Storage").
 
 ## 12.3 Shadow Identities
 

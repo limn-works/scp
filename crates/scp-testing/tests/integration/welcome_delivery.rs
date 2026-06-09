@@ -13,7 +13,6 @@
 //! ECIES envelope seal/open used for secure Welcome delivery over untrusted
 //! relays, and the `WelcomeGenerated` event in `ContextManager`.
 
-use scp_core::context::builder::ContextCryptoProvider;
 use scp_core::crypto::envelope_seal::{
     derive_invitation_routing_id, derive_key_package_routing_id,
 };

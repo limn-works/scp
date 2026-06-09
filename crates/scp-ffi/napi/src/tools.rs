@@ -385,10 +385,10 @@ pub(crate) async fn tool_invoke_on(
         })
     })?;
 
-    let manager = crate::runtime::context_manager(bi)?;
+    let supervisor = crate::runtime::supervisor(bi)?;
     let invoker_did_typed: scp_primitives::DID = identity_did.into();
     let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
-    let outcome = manager
+    let outcome = supervisor
         .invoke_tool_with_economy(
             &context_id,
             &registry,
@@ -524,8 +524,8 @@ pub(crate) async fn tool_invoke_cross_context_on(
 
     // Validate chain depth (context-configurable, default 8 per ADR-043).
     let max_chain_depth = {
-        let mgr = crate::runtime::context_manager(bi)?;
-        let source_max = mgr
+        let supervisor = crate::runtime::supervisor(bi)?;
+        let source_max = supervisor
             .context_params(&source_context_id)
             .await
             .and_then(|p| p.max_chain_depth);
@@ -663,8 +663,9 @@ pub(crate) async fn tool_session_create_on(
 
     // Read context-configured session cap (ADR-043), falling back to default.
     let cap = {
-        let mgr = crate::runtime::context_manager(bi)?;
-        mgr.context_params(&context_id)
+        let supervisor = crate::runtime::supervisor(bi)?;
+        supervisor
+            .context_params(&context_id)
             .await
             .and_then(|p| p.session_cap)
             .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER) as usize

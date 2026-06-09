@@ -72,6 +72,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 unicode-normalization = "0.1"
 arc-swap = "1"
+futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 redb = "2"
 
@@ -92,3 +93,10 @@ todo = "deny"
 unimplemented = "deny"
 too_many_lines = "deny"
 too_many_arguments = "deny"
+# Actor-per-context refactor (ADR-049): the actor body serializes access
+# to per-context state; no lock is needed across awaits in actor code.
+# In legacy code paths, any `await` while holding a `std::sync::Mutex` /
+# `parking_lot::Mutex` / `RwLock` guard is a deadlock hazard and gets
+# denied here. See scripts/check-block-in-place.py for the complementary
+# sync-bridge enforcement.
+await_holding_lock = "deny"

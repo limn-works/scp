@@ -1,10 +1,10 @@
 //! napi-rs bridge for context lifecycle, messaging, governance, broadcast,
 //! membership queries, TTL, and events.
 //!
-//! All operations delegate to the shared `ContextManager` instance via
-//! [`crate::runtime::context_manager()`]. The `NapiContextHandle` is a thin
-//! handle carrying context metadata and a reference to the `ContextHandle`
-//! from `scp-core`.
+//! All operations route through [`crate::runtime::supervisor`] via the
+//! ADR-049 dispatch surface (`Supervisor::dispatch_*`). The
+//! `NapiContextHandle` is a thin handle carrying context metadata and a
+//! reference to the `ContextHandle` from `scp-core`.
 //!
 //! See issue #388 and ADR-022 in `.docs/adrs/phase-4.md`.
 
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_core::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
-use scp_core::context::manager::GovernanceActionResult;
+use scp_core::context::state::GovernanceActionResult;
 use scp_core::context::{ContextHandle, ContextState};
 use scp_identity::DID;
 use scp_primitives::Clock;
@@ -27,7 +27,7 @@ use scp_ffi_common::validate::validate_did;
 
 use crate::error::ScpNapiError;
 use crate::identity::NapiIdentity;
-use crate::runtime::{NapiBridgeInstance, context_manager};
+use crate::runtime::NapiBridgeInstance;
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -245,10 +245,24 @@ impl NapiContextHandle {
     /// Returns an error if the `ContextManager` is not initialised.
     #[napi(getter, js_name = "memberCount")]
     pub fn member_count(&self) -> napi::Result<u32> {
-        let manager = context_manager(&self.bi)?;
-        let count = crate::runtime()
-            .block_on(manager.member_count(&self.context_id))
-            .unwrap_or(0);
+        use scp_core::context::actor::commands::QueriesCommand;
+        let sup = crate::runtime::supervisor(&self.bi)?;
+        let sup = Arc::clone(sup);
+        let context_id = self.context_id.clone();
+        let count = crate::runtime().block_on(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = QueriesCommand::MemberCount {
+                context_id,
+                reply: tx,
+            };
+            if sup.dispatch_query(cmd).await.is_err() {
+                return 0usize;
+            }
+            match rx.await {
+                Ok(Ok(Some(n))) => n,
+                _ => 0,
+            }
+        });
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
@@ -295,7 +309,7 @@ impl NapiContextHandle {
             .as_ref()
             .ok_or_else(|| ScpNapiError::Context {
                 message: "context does not have a core handle — context was not created via \
-                      ContextManager"
+                      Supervisor"
                     .to_owned(),
                 code: codes::CTX_2024.to_owned(),
             })
@@ -537,34 +551,67 @@ pub(crate) async fn context_create_on(
             })
         })?;
 
-    // Initialize the ContextManager if not already done (first context_create call).
+    // Initialize the Supervisor if not already done (first context_create call).
     // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_context_manager(bi, &creator_did);
+    crate::runtime::init_supervisor(bi, &creator_did);
 
     // Derive the context-scoped pseudonym routing ID (§9.10.4, SCP-214 criterion 5).
     // Derived BEFORE create_context so it can be passed to the ContextManager.
     let local_pseudonym = derive_context_pseudonym(identity, &context_id).await;
 
-    // Delegate to ContextManager with pseudonym for per-member routing.
-    let manager = context_manager(bi)?;
-    let core_handle = manager
-        .create_context(
-            context_id.clone(),
-            context_params,
-            DID(creator_did.clone()),
-            local_pseudonym,
-        )
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    // Route through the ADR-049 lifecycle dispatch surface
+    // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
+    // rather than calling a `ContextManager` method directly. The actor
+    // mailbox wraps the delegated call in the 30s transport-timeout budget.
+    let sup = crate::runtime::supervisor(bi)?;
+    let core_handle = {
+        use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CreateContext {
+            payload: Box::new(CreateContextPayload {
+                context_id: context_id.clone(),
+                params: context_params,
+                creator_did: DID(creator_did.clone()),
+                local_pseudonym,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        rx.await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("shim reply dropped: {e}"),
+                    code: codes::CTX_2000.to_owned(),
+                })
+            })?
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("create_context failed: {e}"),
+                    code: codes::CTX_2000.to_owned(),
+                })
+            })?
+    };
 
-    // Register the creator's DID as a local DID for defense-in-depth.
-    manager.register_local_did(DID(creator_did.clone())).await;
+    // Register the creator's DID as a local DID for defense-in-depth. Routes
+    // through the supervisor's direct method — the local-DID set is
+    // supervisor-wide (no per-context command target).
+    sup.register_local_did(DID(creator_did.clone()))
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("register_local_did failed: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?;
 
     // §9.10.4: Send pseudonym announcement to inform other members of the
     // creator's per-context routing ID. For freshly created single-member
     // contexts this is a no-op (no recipients), but on restored/imported
     // contexts with existing members the announcement is needed.
-    // Best-effort: if signing key is not available, skip silently.
+    // Best-effort: if signing key is not available, skip silently. Routes
+    // through the ADR-049 commit-8 messaging shim.
     if local_pseudonym.is_some() {
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -575,10 +622,24 @@ pub(crate) async fn context_create_on(
             if let Some((custody, key_handle)) = custody_and_key
                 && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
             {
+                use scp_core::context::actor::commands::{
+                    MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                };
                 let sender_did = DID(creator_did.clone());
-                if let Ok(mgr) = context_manager(bi) {
-                    mgr.send_pseudonym_announcement(&core_handle, &sender_did, &sk)
-                        .await;
+                let ann_ctx_id = core_handle.context_id().to_owned();
+                let ann_params = core_handle.params().clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = MessagingCommand::SendPseudonymAnnouncement {
+                    payload: Box::new(SendPseudonymAnnouncementPayload {
+                        context_id: ann_ctx_id.clone(),
+                        params: ann_params,
+                        sender_did,
+                        signing_key: SigningKeyBytes::from_signing_key(&sk),
+                    }),
+                    reply: tx,
+                };
+                if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
+                    let _ = rx.await;
                 }
             }
         }
@@ -646,11 +707,11 @@ pub(crate) async fn context_join_on(
         })
         .transpose()?;
 
-    // Ensure the ContextManager is initialized — context_join is a valid
+    // Ensure the Supervisor is initialized — context_join is a valid
     // first operation (e.g. a device joining a context without creating one).
-    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    // init_supervisor is idempotent (OnceLock — first call wins). #1073
     // Passes the joiner DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_context_manager(bi, &identity_did);
+    crate::runtime::init_supervisor(bi, &identity_did);
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
 
@@ -692,19 +753,39 @@ pub(crate) async fn context_join_on(
         }
     };
 
-    let manager = context_manager(bi)?;
-    manager
-        .join_context(
-            core_handle,
-            key_package,
-            spending_ucan.as_ref(),
-            local_pseudonym,
-        )
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    // Route through the ADR-049 lifecycle dispatch surface.
+    use scp_core::context::actor::commands::{JoinContextPayload, LifecycleCommand};
+    let sup = crate::runtime::supervisor(bi)?;
+    let join_ctx_id = context_id.clone();
+    let join_params = core_handle.params().clone();
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::JoinContext {
+            payload: Box::new(JoinContextPayload {
+                context_id: join_ctx_id,
+                params: join_params,
+                key_package,
+                spending_ucan,
+                local_pseudonym,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        rx.await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("join_context shim reply dropped: {e}"),
+                    code: codes::CTX_2013.to_owned(),
+                })
+            })?
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    }
 
     // §9.10.4: Send pseudonym announcement to inform existing members.
-    // Best-effort: if signing key is not available, skip silently.
+    // Best-effort: if signing key is not available, skip silently. Routes
+    // through the ADR-049 commit-8 messaging shim.
     if local_pseudonym.is_some() {
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -717,12 +798,24 @@ pub(crate) async fn context_join_on(
             if let Some((custody, key_handle)) = custody_and_key
                 && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
             {
+                use scp_core::context::actor::commands::{
+                    MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                };
                 let sender_did = DID(identity_did.clone());
-                if let (Some(mgr), Ok(ann_handle)) =
-                    (context_manager(bi).ok(), handle.require_core_handle())
-                {
-                    mgr.send_pseudonym_announcement(ann_handle, &sender_did, &sk)
-                        .await;
+                let ann_ctx_id = context_id.clone();
+                let ann_params = core_handle.params().clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = MessagingCommand::SendPseudonymAnnouncement {
+                    payload: Box::new(SendPseudonymAnnouncementPayload {
+                        context_id: ann_ctx_id.clone(),
+                        params: ann_params,
+                        sender_did,
+                        signing_key: SigningKeyBytes::from_signing_key(&sk),
+                    }),
+                    reply: tx,
+                };
+                if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
+                    let _ = rx.await;
                 }
             }
         }
@@ -759,10 +852,31 @@ pub(crate) async fn context_leave_on(
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
 
-    let manager = context_manager(bi)?;
-    manager
-        .leave_context(core_handle, &did, &did)
+    // Route through the ADR-049 lifecycle dispatch surface.
+    use scp_core::context::actor::commands::{LeaveContextPayload, LifecycleCommand};
+    let sup = crate::runtime::supervisor(bi)?;
+    let leave_ctx_id = core_handle.context_id().to_owned();
+    let leave_params = core_handle.params().clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::LeaveContext {
+        payload: Box::new(LeaveContextPayload {
+            context_id: leave_ctx_id,
+            params: leave_params,
+            caller_did: did.clone(),
+            member_did: did,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd)
         .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    rx.await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("leave_context shim reply dropped: {e}"),
+                code: codes::CTX_2015.to_owned(),
+            })
+        })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
     Ok(())
@@ -799,11 +913,35 @@ pub(crate) async fn context_close_on(
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
 
-    let manager = context_manager(bi)?;
-    manager
-        .close_context(core_handle, &did)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    // Route through the ADR-049 lifecycle dispatch surface
+    // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
+    // rather than calling a `ContextManager` method directly. The actor
+    // mailbox wraps the delegated call in the 30s transport-timeout budget
+    // and preserves byte-identical close semantics.
+    {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let sup = crate::runtime::supervisor(bi)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: core_handle.context_id().to_owned(),
+                params: core_handle.params().clone(),
+                initiator_did: did,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        rx.await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("shim reply dropped: {e}"),
+                    code: codes::CTX_2000.to_owned(),
+                })
+            })?
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    }
 
     handle.set_closed().map_err(NapiError::from)?;
 
@@ -898,17 +1036,44 @@ pub(crate) async fn context_send_on(
             })
         })?;
 
-    let manager = context_manager(bi)?;
-    manager
-        .send_message(
-            core_handle,
-            &did,
-            &payload,
-            resolved_signing_key.as_ref(),
-            None,
-            spending_ucan.as_ref(),
-        )
+    // Route through the ADR-049 messaging dispatch surface
+    // ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command))
+    // rather than calling a `ContextManager` method directly. The actor
+    // mailbox exercises the RAII [`SequenceReservation`] + 30s transport
+    // timeout inside the handler and preserves byte-identical envelope
+    // construction.
+    use scp_core::context::actor::commands::{
+        MessagingCommand, SendMessagePayload, SigningKeyBytes,
+    };
+    let sup = crate::runtime::supervisor(bi)?;
+    let context_id = core_handle.context_id().to_owned();
+    let params = core_handle.params().clone();
+    let signing_key_bytes = resolved_signing_key
+        .as_ref()
+        .map(SigningKeyBytes::from_signing_key);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = MessagingCommand::SendMessage {
+        payload: Box::new(SendMessagePayload {
+            context_id: context_id.clone(),
+            params,
+            sender_did: did,
+            payload: payload.clone(),
+            signing_key: signing_key_bytes,
+            source_provenance: None,
+            spending_ucan,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_command(&context_id, cmd)
         .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    rx.await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("shim reply dropped: {e}"),
+                code: codes::CTX_2001.to_owned(),
+            })
+        })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
     Ok(())
@@ -1089,11 +1254,11 @@ pub(crate) async fn context_subscribe_on(
     // orphan the task, making shutdown falsely report `GracefulWithin`
     // while the subscription still held onto `transport_mgr`,
     // `ContextManager`, and the cancel_token Arcs.
-    // Capture an owned `Arc<ContextManager>` scoped to this bridge so the
-    // spawned task doesn't need to re-resolve it via a process-global lookup.
-    // Falls back gracefully if the ContextManager is not attached yet; the
-    // spawned task signals completion when so.
-    let manager_for_task = context_manager(bi).ok().cloned();
+    // Capture an owned `Arc<Supervisor>` scoped to this bridge so the spawned
+    // task doesn't need to re-resolve it via a per-instance lookup. Falls back
+    // gracefully if the supervisor is not attached yet; the spawned task
+    // signals completion when so.
+    let supervisor_for_task = crate::runtime::supervisor(bi).ok().cloned();
     let mut tasks = bi_core.task_handle().await;
     // Disarm the outer guard and transfer the flag to the spawned task's
     // inner guard. No intermediate "flag is true but un-guarded" window —
@@ -1110,14 +1275,28 @@ pub(crate) async fn context_subscribe_on(
         // bug-catcher finding).
         let _active_flag_guard = ActiveFlagGuard(Some(active_flag));
 
-        // Collect the member's pseudonym from the ContextManager state.
-        // Done inside the async block because local_pseudonym is async.
+        // Collect the member's pseudonym via the ADR-049 query shim.
         // Broadcast contexts do not use pseudonyms — skip the lookup.
-        let local_pseudonym = if is_broadcast {
+        let local_pseudonym: Option<[u8; 32]> = if is_broadcast {
             None
         } else {
-            match manager_for_task.as_ref() {
-                Some(mgr) => mgr.local_pseudonym(&context_id).await.ok().flatten(),
+            use scp_core::context::actor::commands::QueriesCommand;
+            match supervisor_for_task.as_ref() {
+                Some(sup) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = QueriesCommand::LocalPseudonym {
+                        context_id: context_id.clone(),
+                        reply: tx,
+                    };
+                    if sup.dispatch_query(cmd).await.is_ok() {
+                        match rx.await {
+                            Ok(Ok(p)) => p,
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
                 None => None,
             }
         };
@@ -1165,8 +1344,13 @@ pub(crate) async fn context_subscribe_on(
             }
         }
 
-        let Some(manager) = manager_for_task else {
-            tracing::error!("ContextManager not initialized");
+        // Route decrypt through the ADR-049 messaging dispatch surface
+        // ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command))
+        // rather than calling a `ContextManager` method directly. The
+        // actor mailbox wraps the call in a 30s transport timeout and
+        // preserves byte-identical crypto / anti-replay / buffered delivery.
+        let Some(supervisor) = supervisor_for_task else {
+            tracing::error!("Supervisor not initialized");
             on_message.call(
                 Ok(None),
                 napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
@@ -1207,11 +1391,28 @@ pub(crate) async fn context_subscribe_on(
 
             match event {
                 scp_transport::TransportEvent::Envelope(envelope) => {
-                    // Decrypt via ContextManager.
-                    match manager
-                        .deliver_incoming(&context_id, &envelope.encrypted_blob)
-                        .await
-                    {
+                    // Decrypt via the ADR-049 commit-8 messaging shim.
+                    use scp_core::context::actor::commands::MessagingCommand;
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = MessagingCommand::DeliverIncoming {
+                        context_id: context_id.clone(),
+                        envelope_bytes: envelope.encrypted_blob.clone(),
+                        reply: tx,
+                    };
+                    let dispatch_result = supervisor.dispatch_command(&context_id, cmd).await;
+                    let reply_result = if dispatch_result.is_ok() {
+                        rx.await.ok()
+                    } else {
+                        None
+                    };
+                    let deliver_result = match (dispatch_result, reply_result) {
+                        (Ok(_), Some(r)) => r,
+                        (Err(e), _) => Err(e),
+                        (Ok(_), None) => Err(scp_core::context::ContextError::CryptoFailed(
+                            "deliver shim reply dropped".to_owned(),
+                        )),
+                    };
+                    match deliver_result {
                         Ok(Some((plaintext, sender_did))) => {
                             sequence_counter += 1.0;
                             #[allow(clippy::cast_precision_loss)]
@@ -1303,49 +1504,115 @@ pub(crate) fn context_cancel_subscription_on(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`context_member_count`].
+///
+/// Routed through the ADR-049 query dispatch surface
+/// ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
 pub(crate) async fn context_member_count_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<u32> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::napi_check_handle!(&bi.core, handle);
-    let manager = context_manager(bi)?;
-    let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
+    let supervisor = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberCount {
+        context_id,
+        reply: tx,
+    };
+    supervisor
+        .dispatch_query(cmd)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("supervisor dispatch_query failed: {e}")))?;
+    let count = rx
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?
+        .unwrap_or(0);
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 /// Per-bridge-instance implementation of [`context_is_member`].
+///
+/// Routed through the ADR-049 query dispatch surface. The handler acquires
+/// the same per-context mutex as the legacy `is_member` path.
 pub(crate) async fn context_is_member_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<bool> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::napi_check_handle!(&bi.core, handle);
-    let manager = context_manager(bi)?;
-    Ok(manager.is_member(&handle.context_id, &did).await)
+    let supervisor = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::IsMember {
+        context_id,
+        did,
+        reply: tx,
+    };
+    supervisor
+        .dispatch_query(cmd)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("supervisor dispatch_query failed: {e}")))?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 /// Per-bridge-instance implementation of [`context_member_dids`].
+///
+/// Routed through the ADR-049 query dispatch surface.
 pub(crate) async fn context_member_dids_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<Vec<String>> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::napi_check_handle!(&bi.core, handle);
-    let manager = context_manager(bi)?;
-    Ok(manager.member_dids(&handle.context_id).await)
+    let supervisor = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberDids {
+        context_id,
+        reply: tx,
+    };
+    supervisor
+        .dispatch_query(cmd)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("supervisor dispatch_query failed: {e}")))?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 /// Per-bridge-instance implementation of [`context_member_role`].
+///
+/// Routed through the ADR-049 query dispatch surface. Returns the role name
+/// as a string, or `null` if the member is not found.
 pub(crate) async fn context_member_role_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<Option<String>> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::napi_check_handle!(&bi.core, handle);
-    let manager = context_manager(bi)?;
-    Ok(manager
-        .member_role(&handle.context_id, &did)
+    let supervisor = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberRole {
+        context_id,
+        did,
+        reply: tx,
+    };
+    supervisor
+        .dispatch_query(cmd)
         .await
-        .map(|a| a.role_name))
+        .map_err(|e| napi::Error::from_reason(format!("supervisor dispatch_query failed: {e}")))?;
+    let assignment = rx
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    Ok(assignment.map(|a| a.role_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,59 +1653,124 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
 }
 
 /// Per-bridge-instance implementation of [`context_drain_events`].
+///
+/// Routed through the ADR-049 messaging dispatch surface
+/// ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command)).
+/// `drain_events` lives on the messaging enum because the receive buffer
+/// is the messaging path's downstream sink (fed by `deliver_incoming`,
+/// consumed by FFI receive polling).
 pub(crate) async fn context_drain_events_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<Vec<String>> {
+    use scp_core::context::actor::commands::MessagingCommand;
     crate::napi_check_handle!(&bi.core, handle);
-    let manager = context_manager(bi)?;
-    let events = manager.drain_events(&handle.context_id).await;
+    let sup = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = MessagingCommand::DrainEvents {
+        context_id: context_id.clone(),
+        reply: tx,
+    };
+    sup.dispatch_command(&context_id, cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_command failed: {e}"))
+    })?;
+    let events = rx
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("drain_events shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(format!("drain_events failed: {e}")))?;
     Ok(events.iter().map(format_context_event).collect())
 }
 
 // ---------------------------------------------------------------------------
-// Bridge functions — access key lifecycle (#1529, delegated to ContextManager)
+// Bridge functions — access key lifecycle (#1529, ADR-049 dispatch surface)
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`access_key_generate`].
+///
+/// Routed through the ADR-049 lifecycle dispatch surface
+/// ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn access_key_generate_on(
     bi: &NapiBridgeInstance,
     context_id: String,
     member_did: String,
     caller_did: String,
 ) -> napi::Result<()> {
-    let manager = context_manager(bi)?;
-    manager
-        .generate_context_access_key(&context_id, &member_did, &caller_did)
-        .await
+    use scp_core::context::actor::commands::LifecycleCommand;
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::GenerateContextAccessKey {
+        context_id,
+        member_did,
+        caller_did,
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!(
+            "[SCP-CTX-2070] supervisor dispatch_lifecycle_command failed: {e}"
+        ))
+    })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2070] shim reply dropped: {e}")))?
         .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2070] {e}")))
 }
 
 /// Per-bridge-instance implementation of [`access_key_revoke`].
+///
+/// Routed through the ADR-049 lifecycle dispatch surface.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn access_key_revoke_on(
     bi: &NapiBridgeInstance,
     context_id: String,
     member_did: String,
     caller_did: String,
 ) -> napi::Result<()> {
-    let manager = context_manager(bi)?;
-    manager
-        .revoke_context_access_key(&context_id, &member_did, &caller_did)
-        .await
+    use scp_core::context::actor::commands::LifecycleCommand;
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::RevokeContextAccessKey {
+        context_id,
+        member_did,
+        caller_did,
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!(
+            "[SCP-CTX-2071] supervisor dispatch_lifecycle_command failed: {e}"
+        ))
+    })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2071] shim reply dropped: {e}")))?
         .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2071] {e}")))
 }
 
 /// Per-bridge-instance implementation of [`access_key_restore`].
+///
+/// Routed through the ADR-049 lifecycle dispatch surface.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn access_key_restore_on(
     bi: &NapiBridgeInstance,
     context_id: String,
     member_did: String,
     caller_did: String,
 ) -> napi::Result<()> {
-    let manager = context_manager(bi)?;
-    manager
-        .restore_context_access_key(&context_id, &member_did, &caller_did)
-        .await
+    use scp_core::context::actor::commands::LifecycleCommand;
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::RestoreContextAccessKey {
+        context_id,
+        member_did,
+        caller_did,
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!(
+            "[SCP-CTX-2072] supervisor dispatch_lifecycle_command failed: {e}"
+        ))
+    })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2072] shim reply dropped: {e}")))?
         .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2072] {e}")))
 }
 
@@ -1447,117 +1779,83 @@ pub(crate) async fn access_key_restore_on(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`context_broadcast_subscriber_count`].
+///
+/// Routed through the ADR-049 broadcast dispatch surface.
 pub(crate) async fn context_broadcast_subscriber_count_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<u32>> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     crate::napi_check_handle!(&bi.core, handle);
-    let manager = context_manager(bi)?;
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(manager
-        .broadcast_subscriber_count(&handle.context_id)
+    let sup = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::BroadcastSubscriberCount {
+        context_id,
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_broadcast_command failed: {e}"))
+    })?;
+    let count = rx
         .await
-        .map(|c| c as u32))
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(count.map(|c| c as u32))
 }
 
 /// Per-bridge-instance implementation of [`context_is_broadcast_subscriber`].
+///
+/// Routed through the ADR-049 broadcast dispatch surface.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn context_is_broadcast_subscriber_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<bool> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     crate::napi_check_handle!(&bi.core, handle);
-    let manager = context_manager(bi)?;
-    Ok(manager
-        .is_broadcast_subscriber(&handle.context_id, &did)
-        .await)
+    let sup = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::IsBroadcastSubscriber {
+        context_id,
+        did,
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_broadcast_command failed: {e}"))
+    })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 /// Per-bridge-instance implementation of [`context_broadcast_admission`].
+///
+/// Routed through the ADR-049 broadcast dispatch surface.
 pub(crate) async fn context_broadcast_admission_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<String>> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     crate::napi_check_handle!(&bi.core, handle);
-    let manager = context_manager(bi)?;
-    Ok(manager
-        .broadcast_admission(&handle.context_id)
+    let sup = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::BroadcastAdmission {
+        context_id,
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_broadcast_command failed: {e}"))
+    })?;
+    let admission = rx
         .await
-        .map(|a| format!("{a:?}")))
-}
-
-// ---------------------------------------------------------------------------
-// No-op UCAN validation trait stubs for subscribe_broadcast
-//
-// Minimal implementations satisfying the generic bounds on
-// ContextManager::subscribe_broadcast. Broadcast subscription in open mode
-// does not require UCAN validation; gated mode validation will be wired
-// when the full UCAN pipeline is integrated with the NAPI bridge.
-// ---------------------------------------------------------------------------
-
-struct NoOpDidResolver;
-impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
-    fn resolve_public_key(
-        &self,
-        _did: &str,
-    ) -> Result<[u8; 32], scp_core::crypto::ucan::UcanError> {
-        Err(scp_core::crypto::ucan::UcanError::MalformedToken(
-            "NoOpDidResolver: no DID resolution available".into(),
-        ))
-    }
-}
-
-/// Fail-closed nonce tracker: rejects all nonces when no real tracker is
-/// available. Used as a type parameter only — never reached when token is
-/// `None`, but rejects by default if accidentally called.
-struct RejectAllNonceTracker;
-impl scp_core::crypto::ucan::validate::NonceTracker for RejectAllNonceTracker {
-    fn check_replay(
-        &self,
-        nonce: &str,
-        _token_expiry: u64,
-    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
-        // Fail-closed: reject all nonces when no real tracker is available.
-        Err(scp_core::crypto::ucan::UcanError::NonceReused(
-            nonce.to_owned(),
-        ))
-    }
-
-    fn record(
-        &mut self,
-        nonce: &str,
-        _token_expiry: u64,
-    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
-        // Fail-closed: reject all nonces when no real tracker is available.
-        Err(scp_core::crypto::ucan::UcanError::NonceReused(
-            nonce.to_owned(),
-        ))
-    }
-}
-
-/// Fail-closed revocation checker: treats all tokens as revoked when no real
-/// checker is available. Used as a type parameter only — never reached when
-/// token is `None`, but rejects by default if accidentally called.
-struct RejectAllRevocationChecker;
-impl scp_core::crypto::ucan::validate::RevocationChecker for RejectAllRevocationChecker {
-    fn is_revoked(&self, _token_cid: &str) -> bool {
-        // Fail-closed: treat all tokens as revoked when no real checker is available.
-        true
-    }
-}
-
-/// Fail-closed proof resolver: rejects all proof lookups. Used as a type
-/// parameter only — never reached when token is `None`.
-struct RejectAllProofResolver;
-impl scp_core::crypto::ucan::validate::ProofResolver for RejectAllProofResolver {
-    fn resolve_proof(
-        &self,
-        cid: &str,
-    ) -> Result<scp_core::crypto::ucan::UcanToken, scp_core::crypto::ucan::UcanError> {
-        Err(scp_core::crypto::ucan::UcanError::DelegationChainBroken(
-            format!("RejectAllProofResolver: no proof available for CID {cid}"),
-        ))
-    }
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    Ok(admission.map(|a| format!("{a:?}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,14 +1863,18 @@ impl scp_core::crypto::ucan::validate::ProofResolver for RejectAllProofResolver 
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`broadcast_subscribe`].
+///
+/// Routed through the ADR-049 broadcast dispatch surface.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn broadcast_subscribe_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     subscriber_did: String,
 ) -> napi::Result<()> {
+    use scp_core::context::actor::commands::{BroadcastCommand, SubscribeBroadcastPayload};
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
     let did: DID = DID(subscriber_did);
     let timestamp = std::time::SystemTime::now()
@@ -1580,35 +1882,57 @@ pub(crate) async fn broadcast_subscribe_on(
         .unwrap_or_default()
         .as_secs();
 
-    manager
-        .subscribe_broadcast::<
-            NoOpDidResolver,
-            RejectAllNonceTracker,
-            RejectAllRevocationChecker,
-            RejectAllProofResolver,
-            std::hash::RandomState,
-        >(&context_id, &did, None, timestamp, None)
-        .await
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::SubscribeBroadcast {
+        payload: Box::new(SubscribeBroadcastPayload {
+            context_id,
+            subscriber_did: did,
+            ucan: None,
+            timestamp,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_broadcast_command failed: {e}"))
+    })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(())
 }
 
 /// Per-bridge-instance implementation of [`broadcast_unsubscribe`].
+///
+/// When `rotate_keys` is `true`, all authors rotate their broadcast keys
+/// for forward secrecy. Routed through the ADR-049 broadcast dispatch surface.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn broadcast_unsubscribe_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     subscriber_did: String,
     rotate_keys: Option<bool>,
 ) -> napi::Result<()> {
+    use scp_core::context::actor::commands::{BroadcastCommand, UnsubscribeBroadcastPayload};
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
     let did: DID = DID(subscriber_did);
 
-    manager
-        .unsubscribe_broadcast(&context_id, &did, rotate_keys.unwrap_or(false))
-        .await
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::UnsubscribeBroadcast {
+        payload: Box::new(UnsubscribeBroadcastPayload {
+            context_id,
+            subscriber_did: did,
+            rotate_keys: rotate_keys.unwrap_or(false),
+        }),
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_broadcast_command failed: {e}"))
+    })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(())
 }
@@ -1622,12 +1946,12 @@ pub(crate) async fn broadcast_publish_on(
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager(bi)?;
     let context_id = handle.context_id.clone();
     let author_did = DID(author_did);
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
+        use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastPayload};
         let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
             NapiError::from(ScpNapiError::Permission {
                 message: "broadcast publish requires key custody — create the identity with \
@@ -1645,21 +1969,36 @@ pub(crate) async fn broadcast_publish_on(
             })
         })?;
 
-        manager
-            .publish_broadcast(
-                &context_id,
-                &author_did,
-                &payload,
-                custody.as_ref(),
-                &signing_key,
-            )
+        // Route through the ADR-049 broadcast dispatch surface with custody.
+        // Publish requires the custody-bearing variant because the
+        // `KeyCustody` trait is not dyn-safe and cannot cross the actor
+        // mailbox.
+        let sup = crate::runtime::supervisor(bi)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::PublishBroadcast {
+            payload: Box::new(PublishBroadcastPayload {
+                context_id,
+                author_did,
+                payload,
+                signing_key_handle: signing_key,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
             .await
+            .map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "supervisor dispatch_broadcast_command_with_custody failed: {e}"
+                ))
+            })?;
+        rx.await
+            .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     }
 
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (manager, context_id, author_did, payload);
+        let _ = (context_id, author_did, payload);
         return Err(NapiError::from(ScpNapiError::Permission {
             message: "broadcast publish requires key custody — in_memory custody feature is \
                       not enabled"
@@ -1717,7 +2056,6 @@ pub(crate) async fn broadcast_publish_asset_on(
 ) -> napi::Result<NapiPublishResult> {
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager(bi)?;
     let context_id = handle.context_id.clone();
     let author_did_val = DID(author_did.clone());
 
@@ -1780,6 +2118,9 @@ pub(crate) async fn broadcast_publish_asset_on(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
+        use scp_core::context::actor::commands::{
+            BroadcastCommand, PublishBroadcastContentPayload,
+        };
         let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
             NapiError::from(ScpNapiError::Permission {
                 message: "broadcast publish asset requires key custody — create the identity with \
@@ -1797,15 +2138,28 @@ pub(crate) async fn broadcast_publish_asset_on(
             })
         })?;
 
-        let envelope = manager
-            .publish_broadcast_content(
-                &context_id,
-                &author_did_val,
+        // Route through the ADR-049 commit-11 broadcast shim with custody.
+        let sup = crate::runtime::supervisor(bi)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::PublishBroadcastContent {
+            payload: Box::new(PublishBroadcastContentPayload {
+                context_id,
+                author_did: author_did_val,
                 content,
-                custody.as_ref(),
-                &signing_key,
-            )
+                signing_key_handle: signing_key,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
             .await
+            .map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "supervisor dispatch_broadcast_command_with_custody failed: {e}"
+                ))
+            })?;
+        let envelope = rx
+            .await
+            .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
         let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
@@ -1828,7 +2182,7 @@ pub(crate) async fn broadcast_publish_asset_on(
 
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (manager, context_id, author_did_val, content, deploy_id_str);
+        let _ = (context_id, author_did_val, content, deploy_id_str);
         Err(NapiError::from(ScpNapiError::Permission {
             message: "broadcast publish asset requires key custody — in_memory custody feature is \
                       not enabled"
@@ -1859,7 +2213,6 @@ pub(crate) async fn broadcast_publish_assets_on(
     }
 
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager(bi)?;
     let context_id = handle.context_id.clone();
     let author_did_val = DID(author_did.clone());
 
@@ -1886,6 +2239,9 @@ pub(crate) async fn broadcast_publish_assets_on(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
+        use scp_core::context::actor::commands::{
+            BroadcastCommand, PublishBroadcastContentPayload,
+        };
         let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
             NapiError::from(ScpNapiError::Permission {
                 message: "broadcast publish assets requires key custody".to_owned(),
@@ -1899,6 +2255,9 @@ pub(crate) async fn broadcast_publish_assets_on(
             })
         })?;
 
+        // Route each asset through the ADR-049 commit-11 broadcast shim
+        // with custody.
+        let sup = crate::runtime::supervisor(bi)?;
         let mut results = Vec::with_capacity(assets.len());
         for asset in assets {
             let content_path = scp_core::context::ContentPath::new(asset.path).map_err(|e| {
@@ -1927,15 +2286,26 @@ pub(crate) async fn broadcast_publish_assets_on(
                 body: asset.body,
             };
 
-            let envelope = manager
-                .publish_broadcast_content(
-                    &context_id,
-                    &author_did_val,
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcastContent {
+                payload: Box::new(PublishBroadcastContentPayload {
+                    context_id: context_id.clone(),
+                    author_did: author_did_val.clone(),
                     content,
-                    custody.as_ref(),
-                    &signing_key,
-                )
+                    signing_key_handle: signing_key,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
                 .await
+                .map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "supervisor dispatch_broadcast_command_with_custody failed: {e}"
+                    ))
+                })?;
+            let envelope = rx
+                .await
+                .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
             let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
@@ -1963,7 +2333,7 @@ pub(crate) async fn broadcast_publish_assets_on(
 
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (manager, context_id, author_did_val, deploy_id_val, assets);
+        let _ = (context_id, author_did_val, deploy_id_val, assets);
         Err(NapiError::from(ScpNapiError::Permission {
             message: "broadcast publish assets requires key custody — in_memory custody feature \
                       is not enabled"
@@ -1974,67 +2344,117 @@ pub(crate) async fn broadcast_publish_assets_on(
 }
 
 /// Per-bridge-instance implementation of [`broadcast_block_subscriber`].
+///
+/// The subscriber is removed from the registry and added to all authors'
+/// block lists; all author keys are rotated. Routed through the ADR-049
+/// broadcast dispatch surface.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn broadcast_block_subscriber_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     subscriber_did: String,
     blocker_did: String,
 ) -> napi::Result<()> {
+    use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&blocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
     let subscriber: DID = DID(subscriber_did);
     let blocker: DID = DID(blocker_did);
 
-    manager
-        .block_broadcast_subscriber(&context_id, &blocker, &subscriber)
-        .await
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::BlockBroadcastSubscriber {
+        payload: Box::new(BroadcastBlockPayload {
+            context_id,
+            author_did: blocker,
+            subscriber_did: subscriber,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_broadcast_command failed: {e}"))
+    })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`broadcast_unblock_subscriber`].
+/// Per-bridge-instance implementation of [`broadcast_unblock_subscriber`] (§9.16.8).
+///
+/// Forward-only: the unblocked subscriber can request the current key on
+/// next pull but cannot decrypt content from the block period. Routed through
+/// the ADR-049 broadcast dispatch surface.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn broadcast_unblock_subscriber_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     subscriber_did: String,
     unblocker_did: String,
 ) -> napi::Result<()> {
+    use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&unblocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
     let subscriber: DID = DID(subscriber_did);
     let unblocker: DID = DID(unblocker_did);
 
-    manager
-        .unblock_broadcast_subscriber(&context_id, &unblocker, &subscriber)
-        .await
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::UnblockBroadcastSubscriber {
+        payload: Box::new(BroadcastBlockPayload {
+            context_id,
+            author_did: unblocker,
+            subscriber_did: subscriber,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_broadcast_command failed: {e}"))
+    })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(())
 }
 
 /// Per-bridge-instance implementation of [`broadcast_handle_key_request`].
+///
+/// Validates the author DID is locally controlled and processes the key
+/// distribution request. Returns a debug string describing the decision.
+/// Routed through the ADR-049 broadcast dispatch surface.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn broadcast_handle_key_request_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     author_did: String,
     requester_did: String,
 ) -> napi::Result<String> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&requester_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
     let author: DID = DID(author_did);
     let requester: DID = DID(requester_did);
 
-    let decision = manager
-        .handle_broadcast_key_request(&context_id, &author, &requester)
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::HandleBroadcastKeyRequest {
+        context_id,
+        author_did: author,
+        requester_did: requester,
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_broadcast_command failed: {e}"))
+    })?;
+    let decision = rx
         .await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(format!("{decision:?}"))
 }
@@ -2096,11 +2516,26 @@ pub(crate) async fn context_execute_governance_action_on(
         created_at_epoch: None,
     };
 
-    let manager = context_manager(bi)?;
+    // Route through the ADR-049 governance dispatch surface.
+    use scp_core::context::actor::commands::{ExecuteGovernanceActionPayload, GovernanceCommand};
+    let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
-    let result = manager
-        .execute_governance_action(&context_id, &proposal)
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::ExecuteGovernanceAction {
+        payload: Box::new(ExecuteGovernanceActionPayload {
+            context_id: context_id.clone(),
+            proposal,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!(
+            "supervisor dispatch_governance_command failed: {e}"
+        ))
+    })?;
+    let result = rx
         .await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
     // Re-sync local UCAN role state cache from ContextManager after any
@@ -2222,15 +2657,44 @@ pub(crate) async fn context_governance_propose_on(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
+        use scp_core::context::actor::commands::{
+            GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
+        };
+
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(proposer_did);
-        let manager = context_manager(bi)?;
         let context_id = handle.context_id.clone();
 
-        let outcome = manager
-            .propose_governance_action_checked(&context_id, &did, action, &signing_key)
+        // Route through the ADR-049 commit-10 governance shim
+        // ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command))
+        // rather than calling `ContextManager::propose_governance_action_checked`
+        // directly.
+        let sup = crate::runtime::supervisor(bi)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ProposeGovernanceActionChecked {
+            payload: Box::new(ProposeGovernanceActionPayload {
+                context_id: context_id.clone(),
+                proposer_did: did,
+                action,
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_governance_command failed: {e}"),
+                code: codes::CTX_2041.to_owned(),
+            })
+        })?;
+        let outcome = rx
             .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("governance proposal shim reply dropped: {e}"),
+                    code: codes::CTX_2041.to_owned(),
+                })
+            })?
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance proposal failed: {e}"),
@@ -2284,15 +2748,41 @@ pub(crate) async fn context_governance_approve_on(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
+        use scp_core::context::actor::commands::{
+            GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+        };
+
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(voter_did);
-        let manager = context_manager(bi)?;
         let context_id = handle.context_id.clone();
 
-        let status = manager
-            .approve_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
+        // Route through the ADR-049 governance dispatch surface.
+        let sup = crate::runtime::supervisor(bi)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ApproveGovernanceProposal {
+            payload: Box::new(VoteOnProposalPayload {
+                context_id: context_id.clone(),
+                proposal_id,
+                voter_did: did,
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_governance_command failed: {e}"),
+                code: codes::CTX_2042.to_owned(),
+            })
+        })?;
+        let status = rx
             .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("governance approval shim reply dropped: {e}"),
+                    code: codes::CTX_2042.to_owned(),
+                })
+            })?
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance approval failed: {e}"),
@@ -2338,15 +2828,40 @@ pub(crate) async fn context_governance_reject_on(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
+        use scp_core::context::actor::commands::{
+            GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+        };
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(voter_did);
-        let manager = context_manager(bi)?;
+        let sup = crate::runtime::supervisor(bi)?;
         let context_id = handle.context_id.clone();
 
-        let status = manager
-            .reject_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
+        // Route through the ADR-049 governance dispatch surface.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::RejectGovernanceProposal {
+            payload: Box::new(VoteOnProposalPayload {
+                context_id: context_id.clone(),
+                proposal_id,
+                voter_did: did,
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_governance_command failed: {e}"),
+                code: codes::CTX_2043.to_owned(),
+            })
+        })?;
+        let status = rx
             .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("governance reject shim reply dropped: {e}"),
+                    code: codes::CTX_2043.to_owned(),
+                })
+            })?
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance rejection failed: {e}"),
@@ -2381,21 +2896,44 @@ pub(crate) async fn context_governance_reject_on(
 }
 
 /// Per-bridge-instance implementation of [`context_governance_withdraw`].
+///
+/// Routed through the ADR-049 governance dispatch surface. No signing key
+/// is required.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) async fn context_governance_withdraw_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
     let did = DID(voter_did);
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
 
-    let status = manager
-        .withdraw_governance_vote(&context_id, &proposal_id, &did)
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::WithdrawGovernanceVote {
+        context_id: context_id.clone(),
+        proposal_id,
+        voter_did: did,
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
+            code: codes::CTX_2044.to_owned(),
+        })
+    })?;
+    let status = rx
         .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("governance withdraw shim reply dropped: {e}"),
+                code: codes::CTX_2044.to_owned(),
+            })
+        })?
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("governance vote withdrawal failed: {e}"),
@@ -2419,19 +2957,41 @@ pub(crate) async fn context_governance_withdraw_on(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`context_governance_get_proposal`].
+///
+/// Returns the full proposal as a JSON string, or rejects if not found.
+/// Routed through the ADR-049 governance dispatch surface.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) async fn context_governance_get_proposal_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     proposal_id_hex: String,
 ) -> napi::Result<String> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
 
-    let proposal = manager
-        .get_proposal(&context_id, &proposal_id)
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::GetProposal {
+        context_id,
+        proposal_id,
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
+            code: codes::CTX_2045.to_owned(),
+        })
+    })?;
+    let proposal = rx
         .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("get proposal shim reply dropped: {e}"),
+                code: codes::CTX_2045.to_owned(),
+            })
+        })?
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("get proposal failed: {e}"),
@@ -2448,20 +3008,43 @@ pub(crate) async fn context_governance_get_proposal_on(
 }
 
 /// Per-bridge-instance implementation of [`context_governance_list_proposals`].
+///
+/// Returns a JSON array of proposals, or an empty array if the context has
+/// no pending proposals. Routed through the ADR-049 governance dispatch surface.
 pub(crate) async fn context_governance_list_proposals_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<String> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
 
-    let proposals = manager.list_proposals(&context_id).await.map_err(|e| {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::ListProposals {
+        context_id,
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
-            message: format!("list proposals failed: {e}"),
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
             code: codes::CTX_2046.to_owned(),
         })
     })?;
+    let proposals = rx
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("list proposals shim reply dropped: {e}"),
+                code: codes::CTX_2046.to_owned(),
+            })
+        })?
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("list proposals failed: {e}"),
+                code: codes::CTX_2046.to_owned(),
+            })
+        })?;
 
     serde_json::to_string(&proposals).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
@@ -2481,16 +3064,34 @@ pub(crate) async fn context_apply_pending_ceiling_modification_on(
     handle: &NapiContextHandle,
     current_timestamp: f64,
 ) -> napi::Result<bool> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let ts = current_timestamp as u64;
 
-    manager
-        .apply_pending_ceiling_modification(&context_id, ts)
-        .await
+    // Route through the ADR-049 governance dispatch surface.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::ApplyPendingCeilingModification {
+        context_id,
+        current_timestamp: ts,
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
+            code: codes::CTX_2060.to_owned(),
+        })
+    })?;
+    rx.await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("apply_pending_ceiling_modification shim reply dropped: {e}"),
+                code: codes::CTX_2060.to_owned(),
+            })
+        })?
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("apply_pending_ceiling_modification failed: {e}"),
@@ -2500,12 +3101,16 @@ pub(crate) async fn context_apply_pending_ceiling_modification_on(
 }
 
 /// Per-bridge-instance implementation of [`context_finalize_close`].
+///
+/// Transitions the context from `Closing` to `Closed`, destroys keys per
+/// memory scope, and records a `ContextClosed` event. Routed through the
+/// ADR-049 TTL-close dispatch surface.
 pub(crate) async fn context_finalize_close_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<()> {
+    use scp_core::context::actor::commands::{TtlCloseCommand, TtlContextPayload};
     crate::napi_check_handle!(&bi.core, handle);
-    let manager = context_manager(bi)?;
 
     // Use the handle's actual core_handle (which carries correct ContextParams
     // including memory_scope) instead of constructing one with default params.
@@ -2517,12 +3122,34 @@ pub(crate) async fn context_finalize_close_on(
     // or invalid source state) and we ignore the error.
     let _ = core_handle.transition_to(&ContextState::Closing).await;
 
-    manager.finalize_close(core_handle).await.map_err(|e| {
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = TtlCloseCommand::FinalizeClose {
+        payload: Box::new(TtlContextPayload {
+            context_id: core_handle.context_id().to_owned(),
+            params: core_handle.params().clone(),
+        }),
+        reply: tx,
+    };
+    sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
-            message: format!("finalize_close failed: {e}"),
+            message: format!("supervisor dispatch_ttl_close_command failed: {e}"),
             code: codes::CTX_2061.to_owned(),
         })
     })?;
+    rx.await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("finalize_close shim reply dropped: {e}"),
+                code: codes::CTX_2061.to_owned(),
+            })
+        })?
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("finalize_close failed: {e}"),
+                code: codes::CTX_2061.to_owned(),
+            })
+        })?;
 
     // Update FFI handle state to Closed.
     if let Ok(mut s) = handle.state.lock() {
@@ -2547,7 +3174,6 @@ pub(crate) async fn context_create_governance_checkpoint_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager(bi)?;
 
     let merkle_root = parse_napi_hex_32(&merkle_root_hex, "merkle_root")?;
     let last_event_hash = parse_napi_hex_32(&last_event_hash_hex, "last_event_hash")?;
@@ -2565,18 +3191,42 @@ pub(crate) async fn context_create_governance_checkpoint_on(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let count = event_count as u64;
 
-    let checkpoint = manager
-        .create_governance_checkpoint(
-            &context_id,
-            seq,
+    // Route through the ADR-049 trust-recovery dispatch surface
+    // ([`Supervisor::dispatch_trust_recovery_command`](scp_core::context::supervisor::Supervisor::dispatch_trust_recovery_command)).
+    use scp_core::context::actor::commands::{
+        CreateGovernanceCheckpointPayload, TrustRecoveryCommand,
+    };
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = TrustRecoveryCommand::CreateGovernanceCheckpoint {
+        payload: Box::new(CreateGovernanceCheckpointPayload {
+            context_id,
+            checkpoint_seq: seq,
             merkle_root,
-            count,
+            event_count: count,
             last_event_hash,
             state_snapshot_hash,
-            &did,
+            creator_did: did,
             creator_signature,
-        )
+        }),
+        reply: tx,
+    };
+    sup.dispatch_trust_recovery_command(cmd)
         .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_trust_recovery_command failed: {e}"),
+                code: codes::CTX_2062.to_owned(),
+            })
+        })?;
+    let checkpoint = rx
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("create_governance_checkpoint shim reply dropped: {e}"),
+                code: codes::CTX_2062.to_owned(),
+            })
+        })?
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("create_governance_checkpoint failed: {e}"),
@@ -2600,11 +3250,11 @@ pub(crate) async fn context_add_checkpoint_cosignature_on(
     signer_did: String,
     signature_hex: String,
 ) -> napi::Result<String> {
+    use scp_core::context::actor::commands::TrustRecoveryCommand;
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager(bi)?;
 
-    let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
+    let checkpoint: scp_core::context::governance::ContextCheckpoint =
         serde_json::from_str(&checkpoint_json).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("invalid checkpoint JSON: {e}"),
@@ -2624,9 +3274,31 @@ pub(crate) async fn context_add_checkpoint_cosignature_on(
         signature,
     };
 
-    let status = manager
-        .add_checkpoint_cosignature(&context_id, &mut checkpoint, cosignature)
+    // Route through the ADR-049 trust-recovery dispatch surface.
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = TrustRecoveryCommand::AddCheckpointCosignature {
+        context_id,
+        checkpoint: Box::new(checkpoint),
+        cosignature: Box::new(cosignature),
+        reply: tx,
+    };
+    sup.dispatch_trust_recovery_command(cmd)
         .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_trust_recovery_command failed: {e}"),
+                code: codes::CTX_2063.to_owned(),
+            })
+        })?;
+    let (updated_checkpoint, status) = rx
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("add_checkpoint_cosignature shim reply dropped: {e}"),
+                code: codes::CTX_2063.to_owned(),
+            })
+        })?
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("add_checkpoint_cosignature failed: {e}"),
@@ -2636,37 +3308,46 @@ pub(crate) async fn context_add_checkpoint_cosignature_on(
 
     let response = serde_json::json!({
         "attestation_status": format!("{status:?}"),
-        "checkpoint": serde_json::to_value(&checkpoint).unwrap_or_default(),
+        "checkpoint": serde_json::to_value(&updated_checkpoint).unwrap_or_default(),
     });
     Ok(response.to_string())
 }
 
 /// Per-bridge-instance implementation of [`context_restore`].
+///
+/// Routed through the ADR-049 lifecycle dispatch surface. The handler
+/// loads the persisted snapshot itself and reconstructs an ephemeral
+/// `ContextHandle` from it — the `ContextParams` supplied here are only
+/// used to initialise the ephemeral wrapper; the handler overwrites all
+/// memory-scope-sensitive state from the loaded snapshot.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) async fn context_restore_on(
     bi: &NapiBridgeInstance,
     context_id: String,
 ) -> napi::Result<()> {
-    let manager = context_manager(bi)?;
-
-    // Load the persisted snapshot to obtain the correct ContextParams (including
-    // memory_scope). Using ContextParams::default() would give Ephemeral scope,
-    // which would cause incorrect key destruction on subsequent finalize_close.
-    let (snapshot, _broadcast) =
-        manager
-            .load_persisted_context_state(&context_id)
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("restore_context: failed to load persisted state: {e}"),
-                    code: codes::CTX_2064.to_owned(),
-                })
-            })?;
-
-    let core_handle = ContextHandle::new(context_id.clone(), snapshot.context_params.clone());
-    let _ = core_handle.transition_to(&ContextState::Active).await;
-
-    manager
-        .restore_context(&context_id, &core_handle)
-        .await
+    use scp_core::context::actor::commands::{LifecycleCommand, RestoreContextPayload};
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::RestoreContext {
+        payload: Box::new(RestoreContextPayload {
+            context_id,
+            params: scp_core::context::ContextParams::default(),
+        }),
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_lifecycle_command failed: {e}"),
+            code: codes::CTX_2064.to_owned(),
+        })
+    })?;
+    rx.await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("restore_context shim reply dropped: {e}"),
+                code: codes::CTX_2064.to_owned(),
+            })
+        })?
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("restore_context failed: {e}"),
@@ -2676,10 +3357,14 @@ pub(crate) async fn context_restore_on(
 }
 
 /// Per-bridge-instance implementation of [`context_restore_all`].
+///
+/// Returns a JSON array of restored context ID strings. Routes through the
+/// supervisor-scope direct method; `restore_all_contexts` operates on the
+/// supervisor-wide context registry and has no per-context command target.
 pub(crate) async fn context_restore_all_on(bi: &NapiBridgeInstance) -> napi::Result<String> {
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
 
-    let restored = manager.restore_all_contexts().await.map_err(|e| {
+    let restored = sup.restore_all_contexts().await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("restore_all_contexts failed: {e}"),
             code: codes::CTX_2065.to_owned(),
@@ -2722,11 +3407,28 @@ pub(crate) async fn context_tombstone_migrated_on(
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager(bi)?;
 
-    manager
-        .tombstone_migrated_context(&context_id)
-        .await
+    // Route through the ADR-049 governance dispatch surface.
+    use scp_core::context::actor::commands::GovernanceCommand;
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::TombstoneMigratedContext {
+        context_id,
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
+            code: codes::CTX_2050.to_owned(),
+        })
+    })?;
+    rx.await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("tombstone_migrated_context shim reply dropped: {e}"),
+                code: codes::CTX_2050.to_owned(),
+            })
+        })?
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("tombstone_migrated_context failed: {e}"),
@@ -2742,16 +3444,44 @@ pub(crate) async fn context_tombstone_migrated_on(
     Ok(())
 }
 
-/// Per-bridge-instance implementation of [`context_migration_state`].
+/// Per-bridge-instance implementation of [`context_migration_state`] (§5.11A).
+///
+/// Returns a JSON string with migration state fields, or `null` if the
+/// context is not migrating. Routed through the ADR-049 governance dispatch surface.
 pub(crate) async fn context_migration_state_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<String>> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager(bi)?;
+    let sup = crate::runtime::supervisor(bi)?;
 
-    let state = manager.migration_state(&context_id).await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::MigrationState {
+        context_id,
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
+            code: codes::CTX_2050.to_owned(),
+        })
+    })?;
+    let state = rx
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("migration_state shim reply dropped: {e}"),
+                code: codes::CTX_2050.to_owned(),
+            })
+        })?
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("migration_state failed: {e}"),
+                code: codes::CTX_2050.to_owned(),
+            })
+        })?;
     match state {
         Some(ms) => {
             let json = serde_json::json!({
@@ -2772,51 +3502,101 @@ pub(crate) async fn context_migration_state_on(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`context_handle_ttl_expiry`].
+///
+/// Routed through the ADR-049 TTL-close dispatch surface.
 pub(crate) async fn context_handle_ttl_expiry_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<()> {
+    use scp_core::context::actor::commands::{TtlCloseCommand, TtlContextPayload};
     crate::napi_check_handle!(&bi.core, handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
-    let manager = context_manager(bi)?;
-    manager
-        .handle_ttl_expiry(core_handle)
-        .await
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = TtlCloseCommand::ExecuteTtlClose {
+        payload: Box::new(TtlContextPayload {
+            context_id: core_handle.context_id().to_owned(),
+            params: core_handle.params().clone(),
+        }),
+        reply: tx,
+    };
+    sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_ttl_close_command failed: {e}"))
+    })?;
+    rx.await
+        .map_err(|e| {
+            napi::Error::from_reason(format!("handle_ttl_expiry shim reply dropped: {e}"))
+        })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(())
 }
 
 /// Per-bridge-instance implementation of [`context_propose_ttl_extension`].
+///
+/// Routed through the ADR-049 TTL-close dispatch surface. Records consent
+/// from the given member. Returns `true` if the extension was unanimously
+/// approved.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn context_propose_ttl_extension_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     proposer_did: String,
     extension_secs: u32,
 ) -> napi::Result<bool> {
+    use scp_core::context::actor::commands::TtlCloseCommand;
     crate::napi_check_handle!(&bi.core, handle);
     let did = DID(proposer_did.clone());
     let duration = std::time::Duration::from_secs(u64::from(extension_secs));
-    let manager = context_manager(bi)?;
-    let unanimous = manager
-        .propose_ttl_extension(&handle.context_id, &did, duration)
+    let sup = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = TtlCloseCommand::ExtendTtl {
+        context_id,
+        member_did: did,
+        proposed_duration: duration,
+        reply: tx,
+    };
+    sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_ttl_close_command failed: {e}"))
+    })?;
+    let unanimous = rx
         .await
+        .map_err(|e| {
+            napi::Error::from_reason(format!("propose_ttl_extension shim reply dropped: {e}"))
+        })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(unanimous)
 }
 
 /// Per-bridge-instance implementation of [`context_reset_ttl_timer`].
+///
+/// Routed through the ADR-049 TTL-close dispatch surface. Requires a core
+/// handle and a new duration.
 pub(crate) async fn context_reset_ttl_timer_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     new_duration_secs: u32,
 ) -> napi::Result<()> {
+    use scp_core::context::actor::commands::{TtlCloseCommand, TtlTimerPayload};
     crate::napi_check_handle!(&bi.core, handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let duration = std::time::Duration::from_secs(u64::from(new_duration_secs));
-    let manager = context_manager(bi)?;
-    manager
-        .reset_ttl_timer(&handle.context_id, duration, core_handle.clone())
-        .await;
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = TtlCloseCommand::ResetTtlTimer {
+        payload: Box::new(TtlTimerPayload {
+            context_id: core_handle.context_id().to_owned(),
+            params: core_handle.params().clone(),
+            duration,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
+        napi::Error::from_reason(format!("supervisor dispatch_ttl_close_command failed: {e}"))
+    })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("reset_ttl_timer shim reply dropped: {e}")))?
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(())
 }
 
@@ -2825,17 +3605,43 @@ pub(crate) async fn context_reset_ttl_timer_on(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`context_export`].
+///
+/// Returns serialized `StoredValue<ContextExport>` bytes (§17.5) suitable for
+/// backup, migration, or transfer to another node. Routed through the ADR-049
+/// lifecycle dispatch surface.
 pub(crate) async fn context_export_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<Vec<u8>> {
+    use scp_core::context::actor::commands::LifecycleCommand;
     crate::napi_check_handle!(&bi.core, handle);
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
-    let manager = context_manager(bi)?;
-    let export = manager
-        .export_context(&handle.context_id, exporter_did)
+    let context_id = handle.context_id.clone();
+
+    // Route through the ADR-049 lifecycle dispatch surface.
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::ExportContext {
+        context_id,
+        exporter_did,
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_lifecycle_command failed: {e}"),
+            code: codes::CTX_2030.to_owned(),
+        })
+    })?;
+    let export = rx
         .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("export_context shim reply dropped: {e}"),
+                code: codes::CTX_2030.to_owned(),
+            })
+        })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
     scp_core::context::export_import::serialize_export(&export).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("export serialization failed: {e}"),
@@ -2845,10 +3651,15 @@ pub(crate) async fn context_export_on(
 }
 
 /// Per-bridge-instance implementation of [`context_import`].
+///
+/// The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
+/// produced by [`context_export`]. Routed through the ADR-049 lifecycle
+/// dispatch surface. Returns the context ID of the imported context.
 pub(crate) async fn context_import_on(
     bi: &NapiBridgeInstance,
     data: Vec<u8>,
 ) -> napi::Result<String> {
+    use scp_core::context::actor::commands::LifecycleCommand;
     let export = scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("invalid export data: {e}"),
@@ -2857,19 +3668,34 @@ pub(crate) async fn context_import_on(
     })?;
     let context_id = export.snapshot.context_id.clone();
 
-    // Validate the exporter DID before passing to init_context_manager (#1324).
+    // Validate the exporter DID before passing to init_supervisor (#1324).
     validate_did(&export.exporter_did.0).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    // Ensure the ContextManager is initialized — context_import is a valid
+    // Ensure the Supervisor is initialized — context_import is a valid
     // first operation (e.g. a device receiving exported context data).
-    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    // init_supervisor is idempotent (OnceLock — first call wins). #1073
     // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_context_manager(bi, &export.exporter_did.0);
+    crate::runtime::init_supervisor(bi, &export.exporter_did.0);
 
-    let manager = context_manager(bi)?;
-    manager
-        .import_context(export)
-        .await
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::ImportContext {
+        export: Box::new(export),
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_lifecycle_command failed: {e}"),
+            code: codes::CTX_2032.to_owned(),
+        })
+    })?;
+    rx.await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("import_context shim reply dropped: {e}"),
+                code: codes::CTX_2032.to_owned(),
+            })
+        })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(context_id)
 }
@@ -3359,24 +4185,138 @@ fn parse_template_id_napi(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use crate::runtime::context_manager;
     use scp_core::context::ContextParams;
     use scp_core::context::governance::GovernanceAction;
     use scp_core::context::membership::KeyPackage;
     use scp_core::context::params::Capability;
     use scp_ffi_common::error_codes as codes;
     use scp_identity::DID;
+    use std::sync::Arc;
 
     use scp_ffi_common::test_helpers::approved_proposal;
 
-    /// Verifies that `ContextManager::member_count` returns the live member
+    /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
+    /// supervisor. Mirrors the production rewire pattern but is callable
+    /// from tests with a pre-built `ContextParams`.
+    async fn test_dispatch_create_context(
+        bi: &crate::runtime::NapiBridgeInstance,
+        ctx_id: &str,
+        params: ContextParams,
+        creator: scp_identity::DID,
+    ) -> scp_core::context::ContextHandle {
+        use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
+        let sup = crate::runtime::supervisor(bi).unwrap();
+        let sup = Arc::clone(sup);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CreateContext {
+            payload: Box::new(CreateContextPayload {
+                context_id: ctx_id.to_owned(),
+                params,
+                creator_did: creator,
+                local_pseudonym: None,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd).await.unwrap();
+        rx.await.unwrap().unwrap()
+    }
+
+    /// Test helper: dispatch `LifecycleCommand::JoinContext` through the
+    /// supervisor.
+    async fn test_dispatch_join_context(
+        bi: &crate::runtime::NapiBridgeInstance,
+        handle: &scp_core::context::ContextHandle,
+        key_package: KeyPackage,
+    ) {
+        use scp_core::context::actor::commands::{JoinContextPayload, LifecycleCommand};
+        let sup = crate::runtime::supervisor(bi).unwrap();
+        let sup = Arc::clone(sup);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::JoinContext {
+            payload: Box::new(JoinContextPayload {
+                context_id: handle.context_id().to_owned(),
+                params: handle.params().clone(),
+                key_package,
+                spending_ucan: None,
+                local_pseudonym: None,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd).await.unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    /// Test helper: dispatch `QueriesCommand::MemberCount` through the
+    /// supervisor.
+    async fn test_dispatch_member_count(
+        bi: &crate::runtime::NapiBridgeInstance,
+        ctx_id: &str,
+    ) -> usize {
+        use scp_core::context::actor::commands::QueriesCommand;
+        let sup = crate::runtime::supervisor(bi).unwrap();
+        let sup = Arc::clone(sup);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::MemberCount {
+            context_id: ctx_id.to_owned(),
+            reply: tx,
+        };
+        sup.dispatch_query(cmd).await.unwrap();
+        rx.await.unwrap().unwrap().unwrap_or(0)
+    }
+
+    /// Test helper: dispatch `GovernanceCommand::ExecuteGovernanceAction`
+    /// through the supervisor.
+    async fn test_dispatch_execute_governance(
+        bi: &crate::runtime::NapiBridgeInstance,
+        ctx_id: &str,
+        proposal: scp_core::context::governance::GovernanceProposal,
+    ) {
+        use scp_core::context::actor::commands::{
+            ExecuteGovernanceActionPayload, GovernanceCommand,
+        };
+        let sup = crate::runtime::supervisor(bi).unwrap();
+        let sup = Arc::clone(sup);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ExecuteGovernanceAction {
+            payload: Box::new(ExecuteGovernanceActionPayload {
+                context_id: ctx_id.to_owned(),
+                proposal,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    /// Test helper: dispatch `QueriesCommand::ContextParams` through the
+    /// supervisor.
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn test_dispatch_context_params(
+        bi: &crate::runtime::NapiBridgeInstance,
+        ctx_id: &str,
+    ) -> ContextParams {
+        use scp_core::context::actor::commands::QueriesCommand;
+        let sup = crate::runtime::supervisor(bi).unwrap();
+        let sup = Arc::clone(sup);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::ContextParams {
+            context_id: ctx_id.to_owned(),
+            reply: tx,
+        };
+        sup.dispatch_query(cmd).await.unwrap();
+        rx.await
+            .unwrap()
+            .unwrap()
+            .expect("stored params should be retrievable")
+    }
+
+    /// Verifies that member count queries return the live member
     /// count — not a hardcoded value.  After creation the count is 1 (the
     /// creator); after a join it becomes 2.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        crate::runtime::init_context_manager_for_test_on(&bi);
-        let manager = context_manager(&bi).expect("manager initialized above");
+        crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
         let creator = DID("did:key:z6MkCreator".to_owned());
 
@@ -3385,24 +4325,18 @@ mod tests {
             ..ContextParams::default()
         };
 
-        let handle = manager
-            .create_context(ctx_id.clone(), params, creator, None)
-            .await
-            .expect("create_context should succeed");
+        let handle = test_dispatch_create_context(&bi, &ctx_id, params, creator).await;
 
-        let count = manager.member_count(&ctx_id).await.unwrap();
+        let count = test_dispatch_member_count(&bi, &ctx_id).await;
         assert_eq!(
             count, 1,
             "newly created context should have exactly 1 member"
         );
 
         let kp = KeyPackage::mock(DID("did:key:z6MkJoiner".to_owned()));
-        manager
-            .join_context(&handle, kp, None, None)
-            .await
-            .expect("join_context should succeed");
+        test_dispatch_join_context(&bi, &handle, kp).await;
 
-        let count = manager.member_count(&ctx_id).await.unwrap();
+        let count = test_dispatch_member_count(&bi, &ctx_id).await;
         assert_eq!(count, 2, "after join, context should have 2 members");
     }
 
@@ -3465,18 +4399,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_change_role() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        crate::runtime::init_context_manager_for_test_on(&bi);
-        let manager = context_manager(&bi).expect("manager initialized above");
+        crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator1";
         let params = ContextParams {
             ceiling: vec![Capability::new("role:assign")],
             ..ContextParams::default()
         };
-        manager
-            .create_context(ctx_id.clone(), params, DID(creator.to_owned()), None)
-            .await
-            .unwrap();
+        test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
         crate::runtime::register_test_context(&bi, &ctx_id, creator);
         let new_did = "did:key:z6MkNapiMember1";
         let add = approved_proposal(
@@ -3488,10 +4418,7 @@ mod tests {
             },
             creator,
         );
-        manager
-            .execute_governance_action(&ctx_id, &add)
-            .await
-            .unwrap();
+        test_dispatch_execute_governance(&bi, &ctx_id, add).await;
         crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
             .await
             .unwrap();
@@ -3504,10 +4431,7 @@ mod tests {
             },
             creator,
         );
-        manager
-            .execute_governance_action(&ctx_id, &change)
-            .await
-            .unwrap();
+        test_dispatch_execute_governance(&bi, &ctx_id, change).await;
         crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
             .await
             .unwrap();
@@ -3527,18 +4451,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_add_member() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        crate::runtime::init_context_manager_for_test_on(&bi);
-        let manager = context_manager(&bi).expect("manager initialized above");
+        crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator2";
         let params = ContextParams {
             ceiling: vec![Capability::new("role:assign")],
             ..ContextParams::default()
         };
-        manager
-            .create_context(ctx_id.clone(), params, DID(creator.to_owned()), None)
-            .await
-            .unwrap();
+        test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
         crate::runtime::register_test_context(&bi, &ctx_id, creator);
         let new_did = "did:key:z6MkNapiAdded1";
         crate::runtime::with_context(&bi, &ctx_id, |st| {
@@ -3555,10 +4475,7 @@ mod tests {
             },
             creator,
         );
-        manager
-            .execute_governance_action(&ctx_id, &add)
-            .await
-            .unwrap();
+        test_dispatch_execute_governance(&bi, &ctx_id, add).await;
         crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
             .await
             .unwrap();
@@ -3580,8 +4497,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_remove_member() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        crate::runtime::init_context_manager_for_test_on(&bi);
-        let manager = context_manager(&bi).expect("manager initialized above");
+        crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator3";
         let target = "did:key:z6MkNapiRemTarget";
@@ -3589,10 +4505,7 @@ mod tests {
             ceiling: vec![Capability::new("role:assign")],
             ..ContextParams::default()
         };
-        manager
-            .create_context(ctx_id.clone(), params, DID(creator.to_owned()), None)
-            .await
-            .unwrap();
+        test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
         crate::runtime::register_test_context(&bi, &ctx_id, creator);
         let add = approved_proposal(
             [13u8; 32],
@@ -3603,10 +4516,7 @@ mod tests {
             },
             creator,
         );
-        manager
-            .execute_governance_action(&ctx_id, &add)
-            .await
-            .unwrap();
+        test_dispatch_execute_governance(&bi, &ctx_id, add).await;
         crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
             .await
             .unwrap();
@@ -3624,10 +4534,7 @@ mod tests {
             },
             creator,
         );
-        manager
-            .execute_governance_action(&ctx_id, &rm)
-            .await
-            .unwrap();
+        test_dispatch_execute_governance(&bi, &ctx_id, rm).await;
         crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
             .await
             .unwrap();
@@ -3842,11 +4749,7 @@ mod tests {
             .await
             .expect("context_create should succeed");
 
-        let manager = context_manager(&bi).expect("manager should be initialized");
-        let stored = manager
-            .context_params(&handle.context_id)
-            .await
-            .expect("stored params should be retrievable");
+        let stored = test_dispatch_context_params(&bi, &handle.context_id).await;
 
         assert_eq!(
             stored.consequence_rules.len(),

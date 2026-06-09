@@ -555,7 +555,7 @@ pub struct ReceivedBlockResult {
 ///
 /// Returns `true` if the target is blocked in the specified context
 /// (Tier 1) OR is globally blocked (Tier 2). This is the check that
-/// [`crate::crypto::sender_keys::handle_sender_key_request`] should use
+/// [`crate::crypto::sender_keys::key_protocol::handle_sender_key_request`] should use
 /// to deny key distribution (§9.16.3 step 5).
 ///
 /// # Arguments

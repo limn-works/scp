@@ -226,7 +226,7 @@ fn query_manager_entries(
     query_filter: &scp_core::store::event_log::EventQueryFilter,
 ) -> PyResult<Option<Vec<PyEvent>>> {
     let ctx_id_bytes = scp_core::context::context_id_bytes(context_id);
-    let Some(entries) = crate::runtime::context_manager(bi)
+    let Some(entries) = crate::runtime::supervisor(bi)
         .ok()
         .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
     else {

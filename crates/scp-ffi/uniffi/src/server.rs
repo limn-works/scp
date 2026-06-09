@@ -110,7 +110,7 @@ impl From<BroadcastKeyError> for ScpError {
     }
 }
 
-/// Auto-wires the global [`ContextManager`] with relay transport after
+/// Auto-wires the global `ContextManager` with relay transport after
 /// node startup.
 ///
 /// Connects to the node's local relay (with bearer token authentication)
@@ -150,8 +150,8 @@ async fn auto_wire_context_manager(
             // The bearer auto-wire path stays WebSocket-only (QUIC has no
             // bearer-upgrade surface, spec §10.14.3 item 4), so it connects
             // directly via `connect_sourced_with_bearer` rather than the QUIC
-            // selector. The shared `init_context_manager_with_relay_transport`
-            // helper now takes a `Box<dyn TransportAdapter>` (so the discovering
+            // selector. The shared `init_supervisor_with_relay_transport`
+            // helper takes a `Box<dyn TransportAdapter>` (so the discovering
             // connect sites can hand it the selector's boxed adapter); box the
             // concrete bearer adapter here to match.
             bi.init_context_manager_with_relay_transport(did, Box::new(adapter));
@@ -164,7 +164,7 @@ async fn auto_wire_context_manager(
                  context operations may fail until transport is configured manually"
             );
             // Fall back to initializing with MLS crypto so that the
-            // ContextManager exists with real crypto bound to the identity's
+            // Supervisor exists with real crypto bound to the identity's
             // DID, matching PyO3/NAPI behavior. (The bridge no longer has a
             // DID-less stub crypto path — see commit 4 of the phase 4
             // persistence refactor.)
@@ -172,8 +172,13 @@ async fn auto_wire_context_manager(
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
-    if let Ok(mgr) = bi.context_manager_expect() {
-        mgr.register_local_did(did.to_owned().into()).await;
+    if let Ok(supervisor) = bi.context_manager_or_error()
+        && let Err(e) = supervisor.register_local_did(did.to_owned().into()).await
+    {
+        tracing::debug!(
+            error = %e,
+            "auto_wire_context_manager: register_local_did skipped (supervisor not ready)"
+        );
     }
 }
 
@@ -346,12 +351,12 @@ impl NodeHandle {
 
         // Resolve broadcast key: explicit, auto-lookup, or auto with explicit author.
         // Delegates to the shared resolver in scp-ffi-common (same logic as PyO3/NAPI).
-        let mgr = self.bi.context_manager_expect()?;
+        let supervisor = self.bi.context_manager_expect()?;
         let resolved = server::resolve_broadcast_key(
             broadcast_key_hex,
             author_did,
             self.inner.did(),
-            mgr,
+            supervisor,
             &context_id,
         )
         .await?;

@@ -11,6 +11,21 @@ Each OpSpec describes:
 Adding a new op is ~20 lines: one `OpSpec`, one `py_call`, one case in
 the Bun runner's dispatch. The library is append-only.
 
+Storage-required model (ADR-049 / spec §17.6): any op that creates a
+context MUST first attach a supervisor backed by a storage backend. The
+PyO3 runtime never defaults storage and `SCP()` (bare constructor) carries
+none, so a context op on a bare instance fail-closes with SCP-CTX-2001.
+Such ops use `OpContext.attached_scp()`, which calls
+`configure_local_transport(did)` — the bridge-layer DEV affordance that
+seeds an encrypted in-memory store and attaches a local-transport
+supervisor in one shot. The alt-bridge runners need no equivalent explicit
+call: NAPI/UniFFI seed their in-memory `mls_storage` at CONSTRUCTION TIME
+(`new_napi` / `new_uniffi`), and WASM uses a self-initializing thread-local
+manager (ADR-034). Both sides therefore end up backed by an in-memory store
+and emit identical canonical output. See `OpContext.attached_scp` for the
+full rationale. Non-context ops (identity_create, scpid_sign error paths,
+transport_status) need no supervisor and keep the bare `SCP()` constructor.
+
 Current op library: 11 ops. The first 5 are the MVP per ADR-046;
 ops 6-10 cover tool registration, UCAN mint/validate-error, transport
 status, and filtered event-log query; op 11 pins the
@@ -136,6 +151,48 @@ class OpContext:
 
     scp_core: Any
     scratch: dict[str, Any]
+
+    def attached_scp(self, seed: bytes | None = None) -> tuple[Any, Any]:
+        """Build a fresh PyO3 `SCP` with a supervisor attached, plus an identity.
+
+        Storage-required model (ADR-049 / spec §17.6): the PyO3 runtime
+        never defaults storage, and `PyBridgeInstance::new_py` (the bare
+        `SCP()` constructor) carries no storage backend. Any context /
+        event-log / tool / UCAN-with-context op therefore needs a
+        supervisor attached *with* a storage backend first, otherwise the
+        supervisor build fails closed and the op surfaces SCP-CTX-2001.
+
+        `configure_local_transport(did)` is the sanctioned bridge-layer
+        DEV affordance: it seeds the encrypted in-memory storage backend
+        (the equivalent of `SCP.with_storage({"type": "in_memory"})`)
+        *and* attaches a `LocalTransportProvider`-backed supervisor in one
+        call. This is exactly the affordance the production relay path
+        (`configure_relay_transport`) deliberately does NOT provide — it
+        fail-closes without storage so a forgetful production caller never
+        silently runs on an ephemeral in-memory store.
+
+        Cross-bridge parity note: the NAPI and UniFFI (Kotlin/Swift)
+        constructors seed their in-memory `mls_storage` backend AT
+        CONSTRUCTION TIME (see `new_napi` / `new_uniffi` in the respective
+        `runtime.rs`), so their `context_create` auto-attaches a supervisor
+        with no explicit attach call. WASM uses a self-initializing
+        thread-local manager (ADR-034). PyO3 alone defers the dev
+        affordance to `configure_local_transport`. This helper is the PyO3
+        equivalent of those bridges' constructor-time seeding, so both
+        sides of every parity comparison end up backed by an encrypted
+        in-memory store and emit byte-identical canonical output.
+
+        Returns the attached `SCP` instance and the created identity so
+        callers can reference `identity.did`.
+        """
+        scp = self.scp_core.SCP()
+        identity = (
+            scp.identity_create("in_memory", seed)
+            if seed is not None
+            else scp.identity_create("in_memory")
+        )
+        scp.configure_local_transport(identity.did)
+        return scp, identity
 
 
 @dataclass(frozen=True)
@@ -270,8 +327,7 @@ OP_IDENTITY_CREATE = OpSpec(
 
 
 def _py_context_create(ctx: OpContext) -> dict[str, Any]:
-    scp = ctx.scp_core.SCP()
-    identity = scp.identity_create("in_memory")
+    scp, identity = ctx.attached_scp()
     params = {"name": "parity-test", "mode": "encrypted"}
     handle = scp.context_create(identity.did, params)
     return {
@@ -372,8 +428,7 @@ OP_INVALID_CAPABILITY = OpSpec(
 
 
 def _py_event_log_append(ctx: OpContext) -> dict[str, Any]:
-    scp = ctx.scp_core.SCP()
-    identity = scp.identity_create("in_memory")
+    scp, identity = ctx.attached_scp()
     handle = scp.context_create(identity.did, {"name": "parity-elog", "mode": "encrypted"})
     events = scp.event_log_query(handle.context_id, None)
     first = events[0] if events else None
@@ -546,8 +601,7 @@ _TOOL_SCHEMA: dict[str, Any] = {
 
 
 def _py_tool_register(ctx: OpContext) -> dict[str, Any]:
-    scp = ctx.scp_core.SCP()
-    identity = scp.identity_create("in_memory")
+    scp, identity = ctx.attached_scp()
     handle = scp.context_create(
         identity.did,
         {"name": "parity-tools", "mode": "encrypted", "ceiling": _TOOL_CEILING},
@@ -615,8 +669,7 @@ _UCAN_REQUESTED_CAPS = ["messages:read"]
 
 
 def _py_ucan_mint(ctx: OpContext) -> dict[str, Any]:
-    scp = ctx.scp_core.SCP()
-    identity = scp.identity_create("in_memory")
+    scp, identity = ctx.attached_scp()
     handle = scp.context_create(
         identity.did,
         {"name": "parity-ucan", "mode": "encrypted", "ceiling": _UCAN_CEILING},
@@ -691,8 +744,7 @@ _EXPECTED_MALFORMED_UCAN_CODE = "SCP-PERM-3001"
 
 
 def _py_ucan_validate_malformed(ctx: OpContext) -> dict[str, Any]:
-    scp = ctx.scp_core.SCP()
-    identity = scp.identity_create("in_memory")
+    scp, identity = ctx.attached_scp()
     handle = scp.context_create(
         identity.did, {"name": "parity-ucan-v", "mode": "encrypted", "ceiling": _UCAN_CEILING}
     )
@@ -804,8 +856,7 @@ _EVENT_LOG_FILTER = {"event_type": "ContextCreated"}
 
 
 def _py_event_log_query_filtered(ctx: OpContext) -> dict[str, Any]:
-    scp = ctx.scp_core.SCP()
-    identity = scp.identity_create("in_memory")
+    scp, identity = ctx.attached_scp()
     handle = scp.context_create(identity.did, {"name": "parity-elog-f", "mode": "encrypted"})
     events = scp.event_log_query(handle.context_id, _EVENT_LOG_FILTER)
     first = events[0] if events else None

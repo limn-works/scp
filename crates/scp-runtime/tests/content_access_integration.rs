@@ -4,7 +4,10 @@
     clippy::items_after_statements,
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::panic
+    clippy::panic,
+    // ADR-049 commit 12c.2: lifecycle hoist inflates some test-path
+    // futures past clippy's 16 KB stack budget.
+    clippy::large_futures
 )]
 //! SCP-CAC-009: Content access integration tests.
 //!
@@ -23,7 +26,7 @@ use scp_identity::DID;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{
     AccessScope, GovernanceAction, KeyResolver, ProposalStatus,
 };
@@ -35,12 +38,13 @@ use scp_protocol::identity::SigningKeyId;
 use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::manager::ContextManager;
-use scp_runtime::context::manager::ProposalOutcome;
+use scp_runtime::context::state::ProposalOutcome;
+use scp_runtime::context::supervisor::Supervisor;
 use scp_runtime::crypto::access_keys::lifecycle::{
     handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
     revoke_read_access, revoke_write_access,
 };
+use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 use scp_runtime::crypto::sender_keys::key_protocol::send_block_notification;
 use scp_runtime::identity::blocking::{
     BlockInContextParams, GlobalBlockParams, block_did_global, block_did_in_context,
@@ -89,74 +93,6 @@ async fn make_custody_and_key() -> (InMemoryKeyCustody, scp_platform::traits::Ke
 // ---------------------------------------------------------------------------
 // Mock providers (same pattern as content_access_governance_integration.rs)
 // ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct MockCrypto;
-
-impl ContextCryptoProvider for MockCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn add_member(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
-        Ok(scp_protocol::context::builder::AddMemberOutput::default())
-    }
-    fn remove_member(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
-        Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
-    }
-    fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn remove_member_sender_key(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn seal(
-        &self,
-        _context_id: &[u8; 32],
-        inner: &scp_protocol::envelope::inner::InnerEnvelope,
-        _routing_id: &[u8],
-        _blob_ttl: u32,
-    ) -> Result<Vec<u8>, ContextError> {
-        // Mock: serialize inner envelope directly (no encryption).
-        rmp_serde::to_vec_named(inner)
-            .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
-    }
-}
 
 #[derive(Default)]
 struct MockTransport {
@@ -239,9 +175,13 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 // Manager factory
 // ---------------------------------------------------------------------------
 
-fn new_manager() -> ContextManager {
-    ContextManager::new(
-        Box::new(MockCrypto),
+fn new_manager() -> std::sync::Arc<scp_runtime::context::supervisor::Supervisor> {
+    // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
+    // `Supervisor` directly via `test_supervisor`.
+    scp_runtime::context::test_supervisor(
+        Arc::new(MlsCryptoProvider::new(
+            "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+        )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
         mock_key_resolver(),
@@ -268,7 +208,7 @@ fn governance_ceiling() -> Vec<Capability> {
 /// `vote_on_proposal` exceeds clippy's `large_futures` threshold
 /// (~16 KB) when inlined at many call sites.
 fn propose_and_approve_threshold<'a>(
-    manager: &'a ContextManager,
+    manager: &'a Supervisor,
     ctx_id: &'a str,
     action: GovernanceAction,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ProposalOutcome> + Send + 'a>> {

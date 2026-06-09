@@ -375,7 +375,7 @@ Contexts support multiple governance models for who can change roles, settings, 
 
 The governance model is declared at creation and visible to all. Governance implementations are **pluggable** — the protocol defines the `GovernanceEngine` trait (propose, approve, reject) with four concrete models: `SingleAdmin` (single-admin authority), `Threshold` (M-of-N approval), `Majority` (majority vote), and `Unanimity` (full consensus). See ADR-008 (context lifecycle state machine with single-admin governance), ADR-009 (role assignment and capability ceiling enforcement), and ADR-031 (multi-admin governance models) for full specification. Context creators select a governance model at creation; the selection is visible in context metadata (§5.7) and cannot be changed after creation unless the model itself defines a governance transition mechanism.
 
-**Governance execution invariants.** When the `ContextManager` executes an approved governance action, two protocol-level invariants MUST hold:
+**Governance execution invariants.** When the runtime executes an approved governance action, two protocol-level invariants MUST hold:
 
 1. **Proposal-context binding.** A governance proposal's `context_id` MUST match the context it is submitted to for execution. A proposal approved for context A MUST NOT be executable against context B. This prevents cross-context proposal injection — an attacker who obtains an approved proposal from one context cannot replay it against a different context.
 
@@ -1574,3 +1574,86 @@ Relative to Encrypted contexts, Broadcast contexts have the following security p
 **Changed:** Confidentiality via per-author broadcast key (not MLS). No MLS `membership_tag` (authentication is signature-only). No MLS forward secrecy (mitigated by key epoch rotation on block events). Public `routing_id` (SHA-256 of context_id, not HKDF-derived). Author identity visible to relays in the outer envelope (authors are public figures in a broadcast context — this is a feature, not a leak).
 
 See §9.5, §9.8, §9.9, and §9.10 for the full broadcast security analysis.
+
+## 5.15 Runtime Concurrency Model
+
+SCP runtimes serialize all mutation of a single context's state through exactly one owning computation. Implementations MAY use any concurrency primitive that delivers the properties below; the reference implementation uses one actor task per context. Protocol observers may depend on these properties.
+
+### 5.15.1 Single-Context Serialization
+
+For any given context, operations execute in a total order. No two operations on the same context observe or mutate state concurrently. The total order is determined by the arrival order of operations at the context's owning computation.
+
+Operations on different contexts are independent and MAY run in parallel, bounded only by the runtime's scheduling model.
+
+Runtimes apply backpressure when a single context's operation queue grows unbounded. Implementations MUST provide a per-context queue with a finite bound of at least 256 operations; a deeper bound is permitted. Callers observe backpressure as a typed **context-busy** error (surfaced consistently across bindings; see each SDK's error taxonomy) and SHOULD retry with backoff.
+
+Authorization-downward operations (see §9.4.2) MUST NOT be starved by coalesced or lower-priority traffic: either the queue is strict FIFO (so §9.4.2 sync-persist bounds remain time-bounded), or authorization-downward commands are processed at or above all other categories. Implementations choose; callers observe no weaker ordering than strict FIFO.
+
+Among commands in the same priority class (including two authorization-downward operations on the same context, or an authorization-downward operation co-pending with a saga-phase message), arrival order is preserved. No reordering is permitted beyond the FIFO or strict-priority-lane-plus-FIFO shapes above; a conformant implementation never processes a later-arriving command of the same class before an earlier-arriving one of the same class.
+
+### 5.15.2 Context State Variants
+
+A context's state is mode-specific. An encrypted context carries MLS group state and sender keys; a broadcast context carries per-author broadcast keys, subscriber list, and author blocks.
+
+**Mode invariant** (normative): mode is fixed at context creation; a context never changes mode over its lifetime. A mutation that would require changing mode MUST fail with a typed mode-mismatch error. This invariant is protocol-level, not concurrency-level; it is restated here because the actor-per-context model relies on it (one actor, one mode-specific state shape).
+
+### 5.15.3 Caller-Visible Persistence Guarantee
+
+**Observers** (used throughout §5.15, §9.4.2, §17.15): for the purposes of persistence-ordering guarantees, any of the following counts as an observer of a mutation and MUST NOT see the effect before the persist tier's guarantee completes — the caller's acknowledgment, an outgoing network message derived from the mutation, a readable event log entry, an event-log subscriber notification, a sync-tier replication stream, or a saga phase message sent to another actor. Additional observer channels a specific implementation introduces (e.g., a custom RPC stream) MUST be treated equivalently.
+
+Operations fall into two persistence tiers.
+
+**Sync-persisted** — the caller's acknowledgment implies durable commit. A process crash immediately after the ack does not roll back the operation, and no observer (as defined above) sees the effect before the persist completes. Sync-persisted operations — this is the complete enumeration; §9.4.2 lists the subset that is a security invariant:
+
+- MLS epoch advance, sender-key rotation, MLS member removal
+- Every authorization-downward operation enumerated in §9.4.2
+- Event log append (chain integrity)
+- Saga phase transitions and per-actor saga-state transitions (§5.15.4)
+- KeyPackage consumption (Welcome idempotency)
+
+**Coalesced-persisted** — state MAY be persisted up to 50 ms after mutation. A process crash within this window rolls state back to the last persisted snapshot. Implementations MAY persist more aggressively but MUST NOT coalesce beyond 50 ms. The bound is observable via crash-recovery conformance tests: after sustained mutation at any rate, at most 50 ms of mutation may be absent from the post-recovery snapshot.
+
+Coalesced rollback applies to: participation counters, velocity trackers, incremental cache updates, in-flight send-sequence assignments. Send-sequence monotonicity is preserved across rollback by the reservation protocol in §5.15.7.
+
+The security invariant governing which operations belong in the sync-persisted tier is stated in §9.4.2.
+
+### 5.15.4 Cross-Context Operations Use Sagas
+
+Operations spanning 2+ contexts — standing-pair creation, cross-context tool invocation, context migration (§5.11A), broadcast hosting handshake (§5.14) — execute as coordinated sagas driven by a supervisor that never allows contexts to await each other directly. Phase states and the predicates that select among their outgoing transitions:
+
+```
+Initiated --[supervisor begins Prepare]--> PreparingA
+PreparingA --[A returns Prepared]--> PreparingB
+PreparingA --[A returns Rejected | Prepare timeout]--> Aborting
+PreparingB --[B returns Prepared]--> Committing
+PreparingB --[B returns Rejected | Prepare timeout]--> Aborting
+Committing --[both actors return Committed]--> Committed (terminal)
+Committing --[retry budget exhausted]--> NeedsRepair (terminal)
+Aborting   --[all participants ack Abort]--> Aborted (terminal)
+```
+
+Each phase transition is synchronously persisted to a durable journal (§17.16) before any outbound effect of that phase — including the phase message dispatched to the next participating actor — is visible. Journal durability is the gate; the subsequent phase message and any other observer channel (§5.15.3) follow after the journal's durable acknowledgment. On process restart the supervisor replays unresolved journal entries.
+
+Concurrent sagas against the same context are serialized. A context accepts at most one pending saga at a time; a second Prepare while one is pending is rejected with a typed **saga-busy** error (surfaced consistently across bindings).
+
+Commit retry budget: three retries (500 ms / 1 s / 2 s delays), then terminal `NeedsRepair` requiring operator action or process restart. No indefinite retry loop.
+
+Secret-bearing sagas (migration custody handovers) are governed by §9.4.3 — commitment-only journaling, bearer in actor-local state with zeroization, journal-backend at-rest-encryption refusal. The journal alone cannot replay a secret-bearing Commit; crash recovery requires both the journal and the surviving actor state.
+
+### 5.15.5 Governance is Single-Context
+
+All governance actions in ADR-031 run single-context. Governance never requires cross-context coordination; if it appears to, that is a spec bug to be surfaced rather than a saga to be designed.
+
+### 5.15.6 Identity Scope
+
+Per-identity resources (KeyPackage pool, wrapping keys, recovery state) are owned at the identity level, not the context level. An operation executing against a context `X` held by identity `A` MAY read `A`'s per-identity state and MUST NOT read any other identity's per-identity state directly. Cross-identity operations (migration, federation) execute as sagas.
+
+### 5.15.7 Send-Sequence Reservation
+
+An implementation that assigns monotonically increasing send-sequence numbers MUST guarantee that a sequence number becomes durable (consumed) if and only if the corresponding encrypted payload has been handed to the transport layer for transmission. Any terminal outcome prior to transmit — including encryption failure, caller-side cancellation, timeout, operation panic, or early error return — MUST release the sequence number back into the sequence pool.
+
+The reference implementation uses an RAII reservation guard (drop-on-not-commit). Non-Rust reference implementations MUST use an equivalent mechanism that is robust against panic, exception propagation, and cancellation; language-specific `try/finally` approaches MUST cover every terminal path in the operation.
+
+A receiver MAY observe gaps in the send-sequence of a peer (for example, a legitimate send-then-crash where transmission occurred but the acknowledgment was lost). Receivers MUST treat gaps as non-anomalous for the purpose of anti-replay: monotonic advancement of a high-water mark is the only requirement.
+
+See ADR-049 for the reference-implementation mechanism and rejected alternatives.

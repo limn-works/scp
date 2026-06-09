@@ -59,9 +59,18 @@ def session_scp() -> SCP:
     instance; every caller now threads an explicit ``SCP()`` through.
     Handle-affinity is wired through caller-owned instances, so this
     fixture simply constructs a fresh bridge for the session.
+
+    Storage-required model (ADR-049 / spec §17.6): this fixture wires the
+    production relay path (``configure_relay_transport``), which deliberately
+    does NOT default storage — without a storage backend the supervisor
+    build fails closed and every ``context_create`` raises SCP-CTX-2001.
+    We therefore construct via ``SCP.with_storage({"type": "in_memory"})``
+    (the sanctioned test affordance under ``allow_in_memory_custody``) so a
+    storage backend is present before ``configure_relay_transport`` derives
+    the supervisor's ``mls_storage`` view from it.
     """
     wrapper = SCP.__new__(SCP)
-    wrapper._native = _scp_core.SCP()
+    wrapper._native = _scp_core.SCP.with_storage({"type": "in_memory"})
     yield wrapper
     # No shutdown here: session-scoped bridge is reaped when the process
     # exits. Explicit shutdown would race with any lingering asyncio

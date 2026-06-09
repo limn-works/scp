@@ -33,6 +33,6 @@ mod network;
 mod node;
 
 pub use crypto::E2eCryptoProvider;
-pub use exchange::{KeyExchange, PendingWelcome};
+pub use exchange::KeyExchange;
 pub use network::FullStackNetwork;
 pub use node::FullStackNode;

@@ -244,6 +244,72 @@ Key principles:
 
 **Observability is the immune system.** The protocol provides verifiable event logs, participation records, tool verification results, challenge-response outcomes, and attestation freshness data. These are the immune system's sensory apparatus. The actual immune response is an evolving network of agents and governance tools that consume this data and get better over time.
 
+### 9.4.1 Isolation Boundaries Enforced by Construction
+
+Wherever possible, isolation boundaries SHOULD be enforced by the language's visibility or type-checking rules rather than by documentation or external lint checks. Construction-time enforcement survives refactoring, aliased imports, and re-exports; after-the-fact checks are weaker and must be actively maintained.
+
+Specific isolation boundaries in the runtime:
+
+- **Per-context state ownership.** A context's state is owned by exactly one computation and is not shareable. Handler code mutates state only through the owning computation. No mechanism exposes one context's state to another context's handler.
+- **Cross-identity capability restriction.** Operations that read per-identity state (wrapping keys, KeyPackage pool, recovery state) are reachable only via a capability proof that identifies the requesting identity. The capability proof is issued at actor construction and cannot be constructed or copied by handler code. An operation executing in an actor owned by identity `A` can read only `A`'s per-identity state; any read of another identity's state requires a saga (§5.15.4).
+- **Capability is unduplicable, unforgeable, and opaque.** The capability proof MUST satisfy all of:
+  1. **Not duplicable.** No API, trait, impl, or ergonomic conversion returns a copy, clone, or alternative instance of the proof. Language-specific: Rust impls MUST NOT derive or implement `Clone`, `Copy`, `Serialize`, `Deserialize`, `Default`, `Hash`, `PartialEq`, `Eq`, `Borrow`, or `From`/`Into` for the capability type; other languages MUST apply the equivalent set of restrictions.
+  2. **Not inspectable.** No API (including any `Debug`, `Display`, `Deref`, `AsRef`, or equivalent accessor) returns the inner DID or its bytes in a form that allows reconstruction of the proof or its use as a lookup key elsewhere. The proof is opaque to handler code; only supervisor-module code consumes it.
+  3. **Not forgeable.** The proof's constructor MUST be visible only to the supervisor module that issues it. Unsafe escapes (raw-pointer conversion, transmute, reflection-based instantiation) MUST be explicitly forbidden in the module that defines the capability.
+  4. **Not leak-prone.** No reachable field on any type bound to handler code stores the proof by value, by clone, by shared reference beyond its originating call, or by serialized representation.
+  Implementations MUST enforce these properties with a mechanical check (CI lint scoped to the capability type's definition), in addition to the language-visibility constraints above.
+- **No API returns per-identity state given an arbitrary DID.** The only supervisor API that returns per-identity state takes the capability proof as a parameter. Callers cannot pass another identity's DID and receive that identity's state.
+
+### 9.4.2 Authorization-State Persistence Invariant
+
+Any operation that transitions a member's authorization **downward** MUST be synchronously persisted before the operation is visible to any observer as defined in §5.15.3. A process crash between the mutation and the acknowledgment MUST NOT restore the pre-mutation authorization.
+
+Operations covered (downward transitions — those that reduce or remove authority):
+
+- UCAN attenuation, expiration enforcement, revocation (NOT issuance — see note below)
+- Role demotion, role revocation, blocklist additions, broadcast author block
+- Content-access key revocation, sender-key destruction on block (all three tiers of §9.16 enforcement)
+- MLS member removal
+- Capability suspension and standing downgrades (including cooldown activation that forecloses previously-authorized action)
+- Governance timeout expiry that transitions an active proposal into a denied or lapsed terminal state
+- Wrapping-key rotation (forward-secrecy class)
+
+**UCAN issuance note.** Issuance grants authority and is therefore not itself downward. It is listed in §5.15.3 as sync-persisted for a distinct reason: a caller's acknowledgment of "the token was issued" that rolls back would leave a non-existent token that the caller believes to hold. For the §9.4.2 security invariant, only the downward transitions above are load-bearing; issuance's sync-persistence is a caller-consistency concern.
+
+Coalesced persistence (§5.15.3) MUST NOT be used for any downward transition above. Rollback from a coalesced crash would re-grant authority that was meant to be removed, creating a window where a revoked or suspended attacker can replay actions.
+
+The full list of sync-persisted operations (which is a superset of the downward-transition set above) is enumerated in §5.15.3.
+
+### 9.4.3 Saga Journal Secret Handling
+
+The cross-context saga coordinator writes phase transitions to a durable journal (§5.15.4, §17.16). Saga evidence carried in journal entries is classified as **secret-bearing** or **public**. Bearer artifacts (migration custody handovers; unrevoked proof tokens that would authorize action on their own) are secret-bearing; plan-level metadata and public identifiers are not.
+
+**Commitment construction.** Secret-bearing sagas MUST journal only a commitment — never the bearer bytes. The commitment is constructed as:
+
+```
+commitment = SHA-256(domain_separator ‖ bearer_envelope ‖ nonce)
+```
+
+where:
+
+- `domain_separator` is a fixed, per-saga-type byte string of at least 16 bytes, unique across saga types and distinct from any other protocol hash domain (e.g., `"scp/saga-commit/migration/v1"`).
+- `bearer_envelope` is the canonical serialization of the bearer artifact (deterministic; two conforming implementations produce byte-identical envelopes for equivalent inputs).
+- `nonce` is a freshly sampled 32-byte value from a cryptographically secure random source (OsRng or equivalent). The nonce is distinct per saga instance; nonce reuse is a protocol violation.
+
+SHA-256 is the only approved hash for this construction. The commitment is binding (no two distinct bearers produce the same commitment within computational bounds of SHA-256) and hiding (no bearer can be recovered from the commitment alone).
+
+**Bearer handling in memory.** The bearer remains in actor-local state. Bearer bytes MUST be stored in a wrapper that zeroizes on drop, is never cloneable, never serializable, never renderable via any debug or display accessor, and never printable via any formatter. Any function that receives the bearer by value MUST zeroize it before returning, even on panic, cancellation, or early error return. Language-specific: Rust implementations MUST use `Zeroizing`-wrapped storage with no `Clone`/`Debug`/`Display`/`Serialize`/`Deserialize` on the containing type; other languages MUST apply the equivalent set of restrictions. Implementations MUST enforce this discipline with a mechanical check (CI lint scoped to the bearer type's definition), analogous to the capability-proof enforcement in §9.4.1.
+
+**Journal entry handling at rest.** In-memory journal entries MUST be zeroized on drop. Storage backends for the journal MUST declare an at-rest encryption posture. Backends without at-rest encryption MUST refuse to host secret-bearing saga types; the runtime's journal construction fails closed against mismatched backends. Marking a secret-bearing saga resolved MUST synchronously overwrite the on-disk evidence bytes before the operation returns, not at next compaction.
+
+### 9.4.4 Construction-time enforcement of §9.4 invariants in the SCP runtime
+
+The §9.4 invariants — per-context state ownership, cross-identity capability restriction, the authorization-state persistence rule, and the saga journal secret-handling policy — are enforced **by construction** in the SCP reference runtime per [ADR-049 §1, §5, §9](../adrs/ADR-049-actor-per-context.md) (actor-per-context) rather than by review discipline.
+
+The actor model collapses lock-ordering and TOCTOU concerns into per-context single-task ownership: a context's state is owned by exactly one tokio task that holds `&mut PerContextState` by move. Cross-identity reads route through `SupervisorHandle` methods that take `&OwnedIdentityDid`, a capability proof issued at actor spawn time and unconstructable from handler code. The lock-free read invariant ([ADR-049 §Decision 12](../adrs/ADR-049-actor-per-context.md#12-lock-free-read-invariant)) keeps the read path off `RwLock` so per-acquire cost cannot accumulate into a denial-of-service surface. The per-saga-phase journal write satisfies §9.4.3's "synchronous overwrite on terminal resolution" requirement.
+
+Implementers retargeting another runtime to SCP MAY use a different concurrency primitive (mutex-per-context, single-threaded event loop, etc.) provided each §9.4 invariant remains enforced — by construction or by an equivalent mechanical check. Retrofitting these guarantees as discipline rules has been observed to fail in practice (see ADR-049 §Context for the SCP runtime's pre-refactor experience); ADR-049 §Decision 1 documents the choice to pay the one-time refactor cost rather than maintain ongoing review burden.
+
 ## 9.5 Cryptographic Primitive Specification
 
 The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. This eliminates downgrade attacks and simplifies implementation.

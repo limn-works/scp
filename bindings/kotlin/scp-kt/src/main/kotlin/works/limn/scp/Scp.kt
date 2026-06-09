@@ -43,6 +43,7 @@ import uniffi.scp.McpToolInfo
 import uniffi.scp.MessageListener
 import uniffi.scp.Proof
 import uniffi.scp.PublishResult
+import uniffi.scp.SqliteKeyMaterial
 import uniffi.scp.StorageConfig
 import uniffi.scp.SyncPolicyResult
 import uniffi.scp.ToolDefinition
@@ -756,6 +757,19 @@ class SCP internal constructor(
             contextId = contextId,
             did = did,
         )
+
+    /**
+     * Forwards to [NativeScp.economyVerifyPaymentReceipts] on [inner].
+     *
+     * Verifies a batch of payment receipts against the configured payment
+     * adapter. Maximum 10,000 receipts per call. Returns a JSON object
+     * `{"all_valid": <bool>, "results": [...]}`; `all_valid` is vacuously
+     * `true` for an empty batch. Each entry's `ok` means the adapter
+     * *responded* — NOT that the payment is valid; scan `valid`/`all_valid`
+     * for payment validity.
+     */
+    suspend fun economyVerifyPaymentReceipts(receiptsJson: String): String =
+        inner.economyVerifyPaymentReceipts(receiptsJson = receiptsJson)
 
     /** Forwards to [NativeScp.evaluateInvitation] on [inner]. */
     @Suppress("LongParameterList")
@@ -1677,7 +1691,45 @@ class SCP internal constructor(
         ): SCP =
             SCP(
                 NativeScp.withStorage(
-                    StorageConfig.Sqlite(path = dir.absolutePath, key = key),
+                    StorageConfig.Sqlite(
+                        path = dir.absolutePath,
+                        key = SqliteKeyMaterial.Raw(key = key),
+                    ),
+                ),
+            )
+
+        /**
+         * Constructs an [SCP] backed by SQLCipher-encrypted on-disk storage
+         * whose key is derived from a passphrase via Argon2id (spec §17.6).
+         *
+         * Convenience wrapper over [withStorage] carrying
+         * [SqliteKeyMaterial.Passphrase]. The passphrase derives the same
+         * SQLCipher key on every open via a persisted per-database salt
+         * sidecar (`{dir}/scp.salt`), so the same passphrase re-opens the
+         * same database across restarts. The raw-key and passphrase paths
+         * are mutually exclusive — the [SqliteKeyMaterial] sum type enforces
+         * "exactly one".
+         *
+         * **Fail closed (spec §17.6):** if the database cannot be opened
+         * (wrong passphrase against an existing DB, permission denied,
+         * corrupt file, or a salt-sidecar fail-closed condition) this throws
+         * `ScpException.Context` rather than silently degrading to in-memory
+         * storage.
+         *
+         * The passphrase crosses the UniFFI boundary as a `String`; the Rust
+         * side moves it into zeroizing memory before deriving the key.
+         *
+         * @param dir Directory the database (and salt sidecar) files live in.
+         *   Passed to the Rust side as `dir.absolutePath`.
+         * @param passphrase Human-chosen passphrase.
+         */
+        fun withSqlite(dir: File, passphrase: String): SCP =
+            SCP(
+                NativeScp.withStorage(
+                    StorageConfig.Sqlite(
+                        path = dir.absolutePath,
+                        key = SqliteKeyMaterial.Passphrase(passphrase = passphrase),
+                    ),
                 ),
             )
 

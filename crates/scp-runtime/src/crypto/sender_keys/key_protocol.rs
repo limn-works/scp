@@ -3,8 +3,8 @@
 //! This module contains the **async** operations that depend on
 //! [`KeyCustody`] for signing and key agreement. Pure synchronous
 //! verification, wire types, HPKE helpers, and constants live in
-//! [`super::key_protocol_verify`] and are re-exported here for backward
-//! compatibility.
+//! [`scp_protocol::crypto::sender_keys::key_protocol_verify`] and are
+//! re-exported here for backward compatibility.
 //!
 //! See ADR-007 in `.docs/adrs/phase-1.md` for the full protocol design
 //! and §5.14.8 for broadcast-mode blocking specifics.

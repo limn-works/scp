@@ -14,7 +14,7 @@ categories = ["cryptography", "network-programming"]
 # Enables non-standard did:key:{hex} DID format acceptance. Only for
 # integration tests that run outside `#[cfg(test)]`. Production builds
 # must never enable this feature. See issue #128.
-testing = ["allow_unencrypted_storage", "scp-protocol/testing"]
+testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/testing"]
 # Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
 # without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
 # requires `EncryptedStorage`. Follows the `allow_in_memory_custody` pattern
@@ -62,6 +62,8 @@ subtle = { workspace = true }
 unicode-normalization = { workspace = true }
 metrics = { workspace = true }
 dashmap = { workspace = true }
+arc-swap = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

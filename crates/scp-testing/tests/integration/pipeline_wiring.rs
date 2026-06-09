@@ -21,23 +21,40 @@
 // Source files embedded at compile time
 // ---------------------------------------------------------------------------
 
-// Production submodules first so extract_fn_body finds real implementations
-// before test mocks in mod.rs (the parser returns the first match).
+// Production helper modules + domain logic modules. The legacy
+// `manager/<domain>.rs` submodules and `manager/mod.rs` were deleted
+// in ADR-049 commit 12 — every method body that the pipeline-wiring
+// assertions probe now lives in `<domain>_helpers.rs` (forwarder-free),
+// `<domain>_helpers_legacy.rs` during Phase 2A actor migration windows,
+// or in `<domain>_logic.rs` (the free-function logic that used to share
+// a file with `impl ContextManager` blocks).
 const MANAGER_SRC: &str = concat!(
-    include_str!("../../../../crates/scp-runtime/src/context/manager/economy.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/lifecycle.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/queries.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/standing.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/tools.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/trust_recovery.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/ttl_close.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/mod.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/economy_logic.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_logic.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/governance_logic.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/standing_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/tools_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/trust_recovery_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/ttl_close_helpers.rs"),
 );
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
+
+// Supervisor dispatch source — owns `dispatch_lifecycle_direct`, whose
+// bootstrap arms (Create / Import / Restore) moved to the actor-shape
+// `lifecycle_helpers::{create,import,restore}_context` in the ADR-049
+// Phase 2A finalization (storage-foundation keystone). The structural
+// assertion below pins that wiring so a future refactor cannot silently
+// regress the bootstrap path back to the `_legacy` `&Supervisor` helpers
+// (which no longer spawn a per-context actor).
+const SUPERVISOR_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
 
 // WASM bridge sources. Bridge has its own consequence-dispatch path and is
 // asserted separately below — scp-runtime and scp-ffi-wasm are two parallel
@@ -64,7 +81,7 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 38;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 41;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -183,6 +200,143 @@ fn deliver_incoming_calls_open() {
                 && fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", ".open(")),
         "deliver_incoming must call crypto.open (envelope pipeline), either directly \
          or via decrypt_and_dispatch"
+    );
+}
+
+// Supervisor level: the lifecycle bootstrap arms spawn a real per-context
+// actor by delegating to the actor-shape `lifecycle_helpers::*` bodies
+// (each of which spawns an owned-state actor via `spawn_actor_with_state`).
+// ADR-049 Phase 2A finalization. This is an additive assertion —
+// `dispatch_lifecycle_direct` still references the `_legacy` helpers for the
+// per-context Join / Leave / Close / Export / AccessKey arms, so we pin the
+// presence of the actor-shape bootstrap calls rather than the absence of all
+// legacy references.
+#[test]
+fn dispatch_lifecycle_direct_bootstrap_arms_call_actor_shape_helpers() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_lifecycle_direct",
+            "lifecycle_helpers::create_context("
+        ),
+        "dispatch_lifecycle_direct CreateContext arm must delegate to the \
+         actor-shape lifecycle_helpers::create_context (spawns the per-context actor)"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_lifecycle_direct",
+            "lifecycle_helpers::import_context("
+        ),
+        "dispatch_lifecycle_direct ImportContext arm must delegate to the \
+         actor-shape lifecycle_helpers::import_context (spawns the per-context actor)"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_lifecycle_direct",
+            "lifecycle_helpers::restore_context("
+        ),
+        "dispatch_lifecycle_direct RestoreContext arm must delegate to the \
+         actor-shape lifecycle_helpers::restore_context (spawns the per-context actor)"
+    );
+}
+
+// Supervisor level: import is actor-native. The replaceability gate (NEVER
+// overwrite a live context) + the §23.17 epoch-floor capture/teardown/merge
+// run INSIDE the existing actor via `dispatch_prepare_for_replace`
+// (PrepareForReplace), and the imported state is spawned as an owned-state
+// actor via `spawn_actor_with_state`. ADR-049 Phase 2A finalization keystone.
+// Pins the actor-native shape AND the absence of the deleted DashMap
+// dual-write machinery so a regression cannot reintroduce a silent
+// live-context overwrite. Additive assertion.
+#[test]
+fn import_context_is_actor_native_not_dashmap_dual_write() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "import_context",
+            "dispatch_prepare_for_replace"
+        ),
+        "lifecycle_helpers::import_context must run the replaceability gate + \
+         crypto teardown inside the existing actor via dispatch_prepare_for_replace"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "import_context", "spawn_actor_with_state"),
+        "lifecycle_helpers::import_context must spawn the imported state as an \
+         owned-state actor via spawn_actor_with_state"
+    );
+    for legacy in [
+        "with_existing_context_for_import",
+        "replace_context(",
+        "spawn_actor_for_context(",
+    ] {
+        assert!(
+            !fn_body_contains(MANAGER_SRC, "import_context", legacy),
+            "lifecycle_helpers::import_context must not reach the deleted DashMap \
+             dual-write machinery ({legacy}) — the gate is actor-native now"
+        );
+    }
+    // Note: the lifecycle_control handler's dispatch of PrepareForReplace and
+    // the actor run-loop's terminal-exit arm are compiler-guaranteed (the
+    // match is exhaustive and the `is_terminal` arm would not compile if the
+    // variant were unhandled), so no string assertion is needed for those.
+}
+
+// Timer level: the actor-shape TTL timer helpers install the timer on
+// actor-owned state via `ttl_close_helpers::spawn_ttl_timer` (registry +
+// `FireTimer` mailbox tick), NOT the legacy `spawn_ttl_timer_legacy`
+// DashMap-reading task. ADR-049 Phase 2A finalization (timer → actor
+// registry + mailbox). Additive assertion — pins the actor-shape call so
+// a future refactor cannot regress the timer back to the legacy
+// `&Supervisor` / `contexts` DashMap path.
+#[test]
+fn ttl_timer_helpers_call_actor_shape_spawn_not_legacy() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "start_ttl_timer", "spawn_ttl_timer(")
+            && !fn_body_contains(MANAGER_SRC, "start_ttl_timer", "spawn_ttl_timer_legacy("),
+        "ttl_close_helpers::start_ttl_timer must install via the actor-shape \
+         spawn_ttl_timer (registry + FireTimer tick), not spawn_ttl_timer_legacy"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "reset_ttl_timer", "spawn_ttl_timer(")
+            && !fn_body_contains(MANAGER_SRC, "reset_ttl_timer", "spawn_ttl_timer_legacy("),
+        "ttl_close_helpers::reset_ttl_timer must install via the actor-shape \
+         spawn_ttl_timer (registry + FireTimer tick), not spawn_ttl_timer_legacy"
+    );
+}
+
+// Timer level: the lifecycle bootstrap paths install timers by mailboxing
+// the freshly-spawned actor (`dispatch_start_ttl_timer` /
+// `start_governance_timeout_task` → StartTimeoutTask), NOT by reaching the
+// legacy `spawn_ttl_timer_legacy` / `start_governance_timeout_task_legacy`
+// `&Supervisor` helpers. ADR-049 Phase 2A finalization. Additive.
+#[test]
+fn lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy() {
+    for fn_name in ["finalize_create", "restore_context", "import_context"] {
+        assert!(
+            !fn_body_contains(MANAGER_SRC, fn_name, "spawn_ttl_timer_legacy("),
+            "lifecycle_helpers::{fn_name} must not reach the legacy \
+             spawn_ttl_timer_legacy — install the TTL timer via the actor \
+             mailbox (dispatch_start_ttl_timer)"
+        );
+    }
+    // The non-legacy governance-timeout entry point installs via the
+    // actor mailbox (StartTimeoutTask), not the legacy DashMap-reading
+    // spawn dance.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "start_governance_timeout_task",
+            "StartTimeoutTask"
+        ) && !fn_body_contains(
+            MANAGER_SRC,
+            "start_governance_timeout_task",
+            "start_governance_timeout_task_legacy("
+        ),
+        "governance_helpers::start_governance_timeout_task must dispatch \
+         StartTimeoutTask to the actor, not delegate to the legacy \
+         start_governance_timeout_task_legacy DashMap spawn dance"
     );
 }
 
@@ -448,13 +602,17 @@ fn propose_governance_checks_proposer_eligibility() {
 
 #[test]
 fn governance_dispatch_calls_evaluate_consequences() {
+    // ADR-049 actor migration relocated the post-delivery consequence
+    // dispatch from the legacy `dispatch_consequences` wrapper into the
+    // actor-shape `run_buffered_post_delivery` (messaging_helpers.rs),
+    // which evaluates consequence rules against the buffered events.
     assert!(
         fn_body_contains(
             MANAGER_SRC,
-            "dispatch_consequences",
+            "run_buffered_post_delivery",
             "evaluate_consequence_rules"
         ),
-        "dispatch_consequences must call evaluate_consequence_rules"
+        "run_buffered_post_delivery must call evaluate_consequence_rules"
     );
 }
 
@@ -497,63 +655,73 @@ fn governance_enforces_economic_policy() {
 
 #[test]
 fn invoke_tool_with_economy_wires_escalation_and_rollback() {
-    // The manager wrapper must (a) call the free invoke_tool, (b) record the
-    // new velocity entry so compute_escalated_cost sees it, (c) thread the
-    // per-context velocity_tracker and message_pricing into ToolEconomyContext,
-    // and (d) roll back the velocity entry on invocation failure.
+    // ADR-049 actor split: the Phase-1 economy reserve runs on actor-owned
+    // state in `reserve_tool_economy`. It must (a) record the new velocity
+    // entry so compute_escalated_cost sees it, (b) thread the per-context
+    // velocity_tracker and message_pricing into ToolEconomyContext, and the
+    // Phase-3 `rollback_tool_economy` must roll back the velocity entry on
+    // executor failure. The orchestrator `invoke_tool_with_economy` runs the
+    // tool executor between the two phases.
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "invoke_tool"),
-        "invoke_tool_with_economy must delegate to invoke_tool"
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "record_message"),
+        "reserve_tool_economy must record the invocation for velocity tracking"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "record_message"),
-        "invoke_tool_with_economy must record the invocation for velocity tracking"
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "velocity_tracker"),
+        "reserve_tool_economy must thread velocity_tracker into ToolEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "velocity_tracker"),
-        "invoke_tool_with_economy must thread velocity_tracker into ToolEconomyContext"
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "message_pricing"),
+        "reserve_tool_economy must thread message_pricing into ToolEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "message_pricing"),
-        "invoke_tool_with_economy must thread message_pricing into ToolEconomyContext"
-    );
-    assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", ".rollback("),
-        "invoke_tool_with_economy must roll back the velocity entry on failure \
+        fn_body_contains(MANAGER_SRC, "rollback_tool_economy", ".rollback("),
+        "rollback_tool_economy must roll back the velocity entry on executor failure \
          via the F5 identity-based `rollback(token)` API"
+    );
+    // The orchestrator runs the tool executor between reserve and settle.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "invoke_tool_with_economy",
+            "invoke_tool_execute_and_validate"
+        ),
+        "invoke_tool_with_economy must run the executor via invoke_tool_execute_and_validate \
+         between the reserve (Phase 1) and settle (Phase 3) mailbox round-trips"
     );
 }
 
-/// D4: `invoke_tool_with_economy` must reference the hard rate limit.
-/// Enforced structurally so a future refactor cannot silently drop
-/// the Matrix Synapse–style defense-in-depth cap on the tool path.
+/// D4: the Phase-1 reserve (`reserve_tool_economy`) must reference the
+/// hard rate limit. Enforced structurally so a future refactor cannot
+/// silently drop the Matrix Synapse–style defense-in-depth cap on the
+/// tool path.
 #[test]
 fn invoke_tool_with_economy_enforces_hard_rate_limit() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "hard_rate_limit"),
-        "invoke_tool_with_economy must reference hard_rate_limit so the Matrix Synapse–style \
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "hard_rate_limit"),
+        "reserve_tool_economy must reference hard_rate_limit so the Matrix Synapse–style \
          defense-in-depth cap is enforced on the tool path (D4)"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "try_consume"),
-        "invoke_tool_with_economy must call try_consume on the hard rate limit token bucket \
+        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "try_consume"),
+        "reserve_tool_economy must call try_consume on the hard rate limit token bucket \
          before any Phase 1 bookkeeping — mirrors enforce_send_economy at messaging.rs:346"
     );
 }
 
-/// D4: every Phase 1 failure branch in `invoke_tool_with_economy`
-/// MUST refund the hard rate limit token. We expect at least 3 inline
-/// refund sites: `economy_pre_check` failure, `record_spend` failure,
-/// and `authorize_tool_payment` failure. Dropping any branch leaks a
+/// D4: every Phase 1 failure branch in `reserve_tool_economy` MUST refund
+/// the hard rate limit token. We expect at least 3 inline refund sites:
+/// `economy_pre_check` failure, `record_spend` failure, and
+/// `authorize_tool_payment` failure. Dropping any branch leaks a
 /// rate-limit token on failure.
 #[test]
 fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
-    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
-        .expect("invoke_tool_with_economy body must exist");
+    let body = extract_fn_body(MANAGER_SRC, "reserve_tool_economy")
+        .expect("reserve_tool_economy body must exist");
     let refund_sites = body.matches("hard_rate_limit.refund").count();
     assert!(
         refund_sites >= 3,
-        "invoke_tool_with_economy must have at least 3 inline hard_rate_limit.refund sites \
+        "reserve_tool_economy must have at least 3 inline hard_rate_limit.refund sites \
          (economy_pre_check failure, record_spend failure, authorize_tool_payment failure); \
          found {refund_sites}. Dropping any branch leaks a rate-limit token on failure."
     );
@@ -561,30 +729,38 @@ fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
 
 #[test]
 fn invoke_tool_with_economy_releases_lock_before_executor() {
-    // F1-F3 lock-split invariant: the caller-supplied executor must run
-    // WITHOUT holding the `ContextManager.contexts` mutex. The wrapper
-    // must explicitly release the Phase-1 lock before dispatching the
-    // executor. A mis-behaving tool executor blocked every concurrent
-    // manager call until this refactor landed; regressions here reintroduce
-    // a process-wide stall bug.
+    // ADR-049 actor-split invariant (supersedes the legacy lock_context /
+    // relock_context generation-guard mechanism, which is gone with the
+    // `contexts` DashMap): the caller-supplied non-Send executor must run
+    // OUTSIDE the per-context actor — between the Phase-1 economy reserve and
+    // the Phase-3 settle. The economy bookkeeping that mutates per-context
+    // state lives entirely in `reserve_tool_economy` / `settle_tool_economy`
+    // (which run on `&mut PerContextState` inside the actor); the executor
+    // never crosses the actor mailbox and never holds per-context state
+    // exclusively. A mis-behaving tool executor blocked every concurrent
+    // manager call until the original lock-split landed; the actor split
+    // preserves the same off-state-executor guarantee.
     //
-    // We assert:
-    //   (1) The function body contains an explicit `drop(contexts)` call.
-    //       This is the exit boundary of Phase 1.
-    //   (2) The function body acquires `self.contexts.lock()` at least
-    //       twice — once in Phase 1 (pre-check / record_spend / escrow
-    //       authorize) and once in Phase 3 (post-invocation bookkeeping).
-    //       A single lock acquisition would imply the lock is held across
-    //       the executor future.
-    // Phase B: invoke_tool_with_economy uses lock_context (Phase 1) and
-    // relock_context (Phase 3) instead of bare self.contexts.lock().await.
-    // The lock is dropped between phases so the executor future runs unlocked.
+    // We assert the orchestrator:
+    //   (1) hands the reserve closure to the helper (Phase 1),
+    //   (2) hands the settle closure to the helper (Phase 3), and
+    //   (3) runs the executor (Phase 2) between them.
     let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
         .expect("invoke_tool_with_economy body must exist");
     assert!(
-        body.contains("lock_context") && body.contains("relock_context"),
-        "invoke_tool_with_economy must use lock_context (Phase 1) and \
-         relock_context (Phase 3) for per-context locking with generation check"
+        body.contains("reserve()")
+            && body.contains("settle(")
+            && body.contains("invoke_tool_execute_and_validate"),
+        "invoke_tool_with_economy must run the reserve (Phase 1) and settle (Phase 3) \
+         mailbox round-trips around the off-actor executor (Phase 2) so the non-Send tool \
+         executor never holds per-context state exclusively"
+    );
+    // Defense in depth: the settle path must cover BOTH the success
+    // (Capture) and failure (Rollback) branches.
+    assert!(
+        body.contains("Capture") && body.contains("Rollback"),
+        "invoke_tool_with_economy must settle via Capture on executor success and Rollback \
+         on executor failure"
     );
 }
 

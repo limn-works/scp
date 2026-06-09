@@ -428,6 +428,90 @@ impl crate::scp::PyScp {
         });
         Ok(cost.value())
     }
+
+    /// Verifies a batch of payment receipts against the configured payment
+    /// adapter.
+    ///
+    /// Routes through the ADR-049 commit-10 economy shim
+    /// ([`Supervisor::dispatch_economy_command`](scp_core::context::supervisor::Supervisor::dispatch_economy_command))
+    /// rather than calling `ContextManager::verify_payment_receipts`
+    /// directly. The shim wraps the delegated call in a 30s transport-
+    /// timeout budget and is the entry point commit 12 will keep after
+    /// `ContextManager` is deleted.
+    ///
+    /// Maximum 10,000 receipts per call.
+    ///
+    /// # Arguments
+    ///
+    /// * `receipts_json` — JSON-encoded array of `PaymentReceipt` objects.
+    ///
+    /// # Returns
+    ///
+    /// A JSON object `{"all_valid": <bool>, "results": [...]}`. `all_valid`
+    /// is `true` iff every entry both reached the adapter (`ok == true`) and
+    /// the adapter reported the receipt valid (`result.valid == true`); it is
+    /// vacuously `true` for an empty batch. Each `results` entry is either
+    /// `{"receipt_id": <hex>, "ok": true, "valid": <bool>, "result": <structured
+    /// VerificationResult>}` on success or `{"ok": false, "error": "..."}` on
+    /// failure.
+    ///
+    /// `ok` means the adapter *responded* — NOT that the payment is valid.
+    /// Payment validity is carried by the per-entry `valid` field (and the
+    /// structured `result.valid`) and aggregated into top-level `all_valid`.
+    /// A caller scanning for failures must inspect `valid`/`all_valid`, not
+    /// `ok` — an invalid-but-reachable receipt has `ok == true`, `valid ==
+    /// false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeError` if the receipts JSON is invalid or the
+    /// supervisor is not initialized.
+    #[pyo3(name = "economy_verify_payment_receipts")]
+    pub fn economy_verify_payment_receipts(&self, receipts_json: &str) -> PyResult<String> {
+        use pyo3::exceptions::{PyRuntimeError, PyValueError};
+
+        let bi = &*self.inner;
+        let rt = crate::runtime()?;
+        let sup =
+            crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = sup.clone();
+
+        let receipts: Vec<scp_core::economy::PaymentReceipt> = serde_json::from_str(receipts_json)
+            .map_err(|e| PyValueError::new_err(format!("invalid receipts JSON: {e}")))?;
+
+        // Bound the per-call batch before dispatch: each receipt fans out to a
+        // serial payment-adapter verification round-trip, so an unbounded batch
+        // is a denial-of-service vector. See `MAX_RECEIPT_BATCH`.
+        if receipts.len() > scp_core::economy::MAX_RECEIPT_BATCH {
+            return Err(PyValueError::new_err(format!(
+                "receipt batch too large: {} (max {})",
+                receipts.len(),
+                scp_core::economy::MAX_RECEIPT_BATCH
+            )));
+        }
+
+        rt.block_on(async move {
+            use scp_core::context::actor::commands::EconomyCommand;
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = EconomyCommand::VerifyPaymentReceipts {
+                receipts: Box::new(receipts),
+                reply: tx,
+            };
+            sup.dispatch_economy_command(cmd).await.map_err(|e| {
+                PyRuntimeError::new_err(format!("supervisor dispatch_economy_command failed: {e}"))
+            })?;
+            let results = rx.await.map_err(|e| {
+                PyRuntimeError::new_err(format!("verify_payment_receipts shim reply dropped: {e}"))
+            })?;
+
+            // Serialize via the single canonical helper shared by all bridges,
+            // so the JSON contract (string currency, numeric amount, `ok` vs
+            // `valid`/`all_valid` semantics) cannot drift across PyO3, napi, and
+            // UniFFI. See `scp_runtime::economy::receipt::verification_results_to_json`.
+            Ok(scp_core::economy::verification_results_to_json(results))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

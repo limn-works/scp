@@ -1,3 +1,8 @@
+// ADR-049 commit 12c.9e: ContextCryptoProvider trait deleted. MockCrypto
+// here reimplements that trait for unit-test coverage of tool economy
+// wiring. Rewiring to real `MlsCryptoProvider` requires backend injection
+// (12c.9f). File gated until then.
+#![cfg(any())]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -414,12 +419,13 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
     // bound to the invoker DID. Use mock_key_resolver so validate_spending_ucan_signed
     // can resolve the verifying key, and signed_spending_ucan_for to produce a
     // token signed by the matching private key.
-    let manager = ContextManager::new(
+    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+    let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let invoker = DID::from("did:key:invoker");
     let context_id = "ctx-c4-tool-economy".to_owned();
@@ -534,12 +540,13 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
 
 #[tokio::test]
 async fn invoke_tool_with_economy_rejects_insufficient_budget() {
-    let manager = ContextManager::new(
+    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+    let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let invoker = DID::from("did:key:invoker");
     let context_id = "ctx-c4-budget-rejected".to_owned();

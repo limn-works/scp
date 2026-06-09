@@ -186,6 +186,42 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
     expect(scp.instanceId).not.toBe("0");
   });
 
+  test("SCP.withStorage accepts a sqlite config with a passphrase", () => {
+    // Passphrase mode (spec §17.6) — the NAPI layer derives the SQLCipher
+    // key via Argon2id. We only assert the factory accepts the shape and
+    // produces a live instance; durability + fail-closed round-trips are
+    // covered by persistence.test.ts and the Rust-side tests.
+    const { mkdtempSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "scp-sqlite-pass-"));
+    const scp = addon.SCP.withStorage(
+      JSON.stringify({ type: "sqlite", path: dir, passphrase: "correct horse battery staple" }),
+    );
+    expect(typeof scp.instanceId).toBe("string");
+    expect(scp.instanceId).not.toBe("0");
+  });
+
+  test("SCP.withStorage rejects a sqlite config with both key and passphrase", () => {
+    const { mkdtempSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "scp-sqlite-both-"));
+    expect(() =>
+      addon.SCP.withStorage(
+        JSON.stringify({ type: "sqlite", path: dir, key: "00".repeat(32), passphrase: "p" }),
+      ),
+    ).toThrow();
+  });
+
+  test("SCP.withStorage rejects a sqlite config with neither key nor passphrase", () => {
+    const { mkdtempSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "scp-sqlite-neither-"));
+    expect(() => addon.SCP.withStorage(JSON.stringify({ type: "sqlite", path: dir }))).toThrow();
+  });
+
   test("shutdown(timeoutMillis) resolves without error", async () => {
     const scp = new addon.SCP();
     // Native `SCP.shutdown` takes unsigned milliseconds after the #1549
@@ -308,5 +344,23 @@ describe("serializeStorageConfig (PR 3 SQLite wire format)", () => {
       path: "/tmp/scp-db-hex",
       key: "deadbeef",
     });
+  });
+
+  test("sqlite + passphrase forwards the passphrase verbatim (no key field)", () => {
+    // Passphrase mode (spec §17.6): the serializer forwards `passphrase`
+    // unchanged and emits no `key` field, so the NAPI mutual-exclusion
+    // guard sees exactly one of key/passphrase.
+    const wire = __serializeStorageConfigForTests({
+      type: "sqlite",
+      path: "/tmp/scp-db-pass",
+      passphrase: "correct horse battery staple",
+    });
+    const parsed = JSON.parse(wire);
+    expect(parsed).toEqual({
+      type: "sqlite",
+      path: "/tmp/scp-db-pass",
+      passphrase: "correct horse battery staple",
+    });
+    expect("key" in parsed).toBe(false);
   });
 });

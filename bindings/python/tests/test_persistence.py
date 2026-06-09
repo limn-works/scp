@@ -147,3 +147,23 @@ def test_sqlite_missing_path_field_raises() -> None:
     """Malformed sqlite config must surface a ValidationError at the boundary."""
     with pytest.raises(_scp_core.ValidationError):
         SCP(storage={"type": "sqlite", "key": _SQLITE_KEY})  # no 'path'
+
+
+def test_sqlite_open_failure_fails_closed_not_no_storage() -> None:
+    """A SQLite open at an unusable path raises — never a no-storage instance.
+
+    Spec §17.6 fail-closed: a failed durable-backend open is terminal. The
+    bridge must NOT return a degraded instance.
+    """
+    # A path whose parent is a regular file cannot host scp.db.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        not_a_dir = Path(tmpdir) / "regular_file"
+        not_a_dir.write_bytes(b"not a directory")
+        with pytest.raises(_scp_core.ValidationError):
+            SCP(
+                storage={
+                    "type": "sqlite",
+                    "path": str(not_a_dir / "sub"),
+                    "key": _SQLITE_KEY,
+                }
+            )

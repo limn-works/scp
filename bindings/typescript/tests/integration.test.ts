@@ -1823,6 +1823,19 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       });
       expect(typeof scp.economyCheckPolicyLock(locked)).toBe("boolean");
     });
+
+    it("scp.economyVerifyPaymentReceipts returns an empty results set for empty input", () => {
+      // An empty receipt batch is the clean supervisor-backed happy path —
+      // it needs no payment adapter, so it exercises the cross-bridge
+      // forwarder without a configured paid context. The bridge returns
+      // `{"all_valid":true,"results":[]}` — `all_valid` is vacuously true for
+      // an empty batch, and `ok` (adapter-responded) is distinct from
+      // `valid`/`all_valid` (payment validity).
+      const out = scp.economyVerifyPaymentReceipts(JSON.stringify([]));
+      const parsed = JSON.parse(out);
+      expect(parsed.all_valid).toBe(true);
+      expect(parsed.results).toEqual([]);
+    });
   });
 
   // -------------------------------------------------------------------

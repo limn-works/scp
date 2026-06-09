@@ -4,7 +4,10 @@
     clippy::items_after_statements,
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::panic
+    clippy::panic,
+    // ADR-049 commit 12c.2: lifecycle hoist inflates some test-path
+    // futures past clippy's 16 KB stack budget.
+    clippy::large_futures
 )]
 //! SCP-274: Full governance lifecycle integration test.
 //!
@@ -34,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ed25519_dalek::Signer;
 
 use scp_identity::DID;
-use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::majority::MajorityVoteEngine;
 use scp_protocol::context::governance::multisig::ThresholdEngine;
 use scp_protocol::context::governance::unanimity::UnanimityEngine;
@@ -47,77 +50,13 @@ use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_protocol::context::{ContextError, ContextState};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
-use scp_runtime::context::manager::ContextManager;
-use scp_runtime::context::manager::{GovernanceActionResult, ProposalOutcome};
+use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
+use scp_runtime::context::supervisor::Supervisor;
+use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 
 // ---------------------------------------------------------------------------
 // Mock providers
 // ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct MockCrypto {
-    fail_create_mls: AtomicBool,
-    fail_validate_key_package: AtomicBool,
-}
-
-impl ContextCryptoProvider for MockCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        if self.fail_create_mls.load(Ordering::Relaxed) {
-            return Err(ContextCreationError::CryptoFailed("mock".into()));
-        }
-        Ok(())
-    }
-    fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        if self.fail_validate_key_package.load(Ordering::Relaxed) {
-            return Err(ContextError::InvalidKeyPackage("mock".into()));
-        }
-        Ok(())
-    }
-    fn add_member(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
-        Ok(scp_protocol::context::builder::AddMemberOutput::default())
-    }
-    fn remove_member(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
-        Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
-    }
-    fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn remove_member_sender_key(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-}
 
 #[derive(Default)]
 struct MockTransport {
@@ -220,9 +159,15 @@ fn eve() -> DID {
 // Manager factory
 // ---------------------------------------------------------------------------
 
-fn new_manager() -> ContextManager {
-    ContextManager::new(
-        Box::new(MockCrypto::default()),
+fn new_manager() -> std::sync::Arc<Supervisor> {
+    // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
+    // `Supervisor` directly via `test_supervisor` and call the
+    // passthrough methods (`is_member`, `list_proposals`, etc.) that
+    // forward to the per-domain `*_helpers`.
+    scp_runtime::context::test_supervisor(
+        Arc::new(MlsCryptoProvider::new(
+            "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+        )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
         mock_key_resolver(),

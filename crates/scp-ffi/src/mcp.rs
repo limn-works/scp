@@ -881,8 +881,8 @@ impl ContextProvider for FfiBridgeProvider {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let manager = crate::runtime::context_manager(&bi).map_err(|e| format!("{e}"))?;
-        if !manager.try_consume_hard_rate_limit_from_any_context(
+        let supervisor = crate::runtime::supervisor(&bi).map_err(|e| format!("{e}"))?;
+        if !supervisor.try_consume_hard_rate_limit_from_any_context(
             context_id,
             &invoker_did_typed,
             now_secs,
@@ -896,7 +896,8 @@ impl ContextProvider for FfiBridgeProvider {
         // as the consume call above.
         let ctx_id_for_refund = context_id.to_owned();
         let refund = |e: String| -> String {
-            manager.refund_hard_rate_limit_from_any_context(&ctx_id_for_refund, &invoker_did_typed);
+            supervisor
+                .refund_hard_rate_limit_from_any_context(&ctx_id_for_refund, &invoker_did_typed);
             e
         };
 

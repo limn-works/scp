@@ -211,6 +211,26 @@ pub struct PaymentAuthorization {
 }
 
 // ---------------------------------------------------------------------------
+// Batch limits
+// ---------------------------------------------------------------------------
+
+/// Maximum number of [`PaymentReceipt`]s accepted in a single
+/// `verify_payment_receipts` call.
+///
+/// Verification fans out to one serial `PaymentAdapter::verify_dyn` round-trip
+/// per receipt against a live payment rail. An unbounded batch lets a single
+/// unauthenticated call drive an arbitrarily large number of outbound
+/// adapter-verification I/O operations, which is a denial-of-service vector.
+/// This cap bounds the per-call receipt batch — and therefore the outbound
+/// adapter I/O — to a fixed ceiling.
+///
+/// The FFI bridges enforce this at the boundary (returning a validation error)
+/// and the supervisor dispatch chokepoint enforces it as defense in depth for
+/// non-bridge callers. Mirrors the `MAX_BATCH_ASSETS` precedent used for
+/// `commit_deploy`.
+pub const MAX_RECEIPT_BATCH: usize = 10_000;
+
+// ---------------------------------------------------------------------------
 // PaymentReceipt
 // ---------------------------------------------------------------------------
 
@@ -535,7 +555,7 @@ impl<T: PaymentAdapter> PaymentAdapterDyn for T {
 /// dummy receipts for non-zero actions.
 ///
 /// Used in tests and the governance dispatch path to wire the
-/// [`prepare_paid_action`] call without requiring real payment
+/// [`prepare_paid_action`](crate::economy::integration::prepare_paid_action) call without requiring real payment
 /// infrastructure. Free actions (cost=0) bypass the adapter entirely
 /// (handled by `prepare_paid_action`). Non-zero actions will be authorized
 /// with a dummy authorization that always succeeds.

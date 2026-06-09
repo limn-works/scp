@@ -57,7 +57,7 @@ fn node_err(e: NodeError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err("node operation failed")
 }
 
-/// Auto-wires the global [`ContextManager`] with relay transport after
+/// Auto-wires the global `ContextManager` with relay transport after
 /// node startup.
 ///
 /// Connects to the node's local relay (with bearer token authentication)
@@ -102,9 +102,9 @@ fn auto_wire_context_manager(
         ))
     }) {
         Ok(adapter) => {
-            let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
-                did_owned.clone(),
-            ));
+            let crypto = std::sync::Arc::new(
+                scp_core::crypto::mls::provider::MlsCryptoProvider::new(did_owned.clone()),
+            );
             let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
             let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
                 Box::new(crate::runtime::NoOpEventLogProvider);
@@ -132,7 +132,7 @@ fn auto_wire_context_manager(
                     tracing::warn!(
                         error = %e,
                         relay_url = %relay_url,
-                        "auto_wire_context_manager: ContextManager wired but failed to \
+                        "auto_wire_supervisor: Supervisor wired but failed to \
                          populate BridgeInstance transport manager — broadcast publish and \
                          discovery may require a manual transport_connect call"
                     );
@@ -147,14 +147,23 @@ fn auto_wire_context_manager(
                  context operations may fail until transport is configured manually"
             );
             // Fall back to initializing without transport so that at least
-            // the ContextManager exists (with NotConfiguredTransportProvider).
+            // the Supervisor exists (with NotConfiguredTransportProvider).
             crate::runtime::init_context_manager(bi, &did_owned);
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
     py.allow_threads(|| {
-        if let Ok(mgr) = crate::runtime::context_manager(bi) {
-            rt.block_on(mgr.register_local_did(did_owned.into()));
+        // Best-effort: log and continue if the supervisor reports
+        // `NotInitialized` (no manager attached yet) — the caller
+        // path above already attempted attach, and a duplicate
+        // failure is non-fatal for defense-in-depth registration.
+        if let Ok(supervisor) = crate::runtime::supervisor(bi)
+            && let Err(e) = rt.block_on(supervisor.register_local_did(did_owned.into()))
+        {
+            tracing::debug!(
+                error = %e,
+                "auto_wire_context_manager: register_local_did skipped (supervisor not ready)"
+            );
         }
     });
 }
@@ -327,10 +336,10 @@ impl PyNodeHandle {
         }
         let rt = crate::runtime()?;
 
-        // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        // Phase D (#1695): `PyNodeHandle` carries a reference to the bridge
-        // instance that spawned it, so we resolve the manager from there.
-        let mgr = Arc::clone(crate::runtime::context_manager(&self.bi).map_err(|e| {
+        // Resolve broadcast key: explicit or auto-lookup via Supervisor.
+        // `PyNodeHandle` carries a reference to the bridge instance that
+        // spawned it, so we resolve the supervisor from there.
+        let supervisor = Arc::clone(crate::runtime::supervisor(&self.bi).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "broadcast key auto-lookup failed: {e}"
             ))
@@ -340,7 +349,7 @@ impl PyNodeHandle {
                 broadcast_key_hex,
                 author_did,
                 self.inner.did(),
-                &mgr,
+                &supervisor,
                 &context_id,
             ))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
@@ -903,7 +912,7 @@ mod tests {
     fn auto_wire_populates_transport_manager_global() {
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
-        // Phase D (#1695): tests construct a fresh per-test bridge instance.
+        // Tests construct a fresh per-test bridge instance.
         let bi_setup = std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py());
         crate::runtime::init_context_manager_for_test(&bi_setup);
 

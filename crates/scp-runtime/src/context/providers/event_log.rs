@@ -33,6 +33,10 @@
 //! See ADR-008 (context creation), spec section 9.9 (event log).
 
 use std::collections::HashMap;
+#[allow(
+    clippy::disallowed_types,
+    reason = "sync `ContextEventLogProvider` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -177,7 +181,7 @@ fn compute_entry_hash(
 
 /// Persistence adapter for `MerkleEventLogProvider` event log entries.
 ///
-/// Mirrors the [`ContextPersistence`](crate::context::manager::ContextPersistence)
+/// Mirrors the [`ContextPersistence`](crate::context::persistence::ContextPersistence)
 /// pattern: synchronous trait methods, bridged to async `ProtocolRepository` via
 /// `tokio::task::block_in_place` in production.
 ///
@@ -276,12 +280,20 @@ pub trait EventLogPersistence: Send + Sync {
 /// ```
 pub struct MerkleEventLogProvider {
     /// Per-context event logs, keyed by context ID bytes.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "sync `ContextEventLogProvider` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. The actor refactor replaces this provider with an async trait — deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     logs: Mutex<HashMap<[u8; 32], ContextLog>>,
     /// Optional persistence backend for surviving process restarts (#636).
     persistence: Option<std::sync::Arc<dyn EventLogPersistence>>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "sync `ContextEventLogProvider` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 impl MerkleEventLogProvider {
     /// Creates a new empty event log provider (in-memory only).
     #[must_use]
@@ -1014,9 +1026,17 @@ mod tests {
 
     /// In-memory `EventLogPersistence` for testing.
     struct MockEventLogPersistence {
+        #[allow(
+            clippy::disallowed_types,
+            reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml'."
+        )]
         store: Mutex<HashMap<String, Vec<EventLogEntry>>>,
     }
 
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     impl MockEventLogPersistence {
         fn new() -> Self {
             Self {

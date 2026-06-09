@@ -1339,6 +1339,14 @@
           "swift": true
         },
         {
+          "name": "verify_payment_receipts",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + Python/TypeScript/Kotlin/Swift SDKs. WASM cannot link the async runtime payment adapter (ADR-034); the TS WASM bridge surfaces a fail-closed throw (SCP-ECON-12095)."
+        },
+        {
           "name": "enforce_economy_send_path",
           "python": false,
           "typescript": false,
@@ -1868,7 +1876,7 @@
         {"name": "resume", "python": true, "typescript": true, "kotlin": true, "swift": true,
          "notes": "ASYNC as of Phase 4 PR 3 (#1678, 2026-04-18) — BREAKING CHANGE. BridgeInstanceCore::resume is async fn; per-bridge overrides reconnect every pending relay URL and restore persisted contexts before returning. Reconnect failures surface as LifecycleError::ReconnectFailed { url, reason }. All three FFI bridges expose the async path: PyO3 releases the GIL and block_ons, NAPI returns a Promise, UniFFI generates Kotlin suspend fun / Swift async throws. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.resume() is now the only entry point in every SDK: Python async def resume(), TypeScript scp.resume(): Promise<void>, Kotlin scp.resume() (suspend fun), Swift func resume() async throws. WASM is a no-op (no long-lived native runtime)."},
         {"name": "with_storage_sqlite", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP.withStorage(Sqlite { path, key }) exposes the SQLCipher-backed SqliteStorage across all three non-WASM bridges (#1491, #1260; Phase 4 PR 3, 2026-04-18). StorageConfig::Sqlite { path: String, key: Vec<u8> } variant with 32-byte key validated at the FFI boundary. PyO3 accepts Python bytes; NAPI accepts hex string OR Uint8Array; UniFFI generates Swift StorageConfig.sqlite(path:key:) and Kotlin StorageConfig.Sqlite(path, key) via #[derive(uniffi::Enum)]. SDK convenience constructors: Swift SCP.withStorage(sqliteDir:key:), Kotlin SCP.withSqlite(dir, key), Python SCP(storage={...}), TypeScript SCP.withStorage({...}). The ContextManager and CoreFields share a single rusqlite::Connection via Arc<SqliteStorage>.",
+         "notes": "SCP.withStorage(Sqlite { path, key }) exposes the SQLCipher-backed SqliteStorage across all three non-WASM bridges (#1491, #1260; Phase 4 PR 3, 2026-04-18). The StorageConfig::Sqlite key field is a SqliteKeyMaterial sum type accepting EITHER raw key material (Raw, 32-byte key validated at the FFI boundary) OR a passphrase (Passphrase, SQLCipher key derived via Argon2id with a persisted per-database salt sidecar). For sqlite, exactly ONE of key/passphrase must be supplied — both or neither is a ValidationError; both forms are wrapped in Zeroizing. PyO3 accepts Python bytes (key) or a str (passphrase); NAPI accepts a hex string OR Uint8Array (key) or a string (passphrase); UniFFI generates Swift StorageConfig.sqlite(path:key:) / SqliteKeyMaterial.raw|.passphrase and the Kotlin equivalents via #[derive(uniffi::Enum)]. SDK convenience constructors: Swift SCP.withStorage(sqliteDir:key:)/passphrase variant, Kotlin SCP.withSqlite(dir, key)/passphrase variant, Python SCP.with_storage({...}), TypeScript SCP.withStorage({...}). The Supervisor's mls_storage view, context-snapshot persistence, and event log all share a single rusqlite::Connection via the one Arc<SqliteStorage>.",
          "exemptions": {}},
         {"name": "add_relay_url", "python": true, "typescript": true, "kotlin": true, "swift": true,
          "notes": "CoreFields::relay_url (Mutex<Option<String>>) replaced with relay_urls (Mutex<HashSet<String>>) in Phase 4 PR 3 (#1678, 2026-04-18). New accessors add_relay_url / remove_relay_url / pending_relay_urls; each per-bridge resume() iterates the HashSet and reconnects each URL. First reconnect failure surfaces as LifecycleError::ReconnectFailed { url, reason }; successfully-connected URLs remain in the pending set for retry.",
@@ -1892,8 +1900,8 @@
       "evidence": {
         "pipeline_wiring_test": "governance_enforces_economic_policy",
         "code_sites": [
-          "crates/scp-runtime/src/context/manager/messaging.rs:49 enforce_send_economy \u2192 super::economy::enforce_economy",
-          "crates/scp-runtime/src/context/manager/economy.rs:300 enforce_economy definition"
+          "crates/scp-runtime/src/context/messaging_helpers.rs:211 enforce_send_economy \u2192 economy_logic::enforce_economy",
+          "crates/scp-runtime/src/context/economy_logic.rs:313 enforce_economy definition"
         ]
       }
     },
@@ -1911,7 +1919,7 @@
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-runtime/src/context/manager/lifecycle.rs:983 import_context \u2192 validate_export_for_import"
+          "crates/scp-runtime/src/context/lifecycle_helpers.rs:1257 import_context \u2192 validate_export_for_import"
         ]
       }
     },

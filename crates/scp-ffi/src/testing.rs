@@ -28,7 +28,6 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use scp_core::context::builder::ContextCryptoProvider;
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, context_id_bytes};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
@@ -225,9 +224,14 @@ fn fullstack_add_member_impl(
 
 /// Joins a context by retrieving the Welcome from the shared `KeyExchange`.
 ///
-/// After joining, the context is registered on the joiner's `ContextManager`
-/// with a `ContextHandle`, enabling subsequent `py_fullstack_send_message`
-/// and `py_fullstack_remove_member` calls on this node.
+/// The joiner's `E2eCryptoProvider` processes the Welcome and picks up the
+/// access/sender keys so it can DECRYPT messages from the creator. It does
+/// NOT register a per-context send `ContextHandle`: the actor-per-context
+/// model has no spawn-from-Welcome entrypoint yet (the separate
+/// Welcome-Delivery work item), so a subsequent `fullstack_send_message` on a
+/// Welcome-joined node fails closed with "context not found in node's
+/// handles". The unidirectional path (creator sends, joiner decrypts) is
+/// fully supported.
 fn fullstack_join_from_welcome_impl(
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,
@@ -235,67 +239,18 @@ fn fullstack_join_from_welcome_impl(
 ) -> PyResult<()> {
     crate::pyscp_check_handle!(&bi.core, node);
     let ctx_bytes = context_id_bytes(&context_id);
-    let rt = crate::runtime()?;
 
-    // Step 1: Register the context on the joiner's ContextManager.
-    let params = ContextParams {
-        mode: ContextMode::Encrypted,
-        ceiling: vec![
-            Capability::MessagesRead,
-            Capability::MessagesWrite,
-            Capability::RoleAssign,
-            Capability::MemberInvite,
-            Capability::MemberRemove,
-            Capability::ContextClose,
-        ],
-        ..ContextParams::default()
-    };
-    let handle = rt
-        .block_on(node.inner.create_context(&context_id, params))
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to register context on joiner: {e}"
-            ))
-        })?;
-
-    // Step 2: Replace the throwaway MLS group with the Welcome-derived one
-    // and pick up the adder's sender keys and access key from the exchange.
+    // ADR-049 commit 12c.9f: the joiner's MLS group, sender keys, and access
+    // keys live directly in its `E2eCryptoProvider` (the joiner has no context
+    // actor). `join_from_welcome` forms the group from the captured Welcome,
+    // picks up the inviter-minted access keys, processes the inviter's
+    // HPKE-sealed sender-key distribution, and applies any epoch-advance
+    // Commits — all real crypto.
     node.inner
         .join_from_welcome(&context_id, &ctx_bytes)
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
-        })?;
-
-    // Step 2b: Regenerate the joiner's sender key and distribute it to
-    // existing members. The key from create_context was for the throwaway
-    // MLS group and is now stale.
-    node.inner
-        .regenerate_and_distribute_sender_key(&ctx_bytes)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to distribute joiner sender key: {e}"
-            ))
-        })?;
-
-    // Step 2c: Sync all members' access keys into the ContextManager's
-    // PerContextState so that send_message wraps content for all recipients.
-    // join_from_welcome already populates E2eCryptoProvider's local store;
-    // this step ensures the ContextManager also has them.
-    rt.block_on(
-        node.inner
-            .sync_access_keys_to_manager(&context_id, &ctx_bytes),
-    );
-
-    // Step 3: Store the handle.
-    {
-        let mut handles = node
-            .handles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        handles.insert(context_id, handle);
-    }
-
-    Ok(())
+        })
 }
 
 /// Synchronises sender keys between two nodes for a given context.
@@ -449,7 +404,7 @@ fn fullstack_remove_member_impl(
     // sends via the transport. These are control-plane messages, not
     // application messages, and must not bleed into the buffer that
     // py_fullstack_send_message checks for exactly-one application ciphertext.
-    node.inner.take_sent_ciphertexts();
+    let _ = node.inner.take_sent_ciphertexts();
 
     Ok(())
 }

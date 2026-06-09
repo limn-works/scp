@@ -6,6 +6,7 @@
 pub mod mls;
 
 pub mod access_keys;
+pub mod hpke_backend;
 pub mod sender_keys;
 pub mod ucan;
 

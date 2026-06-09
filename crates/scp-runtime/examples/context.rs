@@ -14,26 +14,31 @@ use std::sync::Arc;
 use scp_identity::DID;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::{Capability, ContextMode, ContextParams, ContextState};
-use scp_runtime::context::manager::ContextManager;
+use scp_runtime::context::supervisor::Supervisor;
 
 mod support;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Build a ContextManager with mock providers.
+    // 1. Build a Supervisor with mock providers.
     //    In production, these would be real MLS crypto, relay transport,
     //    and Merkle event log implementations.
     let key_resolver: KeyResolver = Arc::new(|_did| None);
-    let manager = ContextManager::new(
-        Box::new(support::MockCrypto),
+    let manager = Supervisor::with_providers(
+        support::example_crypto("did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"),
         Box::new(support::MockTransport),
         Box::new(support::MockEventLog),
         key_resolver,
+        None,
+        None,
+        None,
+        None,
+        support::example_mls_storage(),
     );
 
     // 2. Register our DID so the manager recognizes us as a local participant.
     let alice: DID = "did:dht:z6MkAlice".into();
-    manager.register_local_did(alice.clone()).await;
+    manager.register_local_did(alice.clone()).await?;
 
     // 3. Define context parameters.
     let params = ContextParams {

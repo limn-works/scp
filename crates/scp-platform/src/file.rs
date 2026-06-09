@@ -52,7 +52,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use argon2::Argon2;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::RngCore;
 use std::sync::Mutex as StdMutex;
@@ -96,15 +95,6 @@ const KEY_TYPE_ED25519: u8 = 0x01;
 
 /// Key type byte for X25519.
 const KEY_TYPE_X25519: u8 = 0x02;
-
-/// Argon2id iteration count (OWASP minimum: 3).
-const ARGON2_ITERATIONS: u32 = 3;
-
-/// Argon2id memory cost in KiB (OWASP recommendation: 64 MiB = 65536 KiB).
-const ARGON2_MEMORY_KIB: u32 = 65_536;
-
-/// Argon2id parallelism.
-const ARGON2_PARALLELISM: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -154,14 +144,40 @@ impl HandleMap {
 // Atomic write helper
 // ---------------------------------------------------------------------------
 
-/// Writes `data` to `path` atomically via a `.tmp` sibling file.
+/// Writes `data` to `path` atomically via a randomized `.tmp` sibling file.
 ///
-/// 1. Writes to `{path}.tmp` with `mode(0o600)` on Unix.
-/// 2. Calls `sync_all` to flush to durable storage.
-/// 3. Renames to `path` (atomic on POSIX).
-/// 4. Cleans up the tmp file on any failure after creation.
+/// 1. Generates a randomized, unpredictable temp name `{file}.{random_hex}.tmp`
+///    in the parent directory so concurrent writes cannot collide and the name
+///    cannot be pre-planted by an attacker.
+/// 2. Opens the temp file with `create_new(true)` (`O_EXCL`): a pre-existing file
+///    or symlink at the temp path fails the open rather than being
+///    followed/overwritten. On `AlreadyExists` it errors fail-closed.
+/// 3. Writes `data` with `mode(0o600)` on Unix.
+/// 4. Calls `sync_all` to flush the file to durable storage.
+/// 5. Renames to `path` (atomic on POSIX).
+/// 6. On Unix, fsyncs the PARENT DIRECTORY so the rename is durable across a
+///    crash. Best-effort on platforms without directory fsync.
+/// 7. Cleans up the tmp file on any failure after creation.
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PlatformError> {
-    let tmp_path = path.with_extension("tmp");
+    let parent = path.parent().ok_or_else(|| {
+        PlatformError::CustodyError(format!(
+            "key path {} has no parent directory",
+            path.display()
+        ))
+    })?;
+
+    // Randomized, unpredictable temp name in the same directory as the target
+    // so the final `rename` stays on one filesystem (atomic). 128 bits of
+    // CSPRNG entropy rendered as 32 hex chars — collision-free in practice and
+    // unguessable, so an attacker cannot pre-plant the temp path.
+    let mut rand_bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut rand_bytes);
+    let rand_suffix = u128::from_le_bytes(rand_bytes);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("keys.scp");
+    let tmp_path = parent.join(format!("{file_name}.{rand_suffix:032x}.tmp"));
 
     // Write to temp file with restrictive permissions on Unix.
     #[cfg(unix)]
@@ -170,12 +186,14 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PlatformError> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp_path)
             .map_err(|e| {
-                PlatformError::CustodyError(format!("failed to create temp key file: {e}"))
+                PlatformError::CustodyError(format!(
+                    "failed to create temp key file at {}: {e}",
+                    tmp_path.display()
+                ))
             })?;
         file.write_all(data).map_err(|e| {
             let _ = std::fs::remove_file(&tmp_path);
@@ -191,11 +209,13 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PlatformError> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&tmp_path)
             .map_err(|e| {
-                PlatformError::CustodyError(format!("failed to create temp key file: {e}"))
+                PlatformError::CustodyError(format!(
+                    "failed to create temp key file at {}: {e}",
+                    tmp_path.display()
+                ))
             })?;
         file.write_all(data).map_err(|e| {
             let _ = std::fs::remove_file(&tmp_path);
@@ -213,7 +233,29 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PlatformError> {
         PlatformError::CustodyError(format!("failed to rename temp key file: {e}"))
     })?;
 
+    // Durably persist the directory entry created by the rename. Best-effort:
+    // platforms without directory fsync tolerate the error.
+    sync_parent_dir(parent);
+
     Ok(())
+}
+
+/// Best-effort fsync of a directory so a preceding `rename` into it is durable.
+///
+/// On Unix, opens the directory and calls `sync_all`. Errors are tolerated
+/// (some filesystems/platforms do not support directory fsync). No-op on
+/// non-Unix targets.
+fn sync_parent_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,28 +399,15 @@ impl FileKeyCustody {
     }
 
     /// Derives an AES-256 key from a passphrase and salt using Argon2id.
+    ///
+    /// Delegates to [`crate::kdf::derive_argon2id_key`] — the single source of
+    /// the Argon2id parameterization (spec §17.6 / §17.8). Behavior is
+    /// byte-identical to the historical inline derivation.
     fn derive_key(
         passphrase: &str,
         salt: &[u8; SALT_LEN],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        let params = argon2::Params::new(
-            ARGON2_MEMORY_KIB,
-            ARGON2_ITERATIONS,
-            ARGON2_PARALLELISM,
-            Some(32),
-        )
-        .map_err(|e| PlatformError::CustodyError(format!("argon2 params error: {e}")))?;
-
-        let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-
-        let mut key = Zeroizing::new([0u8; 32]);
-        argon2
-            .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
-            .map_err(|e| {
-                PlatformError::CustodyError(format!("argon2 key derivation failed: {e}"))
-            })?;
-
-        Ok(key)
+        crate::kdf::derive_argon2id_key(passphrase.as_bytes(), salt)
     }
 
     /// Encrypts a 32-byte private key using AES-256-GCM with a fresh nonce.
@@ -1265,6 +1294,34 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "key file should be owner-only (0600), got: {mode:o}"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_write_ignores_stale_fixed_temp_and_leaves_no_residue() {
+        // A pre-planted file at the OLD predictable temp path (`keys.scp.tmp`)
+        // must not block writes — the temp name is now randomized — and our
+        // randomized temp must be renamed away, leaving no `*.tmp` residue.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        std::fs::write(dir.path().join("keys.scp.tmp"), b"stale").unwrap();
+
+        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pubkey = custody.public_key(&handle).await.unwrap();
+        assert_eq!(pubkey.as_bytes().len(), 32);
+
+        // Only the stale fixed-name temp remains; no randomized residue.
+        let residue: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("keys.scp.") && n.contains(".tmp"))
+            .collect();
+        assert_eq!(
+            residue,
+            vec!["keys.scp.tmp".to_owned()],
+            "randomized temp must be renamed away, leaving no residue"
         );
     }
 

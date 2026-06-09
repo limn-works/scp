@@ -63,7 +63,7 @@ use scp_protocol::envelope::padding::strip_padding;
 ///
 /// See ADR-002 acceptance criterion 4 and ADR-007.
 ///
-/// [`create_inner_envelope`]: crate::envelope::inner::create_inner_envelope
+/// [`create_inner_envelope`]: crate::envelope::inner::sign::create_inner_envelope
 pub fn seal_envelope(
     inner: &InnerEnvelope,
     group: &mut ScpMlsGroup,

@@ -58,6 +58,11 @@ pub mod apple;
 pub mod file;
 #[cfg(feature = "filesystem")]
 pub mod filesystem;
+// Shared Argon2id passphrase→key derivation (spec §17.6 / §17.8). Single
+// source of the Argon2id parameterization; used by FileKeyCustody (`file`)
+// and the SqliteStorage passphrase constructor (`sqlite`).
+#[cfg(any(feature = "file", feature = "sqlite"))]
+pub mod kdf;
 // Shared pseudonym secret derivation — used by all KeyCustody backends.
 // Gated behind `software_platform` because it depends on ed25519-dalek, hkdf, sha2.
 #[cfg(feature = "software_platform")]

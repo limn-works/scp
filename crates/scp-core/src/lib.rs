@@ -55,7 +55,7 @@ pub mod context {
     pub use scp_runtime::context::app_sandbox;
     pub use scp_runtime::context::builder;
     pub use scp_runtime::context::export_import;
-    pub use scp_runtime::context::manager;
+    pub use scp_runtime::context::key_destruction;
     pub use scp_runtime::context::policy;
     pub use scp_runtime::context::providers;
     pub use scp_runtime::context::ttl;
@@ -64,16 +64,36 @@ pub mod context {
     };
     // Key runtime types re-exported at this level.
     pub use scp_protocol::context::builder::{
-        AddMemberOutput, AdvanceEpochOutput, ContextCreationError, ContextCryptoProvider,
-        MANAGEMENT_MSG_MAGIC, MAX_MANAGEMENT_PAYLOAD_SIZE, RemoveMemberOutput,
+        AddMemberOutput, AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC,
+        MAX_MANAGEMENT_PAYLOAD_SIZE, RemoveMemberOutput,
     };
     pub use scp_runtime::context::ContextHandle;
+    /// Actor module — re-exported from `scp-runtime` so the FFI bridges
+    /// can name the [`QueriesCommand`](actor::commands::QueriesCommand)
+    /// variants they dispatch through
+    /// [`supervisor::Supervisor::dispatch_query`]. Part of the same
+    /// commits-7-to-11 shim surface; deleted in commit 12.
+    pub use scp_runtime::context::actor;
     pub use scp_runtime::context::builder::{
         ContextEventLogProvider, ContextTransportProvider, LocalTransportProvider,
         NotConfiguredTransportProvider,
     };
-    pub use scp_runtime::context::manager::ContextManager;
-    pub use scp_runtime::context::manager::ContextPersistence;
+    /// Test-only helper: builds a fresh [`supervisor::Supervisor`] with
+    /// caller-supplied providers and no-op persistence (ADR-049
+    /// commit 12, replacing the legacy `attach_test_supervisor`).
+    #[cfg(any(test, feature = "testing"))]
+    pub use scp_runtime::context::test_supervisor;
+    // ContextManager type deleted in ADR-049 commit 12; consumers
+    // build a `Supervisor` directly via `Supervisor::with_providers`
+    // (re-exported through `scp_core::context::supervisor`).
+    pub use scp_runtime::context::persistence;
+    pub use scp_runtime::context::persistence::ContextPersistence;
+    pub use scp_runtime::context::state;
+    /// Supervisor module — re-exported from `scp-runtime` so the FFI
+    /// bridges (which depend on `scp-core`, not `scp-runtime` directly)
+    /// can construct the commits-7-to-11 query shim. Shrinks back to an
+    /// internal module in commit 12 when the shim is deleted.
+    pub use scp_runtime::context::supervisor;
     // Broadcast content types (previously at context level).
     pub use scp_protocol::context::broadcast_content::{
         BROADCAST_CONTENT_MAGIC, BROADCAST_CONTENT_VERSION, BroadcastContent,
@@ -158,6 +178,7 @@ pub mod economy {
     pub use scp_runtime::economy::integration;
     pub use scp_runtime::economy::integration::*;
     pub use scp_runtime::economy::receipt;
+    pub use scp_runtime::economy::receipt::verification_results_to_json;
 }
 
 pub mod discovery {

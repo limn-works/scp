@@ -68,8 +68,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use scp_core::context::ContextManager;
 use scp_core::context::ContextPersistence;
+use scp_core::context::supervisor::Supervisor;
 use scp_core::discovery::handles::HandleRegistry;
 use scp_core::discovery::petnames::PetnameMap;
 use scp_core::discovery::scope::ScopeRegistry;
@@ -203,24 +203,36 @@ pub struct KnownContext {
 ///
 /// - Once shut down, [`CoreFields::is_shutdown`] returns `true` permanently.
 ///   All bridge operations should check this flag and fail fast.
-/// - The `ContextManager` reference is shared (`Arc`) and may outlive this
+/// - The `Supervisor` reference is shared (`Arc`) and may outlive this
 ///   instance if cloned elsewhere. Shutdown does NOT drop or invalidate
-///   the `ContextManager` — it is a signal to the bridge layer only.
+///   the `Supervisor` — it is a signal to the bridge layer only.
 pub struct CoreFields {
-    /// Shared context lifecycle manager (MLS, membership, governance, broadcast).
+    /// Shared per-instance `Supervisor` — actor registry, saga
+    /// coordinator, and query dispatcher.
     ///
-    /// Stored in a `OnceLock` so that the per-bridge [`CoreFields`] (and thus the DID
-    /// resolver slot it owns) can exist BEFORE the `ContextManager` is
-    /// constructed. The `ContextManager`'s `MlsCryptoProvider` needs the real
-    /// DID at construction time, but the DID is only known after
-    /// `DidDht::create()` runs inside `identity_create`. Deferring the CM
-    /// resolves this ordering.
+    /// Stored in a `OnceLock` so that the per-bridge [`CoreFields`] (and
+    /// thus the DID resolver slot it owns) can exist BEFORE the
+    /// supervisor is constructed. The supervisor's underlying
+    /// `ContextManager` (during the ADR-049 transition window) needs
+    /// the real DID at construction time, but the DID is only known
+    /// after `DidDht::create()` runs inside `identity_create`. Deferring
+    /// the supervisor resolves this ordering.
     ///
-    /// Accessors that expect a ready CM call [`context_manager`] / [`try_context_manager`]
-    /// which panic / return `None` when the CM hasn't been set yet. During
-    /// steady-state operation, callers go through bridge functions that ensure
-    /// `init_context_manager(real_did)` has been called first.
-    context_manager: OnceLock<Arc<ContextManager>>,
+    /// Accessors that expect a ready supervisor call
+    /// [`supervisor`](Self::supervisor) / [`try_supervisor`](Self::try_supervisor)
+    /// which return `None` when the supervisor hasn't been set yet.
+    /// During steady-state operation, callers go through bridge
+    /// functions that ensure `init_supervisor(real_did)` has been called
+    /// first.
+    ///
+    /// ADR-049 commit 12c.9g.3 — replaces the previous twin
+    /// `(context_manager: OnceLock<Arc<ContextManager>>, supervisor:
+    /// Arc<Supervisor>)` slot pair with a single OnceLock-managed
+    /// supervisor. The `ContextManager` (when constructed by the FFI
+    /// layer) is attached internally by the supervisor builder before
+    /// the supervisor reaches this slot; bridges no longer hold a
+    /// distinct `Arc<ContextManager>`.
+    supervisor: OnceLock<Arc<Supervisor>>,
 
     /// Whether this instance has been shut down permanently.
     ///
@@ -290,7 +302,7 @@ pub struct CoreFields {
     /// Keyed by context ID. Created lazily on first access via
     /// [`with_economy_budget`] / [`with_economy_budget_mut`]. Budget trackers
     /// are NOT removed automatically when contexts are closed -- call
-    /// [`remove_economy_state`] for cleanup in long-running processes.
+    /// [`Self::remove_economy_state`] for cleanup in long-running processes.
     economy_budgets: DashMap<String, MemberBudgetTracker>,
 
     /// Per-context antispam velocity trackers for economic governance.
@@ -343,7 +355,7 @@ pub struct CoreFields {
     /// Optional persistence provider, forwarded from the `ContextManager`.
     ///
     /// When `Some`, `suspend()` and `shutdown()` call
-    /// [`ContextManager::flush_all_contexts_sync`] to persist context state
+    /// `ContextManager::flush_all_contexts_sync` to persist context state
     /// before tearing down transport or destroying MLS groups. The provider
     /// reference is retained here so the bridge layer can pass it through
     /// `with_persistence()` at construction time and expose it via the
@@ -375,9 +387,9 @@ pub struct CoreFields {
     /// URL individually, so the set is the source of truth for "which
     /// relays does this bridge intend to be connected to".
     ///
-    /// Populated via [`add_relay_url`]. Entries removed via
+    /// Populated via [`Self::add_relay_url`]. Entries removed via
     /// [`remove_relay_url`] (explicit disconnect). Retrieved as a
-    /// deduplicated snapshot via [`pending_relay_urls`]. Preserved across
+    /// deduplicated snapshot via [`Self::pending_relay_urls`]. Preserved across
     /// `suspend()` / `resume()` cycles so callers can reconnect.
     /// Cleared in full by [`shutdown()`] and [`clear_relay_urls`].
     relay_urls: Mutex<HashSet<String>>,
@@ -471,27 +483,27 @@ impl Default for CoreFields {
 }
 
 impl CoreFields {
-    /// Creates a new `CoreFields` without a `ContextManager`.
+    /// Creates a new `CoreFields` without a `Supervisor`.
     ///
     /// Initializes all shared state registries (transport, known contexts,
     /// rate limiters) as empty. Allocates a fresh [`CoreFields::instance_id`],
     /// a fresh [`CancellationToken`], and an empty [`JoinSet`]. The
-    /// `ContextManager` is **unbound** — call
-    /// [`set_context_manager`](Self::set_context_manager) once the identity
-    /// has been created and the `ContextManager` constructed with its
-    /// `MlsCryptoProvider` (which carries the real local DID).
+    /// per-instance `Supervisor` is **unbound** — call
+    /// [`set_supervisor`](Self::set_supervisor) once the identity has
+    /// been created and the supervisor constructed with its providers
+    /// (whose `MlsCryptoProvider` carries the real local DID).
     ///
-    /// Decoupling the `ContextManager` from construction lets the FFI
-    /// bridge initialize the DID resolver slot BEFORE any identity is
-    /// known. That resolves the chicken-and-egg where the DID resolver
-    /// lives inside `CoreFields` but the DID itself is generated by
+    /// Decoupling the supervisor from construction lets the FFI bridge
+    /// initialize the DID resolver slot BEFORE any identity is known.
+    /// That resolves the chicken-and-egg where the DID resolver lives
+    /// inside `CoreFields` but the DID itself is generated by
     /// `DidDht::create()` which runs later. `CoreFields` itself never
     /// stores or tracks the DID — that is the `MlsCryptoProvider`'s job
     /// (spec §12.2.3).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            context_manager: OnceLock::new(),
+            supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
@@ -516,39 +528,40 @@ impl CoreFields {
         }
     }
 
-    /// Creates a new `CoreFields` pre-populated with a `ContextManager`.
+    /// Creates a new `CoreFields` pre-populated with a `Supervisor`.
     ///
-    /// Convenience constructor for callers that already have a `ContextManager`
-    /// (e.g., test fixtures, the NAPI/UniFFI `ensure_bridge_instance` helpers
-    /// that lazily construct a CM with placeholder providers). Equivalent to
-    /// [`new`](Self::new) followed by [`set_context_manager`](Self::set_context_manager).
+    /// Convenience constructor for callers that already have a
+    /// `Supervisor` (e.g., test fixtures, the NAPI/UniFFI
+    /// `ensure_bridge_instance` helpers that lazily construct one with
+    /// placeholder providers). Equivalent to [`new`](Self::new) followed
+    /// by [`set_supervisor`](Self::set_supervisor).
     #[must_use]
-    pub fn with_context_manager(context_manager: Arc<ContextManager>) -> Self {
+    pub fn with_supervisor(supervisor: Arc<Supervisor>) -> Self {
         let instance = Self::new();
-        instance.set_context_manager(context_manager);
+        instance.set_supervisor(supervisor);
         instance
     }
 
     /// Creates a new `CoreFields` with a persistence provider but no
-    /// `ContextManager`.
+    /// `Supervisor`.
     ///
     /// Attaches a [`ContextPersistence`] provider. When provided,
     /// [`suspend`](Self::suspend) and [`shutdown`](Self::shutdown) will
     /// flush all context snapshots via
-    /// [`ContextManager::flush_all_contexts_sync`] before tearing down
-    /// transport or destroying MLS groups — but only after the
-    /// `ContextManager` itself has been set via
-    /// [`set_context_manager`](Self::set_context_manager).
+    /// [`Supervisor::flush_all_contexts_sync`](scp_core::context::supervisor::Supervisor::flush_all_contexts_sync)
+    /// before tearing down transport or destroying MLS groups — but only
+    /// after the supervisor itself has been set via
+    /// [`set_supervisor`](Self::set_supervisor).
     ///
     /// The persistence provider should be the same one configured on the
-    /// eventual [`ContextManager`] (typically constructed via
-    /// [`ContextManager::with_persistence`] or the builder `.storage()` method).
+    /// eventual `ContextManager` (typically constructed via
+    /// `ContextManager::with_persistence` or the builder `.storage()` method).
     ///
     /// # Arguments
     ///
     /// - `persistence` — the persistence provider for bridge-level flush on
     ///   suspend/shutdown. Accepts `Box` for ergonomic call-site parity
-    ///   with [`ContextManager::with_persistence`]; the box is upgraded to
+    ///   with `ContextManager::with_persistence`; the box is upgraded to
     ///   `Arc` internally so
     ///   [`persistence_arc_clone`](Self::persistence_arc_clone) can hand
     ///   the same provider to downstream consumers.
@@ -562,7 +575,7 @@ impl CoreFields {
     /// Variant of [`with_persistence`](Self::with_persistence) that accepts
     /// `Arc<dyn ContextPersistence + Send + Sync>` directly. Callers that
     /// need to hand the exact same provider to both this mirror and
-    /// [`ContextManager::with_persistence`] must use this constructor to
+    /// `ContextManager::with_persistence` must use this constructor to
     /// avoid opening two separate `SQLite` connections (one connection per
     /// `Box`) to the same database file.
     ///
@@ -572,7 +585,7 @@ impl CoreFields {
     #[must_use]
     pub fn with_persistence_arc(persistence: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
         Self {
-            context_manager: OnceLock::new(),
+            supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
@@ -711,17 +724,31 @@ impl CoreFields {
         }
     }
 
-    /// Stores the shared [`ContextManager`] for this instance.
+    /// Stores the shared `Supervisor` for this instance.
     ///
-    /// Called by the FFI bridge's `init_context_manager*` family once the
-    /// `ContextManager` has been constructed (with the real DID passed
-    /// directly into its `MlsCryptoProvider` — the bridge [`CoreFields`] itself
-    /// does not carry a DID). Subsequent calls are ignored with a warning
-    /// (`OnceLock` guarantees single initialization).
-    pub fn set_context_manager(&self, context_manager: Arc<ContextManager>) {
-        if self.context_manager.set(context_manager).is_err() {
-            tracing::warn!("set_context_manager called but ContextManager already set — ignoring");
+    /// Called by the FFI bridge's `init_supervisor*` family once the
+    /// supervisor has been constructed (with the real DID passed
+    /// directly into its `MlsCryptoProvider` — the bridge
+    /// [`CoreFields`] itself does not carry a DID). Subsequent calls
+    /// are ignored with a warning (`OnceLock` guarantees single
+    /// initialization).
+    pub fn set_supervisor(&self, supervisor: Arc<Supervisor>) {
+        if self.supervisor.set(supervisor).is_err() {
+            tracing::warn!("set_supervisor called but Supervisor already set — ignoring");
         }
+    }
+
+    /// Returns the shared per-instance `Supervisor`, or `None` if not
+    /// yet set.
+    ///
+    /// FFI query call sites route through
+    /// [`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)
+    /// on the returned reference. Callers that need the supervisor must
+    /// surface a typed error at the FFI boundary when this returns
+    /// `None` (matches the `try_supervisor` lifecycle contract).
+    #[must_use]
+    pub fn supervisor(&self) -> Option<&Arc<Supervisor>> {
+        self.supervisor.get()
     }
 
     /// Returns a reference to the persistence provider, if configured.
@@ -739,7 +766,7 @@ impl CoreFields {
     ///
     /// Used by bridge constructors that want to hand the same provider
     /// instance to both this mirror and
-    /// [`ContextManager::with_persistence`] — critical when the underlying
+    /// `ContextManager::with_persistence` — critical when the underlying
     /// backend (e.g. `SqliteStorage`) cannot tolerate multiple concurrent
     /// connections to the same database file.
     ///
@@ -749,28 +776,28 @@ impl CoreFields {
         self.persistence.clone()
     }
 
-    /// Returns a reference to the shared [`ContextManager`], or `None` if not
-    /// yet set.
+    /// Returns a reference to the shared `Supervisor`, or `None` if
+    /// not yet set.
     ///
-    /// All callers must handle the `None` case explicitly — returning an
-    /// appropriate lifecycle error at the FFI boundary (typically
-    /// `CTX_2000` / "`ContextManager` not yet attached"). Callers that only
+    /// All callers must handle the `None` case explicitly — returning
+    /// an appropriate lifecycle error at the FFI boundary (typically
+    /// `CTX_2000` / "`Supervisor` not yet attached"). Callers that only
     /// touch [`CoreFields`]-owned state (transport, DID resolver, known
-    /// contexts) can proceed without the CM.
+    /// contexts) can proceed without the supervisor.
     ///
     /// There is intentionally no panic-variant accessor: a missing
-    /// `ContextManager` is a normal lifecycle state (bridge created for DID
-    /// resolution before any identity exists; bridge after shutdown) and
-    /// must not crash the host process.
+    /// `Supervisor` is a normal lifecycle state (bridge created for DID
+    /// resolution before any identity exists; bridge after shutdown)
+    /// and must not crash the host process.
     #[must_use]
-    pub fn try_context_manager(&self) -> Option<&Arc<ContextManager>> {
-        self.context_manager.get()
+    pub fn try_supervisor(&self) -> Option<&Arc<Supervisor>> {
+        self.supervisor.get()
     }
 
-    /// Returns whether a [`ContextManager`] has been set on this instance.
+    /// Returns whether a `Supervisor` has been set on this instance.
     #[must_use]
-    pub fn has_context_manager(&self) -> bool {
-        self.context_manager.get().is_some()
+    pub fn has_supervisor(&self) -> bool {
+        self.supervisor.get().is_some()
     }
 
     /// Returns a reference to the per-identity petname maps registry.
@@ -1002,10 +1029,15 @@ impl CoreFields {
         // Flush all context snapshots before disconnecting transport.
         // Best-effort: errors are logged inside flush_all_contexts_sync and do
         // not prevent suspension from completing. Skipped if the
-        // ContextManager hasn't been set yet (i.e., suspend before any
-        // context operation has run).
-        if let Some(cm) = self.context_manager.get() {
-            cm.flush_all_contexts_sync();
+        // Supervisor hasn't been set yet (i.e., suspend before any
+        // context operation has run) — in that case there is no
+        // supervisor to invoke and the call is a no-op. When set, the
+        // supervisor's forwarder may itself report
+        // `Err(ContextError::NotInitialized)` if no manager is
+        // attached; we discard that to preserve the prior silent-skip
+        // behavior.
+        if let Some(supervisor) = self.supervisor.get() {
+            let _ = supervisor.flush_all_contexts_sync();
         }
         if let Err(e) = self.clear_transport() {
             // Revert the suspended flag — the instance is not cleanly
@@ -1056,7 +1088,7 @@ impl CoreFields {
     /// Clears the suspended flag so bridge operations can proceed.
     ///
     /// `resume` is `async` so per-bridge overrides (see
-    /// [`BridgeInstanceCore::resume`]) can chain async work — reconnecting
+    /// `BridgeInstanceCore::resume`) can chain async work — reconnecting
     /// transport from pending relay URLs, rehydrating persisted context
     /// state — after the core flag flip. The core-only body below is `.await`-
     /// free and remains cheap.
@@ -1180,9 +1212,9 @@ impl CoreFields {
     /// Clears the transport manager (called on disconnect or suspend).
     ///
     /// Does **not** clear the stored relay URL — the URL is preserved so
-    /// that callers can retrieve it after [`resume`] and reconnect to the
+    /// that callers can retrieve it after [`Self::resume`] and reconnect to the
     /// same relay. The relay URL is only cleared explicitly in
-    /// [`shutdown`] (after flush) or by the caller via an explicit
+    /// [`Self::shutdown`] (after flush) or by the caller via an explicit
     /// disconnect flow.
     ///
     /// After this, relay-based operations will fail until a new transport
@@ -1227,11 +1259,11 @@ impl CoreFields {
     /// connected to.
     ///
     /// Callers (bridge `transport_connect` functions) call this immediately
-    /// after [`set_transport`] so that [`pending_relay_urls`] returns the
-    /// URL in subsequent reconnect attempts after [`resume`]. Duplicate
+    /// after [`Self::set_transport`] so that [`Self::pending_relay_urls`] returns the
+    /// URL in subsequent reconnect attempts after [`Self::resume`]. Duplicate
     /// calls are idempotent because the underlying set deduplicates.
     ///
-    /// No-op after [`shutdown`] — [`pending_relay_urls`] is cleared on
+    /// No-op after [`Self::shutdown`] — [`Self::pending_relay_urls`] is cleared on
     /// shutdown and we must not resurrect it by admitting a late writer.
     /// Without this guard, a concurrent `add_relay_url` racing with a
     /// shutdown-triggered `relay_urls.clear()` could leave a stale URL in
@@ -1291,10 +1323,10 @@ impl CoreFields {
     }
 
     /// Returns a snapshot of every relay URL registered via
-    /// [`add_relay_url`] and not yet removed.
+    /// [`Self::add_relay_url`] and not yet removed.
     ///
-    /// After [`suspend`] the set is preserved so `resume()` overrides can
-    /// reconnect each relay. After [`shutdown`] the set is empty.
+    /// After [`Self::suspend`] the set is preserved so `resume()` overrides can
+    /// reconnect each relay. After [`Self::shutdown`] the set is empty.
     ///
     /// Returns an empty set if no URLs have been stored, if the instance
     /// has been shut down, or if the internal mutex is poisoned.
@@ -1316,13 +1348,13 @@ impl CoreFields {
             .is_some_and(|guard| !guard.is_empty())
     }
 
-    /// Reconnects every pending relay URL registered via [`add_relay_url`].
+    /// Reconnects every pending relay URL registered via [`Self::add_relay_url`].
     ///
-    /// Iterates the deduplicated snapshot from [`pending_relay_urls`], calls
+    /// Iterates the deduplicated snapshot from [`Self::pending_relay_urls`], calls
     /// `NativeRelayAdapter::connect_sourced` (source = `Explicit`) for each
     /// URL, wraps the adapter in a [`scp_transport::TransportManager`], and
-    /// stores it via [`set_transport`]. Called from per-bridge
-    /// [`BridgeInstanceCore::resume`] overrides after the core flag flip.
+    /// stores it via [`Self::set_transport`]. Called from per-bridge
+    /// `BridgeInstanceCore::resume` overrides after the core flag flip.
     ///
     /// Collects every failure and returns the first as
     /// [`LifecycleError::ReconnectFailed`] so the caller sees a real error.
@@ -1602,10 +1634,10 @@ impl CoreFields {
 
     /// Rehydrates every context that was persisted before the most recent
     /// `suspend()`/`shutdown()` cycle — see
-    /// [`ContextManager::restore_all_contexts`].
+    /// `ContextManager::restore_all_contexts`.
     ///
-    /// Called from per-bridge [`BridgeInstanceCore::resume`] overrides after
-    /// [`reconnect_transport_if_pending`]. No-ops silently when:
+    /// Called from per-bridge `BridgeInstanceCore::resume` overrides after
+    /// [`Self::reconnect_transport_if_pending`]. No-ops silently when:
     /// - No `ContextManager` is attached yet (the bridge hasn't seen its
     ///   first `identity_create` / `context_create`).
     /// - The attached `ContextManager` was built without persistence
@@ -1615,10 +1647,17 @@ impl CoreFields {
     /// restore is a best-effort rehydration. A caller that needs failure
     /// visibility calls `ContextManager::restore_all_contexts` directly.
     pub async fn restore_all_persisted_contexts(&self) {
-        let Some(cm) = self.context_manager.get() else {
+        // Supervisor forwards to `ContextManager::restore_all_contexts` when a
+        // manager is attached, and returns `Err(ContextError::NotInitialized)`
+        // otherwise. Both the no-supervisor path (instance has no
+        // supervisor wired yet) and the "no persistence provider
+        // configured" path are expected for ephemeral bridges and share
+        // the same debug-log-and-continue behavior as before the rewire.
+        let Some(supervisor) = self.supervisor.get() else {
+            tracing::debug!("restore_all_persisted_contexts: skipped (no Supervisor attached yet)");
             return;
         };
-        match cm.restore_all_contexts().await {
+        match supervisor.restore_all_contexts().await {
             Ok(restored) => {
                 tracing::debug!(
                     count = restored.len(),
@@ -1628,9 +1667,12 @@ impl CoreFields {
             Err(e) => {
                 // `no persistence provider configured` is the expected path
                 // for ephemeral bridges; log at debug rather than warn.
+                // `NotInitialized` (no ContextManager attached to the
+                // supervisor) is likewise an expected no-op — the bridge
+                // hasn't seen its first identity_create / context_create.
                 tracing::debug!(
                     error = %e,
-                    "restore_all_persisted_contexts: skipped (no-op is expected when persistence is not configured)"
+                    "restore_all_persisted_contexts: skipped (no-op is expected when persistence is not configured or no supervisor is attached)"
                 );
             }
         }
@@ -1720,10 +1762,10 @@ impl CoreFields {
 
     /// Returns a reference to the known-contexts `DashMap`.
     ///
-    /// **Prefer the typed accessors** ([`register_known_context`],
-    /// [`remove_known_context`], [`all_known_contexts`],
-    /// [`known_contexts_for_member`], [`known_context_count`],
-    /// [`has_known_context`]) which enforce capacity limits. Direct
+    /// **Prefer the typed accessors** ([`Self::register_known_context`],
+    /// [`Self::remove_known_context`], [`Self::all_known_contexts`],
+    /// [`Self::known_contexts_for_member`], [`Self::known_context_count`],
+    /// [`Self::has_known_context`]) which enforce capacity limits. Direct
     /// mutation via this reference bypasses capacity enforcement.
     #[must_use]
     pub const fn known_contexts(&self) -> &DashMap<String, KnownContext> {
@@ -1804,7 +1846,7 @@ impl CoreFields {
 
     /// Returns a reference to the rate-limiters `DashMap`.
     ///
-    /// **Prefer [`with_rate_limit_tracker`]** which enforces capacity limits.
+    /// **Prefer [`Self::with_rate_limit_tracker`]** which enforces capacity limits.
     /// Direct mutation via this reference bypasses capacity enforcement.
     #[must_use]
     pub const fn rate_limiters(&self) -> &DashMap<String, RateLimitTracker> {
@@ -1875,7 +1917,7 @@ impl CoreFields {
     /// requested context ID does not already have a tracker, an ephemeral
     /// (non-persisted) default tracker is used and a warning is logged.
     /// Budget trackers are 1:1 with contexts, so the cap should never be
-    /// reached unless [`remove_economy_state`] is not called on context cleanup.
+    /// reached unless [`Self::remove_economy_state`] is not called on context cleanup.
     ///
     /// After shutdown, returns an ephemeral tracker to avoid re-populating
     /// the cleared `DashMap`.
@@ -2062,7 +2104,7 @@ impl CoreFields {
     ///    groups, clear registries, run shutdown hooks, clear transport)
     ///    regardless of graceful/timeout outcome — these side effects must
     ///    happen on *every* shutdown. The persistence flush
-    ///    ([`ContextManager::flush_all_contexts_sync`]) is executed
+    ///    (`ContextManager::flush_all_contexts_sync`) is executed
     ///    inside the remaining timeout budget so the caller's deadline is
     ///    honored end-to-end; if it exceeds the budget, flush is abandoned
     ///    and a warning is logged.
@@ -2128,7 +2170,7 @@ impl CoreFields {
             urls.clear();
         }
 
-        if let Some(cm) = self.context_manager.get() {
+        if let Some(supervisor) = self.supervisor.get() {
             // Persistence flush must honor the caller-supplied deadline.
             // The flush is now natively async (per-context bounded
             // `Mutex::lock` with a 250ms budget and degraded-snapshot
@@ -2136,14 +2178,28 @@ impl CoreFields {
             // so aggregate storage latency cannot push us past the caller's
             // shutdown budget. Zero budget falls through to a best-effort
             // inline flush (matches the sync shutdown path's contract).
+            //
+            // Supervisor::flush_all_contexts/shutdown_all_contexts are thin
+            // forwarders over the infallible ContextManager methods; the only
+            // reachable error is `NotInitialized` (no manager attached to
+            // the supervisor). Any error returned here we log rather than
+            // panic since shutdown must finish.
             if flush_budget.is_zero() {
                 tracing::warn!(
                     "shutdown flush budget exhausted before flush_all_contexts — \
                      context state may not be persisted"
                 );
             } else {
-                match tokio::time::timeout(flush_budget, cm.flush_all_contexts()).await {
-                    Ok(()) => {}
+                match tokio::time::timeout(flush_budget, supervisor.flush_all_contexts()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            "flush_all_contexts returned an error during shutdown \
+                             (likely supervisor providers detached mid-flight) — \
+                             context state may not be persisted"
+                        );
+                    }
                     Err(_elapsed) => {
                         tracing::warn!(
                             budget_ms = flush_budget.as_millis(),
@@ -2153,7 +2209,13 @@ impl CoreFields {
                     }
                 }
             }
-            cm.shutdown_all_contexts();
+            if let Err(e) = supervisor.shutdown_all_contexts().await {
+                tracing::warn!(
+                    error = %e,
+                    "shutdown_all_contexts returned an error during shutdown \
+                     (likely supervisor providers detached mid-flight)"
+                );
+            }
         }
 
         self.finish_shutdown_cleanup();
@@ -2174,9 +2236,27 @@ impl CoreFields {
             urls.clear();
         }
 
-        if let Some(cm) = self.context_manager.get() {
-            cm.flush_all_contexts_sync();
-            cm.shutdown_all_contexts();
+        if let Some(supervisor) = self.supervisor.get() {
+            // Supervisor::flush_all_contexts_sync and shutdown_all_contexts
+            // are thin forwarders over the infallible ContextManager methods.
+            // Any non-Ok return indicates the manager was detached
+            // mid-flight (or never attached), which we log since sync
+            // shutdown must finish regardless.
+            if let Err(e) = supervisor.flush_all_contexts_sync() {
+                tracing::warn!(
+                    error = %e,
+                    "flush_all_contexts_sync returned an error during shutdown \
+                     (likely supervisor providers detached mid-flight) — \
+                     context state may not be persisted"
+                );
+            }
+            if let Err(e) = supervisor.shutdown_all_contexts_sync() {
+                tracing::warn!(
+                    error = %e,
+                    "shutdown_all_contexts_sync returned an error during shutdown \
+                     (likely supervisor providers detached mid-flight)"
+                );
+            }
         }
 
         self.finish_shutdown_cleanup();
@@ -2330,29 +2410,67 @@ pub trait BridgeInstanceCore: Send + Sync {
 
     /// Resumes the instance — see [`CoreFields::resume`].
     ///
-    /// Default implementation delegates to `CoreFields::resume` (flag flip
-    /// only). Per-bridge implementations override this to chain async work
-    /// such as transport reconnect and persisted-context restoration.
+    /// Default implementation (extended in commit 6 of the actor-per-context
+    /// refactor, ADR-049 §11):
+    ///
+    /// 1. Flip the suspended flag via [`CoreFields::resume`].
+    /// 2. Reconnect transport if a relay URL was retained via
+    ///    [`CoreFields::reconnect_transport_if_pending`] — the reconnect
+    ///    MUST precede persisted-context rehydration so restored
+    ///    subscriptions attach to a live relay connection.
+    /// 3. Rehydrate persisted contexts via
+    ///    [`CoreFields::restore_all_persisted_contexts`].
+    ///
+    /// Per-bridge concrete structs (`PyBridgeInstance`,
+    /// `NapiBridgeInstance`, `UniffiBridgeInstance`) MUST NOT override
+    /// this default. The CI gate
+    /// `scripts/check-bridge-instance-lifecycle.py` enforces the ban.
+    /// Bridges that need additional resume-time work add a
+    /// `post_resume_hook` (future extension; not yet defined because
+    /// no bridge currently requires one).
     ///
     /// # Errors
     ///
     /// Returns [`LifecycleError::AlreadyShutDown`] if the instance has
-    /// been permanently shut down.
+    /// been permanently shut down, or [`LifecycleError::ReconnectFailed`]
+    /// if transport reconnect raced to failure.
     async fn resume(&self) -> Result<(), LifecycleError> {
-        self.core().resume().await
+        self.core().resume().await?;
+        self.core().reconnect_transport_if_pending().await?;
+        self.core().restore_all_persisted_contexts().await;
+        Ok(())
     }
 
     /// Async shutdown with a graceful deadline.
     ///
-    /// Implementors typically delegate to
-    /// [`CoreFields::shutdown_core_async`] and then call
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`] to clean up any
-    /// bridge-specific typed fields.
+    /// Default implementation (landed in commit 6 of the actor-per-context
+    /// refactor, ADR-049 §11) drains the core's async tasks under the
+    /// supplied timeout, then delegates to
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] so per-bridge
+    /// concrete structs can drop their typed registries (MCP registries,
+    /// identity custody, etc.).
+    ///
+    /// `bridge_specific_shutdown` runs UNCONDITIONALLY — even when
+    /// [`CoreFields::shutdown_core_async`] returns
+    /// [`ShutdownError::AlreadyShutDown`]. That variant signals a race
+    /// between this call and a prior sync `shutdown()` / prior async call;
+    /// without invoking the bridge-specific cleanup, typed registries
+    /// would leak key material past shutdown.
+    ///
+    /// Per-bridge concrete structs (`PyBridgeInstance`,
+    /// `NapiBridgeInstance`, `UniffiBridgeInstance`) MUST NOT override
+    /// this default. Override `bridge_specific_shutdown` (and the
+    /// `pre_*_hook` / `post_*_hook` extension points) instead. The CI
+    /// gate `scripts/check-bridge-instance-lifecycle.py` enforces this.
     ///
     /// # Errors
     ///
     /// Returns [`ShutdownError::AlreadyShutDown`] on a second call.
-    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError>;
+    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
+        let result = self.core().shutdown_core_async(timeout).await;
+        self.bridge_specific_shutdown();
+        result
+    }
 
     /// Override hook for per-bridge concrete structs to drop their
     /// bridge-specific typed fields (MCP registries, custody store, etc.).
@@ -2590,62 +2708,32 @@ pub enum ShutdownError {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use scp_core::context::LocalTransportProvider;
-    use scp_core::context::builder::{
-        ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
+    use scp_core::context::builder::{ContextCreationError, ContextEventLogProvider};
+    use scp_core::crypto::mls::provider::MlsCryptoProvider;
+    use scp_core::crypto::mls::storage_adapter::{
+        OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
     };
-    use scp_core::context::{AddMemberOutput, ContextError, RemoveMemberOutput};
     use std::pin::Pin;
+
+    /// Test-only in-memory `OpenMLS` storage adapter for the required
+    /// `mls_storage` arg of `Supervisor::with_providers`. The runtime never
+    /// defaults storage; tests supply this explicit dev affordance.
+    fn test_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
+        Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+            scp_platform::testing::InMemoryStorage::new(),
+        )))
+    }
 
     use scp_core::envelope::outer::OuterEnvelope;
     use scp_transport::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportError};
 
-    // Minimal no-op providers for constructing a ContextManager in tests.
-
-    struct NoOpCrypto;
-    impl ContextCryptoProvider for NoOpCrypto {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn create_mls_group(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn generate_sender_key(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn init_broadcast_key(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn destroy_mls_group(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn destroy_sender_key(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn validate_key_package(&self, _: &str, _: Option<&[u8]>) -> Result<(), ContextError> {
-            Ok(())
-        }
-        fn add_member(
-            &self,
-            _: &[u8; 32],
-            _: &str,
-            _: Option<&[u8]>,
-        ) -> Result<AddMemberOutput, ContextError> {
-            Ok(AddMemberOutput::default())
-        }
-        fn remove_member(&self, _: &[u8; 32], _: &str) -> Result<RemoveMemberOutput, ContextError> {
-            Ok(RemoveMemberOutput::default())
-        }
-        fn distribute_sender_key(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
-            Ok(())
-        }
-        fn remove_member_sender_key(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
-            Ok(())
-        }
-    }
+    // Minimal no-op event-log provider for constructing a ContextManager in
+    // tests. Crypto now uses the real `MlsCryptoProvider` directly —
+    // `ContextCryptoProvider` was deleted in commit 12c.9e of ADR-049.
 
     struct NoOpEventLog;
     impl ContextEventLogProvider for NoOpEventLog {
@@ -2666,16 +2754,28 @@ mod tests {
         }
     }
 
-    fn test_context_manager() -> Arc<ContextManager> {
+    /// Builds a per-instance Supervisor with test-friendly providers.
+    /// Mirrors the FFI bridges' `init_supervisor*` path:
+    /// `Supervisor::with_providers` constructs the supervisor and
+    /// populates the lifted-provider slots expected by every
+    /// `Supervisor::*` passthrough method (ADR-049 commit 12c.9g.3.6 —
+    /// the FFI layer no longer touches `ContextManager` directly).
+    fn test_supervisor() -> Arc<Supervisor> {
         // Use LocalTransportProvider (silently succeeds) for tests.
         // Key resolver returns None — no signature verification in tests.
         let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
-        Arc::new(ContextManager::new(
-            Box::new(NoOpCrypto),
+        let test_did = "did:test:bridge-instance-test".to_owned();
+        Supervisor::with_providers(
+            Arc::new(MlsCryptoProvider::new(test_did)),
             Box::new(LocalTransportProvider),
             Box::new(NoOpEventLog),
             key_resolver,
-        ))
+            None,
+            None,
+            None,
+            None,
+            test_mls_storage(),
+        )
     }
 
     /// Minimal no-op transport adapter for lifecycle tests.
@@ -2715,12 +2815,12 @@ mod tests {
 
     #[test]
     fn new_creates_instance_with_expected_state() {
-        let cm = test_context_manager();
-        let instance = CoreFields::with_context_manager(Arc::clone(&cm));
+        let sup = test_supervisor();
+        let instance = CoreFields::with_supervisor(Arc::clone(&sup));
 
         assert!(!instance.is_shutdown());
-        // Verify the ContextManager pointer is the same Arc
-        assert!(Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm));
+        // Verify the Supervisor pointer is the same Arc
+        assert!(Arc::ptr_eq(instance.try_supervisor().unwrap(), &sup));
         // Shared state starts empty
         assert!(!instance.has_transport());
         assert!(instance.known_contexts().is_empty());
@@ -2728,46 +2828,46 @@ mod tests {
     }
 
     #[test]
-    fn new_creates_instance_without_context_manager() {
+    fn new_creates_instance_without_supervisor() {
         // Per spec §12.2.3, BridgeInstance is infrastructure and has no DID
         // requirement — it can exist before any identity is created.
         let instance = CoreFields::new();
 
-        assert!(!instance.has_context_manager());
-        assert!(instance.try_context_manager().is_none());
+        assert!(!instance.has_supervisor());
+        assert!(instance.try_supervisor().is_none());
         assert!(!instance.is_shutdown());
     }
 
     #[test]
-    fn set_context_manager_is_idempotent_once_set() {
+    fn set_supervisor_is_idempotent_once_set() {
         let instance = CoreFields::new();
-        let cm1 = test_context_manager();
-        instance.set_context_manager(Arc::clone(&cm1));
-        assert!(Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm1));
+        let sup1 = test_supervisor();
+        instance.set_supervisor(Arc::clone(&sup1));
+        assert!(Arc::ptr_eq(instance.try_supervisor().unwrap(), &sup1));
 
         // Second set is a silent no-op (OnceLock).
-        let cm2 = test_context_manager();
-        instance.set_context_manager(Arc::clone(&cm2));
+        let sup2 = test_supervisor();
+        instance.set_supervisor(Arc::clone(&sup2));
         assert!(
-            Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm1),
-            "set_context_manager must not replace the existing CM"
+            Arc::ptr_eq(instance.try_supervisor().unwrap(), &sup1),
+            "set_supervisor must not replace the existing Supervisor"
         );
     }
 
     #[test]
-    fn shutdown_without_context_manager_is_safe() {
+    fn shutdown_without_supervisor_is_safe() {
         // Simulates the case where the bridge was partially initialized
-        // (BridgeInstance exists but identity_create / init_context_manager
+        // (BridgeInstance exists but identity_create / init_supervisor
         // never ran) and then shutdown is called.
         let instance = CoreFields::new();
-        assert!(!instance.has_context_manager());
+        assert!(!instance.has_supervisor());
         instance.shutdown();
         assert!(instance.is_shutdown());
     }
 
     #[test]
     fn shutdown_transitions_flag_permanently() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
 
         assert!(!instance.is_shutdown());
         instance.shutdown();
@@ -2779,12 +2879,12 @@ mod tests {
     }
 
     #[test]
-    fn context_manager_returns_shared_reference() {
-        let cm = test_context_manager();
-        let instance = CoreFields::with_context_manager(Arc::clone(&cm));
+    fn supervisor_returns_shared_reference() {
+        let sup = test_supervisor();
+        let instance = CoreFields::with_supervisor(Arc::clone(&sup));
 
-        // Both should point to the same ContextManager allocation
-        assert!(Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm));
+        // Both should point to the same Supervisor allocation
+        assert!(Arc::ptr_eq(instance.try_supervisor().unwrap(), &sup));
     }
 
     #[test]
@@ -2799,7 +2899,7 @@ mod tests {
 
     #[test]
     fn transport_starts_empty() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         assert!(!instance.has_transport());
         assert_eq!(
             instance.with_transport(|_| ()).unwrap_err(),
@@ -2809,7 +2909,7 @@ mod tests {
 
     #[test]
     fn clear_transport_when_empty_is_ok() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         assert!(instance.clear_transport().is_ok());
         assert!(!instance.has_transport());
     }
@@ -2820,7 +2920,7 @@ mod tests {
 
     #[test]
     fn register_and_retrieve_known_context() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let known = KnownContext {
             routing_id: [42u8; 32],
             relay_url: Some("wss://relay.example.com".to_owned()),
@@ -2839,7 +2939,7 @@ mod tests {
 
     #[test]
     fn known_contexts_for_member_filters() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.register_known_context(
             "ctx-alice",
             KnownContext {
@@ -2873,7 +2973,7 @@ mod tests {
 
     #[test]
     fn remove_known_context_works() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.register_known_context(
             "ctx-1",
             KnownContext {
@@ -2894,7 +2994,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_creates_default_on_first_access() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         assert!(instance.rate_limiters().is_empty());
 
         // Accessing a non-existent tracker creates a default one
@@ -2932,7 +3032,7 @@ mod tests {
 
     #[test]
     fn suspend_clears_transport() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -2946,7 +3046,7 @@ mod tests {
 
     #[test]
     fn suspend_is_noop_when_shutdown() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
 
         // Suspending an already-shutdown instance is a no-op (not an error)
@@ -2957,7 +3057,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_clears_suspended_flag() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
@@ -2965,9 +3065,9 @@ mod tests {
         assert!(!instance.is_suspended());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_fails_after_shutdown() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
 
         let err = instance.resume().await.unwrap_err();
@@ -2980,7 +3080,7 @@ mod tests {
 
     #[test]
     fn shutdown_is_idempotent() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Register some state
         instance.register_known_context(
@@ -3006,7 +3106,7 @@ mod tests {
 
     #[test]
     fn shutdown_clears_registries() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Populate registries
         instance.register_known_context(
@@ -3041,7 +3141,7 @@ mod tests {
 
     #[test]
     fn shutdown_clears_suspended_flag() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
@@ -3053,7 +3153,7 @@ mod tests {
 
     #[test]
     fn new_instance_is_not_suspended() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         assert!(!instance.is_suspended());
     }
 
@@ -3071,13 +3171,13 @@ mod tests {
 
     #[test]
     fn check_ready_passes_when_active() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         assert!(instance.check_ready().is_ok());
     }
 
     #[test]
     fn check_ready_fails_when_shutdown() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
         let err = instance.check_ready().unwrap_err();
         assert_eq!(err, LifecycleError::AlreadyShutDown);
@@ -3085,7 +3185,7 @@ mod tests {
 
     #[test]
     fn check_ready_fails_when_suspended() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.suspend().unwrap();
         let err = instance.check_ready().unwrap_err();
         assert_eq!(err, LifecycleError::Suspended);
@@ -3093,7 +3193,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_ready_passes_after_resume() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.suspend().unwrap();
         assert!(instance.check_ready().is_err());
         instance.resume().await.unwrap();
@@ -3102,7 +3202,7 @@ mod tests {
 
     #[test]
     fn known_contexts_cap_evicts_oldest() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Register MAX_KNOWN_CONTEXTS entries.
         for i in 0..MAX_KNOWN_CONTEXTS {
@@ -3135,7 +3235,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_cap_evicts_oldest() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Fill up to capacity.
         for i in 0..MAX_RATE_LIMITERS {
@@ -3162,7 +3262,7 @@ mod tests {
     #[test]
     fn shutdown_hooks_are_called_on_shutdown() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
 
         let counter = Arc::new(AtomicUsize::new(0));
         let c1 = Arc::clone(&counter);
@@ -3187,7 +3287,7 @@ mod tests {
     #[test]
     fn shutdown_hooks_run_only_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
 
         let counter = Arc::new(AtomicUsize::new(0));
         let c = Arc::clone(&counter);
@@ -3207,7 +3307,7 @@ mod tests {
     #[test]
     fn register_hook_after_shutdown_runs_immediately() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
 
         instance.shutdown();
 
@@ -3233,7 +3333,7 @@ mod tests {
 
     #[test]
     fn set_transport_warns_after_shutdown() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
 
         // set_transport after shutdown warns but does not error — matches
@@ -3250,7 +3350,7 @@ mod tests {
 
     #[test]
     fn set_transport_rejects_when_suspended() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.suspend().unwrap();
 
         let err = instance
@@ -3265,7 +3365,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_transport_accepts_after_resume() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.suspend().unwrap();
         instance.resume().await.unwrap();
 
@@ -3284,7 +3384,7 @@ mod tests {
     #[test]
     #[allow(clippy::panic)]
     fn register_hook_after_shutdown_catches_panic() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
 
         // A panicking hook registered after shutdown must not propagate.
@@ -3314,7 +3414,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         for _ in 0..50 {
-            let instance = Arc::new(CoreFields::with_context_manager(test_context_manager()));
+            let instance = Arc::new(CoreFields::with_supervisor(test_supervisor()));
             let fired = Arc::new(AtomicUsize::new(0));
 
             // Thread B: register several hooks concurrently with shutdown.
@@ -3357,7 +3457,7 @@ mod tests {
     fn shutdown_hook_modifies_external_state() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let state = Arc::new(AtomicBool::new(false));
         let state2 = Arc::clone(&state);
 
@@ -3384,7 +3484,7 @@ mod tests {
     fn multiple_hooks_all_run_even_if_one_panics() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let counter = Arc::new(AtomicUsize::new(0));
         let c1 = Arc::clone(&counter);
         let c3 = Arc::clone(&counter);
@@ -3418,7 +3518,7 @@ mod tests {
 
     #[test]
     fn economy_budget_creates_default_on_first_access() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let remaining = instance.with_economy_budget("ctx-1", |tracker| {
             tracker.remaining(&scp_primitives::DID::from("did:dht:zalice"))
         });
@@ -3427,7 +3527,7 @@ mod tests {
 
     #[test]
     fn economy_budget_mut_grants_and_reads() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let did = scp_primitives::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-eco", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(500));
@@ -3438,7 +3538,7 @@ mod tests {
 
     #[test]
     fn economy_antispam_creates_default_on_first_access() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let did = scp_primitives::DID::from("did:dht:zbob");
         let velocity =
             instance.with_economy_antispam("ctx-spam", |tracker| tracker.get_velocity(&did, 1000));
@@ -3447,7 +3547,7 @@ mod tests {
 
     #[test]
     fn remove_economy_state_clears_both() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let did = scp_primitives::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-rm", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(100));
@@ -3465,7 +3565,7 @@ mod tests {
 
     #[test]
     fn economy_existing_context_id_bypasses_capacity_check() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let did = scp_primitives::DID::from("did:dht:zalice");
 
         // Create one entry.
@@ -3486,7 +3586,7 @@ mod tests {
 
     #[test]
     fn economy_accessors_use_ephemeral_after_shutdown() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let did = scp_primitives::DID::from("did:dht:zalice");
 
         // Grant a budget before shutdown.
@@ -3535,7 +3635,7 @@ mod tests {
 
     #[test]
     fn bridge_state_starts_empty() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         assert!(instance.bridge_state().is_empty());
     }
 
@@ -3544,7 +3644,7 @@ mod tests {
         use scp_protocol::bridge::shadow::ShadowRegistry;
         use scp_protocol::crypto::sender_keys::SenderKeyStore;
 
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.bridge_state().insert(
             "ctx-bs".to_owned(),
             BridgeContextState {
@@ -3564,7 +3664,7 @@ mod tests {
 
     #[test]
     fn did_resolver_starts_none() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         assert!(instance.did_resolver().is_none());
     }
 
@@ -3577,7 +3677,7 @@ mod tests {
         use scp_protocol::bridge::shadow::ShadowRegistry;
         use scp_protocol::crypto::sender_keys::SenderKeyStore;
 
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Populate economy
         let did = scp_primitives::DID::from("did:dht:zalice");
@@ -3609,7 +3709,7 @@ mod tests {
 
     #[test]
     fn new_instance_has_no_persistence() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         assert!(
             instance.persistence().is_none(),
             "new() must not have a persistence provider"
@@ -3622,7 +3722,7 @@ mod tests {
 
         let persistence = Box::new(InMemoryPersistence::new());
         let instance = CoreFields::with_persistence(persistence);
-        instance.set_context_manager(test_context_manager());
+        instance.set_supervisor(test_supervisor());
         assert!(
             instance.persistence().is_some(),
             "with_persistence() must set the persistence provider"
@@ -3635,14 +3735,14 @@ mod tests {
 
     #[test]
     fn pending_relay_urls_is_empty_by_default() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         assert!(instance.pending_relay_urls().is_empty());
         assert!(!instance.has_pending_relay_urls());
     }
 
     #[test]
     fn add_relay_url_stores_urls() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.add_relay_url("wss://relay1.example.com".to_owned());
         instance.add_relay_url("wss://relay2.example.com".to_owned());
         let urls = instance.pending_relay_urls();
@@ -3653,7 +3753,7 @@ mod tests {
 
     #[test]
     fn add_relay_url_deduplicates() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.add_relay_url("wss://relay.example.com".to_owned());
         instance.add_relay_url("wss://relay.example.com".to_owned());
         assert_eq!(instance.pending_relay_urls().len(), 1);
@@ -3661,7 +3761,7 @@ mod tests {
 
     #[test]
     fn remove_relay_url_drops_entry() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.add_relay_url("wss://relay1.example.com".to_owned());
         instance.add_relay_url("wss://relay2.example.com".to_owned());
         instance.remove_relay_url("wss://relay1.example.com");
@@ -3672,7 +3772,7 @@ mod tests {
 
     #[test]
     fn add_relay_url_after_shutdown_is_noop() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
         instance.add_relay_url("wss://relay.example.com".to_owned());
         assert!(
@@ -3698,7 +3798,7 @@ mod tests {
         // joins both, and asserts the post-shutdown URL set is empty.
         use std::thread;
         for trial in 0..50 {
-            let instance = Arc::new(CoreFields::with_context_manager(test_context_manager()));
+            let instance = Arc::new(CoreFields::with_supervisor(test_supervisor()));
             let writer_instance = Arc::clone(&instance);
             let writer = thread::spawn(move || {
                 for i in 0..100 {
@@ -3722,7 +3822,7 @@ mod tests {
 
     #[test]
     fn clear_transport_preserves_relay_urls() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -3740,7 +3840,7 @@ mod tests {
 
     #[test]
     fn suspend_preserves_relay_urls() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -3757,7 +3857,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_transport_if_pending_is_noop_when_empty() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         // No URLs registered — should return Ok(()) without touching
         // the transport.
         assert!(
@@ -3766,9 +3866,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconnect_transport_if_pending_rejects_after_shutdown() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.add_relay_url("wss://relay.example.com".to_owned());
         instance.shutdown();
         let result = instance.reconnect_transport_if_pending().await;
@@ -3791,8 +3891,7 @@ mod tests {
         // connect timeout, giving us a window to cancel.
         use std::time::Duration;
 
-        let instance =
-            std::sync::Arc::new(CoreFields::with_context_manager(test_context_manager()));
+        let instance = std::sync::Arc::new(CoreFields::with_supervisor(test_supervisor()));
         // Reserved TEST-NET-1 address (RFC 5737) with a closed port —
         // `connect_sourced` stalls until the profile's handshake timeout.
         let unreachable = "ws://192.0.2.1:1/".to_owned();
@@ -3834,15 +3933,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_in_flight_reconnect_dial() {
         // #1696: `shutdown()` must also cancel a pending reconnect.
         // Same dynamics as the suspend variant — uses the same TEST-NET-1
         // unreachable target to keep the dial in-flight.
         use std::time::Duration;
 
-        let instance =
-            std::sync::Arc::new(CoreFields::with_context_manager(test_context_manager()));
+        let instance = std::sync::Arc::new(CoreFields::with_supervisor(test_supervisor()));
         let unreachable = "ws://192.0.2.1:1/".to_owned();
         instance.add_relay_url(unreachable);
 
@@ -3874,7 +3972,7 @@ mod tests {
         // scope rather than inheriting an already-cancelled one. Without
         // rotation, every reconnect after the first suspend would short-
         // circuit on the cancellation branch.
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let token_before = instance.reconnect_cancel_token();
         assert!(!token_before.is_cancelled());
 
@@ -3898,7 +3996,7 @@ mod tests {
         // All pending URLs point at unreachable hosts. The function must
         // return a ReconnectFailed error (not panic, not silently succeed)
         // and the URL must remain in the pending set so callers can retry.
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         // Reserved TEST-NET-1 address (RFC 5737) with a closed port.
         let unreachable = "ws://192.0.2.1:1/".to_owned();
         instance.add_relay_url(unreachable.clone());
@@ -3928,7 +4026,7 @@ mod tests {
     // loop, this deadline trips.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconnect_transport_if_pending_dials_urls_in_parallel() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         // Three reserved TEST-NET-1 addresses, different ports — each
         // unroutable and distinct, so the OS cannot coalesce.
         for port in [10_000_u16, 10_001, 10_002] {
@@ -3961,7 +4059,7 @@ mod tests {
     async fn relay_urls_survive_suspend_resume_cycle() {
         // Multiple relay URLs must survive suspend/resume so callers can
         // reconnect to every one of them after resume.
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -3983,7 +4081,7 @@ mod tests {
 
     #[test]
     fn shutdown_clears_relay_urls() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.add_relay_url("wss://relay.example.com".to_owned());
         assert!(instance.has_pending_relay_urls());
 
@@ -4002,17 +4100,17 @@ mod tests {
     fn two_instances_are_independent() {
         // BridgeInstances are containers — they carry no DID of their own
         // (spec §12.2.3). The DID belongs to the `MlsCryptoProvider` inside
-        // each `ContextManager`. Two instances with distinct CMs must be
-        // independently shut-down-able.
-        let cm1 = test_context_manager();
-        let cm2 = test_context_manager();
-        let bi1 = CoreFields::with_context_manager(Arc::clone(&cm1));
-        let bi2 = CoreFields::with_context_manager(Arc::clone(&cm2));
+        // each `Supervisor`'s attached manager. Two instances with distinct
+        // supervisors must be independently shut-down-able.
+        let sup1 = test_supervisor();
+        let sup2 = test_supervisor();
+        let bi1 = CoreFields::with_supervisor(Arc::clone(&sup1));
+        let bi2 = CoreFields::with_supervisor(Arc::clone(&sup2));
 
-        // Their ContextManager allocations are distinct.
+        // Their Supervisor allocations are distinct.
         assert!(!Arc::ptr_eq(
-            bi1.try_context_manager().unwrap(),
-            bi2.try_context_manager().unwrap()
+            bi1.try_supervisor().unwrap(),
+            bi2.try_supervisor().unwrap()
         ));
 
         // Shutting down one does not affect the other.
@@ -4040,22 +4138,30 @@ mod tests {
         use std::sync::Arc;
 
         let persistence = Arc::new(InMemoryPersistence::new());
-        let persistence_for_cm = Box::new(InMemoryPersistence::new());
+        let persistence_for_supervisor: Box<dyn ContextPersistence> =
+            Box::new(InMemoryPersistence::new());
         let persistence_for_instance: Box<dyn ContextPersistence + Send + Sync> =
             Box::new(InMemoryPersistence::new());
 
-        // Build a ContextManager with persistence.
+        // Build the Supervisor directly through `with_providers` (ADR-049
+        // commit 12c.9g.3.6 — the FFI layer no longer touches
+        // `ContextManager`). The supervisor populates its lifted-
+        // provider slots and the manager attachment internally.
         let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
-        let cm = Arc::new(ContextManager::with_persistence(
-            Box::new(NoOpCrypto),
+        let supervisor = Supervisor::with_providers(
+            Arc::new(MlsCryptoProvider::new("did:test:suspend-flush".to_owned())),
             Box::new(scp_core::context::LocalTransportProvider),
             Box::new(NoOpEventLog),
-            persistence_for_cm,
             key_resolver,
-        ));
+            Some(persistence_for_supervisor),
+            None,
+            None,
+            None,
+            test_mls_storage(),
+        );
 
         let instance = CoreFields::with_persistence(persistence_for_instance);
-        instance.set_context_manager(cm);
+        instance.set_supervisor(supervisor);
 
         // Verify the persistence accessor returns Some.
         assert!(instance.persistence().is_some());
@@ -4076,7 +4182,7 @@ mod tests {
 
         // Suppress the unused `persistence` warning — it was only used to
         // verify the Arc::new pattern compiles; the real persistence is
-        // inside the ContextManager.
+        // owned by the Supervisor through the manager it holds internally.
         let _ = persistence;
     }
 
@@ -4086,10 +4192,10 @@ mod tests {
 
     #[test]
     fn two_instances_operate_concurrently() {
-        let cm1 = test_context_manager();
-        let cm2 = test_context_manager();
-        let bi1 = CoreFields::with_context_manager(Arc::clone(&cm1));
-        let bi2 = CoreFields::with_context_manager(Arc::clone(&cm2));
+        let sup1 = test_supervisor();
+        let sup2 = test_supervisor();
+        let bi1 = CoreFields::with_supervisor(Arc::clone(&sup1));
+        let bi2 = CoreFields::with_supervisor(Arc::clone(&sup2));
 
         // Register known contexts independently.
         bi1.register_known_context(
@@ -4268,7 +4374,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_core_async_graceful_when_no_tasks() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let outcome = instance
             .shutdown_core_async(Duration::from_secs(1))
             .await
@@ -4287,7 +4393,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_core_async_times_out_with_long_task() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         {
             let mut tasks = instance.task_handle().await;
             tasks.spawn(async move {
@@ -4323,7 +4429,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_core_async_fires_cancellation_token() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let observed = Arc::new(AtomicBool::new(false));
         let observed_clone = Arc::clone(&observed);
         let token = instance.cancel_token();
@@ -4353,7 +4459,7 @@ mod tests {
     async fn shutdown_core_async_counts_panicked_tasks() {
         // Spawn a task that panics quickly — the drain should observe it
         // and surface the count in `GracefulWithin.panicked_tasks`.
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         {
             let mut tasks = instance.task_handle().await;
             tasks.spawn(async move {
@@ -4383,7 +4489,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_core_async_runs_hooks_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = Arc::clone(&counter);
         instance.register_shutdown_hook(Box::new(move || {
@@ -4399,7 +4505,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_core_async_is_idempotent() {
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         let first = instance
             .shutdown_core_async(Duration::from_secs(1))
             .await
@@ -4413,12 +4519,12 @@ mod tests {
         assert_eq!(err, ShutdownError::AlreadyShutDown);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_core_async_after_sync_shutdown_errors() {
         // The sync `shutdown()` path also flips the idempotent flag, so the
         // async variant must report AlreadyShutDown afterwards — callers
         // get a single source of truth for "is already terminated?"
-        let instance = CoreFields::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
         let err = instance
             .shutdown_core_async(Duration::from_secs(1))
@@ -4443,11 +4549,11 @@ mod tests {
         fn core(&self) -> &CoreFields {
             &self.core
         }
-        async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-            let outcome = self.core.shutdown_core_async(timeout).await?;
-            self.bridge_specific_shutdown();
-            Ok(outcome)
-        }
+        // `shutdown` inherits the trait default (landed in commit 6 of
+        // ADR-049): `self.core().shutdown_core_async(timeout).await +
+        // self.bridge_specific_shutdown()`. Overriding it here would
+        // diverge from production behavior and be caught by the
+        // cross-bridge consistency gate.
     }
 
     #[test]
@@ -4465,7 +4571,7 @@ mod tests {
     #[tokio::test]
     async fn trait_shutdown_delegates_to_core() {
         let bridge = TestBridge {
-            core: CoreFields::with_context_manager(test_context_manager()),
+            core: CoreFields::with_supervisor(test_supervisor()),
         };
         let outcome = bridge.shutdown(Duration::from_secs(1)).await.unwrap();
         assert!(matches!(outcome, ShutdownOutcome::GracefulWithin { .. }));

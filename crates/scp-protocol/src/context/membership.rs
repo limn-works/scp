@@ -751,7 +751,7 @@ pub enum ContextEvent {
     /// Relay equivocation detected: a remote checkpoint reports the same event
     /// count but a different Merkle root (§9.9.3, ADR-011 AC-8).
     ///
-    /// Emitted by [`super::super::ContextManager::compare_remote_checkpoint`]
+    /// Emitted by the runtime's `compare_remote_checkpoint` flow
     /// when the comparison returns [`scp_event_log::checkpoint::CheckpointComparison::Divergent`].
     /// The relay is showing different histories to different members.
     EquivocationDetected {
@@ -769,7 +769,7 @@ pub enum ContextEvent {
     /// Once this event fires, subsequent context-mutating operations on the
     /// context will return `ContextError::CommitBroadcastFault` until an
     /// operator clears the marker via
-    /// [`super::super::ContextManager::acknowledge_commit_fault`].
+    /// the runtime's `acknowledge_commit_fault` operation.
     /// SDK consumers MUST surface this prominently — local state has
     /// permanently diverged from any peers that never received the commit.
     CommitBroadcastFailed {

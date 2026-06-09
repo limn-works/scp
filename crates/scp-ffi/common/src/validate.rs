@@ -647,7 +647,7 @@ pub fn validate_payment_adapter_ref(adapter_ref: &str) -> Result<(), ValidationE
 // Governance action string validation (#1601)
 // ---------------------------------------------------------------------------
 
-/// Validates all user-controlled string fields on a [`GovernanceAction`].
+/// Validates all user-controlled string fields on a `GovernanceAction`.
 ///
 /// Called from all FFI bridge `governance_propose` functions after JSON
 /// deserialization and before passing the action to the `ContextManager`.

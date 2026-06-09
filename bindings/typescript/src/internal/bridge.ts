@@ -572,6 +572,7 @@ export interface Bridge {
     floor: number | null,
     cap: number | null,
   ): number;
+  economyVerifyPaymentReceipts(receiptsJson: string): string;
 
   // Media (ADR-024)
   mediaCheckCapability(ceiling: string[], capability: string): boolean;

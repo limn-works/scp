@@ -77,25 +77,22 @@ impl Scp {
 
     /// Constructs an `SCP` instance with a storage configuration.
     ///
-    /// `StorageConfig::Sqlite` opens a `SQLCipher`-encrypted database at
-    /// `{path}/scp.db` via [`scp_platform::sqlite::SqliteStorage`].
+    /// `StorageConfig::InMemory` selects the encrypted in-memory dev/test
+    /// backend; `StorageConfig::Sqlite { path, key }` selects a
+    /// `SQLCipher`-encrypted database, where `key` is either raw key material
+    /// or a passphrase (Argon2id; spec §17.6).
     ///
     /// # Errors
     ///
-    /// Returns [`ScpError::Validation`] with code `SCP-VALID-7005` if the
-    /// `SQLite` database cannot be opened (bad key, permission denied,
-    /// corrupt file). Previously this condition logged an error and
-    /// silently fell back to an in-memory instance — a split-brain that
-    /// produced a working-looking `Scp` whose writes vanished on drop.
+    /// FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
+    /// opened — bad key/passphrase, permission denied, corrupt file, or a
+    /// salt-sidecar fail-closed condition — this returns `ScpError::Context`
+    /// rather than silently degrading to in-memory storage. Surfaces to Swift
+    /// as `throws` and Kotlin as a thrown exception.
     #[uniffi::constructor]
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_storage(config: StorageConfig) -> Result<Arc<Self>, ScpError> {
-        let inner = UniffiBridgeInstance::with_storage_uniffi(config).map_err(|e| {
-            ScpError::Validation {
-                msg: e.to_string(),
-                code: codes::VALID_7005.to_owned(),
-            }
-        })?;
+        let inner = UniffiBridgeInstance::with_storage_uniffi(config)?;
         increment_handle_count();
         Ok(Arc::new(Self {
             inner: Arc::new(inner),

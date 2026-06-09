@@ -1,7 +1,7 @@
-//! Production provider implementations for [`ContextManager`].
+//! Production provider implementations for `ContextManager`.
 //!
 //! These providers wrap the real SCP crypto, event log, and persistence
-//! subsystems, allowing [`ContextManager`] to operate outside of tests.
+//! subsystems, allowing `ContextManager` to operate outside of tests.
 //!
 //! - [`MlsCryptoProvider`] — Production `ContextCryptoProvider` backed by
 //!   `OpenMLS` with HPKE sender key distribution, nonce deduplication, and
@@ -15,8 +15,6 @@
 //!
 //! The transport provider (`RelayTransportProvider`) lives in `scp-transport`
 //! because it wraps `NativeRelayAdapter`.
-//!
-//! [`ContextManager`]: super::manager::ContextManager
 
 pub mod event_log;
 pub mod persistence;

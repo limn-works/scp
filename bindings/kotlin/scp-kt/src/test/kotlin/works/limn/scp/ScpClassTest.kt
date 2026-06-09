@@ -18,6 +18,7 @@
 package works.limn.scp
 
 import java.nio.file.Files
+import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
@@ -164,5 +165,23 @@ class ScpClassTest {
                 "SCP() must allocate fresh instances, not reuse a cached handle",
             )
             second.shutdown(bridge(), 1.seconds)
+        }
+
+    // ── economy verify-payment-receipts (suspend, real UniFFI bridge) ──
+
+    @Test
+    fun `economyVerifyPaymentReceipts returns a results document for an empty batch`() =
+        runBlocking {
+            // The verify-payment-receipts path dispatches an
+            // EconomyCommand to the supervisor, so a supervisor must be
+            // attached first (mirrors the reference Rust test, which calls
+            // configure_local_transport before the empty-batch call). An
+            // empty receipt batch needs no payment adapter, so it is the
+            // clean happy path once the supervisor is attached — the bridge
+            // returns `{"all_valid":true,"results":[]}` (all_valid is
+            // vacuously true for an empty batch).
+            scp.configureLocalTransport("did:key:z6MkKotlinVerifyReceiptsEmptyTest")
+            val out = scp.economyVerifyPaymentReceipts("[]")
+            assertEquals("{\"all_valid\":true,\"results\":[]}", out)
         }
 }

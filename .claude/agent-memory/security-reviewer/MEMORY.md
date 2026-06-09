@@ -2,6 +2,14 @@
 
 ## SCP Codebase Security Patterns
 
+### PyO3 Passphrase Storage + Redacting Debug (ed6290851, actor-per-context) -- 2026-06-04
+- See `pyo3-passphrase-storage-ed6290851.md`. CLEAN, no findings. Fail-closed passphrase path,
+  exactly-one-of key/passphrase, hand-written redacting Debug on all 3 bridges, dev-affordance
+  gated on storage_provider().is_none(), capability matrix notes-only. with_passphrase lives only
+  in scp-platform/src/sqlite/mod.rs (fails closed: no salt regen beside existing DB).
+- GOTCHA: Bash cwd resets; `cd /Users/alec/Developer/limn/scp` = MAIN worktree, not actor-per-context.
+  Use the worktree path or `git show <sha>:<file>`.
+
 ### Adversarial Review (PR#4) -- Black Hat Findings
 - See `/tmp/black-hat-review.md` and PR#4 comment for full details
 - Key themes: relay metadata surveillance, missing auth guards, no rate limiting, schema bypass, Sybil weakness

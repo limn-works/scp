@@ -56,24 +56,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
 
 use dashmap::DashMap;
-use scp_core::context::ContextError;
 use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
-use scp_core::context::manager::{ContextManager, ContextPersistence};
+use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::providers::{
     MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
 };
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
+use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
-use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError, ShutdownOutcome};
+use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `pyscp_check_handle!` macro can refer to it as
 // `$crate::runtime::CoreFields`.
@@ -164,7 +163,9 @@ pub type ToolHandler =
 /// Returns `ScpPyError::ContextError` if the `ContextManager` has not been
 /// attached to the instance yet (i.e., `init_context_manager` has not been
 /// called), or if the bridge is currently suspended.
-pub fn context_manager(bi: &PyBridgeInstance) -> Result<&Arc<ContextManager>, ScpPyError> {
+pub fn supervisor(
+    bi: &PyBridgeInstance,
+) -> Result<&Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
     // Suspended: return error (recoverable — caller should call resume()).
     // AlreadyShutDown: warn only. Shutdown already destroyed MLS groups,
     // cleared registries, and disconnected transport — operations will fail
@@ -178,7 +179,7 @@ pub fn context_manager(bi: &PyBridgeInstance) -> Result<&Arc<ContextManager>, Sc
     if bi.core.is_shutdown() {
         tracing::warn!("context_manager() called after shutdown — operations may fail");
     }
-    bi.core.try_context_manager().ok_or_else(|| {
+    bi.core.try_supervisor().ok_or_else(|| {
         ScpPyError::context(
             "ContextManager not yet attached — call py_context_create, \
              py_context_join, py_context_import, or init_context_manager first"
@@ -191,14 +192,56 @@ pub fn context_manager(bi: &PyBridgeInstance) -> Result<&Arc<ContextManager>, Sc
 // PyBridgeInstance (per-bridge concrete struct wrapping CoreFields — #1549 Phase 4)
 // ---------------------------------------------------------------------------
 
+/// `SQLCipher` key-material selector for [`StorageConfig::Sqlite`] (spec §17.6).
+///
+/// The caller supplies EITHER raw key material OR a passphrase — never both,
+/// never neither. The sum type makes that mutual exclusion unrepresentable as
+/// an invalid state: there is exactly one happy path per variant. Both forms
+/// are wrapped in [`Zeroizing`] so they are wiped from memory on drop. This
+/// mirrors the `NAPI` and `UniFFI` bridges' `SqliteKeyMaterial`.
+///
+/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+///   mode; the existing, unchanged path).
+/// - [`SqliteKeyMaterial::Passphrase`] feeds
+///   [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+///   key from the passphrase via the shared Argon2id parameterization with a
+///   persisted per-database salt sidecar.
+///
+/// Does NOT derive `Debug`: a custom redacting [`std::fmt::Debug`] impl keeps
+/// the key/passphrase bytes out of logs and panic messages (defense in depth).
+#[derive(Clone)]
+pub enum SqliteKeyMaterial {
+    /// Raw encryption key material (32 bytes recommended).
+    Raw(Zeroizing<Vec<u8>>),
+    /// Human-chosen passphrase; the `SQLCipher` key is derived via Argon2id.
+    Passphrase(Zeroizing<String>),
+}
+
+impl std::fmt::Debug for SqliteKeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the key or passphrase bytes — only the variant and a
+        // length hint for the raw case. Mirrors the NAPI/UniFFI redacting impl.
+        match self {
+            Self::Raw(bytes) => {
+                write!(
+                    f,
+                    "SqliteKeyMaterial::Raw(<redacted {} bytes>)",
+                    bytes.len()
+                )
+            }
+            Self::Passphrase(_) => write!(f, "SqliteKeyMaterial::Passphrase(<redacted>)"),
+        }
+    }
+}
+
 /// Storage configuration selector for [`PyBridgeInstance::with_storage_py`].
 ///
 /// Two variants are supported:
 /// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
 /// - [`StorageConfig::Sqlite`] — persistent SQLCipher-encrypted storage on
-///   disk. The `key` is the raw encryption key material held in
-///   [`Zeroizing`] so it is wiped from memory as soon as the config is
-///   consumed.
+///   disk. The key material is a [`SqliteKeyMaterial`]: EITHER raw key bytes
+///   (`key`) OR a passphrase (`passphrase`), each held in [`Zeroizing`] so it
+///   is wiped from memory as soon as the config is consumed.
 ///
 /// Keeping this as an enum (instead of a string parameter) means adding future
 /// variants is an additional arm, not a breaking API change.
@@ -209,13 +252,15 @@ pub enum StorageConfig {
     /// SQLCipher-encrypted storage at `{path}/scp.db`.
     ///
     /// Wraps [`scp_platform::sqlite::SqliteStorage`]. Persists across
-    /// process restarts. The `key` is raw encryption key material wrapped in
-    /// [`Zeroizing`] so the caller's copy is wiped after construction.
+    /// process restarts. The `key` selects raw-key vs. passphrase derivation
+    /// via [`SqliteKeyMaterial`]; both forms are wrapped in [`Zeroizing`] so
+    /// the caller's copy is wiped after construction.
     Sqlite {
         /// Directory the database file is created in.
         path: PathBuf,
-        /// Raw encryption key material (32 bytes recommended).
-        key: Zeroizing<Vec<u8>>,
+        /// Raw key material or passphrase (exactly one — see
+        /// [`SqliteKeyMaterial`]).
+        key: SqliteKeyMaterial,
     },
 }
 
@@ -524,11 +569,25 @@ impl PyBridgeInstance {
                 // draft called `SqliteStorage::new` twice (once for the
                 // provider, once for the persistence bridge) and hit
                 // `SQLITE_BUSY` the moment both tried to write.
-                let storage = SqliteStorage::new(&path, &key).map_err(|e| {
+                //
+                // Raw-key mode feeds `SqliteStorage::new`; passphrase mode feeds
+                // `SqliteStorage::with_passphrase` (Argon2id key derivation with
+                // a persisted per-database salt sidecar). Both share the same
+                // single-open / shared-`Arc` / fail-closed contract below.
+                let open_result = match &key {
+                    SqliteKeyMaterial::Raw(bytes) => SqliteStorage::new(&path, bytes),
+                    SqliteKeyMaterial::Passphrase(pass) => {
+                        SqliteStorage::with_passphrase(&path, pass.as_bytes())
+                    }
+                };
+                let storage = open_result.map_err(|e| {
+                    // FAIL CLOSED (spec §17.6): surface the error rather than
+                    // degrading to in-memory. No silent fallback. The error
+                    // message never carries key or passphrase bytes.
                     tracing::error!(
                         error = %e,
                         path = %path.display(),
-                        "with_storage_py: SqliteStorage::new failed — returning error to caller"
+                        "with_storage_py: SQLCipher open failed — returning error to caller, no in-memory fallback"
                     );
                     StorageInitError::SqliteOpen {
                         path: path.display().to_string(),
@@ -558,10 +617,10 @@ impl PyBridgeInstance {
                 let _ = instance
                     .storage_provider
                     .set(StorageProvider::Sqlite(arc_storage));
-                // `key` is `Zeroizing<Vec<u8>>`, zeroed on drop here.
-                // SQLCipher has already retained its derived key
-                // internally, so the caller's key material is safe
-                // to wipe at this point.
+                // `key` is a `SqliteKeyMaterial` wrapping `Zeroizing` raw
+                // bytes or passphrase, zeroed on drop here. SQLCipher has
+                // already retained its derived key internally, so the caller's
+                // key material is safe to wipe at this point.
                 drop(key);
                 Ok(instance)
             }
@@ -580,8 +639,8 @@ impl PyBridgeInstance {
     /// [`CoreFields::try_context_manager`]. Returns `None` until
     /// `init_context_manager` (or one of its variants) has been called.
     #[must_use]
-    pub fn try_context_manager(&self) -> Option<&Arc<ContextManager>> {
-        self.core.try_context_manager()
+    pub fn try_supervisor(&self) -> Option<&Arc<scp_core::context::supervisor::Supervisor>> {
+        self.core.try_supervisor()
     }
 
     /// Returns a reference to the storage provider if initialized.
@@ -654,34 +713,6 @@ impl PyBridgeInstance {
 impl BridgeInstanceCore for PyBridgeInstance {
     fn core(&self) -> &CoreFields {
         &self.core
-    }
-
-    /// `PyO3`-specific resume: flag flip, then transport reconnect, then
-    /// persisted-context restore.
-    ///
-    /// Mirrors the NAPI / `UniFFI` overrides so the Python SDK sees the
-    /// same resume semantics as the other bridges.
-    async fn resume(&self) -> Result<(), scp_ffi_common::bridge_instance::LifecycleError> {
-        self.core.resume().await?;
-        // Reconnect transport BEFORE rehydrating persisted contexts so
-        // restored subscriptions can attach to a live relay connection.
-        self.core.reconnect_transport_if_pending().await?;
-        self.core.restore_all_persisted_contexts().await;
-        Ok(())
-    }
-
-    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-        // Drain async tasks first (respects timeout + cancellation token),
-        // then run bridge-specific cleanup (clears typed fields).
-        //
-        // `bridge_specific_shutdown` MUST run even when
-        // `shutdown_core_async` returns `AlreadyShutDown` — that variant
-        // signals the sync shutdown path raced ahead; without the cleanup
-        // call, typed PyO3 registries (identity, MCP, FFI bridge state)
-        // leak key material past shutdown.
-        let result = self.core.shutdown_core_async(timeout).await;
-        self.bridge_specific_shutdown();
-        result
     }
 
     fn bridge_specific_shutdown(&self) {
@@ -787,7 +818,7 @@ impl Drop for PyBridgeInstance {
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 /// If the manager is already initialized with a different DID, a warning is logged.
 pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         tracing::debug!(
             requested_did = %local_did,
             "init_context_manager: ContextManager already attached — using existing instance"
@@ -796,16 +827,23 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
     }
 
     let did = local_did.to_owned();
-    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let persistence = build_persistence_provider(bi);
-    let cm_arc = build_context_manager(
+    let supervisor_arc = match build_supervisor(
+        bi,
         crypto,
         Box::new(NotConfiguredTransportProvider),
         build_event_log_provider(bi),
         persistence,
-    );
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "init_context_manager: build_supervisor failed");
+            return;
+        }
+    };
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
 /// Initializes the global [`ContextManager`] with custom providers.
@@ -819,7 +857,7 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
 pub fn init_context_manager_with(
     bi: &PyBridgeInstance,
     _local_did: &str,
-    crypto: Box<dyn ContextCryptoProvider>,
+    crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
@@ -827,12 +865,18 @@ pub fn init_context_manager_with(
     // `_local_did` is retained in the signature for API stability: callers
     // construct `crypto` with the DID before calling into this function
     // (it is the `MlsCryptoProvider` that carries the DID; see spec §12.2.3).
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         return;
     }
     let persistence = persistence.or_else(|| build_persistence_provider(bi));
-    let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
-    bi.core.set_context_manager(cm_arc);
+    let supervisor_arc = match build_supervisor(bi, crypto, transport, event_log, persistence) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "init_context_manager_with: build_supervisor failed");
+            return;
+        }
+    };
+    bi.core.set_supervisor(supervisor_arc);
 }
 
 /// Initializes the given bridge instance's [`ContextManager`] with a
@@ -855,24 +899,42 @@ pub fn init_context_manager_with(
 ///
 /// No-op if the bridge already has a `ContextManager` attached.
 pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_did: &str) {
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         tracing::warn!(
             requested_did = %local_did,
             "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
         );
         return;
     }
+    // The supervisor's `mls_storage` consumer requires a single Storage
+    // handle (storage-before-supervisor precondition, spec §17.6). Test
+    // instances built via `new_py()` carry no storage, so the bridge layer
+    // makes the explicit in-memory dev-affordance selection here when none
+    // was set. The runtime core itself never defaults storage — this is a
+    // bridge-layer choice. A no-op if a provider is already set (`OnceLock`).
+    if bi.storage_provider().is_none() {
+        let _ = bi
+            .storage_provider
+            .set(StorageProvider::new_in_memory_encrypted());
+    }
     let did = local_did.to_owned();
-    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let persistence = build_persistence_provider(bi);
-    let cm_arc = build_context_manager(
+    let supervisor_arc = match build_supervisor(
+        bi,
         crypto,
         Box::new(scp_core::context::LocalTransportProvider),
         build_event_log_provider(bi),
         persistence,
-    );
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "init_context_manager_with_local_transport: build_supervisor failed");
+            return;
+        }
+    };
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
 /// Test variant of [`init_context_manager`] that uses `LocalTransportProvider`
@@ -886,18 +948,39 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
 /// Not behind `#[cfg(test)]` because integration tests (`tests/e2e_bridge.rs`)
 /// compile as separate crates and need access to this function.
 pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         return;
     }
+    // The supervisor's `mls_storage` consumer requires a single Storage
+    // handle (storage-before-supervisor precondition, spec §17.6). Test
+    // instances built via `new_py()` carry no storage, so the bridge layer
+    // makes the explicit in-memory dev-affordance selection here when none
+    // was set. The runtime core itself never defaults storage — this is a
+    // bridge-layer choice. A no-op if a provider is already set (`OnceLock`).
+    if bi.storage_provider().is_none() {
+        let _ = bi
+            .storage_provider
+            .set(StorageProvider::new_in_memory_encrypted());
+    }
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        "did:test:pyo3-bridge-test".to_owned(),
+    ));
     let persistence = build_persistence_provider(bi);
-    let cm_arc = build_context_manager(
-        Box::new(NoOpCryptoProvider),
+    let supervisor_arc = match build_supervisor(
+        bi,
+        crypto,
         Box::new(scp_core::context::LocalTransportProvider),
         build_event_log_provider(bi),
         persistence,
-    );
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "init_context_manager_for_test: build_supervisor failed");
+            return;
+        }
+    };
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
 /// Constructs a [`ProtocolRepositoryContextBridge`] from the bridge's storage
@@ -962,7 +1045,7 @@ impl ContextPersistence for ArcContextPersistence {
     fn persist_context(
         &self,
         context_id: &str,
-        snapshot: &scp_core::context::manager::ContextSnapshot,
+        snapshot: &scp_core::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.persist_context(context_id, snapshot)
     }
@@ -971,7 +1054,7 @@ impl ContextPersistence for ArcContextPersistence {
         &self,
         context_id: &str,
     ) -> Result<
-        Option<scp_core::context::manager::ContextSnapshot>,
+        Option<scp_core::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         self.inner.load_context(context_id)
@@ -1051,28 +1134,77 @@ fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogPro
     }
 }
 
-/// Constructs a `ContextManager` with or without persistence.
-fn build_context_manager(
-    crypto: Box<dyn ContextCryptoProvider>,
+/// Constructs a fresh per-instance `Supervisor` with the given providers.
+///
+/// ADR-049 — the FFI bridge no longer touches `ContextManager` at all.
+/// `Supervisor::with_providers` is the single entry point that constructs the
+/// supervisor + populates the lifted-provider slots. The supervisor is the
+/// only handle returned to the bridge layer.
+///
+/// The supervisor's `mls_storage` consumer (the `OpenMLS` storage view) is
+/// derived from the bridge instance's single chosen Storage:
+/// `storage_provider()` is wrapped ONCE via `SpawnBlockingStorageAdapter` into
+/// an `Arc<dyn OpenMlsStorageAdapter>`. This is the same `StorageProvider` that
+/// backs persistence and the event log, so all three consumers share one
+/// backend (spec §17.6).
+///
+/// # Errors
+///
+/// Returns a [`ScpPyError::ContextError`] if the bridge instance has no
+/// storage provider set (storage-before-supervisor precondition). The runtime
+/// never defaults storage; the caller (bridge layer) must supply it first.
+fn build_supervisor(
+    bi: &PyBridgeInstance,
+    crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
-) -> Arc<ContextManager> {
-    match persistence {
-        Some(p) => Arc::new(ContextManager::with_persistence(
-            crypto,
-            transport,
-            event_log,
-            p,
-            not_configured_key_resolver(),
-        )),
-        None => Arc::new(ContextManager::new(
-            crypto,
-            transport,
-            event_log,
-            not_configured_key_resolver(),
-        )),
-    }
+) -> Result<Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
+    let mls_storage = derive_mls_storage(bi)?;
+    Ok(scp_core::context::supervisor::Supervisor::with_providers(
+        crypto,
+        transport,
+        event_log,
+        not_configured_key_resolver(),
+        persistence,
+        None,
+        None,
+        None,
+        mls_storage,
+    ))
+}
+
+/// Derives the supervisor's `OpenMLS` storage adapter from the bridge
+/// instance's single chosen [`StorageProvider`] (spec §17.6).
+///
+/// `StorageProvider` implements `Storage` (enum dispatch) and `Clone`, so we
+/// wrap a clone in `SpawnBlockingStorageAdapter` to obtain the dyn-safe
+/// `OpenMlsStorageAdapter` view. The clone shares the same inner backend
+/// (`Arc<EncryptingAdapter<InMemoryStorage>>` or `Arc<SqliteStorage>`), so the
+/// `OpenMLS` view, persistence, and event log all read/write one backend.
+///
+/// # Errors
+///
+/// Returns [`ScpPyError::ContextError`] when no storage provider is set — the
+/// storage-before-supervisor precondition. No fabrication, no default.
+fn derive_mls_storage(
+    bi: &PyBridgeInstance,
+) -> Result<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>, ScpPyError> {
+    let provider = bi.storage_provider().ok_or_else(|| {
+        ScpPyError::context(
+            "storage-before-supervisor precondition failed: no storage provider \
+             set on the bridge instance — the runtime never defaults storage \
+             (spec §17.6). Select storage via SCP.with_storage({...}) first."
+                .to_owned(),
+        )
+    })?;
+    let adapter = scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+        Arc::new(provider.clone()),
+    );
+    Ok(Arc::new(adapter)
+        as Arc<
+            dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+        >)
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,70 +1252,6 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 // ---------------------------------------------------------------------------
 // No-op provider implementations for ContextManager initialization
 // ---------------------------------------------------------------------------
-
-/// No-op crypto provider used only by [`init_context_manager_for_test`].
-///
-/// Production code now uses `MlsCryptoProvider` (issue #1324). Tests
-/// continue using this no-op because they pass `did:key:` test DIDs and
-/// `None` key packages which `MlsCryptoProvider` rejects.
-struct NoOpCryptoProvider;
-
-impl ContextCryptoProvider for NoOpCryptoProvider {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn add_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
-    }
-    fn remove_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
-        Ok(scp_core::context::RemoveMemberOutput::default())
-    }
-    fn distribute_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn remove_member_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-}
 
 // Use the not-configured transport provider from scp-core (#501).
 // Unlike `LocalTransportProvider` (which silently succeeds), this returns
@@ -1473,12 +1541,10 @@ pub fn sync_role_state_from_manager(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<(), ScpPyError> {
-    let mgr = context_manager(bi)?;
+    let sup = supervisor(bi)?;
     let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-    let new_role_state = rt.block_on(mgr.get_role_state(context_id)).ok_or_else(|| {
-        ScpPyError::context(format!(
-            "context '{context_id}' not found in ContextManager"
-        ))
+    let new_role_state = rt.block_on(sup.get_role_state(context_id)).ok_or_else(|| {
+        ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
     })?;
 
     with_ffi_state(bi, context_id, |st| {
@@ -1524,6 +1590,31 @@ pub fn close_receive_channel(bi: &PyBridgeInstance, context_id: &str) -> Result<
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found, has no
 /// active receive channel, or if the channel is closed.
+/// The sender + shared-receiver pair backing a context's receive channel.
+/// Cloned out of [`FfiBridgeState`] so an event can be delivered after the
+/// owning bridge state has been removed from the registry (the close
+/// teardown removes the FFI state BEFORE the actor despawn to fail closed,
+/// then still delivers the `SystemClose` event through these handles).
+pub type ReceiveChannelHandles = (
+    mpsc::Sender<PyMessage>,
+    Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
+);
+
+/// Clone a context's receive-channel handles out of the FFI state
+/// registry, if a receive channel is active. Returns `None` when the
+/// context is unregistered or has no open channel.
+#[must_use]
+pub fn clone_receive_channel_handles(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Option<ReceiveChannelHandles> {
+    with_ffi_state(bi, context_id, |st| {
+        Ok(st.message_tx.clone().zip(st.message_rx.clone()))
+    })
+    .ok()
+    .flatten()
+}
+
 pub fn deliver_message(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1541,7 +1632,27 @@ pub fn deliver_message(
         })?;
         Ok((tx, rx))
     })?;
+    deliver_message_with_handles(bi, context_id, &tx, &rx_arc, message)
+}
 
+/// Deliver a message through pre-captured channel handles.
+///
+/// Bypasses the FFI state registry (oldest-drop on overflow). Used by the
+/// close teardown to deliver the `SystemClose` event AFTER the bridge
+/// state has been removed (fail-closed ordering). Same overflow semantics
+/// as [`deliver_message`].
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the channel is closed or a send
+/// fails after an overflow drop.
+pub fn deliver_message_with_handles(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    tx: &mpsc::Sender<PyMessage>,
+    rx_arc: &Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
+    message: PyMessage,
+) -> Result<(), ScpPyError> {
     match tx.try_send(message.clone()) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -2230,11 +2341,11 @@ mod tests {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
         init_context_manager_for_test(bi);
-        let mgr1 = context_manager(bi).unwrap();
+        let sup1 = supervisor(bi).unwrap();
         init_context_manager_for_test(bi);
-        let mgr2 = context_manager(bi).unwrap();
+        let sup2 = supervisor(bi).unwrap();
         // Same Arc (same pointer).
-        assert!(Arc::ptr_eq(mgr1, mgr2));
+        assert!(Arc::ptr_eq(sup1, sup2));
     }
 
     #[test]
@@ -2259,6 +2370,64 @@ mod tests {
         init_context_manager_for_test(bi);
         let result = with_ffi_state(bi, "nonexistent-ctx-id", |_| Ok(()));
         assert!(result.is_err());
+    }
+
+    /// The close-teardown fail-closed ordering: once the FFI bridge state
+    /// is removed (which `context_close` now does BEFORE the actor
+    /// despawn, so a fail-open rate-limit can't gate unthrottled tool
+    /// dispatch), `with_context`/`with_ffi_state` tool lookups fail
+    /// closed — yet the receive-channel handles captured BEFORE removal
+    /// still deliver the `SystemClose` event to an active receiver.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_channel_handles_survive_ffi_state_removal() {
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let ctx_id = unique_ctx_id("close-fail-closed");
+        register_context(bi, &ctx_id, "did:dht:z6MkCloseFailClosed", &[]).unwrap();
+
+        // Open a receive channel on the FFI state (as `context_receive`
+        // would).
+        let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+        with_ffi_state(bi, &ctx_id, |st| {
+            st.message_tx = Some(tx);
+            st.message_rx = Some(Arc::clone(&rx_arc));
+            Ok(())
+        })
+        .unwrap();
+
+        // Capture the channel handles BEFORE removing the FFI state — this
+        // is what the close teardown does so it can still deliver the
+        // close event after failing the tool path closed.
+        let handles =
+            clone_receive_channel_handles(bi, &ctx_id).expect("an open channel yields handles");
+
+        // Fail closed: remove the FFI bridge state.
+        remove_context(bi, &ctx_id);
+        assert!(
+            with_ffi_state(bi, &ctx_id, |_| Ok(())).is_err(),
+            "tool dispatch lookup must fail closed once FFI state is removed"
+        );
+
+        // Delivery through the captured handles still works after removal.
+        let (tx2, rx2) = handles;
+        let msg = PyMessage::new(
+            bi,
+            "scp:system".to_owned(),
+            b"SystemClose".to_vec(),
+            0.0,
+            ctx_id.clone(),
+        );
+        deliver_message_with_handles(bi, &ctx_id, &tx2, &rx2, msg)
+            .expect("captured handles still deliver after FFI-state removal");
+
+        // The receiver observes the delivered close event.
+        let received = rx_arc.lock().await.try_recv();
+        assert!(
+            received.is_ok(),
+            "the SystemClose event must reach the receiver via the captured handles"
+        );
     }
 
     /// User-provided ceiling strings in colon format (e.g. `"tool:invoke:*"`)
@@ -2356,11 +2525,11 @@ mod tests {
         let bi = &*bi_arc;
         init_context_manager_for_test(bi);
 
-        let cm = context_manager(bi).expect("context_manager should be initialized");
+        let sup = supervisor(bi).expect("supervisor should be initialized");
 
         // Both should point to the same ContextManager allocation.
         assert!(
-            Arc::ptr_eq(cm, bi.core.try_context_manager().unwrap()),
+            Arc::ptr_eq(sup, bi.core.try_supervisor().unwrap()),
             "context_manager() must return the per-instance ContextManager Arc"
         );
     }
@@ -2382,19 +2551,24 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Build an isolated CoreFields (not the global default PyBridgeInstance)
-        // to avoid interfering with the OnceLock-based singleton used by other
-        // tests. `CoreFields` is imported at module top via `use
-        // scp_ffi_common::bridge_instance::CoreFields`. Persistence is not
-        // needed for shutdown-hook testing — this test exercises the hook
-        // wiring only, not storage behaviour.
-        let cm = build_context_manager(
-            Box::new(NoOpCryptoProvider),
+        // Build an isolated PyBridgeInstance (not the global default) to avoid
+        // interfering with the OnceLock-based singleton used by other tests.
+        // It carries an explicit in-memory storage provider so the
+        // storage-before-supervisor precondition in `build_supervisor` is
+        // satisfied.
+        let isolated = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
+            .expect("in-memory storage construction is infallible");
+        let supervisor_arc = build_supervisor(
+            &isolated,
+            Arc::new(MlsCryptoProvider::new(
+                "did:test:pyo3-bridge-test".to_owned(),
+            )),
             Box::new(scp_core::context::LocalTransportProvider),
             Box::new(NoOpEventLogProvider),
             None,
-        );
-        let bi = CoreFields::with_context_manager(cm);
+        )
+        .expect("build_supervisor must succeed with in-memory storage set");
+        let bi = CoreFields::with_supervisor(supervisor_arc);
 
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = Arc::clone(&ran);
@@ -2490,6 +2664,133 @@ mod tests {
         );
     }
 
+    /// Build a dedicated current-thread tokio runtime so the async `Storage`
+    /// trait methods can be driven from a sync `#[test]` without depending on
+    /// the bridge's shared global runtime (which may not be initialized in a
+    /// unit-test process).
+    fn test_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread tokio runtime")
+    }
+
+    /// Parity with the NAPI bridge `test_sqlite_passphrase_round_trip`: data
+    /// written under a passphrase-derived `SQLCipher` key must survive a reopen
+    /// with the SAME passphrase (the persisted salt sidecar re-derives the
+    /// same key). Exercises the `with_storage_py` `Passphrase` arm.
+    #[test]
+    fn test_with_storage_py_sqlite_passphrase_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: dir.clone(),
+            key: SqliteKeyMaterial::Passphrase(Zeroizing::new(
+                "correct horse battery staple".to_owned(),
+            )),
+        })
+        .expect("passphrase sqlite open must succeed");
+        let provider = bi
+            .storage_provider()
+            .cloned()
+            .expect("passphrase path must populate the storage provider");
+        let rt = test_rt();
+        rt.block_on(async {
+            provider
+                .store("scp-test/persist", b"durable-value")
+                .await
+                .expect("store via storage provider");
+        });
+        drop(provider);
+        drop(bi);
+
+        // Reopen with the SAME passphrase.
+        let bi2 = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: dir,
+            key: SqliteKeyMaterial::Passphrase(Zeroizing::new(
+                "correct horse battery staple".to_owned(),
+            )),
+        })
+        .expect("reopen with same passphrase must succeed");
+        let provider2 = bi2
+            .storage_provider()
+            .cloned()
+            .expect("reopened passphrase path must populate the storage provider");
+        let read_back = rt.block_on(async {
+            provider2
+                .retrieve("scp-test/persist")
+                .await
+                .expect("retrieve via reopened provider")
+        });
+        assert_eq!(
+            read_back.as_deref(),
+            Some(b"durable-value".as_slice()),
+            "data written under the passphrase must survive a reopen with the same passphrase"
+        );
+    }
+
+    /// Parity with the NAPI bridge `test_sqlite_wrong_passphrase_fails_closed`:
+    /// reopening an existing DB with the WRONG passphrase must FAIL CLOSED
+    /// (spec §17.6) — never silently open a fresh, empty database.
+    #[test]
+    fn test_with_storage_py_sqlite_wrong_passphrase_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: dir.clone(),
+            key: SqliteKeyMaterial::Passphrase(Zeroizing::new("the-right-passphrase".to_owned())),
+        })
+        .expect("initial passphrase open must succeed");
+        let provider = bi
+            .storage_provider()
+            .cloned()
+            .expect("storage provider present");
+        test_rt().block_on(async {
+            provider
+                .store("scp-test/secret", b"top-secret")
+                .await
+                .expect("store secret");
+        });
+        drop(provider);
+        drop(bi);
+
+        // Reopen with the WRONG passphrase: must fail closed, no in-memory
+        // fallback, no fresh empty DB.
+        let result = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: dir,
+            key: SqliteKeyMaterial::Passphrase(Zeroizing::new("the-wrong-passphrase".to_owned())),
+        });
+        assert!(
+            matches!(result, Err(StorageInitError::SqliteOpen { .. })),
+            "reopening with the wrong passphrase must fail closed with SqliteOpen"
+        );
+    }
+
+    /// `SqliteKeyMaterial`'s custom `Debug` impl must NOT leak the key or
+    /// passphrase bytes (defense in depth). Mirrors the NAPI/UniFFI redacting
+    /// impls.
+    #[test]
+    fn test_sqlite_key_material_debug_redacts_secrets() {
+        let raw = SqliteKeyMaterial::Raw(Zeroizing::new(vec![0xAB_u8; 32]));
+        let raw_dbg = format!("{raw:?}");
+        assert_eq!(raw_dbg, "SqliteKeyMaterial::Raw(<redacted 32 bytes>)");
+        assert!(
+            !raw_dbg.contains("ab") && !raw_dbg.contains("171"),
+            "raw Debug must not contain key bytes: {raw_dbg}"
+        );
+
+        let secret = "super-secret-passphrase";
+        let pass = SqliteKeyMaterial::Passphrase(Zeroizing::new(secret.to_owned()));
+        let pass_dbg = format!("{pass:?}");
+        assert_eq!(pass_dbg, "SqliteKeyMaterial::Passphrase(<redacted>)");
+        assert!(
+            !pass_dbg.contains(secret),
+            "passphrase Debug must not contain the passphrase: {pass_dbg}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Per-instance ContextManager attachment (bug-catcher follow-up, #1549)
     // -----------------------------------------------------------------------
@@ -2507,12 +2808,12 @@ mod tests {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
         assert!(
-            !bi.core.has_context_manager(),
+            !bi.core.has_supervisor(),
             "fresh PyBridgeInstance must not have a ContextManager attached"
         );
         init_context_manager_for_test(bi);
         assert!(
-            bi.core.has_context_manager(),
+            bi.core.has_supervisor(),
             "init_context_manager_for_test(bi) must attach a ContextManager to bi.core"
         );
     }
@@ -2532,11 +2833,11 @@ mod tests {
         let bi_b = PyBridgeInstance::new_py();
         init_context_manager_for_test(&bi_a);
         init_context_manager_for_test(&bi_b);
-        assert!(bi_a.core.has_context_manager());
-        assert!(bi_b.core.has_context_manager());
+        assert!(bi_a.core.has_supervisor());
+        assert!(bi_b.core.has_supervisor());
         // Each instance holds a distinct Arc<ContextManager>.
-        let cm_a = bi_a.core.try_context_manager().unwrap();
-        let cm_b = bi_b.core.try_context_manager().unwrap();
+        let cm_a = bi_a.core.try_supervisor().unwrap();
+        let cm_b = bi_b.core.try_supervisor().unwrap();
         assert!(
             !Arc::ptr_eq(cm_a, cm_b),
             "distinct PyBridgeInstances must hold distinct ContextManager Arcs"
@@ -2551,11 +2852,11 @@ mod tests {
     fn register_context_on_non_default_bi_attaches_cm_to_bi() {
         let first = PyBridgeInstance::new_py();
         init_context_manager_for_test(&first);
-        let first_manager = Arc::clone(first.core.try_context_manager().unwrap());
+        let first_manager = Arc::clone(first.core.try_supervisor().unwrap());
 
         let second = PyBridgeInstance::new_py();
         assert!(
-            !second.core.has_context_manager(),
+            !second.core.has_supervisor(),
             "fresh bi must not inherit a ContextManager from another instance"
         );
 
@@ -2564,10 +2865,10 @@ mod tests {
         register_context(&second, &ctx_id, creator, &[]).unwrap();
 
         assert!(
-            second.core.has_context_manager(),
+            second.core.has_supervisor(),
             "register_context(second, ...) must attach a ContextManager to it"
         );
-        let second_manager = second.core.try_context_manager().unwrap();
+        let second_manager = second.core.try_supervisor().unwrap();
         assert!(
             !Arc::ptr_eq(&first_manager, second_manager),
             "second bi must hold a distinct ContextManager — not the first's"

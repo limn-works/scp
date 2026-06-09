@@ -29,7 +29,11 @@ testing = ["software_platform"]
 # Same engine as `sqlite` but encryption key provided by caller (Apple Keychain).
 apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
 # SQLite storage adapter with SQLCipher encryption (spec section 17.6).
-sqlite = ["dep:rusqlite", "dep:hex", "dep:fs2"]
+# `argon2` + `rand` back the passphrase key-derivation mode (§17.6) and its
+# per-database salt generation; the shared `kdf` module is the single source
+# of the Argon2id parameterization. `fs2` provides advisory file locking for
+# the per-database salt sidecar (fail-closed on lock contention).
+sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2"]
 # Encrypted file-backed key custody (Argon2id + AES-256-GCM).
 # Universal fallback for non-HSM platforms. See GitHub issue #391.
 file = ["software_platform", "dep:aes-gcm", "dep:argon2"]

@@ -2101,6 +2101,21 @@ export function createWasmBridge(): Bridge {
       );
     },
 
+    economyVerifyPaymentReceipts(_receiptsJson: string): string {
+      // The WASM bridge has no runtime payment adapter — `scp-runtime`'s
+      // payment-receipt verification path does not compile to `wasm32`
+      // per ADR-034. The method must exist (the shared `ScpBridge`
+      // interface requires it) but is rejected fail-closed rather than
+      // returning a fabricated result.
+      throw new EconomicPolicyUnsupportedOnWasm(
+        "economyVerifyPaymentReceipts is not supported by the WASM bridge — " +
+          "payment-receipt verification requires a native client whose " +
+          "bridge runs the payment adapter (the NAPI / Python / Swift / " +
+          "Kotlin SDKs) per ADR-034.",
+        "SCP-ECON-12095",
+      );
+    },
+
     // Media (ADR-024)
     mediaCheckCapability(ceiling: string[], capability: string): boolean {
       const wasm = getWasm();

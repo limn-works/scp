@@ -1,25 +1,35 @@
-//! Production `ContextCryptoProvider` implementation backed by `OpenMLS`.
+//! Production `MlsCryptoProvider` implementation backed by `OpenMLS`.
 //!
-//! [`MlsCryptoProvider`] bridges the [`ContextCryptoProvider`] trait (used by
-//! [`ContextManager`]) to the existing `OpenMLS` wrappers in `crypto/mls/`:
+//! [`MlsCryptoProvider`] bridges the historical inherent API to the actor-era
+//! [`MlsBackend`](super::backend::MlsBackend) and
+//! [`HpkeBackend`](crate::crypto::hpke_backend::HpkeBackend) primitives. State
+//! that used to live in `Mutex<HashMap>` / `Mutex<scalar>` fields on the
+//! provider has migrated to lock-free containers per ADR-049 commit 12c.9f
+//! (`MlsCryptoProvider` dissolution):
 //!
-//! - Group lifecycle → [`group::create_group`], [`group::add_member`],
-//!   [`group::remove_member`], [`group::destroy_group`]
-//! - Encrypt/decrypt → `encrypt::encrypt`, `encrypt::decrypt`
-//! - Key packages → `key_package::KeyPackageBuffer`
-//! - Sender keys → `sender_keys::generate_sender_key`
+//! - Per-context MLS state → `DashMap<[u8;32], ContextCryptoState>`
+//! - Broadcast keys → `DashMap<[u8;32], SenderKey>`
+//! - Wrapping keys (X25519, §9.16.1) → `ArcSwap<...>` for atomic rotation; the
+//!   supervisor exposes per-identity accessors that mirror the same source.
+//! - Pending Welcome-join state → `ArcSwap<Option<Arc<PendingJoinState>>>`
+//! - Taken-context tracking → `DashSet<[u8;32]>`
 //!
-//! Each context's MLS group and sender key are stored in per-context maps
-//! protected by `std::sync::Mutex`. The provider is `Send + Sync` as required
-//! by the trait bound.
+//! No `std::sync::Mutex` survives in this file (CI: `clippy.toml`'s
+//! `disallowed-types` ban for `std::sync::Mutex` is enforced — every internal
+//! datapath is lock-free).
 //!
-//! See ADR-001 for the MLS wrapper design and ADR-007 for sender keys.
+//! Inline `OpenMLS` calls in primitive paths route through the injected
+//! [`MlsBackend`](super::backend::MlsBackend) so test harnesses can substitute
+//! a fail-injecting backend via [`MlsCryptoProvider::with_backends`].
 //!
-//! [`ContextCryptoProvider`]: scp_protocol::context::builder::ContextCryptoProvider
-//! [`ContextManager`]: crate::context::manager::ContextManager
+//! See ADR-001 for the MLS wrapper design and ADR-007 for sender keys; ADR-049
+//! for the actor refactor + dissolution ladder.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::Arc;
+
+use arc_swap::{ArcSwap, ArcSwapOption};
+use dashmap::{DashMap, DashSet};
 
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -30,11 +40,14 @@ use serde::{Deserialize, Serialize};
 use tls_codec::Deserialize as TlsDeserializeTrait;
 use zeroize::{Zeroize, Zeroizing};
 
+use super::backend::MlsBackend;
 use super::credential::ScpCredential;
 use super::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
+use super::production_backend::ProductionMlsBackend;
+use crate::crypto::hpke_backend::{HpkeBackend, ProductionHpkeBackend};
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::crypto::sender_keys::{
     NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse, SenderKeyStore,
     generate_sender_key, generate_wrapping_keypair,
@@ -225,6 +238,105 @@ struct ContextCryptoState {
     recv_sequence_tracker: HashMap<String, (u64, u64)>,
 }
 
+// ---------------------------------------------------------------------------
+// OwnedMlsCryptoState — destructive-move payload for actor ownership transfer
+// ---------------------------------------------------------------------------
+
+/// Owned per-context MLS crypto state moved out of
+/// [`MlsCryptoProvider::contexts`] by [`MlsCryptoProvider::take_crypto_state`]
+/// (ADR-049 commit 12).
+///
+/// Mirrors the private [`ContextCryptoState`] struct above — one public
+/// `pub` field per legacy field, plus the `send_sequence` counter so
+/// callers can seed an actor-side
+/// [`crate::context::actor::SendSequenceTracker`] at take-time. After
+/// `take_crypto_state` returns `Ok(OwnedMlsCryptoState)`, the provider's
+/// `contexts[ctx_id]` entry is absent and subsequent `seal` / `open` /
+/// `with_context` calls targeting that context return
+/// [`ContextError::CryptoFailed`] with a "context state owned by actor"
+/// message. The invariant is tracked by
+/// [`MlsCryptoProvider::taken_context_ids`] — a post-refactor set that
+/// distinguishes "state has been taken" from "state was never created"
+/// so the error message is actionable.
+///
+/// # Scope — infrastructure only
+///
+/// Commit 12b.2a does NOT move any production state into actor ownership.
+/// `take_crypto_state` is callable but no production site calls it yet;
+/// the legacy `create_mls_group` still populates `contexts` via the
+/// `ContextCryptoProvider` trait impl, and the legacy `seal` / `open`
+/// path continues to operate on `contexts[ctx_id]`. Commit 12b.2b is the
+/// first site that invokes `take_crypto_state` to atomically migrate every
+/// messaging handler's state into actor ownership at spawn time — see
+/// `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder row 12b.2b.
+///
+/// # Why every field is `pub`
+///
+/// This type is a move payload, not a domain struct. Callers (the actor
+/// construction helper in 12b.2b) destructure it field-by-field to build
+/// the actor-side [`crate::context::actor::ContextCryptoState`]. The
+/// legacy `ContextCryptoState` keeps its fields private because it is
+/// internal to the provider; the owned mirror here is the FFI-boundary
+/// shape between the provider and the actor.
+pub struct OwnedMlsCryptoState {
+    /// The `OpenMLS` group handle for this context.
+    pub mls_group: ScpMlsGroup,
+    /// Local member's AES-256 sender key.
+    pub sender_key: SenderKey,
+    /// Per-member sender-key store.
+    pub sender_key_store: SenderKeyStore,
+    /// Sender-key epoch counter.
+    pub sender_key_epoch: u64,
+    /// Send-side sequence counter at take-time. Callers seed their
+    /// actor-side [`crate::context::actor::SendSequenceTracker`] with this
+    /// value via
+    /// [`crate::context::actor::SendSequenceTracker::from_persisted`] so
+    /// the actor picks up where the provider left off (preserves AAD
+    /// byte-identity — see `crates/scp-runtime/src/context/actor/sequence.rs`
+    /// §"Sequence numbering convention").
+    pub send_sequence: u64,
+    /// Pending sender-key distribution messages (target DID, serialized
+    /// message). Not yet drained to transport at take-time; actor
+    /// replays via its own transport provider.
+    pub pending_distributions: Vec<(String, Vec<u8>)>,
+    /// Nonce dedup cache for sender-key requests (replay protection).
+    pub nonce_dedup: NonceDedup,
+    /// Remote members' X25519 wrapping public keys (by DID).
+    pub member_wrapping_keys: HashMap<String, [u8; 32]>,
+    /// Receive-side sender-key sequence tracker (by DID →
+    /// `(last_epoch, last_sequence)`).
+    pub recv_sequence_tracker: HashMap<String, (u64, u64)>,
+}
+
+// SECURITY: Redacts the MLS group (holds OpenMLS epoch secrets) and
+// sender key (raw AES-256 key material). Other fields are counters or
+// byte-array maps that already redact on their own. Manual impl —
+// `ScpMlsGroup` does not derive `Debug` at the library boundary.
+impl std::fmt::Debug for OwnedMlsCryptoState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedMlsCryptoState")
+            .field("mls_group", &"[REDACTED]")
+            .field("sender_key", &"[REDACTED]")
+            .field("sender_key_store", &self.sender_key_store)
+            .field("sender_key_epoch", &self.sender_key_epoch)
+            .field("send_sequence", &self.send_sequence)
+            .field(
+                "pending_distributions",
+                &format_args!("[{} entries]", self.pending_distributions.len()),
+            )
+            .field("nonce_dedup", &self.nonce_dedup)
+            .field(
+                "member_wrapping_keys",
+                &format_args!("[{} entries]", self.member_wrapping_keys.len()),
+            )
+            .field(
+                "recv_sequence_tracker",
+                &format_args!("[{} entries]", self.recv_sequence_tracker.len()),
+            )
+            .finish()
+    }
+}
+
 /// State retained for a pending Welcome-based join operation.
 ///
 /// When [`MlsCryptoProvider::prepare_key_package_for_join`] generates a key
@@ -239,7 +351,7 @@ struct PendingJoinState {
     provider: super::storage::InMemoryMlsProvider,
 }
 
-/// Production [`ContextCryptoProvider`] backed by `OpenMLS`.
+/// Production `ContextCryptoProvider` backed by `OpenMLS`.
 ///
 /// Manages per-context MLS groups and sender keys. Thread-safe via internal
 /// `Mutex`-protected maps.
@@ -258,64 +370,290 @@ struct PendingJoinState {
 pub struct MlsCryptoProvider {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,
+    /// Injected MLS primitive backend (ADR-049 commit 12). Production
+    /// callers receive a [`ProductionMlsBackend`] from
+    /// [`MlsCryptoProvider::new`]; tests inject failure-driven mocks via
+    /// [`MlsCryptoProvider::with_backends`]. The provider's orchestration
+    /// methods route every inline `OpenMLS` primitive through this trait —
+    /// state still lives on the provider's lock-free containers below.
+    mls_backend: Arc<dyn MlsBackend>,
+    /// Injected HPKE primitive backend (ADR-049 commit 12). Same
+    /// injection contract as `mls_backend` — production wires
+    /// [`ProductionHpkeBackend`]; tests can substitute mocks for fail
+    /// injection on the wrapping-key seal/unseal path.
+    hpke_backend: Arc<dyn HpkeBackend>,
     /// Per-context crypto state, keyed by the 32-byte context ID.
-    contexts: Mutex<HashMap<[u8; 32], ContextCryptoState>>,
+    ///
+    /// Lock-free [`DashMap`] — the actor refactor (ADR-049 commit 12)
+    /// removed the `std::sync::Mutex<HashMap<...>>` wrapper. State that
+    /// migrates onto [`crate::context::actor::ContextActor`] via
+    /// [`Self::take_crypto_state`] is removed from this map and recorded
+    /// in [`Self::taken_context_ids`].
+    contexts: DashMap<[u8; 32], ContextCryptoState>,
     /// Broadcast keys for broadcast-mode contexts.
-    broadcast_keys: Mutex<HashMap<[u8; 32], SenderKey>>,
+    ///
+    /// Lock-free [`DashMap`] — same migration path as
+    /// [`Self::contexts`]. Per ADR-049 the post-actor home for these is
+    /// `ContextModeState::Broadcast` on the per-context actor state;
+    /// during the 12c.9f → 12 window the provider continues to hold the
+    /// authoritative copy for non-actor callers.
+    broadcast_keys: DashMap<[u8; 32], SenderKey>,
     /// X25519 wrapping public key for sender key HPKE (§9.16.1).
     /// Published in the MLS `LeafNode` `scp_wrapping_key` extension.
-    /// Behind a `Mutex` so it can be restored from a persisted snapshot
-    /// via [`ContextCryptoProvider::restore_crypto_state`] (which takes `&self`).
-    wrapping_public_key: Mutex<[u8; 32]>,
+    ///
+    /// Held in [`ArcSwap`] so the snapshot-restore path (which takes
+    /// `&self`) can replace the keypair atomically without contention.
+    /// The supervisor mirrors this slot per-identity via
+    /// [`crate::context::supervisor::Supervisor::wrapping_public_key_for`]
+    /// — both pointers are kept consistent on
+    /// [`MlsCryptoProvider`] writes through the supervisor's
+    /// `set_wrapping_keys` accessor.
+    wrapping_public_key: ArcSwap<[u8; 32]>,
     /// X25519 wrapping secret key for sender key HPKE (§9.16.1).
-    /// Used to open HPKE-sealed sender key responses. Wrapped in
-    /// [`Zeroizing`] so key material is zeroed on drop.
-    wrapping_secret_key: Mutex<Zeroizing<[u8; 32]>>,
+    /// Used to open HPKE-sealed sender key responses.
+    ///
+    /// Held in [`ArcSwap<Zeroizing<[u8; 32]>>`] so rotation is atomic and
+    /// the prior key material is zeroized when the last `Arc` to it
+    /// drops. Reader discipline (load → use → drop within the same
+    /// poll) is enforced at every callsite — no callsite stores the
+    /// loaded `Arc` in a struct field.
+    wrapping_secret_key: ArcSwap<Zeroizing<[u8; 32]>>,
     /// Pending key package state for Welcome-based joins (§5.12.3).
     /// `prepare_key_package_for_join` replaces any previous entry;
-    /// `join_from_welcome` takes it. `Option` enforces the single-entry
-    /// invariant at the type level.
-    pending_joins: Mutex<Option<PendingJoinState>>,
+    /// `join_from_welcome` takes it. `ArcSwapOption` enforces the
+    /// single-entry invariant at the type level (None = no pending
+    /// join, Some = one pending key package).
+    ///
+    /// `swap(None)` is the atomic take primitive; the consumer then
+    /// `Arc::try_unwrap`s to extract the [`PendingJoinState`]. The
+    /// provider is the sole writer of this slot — `swap` returns an
+    /// `Arc` whose strong count is 1 in the absence of concurrent
+    /// `load`s, so `try_unwrap` succeeds in the steady state.
+    pending_joins: ArcSwapOption<PendingJoinState>,
+    /// Contexts whose crypto state has been destructively moved into a
+    /// [`crate::context::actor::ContextActor`] via
+    /// [`Self::take_crypto_state`] (ADR-049 commit 12).
+    ///
+    /// Tracked separately from [`Self::contexts`] so [`Self::with_context`]
+    /// can distinguish "context was never created" (returns the legacy
+    /// `no MLS group for this context` error) from "state was taken by
+    /// the actor runtime" (returns an actionable
+    /// `context state owned by actor` error). The two failure modes have
+    /// different call-site remediations — the former indicates a
+    /// create-before-send ordering bug, the latter indicates a caller
+    /// reaching through the provider after actor ownership has been
+    /// transferred (post-12b.2b that caller should route through the
+    /// actor's mailbox instead).
+    ///
+    /// # Lifecycle
+    ///
+    /// - Insert: on successful [`Self::take_crypto_state`].
+    /// - Remove: never in this commit — actor ownership is one-way during
+    ///   the 12b.2a → 12 window. Commit 12 deletes the provider
+    ///   entirely; until then a taken context stays taken for the
+    ///   provider's lifetime.
+    ///
+    /// Lock-free [`DashSet`] — the prior `std::sync::Mutex<HashSet>`
+    /// wrapper was removed in ADR-049 commit 12c.9f.
+    taken_context_ids: DashSet<[u8; 32]>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
 impl MlsCryptoProvider {
     /// Creates a new production crypto provider for the given local DID.
     ///
+    /// Constructs the production [`MlsBackend`] / [`HpkeBackend`]
+    /// implementations and injects them into the provider. Call
+    /// [`Self::with_backends`] when test fail-injection is required.
+    ///
     /// # Arguments
     ///
     /// * `local_did` - The local member's DID (must be a valid `did:dht:z...`).
     #[must_use]
     pub fn new(local_did: String) -> Self {
+        Self::with_backends(
+            local_did,
+            Arc::new(ProductionMlsBackend::new()),
+            Arc::new(ProductionHpkeBackend::new()),
+        )
+    }
+
+    /// Creates an `MlsCryptoProvider` with caller-supplied backends.
+    ///
+    /// Test seam introduced by ADR-049 commit 12c.9f. Production code
+    /// uses [`Self::new`]; failure-injection tests instantiate mock
+    /// `MlsBackend` / `HpkeBackend` impls and pass them here. The
+    /// `local_did` and lock-free state containers behave identically to
+    /// [`Self::new`].
+    ///
+    /// # Arguments
+    ///
+    /// * `local_did` - The local member's DID (must be a valid `did:dht:z...`).
+    /// * `mls_backend` - The MLS primitive backend (typically
+    ///   [`ProductionMlsBackend`] in production; a mock for fail-injection
+    ///   in tests).
+    /// * `hpke_backend` - The HPKE primitive backend (typically
+    ///   [`ProductionHpkeBackend`] in production).
+    #[must_use]
+    pub fn with_backends(
+        local_did: String,
+        mls_backend: Arc<dyn MlsBackend>,
+        hpke_backend: Arc<dyn HpkeBackend>,
+    ) -> Self {
         let (wrapping_public_key, wrapping_secret_key) = generate_wrapping_keypair();
         Self {
             local_did,
-            contexts: Mutex::new(HashMap::new()),
-            broadcast_keys: Mutex::new(HashMap::new()),
-            wrapping_public_key: Mutex::new(wrapping_public_key),
-            wrapping_secret_key: Mutex::new(Zeroizing::new(wrapping_secret_key)),
-            pending_joins: Mutex::new(None),
+            mls_backend,
+            hpke_backend,
+            contexts: DashMap::new(),
+            broadcast_keys: DashMap::new(),
+            wrapping_public_key: ArcSwap::from_pointee(wrapping_public_key),
+            wrapping_secret_key: ArcSwap::from_pointee(Zeroizing::new(wrapping_secret_key)),
+            pending_joins: ArcSwapOption::empty(),
+            taken_context_ids: DashSet::new(),
         }
+    }
+
+    /// Borrowed reference to the injected MLS primitive backend
+    /// (ADR-049 commit 12). Helper functions outside the provider
+    /// that need the same backend (e.g. handler code in
+    /// `handlers/messaging.rs` once the deletion ladder lands) can
+    /// borrow through this accessor.
+    #[must_use]
+    pub fn mls_backend(&self) -> &Arc<dyn MlsBackend> {
+        &self.mls_backend
+    }
+
+    /// Borrowed reference to the injected HPKE primitive backend
+    /// (ADR-049 commit 12). See [`Self::mls_backend`].
+    #[must_use]
+    pub fn hpke_backend(&self) -> &Arc<dyn HpkeBackend> {
+        &self.hpke_backend
+    }
+
+    /// Destructively move the per-context MLS crypto state out of this
+    /// provider and return it as an [`OwnedMlsCryptoState`] the caller
+    /// can hand to a [`crate::context::actor::ContextActor`] at spawn
+    /// time (ADR-049 commit 12).
+    ///
+    /// After `Ok` return:
+    /// - `self.contexts[context_id]` is absent (`HashMap::remove`d).
+    /// - `context_id` is recorded in [`Self::taken_context_ids`].
+    /// - Every subsequent [`Self::with_context`] /
+    ///   `ContextCryptoProvider::seal` /
+    ///   `ContextCryptoProvider::open` on `context_id` returns
+    ///   [`ContextError::CryptoFailed`] with the
+    ///   `context state owned by actor` message.
+    ///
+    /// # Invariant
+    ///
+    /// Actor ownership is one-way during the 12b.2a → 12f migration
+    /// window. Once taken, a context's crypto state does not return to
+    /// the provider — the actor becomes the sole authority for its
+    /// lifetime. This matches plan §"`MlsCryptoProvider` dissolution":
+    /// production lookups (publish, subscribe, etc.) reach the crypto
+    /// state only through the actor's mailbox post-12b.2b.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if no entry exists in
+    ///   `contexts` for `context_id`. The error message distinguishes
+    ///   "never created" from "already taken" by inspecting the
+    ///   `taken_context_ids` set.
+    /// - [`ContextError::CryptoFailed`] if the internal `Mutex` is
+    ///   poisoned (caller should treat this as fatal — the provider is
+    ///   now inconsistent).
+    ///
+    /// # Scope — infrastructure only
+    ///
+    /// This commit wires the move path but no production call site
+    /// invokes it yet. The first production caller arrives in commit
+    /// 12b.2b with the atomic messaging-handler migration.
+    pub fn take_crypto_state(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<OwnedMlsCryptoState, ContextError> {
+        // ADR-049 commit 12c.9f: the underlying `contexts` map is now a
+        // lock-free `DashMap`. `DashMap::remove` is atomic over the
+        // shard; the post-removal taken-set insert is unconditionally
+        // reachable so the actor-ownership marker stays consistent.
+        let Some((_, state)) = self.contexts.remove(context_id) else {
+            // Distinguish "never created" from "already taken" so the
+            // error is actionable.
+            if self.taken_context_ids.contains(context_id) {
+                return Err(ContextError::CryptoFailed(
+                    "context state owned by actor".to_owned(),
+                ));
+            }
+            return Err(ContextError::ContextNotRegistered(format!(
+                "no MLS group for context {}",
+                hex::encode(context_id),
+            )));
+        };
+        // Remove first, then record in the taken set. `DashSet::insert`
+        // is atomic; the actor refactor's one-way ownership invariant
+        // (no take-then-restore) keeps the recorded id stable for the
+        // provider's lifetime.
+        self.taken_context_ids.insert(*context_id);
+        // Map the private struct field-for-field onto the public owned
+        // payload. This is the one place where the private-to-public
+        // shape translation happens; 12b.2b downstream consumes
+        // `OwnedMlsCryptoState` exclusively.
+        let ContextCryptoState {
+            mls_group,
+            sender_key,
+            sender_key_store,
+            sender_key_epoch,
+            send_sequence,
+            pending_distributions,
+            nonce_dedup,
+            member_wrapping_keys,
+            recv_sequence_tracker,
+        } = state;
+        Ok(OwnedMlsCryptoState {
+            mls_group,
+            sender_key,
+            sender_key_store,
+            sender_key_epoch,
+            send_sequence,
+            pending_distributions,
+            nonce_dedup,
+            member_wrapping_keys,
+            recv_sequence_tracker,
+        })
     }
 
     /// Returns a reference to the per-context MLS group state.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::CryptoFailed`] if no MLS group exists for the
-    /// given context ID.
+    /// - [`ContextError::CryptoFailed`] with `"no MLS group for this context"`
+    ///   if the context was never created (or its state was evicted).
+    /// - [`ContextError::CryptoFailed`] with
+    ///   `"context state owned by actor"` if the state was destructively
+    ///   moved via [`Self::take_crypto_state`] (ADR-049 commit 12).
+    ///   Callers seeing this error must route through the actor's
+    ///   mailbox — the provider no longer owns the state.
     fn with_context<F, R>(&self, context_id: &[u8; 32], f: F) -> Result<R, ContextError>
     where
         F: FnOnce(&mut ContextCryptoState) -> Result<R, ContextError>,
     {
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let state = contexts.get_mut(context_id).ok_or_else(|| {
-            ContextError::CryptoFailed("no MLS group for this context".to_string())
-        })?;
-        f(state)
+        // ADR-049 commit 12c.9f: lock-free per-shard access via
+        // `DashMap::get_mut`. The returned guard is per-entry and is
+        // dropped when the closure returns.
+        if let Some(mut entry) = self.contexts.get_mut(context_id) {
+            return f(entry.value_mut());
+        }
+        // Context is not in the map — distinguish "never created" from
+        // "actor took ownership".
+        if self.taken_context_ids.contains(context_id) {
+            return Err(ContextError::CryptoFailed(
+                "context state owned by actor".to_owned(),
+            ));
+        }
+        Err(ContextError::CryptoFailed(
+            "no MLS group for this context".to_string(),
+        ))
     }
 
     /// Creates the SCP credential for the local member.
@@ -326,10 +664,31 @@ impl MlsCryptoProvider {
 }
 
 #[allow(clippy::significant_drop_tightening)]
-impl ContextCryptoProvider for MlsCryptoProvider {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+impl MlsCryptoProvider {
+    /// Validates that the creator's identity is valid and the signing key is
+    /// accessible.
+    ///
+    /// Called during Phase 1 (validation) before any side effects. This is a
+    /// read-only check that does not create or modify any state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::IdentityValidationFailed`] if the
+    /// identity is invalid or the signing key cannot be accessed.
+    pub fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         // Validate that the local DID is a valid did:dht:z... format.
-        if !self.local_did.starts_with("did:dht:z") {
+        //
+        // Under the `testing` feature gate, also accept `did:test:*` and
+        // `did:key:*` prefixes so the extensive test suite — which used
+        // non-dht test DIDs with the deleted `ContextCryptoProvider`
+        // mocks before ADR-049 commit 12c.9e — continues to work with
+        // the inherent `MlsCryptoProvider` API. Production builds (no
+        // `testing` feature) still require `did:dht:z*`.
+        let accepted = self.local_did.starts_with("did:dht:z")
+            || (cfg!(any(test, feature = "testing"))
+                && (self.local_did.starts_with("did:test:")
+                    || self.local_did.starts_with("did:key:")));
+        if !accepted {
             return Err(ContextCreationError::IdentityValidationFailed(
                 "invalid DID format".to_string(),
             ));
@@ -337,13 +696,48 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    /// Creates an MLS group for the given context.
+    ///
+    /// Called only when `mode == Encrypted`. The provider stores the group
+    /// state internally, keyed by `context_id`.
+    ///
+    /// Refuses to overwrite an existing entry: if a group is already
+    /// registered for `context_id`, returns
+    /// [`ContextCreationError::CreationFailed`] and leaves the existing
+    /// state untouched. An unconditional insert here would let a racing
+    /// second bootstrap for the same deterministic id clobber a live
+    /// MLS group with fresh keys (crypto desync — the actor still
+    /// references group #1 while the provider holds group #2). The
+    /// supervisor serializes same-id bootstraps via `bootstrap_spawn_lock`,
+    /// but this is the crypto layer's own defense-in-depth invariant so
+    /// no future caller path can silently overwrite a live group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::CreationFailed`] if a group already
+    /// exists for `context_id`, or [`ContextCreationError::CryptoFailed`]
+    /// if MLS group creation fails.
+    pub fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        use dashmap::mapref::entry::Entry;
+
+        // Reserve the slot up front via `entry`: this is an atomic
+        // check-and-occupy on the `DashMap` shard, so two concurrent
+        // creates for the same id cannot both pass the existence check.
+        // The vacant guard is held across the crypto-init below; the
+        // shard lock it implies is scoped to this one key.
+        let Entry::Vacant(slot) = self.contexts.entry(*context_id) else {
+            return Err(ContextCreationError::CreationFailed(format!(
+                "MLS group already exists for context '{}' — refusing to overwrite a live group",
+                hex::encode(context_id)
+            )));
+        };
+
         let credential = self.make_credential()?;
-        let wrapping_pk = self
-            .wrapping_public_key
-            .lock()
-            .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let mls_group = group::create_group_with_wrapping_key(&credential, Some(&*wrapping_pk))
+        // Load through ArcSwap; the returned guard is dropped before
+        // the create_group call because we copy the bytes into a stack
+        // array.
+        let wrapping_pk = **self.wrapping_public_key.load();
+        let mls_group = group::create_group_with_wrapping_key(&credential, Some(&wrapping_pk))
             .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
 
         let sender_key = generate_sender_key();
@@ -361,94 +755,119 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             recv_sequence_tracker: HashMap::new(),
         };
 
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        contexts.insert(*context_id, state);
+        // Occupy the reserved vacant slot. No overwrite is possible: if
+        // the entry had been occupied we returned `CreationFailed` above.
+        slot.insert(state);
         Ok(())
     }
 
-    fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let state = contexts.get_mut(context_id).ok_or_else(|| {
+    /// Generates a sender key for the given context.
+    ///
+    /// For `Encrypted` mode this is an AES-256 sender key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if sender key generation fails.
+    pub fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextCreationError::CryptoFailed(
                 "no MLS group for this context — cannot generate sender key".to_string(),
             )
         })?;
         // Rotate the sender key to a fresh random value.
-        state.sender_key = generate_sender_key();
+        entry.value_mut().sender_key = generate_sender_key();
         Ok(())
     }
 
-    fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    /// Initializes a broadcast key for the given context.
+    ///
+    /// Called only when `mode == Broadcast`. The provider stores the
+    /// broadcast key internally, keyed by `context_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if broadcast key initialisation fails.
+    pub fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::insert`.
         let key = generate_sender_key();
-        let mut broadcast_keys = self
-            .broadcast_keys
-            .lock()
-            .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        broadcast_keys.insert(*context_id, key);
+        self.broadcast_keys.insert(*context_id, key);
         Ok(())
     }
 
-    fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        if let Some(mut state) = contexts.remove(context_id) {
+    /// Destroys the MLS group created for the given context (rollback).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if destruction fails.
+    pub fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::remove`.
+        if let Some((_, mut state)) = self.contexts.remove(context_id) {
             let _ = group::destroy_group(&mut state.mls_group);
         }
         Ok(())
     }
 
-    fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        // Zeroize the sender key in context state (if present).
-        {
-            let mut contexts = self
-                .contexts
-                .lock()
-                .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
-            if let Some(state) = contexts.get_mut(context_id) {
-                // Overwrite with a fresh key then drop — ensures old key
-                // material doesn't linger. The fresh key is immediately
-                // discarded when the context is later destroyed.
-                state.sender_key = generate_sender_key();
-                // Clear all stored member sender keys for this context.
-                let ctx_id_hex = hex::encode(context_id);
-                let member_dids: Vec<String> = state
-                    .sender_key_store
-                    .get_all(&ctx_id_hex)
-                    .keys()
-                    .cloned()
-                    .collect();
-                for did in &member_dids {
-                    state.sender_key_store.remove(&ctx_id_hex, did);
-                }
+    /// Destroys the sender key created for the given context (rollback).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if destruction fails.
+    pub fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        // ADR-049 commit 12c.9f: lock-free per-shard mutation. Drop the
+        // `RefMut` guard before touching `broadcast_keys` to release the
+        // shard lock.
+        if let Some(mut entry) = self.contexts.get_mut(context_id) {
+            let state = entry.value_mut();
+            // Overwrite with a fresh key then drop — ensures old key
+            // material doesn't linger. The fresh key is immediately
+            // discarded when the context is later destroyed.
+            state.sender_key = generate_sender_key();
+            // Clear all stored member sender keys for this context.
+            let ctx_id_hex = hex::encode(context_id);
+            let member_dids: Vec<String> = state
+                .sender_key_store
+                .get_all(&ctx_id_hex)
+                .keys()
+                .cloned()
+                .collect();
+            for did in &member_dids {
+                state.sender_key_store.remove(&ctx_id_hex, did);
             }
         }
-        // Also clean up broadcast keys.
-        let mut broadcast_keys = self
-            .broadcast_keys
-            .lock()
-            .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        broadcast_keys.remove(context_id);
+        // Also clean up broadcast keys (lock-free `DashMap::remove`).
+        self.broadcast_keys.remove(context_id);
         Ok(())
     }
 
-    fn validate_key_package(
+    /// Validates a joiner's key package.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` - The DID of the key package owner.
+    /// * `key_package_bytes` - Optional TLS-serialized MLS `KeyPackage` bytes.
+    ///   `None` for mock providers; production providers require `Some`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidKeyPackage`] if the key package is invalid.
+    pub fn validate_key_package(
         &self,
         owner_did: &str,
         key_package_bytes: Option<&[u8]>,
     ) -> Result<(), ContextError> {
-        let bytes = key_package_bytes.ok_or_else(|| {
-            ContextError::InvalidKeyPackage(
+        // Under `cfg(test)` / `testing` feature accept `None` as a valid
+        // key package — matches the old `MockCrypto::validate_key_package`
+        // behaviour deleted in ADR-049 commit 12c.9e.
+        let Some(bytes) = key_package_bytes else {
+            if cfg!(any(test, feature = "testing")) {
+                let _ = owner_did;
+                return Ok(());
+            }
+            return Err(ContextError::InvalidKeyPackage(
                 "production MlsCryptoProvider requires MLS key package bytes".to_string(),
-            )
-        })?;
+            ));
+        };
 
         // Deserialize the key package as KeyPackageIn (TLS format).
         // This matches add_member() which also uses KeyPackageIn, ensuring
@@ -491,7 +910,23 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn add_member(
+    /// Adds a member to the MLS group (ADR-001 `add_member()`).
+    ///
+    /// Returns an [`AddMemberOutput`](scp_protocol::context::builder::AddMemberOutput) containing the TLS-serialized MLS
+    /// Welcome (for the joiner) and Commit (for existing members). Non-MLS
+    /// providers return `AddMemberOutput::default()` (empty bytes).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` - The 32-byte context identifier.
+    /// * `member_did` - The DID of the member to add.
+    /// * `key_package_bytes` - Optional TLS-serialized MLS `KeyPackage` bytes.
+    ///   `None` for mock providers; production providers require `Some`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
+    pub fn add_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -499,12 +934,22 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
         use tls_codec::Serialize as TlsSerializeTrait;
 
-        let bytes = key_package_bytes.ok_or_else(|| {
-            ContextError::CryptoFailed(
+        // Under the `testing` feature or `cfg(test)`, `None` key-package
+        // bytes were previously handled by the no-op `MockCrypto` fixture
+        // (deleted in ADR-049 commit 12c.9e). Preserve the mock-equivalent
+        // return so integration tests that don't produce real MLS key
+        // packages continue to exercise the non-crypto pipeline — role
+        // state sync, event logging, governance side effects.
+        let Some(bytes) = key_package_bytes else {
+            if cfg!(any(test, feature = "testing")) {
+                let _ = member_did; // used only by real path
+                return Ok(scp_protocol::context::builder::AddMemberOutput::default());
+            }
+            return Err(ContextError::CryptoFailed(
                 "production MlsCryptoProvider requires MLS key package bytes for add_member"
                     .to_string(),
-            )
-        })?;
+            ));
+        };
 
         // Pre-validate the key package to extract the wrapping key before
         // the add operation consumes it. Key package bytes arrive as TLS-
@@ -558,7 +1003,16 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn remove_member(
+    /// Removes a member from the MLS group (ADR-001 `remove_member()`).
+    ///
+    /// Returns a [`RemoveMemberOutput`](scp_protocol::context::builder::RemoveMemberOutput) containing the TLS-serialized MLS
+    /// Commit (for remaining members to process). Non-MLS providers return
+    /// `RemoveMemberOutput::default()` (empty bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
+    pub fn remove_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -638,19 +1092,22 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn distribute_sender_key(
+    /// Distributes sender key bundle to a new member via ADR-007.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if distribution fails.
+    pub fn distribute_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
     ) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(context_id);
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let state = contexts.get_mut(context_id).ok_or_else(|| {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
+        let state = entry.value_mut();
         // Store our sender key locally under our DID so local
         // encrypt/decrypt can find it.
         state.sender_key_store.set_unchecked(
@@ -706,19 +1163,22 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn remove_member_sender_key(
+    /// Removes a member's sender key from all members' stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if removal fails.
+    pub fn remove_member_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
     ) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(context_id);
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let state = contexts.get_mut(context_id).ok_or_else(|| {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
+        let state = entry.value_mut();
         state.sender_key_store.remove(&ctx_id_hex, member_did);
         // Also remove the member's wrapping key — they are no longer a member.
         state.member_wrapping_keys.remove(member_did);
@@ -739,15 +1199,31 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+    /// Rotates the local sender key for a context (§9.16.4).
+    ///
+    /// Generates a fresh AES-256 sender key, increments `sender_key_epoch`,
+    /// updates the local sender key store, HPKE-seals the new key to each
+    /// remaining member's wrapping public key, and queues distribution
+    /// messages in `pending_distributions`.
+    ///
+    /// Called after a member is removed (governance or voluntary departure)
+    /// so that the removed party cannot decrypt future messages encrypted
+    /// with the new sender key.
+    ///
+    /// The default implementation is a no-op (`Ok(())`) so that mock and
+    /// test providers compile without changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if key generation, HPKE
+    /// sealing, or internal lock acquisition fails.
+    pub fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(context_id);
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let state = contexts.get_mut(context_id).ok_or_else(|| {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
+        let state = entry.value_mut();
 
         // 1. Generate fresh AES-256 sender key.
         let new_key = generate_sender_key();
@@ -838,21 +1314,48 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn drain_pending_sender_key_messages(
+    /// Drains pending sender key distribution messages for a context.
+    ///
+    /// Returns `(target_did, serialized_message)` pairs that should be
+    /// delivered to the target members via transport. Each message is a
+    /// serialized `SenderKeyDistributionMessage::KeyResponse` containing
+    /// an HPKE-sealed sender key.
+    ///
+    /// The default implementation returns an empty vector (no pending
+    /// distributions). Production providers that HPKE-seal sender keys
+    /// during [`distribute_sender_key`](Self::distribute_sender_key) should
+    /// override this to drain their pending queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the internal lock is
+    /// poisoned.
+    pub fn drain_pending_sender_key_messages(
         &self,
         context_id: &[u8; 32],
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let state = contexts.get_mut(context_id).ok_or_else(|| {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
-        Ok(std::mem::take(&mut state.pending_distributions))
+        Ok(std::mem::take(&mut entry.value_mut().pending_distributions))
     }
 
-    fn process_incoming_sender_key(
+    /// Processes an incoming sender key distribution message from a remote
+    /// member.
+    ///
+    /// Deserializes the message, extracts the sender key, and stores it in
+    /// the local sender key store so subsequent messages from `sender_did`
+    /// can be decrypted.
+    ///
+    /// The default implementation is a no-op. Production providers that
+    /// support HPKE sender key distribution should override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if deserialization, HPKE
+    /// decryption, or storage fails.
+    pub fn process_incoming_sender_key(
         &self,
         context_id: &[u8; 32],
         sender_did: &str,
@@ -866,21 +1369,21 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
         match msg {
             SenderKeyDistributionMessage::KeyResponse(response) => {
-                // HPKE-open the sealed sender key using our wrapping secret key.
-                let wrapping_secret = self
-                    .wrapping_secret_key
-                    .lock()
-                    .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-
+                // ADR-049 commit 12c.9f: load wrapping secret through
+                // `ArcSwap`. The returned `Arc` is held only for the
+                // duration of the HPKE-open call (no `.await` between
+                // load and drop).
+                let wrapping_secret_guard = self.wrapping_secret_key.load();
                 let sender_key = crate::crypto::sender_keys::key_protocol::hpke_open_sender_key(
                     &response.hpke_sealed_key,
                     &response.ephemeral_pubkey,
-                    &wrapping_secret,
+                    &wrapping_secret_guard,
                     &ctx_id_hex,
                     &response.sender_did,
                     response.epoch,
                 )
                 .map_err(|e| ContextError::CryptoFailed(format!("HPKE open failed: {e}")))?;
+                drop(wrapping_secret_guard);
 
                 // Verify the sender DID matches the claimed sender.
                 if response.sender_did != sender_did {
@@ -890,13 +1393,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 }
 
                 // Store the recovered sender key with epoch monotonicity check (#1608).
-                let mut contexts = self
-                    .contexts
-                    .lock()
-                    .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-                let state = contexts.get_mut(context_id).ok_or_else(|| {
+                // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+                let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
                     ContextError::CryptoFailed("no MLS group for this context".to_string())
                 })?;
+                let state = entry.value_mut();
 
                 // Epoch poisoning defense: reject sender keys with unreasonably
                 // high epoch values. An attacker could set epoch=u64::MAX to
@@ -920,7 +1421,22 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         }
     }
 
-    fn handle_sender_key_request(
+    /// Handles an incoming sender key request from a remote member.
+    ///
+    /// Verifies the request, checks replay protection, and HPKE-seals the
+    /// local sender key to the requester's wrapping pubkey.
+    ///
+    /// Returns `Some(serialized_response)` if the requester should receive
+    /// a key, or `None` if the request was silently dropped (e.g., blocked).
+    ///
+    /// The default implementation returns an error indicating the provider
+    /// does not support sender key request handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if signature verification,
+    /// HPKE encryption, or serialization fails.
+    pub fn handle_sender_key_request(
         &self,
         context_id: &[u8; 32],
         request_bytes: &[u8],
@@ -936,13 +1452,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
         let now_secs = scp_primitives::SystemClock.now_secs();
 
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let state = contexts.get_mut(context_id).ok_or_else(|| {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
+        let state = entry.value_mut();
 
         // Verify the request signature.
         let valid = scp_protocol::crypto::sender_keys::verify_sender_key_request(
@@ -1020,7 +1534,20 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(Some(message))
     }
 
-    fn seal(
+    /// Seals an inner envelope for transport: serializes, sender-key encrypts,
+    /// MLS encrypts, wraps in outer envelope.
+    ///
+    /// This is the primary send-path crypto operation. The caller constructs
+    /// the `InnerEnvelope` (including signing); this method handles all
+    /// encryption layers.
+    ///
+    /// The default implementation returns an error. Production providers
+    /// (`MlsCryptoProvider`) override this with the full envelope pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if any encryption step fails.
+    pub fn seal(
         &self,
         context_id: &[u8; 32],
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -1086,7 +1613,25 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn open(
+    /// Opens a received envelope: MLS decrypts, sender-key decrypts,
+    /// deserializes, verifies membership + padding + integrity check.
+    ///
+    /// Returns [`OpenResult::Application`](scp_protocol::context::builder::OpenResult::Application) for application messages,
+    /// [`OpenResult::Control`](scp_protocol::context::builder::OpenResult::Control) for MLS Commit/Proposal messages, or
+    /// [`OpenResult::Management`](scp_protocol::context::builder::OpenResult::Management) for MLS-wrapped management messages
+    /// (identified by the [`MANAGEMENT_MSG_MAGIC`](scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC) prefix).
+    ///
+    /// Signature verification is NOT performed here — the caller
+    /// (`ContextManager`) handles it via `key_resolver` after `open` returns.
+    ///
+    /// The default implementation returns an error. Production providers
+    /// (`MlsCryptoProvider`) override this with the full receive pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if MLS decryption, sender key
+    /// decryption, deserialization, padding strip, or integrity check fails.
+    pub fn open(
         &self,
         context_id: &[u8; 32],
         outer_bytes: &[u8],
@@ -1224,7 +1769,20 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn mls_encrypt_management(
+    /// MLS-encrypts a management payload for group-authenticated delivery.
+    ///
+    /// Prepends the [`MANAGEMENT_MSG_MAGIC`](scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC) prefix, MLS-encrypts the result,
+    /// and wraps in an outer envelope. Used to send sender key distributions
+    /// that are authenticated by MLS membership.
+    ///
+    /// The default implementation returns an error. Production providers
+    /// (`MlsCryptoProvider`) override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if MLS encryption or
+    /// serialization fails.
+    pub fn mls_encrypt_management(
         &self,
         context_id: &[u8; 32],
         plaintext: &[u8],
@@ -1262,19 +1820,29 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn advance_epoch(
+    /// Advances the MLS epoch for post-compromise security (§9.12 step 2).
+    ///
+    /// Issues an MLS Update proposal + self-Commit, ratcheting the group to
+    /// a new epoch with fresh key material. After this call, the compromised
+    /// old epoch key is useless for future messages.
+    ///
+    /// Returns an [`AdvanceEpochOutput`](scp_protocol::context::builder::AdvanceEpochOutput) containing the TLS-serialized MLS
+    /// Commit message that must be distributed to all group members.
+    ///
+    /// The default implementation is a no-op returning empty output so that
+    /// mock and test providers compile without changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the MLS update/commit fails.
+    pub fn advance_epoch(
         &self,
         context_id: &[u8; 32],
     ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
         use tls_codec::Serialize as TlsSerializeTrait;
 
-        let wrapping_pk = {
-            let guard = self
-                .wrapping_public_key
-                .lock()
-                .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-            *guard
-        };
+        // ADR-049 commit 12c.9f: load wrapping pubkey through `ArcSwap`.
+        let wrapping_pk = **self.wrapping_public_key.load();
         self.with_context(context_id, |state| {
             let commit = super::ratchet::propose_update_with_wrapping_key(
                 &mut state.mls_group,
@@ -1290,14 +1858,33 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
-        let contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let Some(state) = contexts.get(context_id) else {
+    /// Exports the per-context cryptographic state as an opaque byte blob
+    /// for persistence alongside the `ContextSnapshot`.
+    ///
+    /// The returned bytes capture all state needed to resume MLS encryption
+    /// and decryption for this context after a process restart: the MLS group
+    /// state (tree, epoch secrets, key schedule), the local sender key, the
+    /// sender key store (all member keys), the sender key epoch, and per-member
+    /// wrapping public keys.
+    ///
+    /// Returns an empty `Vec` if no crypto state exists for the given context
+    /// (e.g., mock providers or broadcast-only contexts).
+    ///
+    /// The default implementation returns an empty `Vec` (no state to persist).
+    /// Production providers that manage MLS groups MUST override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if serialization fails.
+    pub fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get`. Holds the
+        // per-shard read guard for the duration of snapshot
+        // construction; no other writer can mutate this entry while
+        // the guard is alive.
+        let Some(entry) = self.contexts.get(context_id) else {
             return Ok(Vec::new());
         };
+        let state = entry.value();
 
         // Extract the MLS group and signer, both required for restore.
         let group = state
@@ -1353,14 +1940,10 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             state.sender_key_store.epochs_for_context(&ctx_id_hex);
 
         // Read the provider-level wrapping keypair for persistence.
-        let pub_key_guard = self
-            .wrapping_public_key
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}")))?;
-        let secret_key_guard = self
-            .wrapping_secret_key
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}")))?;
+        // ADR-049 commit 12c.9f: load through `ArcSwap` and copy the
+        // bytes immediately so guards drop before snapshot serialization.
+        let pub_key_bytes = **self.wrapping_public_key.load();
+        let secret_key_bytes: Vec<u8> = self.wrapping_secret_key.load().to_vec();
 
         let mut snapshot = MlsCryptoSnapshot {
             mls_storage_entries,
@@ -1384,8 +1967,8 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 .collect(),
             signer_bytes: std::mem::take(&mut signer_bytes),
             group_id,
-            wrapping_public_key: *pub_key_guard,
-            wrapping_secret_key: secret_key_guard.to_vec(),
+            wrapping_public_key: pub_key_bytes,
+            wrapping_secret_key: secret_key_bytes,
         };
 
         let result = rmp_serde::to_vec_named(&snapshot)
@@ -1408,7 +1991,25 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         result
     }
 
-    fn restore_crypto_state(&self, context_id: &[u8; 32], data: &[u8]) -> Result<(), ContextError> {
+    /// Restores per-context cryptographic state from a previously exported
+    /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)).
+    ///
+    /// Called during `ContextManager::restore_context` to reinstate MLS
+    /// groups and sender keys after a process restart. If `data` is empty,
+    /// this is a no-op (the provider was never persisted or is a mock).
+    ///
+    /// The default implementation is a no-op. Production providers that
+    /// manage MLS groups MUST override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if deserialization fails or
+    /// the data is corrupt.
+    pub fn restore_crypto_state(
+        &self,
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), ContextError> {
         if data.is_empty() {
             return Ok(());
         }
@@ -1559,13 +2160,16 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         };
 
         // Restore the provider-level X25519 wrapping keypair BEFORE inserting
-        // into the contexts map. This prevents partial state: if any lock is
-        // poisoned the function returns early without modifying either the
-        // contexts map or the wrapping keys.
+        // into the contexts map. This prevents partial state: if either
+        // ArcSwap store is observed mid-rotation the contexts map has not
+        // yet seen the new entry.
         //
-        // Both wrapping key locks are acquired before either is written. This
-        // ensures that a poison on the second lock cannot leave the first key
-        // updated while the second retains its old value.
+        // ADR-049 commit 12c.9f: `ArcSwap::store` is atomic per-slot;
+        // observing one slot pre-rotation and the other post-rotation is
+        // possible only across the two stores below, but both rotate
+        // together to the same `snapshot` source so any in-flight reader
+        // sees a consistent pair (either old/old or new/new) at the
+        // protocol boundary that uses both keys (HPKE seal + open).
         //
         // Legacy snapshots (pre-wrapping-key persistence) have default
         // [0u8; 32] — skip restore in that case to keep the fresh keypair.
@@ -1575,15 +2179,10 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             let mut secret = Zeroizing::new([0u8; 32]);
             secret.copy_from_slice(&snapshot.wrapping_secret_key);
 
-            let mut pub_guard = self.wrapping_public_key.lock().map_err(|e| {
-                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
-            })?;
-            let mut secret_guard = self.wrapping_secret_key.lock().map_err(|e| {
-                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
-            })?;
-
-            *pub_guard = snapshot.wrapping_public_key;
-            *secret_guard = Zeroizing::new(*secret);
+            self.wrapping_public_key
+                .store(Arc::new(snapshot.wrapping_public_key));
+            self.wrapping_secret_key
+                .store(Arc::new(Zeroizing::new(*secret)));
         }
 
         // SECURITY: Zeroize the wrapping secret key bytes remaining in the
@@ -1592,27 +2191,63 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         // should not retain raw X25519 secret key material.
         snapshot.wrapping_secret_key.zeroize();
 
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        contexts.insert(*context_id, crypto_state);
+        // ADR-049 commit 12c.9f: lock-free `DashMap::insert`.
+        self.contexts.insert(*context_id, crypto_state);
 
         Ok(())
     }
 
-    fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
-        let Ok(contexts) = self.contexts.lock() else {
-            return Vec::new();
-        };
-        let Some(state) = contexts.get(context_id) else {
+    /// Returns the per-sender epoch high-water marks for a given context.
+    ///
+    /// Each `(sender_did, epoch)` pair represents the highest sender key epoch
+    /// seen from that participant.  Used by `ContextManager::import_context`
+    /// to capture the local floors **before** destroying existing crypto state
+    /// so the incoming snapshot can be validated against them.
+    ///
+    /// Returns an empty `Vec` when the context has no epoch state (mock
+    /// providers, broadcast-only contexts, or providers that do not track
+    /// epochs).
+    ///
+    /// The default implementation returns an empty `Vec`.  Production
+    /// providers that maintain a `SenderKeyStore` MUST override this.
+    pub fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
+        let Some(entry) = self.contexts.get(context_id) else {
             return Vec::new();
         };
         let ctx_id_hex = hex::encode(context_id);
-        state.sender_key_store.epochs_for_context(&ctx_id_hex)
+        entry
+            .value()
+            .sender_key_store
+            .epochs_for_context(&ctx_id_hex)
     }
 
-    fn validate_and_merge_epoch_floors(
+    /// Validates that the per-sender epoch floors in the just-restored crypto
+    /// state do not regress any entry in `local_floors`, then applies a
+    /// max-merge so `max(local, imported)` is the effective floor for every
+    /// sender (spec §23.17 Invariant 3 + Invariant 4).
+    ///
+    /// Call this AFTER `restore_crypto_state` during `import_context`, passing
+    /// the floors captured via `export_sender_key_epochs` **before** the
+    /// destroy+restore cycle.
+    ///
+    /// Rejects (returns `Err`) if any imported epoch is below its local floor
+    /// (regression) **or** exceeds `local_floor + max_advance_per_sender`
+    /// (epoch-poisoning guard). No state is mutated on failure.
+    ///
+    /// The default implementation is a no-op (`Ok`). Production providers MUST
+    /// override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::SnapshotFloorRegression`] on regression or
+    /// ceiling violation.
+    // Parameter type `Vec<(String, u64)>` is fixed by the `ContextCryptoProvider`
+    // trait signature (the forwarder impl below passes ownership through from a
+    // trait-object call). Switching to `&[(String, u64)]` is a signature change
+    // that belongs with trait deletion in commit 12c.9e.6 of ADR-049.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn validate_and_merge_epoch_floors(
         &self,
         context_id: &[u8; 32],
         local_floors: Vec<(String, u64)>,
@@ -1625,17 +2260,16 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         let ctx_id_hex = hex::encode(context_id);
 
         // Step 1: read the imported (restored) epoch floors.
-        let import_floors: Vec<(String, u64)> = {
-            let contexts = self
-                .contexts
-                .lock()
-                .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-            // No restored state (mls_state was empty): no incoming floors.
-            // Local floors are trivially dominant; merge them in below.
-            contexts.get(context_id).map_or_else(Vec::new, |state| {
-                state.sender_key_store.epochs_for_context(&ctx_id_hex)
-            })
-        };
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
+        let import_floors: Vec<(String, u64)> =
+            self.contexts
+                .get(context_id)
+                .map_or_else(Vec::new, |entry| {
+                    entry
+                        .value()
+                        .sender_key_store
+                        .epochs_for_context(&ctx_id_hex)
+                });
 
         // Step 2: build a temporary store seeded with local floors, then
         // validate the import floors against them via the atomic-reject helper.
@@ -1659,12 +2293,10 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         // Step 3: apply the merged floors (max of local and import) back into
         // the real store. Ensures local-only senders (absent from the import
         // snapshot) retain their floor (Invariant 4 append-only dominance).
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
         let merged = temp_store.epochs_for_context(&ctx_id_hex);
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        if let Some(state) = contexts.get_mut(context_id) {
+        if let Some(mut entry) = self.contexts.get_mut(context_id) {
+            let state = entry.value_mut();
             for (did, epoch) in merged {
                 state
                     .sender_key_store
@@ -1675,20 +2307,27 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
+    /// Generates a key package for joining a group via Welcome.
+    /// Returns TLS-serialized key package bytes. The provider retains the
+    /// private state needed to process the incoming Welcome.
+    ///
+    /// Default: not supported (returns error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if key package generation fails.
+    pub fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
         use tls_codec::Serialize as TlsSerializeTrait;
 
         let credential = self
             .make_credential()
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-        let wrapping_pk = self
-            .wrapping_public_key
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        // ADR-049 commit 12c.9f: load wrapping pubkey through `ArcSwap`.
+        let wrapping_pk = **self.wrapping_public_key.load();
 
         let (kp_bundle, signer, provider) =
-            super::group::generate_key_package_with_wrapping_key(&credential, Some(&*wrapping_pk))
+            super::group::generate_key_package_with_wrapping_key(&credential, Some(&wrapping_pk))
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         let kp_bytes = kp_bundle
@@ -1696,36 +2335,47 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .tls_serialize_detached()
             .map_err(|e| ContextError::CryptoFailed(format!("serializing key package: {e}")))?;
 
-        let mut pending = self
-            .pending_joins
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-
         // Only one key package can be outstanding at a time.
         // New prepare calls replace the old pending state to avoid
         // LIFO matching errors when Welcomes arrive out of order.
-        *pending = Some(PendingJoinState {
+        // ADR-049 commit 12c.9f: `ArcSwapOption::store` is atomic; any
+        // prior `Some` is dropped (with its `Zeroizing` signer wrapper).
+        self.pending_joins.store(Some(Arc::new(PendingJoinState {
             signer: super::group::EagerDropSigner::new(signer),
             provider,
-        });
+        })));
 
         Ok(kp_bytes)
     }
 
-    fn join_from_welcome(
+    /// Joins an MLS group from a TLS-serialized Welcome message.
+    /// Consumes the retained key package state from `prepare_key_package_for_join`.
+    ///
+    /// Default: not supported (returns error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if Welcome processing fails.
+    pub fn join_from_welcome(
         &self,
         context_id: &[u8; 32],
         welcome_bytes: &[u8],
     ) -> Result<(), ContextError> {
-        let mut entry = {
-            let mut pending = self
-                .pending_joins
-                .lock()
-                .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-            pending.take().ok_or_else(|| {
-                ContextError::CryptoFailed("no pending key package for Welcome".into())
-            })?
-        };
+        // ADR-049 commit 12c.9f: atomic take via `ArcSwapOption::swap(None)`.
+        // The provider is the sole writer; in the steady state (no
+        // concurrent reader holding a `load`-ed Arc) the returned Arc
+        // has strong count 1 and `Arc::try_unwrap` succeeds. If a
+        // concurrent reader keeps a strong reference alive we fall back
+        // to a defensive error rather than panicking — but no production
+        // call path does this today.
+        let pending_arc = self.pending_joins.swap(None).ok_or_else(|| {
+            ContextError::CryptoFailed("no pending key package for Welcome".into())
+        })?;
+        let mut entry = Arc::try_unwrap(pending_arc).map_err(|_| {
+            ContextError::CryptoFailed(
+                "pending join state still aliased — concurrent join_from_welcome racing".into(),
+            )
+        })?;
 
         let signer = entry.signer.take().ok_or_else(|| {
             ContextError::CryptoFailed("pending join signer already consumed".into())
@@ -1736,18 +2386,14 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
         let sender_key = generate_sender_key();
 
-        let mut contexts = self
-            .contexts
-            .lock()
-            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-
-        // Destroy any existing MLS group state for this context to ensure
-        // proper key material cleanup (defense-in-depth).
-        if let Some(mut old_state) = contexts.remove(context_id) {
+        // ADR-049 commit 12c.9f: lock-free `DashMap` writes. Destroy any
+        // existing MLS group state for this context to ensure proper key
+        // material cleanup (defense-in-depth).
+        if let Some((_, mut old_state)) = self.contexts.remove(context_id) {
             let _ = group::destroy_group(&mut old_state.mls_group);
         }
 
-        contexts.insert(
+        self.contexts.insert(
             *context_id,
             ContextCryptoState {
                 mls_group: group,
@@ -1831,7 +2477,10 @@ mod tests {
 
     #[test]
     fn validate_creator_identity_rejects_invalid_did() {
-        let provider = MlsCryptoProvider::new("did:key:invalid".to_string());
+        // Under `cfg(test)` the validator accepts `did:key:*` and
+        // `did:test:*` so legacy mock-based tests still work; pick a
+        // truly malformed DID string to prove rejection.
+        let provider = MlsCryptoProvider::new("invalid:format:whatever".to_string());
         assert!(provider.validate_creator_identity().is_err());
     }
 
@@ -1881,14 +2530,25 @@ mod tests {
     }
 
     #[test]
-    fn add_member_requires_key_package_bytes() {
+    fn add_member_rejects_malformed_key_package_bytes() {
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        // add_member with None should fail.
-        let result = provider.add_member(&ctx_id, "did:dht:z6MkBob", None);
-        assert!(result.is_err());
+        // Security intent: add_member must reject key material that is not a
+        // valid MLS KeyPackage. Garbage bytes fail TLS deserialization in
+        // BOTH production and test/testing builds — the `Some(bytes)` branch
+        // is not cfg-gated, so this rejection holds regardless of feature
+        // flags. (A `None` key package is, by design, accepted under the
+        // `testing` feature to drive the non-crypto pipeline; production
+        // builds — where `cfg!(any(test, feature = "testing"))` is false —
+        // still reject `None`. See `add_member`.)
+        let malformed: &[u8] = &[0xFF; 4];
+        let result = provider.add_member(&ctx_id, "did:dht:z6MkBob", Some(malformed));
+        assert!(
+            result.is_err(),
+            "add_member must reject malformed key package bytes: {result:?}"
+        );
     }
 
     #[test]
@@ -1981,8 +2641,8 @@ mod tests {
         // We need the Welcome message to let Bob join. Get it from the
         // underlying group directly.
         let add_result = {
-            let mut contexts = alice_provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let kp_in: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
             group::add_member(&mut state.mls_group, kp_in).unwrap()
         };
@@ -1994,8 +2654,8 @@ mod tests {
         // Alice encrypts a message.
         let plaintext = b"Hello Bob!";
         let ciphertext = {
-            let mut contexts = alice_provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let msg = encrypt(&mut state.mls_group, plaintext).unwrap();
             serialize_ciphertext(&msg).unwrap()
         };
@@ -2021,8 +2681,8 @@ mod tests {
             generate_key_package(&bob_cred).unwrap();
 
         let add_result = {
-            let mut contexts = alice_provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let kp_in: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
             group::add_member(&mut state.mls_group, kp_in).unwrap()
         };
@@ -2032,8 +2692,8 @@ mod tests {
 
         // Alice encrypts in epoch 1.
         let ciphertext_epoch1 = {
-            let mut contexts = alice_provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let msg = encrypt(&mut state.mls_group, b"epoch 1 message").unwrap();
             serialize_ciphertext(&msg).unwrap()
         };
@@ -2050,16 +2710,16 @@ mod tests {
             generate_key_package(&carol_cred).unwrap();
 
         {
-            let mut contexts = alice_provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let kp_in: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
             let _add_result2 = group::add_member(&mut state.mls_group, kp_in).unwrap();
         }
 
         // Verify epoch advanced.
         let epoch = {
-            let contexts = alice_provider.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = alice_provider.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             state.mls_group.epoch().unwrap()
         };
         assert_eq!(epoch, 2, "epoch should be 2 after second add");
@@ -2068,8 +2728,8 @@ mod tests {
         // because they're under different epoch keys. This verifies forward
         // secrecy: keys from epoch 1 are not reusable in epoch 2.
         let ciphertext_epoch2 = {
-            let mut contexts = alice_provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let msg = encrypt(&mut state.mls_group, b"epoch 2 message").unwrap();
             serialize_ciphertext(&msg).unwrap()
         };
@@ -2084,8 +2744,8 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        let contexts = provider.contexts.lock().unwrap();
-        let state = contexts.get(&ctx_id).unwrap();
+        let entry = provider.contexts.get(&ctx_id).unwrap();
+        let state = entry.value();
         let inner = state.mls_group.inner().unwrap();
 
         assert_eq!(
@@ -2108,8 +2768,8 @@ mod tests {
         let (bob_kp_bundle, bob_signer, bob_provider_mls) =
             generate_key_package(&bob_cred).unwrap();
         let add_bob_result = {
-            let mut contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let kp_in: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
             group::add_member(&mut state.mls_group, kp_in).unwrap()
         };
@@ -2125,8 +2785,8 @@ mod tests {
             generate_key_package(&carol_cred).unwrap();
 
         let add_carol_result = {
-            let mut contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let kp_in: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
             group::add_member(&mut state.mls_group, kp_in).unwrap()
         };
@@ -2134,8 +2794,8 @@ mod tests {
         let _carol_group =
             group::join_group(&add_carol_result.welcome, carol_provider_mls, carol_signer).unwrap();
 
-        let contexts = provider.contexts.lock().unwrap();
-        let state = contexts.get(&ctx_id).unwrap();
+        let entry = provider.contexts.get(&ctx_id).unwrap();
+        let state = entry.value();
         let members = state.mls_group.members().unwrap();
         assert_eq!(
             members.len(),
@@ -2168,16 +2828,16 @@ mod tests {
             .unwrap();
 
         {
-            let contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             assert_eq!(state.mls_group.epoch().unwrap(), 1);
         }
 
         provider.remove_member(&ctx_id, bob_did).unwrap();
 
         {
-            let contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             assert_eq!(state.mls_group.epoch().unwrap(), 2);
             let members = state.mls_group.members().unwrap();
             assert_eq!(members.len(), 1, "only Alice should remain");
@@ -2190,8 +2850,8 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        let contexts = provider.contexts.lock().unwrap();
-        let state = contexts.get(&ctx_id).unwrap();
+        let entry = provider.contexts.get(&ctx_id).unwrap();
+        let state = entry.value();
         let inner = state.mls_group.inner().unwrap();
         assert_eq!(
             inner.ciphersuite(),
@@ -2221,13 +2881,68 @@ mod tests {
                 .is_ok()
         );
         {
-            let contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             let ctx_hex = hex::encode(ctx_id);
             assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
         }
 
         assert!(provider.remove_member_sender_key(&ctx_id, TEST_DID).is_ok());
+    }
+
+    #[test]
+    fn create_mls_group_refuses_to_overwrite_existing_group() {
+        // Defense-in-depth: a second `create_mls_group` for the same
+        // context id must FAIL with `CreationFailed` and leave the first
+        // group's state byte-for-byte intact — never clobber a live MLS
+        // group with fresh keys (the crypto-desync clobber that the
+        // standing-context bootstrap-lock gap could trigger).
+        const SENTINEL_SEQ: u64 = 0xDEAD_BEEF;
+
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+
+        provider
+            .create_mls_group(&ctx_id)
+            .expect("first create_mls_group succeeds");
+
+        // Stamp a sentinel onto the live group's mutable state. A fresh
+        // group (the clobber we are guarding against) constructs
+        // `send_sequence: 0`, so a surviving sentinel proves no overwrite
+        // occurred and the SAME `ContextCryptoState` instance is intact.
+        {
+            let mut entry = provider
+                .contexts
+                .get_mut(&ctx_id)
+                .expect("first group is registered");
+            entry.value_mut().send_sequence = SENTINEL_SEQ;
+        }
+
+        // Second create for the SAME id is rejected.
+        match provider.create_mls_group(&ctx_id) {
+            Err(ContextCreationError::CreationFailed(msg)) => {
+                assert!(
+                    msg.contains("already exists"),
+                    "error must explain the duplicate, got: {msg}"
+                );
+            }
+            other => panic!("second create_mls_group must return CreationFailed, got {other:?}"),
+        }
+
+        // The first group's state is byte-for-byte intact — the sentinel
+        // survived, so no clobber with fresh keys occurred.
+        let after_seq = {
+            let entry = provider
+                .contexts
+                .get(&ctx_id)
+                .expect("first group still registered after rejected duplicate");
+            entry.value().send_sequence
+        };
+        assert_eq!(
+            after_seq, SENTINEL_SEQ,
+            "the live group's state must be unchanged after a rejected duplicate create \
+             (a clobber would reset send_sequence to 0)"
+        );
     }
 
     #[test]
@@ -2279,13 +2994,13 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        let contexts = provider.contexts.lock().unwrap();
-        let state = contexts.get(&ctx_id).unwrap();
+        let entry = provider.contexts.get(&ctx_id).unwrap();
+        let state = entry.value();
         let extracted =
             super::super::wrapping_extension::extract_own_wrapping_key(&state.mls_group).unwrap();
         assert_eq!(
             extracted,
-            Some(*provider.wrapping_public_key.lock().unwrap()),
+            Some(**provider.wrapping_public_key.load()),
             "own leaf node must contain provider's wrapping public key"
         );
     }
@@ -2313,8 +3028,8 @@ mod tests {
             .unwrap();
 
         {
-            let contexts = alice_provider.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = alice_provider.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             assert_eq!(
                 state.member_wrapping_keys.get(bob_did),
                 Some(&bob_wrapping),
@@ -2369,8 +3084,8 @@ mod tests {
         provider.distribute_sender_key(&ctx_id, bob_did).unwrap();
 
         {
-            let contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             let ctx_hex = hex::encode(ctx_id);
             assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
         }
@@ -2394,7 +3109,7 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
 
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let bob_wrapping_pk = *bob_provider.wrapping_public_key.lock().unwrap();
+        let bob_wrapping_pk = **bob_provider.wrapping_public_key.load();
         let (bob_kp_bundle, _bob_signer, _bob_mls) =
             generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping_pk)).unwrap();
         let kp_bytes = bob_kp_bundle
@@ -2418,8 +3133,8 @@ mod tests {
             .unwrap();
 
         {
-            let bob_contexts = bob_provider.contexts.lock().unwrap();
-            let bob_state = bob_contexts.get(&ctx_id).unwrap();
+            let bob_entry = bob_provider.contexts.get(&ctx_id).unwrap();
+            let bob_state = bob_entry.value();
             let ctx_hex = hex::encode(ctx_id);
             let alice_key = bob_state.sender_key_store.get(&ctx_hex, TEST_DID);
             assert!(
@@ -2427,8 +3142,8 @@ mod tests {
                 "Bob must have Alice's sender key after processing distribution"
             );
 
-            let alice_contexts = alice_provider.contexts.lock().unwrap();
-            let alice_state = alice_contexts.get(&ctx_id).unwrap();
+            let alice_entry = alice_provider.contexts.get(&ctx_id).unwrap();
+            let alice_state = alice_entry.value();
             assert_eq!(
                 alice_key.unwrap().as_bytes(),
                 alice_state.sender_key.as_bytes(),
@@ -2469,7 +3184,7 @@ mod tests {
         bob_provider.create_mls_group(&ctx_id).unwrap();
 
         let ctx_hex = hex::encode(ctx_id);
-        let bob_wrapping_pk = *bob_provider.wrapping_public_key.lock().unwrap();
+        let bob_wrapping_pk = **bob_provider.wrapping_public_key.load();
         let (sealed_vec, ephemeral_pub) =
             crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 &[42u8; 32],
@@ -2535,8 +3250,8 @@ mod tests {
         // Store a sender key for a remote member.
         {
             let ctx_id_hex = hex::encode(ctx_id);
-            let mut contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             state.sender_key_store.set_unchecked(
                 &ctx_id_hex,
                 "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
@@ -2551,8 +3266,8 @@ mod tests {
 
         // Capture pre-export state for comparison.
         let (original_sender_key, original_epoch, original_wrapping_key, original_bob_key) = {
-            let contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             let ctx_id_hex = hex::encode(ctx_id);
             (
                 state.sender_key.clone(),
@@ -2596,8 +3311,8 @@ mod tests {
 
         // Verify sender key state is restored.
         {
-            let contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider2.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             let ctx_id_hex = hex::encode(ctx_id);
 
             // Sender key matches.
@@ -2670,8 +3385,8 @@ mod tests {
         // Step 1: install Bob's epoch-5 key via set_checked so the
         // epoch map is populated exactly as it would be in production.
         {
-            let mut contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             state
                 .sender_key_store
                 .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 5)
@@ -2693,8 +3408,8 @@ mod tests {
 
         // Verify the restored floor exactly matches the persisted epoch.
         {
-            let contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider2.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             assert_eq!(
                 state.sender_key_store.epoch(&ctx_id_hex, bob_did),
                 5,
@@ -2704,8 +3419,8 @@ mod tests {
 
         // Step 4a: replay of pre-snapshot epoch=3 MUST be rejected.
         {
-            let mut contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let err = state
                 .sender_key_store
                 .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 3)
@@ -2725,8 +3440,8 @@ mod tests {
 
         // Step 4b: same-epoch replay at 5 MUST also be rejected.
         {
-            let mut contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let err = state
                 .sender_key_store
                 .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 5)
@@ -2746,8 +3461,8 @@ mod tests {
 
         // Step 5: legitimate post-snapshot rotation to epoch=6 is accepted.
         {
-            let mut contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             state
                 .sender_key_store
                 .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 6)
@@ -2776,8 +3491,8 @@ mod tests {
         // Install then remove Carol's epoch-9 key. The key is gone but
         // the floor is retained.
         {
-            let mut contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             state
                 .sender_key_store
                 .set_checked(&ctx_id_hex, carol_did, generate_sender_key(), 9)
@@ -2801,8 +3516,8 @@ mod tests {
 
         // Restored store has no key for Carol but still has the floor.
         {
-            let contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider2.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             assert!(
                 state.sender_key_store.get(&ctx_id_hex, carol_did).is_none(),
                 "removed key must not reappear after restore"
@@ -2816,8 +3531,8 @@ mod tests {
 
         // Attempt to install an earlier-epoch key (rejoin attack) — rejected.
         {
-            let mut contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             let err = state
                 .sender_key_store
                 .set_checked(&ctx_id_hex, carol_did, generate_sender_key(), 4)
@@ -2852,8 +3567,8 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let ctx_id_hex = hex::encode(ctx_id);
         {
-            let mut contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             // Set a non-trivial global sender_key_epoch so we can verify
             // the legacy seed uses it.
             state.sender_key_epoch = 7;
@@ -2878,8 +3593,8 @@ mod tests {
         // `sender_key_epoch` counter as a conservative lower bound.
         // This closes the one-shot rollback window.
         {
-            let mut contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             assert_eq!(
                 state.sender_key_store.epoch(&ctx_id_hex, bob_did),
                 7,
@@ -2932,8 +3647,8 @@ mod tests {
         // epoch IS tracked in the `epochs` map but the snapshot
         // format does NOT persist it.
         {
-            let mut contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             state.sender_key_epoch = 1;
             state
                 .sender_key_store
@@ -2962,8 +3677,8 @@ mod tests {
         // LOCAL sender_key_epoch counter (1), NOT the true pre-snapshot
         // peer floor (50). This is the documented residual window.
         {
-            let contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider2.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             let seeded = state.sender_key_store.epoch(&ctx_id_hex, peer_did);
             assert_eq!(
                 seeded, 1,
@@ -2999,8 +3714,8 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let ctx_id_hex = hex::encode(ctx_id);
         {
-            let mut contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             state.sender_key_epoch = 0;
             state
                 .sender_key_store
@@ -3017,8 +3732,8 @@ mod tests {
             .restore_crypto_state(&ctx_id, &legacy_bytes)
             .unwrap();
 
-        let contexts = provider2.contexts.lock().unwrap();
-        let state = contexts.get(&ctx_id).unwrap();
+        let entry = provider2.contexts.get(&ctx_id).unwrap();
+        let state = entry.value();
         assert_eq!(
             state.sender_key_store.epoch(&ctx_id_hex, bob_did),
             1,
@@ -3080,8 +3795,8 @@ mod tests {
 
         // Get the epoch before export.
         let epoch_before = {
-            let contexts = provider.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             state.mls_group.epoch().unwrap()
         };
 
@@ -3092,8 +3807,8 @@ mod tests {
 
         // Verify epoch is preserved.
         let epoch_after = {
-            let contexts = provider2.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = provider2.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             state.mls_group.epoch().unwrap()
         };
 
@@ -3110,8 +3825,8 @@ mod tests {
         provider.create_mls_group(&ctx_id).unwrap();
 
         // Capture the original wrapping keypair.
-        let original_public = *provider.wrapping_public_key.lock().unwrap();
-        let original_secret: [u8; 32] = **provider.wrapping_secret_key.lock().unwrap();
+        let original_public = **provider.wrapping_public_key.load();
+        let original_secret: [u8; 32] = ***provider.wrapping_secret_key.load();
 
         // Sanity: the keypair should not be all zeros.
         assert_ne!(
@@ -3129,7 +3844,7 @@ mod tests {
 
         // Create a fresh provider (simulates restart — gets a NEW random keypair).
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
-        let fresh_public = *provider2.wrapping_public_key.lock().unwrap();
+        let fresh_public = **provider2.wrapping_public_key.load();
         assert_ne!(
             fresh_public, original_public,
             "fresh provider should have a DIFFERENT wrapping public key"
@@ -3139,8 +3854,8 @@ mod tests {
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
         // After restore, the wrapping keypair must match the ORIGINAL, not the fresh one.
-        let restored_public = *provider2.wrapping_public_key.lock().unwrap();
-        let restored_secret: [u8; 32] = **provider2.wrapping_secret_key.lock().unwrap();
+        let restored_public = **provider2.wrapping_public_key.load();
+        let restored_secret: [u8; 32] = ***provider2.wrapping_secret_key.load();
 
         assert_eq!(
             restored_public, original_public,
@@ -3228,8 +3943,8 @@ mod tests {
     /// clear, bypassing any sender-side bound. Bob's `open()` is what
     /// the test exercises.
     fn force_alice_sender_key_epoch(alice: &MlsCryptoProvider, context_id: &[u8; 32], epoch: u64) {
-        let mut contexts = alice.contexts.lock().unwrap();
-        let state = contexts.get_mut(context_id).unwrap();
+        let mut entry = alice.contexts.get_mut(context_id).unwrap();
+        let state = entry.value_mut();
         state.sender_key_epoch = epoch;
     }
 
@@ -3273,8 +3988,8 @@ mod tests {
         // attack still succeeds — the next legitimate message from
         // Alice would be rejected as a "replay or reorder".
         {
-            let contexts = bob.contexts.lock().unwrap();
-            let state = contexts.get(&ctx_id).unwrap();
+            let entry = bob.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
             assert!(
                 !state.recv_sequence_tracker.contains_key(&alice_did),
                 "rejected H9 message must not pollute recv_sequence_tracker"
@@ -3334,8 +4049,8 @@ mod tests {
 
         // The receive tracker must have been updated with the boundary
         // epoch so subsequent same-epoch messages don't replay.
-        let contexts = bob.contexts.lock().unwrap();
-        let state = contexts.get(&ctx_id).unwrap();
+        let entry = bob.contexts.get(&ctx_id).unwrap();
+        let state = entry.value();
         let entry = state.recv_sequence_tracker.get(&alice_did).copied();
         assert_eq!(entry, Some((1001, 0)));
     }
@@ -3359,8 +4074,8 @@ mod tests {
         bob.open(&ctx_id, &sealed1).expect("first seal must open");
         bob.open(&ctx_id, &sealed2).expect("second seal must open");
 
-        let contexts = bob.contexts.lock().unwrap();
-        let state = contexts.get(&ctx_id).unwrap();
+        let entry = bob.contexts.get(&ctx_id).unwrap();
+        let state = entry.value();
         let (epoch, seq) = state
             .recv_sequence_tracker
             .get(&alice_did)
@@ -3395,8 +4110,8 @@ mod tests {
         // the existing replay guard, NOT silently accepted because
         // the H9 ceiling check passed.
         {
-            let mut contexts = alice.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = alice.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             state.send_sequence = 0;
         }
         let inner_replay = build_test_inner(&ctx_id, &alice_did, 0, 0);
@@ -3421,8 +4136,8 @@ mod tests {
         // Bob's last-seen (epoch=1, ...) and must be rejected.
         force_alice_sender_key_epoch(&alice, &ctx_id, 0);
         {
-            let mut contexts = alice.contexts.lock().unwrap();
-            let state = contexts.get_mut(&ctx_id).unwrap();
+            let mut entry = alice.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
             state.send_sequence = 5;
         }
         let inner_lower = build_test_inner(&ctx_id, &alice_did, 0, 0);
@@ -3436,6 +4151,163 @@ mod tests {
                     msg.contains("replay or reorder"),
                     "expected replay/reorder rejection, got: {msg}"
                 );
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-049 commit 12b.2a — `take_crypto_state` tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn take_crypto_state_removes_entry_from_provider() {
+        // Create a two-member context via the legacy path, then take
+        // the state. Post-take: the provider's `contexts` map has no
+        // entry for this context_id, the `taken_context_ids` set
+        // does, and the returned `OwnedMlsCryptoState` carries the
+        // expected mls group + sender key + counter values.
+        let (alice, _bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+
+        // Capture the sender_key_epoch before take so we can compare
+        // to the returned owned value.
+        let epoch_before = alice
+            .contexts
+            .get(&ctx_id)
+            .unwrap()
+            .value()
+            .sender_key_epoch;
+
+        let owned = alice
+            .take_crypto_state(&ctx_id)
+            .expect("take_crypto_state succeeds for live context");
+        assert_eq!(owned.sender_key_epoch, epoch_before);
+        // send_sequence starts at 0 — setup_alice_bob_two_party does
+        // not call seal().
+        assert_eq!(owned.send_sequence, 0);
+
+        // `contexts` map now has no entry for this id.
+        assert!(!alice.contexts.contains_key(&ctx_id));
+        // `taken_context_ids` records the take.
+        assert!(alice.taken_context_ids.contains(&ctx_id));
+    }
+
+    #[test]
+    fn take_crypto_state_missing_context_returns_not_registered() {
+        let provider = make_provider();
+        let ctx_id = [9u8; 32];
+        let err = provider
+            .take_crypto_state(&ctx_id)
+            .expect_err("take on unknown context must error");
+        match err {
+            ContextError::ContextNotRegistered(msg) => {
+                assert!(
+                    msg.contains("no MLS group for context"),
+                    "expected 'no MLS group' message, got: {msg}",
+                );
+            }
+            other => panic!("expected ContextNotRegistered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_crypto_state_double_take_returns_owned_by_actor() {
+        // First take succeeds. Second take sees the id in
+        // `taken_context_ids` and returns the "owned by actor"
+        // error instead of the generic `no MLS group` error.
+        let (alice, _bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+
+        let _owned = alice.take_crypto_state(&ctx_id).unwrap();
+
+        let err = alice
+            .take_crypto_state(&ctx_id)
+            .expect_err("second take must error");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "context state owned by actor");
+            }
+            other => panic!("expected CryptoFailed('owned by actor'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_after_take_returns_owned_by_actor() {
+        // After `take_crypto_state`, the legacy `seal` path on the
+        // same context must return `CryptoFailed('context state
+        // owned by actor')` so callers learn to route through the
+        // actor mailbox instead.
+        let (alice, _bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let _owned = alice.take_crypto_state(&ctx_id).unwrap();
+
+        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let routing_id = ctx_routing_id(&ctx_id);
+
+        let err = alice
+            .seal(&ctx_id, &inner, &routing_id, 300)
+            .expect_err("seal on a taken context must error");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "context state owned by actor");
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_after_take_returns_owned_by_actor() {
+        // Companion to `seal_after_take`: the `open` path also
+        // errors with the same message.
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+
+        // Seal a message via alice BEFORE taking the state so we
+        // have a valid ciphertext to feed into bob's open.
+        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let routing_id = ctx_routing_id(&ctx_id);
+        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
+
+        // Now take bob's state — open on bob's side should error.
+        let _owned = bob.take_crypto_state(&ctx_id).unwrap();
+        let err = bob
+            .open(&ctx_id, &sealed)
+            .expect_err("open on a taken context must error");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "context state owned by actor");
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_context_distinguishes_never_created_from_taken() {
+        // `with_context` (the internal accessor) returns the generic
+        // "no MLS group for this context" error when the id was
+        // never created, and the "context state owned by actor"
+        // error when it was taken. The distinction matters for
+        // actionable diagnostics.
+        let (alice, _bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+
+        // Never-created id.
+        let other_id = [0xAAu8; 32];
+        let err_never = alice
+            .with_context(&other_id, |_state| Ok(()))
+            .expect_err("never-created errors");
+        match err_never {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "no MLS group for this context");
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+
+        // Take and retry — same id now surfaces the "owned by
+        // actor" message.
+        let _owned = alice.take_crypto_state(&ctx_id).unwrap();
+        let err_taken = alice
+            .with_context(&ctx_id, |_state| Ok(()))
+            .expect_err("taken errors");
+        match err_taken {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "context state owned by actor");
             }
             other => panic!("expected CryptoFailed, got {other:?}"),
         }

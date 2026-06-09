@@ -379,6 +379,84 @@ pub(crate) fn economy_antispam_escalated_cost_on(
     Ok(cost.value() as i64)
 }
 
+/// Per-bridge-instance implementation of `economy_verify_payment_receipts`.
+///
+/// Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
+/// dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the supervisor,
+/// returning a JSON `{"all_valid": <bool>, "results": [...]}` document with one
+/// entry per receipt. Mirrors the `PyO3` reference bridge exactly. Maximum
+/// 10,000 receipts per call.
+///
+/// `all_valid` is `true` iff every entry both reached the adapter (`ok ==
+/// true`) and the adapter reported the receipt valid (`result.valid == true`);
+/// it is vacuously `true` for an empty batch. Each `results` entry is either
+/// `{"receipt_id": <hex>, "ok": true, "valid": <bool>, "result": <structured
+/// VerificationResult>}` on success or `{"ok": false, "error": "..."}` on
+/// failure. `ok` means the adapter *responded* — NOT that the payment is
+/// valid; callers scanning for failures must inspect `valid`/`all_valid`.
+///
+/// Runs synchronously on a libuv worker thread — there is no ambient tokio
+/// context, so the actual dispatch is driven via the shared runtime's
+/// `block_on`.
+///
+/// # Errors
+///
+/// Returns a `Validation` error if `receipts_json` is malformed, a suspended
+/// `Context` error if the bridge is suspended, or a `Context` error if the
+/// supervisor dispatch fails or the reply channel is dropped.
+pub(crate) fn economy_verify_payment_receipts_on(
+    bi: &NapiBridgeInstance,
+    receipts_json: String,
+) -> napi::Result<String> {
+    // Validate input at the FFI boundary before touching supervisor state,
+    // so a malformed payload fails fast with a `Validation` error rather than
+    // a misleading supervisor-state error.
+    let receipts: Vec<scp_core::economy::PaymentReceipt> = serde_json::from_str(&receipts_json)
+        .map_err(|e| validation_error(&format!("invalid receipts JSON: {e}")))?;
+
+    // Bound the per-call batch before dispatch: each receipt fans out to a
+    // serial payment-adapter verification round-trip, so an unbounded batch
+    // is a denial-of-service vector. See `MAX_RECEIPT_BATCH`.
+    if receipts.len() > scp_core::economy::MAX_RECEIPT_BATCH {
+        return Err(validation_error(&format!(
+            "receipt batch too large: {} (max {})",
+            receipts.len(),
+            scp_core::economy::MAX_RECEIPT_BATCH
+        )));
+    }
+
+    let rt = crate::runtime();
+    let sup = crate::runtime::supervisor(bi)?.clone();
+
+    rt.block_on(async move {
+        use scp_core::context::actor::commands::EconomyCommand;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = EconomyCommand::VerifyPaymentReceipts {
+            receipts: Box::new(receipts),
+            reply: tx,
+        };
+        sup.dispatch_economy_command(cmd).await.map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_economy_command failed: {e}"),
+                code: codes::ECON_12091.to_owned(),
+            })
+        })?;
+        let results = rx.await.map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("verify_payment_receipts shim reply dropped: {e}"),
+                code: codes::ECON_12091.to_owned(),
+            })
+        })?;
+
+        // Serialize via the single canonical helper shared by all bridges,
+        // so the JSON contract (string currency, numeric amount, `ok` vs
+        // `valid`/`all_valid` semantics) cannot drift across PyO3, napi, and
+        // UniFFI. See `scp_runtime::economy::receipt::verification_results_to_json`.
+        Ok(scp_core::economy::verification_results_to_json(results))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -494,6 +572,73 @@ mod tests {
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_payment_receipts_rejects_malformed_json() {
+        // The invalid-JSON path is reached before any supervisor lookup,
+        // so a bare `new_napi()` instance (no supervisor) suffices.
+        let bi = NapiBridgeInstance::new_napi();
+        let err = economy_verify_payment_receipts_on(&bi, "not json".to_owned()).unwrap_err();
+        assert!(
+            err.reason.contains("invalid receipts JSON"),
+            "error should mention 'invalid receipts JSON': {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_payment_receipts_empty_batch_returns_all_valid_true() {
+        // An empty receipt batch is the clean supervisor-backed happy path —
+        // it needs no payment adapter but still dispatches an `EconomyCommand`
+        // to the supervisor, so a supervisor must be attached first. The new
+        // output contract returns `{"all_valid":true,"results":[]}` —
+        // `all_valid` is vacuously `true` for an empty batch.
+        //
+        // `economy_verify_payment_receipts_on` drives its own `block_on`, so
+        // it is exercised from a plain `#[test]` (no ambient tokio runtime,
+        // mirroring the libuv worker-thread execution context).
+        let bi = NapiBridgeInstance::new_napi();
+        crate::runtime::init_supervisor_for_test_on(&bi);
+
+        let out = economy_verify_payment_receipts_on(&bi, "[]".to_owned()).unwrap();
+        assert_eq!(out, r#"{"all_valid":true,"results":[]}"#);
+    }
+
+    #[test]
+    fn verify_payment_receipts_rejects_oversized_batch() {
+        use scp_core::economy::{
+            Amount, CurrencyCode, MAX_RECEIPT_BATCH, PaidActionType, PaymentReceipt,
+        };
+        use scp_identity::DID;
+
+        // Build one more than the cap of minimal-but-valid receipts. The cap
+        // check runs before any supervisor lookup, so a bare `new_napi()`
+        // instance (no supervisor) suffices — proving the oversized batch is
+        // rejected without dispatching to the payment adapter.
+        let receipts: Vec<PaymentReceipt> = (0..=MAX_RECEIPT_BATCH)
+            .map(|_| PaymentReceipt {
+                receipt_id: [0u8; 32],
+                payer: DID("did:key:alice".to_owned()),
+                payee: DID("did:key:bob".to_owned()),
+                amount: Amount::new(1),
+                currency: CurrencyCode(*b"USDC"),
+                action_type: PaidActionType::MessageSend,
+                context_id: None,
+                adapter_id: "noop".to_owned(),
+                adapter_proof: Vec::new(),
+                timestamp: 0,
+                signature: Vec::new(),
+            })
+            .collect();
+        assert_eq!(receipts.len(), MAX_RECEIPT_BATCH + 1);
+        let receipts_json = serde_json::to_string(&receipts).unwrap();
+
+        let bi = NapiBridgeInstance::new_napi();
+        let err = economy_verify_payment_receipts_on(&bi, receipts_json).unwrap_err();
+        assert!(
+            err.reason.contains("receipt batch too large"),
+            "error should mention 'receipt batch too large': {err:?}"
         );
     }
 

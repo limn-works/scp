@@ -234,19 +234,48 @@ impl Storage for BridgeInMemoryStorage {
 // Event log provider builder
 // ---------------------------------------------------------------------------
 
+/// Shared encrypted in-memory storage handle backing the event-log
+/// `ProtocolRepository`.
+///
+/// This is the single `Storage` value the dev/in-memory path owns. The
+/// event-log `ProtocolRepository` is built *over* this `Arc`, and the same
+/// `Arc` is returned to the bridge so it can derive the supervisor's
+/// `mls_storage` (`OpenMLS`) view via `SpawnBlockingStorageAdapter`. ONE
+/// store therefore backs both the event log and `mls_storage` (spec §17.6 —
+/// in-memory is the dev affordance; one chosen backend, derived consumers).
+pub type BridgeInMemoryStorageHandle = Arc<EncryptingAdapter<BridgeInMemoryStorage>>;
+
+/// `ProtocolRepository` built over the shared [`BridgeInMemoryStorageHandle`].
+///
+/// The repository is generic over the `Arc<EncryptingAdapter<...>>` (rather
+/// than an owned `EncryptingAdapter<...>`) so the underlying store can be
+/// shared with the `mls_storage` consumer. `Arc<EncryptingAdapter<S>>`
+/// satisfies the sealed `EncryptedStorage` bound via the
+/// `impl<T: EncryptedStorage> EncryptedStorage for Arc<T>` blanket
+/// (`scp-platform`).
+pub type BridgeInMemoryRepo = ProtocolRepository<BridgeInMemoryStorageHandle>;
+
 /// Constructs a persistent event log provider backed by encrypted in-memory
 /// storage.
 ///
 /// Creates an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
-/// AES-256-GCM key, wraps it in a `ProtocolRepository`, then builds a
-/// `ProtocolRepositoryEventLogBridge` that implements `EventLogPersistence`.
-/// The resulting `MerkleEventLogProvider` persists entries on each append.
+/// AES-256-GCM key, wraps it in an `Arc`, builds a `ProtocolRepository` over
+/// that `Arc`, then builds a `ProtocolRepositoryEventLogBridge` that
+/// implements `EventLogPersistence`. The resulting `MerkleEventLogProvider`
+/// persists entries on each append.
 ///
-/// Returns both the event log provider (for `ContextManager` initialization)
-/// and the `ProtocolRepository` (for trust store usage and per-bridge
-/// storage). Callers own the repository handle and typically stash it on
-/// the per-bridge concrete struct (e.g. `PyBridgeInstance`,
-/// `NapiBridgeInstance`, `UniffiBridgeInstance`).
+/// Returns three handles to the SAME underlying store:
+/// 1. the event log provider (for `Supervisor`/`ContextManager`
+///    initialization),
+/// 2. the `ProtocolRepository` (for trust store usage and per-bridge
+///    storage; callers stash it on the per-bridge concrete struct, e.g.
+///    `NapiBridgeInstance`, `UniffiBridgeInstance`),
+/// 3. the raw [`BridgeInMemoryStorageHandle`] — previously dropped. It is now
+///    retained so the bridge can wrap it via `SpawnBlockingStorageAdapter`
+///    into the supervisor's required `mls_storage` consumer. Because all
+///    three derive from one `Arc`, the event log, persistence, and `OpenMLS`
+///    storage view read/write a single in-memory store (no split-brain;
+///    spec §17.6).
 ///
 /// Uses [`BridgeInMemoryStorage`] instead of
 /// `scp_platform::testing::InMemoryStorage` so that the `testing` feature
@@ -256,16 +285,20 @@ impl Storage for BridgeInMemoryStorage {
 /// This function is identical in the NAPI and `UniFFI` bridges.
 pub fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
-    Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+    Arc<BridgeInMemoryRepo>,
+    BridgeInMemoryStorageHandle,
 ) {
     let mut key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
-    let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key);
-    let store = Arc::new(ProtocolRepository::new(encrypted));
+    // Wrap the encrypted store in an `Arc` first so the SAME store backs the
+    // event-log `ProtocolRepository` AND the returned `mls_storage` handle.
+    let storage_handle: BridgeInMemoryStorageHandle =
+        Arc::new(EncryptingAdapter::new(BridgeInMemoryStorage::new(), key));
+    let store = Arc::new(ProtocolRepository::new(Arc::clone(&storage_handle)));
 
     let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(&store));
     let event_log = Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)));
-    (event_log, store)
+    (event_log, store, storage_handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,9 +331,13 @@ pub fn build_event_log_provider() -> (
 /// `SQLCipher` database.
 pub enum ProtocolRepoVariant {
     /// Encrypted in-memory repository. Event log and trust aggregation are
-    /// backed by an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
-    /// per-instance AES-256-GCM key. Data is lost when the instance drops.
-    InMemory(Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>),
+    /// backed by an `Arc<EncryptingAdapter<BridgeInMemoryStorage>>`
+    /// ([`BridgeInMemoryStorageHandle`]) with a random per-instance
+    /// AES-256-GCM key. The store is held behind an `Arc` so the SAME
+    /// encrypted backend feeds the event-log repository AND the supervisor's
+    /// `mls_storage` view (spec §17.6 — one chosen backend, derived
+    /// consumers). Data is lost when the instance drops.
+    InMemory(Arc<BridgeInMemoryRepo>),
     /// SQLCipher-backed repository. Event log and trust aggregation share the
     /// same `Arc<SqliteStorage>` that backs `CoreFields::persistence`, so
     /// context snapshots, trust attestations, and event log entries all
@@ -384,4 +421,55 @@ pub struct UcanContextStateCore {
     pub creator_did: String,
     /// Event log (Merkle tree) for this context.
     pub event_log: scp_event_log::EventLog,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod bridge_runtime_storage_tests {
+    use super::build_event_log_provider;
+    use scp_platform::Storage as _;
+
+    /// The raw in-memory storage handle returned by
+    /// [`build_event_log_provider`] and the event-log `ProtocolRepository`
+    /// must read/write a single underlying store. Writing through the raw
+    /// handle (the future `mls_storage` source) must be visible through the
+    /// repository's `storage()` view (the event-log / persistence source),
+    /// proving one store backs both consumers (spec §17.6).
+    #[tokio::test]
+    async fn handle_and_repo_share_one_store() {
+        let (_event_log, repo, storage_handle) = build_event_log_provider();
+
+        // Write via the raw handle (the `mls_storage` source).
+        storage_handle
+            .store("scp-test/key", b"value-via-handle")
+            .await
+            .expect("store via raw handle must succeed");
+
+        // Read via the repository's storage view (the event-log source).
+        let read_back = repo
+            .storage()
+            .retrieve("scp-test/key")
+            .await
+            .expect("retrieve via repo storage must succeed");
+        assert_eq!(
+            read_back.as_deref(),
+            Some(b"value-via-handle".as_slice()),
+            "raw handle write must be visible through the repo store — one backend"
+        );
+
+        // And the reverse direction: write via repo storage, read via handle.
+        repo.storage()
+            .store("scp-test/key2", b"value-via-repo")
+            .await
+            .expect("store via repo storage must succeed");
+        let read_back2 = storage_handle
+            .retrieve("scp-test/key2")
+            .await
+            .expect("retrieve via raw handle must succeed");
+        assert_eq!(
+            read_back2.as_deref(),
+            Some(b"value-via-repo".as_slice()),
+            "repo store write must be visible through the raw handle — one backend"
+        );
+    }
 }

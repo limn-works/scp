@@ -1,0 +1,283 @@
+//! Narrow MLS primitive backend trait.
+//!
+//! Introduced by commit 4 of the actor-per-context refactor (ADR-049 §6).
+//!
+//! # Trait split
+//!
+//! `MlsBackend` is the narrow MLS-primitive surface that replaces the
+//! ~26-method `ContextCryptoProvider` trait. State lives on the caller's
+//! `ScpMlsGroup`; methods take `&mut ScpMlsGroup` and never own state.
+//!
+//! The split strictly preserves RFC 9420 conformance: every method maps to a
+//! single `OpenMLS` primitive with no SCP orchestration in between. The SCP
+//! ciphersuite is fixed to
+//! [`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`](super::group::SCP_CIPHERSUITE).
+//!
+//! # Method contracts
+//!
+//! - `validate_key_package` / `generate_key_package` are cancel-safe and
+//!   side-effect-free on `ScpMlsGroup`. They construct fresh values; no
+//!   caller state changes if the future is dropped mid-flight.
+//! - All other mutating methods are **cancel-hostile** on `&mut ScpMlsGroup`:
+//!   the group's internal epoch state may advance (via `merge_pending_commit`
+//!   or `merge_staged_commit`) before the future returns. Dropping the future
+//!   mid-call can leave the group in a partially-committed state. Cancel-safe
+//!   wrappers live at the supervisor layer — see the saga journal for the
+//!   rollback discipline.
+//! - There is no dedicated rollback helper in this commit; the supervisor
+//!   layer (commit ≥5) is the sole rollback point. Any rollback helper added
+//!   later will be idempotent by construction (the handler must recompute
+//!   rollback target state from `PerContextState`).
+//!
+//! # Production impl
+//!
+//! [`super::production_backend::ProductionMlsBackend`] delegates to the
+//! existing [`super::group`] and [`super::encrypt`] free functions — the same
+//! primitives the pre-refactor `MlsCryptoProvider` calls today. The
+//! byte-identical output test in `production_backend.rs` feeds the same input
+//! to both the backend and a bare `MlsCryptoProvider` and asserts equality on
+//! the produced ciphertext / Welcome / Commit bytes.
+
+use async_trait::async_trait;
+use openmls::prelude::LeafNodeIndex;
+
+use super::credential::ScpCredential;
+use super::encrypt::DecryptedContent;
+use super::error::MlsError;
+use super::group::ScpMlsGroup;
+
+// ---------------------------------------------------------------------------
+// Wrapper output types
+// ---------------------------------------------------------------------------
+
+/// Raw output of an `add_member` primitive.
+///
+/// Exposes the wire-serialized `commit`, `welcome`, and optional `group_info`
+/// bytes that `OpenMLS` produces. Handlers (in later commits) wrap these raw
+/// bytes into the richer `AddMemberOutput` the old trait produced; keeping
+/// this type primitive-only is deliberate — it is the exact abstraction
+/// boundary of the `MlsBackend` trait.
+#[derive(Debug, Clone)]
+pub struct AddMemberRaw {
+    /// TLS-serialized MLS Commit message. Sent to all existing members to
+    /// advance the group epoch.
+    pub commit: Vec<u8>,
+    /// TLS-serialized MLS Welcome message. HPKE-encrypted to the new
+    /// member's `KeyPackage`; contains the group state they need.
+    pub welcome: Vec<u8>,
+    /// TLS-serialized MLS `GroupInfo`, if `OpenMLS` produced one. Optional per
+    /// RFC 9420.
+    pub group_info: Option<Vec<u8>>,
+}
+
+/// Raw output of a `remove_member` primitive.
+///
+/// Exposes the wire-serialized `commit` and optional `group_info` bytes that
+/// `OpenMLS` produces. See [`AddMemberRaw`] for why this is primitive-only.
+#[derive(Debug, Clone)]
+pub struct RemoveMemberRaw {
+    /// TLS-serialized MLS Commit message. Sent to remaining members.
+    pub commit: Vec<u8>,
+    /// TLS-serialized MLS `GroupInfo`, if `OpenMLS` produced one.
+    pub group_info: Option<Vec<u8>>,
+}
+
+/// Output of `validate_key_package` — wraps the validated bytes.
+///
+/// `validate_key_package` returns a plain success marker plus the canonical
+/// bytes of the validated `KeyPackage`. The raw bytes are kept on the
+/// successful path so handler code can re-serialize for storage (key package
+/// pool) without re-running validation.
+#[derive(Debug, Clone)]
+pub struct ValidatedKeyPackage {
+    /// The TLS-serialized `KeyPackage` bytes that passed validation.
+    pub key_package_bytes: Vec<u8>,
+}
+
+/// Output of `generate_key_package` — pairs the wire bytes with the opaque
+/// signer state the caller must retain to later join from a Welcome.
+#[derive(Debug, Clone)]
+pub struct GeneratedKeyPackage {
+    /// The TLS-serialized `KeyPackage` bytes ready for publication.
+    pub key_package_bytes: Vec<u8>,
+    /// Opaque signer-state handle the caller retains to join a group from a
+    /// Welcome message addressed to this `KeyPackage`. The bytes are an
+    /// implementation-defined serialization of the signer / provider state
+    /// and MUST NOT be interpreted by callers; they are passed verbatim to
+    /// [`MlsBackend::join_from_welcome`].
+    ///
+    /// Contains the Ed25519 signing key and `OpenMLS` in-memory storage needed
+    /// to process the Welcome. Wire format is not stable across `OpenMLS`
+    /// upgrades — callers persist alongside schema versioning per §17.15.3.
+    pub signer_state: SignerState,
+}
+
+/// Opaque signer-state handle produced by `generate_key_package` and consumed
+/// by `join_from_welcome`.
+///
+/// The byte layout is defined by the [`MlsBackend`] implementation. Callers
+/// MUST treat the bytes as opaque and MUST NOT attempt to parse them.
+///
+/// The enclosed Ed25519 signing key bytes are wrapped in
+/// [`zeroize::Zeroizing`] via the implementation's serialization format.
+#[derive(Debug, Clone)]
+pub struct SignerState {
+    /// Implementation-defined serialization of the signer + provider state.
+    pub bytes: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// Trait
+// ---------------------------------------------------------------------------
+
+/// Narrow MLS primitive surface.
+///
+/// Every method maps to a single RFC 9420 primitive. State flows in as
+/// `&mut ScpMlsGroup` parameters; the trait owns no state. Implementations
+/// are `Send + Sync` and shared across actors via `Arc<dyn MlsBackend>`.
+///
+/// # Cancel-safety
+///
+/// - `validate_key_package`, `generate_key_package`: cancel-safe,
+///   side-effect-free on external state.
+/// - All other methods: cancel-hostile on `&mut ScpMlsGroup`. The supervisor
+///   layer owns the rollback discipline (see saga journal).
+#[async_trait]
+pub trait MlsBackend: Send + Sync {
+    /// Creates a new MLS group with the caller as the sole member.
+    ///
+    /// Wraps [`super::group::create_group_with_wrapping_key`] exactly.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`] for failure modes (credential serialization, group
+    /// creation, storage).
+    async fn create_group(
+        &self,
+        credential: &ScpCredential,
+        wrapping_pubkey: Option<&[u8; 32]>,
+    ) -> Result<ScpMlsGroup, MlsError>;
+
+    /// Adds a member to `group` by their TLS-serialized `KeyPackage` bytes
+    /// and advances the group epoch.
+    ///
+    /// Returns the raw Commit / Welcome / `GroupInfo` bytes per RFC 9420.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`]. On failure the group state may be partially
+    /// advanced — callers MUST treat this as cancel-hostile and rely on
+    /// supervisor-side rollback.
+    async fn add_member_raw(
+        &self,
+        group: &mut ScpMlsGroup,
+        key_package_bytes: &[u8],
+    ) -> Result<AddMemberRaw, MlsError>;
+
+    /// Removes the member at `leaf_index` from `group` and advances the
+    /// group epoch.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`]. Cancel-hostile on `&mut ScpMlsGroup`.
+    async fn remove_member_raw(
+        &self,
+        group: &mut ScpMlsGroup,
+        leaf_index: LeafNodeIndex,
+    ) -> Result<RemoveMemberRaw, MlsError>;
+
+    /// Encrypts `plaintext` as an MLS application `PrivateMessage` for the
+    /// current epoch of `group`.
+    ///
+    /// Returns the TLS-serialized ciphertext bytes.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`]. `MlsError::EncryptionFailed` maps to `OpenMLS`
+    /// failures (pending proposals, evicted member).
+    async fn encrypt(&self, group: &mut ScpMlsGroup, plaintext: &[u8])
+    -> Result<Vec<u8>, MlsError>;
+
+    /// Decrypts an MLS `PrivateMessage` against `group`, returning a
+    /// [`DecryptedContent`] discriminating Application / Commit / Proposal
+    /// and carrying the sender DID.
+    ///
+    /// For `Commit` messages the staged commit is merged before the call
+    /// returns — this matches today's `decrypt_with_sender_did` contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`].
+    async fn decrypt(
+        &self,
+        group: &mut ScpMlsGroup,
+        ciphertext: &[u8],
+    ) -> Result<DecryptedContent, MlsError>;
+
+    /// Processes a TLS-serialized MLS Commit (external; not produced by this
+    /// local group) against `group` and merges the staged commit. This is
+    /// the lower-level alternative to `decrypt` when the caller has already
+    /// decomposed the incoming wire bytes (e.g. federation / restore).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::DecryptionFailed`] for parse / verification
+    /// failures; [`MlsError::CommitProcessingFailed`] if merging fails.
+    async fn process_commit(
+        &self,
+        group: &mut ScpMlsGroup,
+        commit_bytes: &[u8],
+    ) -> Result<(), MlsError>;
+
+    /// Advances the group epoch via a self-update Commit that republishes
+    /// the caller's `LeafNode` with `wrapping_pubkey` (§9.16.1). Returns the
+    /// TLS-serialized Commit bytes.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`]. Cancel-hostile — the epoch may advance before the
+    /// future returns.
+    async fn advance_epoch(
+        &self,
+        group: &mut ScpMlsGroup,
+        wrapping_pubkey: Option<&[u8; 32]>,
+    ) -> Result<Vec<u8>, MlsError>;
+
+    /// Validates a TLS-serialized `KeyPackage` for joinability. Does not
+    /// touch any group state; callers use this before committing an add.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::AddMemberFailed`] on validation failure (malformed
+    /// KP, signature invalid, ciphersuite mismatch).
+    async fn validate_key_package(
+        &self,
+        key_package_bytes: &[u8],
+    ) -> Result<ValidatedKeyPackage, MlsError>;
+
+    /// Generates a fresh `KeyPackage` for `credential`, optionally with an
+    /// `scp_wrapping_key` `LeafNode` extension. Returns the TLS-serialized KP
+    /// bytes plus an opaque signer-state handle the caller retains to later
+    /// join a group from a Welcome addressed to this KP.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`]. Side-effect-free on external state.
+    async fn generate_key_package(
+        &self,
+        credential: &ScpCredential,
+        wrapping_pubkey: Option<&[u8; 32]>,
+    ) -> Result<GeneratedKeyPackage, MlsError>;
+
+    /// Joins a group from a TLS-serialized MLS Welcome message using the
+    /// opaque `signer_state` previously returned by `generate_key_package`.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`]. Cancel-hostile on the caller's key material.
+    async fn join_from_welcome(
+        &self,
+        welcome_bytes: &[u8],
+        signer_state: SignerState,
+    ) -> Result<ScpMlsGroup, MlsError>;
+}

@@ -420,6 +420,22 @@ The `Storage` trait operates on opaque bytes. Platform-specific encryption happe
 | `FilesystemStorage` | Key -> file path | POSIX systems | Server/CLI, inspectable/debuggable storage | Phase 2 |
 | `WasmSqliteStorage` | wa-sqlite (TypeScript) | Browser WASM | Browser default | Phase 4 |
 
+### In-Memory Storage Is Dev/Test-Only
+
+In-memory storage — `InMemoryStorage`, the FFI-layer `BridgeInMemoryStorage`, and `EncryptingAdapter<InMemoryStorage>` — is a development and test affordance only. It MUST NOT be used as a production system-of-record.
+
+In-memory storage loses all state on process restart. For SCP, that state includes MLS group state, identity keys, the event log, and provenance records. Losing it on restart contradicts the durability and provenance tenets directly: a restarted node would silently lose its cryptographic membership, its append-only audit trail, and its identity. Production deployments MUST use a durable, encrypted backend — `SqliteStorage` (SQLCipher) is the default.
+
+### Storage Selection Fails Closed
+
+When a caller selects a durable storage backend (e.g. `Sqlite`) and the backend cannot be opened — bad path, insufficient permissions, corruption, or a wrong key/passphrase — the bridge or builder layer MUST return an error. Silent fallback to in-memory storage, or to no storage at all, is FORBIDDEN.
+
+In-memory storage is reachable only through an explicit in-memory selection (`{type: "in_memory"}`). It MUST NOT be reachable as a degradation path from a failed durable-backend open. A failed durable open is a terminal error the caller observes, not a condition the system silently recovers from by downgrading durability.
+
+### The Runtime Never Defaults Storage
+
+The runtime core (`scp-runtime`) MUST NOT manufacture or default a storage backend. Storage is supplied by the caller at the bridge or builder layer and threaded into the supervisor as a required (non-optional) parameter. This requirement is enforced by the type system — the supervisor construction surface takes storage as a non-`Option` argument, so there is no code path by which the runtime can run without a caller-supplied backend. The choice of backend (durable vs. in-memory) is made once, at the bridge/builder layer, never silently inside the runtime.
+
 ### SQLite Is the Universal Default
 
 Via `rusqlite`, SQLite works on every native platform: iOS, Android, macOS, Linux, Windows, Python (PyO3), Node (napi-rs). The Rust core bundles its own SQLite — no system dependency. Platform-specific ORMs (SwiftData, Room, Core Data) are unnecessary; the SDK calls through FFI into the Rust core's bundled SQLite. This is the same pattern Mozilla uses for Firefox mobile.
@@ -443,17 +459,65 @@ salt = SHA-256("SCP-SQLCIPHER-KEY-V1")     // fixed salt, 32 bytes
 info = "scp-sqlcipher:" || did             // DID as UTF-8 bytes — binds key to specific identity
 prk  = HKDF-Extract(salt, ikm)            // 32 bytes
 okm  = HKDF-Expand(prk, info, 32)         // 32 bytes — SQLCipher PRAGMA key
-derived_key = hex_encode(okm)             // 64 hex characters for PRAGMA key
+derived_key = hex_encode(okm)             // 64 hex characters, passed via raw-key syntax (x'..')
 ```
 
 The `ikm` is the raw private key bytes of the `#0` Identity Key, retrieved from platform key custody (iOS Keychain, Android Keystore, macOS Keychain, or OS keyring). The HKDF domain separation (`"SCP-SQLCIPHER-KEY-V1"`) ensures the derived key is distinct from any signing key, preventing cross-protocol attacks. The DID in the `info` parameter binds the database to a specific identity — databases for different identities on the same device use different encryption keys.
 
+This HKDF-from-identity-key derivation is the **raw-key mode**: the caller supplies 32 bytes of key material (the `#0` identity key bytes) and the SQLCipher PRAGMA key is derived deterministically from them. Raw-key mode is the default and is unchanged by the passphrase mode defined below.
+
+#### Passphrase Key-Derivation Mode
+
+Some SDK callers supply a human-chosen passphrase rather than raw key material (for example, a CLI or desktop deployment with no platform key custody and no `#0` identity key available at database-open time). For these callers, the SQLCipher PRAGMA key MAY instead be derived from a passphrase using **Argon2id**. The caller selects exactly one derivation mode: raw-key (above) or passphrase. The two modes are mutually exclusive — supplying both is a validation error.
+
+Passphrase derivation MUST use the following parameters, which are NORMATIVE and MUST be identical to the platform key-custody Argon2id parameters (§17.8, `FileKeyCustody`):
+
+```
+algorithm  = Argon2id
+version    = 0x13                              // Argon2 v1.3
+m_cost     = 65536                             // 65536 KiB = 64 MiB memory
+t_cost     = 3                                 // 3 iterations
+p_cost     = 1                                 // parallelism = 1
+output_len = 32                                // 32-byte derived key
+input      = passphrase (UTF-8 bytes)
+salt       = per-database 16-byte salt         // see Salt Persistence below
+derived_key = hex_encode(argon2id(...))        // 64 hex characters, passed via raw-key syntax (x'..')
+```
+
+A single Argon2id parameterization across the entire codebase is REQUIRED. The passphrase-mode SQLCipher key derivation and the `FileKeyCustody` passphrase-to-wrapping-key derivation MUST share one parameter source; implementations MUST NOT define a second, divergent Argon2id parameter set. The derived 32-byte key feeds the same SQLCipher PRAGMA-key path as raw-key mode (identical `cipher_page_size`, `kdf_iter`, HMAC, and KDF PRAGMAs below).
+
+The passphrase and every intermediate buffer carrying it (and the derived key) MUST be held in zeroizing memory and cleared on drop.
+
+#### Salt Persistence
+
+The Argon2id salt is per-database and persisted, because passphrase derivation MUST be deterministic across process restarts — the same passphrase MUST re-derive the same key, or the database becomes permanently unreadable.
+
+- The salt is generated **once** — 16 bytes from a cryptographically secure RNG — when the database directory is first initialized.
+- The salt is persisted to a sidecar file `{dir}/scp.salt`, located **outside** the encrypted `{dir}/scp.db`. The salt is required to derive the key that decrypts the database, so it MUST NOT live inside the encrypted database (that would be a bootstrap deadlock).
+- The salt file MUST be written atomically (write to a temporary file, then rename).
+- On reopen, the existing `{dir}/scp.salt` is read so the same passphrase deterministically re-derives the same key.
+
+A salt is not secret — it is integrity-relevant only. Its presence and length, however, are load-bearing, so the following conditions MUST fail closed (return an error; the system MUST NOT proceed):
+
+- A missing `{dir}/scp.salt` beside an existing `{dir}/scp.db`. The system MUST NOT regenerate the salt: a fresh salt would derive a different key and permanently brick the existing database.
+- A `{dir}/scp.salt` of the wrong length (not 16 bytes).
+- A wrong passphrase. SQLCipher rejects the derived key on the first query against the database; the system MUST surface this as a fail-closed error and MUST NOT silently create or open a fresh, empty database.
+
+Only the first-initialization case — no `scp.db` and no `scp.salt` — generates and writes a new salt.
+
 **SQLCipher configuration:**
 
 ```rust
-// Applied on connection open
+// Applied on connection open.
+// `derived_key` is the 64-hex-character encoding of the 32-byte derived key
+// (raw-key or passphrase mode). It MUST be supplied using SQLCipher's raw-key
+// syntax `x'<derived_key>'` (note: `x'..'` inside the SQL string literal), which
+// tells SQLCipher to interpret the value as raw key bytes. Plain-quote syntax
+// (`'<derived_key>'`) would instead treat the 64 hex characters as a passphrase
+// and PBKDF2-stretch them — a redundant second KDF over already-derived key
+// material. Raw-key syntax avoids that double-KDF.
 conn.execute_batch("
-    PRAGMA key = '<derived_key>';
+    PRAGMA key = \"x'<derived_key>'\";
     PRAGMA cipher_page_size = 4096;
     PRAGMA kdf_iter = 256000;
     PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
@@ -574,6 +638,22 @@ Key custody is NOT part of this spec — it is the existing `KeyCustody` trait (
 | Python/Node/Server | Software keys in SQLCipher-encrypted SQLite | Ed25519, X25519 | No hardware key store on typical servers |
 | Testing | `InMemoryKeyCustody` | Ed25519, X25519 | Already defined (ADR-006) |
 
+### FileKeyCustody Argon2id Parameters
+
+The software-key custody backend for non-HSM platforms (`FileKeyCustody`, the universal fallback used by the Python/Node/Server row above) derives an AES-256 wrapping key from a passphrase using Argon2id. Its parameters are the canonical Argon2id parameterization for the codebase and MUST be:
+
+```
+algorithm  = Argon2id
+version    = 0x13                              // Argon2 v1.3
+m_cost     = 65536                             // 65536 KiB = 64 MiB memory
+t_cost     = 3                                 // 3 iterations
+p_cost     = 1                                 // parallelism = 1
+output_len = 32                                // 32-byte derived key
+salt       = per-file 16-byte salt             // generated once, persisted with the custody file
+```
+
+These are the same parameters the SQLCipher passphrase key-derivation mode (§17.6) MUST use. A single Argon2id parameterization is REQUIRED across the codebase: both the `FileKeyCustody` passphrase-to-wrapping-key derivation and the SQLCipher passphrase-to-PRAGMA-key derivation MUST draw from one shared parameter source. Implementations MUST NOT define a second, divergent Argon2id parameter set.
+
 ## 17.9 OpenMLS StorageProvider Bridge
 
 OpenMLS requires a `StorageProvider` trait implementation for persisting MLS group state (tree nodes, key schedules, proposals, etc.). `MlsStorageBridge` wraps `ProtocolRepository` and delegates to the `mls/{context_id}/...` key prefix.
@@ -618,7 +698,7 @@ The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signat
 
 ### 17.9.1 MLS Crypto State Snapshot
 
-`MlsStorageBridge` (§17.9) implements the OpenMLS `StorageProvider` trait for fine-grained per-item persistence under the `mls/{context_id}/...` key prefix, but is **not currently wired into the runtime `MlsCryptoProvider`** — the runtime uses `InMemoryMlsProvider` instead. A complete MLS crypto context also includes state managed by `ContextCryptoProvider` that lives outside the OpenMLS `StorageProvider` contract:
+`MlsStorageBridge` (§17.9) implements the OpenMLS `StorageProvider` trait for fine-grained per-item persistence under the `mls/{context_id}/...` key prefix. A complete MLS crypto context also includes state that lives outside the OpenMLS `StorageProvider` contract:
 
 - **Sender keys and sender key store** — per-member symmetric keys for the sender key layer (ADR-001, §23)
 - **X25519 wrapping keypair** — HPKE encapsulation key for sender key distribution
@@ -626,15 +706,17 @@ The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signat
 - **Member wrapping keys** — per-member AES-256 keys for sender key wrapping
 - **Sender key epoch** — monotonic counter tracking sender key rotation
 
-To persist all of this atomically, `ContextCryptoProvider` exposes two methods:
+Per ADR-049, this state is owned by the per-context actor (`PerContextState.mode`) — encrypted contexts carry an MLS+sender-key variant, broadcast contexts carry a per-author-key variant. The narrow backend traits `MlsBackend` and `HpkeBackend` (architecture.md §2.5.3) provide stateless primitives over this state; state serialization is an inherent concern of the state itself, not the trait.
 
-- **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto provider state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, wrapping keys, and epoch metadata. Sensitive key material (signer bytes, sender keys, wrapping secret key, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization.
+Two inherent operations on the encrypted-mode state handle snapshot serialization atomically:
+
+- **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, wrapping keys, and epoch metadata. Sensitive key material (signer bytes, sender keys, wrapping secret key, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization.
 
 - **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer to OpenMLS's key store, reconstructs the sender key store and member wrapping keys, and restores the X25519 wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
 
-The snapshot blob is stored in `ContextSnapshot.mls_crypto_state` and persisted alongside the rest of the context state in `context/{context_id}/full_snapshot`. On `restore_context`, the blob is restored before constructing `PerContextState` so that the crypto provider has MLS group and sender keys available for subsequent encrypt/decrypt operations.
+The snapshot blob is stored in `ContextSnapshot.mls_crypto_state` and persisted alongside the rest of the context state in `context/{context_id}/full_snapshot`. On context restoration, the blob is restored before the per-context actor resumes so that its MLS group and sender keys are available for subsequent encrypt/decrypt operations.
 
-**Relationship to `MlsStorageBridge`.** The blob snapshot is the **sole active** persistence mechanism for MLS crypto state in the current implementation. `MlsCryptoProvider` uses an `InMemoryMlsProvider` at runtime; `MlsStorageBridge` (§17.9) is implemented but is **not wired into the runtime crypto provider path**. It exists as infrastructure for future fine-grained persistence if needed.
+**Relationship to `MlsStorageBridge`.** The blob snapshot is the **sole active** persistence mechanism for MLS crypto state in the current implementation. The actor-local OpenMLS provider uses in-memory storage at runtime; `MlsStorageBridge` (§17.9) remains implemented but is **not wired into the runtime crypto provider path**. It exists as infrastructure for future fine-grained persistence if needed.
 
 - **The blob snapshot** (active) captures the complete crypto provider state atomically — both the OpenMLS-managed portion (group state, tree nodes, key schedules) and the SCP-managed portion (sender keys, wrapping keys, signer) — as a single unit. On restore, it re-populates the in-memory structures that OpenMLS operates against.
 - **`MlsStorageBridge`** (not currently instantiated) provides the OpenMLS `StorageProvider` trait implementation for fine-grained, per-item MLS storage. If activated in a future iteration, it would allow OpenMLS to persist individual items incrementally rather than relying on full-state snapshots.
@@ -817,3 +899,59 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 - Event log pruning and checkpointing (compact old events behind Merkle root)
 - Performance optimization: batch writes, connection pooling
 - `ProtocolRepository` profiling and hot-path optimization
+
+## 17.15 Per-Context State Persistence
+
+Under the concurrency model in §5.15, each context has a single owning computation responsible for persisting its state. Persistence uses two modes.
+
+### 17.15.1 Coalesced Persist (Default)
+
+A context's state is marked dirty after any mutation that is not explicitly sync-persisted (§17.15.2). A coalescing timer fires at most once per 50 ms per context; when it fires with a dirty state, the full context snapshot is written via the configured persistence backend. This bounds the write rate per context and avoids persisting every incremental change.
+
+The 50 ms window is a normative upper bound on caller-observable rollback (§5.15.3). Implementations MAY persist more aggressively (shorter interval, every-mutation persist); they MUST NOT coalesce beyond 50 ms.
+
+### 17.15.2 Synchronous Persist (Safety-Critical)
+
+Specific operations bypass coalescing and persist inline before the mutation is visible to any observer (observer set defined in §5.15.3). The full list of sync-persisted operations is normative and appears in §5.15.3.
+
+Implementation-level protocol: mutate in-memory state → persist synchronously → only after persist succeeds, surface any outbound effect. On persist failure, roll back the in-memory mutation and return an error. The caller's acknowledgment implies durable commit.
+
+### 17.15.3 Snapshot Schema Versioning
+
+Every context snapshot carries a schema version identifier. Behavior on mismatch:
+
+- **Older than the current runtime's supported minimum:** loader refuses and returns a versioned-load error. No in-place migration; snapshots are rewritten with the current version on next persist.
+- **Newer than the current runtime understands** (e.g., a runtime downgrade): loader refuses with the same versioned-load error. Silent data loss or partial reads are forbidden.
+
+Pre-1.0 posture: no deployed state needs to survive schema evolution; neither direction produces a migration path.
+
+## 17.16 Saga Journal
+
+The cross-context saga coordinator (§5.15.4) writes phase transitions to a durable journal, separate from per-context snapshots. The journal is the coordinator's authoritative record across process restarts; per-context saga-state is the participant's authoritative record for evidence content.
+
+### 17.16.1 Required Operations
+
+The journal surface provides three operations:
+
+- **Append a journal entry.** The operation does not return until the entry is durably persisted: any write buffers the backend maintains (OS page cache, application buffer, network replication pipeline) MUST be flushed before the call returns success. Backends that cannot flush durably MUST refuse to be used as a saga journal; construction fails closed. Partial writes MUST be detectable on reload (e.g., length prefix plus checksum). The operation is non-cancellable in practice: callers MUST NOT cancel it mid-flight, and a cancelled append is treated as "state unknown" at restart — the next unresolved-saga scan detects any half-written entry and reconciles.
+- **Load unresolved sagas.** Returns the latest entry per saga identifier for sagas not in a terminal state. Used at process start for crash-recovery replay.
+- **Mark a saga terminally resolved.** For sagas classified as secret-bearing (§9.4.3), the operation MUST synchronously overwrite the on-disk evidence bytes before returning; it does not wait for the backend's next compaction. The operation is non-cancellable for secret-bearing sagas: if a cancellation occurs before the overwrite completes (e.g., process abort), implementations MUST complete the overwrite on the next process start before the journal is opened for any other use. Secret bytes MUST NOT survive on disk past the next journal open.
+
+Journal entries are append-only per saga identifier. Earlier entries are not rewritten.
+
+### 17.16.2 Secret-Bearing Entries
+
+Saga classification, commitment construction, bearer handling, and the at-rest-encryption refusal rule are defined in §9.4.3 and apply here without restatement.
+
+### 17.16.3 Key Namespace
+
+Journal entries occupy a dedicated key namespace within the persistence backend. The namespace is distinct from context snapshots and from event log storage; backend operations on the journal namespace do not affect the other surfaces.
+
+### 17.16.4 Crash Recovery
+
+On process start, the coordinator loads all unresolved sagas. For each:
+
+- Pre-Prepare states (no actor committed): discard.
+- Prepare-in-progress with one actor already Prepared: abort the Prepared actor (idempotent); discard.
+- Commit-in-progress: re-send Commit to all participants; participants deduplicate by saga identifier.
+- `NeedsRepair`: surface via a metric (e.g., `saga_repair_needed`); operator retries via a repair command, or the saga is resolved on next process start after the underlying cause is addressed.

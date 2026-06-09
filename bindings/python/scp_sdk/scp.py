@@ -183,11 +183,13 @@ class InMemoryStorage(TypedDict):
 
 
 class SqliteStorage(TypedDict):
-    """Storage config selecting `SQLCipher`-encrypted on-disk storage.
+    """Storage config selecting `SQLCipher`-encrypted on-disk storage (raw key).
 
     ``path`` is the directory the bridge opens ``scp.db`` inside;
     ``key`` is raw encryption key material (32 bytes recommended) that
-    the Rust side zeroizes after `SQLCipher` has consumed it. See
+    the Rust side zeroizes after `SQLCipher` has consumed it. For the
+    passphrase-derived variant, use :class:`SqlitePassphraseStorage`
+    instead — supply exactly one of ``key`` or ``passphrase``. See
     :func:`SCP.with_storage`.
     """
 
@@ -196,10 +198,29 @@ class SqliteStorage(TypedDict):
     key: bytes
 
 
+class SqlitePassphraseStorage(TypedDict):
+    """Storage config selecting `SQLCipher`-encrypted on-disk storage (passphrase).
+
+    ``path`` is the directory the bridge opens ``scp.db`` inside;
+    ``passphrase`` is a human-chosen secret from which the `SQLCipher`
+    key is derived via Argon2id (spec §17.6) with a persisted per-database
+    salt sidecar. The passphrase is held in zeroizing memory on the Rust
+    side. For the raw-key variant, use :class:`SqliteStorage` instead —
+    supply exactly one of ``key`` or ``passphrase``. See
+    :func:`SCP.with_storage`.
+    """
+
+    type: Literal["sqlite"]
+    path: str
+    passphrase: str
+
+
 # Discriminated union of supported storage configurations. The PyO3
-# bridge's `SCP.with_storage` constructor dispatches on ``type``; adding
-# a new variant here requires a matching arm in `PyBridgeInstance::with_storage_py`.
-StorageConfig = InMemoryStorage | SqliteStorage
+# bridge's `SCP.with_storage` constructor dispatches on ``type`` and, for
+# the ``sqlite`` type, on the presence of ``key`` vs ``passphrase`` (exactly
+# one required); adding a new variant here requires a matching arm in
+# `PyBridgeInstance::with_storage_py`.
+StorageConfig = InMemoryStorage | SqliteStorage | SqlitePassphraseStorage
 
 
 def _native_mod() -> Any:
@@ -284,15 +305,28 @@ class SCP:
             * ``{"type": "in_memory"}`` — ephemeral encrypted in-memory
               storage (the default when ``storage`` is ``None``).
             * ``{"type": "sqlite", "path": str, "key": bytes}`` —
-              SQLCipher-encrypted on-disk storage at ``{path}/scp.db``.
-              ``key`` is the raw encryption key material (32 bytes
-              recommended) and is zeroized on the Rust side once the
-              database is opened. Landed in Phase 4 PR 3 (#1549).
+              SQLCipher-encrypted on-disk storage at ``{path}/scp.db``
+              using raw key material. ``key`` is the raw encryption key
+              (32 bytes recommended), zeroized on the Rust side once the
+              database is opened.
+            * ``{"type": "sqlite", "path": str, "passphrase": str}`` —
+              SQLCipher-encrypted on-disk storage whose key is derived from
+              a passphrase via Argon2id (spec §17.6), with a persisted
+              per-database salt sidecar. The passphrase is held in zeroizing
+              memory across the FFI boundary.
+
+            For the ``sqlite`` type, supply exactly one of ``key`` or
+            ``passphrase`` — providing both, or neither, is a
+            ``ValidationError``. A failed SQLCipher open (bad key/passphrase,
+            permission denied, corrupt file) also raises a
+            ``ValidationError``: storage selection FAILS CLOSED (spec §17.6)
+            and never silently degrades to in-memory.
 
             When ``None``, defaults to in-memory storage.
         :raises ValidationError: If ``storage`` contains an unknown
-            ``type`` or is missing required fields for the selected
-            variant.
+            ``type``, is missing required fields for the selected variant,
+            supplies both/neither of ``key``/``passphrase`` for ``sqlite``,
+            or the durable backend cannot be opened.
 
         .. note::
 

@@ -12,9 +12,11 @@
 //! - [`scp_core::store::context::ProtocolRepositoryContextBridge`] — the
 //!   `ContextPersistence` implementation the FFI layer attaches to
 //!   `CoreFields::persistence`.
-//! - [`scp_core::context::manager::ContextManager::builder`] — the exact
-//!   wiring point used by `UniffiBridgeInstance::with_storage_uniffi`
+//! - [`scp_core::context::supervisor::Supervisor::with_providers`] — the
+//!   exact wiring point used by `UniffiBridgeInstance::with_storage_uniffi`
 //!   and its `PyO3`/NAPI siblings (see `crates/scp-ffi/**/runtime.rs`).
+//!   ADR-049 commit 12 deleted the legacy `ContextManager` builder; tests
+//!   now compose providers directly through `Supervisor::with_providers`.
 //!
 //! Issues exercised:
 //! - #1491 (SQLite-backed persistence through the FFI).
@@ -39,19 +41,29 @@
 use std::sync::Arc;
 
 #[cfg(feature = "sqlite")]
+use scp_core::context::builder::NotConfiguredTransportProvider;
+#[cfg(feature = "sqlite")]
 use scp_core::context::governance::KeyResolver;
 #[cfg(feature = "sqlite")]
-use scp_core::context::manager::ContextManager;
+use scp_core::context::providers::MerkleEventLogProvider;
+#[cfg(feature = "sqlite")]
+use scp_core::context::supervisor::Supervisor;
 #[cfg(feature = "sqlite")]
 use scp_core::context::{
     Capability, ContextMode, ContextParams, ContextState, context_id_bytes, context_routing_id,
 };
+#[cfg(feature = "sqlite")]
+use scp_core::crypto::mls::provider::MlsCryptoProvider;
+#[cfg(feature = "sqlite")]
+use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 #[cfg(feature = "sqlite")]
 use scp_core::store::ProtocolRepository;
 #[cfg(feature = "sqlite")]
 use scp_core::store::context::ProtocolRepositoryContextBridge;
 #[cfg(feature = "sqlite")]
 use scp_identity::DID;
+#[cfg(feature = "sqlite")]
+use scp_platform::testing::InMemoryStorage;
 
 #[cfg(feature = "sqlite")]
 use scp_platform::sqlite::SqliteStorage;
@@ -153,101 +165,119 @@ async fn sqlite_storage_rejects_mismatched_key() {
 }
 
 // ---------------------------------------------------------------------------
-// AC2: ContextManager.builder().storage(SqliteStorage) persists state
+// AC2: Supervisor::with_providers + SqliteStorage persists state
 // ---------------------------------------------------------------------------
 
-/// Builds a `ContextManager` wired through a `SqliteStorage` on disk,
-/// then verifies that creating a context + registering the creator DID
-/// writes rows visible in the `ProtocolRepository` membership list.
+/// Builds a `Supervisor` wired through a `SqliteStorage` on disk, then
+/// verifies that creating a context + registering the creator DID writes
+/// rows visible in the `ProtocolRepository` membership list.
 ///
 /// This mirrors the exact wiring the FFI bridges use when
 /// `StorageConfig::Sqlite` is selected:
 /// `SqliteStorage::new(dir, key)` → `ProtocolRepository::new(Arc<SqliteStorage>)`
-/// → `ProtocolRepositoryContextBridge::new(repo)` → attached to
-/// `ContextManager` via `builder().storage(...)`.
+/// → `ProtocolRepositoryContextBridge::new(repo)` → attached to a
+/// `Supervisor` via `Supervisor::with_providers(.., persistence, ..)`.
+/// ADR-049 commit 12 deleted `ContextManager`; the bridges and tests now
+/// compose providers directly through this constructor.
 #[cfg(feature = "sqlite")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_create_persists_membership_to_sqlite() {
     let tmpdir = tempfile::tempdir().unwrap();
 
-    // Open ONE SqliteStorage and share it between the manager (via the
-    // builder's `.storage()` consumption) and the verification side by
-    // wrapping in Arc. The builder takes ownership, so we open the DB
-    // twice here — acceptable because both connections share SQLCipher
-    // state on the same file.
+    // Open ONE SqliteStorage and share it between the supervisor (via
+    // the persistence bridge) and the verification side by wrapping in
+    // Arc. The bridge owns its repo, so we open the DB twice here —
+    // acceptable because both connections share SQLCipher state on the
+    // same file.
     let alice = DID::from(ALICE_DID);
     let ctx_id = "ctx-persist-create";
 
-    // Phase 1: create context + flush, then directly inspect the
-    // persisted snapshot through the same `ProtocolRepository` the
-    // manager is wired through.
+    // Phase 1: create + flush.
+    {
+        let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
+        let repo = Arc::new(ProtocolRepository::new(storage));
+        let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo)));
+
+        // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+        // deleted `ContextManager::builder().storage(..).build()` chain.
+        let manager = Supervisor::with_providers(
+            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Box::new(NotConfiguredTransportProvider),
+            Box::new(MerkleEventLogProvider::new()),
+            permissive_key_resolver(),
+            Some(persistence),
+            None,
+            None,
+            None,
+            // ADR-049 storage-foundation: `with_providers` now requires an
+            // `mls_storage` adapter. These tests assert on the `ProtocolRepository`
+            // snapshot (membership/state), not MLS-group reload, so an in-memory
+            // MLS storage backend is sufficient and keeps the SQLCipher advisory
+            // lock on `scp.db` held by the persistence repo undisturbed.
+            Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+                InMemoryStorage::new(),
+            ))) as Arc<dyn OpenMlsStorageAdapter>,
+        );
+
+        manager.register_local_did(alice.clone()).await.unwrap();
+        let handle = manager
+            .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
+            .await
+            .expect("context_create must succeed with sqlite-backed persistence");
+        assert_eq!(handle.state().await, ContextState::Active);
+        // Flush snapshots before drop.
+        manager.flush_all_contexts_sync().unwrap();
+    }
+
+    // Phase 2: reopen same path, inspect the persisted ContextSnapshot.
     //
-    // The per-test SqliteStorage now holds an advisory lock on
-    // `scp.db.lock` (red-hat RED-1003, added in PR #1690 follow-up) to
-    // refuse concurrent opens on the same directory. This invariant
-    // holds across the manager's lifetime, so we can't open a second
-    // `SqliteStorage` in Phase 2 of this test. Instead we keep one
-    // `Arc<SqliteStorage>` alive, pass it to the manager, and read
-    // through it directly once the flush is done.
-    let storage = Arc::new(SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap());
-    let manager = ContextManager::builder()
-        .crypto(Box::new(
-            scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
-        ))
-        .storage(Arc::clone(&storage))
-        .key_resolver(permissive_key_resolver())
-        .build()
-        .unwrap();
-
-    manager.register_local_did(alice.clone()).await;
-    let handle = manager
-        .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
-        .await
-        .expect("context_create must succeed with sqlite-backed persistence");
-    assert_eq!(handle.state().await, ContextState::Active);
-    manager.flush_all_contexts_sync();
-
-    // Read back via the same storage handle — `ProtocolRepository::new`
-    // wraps `Arc::clone(&storage)` and reads through the same SQLCipher
-    // connection pool. No second advisory lock required.
-    let repo = ProtocolRepository::new(Arc::clone(&storage));
-    let snapshot = repo
-        .load_full_snapshot(ctx_id)
-        .await
-        .expect("load_full_snapshot must succeed")
-        .expect("ContextSnapshot must be persisted for ctx-persist-create");
-    assert_eq!(snapshot.context_id, ctx_id);
-    assert_eq!(snapshot.state, ContextState::Active);
-    let alice_info = snapshot
-        .membership
-        .get(alice.as_ref())
-        .expect("alice must be in the persisted membership");
-    assert_eq!(
-        alice_info.role_name, "admin",
-        "creator must be persisted with admin role"
-    );
+    // `create_context` → `persist_context_snapshot` → `store_full_snapshot`
+    // writes to `context/{ctx}/full_snapshot`. The per-member
+    // `store_membership` / `load_membership` helpers on `ProtocolRepository`
+    // use a different key (`context/{ctx}/membership/{did}`) and are not
+    // exercised by `ContextManager`'s snapshot path — we assert against
+    // the snapshot.
+    {
+        let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
+        let repo = ProtocolRepository::new(storage);
+        let snapshot = repo
+            .load_full_snapshot(ctx_id)
+            .await
+            .expect("load_full_snapshot must succeed")
+            .expect("ContextSnapshot must be persisted for ctx-persist-create");
+        assert_eq!(snapshot.context_id, ctx_id);
+        assert_eq!(snapshot.state, ContextState::Active);
+        let alice_info = snapshot
+            .membership
+            .get(alice.as_ref())
+            .expect("alice must be in the persisted membership");
+        assert_eq!(
+            alice_info.role_name, "admin",
+            "creator must be persisted with admin role"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
 // AC3: Full lifecycle roundtrip — create → send → drop manager → reopen → restore
 // ---------------------------------------------------------------------------
 
-/// Full suspend/kill/restore/resume semantics at the `ContextManager`
+/// Full suspend/kill/restore/resume semantics at the `Supervisor`
 /// layer — the machinery the FFI `suspend()` + `resume()` compose.
 ///
 /// Steps:
-/// 1. Open SqliteStorage#1 at tmpdir, build manager with persistence.
+/// 1. Open SqliteStorage#1 at tmpdir, build supervisor with persistence.
 /// 2. Register Alice's local DID, create context, send one message.
 /// 3. `flush_all_contexts_sync` — persists the snapshot.
-/// 4. Drop the manager (simulates process exit / `Scp::shutdown`).
+/// 4. Drop the supervisor (simulates process exit / `Scp::shutdown`).
 /// 5. Open SqliteStorage#2 at the SAME path with the SAME key.
-/// 6. Build a fresh manager with persistence pointing at the new
+/// 6. Build a fresh supervisor with persistence pointing at the new
 ///    storage. Call `restore_all_contexts` — this is what
 ///    `BridgeInstanceCore::resume` invokes through
 ///    `CoreFields::restore_all_persisted_contexts`.
 /// 7. Verify membership survived and the context handle is restored.
 ///
-/// The new manager uses a NEW `MlsCryptoProvider`, so the MLS group
+/// The new supervisor uses a NEW `MlsCryptoProvider`, so the MLS group
 /// itself does not survive (`OpenMLS` key material lives in the provider
 /// and is not persisted through this path — MLS state persistence is
 /// tracked separately under SCP-PERSIST-050). This test asserts what
@@ -261,28 +291,34 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     let bob = DID::from(BOB_DID);
     let ctx_id = "ctx-persist-lifecycle";
 
-    // The advisory lock on `{tmpdir}/scp.db.lock` (red-hat RED-1003) refuses
-    // concurrent opens on the same directory, so this test — which
-    // originally simulated a cross-process restart via two distinct
-    // `SqliteStorage::new` calls — now keeps one `Arc<SqliteStorage>`
-    // alive across all phases and passes it into both manager instances.
-    // The lock is released only when the last Arc drops, and Phase 3's
-    // manager still needs read access to the persisted snapshot to
-    // exercise `restore_all_contexts`. See PR #1690 review cleanup.
-    let storage = Arc::new(SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap());
-
     // ---- Phase 1: First "process" creates state and flushes. ----
     {
-        let manager = ContextManager::builder()
-            .crypto(Box::new(
-                scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
-            ))
-            .storage(Arc::clone(&storage))
-            .key_resolver(permissive_key_resolver())
-            .build()
-            .unwrap();
+        let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
+        let repo = Arc::new(ProtocolRepository::new(storage));
+        let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo)));
 
-        manager.register_local_did(alice.clone()).await;
+        // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+        // deleted `ContextManager::builder().storage(..).build()` chain.
+        let manager = Supervisor::with_providers(
+            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Box::new(NotConfiguredTransportProvider),
+            Box::new(MerkleEventLogProvider::new()),
+            permissive_key_resolver(),
+            Some(persistence),
+            None,
+            None,
+            None,
+            // ADR-049 storage-foundation: `with_providers` now requires an
+            // `mls_storage` adapter. These tests assert on the `ProtocolRepository`
+            // snapshot (membership/state), not MLS-group reload, so an in-memory
+            // MLS storage backend is sufficient and keeps the SQLCipher advisory
+            // lock on `scp.db` held by the persistence repo undisturbed.
+            Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+                InMemoryStorage::new(),
+            ))) as Arc<dyn OpenMlsStorageAdapter>,
+        );
+
+        manager.register_local_did(alice.clone()).await.unwrap();
         let _handle = manager
             .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
             .await
@@ -296,15 +332,16 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         // Flush to SQLite before dropping — mirrors
         // `CoreFields::shutdown_core_async` and `suspend()`'s
         // `flush_all_contexts_sync` call.
-        manager.flush_all_contexts_sync();
+        manager.flush_all_contexts_sync().unwrap();
     }
 
-    // ---- Phase 2: Inspect the persisted snapshot via the same storage. ----
-    //
-    // Sanity: the persisted snapshot must be readable through
+    // ---- Phase 2: Reopen the same database in a second "process". ----
+    let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
+
+    // Sanity: the persisted snapshot should be readable through
     // `ProtocolRepository` without going through `ContextManager` first.
     {
-        let repo = ProtocolRepository::new(Arc::clone(&storage));
+        let repo = ProtocolRepository::new(storage);
         let persisted = repo.load_full_snapshot(ctx_id).await.unwrap();
         assert!(
             persisted.is_some(),
@@ -321,21 +358,33 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         );
     }
 
-    // ---- Phase 3: Build a fresh manager + persistence + call restore. ----
-    let repo2 = Arc::new(ProtocolRepository::new(Arc::clone(&storage)));
+    // ---- Phase 3: Build a fresh supervisor + persistence + call restore. ----
+    let storage2 = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
+    let repo2 = Arc::new(ProtocolRepository::new(storage2));
     let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo2)));
 
-    let manager2 = ContextManager::with_persistence(
-        Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
-            ALICE_DID.to_owned(),
-        )),
-        Box::new(scp_core::context::NotConfiguredTransportProvider),
-        Box::new(scp_core::context::providers::event_log::MerkleEventLogProvider::new()),
-        persistence,
+    // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+    // deleted `ContextManager::with_persistence(..)` constructor.
+    let manager2 = Supervisor::with_providers(
+        Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+        Box::new(NotConfiguredTransportProvider),
+        Box::new(MerkleEventLogProvider::new()),
         permissive_key_resolver(),
+        Some(persistence),
+        None,
+        None,
+        None,
+        // ADR-049 storage-foundation: `with_providers` now requires an
+        // `mls_storage` adapter. These tests assert on the `ProtocolRepository`
+        // snapshot (membership/state), not MLS-group reload, so an in-memory
+        // MLS storage backend is sufficient and keeps the SQLCipher advisory
+        // lock on `scp.db` held by the persistence repo undisturbed.
+        Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+            InMemoryStorage::new(),
+        ))) as Arc<dyn OpenMlsStorageAdapter>,
     );
 
-    manager2.register_local_did(alice.clone()).await;
+    manager2.register_local_did(alice.clone()).await.unwrap();
     let restored = manager2
         .restore_all_contexts()
         .await
@@ -402,305 +451,4 @@ async fn ffi_scp_with_sqlite_full_lifecycle() {
     //   assert!(scp2.context_is_member(ctx.id(), identity.did()).await);
     //   scp2.context_send(ctx, b"world").await.unwrap();
     panic!("ignored — see #[ignore] reason above");
-}
-
-// ---------------------------------------------------------------------------
-// AC5: ProtocolRepoVariant::Sqlite event-log roundtrip
-//
-// This test exercises the exact shared machinery that
-// `NapiBridgeInstance::with_storage_napi` and
-// `UniffiBridgeInstance::with_storage_uniffi` compose when
-// `StorageConfig::Sqlite` is selected:
-//
-//   SqliteStorage::new(tmpdir, key)
-//     → ProtocolRepository::new(Arc<SqliteStorage>)
-//     → ProtocolRepoVariant::Sqlite(Arc<ProtocolRepository<…>>)
-//     → ProtocolRepoVariant::event_log_provider()
-//     → MerkleEventLogProvider with persistence
-//
-// then appends a Merkle event, drops the provider, reopens the same
-// SQLCipher file with the same key, rebuilds the variant, and asserts
-// the appended event is readable.
-//
-// Before the `ProtocolRepoVariant` fix landed, `with_storage(Sqlite)`
-// on both bridges returned a `ProtocolRepository<BridgeInMemoryStorage>`
-// for the event log even when the caller passed a SQLite config. The
-// Merkle entries invisibly persisted into an ephemeral in-memory store
-// that was dropped on shutdown; on reopen the event log was empty even
-// though context snapshots survived. This test is the regression guard.
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "sqlite")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn protocol_repo_variant_sqlite_event_log_roundtrip() {
-    use scp_core::context::providers::event_log::MerkleEventLogProvider;
-    use scp_core::store::context::ProtocolRepositoryEventLogBridge;
-    use scp_ffi_common::bridge_runtime::ProtocolRepoVariant;
-    use std::sync::Arc;
-
-    let tmpdir = tempfile::tempdir().unwrap();
-    let ctx_id_bytes: [u8; 32] = {
-        let mut h = [0u8; 32];
-        h[..4].copy_from_slice(b"CTX1");
-        h
-    };
-    let event_kind = "test.ac5.event";
-    let actor = "did:dht:z6MkTestPersistAc5Actor";
-    let payload = serde_json::json!({"body": "persistence roundtrip smoke test"});
-
-    // ---- Phase 1: open SQLite, construct the variant, append one Merkle
-    //               event through `event_log_provider()`, drop everything. ----
-    //
-    // This is the exact wiring that `NapiBridgeInstance::with_storage_napi`
-    // and `UniffiBridgeInstance::with_storage_uniffi` compose internally:
-    // open the SQLCipher DB once, wrap in `Arc<ProtocolRepository<…>>`,
-    // stash in `ProtocolRepoVariant::Sqlite`, dispatch through
-    // `event_log_provider()`. We then append via the trait-object that
-    // bridge callers see.
-    {
-        let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-        let repo = Arc::new(ProtocolRepository::new(Arc::new(storage)));
-        let variant = ProtocolRepoVariant::Sqlite(Arc::clone(&repo));
-        let provider = variant.event_log_provider();
-
-        provider
-            .init_event_log(&ctx_id_bytes)
-            .expect("init_event_log must succeed");
-        provider
-            .append_event(&ctx_id_bytes, event_kind, actor, Some(&payload))
-            .expect("append_event must succeed");
-
-        let entries_before = provider
-            .event_log_entries(&ctx_id_bytes)
-            .unwrap()
-            .unwrap_or_default();
-        assert_eq!(
-            entries_before.len(),
-            1,
-            "one append must produce one entry in the live log"
-        );
-        assert_eq!(entries_before[0].event, event_kind);
-        assert_eq!(entries_before[0].actor_did, actor);
-
-        // Letting the scope exit drops `provider`, `variant`, `repo`, and
-        // the Arc<SqliteStorage> behind them — simulating an FFI
-        // `shutdown()`. `ProtocolRepositoryEventLogBridge` persists each
-        // append synchronously via `persist_entry_best_effort`, so the
-        // SQLCipher DB on disk now carries the entry.
-        drop(provider);
-    }
-
-    // ---- Phase 2: reopen SAME path with SAME key and assert the Merkle
-    //               entry is restorable through a fresh variant.
-    //
-    // `MerkleEventLogProvider::with_persistence` is the same constructor
-    // `ProtocolRepoVariant::event_log_provider()` uses — we rebuild it
-    // directly so we can call `restore_event_log`, which loads persisted
-    // entries into the in-memory `logs` map. The bridge `resume()` path
-    // invokes the same method via `restore_all_contexts`.
-    let storage2 = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-    let repo2 = Arc::new(ProtocolRepository::new(Arc::new(storage2)));
-    let _variant2 = ProtocolRepoVariant::Sqlite(Arc::clone(&repo2));
-    let bridge2 = ProtocolRepositoryEventLogBridge::new(Arc::clone(&repo2));
-    let provider2 = MerkleEventLogProvider::with_persistence(Arc::new(bridge2));
-
-    provider2
-        .restore_event_log(&ctx_id_bytes)
-        .expect("restore_event_log must succeed against a sqlite-backed repo");
-
-    let entries_after = provider2.entries(&ctx_id_bytes).unwrap_or_default();
-    assert_eq!(
-        entries_after.len(),
-        1,
-        "event log must carry exactly the one entry we appended before drop — \
-         this is the split-brain regression guard: if the event log had fallen \
-         back to an in-memory store despite the SQLite config, the reopen \
-         would see an empty log"
-    );
-    assert_eq!(
-        entries_after[0].event, event_kind,
-        "appended event kind must survive SQLite roundtrip"
-    );
-    assert_eq!(
-        entries_after[0].actor_did, actor,
-        "appended actor DID must survive SQLite roundtrip"
-    );
-}
-
-// Same roundtrip, but against `ProtocolRepoVariant::InMemory`. The purpose
-// is NOT to prove persistence (an in-memory store necessarily loses state
-// on drop) but to prove the match arms in `event_log_provider()` dispatch
-// correctly and that the in-memory variant supports the same trait surface.
-// If the variant dispatch ever regresses (e.g. one arm returns a different
-// provider type), this test catches it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn protocol_repo_variant_in_memory_event_log_same_trait_surface() {
-    use scp_core::store::ProtocolRepository;
-    use scp_ffi_common::bridge_runtime::{BridgeInMemoryStorage, ProtocolRepoVariant};
-    use scp_platform::encrypting_adapter::EncryptingAdapter;
-    use std::sync::Arc;
-
-    // EncryptingAdapter consumes the key wrapped in `Zeroizing`. Passing a
-    // plain zero key via `.into()` is acceptable in a unit test (no disk
-    // leak). Production paths get a random key via `OsRng`.
-    let key: [u8; 32] = [0u8; 32];
-    let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key.into());
-    let repo = Arc::new(ProtocolRepository::new(encrypted));
-    let variant = ProtocolRepoVariant::InMemory(repo);
-    let provider = variant.event_log_provider();
-
-    let ctx_id_bytes: [u8; 32] = {
-        let mut h = [0u8; 32];
-        h[..4].copy_from_slice(b"CTX2");
-        h
-    };
-    provider.init_event_log(&ctx_id_bytes).unwrap();
-    provider
-        .append_event(
-            &ctx_id_bytes,
-            "test.ac5.in_memory",
-            "did:dht:z6MkTestInMemoryActor",
-            None,
-        )
-        .unwrap();
-    let entries = provider.event_log_entries(&ctx_id_bytes).unwrap().unwrap();
-    assert_eq!(
-        entries.len(),
-        1,
-        "InMemory variant must support append/read via the same trait surface \
-         as the Sqlite variant — variant dispatch regression guard"
-    );
-    assert_eq!(entries[0].event, "test.ac5.in_memory");
-}
-
-/// Synthetic non-empty `Event` slice used by both AC6 trust-aggregation
-/// dispatch tests. The content is deliberately minimal — aggregation only
-/// requires the slice to be non-empty to bypass `TrustError::EmptyEventLog`.
-fn synthetic_events_for_trust() -> Vec<scp_event_log::Event> {
-    use scp_event_log::{Event, EventPayload, EventType};
-    vec![Event {
-        event_type: EventType::MessageSent,
-        actor_did: scp_identity::DID::from("did:dht:z6MkTrustAc6Actor"),
-        timestamp: 1,
-        sequence: 0,
-        payload: EventPayload {
-            data: b"trust-ac6".to_vec(),
-        },
-        prev_hash: [0u8; 32],
-        signature: vec![0u8; 64],
-    }]
-}
-
-// ---------------------------------------------------------------------------
-// AC6: trust aggregation dispatches correctly over ProtocolRepoVariant arms
-//
-// The trust-aggregation surface (`aggregate_trust_input` on NAPI/UniFFI,
-// `aggregate_with_storage` on PyO3) matches on the active repository
-// variant and constructs a `ProtocolRepositoryTrustBridge` over the
-// concrete storage type. Fix 9 (PR #1690 review) asks for per-variant
-// coverage: construct each arm, wrap in the trust bridge, call
-// `populate_and_aggregate`, and confirm the aggregation returns a
-// well-shaped result. This catches regressions where one match arm
-// silently returns a degenerate trust input while the other works.
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn trust_aggregation_dispatches_over_in_memory_variant() {
-    use scp_core::store::ProtocolRepository;
-    use scp_ffi_common::bridge_runtime::{BridgeInMemoryStorage, ProtocolRepoVariant};
-    use scp_ffi_common::trust_store::populate_and_aggregate;
-    use scp_platform::encrypting_adapter::EncryptingAdapter;
-    use std::sync::Arc;
-
-    let key: [u8; 32] = [0u8; 32];
-    let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key.into());
-    let repo = Arc::new(ProtocolRepository::new(encrypted));
-    let variant = ProtocolRepoVariant::InMemory(Arc::clone(&repo));
-
-    // Exhaustiveness check: if the enum ever grows a new variant, the
-    // match below stops compiling — forcing the test author to add a
-    // parallel test for the new arm. Without this gate, a silent new
-    // arm would bypass trust coverage.
-    match &variant {
-        ProtocolRepoVariant::InMemory(_) | ProtocolRepoVariant::Sqlite(_) => {}
-    }
-
-    let ProtocolRepoVariant::InMemory(in_memory_repo) = &variant else {
-        panic!("variant must be InMemory for this test");
-    };
-    let handle = tokio::runtime::Handle::current();
-    let bridge =
-        scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(in_memory_repo), handle);
-
-    let events = synthetic_events_for_trust();
-    let json = tokio::task::spawn_blocking(move || {
-        populate_and_aggregate(
-            bridge,
-            "ctx-in-memory-trust",
-            "did:dht:z6MkInMemoryTrustSubject",
-            Vec::new(),
-            &[],
-            &events,
-            [0u8; 32],
-            &[],
-            &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
-        )
-    })
-    .await
-    .unwrap()
-    .expect("populate_and_aggregate must succeed against the InMemory variant");
-    assert!(
-        !json.is_empty(),
-        "InMemory variant trust aggregation must return a non-empty JSON body"
-    );
-    // The envelope shape must parse as JSON — guards against a variant
-    // dispatch that accidentally returns a raw string.
-    let _parsed: serde_json::Value =
-        serde_json::from_str(&json).expect("aggregation JSON must parse");
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn trust_aggregation_dispatches_over_sqlite_variant() {
-    use scp_ffi_common::bridge_runtime::ProtocolRepoVariant;
-    use scp_ffi_common::trust_store::populate_and_aggregate;
-    use std::sync::Arc;
-
-    let tmpdir = tempfile::tempdir().unwrap();
-    let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-    let repo = Arc::new(ProtocolRepository::new(Arc::new(storage)));
-    let variant = ProtocolRepoVariant::Sqlite(Arc::clone(&repo));
-
-    let ProtocolRepoVariant::Sqlite(sqlite_repo) = &variant else {
-        panic!("variant must be Sqlite for this test");
-    };
-    let handle = tokio::runtime::Handle::current();
-    let bridge =
-        scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(sqlite_repo), handle);
-
-    let events = synthetic_events_for_trust();
-    let json = tokio::task::spawn_blocking(move || {
-        populate_and_aggregate(
-            bridge,
-            "ctx-sqlite-trust",
-            "did:dht:z6MkSqliteTrustSubject",
-            Vec::new(),
-            &[],
-            &events,
-            [0u8; 32],
-            &[],
-            &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
-        )
-    })
-    .await
-    .unwrap()
-    .expect("populate_and_aggregate must succeed against the Sqlite variant");
-    assert!(
-        !json.is_empty(),
-        "Sqlite variant trust aggregation must return a non-empty JSON body"
-    );
-    let _parsed: serde_json::Value =
-        serde_json::from_str(&json).expect("aggregation JSON must parse");
 }

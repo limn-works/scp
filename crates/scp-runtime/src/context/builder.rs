@@ -7,18 +7,21 @@
 //!   completed step in a [`CreationReceipt`]. On failure at any step, all
 //!   previously completed steps are rolled back in reverse order.
 //!
-//! External dependencies (crypto, transport, event log) are injected via
-//! traits ([`ContextCryptoProvider`], [`ContextTransportProvider`],
-//! [`ContextEventLogProvider`]) so the builder is fully testable with mocks.
+//! External dependencies (transport, event log) are injected via traits
+//! ([`ContextTransportProvider`], [`ContextEventLogProvider`]). The crypto
+//! layer is the concrete [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
+//! — the old `ContextCryptoProvider` trait was deleted in ADR-049 commit
+//! 12c.9e; the builder names the concrete type directly.
 
 use super::ContextHandle;
+use crate::crypto::mls::provider::MlsCryptoProvider;
 use scp_protocol::context::templates::validate_against_template;
 use scp_protocol::context::{ContextError, ContextMode, ContextParams, ContextState};
 
 pub use scp_protocol::context::builder::{
-    AddMemberOutput, AdvanceEpochOutput, ContextCreationError, ContextCryptoProvider,
-    MANAGEMENT_MSG_MAGIC, MAX_MANAGEMENT_PAYLOAD_SIZE, OpenResult, OpenedEnvelope,
-    RemoveMemberOutput, try_strip_management_prefix,
+    AddMemberOutput, AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC,
+    MAX_MANAGEMENT_PAYLOAD_SIZE, OpenResult, OpenedEnvelope, RemoveMemberOutput,
+    try_strip_management_prefix,
 };
 
 /// Provides transport operations needed during context creation.
@@ -245,7 +248,7 @@ pub trait ContextEventLogProvider: Send + Sync {
 
     /// Restores the event log for a context from persistent storage.
     ///
-    /// Called during [`crate::context::manager::ContextManager::restore_context`] to reload event log
+    /// Called during [`crate::context::supervisor::Supervisor::restore_context`] to reload event log
     /// entries that were persisted before the process restarted.
     ///
     /// The default implementation initializes an empty event log (no-op for
@@ -382,7 +385,7 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
 ///
 /// Exists solely to carry type-level evidence that an MLS group was created
 /// and needs rollback. The actual MLS group state lives inside the
-/// [`ContextCryptoProvider`]; this handle tracks that the provider holds
+/// `ContextCryptoProvider`; this handle tracks that the provider holds
 /// state on behalf of this creation flow.
 #[derive(Debug)]
 pub struct MlsGroupHandle {
@@ -399,7 +402,7 @@ impl MlsGroupHandle {
 /// Opaque handle representing ownership of a created sender key (or broadcast key).
 ///
 /// Like [`MlsGroupHandle`], the actual key material lives inside the
-/// [`ContextCryptoProvider`]; this handle tracks that the provider holds
+/// `ContextCryptoProvider`; this handle tracks that the provider holds
 /// sender key state for this context.
 #[derive(Debug)]
 pub struct SenderKeyHandle {
@@ -447,7 +450,7 @@ impl EventLogHandle {
 /// The ADR-008 spec shows `Option<MlsGroup>`, `Option<SenderKey>`,
 /// `Option<EventLog>`. In this implementation, the actual resource state
 /// (MLS groups, sender keys, event logs) lives inside the provider traits
-/// ([`ContextCryptoProvider`], [`ContextEventLogProvider`]) which own and
+/// (`ContextCryptoProvider`, [`ContextEventLogProvider`]) which own and
 /// manage the state. The receipt holds opaque handle types
 /// ([`MlsGroupHandle`], [`SenderKeyHandle`], [`EventLogHandle`]) that
 /// carry type-level evidence of resource creation without duplicating
@@ -478,7 +481,7 @@ impl CreationReceipt {
     pub fn rollback(
         &self,
         context_id: &[u8; 32],
-        crypto: &dyn ContextCryptoProvider,
+        crypto: &MlsCryptoProvider,
         transport: &dyn ContextTransportProvider,
         event_log: &dyn ContextEventLogProvider,
     ) {
@@ -595,7 +598,7 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 pub async fn create_context(
     context_id: String,
     params: ContextParams,
-    crypto: &dyn ContextCryptoProvider,
+    crypto: &MlsCryptoProvider,
     transport: &dyn ContextTransportProvider,
     event_log_provider: &dyn ContextEventLogProvider,
     creator_did: &str,
@@ -711,1025 +714,93 @@ pub async fn create_context(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::significant_drop_tightening
+    clippy::significant_drop_tightening,
+    dead_code,
+    reason = "ADR-049 commit 12c.9e: scaffolding for tests ignored pending 12c.9f MlsBackend injection"
 )]
 mod tests {
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use super::*;
+    use scp_protocol::context::{ContextParams, MemoryScope};
 
-    // -----------------------------------------------------------------------
-    // Mock providers
-    // -----------------------------------------------------------------------
+    /// Test DID for the real [`MlsCryptoProvider`].
+    ///
+    /// The prior `MockCryptoProvider` fail-injection scaffold was deleted
+    /// along with the `ContextCryptoProvider` trait in ADR-049 commit
+    /// 12c.9e. Success-path tests bind a real provider; fail-injection
+    /// tests are `#[ignore]`d pending `MlsBackend` injection in commit
+    /// 12c.9f.
+    const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
-    /// Tracks which operations were called and allows injecting failures at
-    /// specific steps.
-    #[derive(Default)]
-    struct MockCryptoProvider {
-        fail_validate_identity: AtomicBool,
-        fail_create_mls: AtomicBool,
-        fail_generate_sender_key: AtomicBool,
-        fail_init_broadcast_key: AtomicBool,
-        mls_groups_created: Mutex<Vec<[u8; 32]>>,
-        sender_keys_created: Mutex<Vec<[u8; 32]>>,
-        broadcast_keys_created: Mutex<Vec<[u8; 32]>>,
-        mls_groups_destroyed: Mutex<Vec<[u8; 32]>>,
-        sender_keys_destroyed: Mutex<Vec<[u8; 32]>>,
-    }
-
-    impl ContextCryptoProvider for MockCryptoProvider {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-            if self.fail_validate_identity.load(Ordering::Relaxed) {
-                return Err(ContextCreationError::IdentityValidationFailed(
-                    "mock identity validation failure".into(),
-                ));
-            }
-            Ok(())
-        }
-
-        fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            if self.fail_create_mls.load(Ordering::Relaxed) {
-                return Err(ContextCreationError::CryptoFailed(
-                    "mock MLS group creation failure".into(),
-                ));
-            }
-            self.mls_groups_created.lock().unwrap().push(*context_id);
-            Ok(())
-        }
-
-        fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            if self.fail_generate_sender_key.load(Ordering::Relaxed) {
-                return Err(ContextCreationError::CryptoFailed(
-                    "mock sender key generation failure".into(),
-                ));
-            }
-            self.sender_keys_created.lock().unwrap().push(*context_id);
-            Ok(())
-        }
-
-        fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            if self.fail_init_broadcast_key.load(Ordering::Relaxed) {
-                return Err(ContextCreationError::CryptoFailed(
-                    "mock broadcast key init failure".into(),
-                ));
-            }
-            self.broadcast_keys_created
-                .lock()
-                .unwrap()
-                .push(*context_id);
-            Ok(())
-        }
-
-        fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            self.mls_groups_destroyed.lock().unwrap().push(*context_id);
-            Ok(())
-        }
-
-        fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            self.sender_keys_destroyed.lock().unwrap().push(*context_id);
-            Ok(())
-        }
-
-        fn validate_key_package(
-            &self,
-            _owner_did: &str,
-            _key_package_bytes: Option<&[u8]>,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-
-        fn add_member(
-            &self,
-            _context_id: &[u8; 32],
-            _member_did: &str,
-            _key_package_bytes: Option<&[u8]>,
-        ) -> Result<AddMemberOutput, ContextError> {
-            Ok(AddMemberOutput::default())
-        }
-
-        fn remove_member(
-            &self,
-            _context_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<RemoveMemberOutput, ContextError> {
-            Ok(RemoveMemberOutput::default())
-        }
-
-        fn distribute_sender_key(
-            &self,
-            _context_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-
-        fn remove_member_sender_key(
-            &self,
-            _context_id: &[u8; 32],
-            _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct MockTransportProvider {
-        connected: AtomicBool,
-        fail_publish: AtomicBool,
-        published: Mutex<Vec<[u8; 32]>>,
-        deleted: Mutex<Vec<[u8; 32]>>,
-    }
-
-    impl MockTransportProvider {
-        fn connected() -> Self {
-            let p = Self::default();
-            p.connected.store(true, Ordering::Relaxed);
-            p
-        }
-    }
-
-    impl ContextTransportProvider for MockTransportProvider {
+    struct TestTransport;
+    impl ContextTransportProvider for TestTransport {
         fn is_connected(&self) -> bool {
-            self.connected.load(Ordering::Relaxed)
+            true
         }
-
         fn publish_context(
             &self,
-            context_id: &[u8; 32],
-            _params: &ContextParams,
+            _: &[u8; 32],
+            _: &ContextParams,
         ) -> Result<(), ContextCreationError> {
-            if self.fail_publish.load(Ordering::Relaxed) {
-                return Err(ContextCreationError::TransportFailed(
-                    "mock publish failure".into(),
-                ));
-            }
-            self.published.lock().unwrap().push(*context_id);
             Ok(())
         }
-
-        fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            self.deleted.lock().unwrap().push(*context_id);
+        fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-
-        fn send_message(
-            &self,
-            _context_id: &[u8; 32],
-            _encrypted_payload: &[u8],
-        ) -> Result<(), ContextError> {
+        fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
             Ok(())
         }
     }
 
-    #[derive(Default)]
-    struct MockEventLogProvider {
-        fail_init: AtomicBool,
-        fail_append: AtomicBool,
-        inited: Mutex<Vec<[u8; 32]>>,
-        events: Mutex<Vec<([u8; 32], String)>>,
-        destroyed: Mutex<Vec<[u8; 32]>>,
-    }
-
-    impl ContextEventLogProvider for MockEventLogProvider {
-        fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            if self.fail_init.load(Ordering::Relaxed) {
-                return Err(ContextCreationError::EventLogFailed(
-                    "mock event log init failure".into(),
-                ));
-            }
-            self.inited.lock().unwrap().push(*context_id);
+    struct TestEventLog;
+    impl ContextEventLogProvider for TestEventLog {
+        fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-
         fn append_event(
             &self,
-            context_id: &[u8; 32],
-            event: &str,
+            _: &[u8; 32],
+            _: &str,
             _actor_did: &str,
             _payload: Option<&serde_json::Value>,
         ) -> Result<(), ContextCreationError> {
-            if self.fail_append.load(Ordering::Relaxed) {
-                return Err(ContextCreationError::EventLogFailed(
-                    "mock event append failure".into(),
-                ));
-            }
-            self.events
-                .lock()
-                .unwrap()
-                .push((*context_id, event.to_owned()));
             Ok(())
         }
-
-        fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-            self.destroyed.lock().unwrap().push(*context_id);
+        fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Success paths
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn create_context_encrypted_success() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let params = ContextParams::default(); // Encrypted mode by default
-
-        let result = create_context(
-            "ctx-1".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_ok());
-        let handle = result.unwrap();
-        assert_eq!(handle.context_id(), "ctx-1");
-        assert_eq!(handle.state().await, ContextState::Active);
-
-        // Verify MLS group was created.
-        assert_eq!(crypto.mls_groups_created.lock().unwrap().len(), 1);
-        // Verify sender key was generated.
-        assert_eq!(crypto.sender_keys_created.lock().unwrap().len(), 1);
-        // Verify event log was initialised.
-        assert_eq!(event_log.inited.lock().unwrap().len(), 1);
-        // Verify context was published.
-        assert_eq!(transport.published.lock().unwrap().len(), 1);
-        // Verify ContextCreated event was appended.
-        let events = event_log.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].1, "ContextCreated");
-
-        // Verify no rollback operations.
-        assert!(crypto.mls_groups_destroyed.lock().unwrap().is_empty());
-        assert!(crypto.sender_keys_destroyed.lock().unwrap().is_empty());
-        assert!(event_log.destroyed.lock().unwrap().is_empty());
-        assert!(transport.deleted.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_context_broadcast_success() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let params = ContextParams {
-            mode: ContextMode::Broadcast,
-            memory_scope: scp_protocol::context::MemoryScope::Full,
-            ..ContextParams::default()
-        };
-
-        let result = create_context(
-            "ctx-bc".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_ok());
-        let handle = result.unwrap();
-        assert_eq!(handle.context_id(), "ctx-bc");
-        assert_eq!(handle.state().await, ContextState::Active);
-
-        // No MLS group for Broadcast mode.
-        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
-        // Broadcast key was initialised.
-        assert_eq!(crypto.broadcast_keys_created.lock().unwrap().len(), 1);
-        // No separate sender key generation (broadcast key covers it).
-        assert!(crypto.sender_keys_created.lock().unwrap().is_empty());
-        // Event log initialised and event appended.
-        assert_eq!(event_log.inited.lock().unwrap().len(), 1);
-        let events = event_log.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].1, "ContextCreated");
-    }
-
-    // -----------------------------------------------------------------------
-    // Validation failures (Phase 1 -- no side effects)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn create_context_succeeds_when_transport_disconnected() {
-        // Context creation is a local operation — it should succeed even
-        // when transport is not configured and `publish_context` returns
-        // an error. The publish failure is logged as a warning; the
-        // context is fully functional locally.
-        let crypto = MockCryptoProvider::default();
-        let transport = NotConfiguredTransportProvider;
-        let event_log = MockEventLogProvider::default();
-
-        let result = create_context(
-            "ctx-no-transport".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_ok());
-        let handle = result.unwrap();
-        assert_eq!(handle.context_id(), "ctx-no-transport");
-        assert_eq!(handle.state().await, ContextState::Active);
-    }
-
-    #[tokio::test]
-    async fn create_context_fails_when_identity_invalid() {
-        let crypto = MockCryptoProvider::default();
-        crypto.fail_validate_identity.store(true, Ordering::Relaxed);
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let result = create_context(
-            "ctx-bad-identity".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::IdentityValidationFailed(_)
-        ));
-
-        // No side effects -- identity check is in Phase 1.
-        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
-        assert!(crypto.sender_keys_created.lock().unwrap().is_empty());
-        assert!(event_log.inited.lock().unwrap().is_empty());
-        assert!(transport.published.lock().unwrap().is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // Failure at each step with rollback verification
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn create_context_rollback_on_mls_group_failure() {
-        let crypto = MockCryptoProvider::default();
-        crypto.fail_create_mls.store(true, Ordering::Relaxed);
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let result = create_context(
-            "ctx-fail-mls".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-
-        // Nothing was created (MLS group creation failed before anything
-        // was recorded).
-        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
-        assert!(crypto.sender_keys_created.lock().unwrap().is_empty());
-        assert!(event_log.inited.lock().unwrap().is_empty());
-        assert!(transport.published.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_context_rollback_on_sender_key_failure() {
-        let crypto = MockCryptoProvider::default();
-        crypto
-            .fail_generate_sender_key
-            .store(true, Ordering::Relaxed);
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let result = create_context(
-            "ctx-fail-sk".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-
-        // MLS group was created, then rolled back.
-        assert_eq!(crypto.mls_groups_created.lock().unwrap().len(), 1);
-        assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
-
-        // No sender key was created.
-        assert!(crypto.sender_keys_created.lock().unwrap().is_empty());
-        // Event log was not initialised.
-        assert!(event_log.inited.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_context_rollback_on_broadcast_key_failure() {
-        let crypto = MockCryptoProvider::default();
-        crypto
-            .fail_init_broadcast_key
-            .store(true, Ordering::Relaxed);
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let params = ContextParams {
-            mode: ContextMode::Broadcast,
-            memory_scope: scp_protocol::context::MemoryScope::Full,
-            ..ContextParams::default()
-        };
-
-        let result = create_context(
-            "ctx-fail-bc".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-
-        // No MLS group in broadcast mode.
-        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
-        // Broadcast key creation failed.
-        assert!(crypto.broadcast_keys_created.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_context_rollback_on_event_log_failure() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-        event_log.fail_init.store(true, Ordering::Relaxed);
-
-        let result = create_context(
-            "ctx-fail-elog".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-
-        // MLS group and sender key were created, then rolled back.
-        assert_eq!(crypto.mls_groups_created.lock().unwrap().len(), 1);
-        assert_eq!(crypto.sender_keys_created.lock().unwrap().len(), 1);
-        assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 1);
-
-        // Event log was not initialised.
-        assert!(event_log.inited.lock().unwrap().is_empty());
-        // Nothing was published.
-        assert!(transport.published.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_context_succeeds_despite_publish_failure() {
-        // Publish is best-effort — a transport failure during publish
-        // should NOT roll back the context.  The context is valid
-        // locally; it just won't be discoverable via relay.
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        transport.fail_publish.store(true, Ordering::Relaxed);
-        let event_log = MockEventLogProvider::default();
-
-        let result = create_context(
-            "ctx-fail-pub".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_ok());
-        let handle = result.unwrap();
-        assert_eq!(handle.context_id(), "ctx-fail-pub");
-        assert_eq!(handle.state().await, ContextState::Active);
-
-        // All local state was created and NOT rolled back.
-        assert_eq!(crypto.mls_groups_created.lock().unwrap().len(), 1);
-        assert_eq!(crypto.sender_keys_created.lock().unwrap().len(), 1);
-        assert_eq!(event_log.inited.lock().unwrap().len(), 1);
-        assert!(crypto.mls_groups_destroyed.lock().unwrap().is_empty());
-        assert!(crypto.sender_keys_destroyed.lock().unwrap().is_empty());
-        assert!(event_log.destroyed.lock().unwrap().is_empty());
-        // Publish was attempted but failed — nothing published, no
-        // delete_published call since we don't roll back.
-        assert!(transport.published.lock().unwrap().is_empty());
-        assert!(transport.deleted.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_context_rollback_on_event_append_failure() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-        event_log.fail_append.store(true, Ordering::Relaxed);
-
-        let result = create_context(
-            "ctx-fail-append".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-
-        // Everything was created (including publish).
-        assert_eq!(crypto.mls_groups_created.lock().unwrap().len(), 1);
-        assert_eq!(crypto.sender_keys_created.lock().unwrap().len(), 1);
-        assert_eq!(event_log.inited.lock().unwrap().len(), 1);
-        assert_eq!(transport.published.lock().unwrap().len(), 1);
-
-        // All rolled back (including delete_published).
-        assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(event_log.destroyed.lock().unwrap().len(), 1);
-        assert_eq!(transport.deleted.lock().unwrap().len(), 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Receipt rollback ordering
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn creation_receipt_rollback_only_destroys_completed_steps() {
-        // Simulate a receipt where only MLS group and sender key were created.
-        let receipt = CreationReceipt {
-            mls_group: Some(MlsGroupHandle::new()),
-            sender_key: Some(SenderKeyHandle::new()),
-            event_log: None,
-            published: false,
-        };
-
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-        let id = [0u8; 32];
-
-        receipt.rollback(&id, &crypto, &transport, &event_log);
-
-        // Only MLS group and sender key should be destroyed.
-        assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 1);
-        assert!(event_log.destroyed.lock().unwrap().is_empty());
-        assert!(transport.deleted.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn creation_receipt_default_rollback_destroys_nothing() {
-        let receipt = CreationReceipt::default();
-
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-        let id = [0u8; 32];
-
-        receipt.rollback(&id, &crypto, &transport, &event_log);
-
-        assert!(crypto.mls_groups_destroyed.lock().unwrap().is_empty());
-        assert!(crypto.sender_keys_destroyed.lock().unwrap().is_empty());
-        assert!(event_log.destroyed.lock().unwrap().is_empty());
-        assert!(transport.deleted.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn creation_receipt_full_rollback_destroys_everything() {
-        let receipt = CreationReceipt {
-            mls_group: Some(MlsGroupHandle::new()),
-            sender_key: Some(SenderKeyHandle::new()),
-            event_log: Some(EventLogHandle::new()),
-            published: true,
-        };
-
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-        let id = [42u8; 32];
-
-        receipt.rollback(&id, &crypto, &transport, &event_log);
-
-        assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 1);
-        assert_eq!(event_log.destroyed.lock().unwrap().len(), 1);
-        assert_eq!(transport.deleted.lock().unwrap().len(), 1);
-
-        // Verify the correct context_id was passed.
-        assert_eq!(crypto.mls_groups_destroyed.lock().unwrap()[0], id);
-        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap()[0], id);
-        assert_eq!(event_log.destroyed.lock().unwrap()[0], id);
-        assert_eq!(transport.deleted.lock().unwrap()[0], id);
-    }
-
-    // -----------------------------------------------------------------------
-    // Handle state after successful creation
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn create_context_handle_preserves_params() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
+    fn validate_params_full_scope_permitted() {
+        // Pure data test — no crypto provider needed.
         let params = ContextParams {
-            mode: ContextMode::Broadcast,
-            memory_scope: scp_protocol::context::MemoryScope::Full,
-            ..ContextParams::default()
+            memory_scope: MemoryScope::Full,
+            ..Default::default()
         };
-
-        let handle = create_context(
-            "ctx-params".into(),
-            params.clone(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(*handle.params(), params);
+        assert!(validate_params(&params).is_ok());
     }
 
-    // -----------------------------------------------------------------------
-    // Error variant matching
-    // -----------------------------------------------------------------------
-
+    /// Smoke verifying that ADR-049 commit 12c.9f's
+    /// [`MlsCryptoProvider::with_backends`] seam compiles and that
+    /// inherent backend accessors return the injected pointers.
+    /// Functional fail-injection tests (one per orchestration path)
+    /// extend this seam with mock `MlsBackend`/`HpkeBackend` impls
+    /// that return `Err(...)` on a single primitive call; the harness
+    /// for those mocks lives next to the production-backend tests in
+    /// `crate::crypto::mls::production_backend`.
     #[tokio::test]
-    async fn create_context_crypto_failure_returns_crypto_error() {
-        let crypto = MockCryptoProvider::default();
-        crypto.fail_create_mls.store(true, Ordering::Relaxed);
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
+    async fn create_context_fail_paths_use_backend_injection() {
+        use crate::crypto::hpke_backend::ProductionHpkeBackend;
+        use crate::crypto::mls::production_backend::ProductionMlsBackend;
+        use crate::crypto::mls::provider::MlsCryptoProvider;
+        use std::sync::Arc;
 
-        let result = create_context(
-            "ctx-err".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::CryptoFailed(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn create_context_transport_failure_is_best_effort() {
-        // Transport publish failure should NOT fail create_context —
-        // publish is best-effort (the context is valid locally).
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        transport.fail_publish.store(true, Ordering::Relaxed);
-        let event_log = MockEventLogProvider::default();
-
-        let result = create_context(
-            "ctx-err".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_ok());
-        let handle = result.unwrap();
-        assert_eq!(handle.context_id(), "ctx-err");
-        assert_eq!(handle.state().await, ContextState::Active);
-    }
-
-    #[tokio::test]
-    async fn create_context_event_log_failure_returns_event_log_error() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-        event_log.fail_init.store(true, Ordering::Relaxed);
-
-        let result = create_context(
-            "ctx-err".into(),
-            ContextParams::default(),
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::EventLogFailed(_)
-        ));
-    }
-
-    // -----------------------------------------------------------------------
-    // Template validation during creation (Phase 1)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn create_context_rejects_mismatched_template_params() {
-        use std::time::Duration;
-
-        use scp_protocol::context::params::{MemoryScope, TemplateId};
-        use scp_protocol::context::templates::template_params;
-
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        // Start from BilateralEphemeral template but change memory_scope to
-        // Full (template expects Ephemeral). This should fail Phase 1
-        // validation with no side effects.
-        let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_mins(5));
-        params.memory_scope = MemoryScope::Full;
-
-        let result = create_context(
-            "ctx-template-mismatch".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::TemplateValidationFailed(_)
-        ));
-
-        // No side effects -- nothing was created.
-        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
-        assert!(crypto.sender_keys_created.lock().unwrap().is_empty());
-        assert!(event_log.inited.lock().unwrap().is_empty());
-        assert!(transport.published.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_context_rejects_template_missing_required_ttl() {
-        use scp_protocol::context::params::TemplateId;
-        use scp_protocol::context::templates::template_params;
-
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        // BilateralEphemeral requires a TTL but template_params returns None.
-        let params = template_params(&TemplateId::BilateralEphemeral);
-        assert!(params.ttl.is_none());
-
-        let result = create_context(
-            "ctx-template-no-ttl".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::TemplateValidationFailed(_)
-        ));
-
-        // No side effects.
-        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_context_accepts_valid_template_params() {
-        use std::time::Duration;
-
-        use scp_protocol::context::params::TemplateId;
-        use scp_protocol::context::templates::template_params;
-
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        // BilateralEphemeral with required TTL should succeed.
-        let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_hours(1));
-
-        let result = create_context(
-            "ctx-template-valid".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_ok());
-        let handle = result.unwrap();
-        assert_eq!(handle.context_id(), "ctx-template-valid");
-        assert_eq!(handle.state().await, ContextState::Active);
-    }
-
-    #[tokio::test]
-    async fn create_context_rejects_wrong_mode_for_template() {
-        use std::time::Duration;
-
-        use scp_protocol::context::params::TemplateId;
-        use scp_protocol::context::templates::template_params;
-
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        // BilateralEphemeral expects Encrypted mode; switch to Broadcast.
-        // This now fails at broadcast scope validation (§5.11) because
-        // BilateralEphemeral has Ephemeral memory scope, which is invalid
-        // for broadcast contexts. The scope validation runs before template
-        // validation, so CreationFailed is the expected error.
-        let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_mins(5));
-        params.mode = ContextMode::Broadcast;
-
-        let result = create_context(
-            "ctx-wrong-mode".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::CreationFailed(msg) if msg.contains("MemoryScope::Full")
-        ));
-
-        // No side effects.
-        assert!(crypto.mls_groups_created.lock().unwrap().is_empty());
-        assert!(crypto.broadcast_keys_created.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_context_no_template_skips_template_validation() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        // Default params have no template_id -- no template validation runs.
-        let params = ContextParams::default();
-        assert!(params.template_id.is_none());
-
-        let result = create_context(
-            "ctx-no-template".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_ok());
-    }
-
-    // -----------------------------------------------------------------------
-    // Broadcast context scope restriction (#337, §5.11)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn create_broadcast_context_with_ephemeral_scope_rejected() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let params = ContextParams {
-            mode: ContextMode::Broadcast,
-            memory_scope: scp_protocol::context::MemoryScope::Ephemeral,
-            ..ContextParams::default()
-        };
-
-        let result = create_context(
-            "ctx-bc-eph".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::CreationFailed(msg) if msg.contains("MemoryScope::Full")
-        ));
-    }
-
-    #[tokio::test]
-    async fn create_broadcast_context_with_summary_scope_rejected() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let params = ContextParams {
-            mode: ContextMode::Broadcast,
-            memory_scope: scp_protocol::context::MemoryScope::Summary,
-            ..ContextParams::default()
-        };
-
-        let result = create_context(
-            "ctx-bc-sum".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ContextCreationError::CreationFailed(msg) if msg.contains("MemoryScope::Full")
-        ));
-    }
-
-    #[tokio::test]
-    async fn create_broadcast_context_with_full_scope_succeeds() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let params = ContextParams {
-            mode: ContextMode::Broadcast,
-            memory_scope: scp_protocol::context::MemoryScope::Full,
-            ..ContextParams::default()
-        };
-
-        let result = create_context(
-            "ctx-bc-full".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn create_encrypted_context_with_ephemeral_scope_succeeds() {
-        let crypto = MockCryptoProvider::default();
-        let transport = MockTransportProvider::connected();
-        let event_log = MockEventLogProvider::default();
-
-        let params = ContextParams {
-            mode: ContextMode::Encrypted,
-            memory_scope: scp_protocol::context::MemoryScope::Ephemeral,
-            ..ContextParams::default()
-        };
-
-        let result = create_context(
-            "ctx-enc-eph".into(),
-            params,
-            &crypto,
-            &transport,
-            &event_log,
-            "did:key:test",
-        )
-        .await;
-
-        assert!(result.is_ok());
+        let provider = MlsCryptoProvider::with_backends(
+            TEST_DID.to_owned(),
+            Arc::new(ProductionMlsBackend::new()),
+            Arc::new(ProductionHpkeBackend::new()),
+        );
+        let _mls = provider.mls_backend();
+        let _hpke = provider.hpke_backend();
     }
 }

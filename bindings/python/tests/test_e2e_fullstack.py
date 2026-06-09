@@ -28,10 +28,15 @@ import pytest
 try:
     from scp_sdk import _scp_core
 
-    # Verify that fullstack functions are available (feature-gated).
-    if not hasattr(_scp_core, "py_fullstack_create_node"):
+    # The fullstack operations were migrated from flat ``py_fullstack_*``
+    # module functions to ``SCP`` methods (Phase 4 PR 4 sub-slice E, #1549)
+    # and are feature-gated behind ``allow_in_memory_custody``. Probe a
+    # throwaway ``_scp_core.SCP`` instance for the migrated method rather than
+    # the module — the free functions no longer exist.
+    _probe = _scp_core.SCP()
+    if not hasattr(_probe, "fullstack_create_node"):
         pytest.skip(
-            "fullstack functions not available — rebuild with allow_in_memory_custody feature",
+            "fullstack methods not available — rebuild with allow_in_memory_custody feature",
             allow_module_level=True,
         )
 except (ImportError, AttributeError):
@@ -93,19 +98,18 @@ class TestBobSendsAliceDecrypts:
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
 
-        # Sync sender keys so both nodes can decrypt each other's messages.
-        scp._native.fullstack_sync_sender_keys(alice, bob, ctx_id)
-
-        # Bob sends a message.
-        plaintext = b"Hello from Bob via Python!"
-        ciphertext = scp._native.fullstack_send_message(bob, ctx_id, plaintext)
-
-        # Ciphertext must differ from plaintext.
-        assert ciphertext != plaintext
-
-        # Alice decrypts Bob's message.
-        decrypted = scp._native.fullstack_decrypt_message(alice, ctx_id, ciphertext, bob.did)
-        assert bytes(decrypted) == plaintext
+        # Joiner-sends is not yet supported under the actor-per-context model
+        # (no spawn-from-Welcome entrypoint — Welcome-Delivery work item). The
+        # send must fail closed, not fake a roundtrip.
+        #
+        # INTENTIONAL TRIPWIRE: this positive fail-closed assertion verifies the
+        # CURRENT one-way contract and is meant to trip loudly the moment the
+        # behavior changes. When the Welcome-Delivery / spawn-from-Welcome
+        # entrypoint lands and joiner-send starts working, this assertion MUST be
+        # rewritten into a real bidirectional roundtrip (Bob sends, Alice
+        # decrypts) — not deleted or relaxed.
+        with pytest.raises(RuntimeError, match="not found in node's handles"):
+            scp._native.fullstack_send_message(bob, ctx_id, b"Hello from Bob via Python!")
 
 
 class TestThreePartyGroup:

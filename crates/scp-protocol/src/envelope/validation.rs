@@ -184,7 +184,7 @@ impl SequenceTracker {
     /// Validates the sequence number and timestamp of an inner envelope,
     /// returning whether it is the expected next message or ahead (gap).
     ///
-    /// This method does NOT advance the tracker state. Call [`advance`] when
+    /// This method does NOT advance the tracker state. Call [`Self::advance`] when
     /// the message is actually delivered to the application layer.
     ///
     /// # Errors
@@ -244,7 +244,7 @@ impl SequenceTracker {
     /// if valid, updates the tracker state.
     ///
     /// This is the legacy method that rejects out-of-order messages. Use
-    /// [`validate`] + [`advance`] for reorder-buffer-aware validation.
+    /// [`Self::validate`] + [`Self::advance`] for reorder-buffer-aware validation.
     ///
     /// # Errors
     ///

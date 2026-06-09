@@ -17,7 +17,7 @@
 //!
 //! # State Machine
 //!
-//! The [`state_machine::transition`] function validates state transitions and
+//! The [`state_machine::transition`](scp_protocol::context::state_machine::transition) function validates state transitions and
 //! returns the new state or an error. It is pure -- no side effects. The
 //! Context Manager (SCP-019/020) is responsible for executing side effects.
 //!
@@ -27,14 +27,32 @@
 //! handles are serialized internally via `tokio::sync::RwLock`. See
 //! `.docs/standards/sdk-common.md` Concurrency Model.
 
+pub mod actor;
 pub mod app_sandbox;
+pub(crate) mod broadcast_helpers;
 pub mod builder;
+pub(crate) mod economy_helpers;
+pub(crate) mod economy_logic;
 pub mod export_import;
 pub mod governance;
-pub mod manager;
+pub(crate) mod governance_helpers;
+pub(crate) mod governance_logic;
+pub mod key_destruction;
+pub(crate) mod lifecycle_helpers;
+pub(crate) mod lifecycle_logic;
+pub(crate) mod manager_methods;
+pub(crate) mod messaging_helpers;
+pub mod persistence;
 pub mod policy;
 pub mod providers;
+pub(crate) mod queries_helpers;
+pub(crate) mod standing_helpers;
+pub mod state;
+pub mod supervisor;
+pub(crate) mod tools_helpers;
+pub(crate) mod trust_recovery_helpers;
 pub mod ttl;
+pub(crate) mod ttl_close_helpers;
 
 pub mod tools;
 
@@ -138,7 +156,7 @@ impl ContextHandle {
     /// Attempts a non-blocking read of the context state.
     ///
     /// Returns `None` if the read lock cannot be acquired immediately (e.g.,
-    /// a state transition is in progress). Used by [`ContextManager`] to
+    /// a state transition is in progress). Used by `ContextManager` to
     /// check state synchronously inside a `Mutex` lock scope, avoiding
     /// TOCTOU races without holding the `MutexGuard` across `.await` points.
     #[must_use]
@@ -148,7 +166,7 @@ impl ContextHandle {
 
     /// Attempts to transition the context to a new state.
     ///
-    /// Validates the transition via [`state_machine::transition`] and applies
+    /// Validates the transition via [`state_machine::transition`](scp_protocol::context::state_machine::transition) and applies
     /// it atomically if valid. Returns the new state on success.
     ///
     /// # Errors
@@ -177,6 +195,58 @@ const fn _assert_send_sync() {
     assert_send_sync::<ContextHandle>();
     assert_send_sync::<ContextState>();
     assert_send_sync::<ContextParams>();
+}
+
+// ---------------------------------------------------------------------------
+// Test-only convenience: build a Supervisor with providers + no-op
+// persistence (ADR-049 commit 12).
+// ---------------------------------------------------------------------------
+
+/// Constructs a fresh test-only [`supervisor::Supervisor`].
+///
+/// Mirror of the legacy
+/// `attach_test_supervisor(ContextManager::new(...))` shorthand: the
+/// `ContextManager` type is gone in commit 12, so callers now build a
+/// supervisor directly via [`supervisor::Supervisor::with_providers`].
+///
+/// Returns [`Arc<supervisor::Supervisor>`] — the supervisor is the
+/// authoritative owner of every per-context state, provider, and
+/// governance engine, and exposes the public API previously rooted on
+/// `ContextManager`.
+///
+/// # Non-production
+///
+/// `persistence`, `payment_adapter`, `event_tx`, and `clock` default to
+/// `None` (i.e. no-op persistence and a `SystemClock`). The required
+/// `mls_storage` provider is wired to an in-memory backend — a
+/// test-only dev opt-in; production bridges supply a real `Storage`.
+/// Tests that exercise any of those specific surfaces must construct
+/// their own supervisor explicitly via
+/// [`supervisor::Supervisor::with_providers`].
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn test_supervisor(
+    crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+    transport: Box<dyn builder::ContextTransportProvider>,
+    event_log: Box<dyn builder::ContextEventLogProvider>,
+    key_resolver: scp_protocol::context::governance::KeyResolver,
+) -> Arc<supervisor::Supervisor> {
+    let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
+        crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+            scp_platform::testing::InMemoryStorage::new(),
+        )),
+    );
+    supervisor::Supervisor::with_providers(
+        crypto,
+        transport,
+        event_log,
+        key_resolver,
+        None,
+        None,
+        None,
+        None,
+        mls_storage,
+    )
 }
 
 #[cfg(test)]

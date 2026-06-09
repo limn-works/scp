@@ -6,24 +6,17 @@ This crate generates Swift and Kotlin bindings from a single Rust definition via
 
 ## Architecture
 
-### Shared ContextManager (`runtime.rs`) — issue #387
+### Shared Supervisor (`runtime.rs`) — post-ADR-049 / commit 12 (supersedes the prior `ContextManager`-keyed wiring tracked in #387)
 
-A single `Arc<ContextManager>` (from `scp-core`) is created once via `OnceLock` and shared across all bridge functions. The `ContextManager` owns all per-context state (membership, roles, governance, broadcast, TTL) and the injected providers. This replaced the old `DashMap<String, ContextRuntime>` global registry.
+A single `Arc<Supervisor>` (from `scp-runtime`) is held in the per-bridge `BridgeInstanceCore.supervisor` slot and shared across all bridge functions. The `Supervisor` owns all per-context state (membership, roles, governance, broadcast, TTL) and the injected providers. This replaced the previously-shared `Arc<ContextManager>` (deleted in commit 12 of the ADR-049 ladder; see `.docs/adrs/ADR-049-actor-per-context.md`).
 
-The manager is initialized via `init_context_manager_with_did(local_did)` with a real `MlsCryptoProvider::new(local_did)` bound to the caller's DID, a `NotConfiguredTransportProvider` (or `RelayTransportProvider` when `auto_wire_context_manager` succeeds), and a persistent `MerkleEventLogProvider` backed by `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). The previous DID-less `FfiBridgeCrypto` / `FfiBridgeTransport` stub path was removed — first-call entry points (`context_create`, `context_join`, `context_import`, `register_local_did`, `identity_create`) now all carry the local DID. Platform-specific key custody is injected via the `KeyCustodyProvider` callback.
+The supervisor is built via `Supervisor::with_providers(...)` with a real `MlsCryptoProvider::new(local_did)` bound to the caller's DID, a `NotConfiguredTransportProvider` (or `RelayTransportProvider` when `auto_wire_supervisor` succeeds), and a persistent `MerkleEventLogProvider` backed by `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). The previous DID-less `FfiBridgeCrypto` / `FfiBridgeTransport` stub path was removed — first-call entry points (`context_create`, `context_join`, `context_import`, `register_local_did`, `identity_create`) now all carry the local DID. Platform-specific key custody is injected via the `KeyCustodyProvider` callback.
 
-Bridge functions access the manager via `crate::runtime::context_manager()`.
+Bridge functions access the supervisor via `crate::runtime::supervisor()`.
 
-### No-Op Validation Trait Stubs (`bridge.rs`)
+### Broadcast subscribe routes through the supervisor shim
 
-Four no-op adapter structs satisfy the generic bounds on `ContextManager::subscribe_broadcast`:
-
-| Adapter | Implements | Purpose |
-|---------|-----------|---------|
-| `NoOpDidResolver` | `DidResolver` | Returns error (no resolution in FFI layer) |
-| `NoOpNonceTracker` | `NonceTracker` | Always accepts (no replay prevention in FFI layer) |
-| `NoOpRevocationChecker` | `RevocationChecker` | Never revoked |
-| `NoOpProofResolver` | `ProofResolver` | Returns error (no proof resolution in FFI layer) |
+`broadcast_subscribe` routes through `Supervisor::dispatch_broadcast_command` with a `BroadcastCommand::SubscribeBroadcast` payload (since ADR-049 commit 11). The legacy generic typed path on the deleted `ContextManager` plus its no-op UCAN-validation trait stubs (`NoOpDidResolver` / `NoOpNonceTracker` / `NoOpRevocationChecker` / `NoOpProofResolver`) were removed once the typed callsite went away.
 
 ### Module Structure
 
@@ -65,10 +58,10 @@ All I/O-bound functions are `async fn`. UniFFI generates Swift `async` functions
 ## Gotchas
 
 - The tokio runtime (`RUNTIME` in `lib.rs`) must be initialized before any async bridge call. It is created as a `OnceLock<Runtime>` and exposed via `runtime()`.
-- **Shared ContextManager (post-#387):** All context lifecycle/membership/governance/broadcast/TTL operations delegate to `crate::runtime::context_manager()`. The old `ContextRuntime` struct and `DashMap` registry are deleted. Context state lives in the `ContextManager`, not in the bridge.
-- Bridge functions create ephemeral `scp_core::context::ContextHandle` instances to pass `context_id` to the manager. The FFI `ContextHandle` (in `bridge.rs`) remains a separate opaque object with its own state lock for handle counting and state queries.
-- **Close authorization**: `context_close` does NOT perform bridge-layer authorization. It delegates to `ContextManager::close_context`, which checks the `ContextClose` capability via `ttl::close_context`. The ContextManager is the authoritative auth layer.
-- **register_local_did**: `context_create` calls `manager.register_local_did(identity.did)` after creating the context, matching NAPI's behavior for defense-in-depth.
+- **Shared Supervisor (post-ADR-049 / commit 12):** All context lifecycle/membership/governance/broadcast/TTL operations delegate to `crate::runtime::supervisor()`. The old `ContextRuntime` struct and `DashMap` registry are deleted. Context state lives in the `Supervisor`, not in the bridge.
+- Bridge functions create ephemeral `scp_runtime::context::ContextHandle` instances to pass `context_id` to the supervisor. The FFI `ContextHandle` (in `bridge.rs`) remains a separate opaque object with its own state lock for handle counting and state queries.
+- **Close authorization**: `context_close` does NOT perform bridge-layer authorization. It delegates to `Supervisor::close_context` (the hoisted `lifecycle_helpers::close_context` body) which checks the `ContextClose` capability via `ttl::close_context`. The Supervisor is the authoritative auth layer.
+- **register_local_did**: `context_create` calls `supervisor.register_local_did(identity.did)` after creating the context, matching NAPI's behavior for defense-in-depth.
 - `ucan_mint` uses `InMemoryKeyCustody` for signing (feature-gated). Real `KeyCustody` wiring deferred to platform integration.
 - Opaque objects (`Identity`, `ContextHandle`, `UcanToken`, `TransportManager`) use `Arc<T>` wrapping and manual handle counting (`increment_handle_count`/`decrement_handle_count` in `lib.rs`). `Drop` impls decrement counts.
 - `OpaqueInMemoryKeyCustody` wrapper implements `Debug` with redacted output to prevent key material in logs.

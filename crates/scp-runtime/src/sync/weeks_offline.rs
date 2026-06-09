@@ -29,6 +29,10 @@
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
 use std::collections::{BTreeMap, HashMap};
+#[allow(
+    clippy::disallowed_types,
+    reason = "Out-of-scope tracking map (sync-only); not per-context state, not migrated by the actor refactor. See ADR-049 §'Out of scope' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -292,11 +296,19 @@ impl ResetRequest {
 #[derive(Debug)]
 pub struct ResetRequestNonceTracker {
     /// Map of `(member_did, nonce)` to the timestamp when first seen.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Out-of-scope tracking map (sync-only); not per-context state, not migrated by the actor refactor. See ADR-049 §'Out of scope' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md` (this map is NOT on the delete list)."
+    )]
     seen: Mutex<HashMap<(String, [u8; 16]), u64>>,
     /// TTL for nonce entries in seconds.
     ttl_secs: u64,
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "Out-of-scope tracking map (sync-only); not per-context state, not migrated by the actor refactor. See ADR-049 §'Out of scope' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 impl ResetRequestNonceTracker {
     /// Creates a new nonce tracker with the given TTL.
     #[must_use]

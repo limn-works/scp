@@ -2398,6 +2398,16 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func economyBudgetRemaining(contextId: String, did: String) throws  -> UInt64
     
     /**
+     * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
+     *
+     * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * supervisor, returning a JSON `{"results":[...]}` document with one
+     * entry per receipt. Mirrors the `PyO3` reference bridge exactly.
+     */
+    func economyVerifyPaymentReceipts(receiptsJson: String) async throws  -> String
+    
+    /**
      * Per-instance equivalent of the free-function `evaluate_invitation`.
      */
     func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?, trustedDids: [String]) throws  -> String
@@ -3307,16 +3317,18 @@ public static func withPersistence() -> Scp  {
     /**
      * Constructs an `SCP` instance with a storage configuration.
      *
-     * `StorageConfig::Sqlite` opens a `SQLCipher`-encrypted database at
-     * `{path}/scp.db` via [`scp_platform::sqlite::SqliteStorage`].
+     * `StorageConfig::InMemory` selects the encrypted in-memory dev/test
+     * backend; `StorageConfig::Sqlite { path, key }` selects a
+     * `SQLCipher`-encrypted database, where `key` is either raw key material
+     * or a passphrase (Argon2id; spec §17.6).
      *
      * # Errors
      *
-     * Returns [`ScpError::Validation`] with code `SCP-VALID-7005` if the
-     * `SQLite` database cannot be opened (bad key, permission denied,
-     * corrupt file). Previously this condition logged an error and
-     * silently fell back to an in-memory instance — a split-brain that
-     * produced a working-looking `Scp` whose writes vanished on drop.
+     * FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
+     * opened — bad key/passphrase, permission denied, corrupt file, or a
+     * salt-sidecar fail-closed condition — this returns `ScpError::Context`
+     * rather than silently degrading to in-memory storage. Surfaces to Swift
+     * as `throws` and Kotlin as a thrown exception.
      */
 public static func withStorage(config: StorageConfig)throws  -> Scp  {
     return try  FfiConverterTypeScp_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -4392,6 +4404,31 @@ open func economyBudgetRemaining(contextId: String, did: String)throws  -> UInt6
         FfiConverterString.lower(did),$0
     )
 })
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
+     *
+     * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * supervisor, returning a JSON `{"results":[...]}` document with one
+     * entry per receipt. Mirrors the `PyO3` reference bridge exactly.
+     */
+open func economyVerifyPaymentReceipts(receiptsJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_economy_verify_payment_receipts(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(receiptsJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -11566,6 +11603,120 @@ extension SourceType: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * `SQLCipher` key-material selector for [`StorageConfig::Sqlite`] (spec §17.6).
+ *
+ * The caller supplies EITHER raw key material OR a passphrase — never both,
+ * never neither. The sum type makes that mutual exclusion unrepresentable as
+ * an invalid state, so there is exactly one happy path per variant. This
+ * mirrors the `PyO3` bridge's `SqliteKeyMaterial`.
+ *
+ * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+ * mode; the existing, unchanged path).
+ * - [`SqliteKeyMaterial::Passphrase`] feeds
+ * [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+ * key from the passphrase via the shared Argon2id parameterization with a
+ * persisted per-database salt sidecar.
+ *
+ * # `UniFFI` representation
+ *
+ * `#[derive(uniffi::Enum)]` exposes this to Swift and Kotlin as an
+ * associated-value enum: Swift sees `case raw(Data)` / `case
+ * passphrase(String)`; Kotlin a `sealed class SqliteKeyMaterial`. The raw
+ * `Vec<u8>` and the `String` cross the FFI boundary by value; the Rust side
+ * moves the passphrase into `Zeroizing` and zeroes the raw bytes after
+ * `SQLCipher` has consumed them. Callers cannot zero their own copy across
+ * the boundary, so they should overwrite their source buffer after the call
+ * returns.
+ */
+
+public enum SqliteKeyMaterial {
+    
+    /**
+     * Raw encryption key material (32 bytes recommended).
+     */
+    case raw(
+        /**
+         * The raw key bytes.
+         */key: Data
+    )
+    /**
+     * Human-chosen passphrase; the `SQLCipher` key is derived via Argon2id.
+     */
+    case passphrase(
+        /**
+         * The passphrase. Moved into `Zeroizing` at the bridge boundary.
+         */passphrase: String
+    )
+}
+
+
+#if compiler(>=6)
+extension SqliteKeyMaterial: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSqliteKeyMaterial: FfiConverterRustBuffer {
+    typealias SwiftType = SqliteKeyMaterial
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SqliteKeyMaterial {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .raw(key: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 2: return .passphrase(passphrase: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SqliteKeyMaterial, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .raw(key):
+            writeInt(&buf, Int32(1))
+            FfiConverterData.write(key, into: &buf)
+            
+        
+        case let .passphrase(passphrase):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(passphrase, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSqliteKeyMaterial_lift(_ buf: RustBuffer) throws -> SqliteKeyMaterial {
+    return try FfiConverterTypeSqliteKeyMaterial.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSqliteKeyMaterial_lower(_ value: SqliteKeyMaterial) -> RustBuffer {
+    return FfiConverterTypeSqliteKeyMaterial.lower(value)
+}
+
+
+extension SqliteKeyMaterial: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Storage configuration for [`UniffiBridgeInstance`].
  *
  * Two variants are supported:
@@ -11600,8 +11751,10 @@ public enum StorageConfig {
          * through `std::path::PathBuf` on the Rust side.
          */path: String, 
         /**
-         * Raw encryption key material (typically 32 bytes).
-         */key: Data
+         * Encryption key material — raw bytes or a passphrase (mutually
+         * exclusive; the [`SqliteKeyMaterial`] sum type makes "exactly
+         * one" the only representable state).
+         */key: SqliteKeyMaterial
     )
 }
 
@@ -11622,7 +11775,7 @@ public struct FfiConverterTypeStorageConfig: FfiConverterRustBuffer {
         
         case 1: return .inMemory
         
-        case 2: return .sqlite(path: try FfiConverterString.read(from: &buf), key: try FfiConverterData.read(from: &buf)
+        case 2: return .sqlite(path: try FfiConverterString.read(from: &buf), key: try FfiConverterTypeSqliteKeyMaterial.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -11640,7 +11793,7 @@ public struct FfiConverterTypeStorageConfig: FfiConverterRustBuffer {
         case let .sqlite(path,key):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(path, into: &buf)
-            FfiConverterData.write(key, into: &buf)
+            FfiConverterTypeSqliteKeyMaterial.write(key, into: &buf)
             
         }
     }
@@ -15027,6 +15180,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_remaining() != 32105) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 4503) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 59132) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15357,7 +15513,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_persistence() != 28565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 21217) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 20129) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {

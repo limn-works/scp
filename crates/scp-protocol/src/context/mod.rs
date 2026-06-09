@@ -430,6 +430,66 @@ pub enum ContextError {
         /// Total number of send attempts.
         attempts: u32,
     },
+
+    /// A caller-side mailbox send exceeded the 30-second per-command
+    /// backpressure deadline (ADR-049 §"Mailbox parameters"). The target
+    /// [`ContextActor`](https://example.invalid) is draining slowly or
+    /// backed up; the caller's command was never delivered to the actor
+    /// and may be retried. Distinct from
+    /// [`Self::RateLimited`], which rejects pre-mailbox on capability
+    /// grounds.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2130` through the bridge error
+    /// translators.
+    #[error("SCP-CTX-2130: actor is busy: {0}")]
+    ActorBusy(String),
+
+    /// A handler reached a code path that has not yet been migrated off
+    /// the legacy `ContextManager` surface (ADR-049 commit ladder — actor
+    /// handlers land incrementally in commits 7-11). The actor skeleton
+    /// wires every command variant to a concrete return value rather than
+    /// `unimplemented!()` / `todo!()` so the dispatch loop compiles and
+    /// test fixtures observe a typed error.
+    ///
+    /// Production callers MUST NOT observe this variant once commit 12 of
+    /// ADR-049 lands — by then every handler has migrated to the actor
+    /// path. The CI gates fail the build if this variant is reachable
+    /// from non-test code after that commit.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2131` through the bridge error
+    /// translators.
+    #[error("SCP-CTX-2131: not implemented: {0}")]
+    NotImplemented(String),
+
+    /// A subsystem required for this operation has not been wired up yet.
+    /// Distinct from `NotImplemented`: the operation itself exists and is
+    /// migrated, but a dependency (e.g. the legacy `ContextManager` bridge
+    /// during the commits-7-11 migration window) is absent.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2132` through the bridge error
+    /// translators.
+    #[error("SCP-CTX-2132: not initialized: {0}")]
+    NotInitialized(String),
+
+    /// A transport operation exceeded its per-call timeout budget while
+    /// invoked inside a context actor handler (ADR-049 §7 / plan §"Transport
+    /// timeouts inside actor handlers"). Distinct from
+    /// [`Self::TransportFailed`]: the transport layer did not return a
+    /// typed error — it hung past the deadline and the handler gave up
+    /// waiting so other mailbox commands can be drained.
+    ///
+    /// On timeout, handlers that had not yet committed their in-memory
+    /// mutations roll back via RAII (see
+    /// [`crate::context::SequenceReservation`](../../context/index.html)
+    /// if applicable). Handlers that already mutated state report
+    /// [`crate::context::builder::ContextCreationError`]-style partial
+    /// success via `Outcome::err_mutated` so the per-context snapshot is
+    /// persisted before the timeout error propagates.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2133` through the bridge error
+    /// translators.
+    #[error("SCP-CTX-2133: transport timeout: {0}")]
+    TransportTimeout(String),
 }
 
 // ---------------------------------------------------------------------------

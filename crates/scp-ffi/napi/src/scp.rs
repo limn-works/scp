@@ -1,7 +1,7 @@
 //! `#[napi] Scp` class — the caller-owned SCP instance exposed to TypeScript.
 //!
 //! `SCP` (exposed to TS as `SCP`) is the top-level SDK-facing handle that
-//! owns a [`NapiBridgeInstance`] — which in turn owns the `ContextManager`,
+//! owns a `NapiBridgeInstance` — which in turn owns the `ContextManager`,
 //! transport, and bridge-specific registries.
 //!
 //! Phase 4 PR 4 (#1549, ADR-048) completed the migration: the
@@ -38,7 +38,7 @@ use crate::mcp::{
     NapiAllowlistState, NapiMcpClientHandle, NapiMcpInvokeResult, NapiMcpServerConfig,
     NapiMcpServerHandle, NapiMcpToolInfo,
 };
-use crate::runtime::{NapiBridgeInstance, StorageConfig};
+use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
 #[cfg(feature = "server")]
 use crate::server::{NapiNodeHandle, NapiRelayHandle};
 use crate::sync::NapiSyncPolicy;
@@ -49,7 +49,7 @@ use crate::trust::{NapiAttestationVerificationResult, NapiChallengeResult, NapiT
 use crate::ucan::NapiUcanToken;
 
 /// The SCP instance — a caller-owned handle that wraps a
-/// [`NapiBridgeInstance`].
+/// `NapiBridgeInstance`.
 ///
 /// # JS usage
 ///
@@ -101,13 +101,26 @@ impl Scp {
 
     /// Constructs an `SCP` instance with a storage configuration.
     ///
-    /// In PR 1 only `{"type":"in_memory"}` is honored. PR 3 adds
-    /// `{"type":"sqlite", "path":..., "key":...}`.
+    /// Accepted shapes:
+    /// - `{"type":"in_memory"}` — encrypted in-memory storage (ephemeral).
+    /// - `{"type":"sqlite","path":"/dir","key":"<hex>"|[..]}` —
+    ///   SQLCipher-encrypted storage at `{path}/scp.db` keyed by raw
+    ///   encryption key material (`key` as a hex string or a JSON byte array).
+    /// - `{"type":"sqlite","path":"/dir","passphrase":"..."}` —
+    ///   SQLCipher-encrypted storage whose key is derived from a passphrase via
+    ///   Argon2id (spec §17.6).
+    ///
+    /// For the `sqlite` type, exactly ONE of `key` or `passphrase` must be
+    /// supplied — providing both, or neither, is a `ValidationError`
+    /// (`SCP-VALID-7005`).
     ///
     /// Accepts a JSON-encoded string so the API remains stable while the
     /// `StorageConfig` surface evolves (napi-rs has no stable derive for
     /// untyped JSON values). Unknown variants are rejected with
-    /// `SCP-VALID-7005`.
+    /// `SCP-VALID-7005`. A failed `SQLCipher` open (bad key/passphrase,
+    /// permission denied, corrupt file, salt-sidecar fail-closed) also raises
+    /// `ValidationError` — the factory FAILS CLOSED (spec §17.6) and never
+    /// silently degrades to in-memory.
     #[napi(factory, js_name = "withStorage")]
     pub fn with_storage(config_json: String) -> napi::Result<Self> {
         let config: serde_json::Value = serde_json::from_str(&config_json).map_err(|e| {
@@ -150,40 +163,77 @@ impl Scp {
                         code: codes::VALID_7005.to_owned(),
                     })
                 })?;
-                // `key` is accepted either as a hex-encoded string (most
-                // common from JS/TS where JSON has no native bytes type)
-                // or as a JSON array of byte values.
-                let key_bytes: Vec<u8> = match config_obj.get("key") {
-                    Some(serde_json::Value::String(hex_str)) => hex::decode(hex_str)
-                        .map_err(|e| {
-                            napi::Error::from(ScpNapiError::Validation {
-                                message: format!(
-                                    "withStorage(sqlite): 'key' is not valid hex: {e}"
-                                ),
-                                code: codes::VALID_7005.to_owned(),
-                            })
-                        })?,
-                    Some(serde_json::Value::Array(arr)) => arr
-                        .iter()
-                        .map(|v| {
-                            v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or_else(|| {
-                                napi::Error::from(ScpNapiError::Validation {
-                                    message: "withStorage(sqlite): 'key' array must contain byte values (0-255)".to_owned(),
-                                    code: codes::VALID_7005.to_owned(),
-                                })
-                            })
-                        })
-                        .collect::<Result<Vec<u8>, _>>()?,
-                    Some(_) | None => {
+                // Exactly one of `key` (raw bytes: hex string OR byte array)
+                // or `passphrase` (string) must be supplied — the
+                // SqliteKeyMaterial sum type enforces mutual exclusion at the
+                // type level; here we enforce it at the JSON boundary (spec
+                // §17.6). The passphrase is moved into Zeroizing immediately so
+                // it never lingers in an un-wiped String.
+                let key_item = config_obj.get("key");
+                let passphrase_item = config_obj.get("passphrase");
+                let key_material = match (key_item, passphrase_item) {
+                    (Some(_), Some(_)) => {
                         return Err(napi::Error::from(ScpNapiError::Validation {
-                            message: "withStorage(sqlite): missing or wrongly-typed 'key' (expected hex string or byte array)".to_owned(),
+                            message: "withStorage(sqlite): supply exactly one of 'key' or 'passphrase', not both".to_owned(),
                             code: codes::VALID_7005.to_owned(),
                         }));
+                    }
+                    (None, None) => {
+                        return Err(napi::Error::from(ScpNapiError::Validation {
+                            message: "withStorage(sqlite): missing key material — supply either 'key' (hex string or byte array) or 'passphrase' (string)".to_owned(),
+                            code: codes::VALID_7005.to_owned(),
+                        }));
+                    }
+                    (Some(key_val), None) => {
+                        // `key` is accepted either as a hex-encoded string (most
+                        // common from JS/TS where JSON has no native bytes type)
+                        // or as a JSON array of byte values.
+                        let key_bytes: Vec<u8> = match key_val {
+                            serde_json::Value::String(hex_str) => hex::decode(hex_str)
+                                .map_err(|e| {
+                                    napi::Error::from(ScpNapiError::Validation {
+                                        message: format!(
+                                            "withStorage(sqlite): 'key' is not valid hex: {e}"
+                                        ),
+                                        code: codes::VALID_7005.to_owned(),
+                                    })
+                                })?,
+                            serde_json::Value::Array(arr) => arr
+                                .iter()
+                                .map(|v| {
+                                    v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or_else(|| {
+                                        napi::Error::from(ScpNapiError::Validation {
+                                            message: "withStorage(sqlite): 'key' array must contain byte values (0-255)".to_owned(),
+                                            code: codes::VALID_7005.to_owned(),
+                                        })
+                                    })
+                                })
+                                .collect::<Result<Vec<u8>, _>>()?,
+                            _ => {
+                                return Err(napi::Error::from(ScpNapiError::Validation {
+                                    message: "withStorage(sqlite): wrongly-typed 'key' (expected hex string or byte array)".to_owned(),
+                                    code: codes::VALID_7005.to_owned(),
+                                }));
+                            }
+                        };
+                        SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(key_bytes))
+                    }
+                    (None, Some(pass_val)) => {
+                        let passphrase = pass_val.as_str().ok_or_else(|| {
+                            napi::Error::from(ScpNapiError::Validation {
+                                message: "withStorage(sqlite): 'passphrase' must be a string"
+                                    .to_owned(),
+                                code: codes::VALID_7005.to_owned(),
+                            })
+                        })?;
+                        SqliteKeyMaterial::Passphrase(zeroize::Zeroizing::new(
+                            passphrase.to_owned(),
+                        ))
                     }
                 };
                 StorageConfig::Sqlite {
                     path: std::path::PathBuf::from(path_str),
-                    key: zeroize::Zeroizing::new(key_bytes),
+                    key: key_material,
                 }
             }
             other => {
@@ -195,14 +245,16 @@ impl Scp {
                 }));
             }
         };
-        let inner = NapiBridgeInstance::with_storage_napi(storage).map_err(|e| {
+        // FAIL CLOSED (spec §17.6): a failed durable-backend open surfaces as a
+        // JS-thrown ValidationError rather than a silent in-memory fallback.
+        let bi = NapiBridgeInstance::with_storage_napi(storage).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: e.to_string(),
                 code: codes::VALID_7005.to_owned(),
             })
         })?;
         Ok(Self {
-            inner: Arc::new(inner),
+            inner: Arc::new(bi),
         })
     }
 
@@ -3285,6 +3337,17 @@ impl Scp {
             floor,
             cap,
         )
+    }
+
+    /// Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
+    ///
+    /// Verifies a JSON array of payment receipts against the supervisor and
+    /// returns a JSON `{"results":[...]}` document with one entry per receipt.
+    /// Synchronous: the supervisor dispatch is driven on the shared runtime
+    /// inside the helper, since libuv worker threads carry no tokio context.
+    #[napi(js_name = "economyVerifyPaymentReceipts")]
+    pub fn economy_verify_payment_receipts(&self, receipts_json: String) -> napi::Result<String> {
+        crate::economy::economy_verify_payment_receipts_on(&self.inner, receipts_json)
     }
 
     // -------------------------------------------------------------------

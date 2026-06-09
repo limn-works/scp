@@ -319,4 +319,21 @@ final class ScpClassTests: XCTestCase {
             "credential provisioned on instance A must not leak into instance B"
         )
     }
+
+    /// An empty receipt batch is the clean supervisor-backed happy path — it
+    /// needs no payment adapter, so it exercises the
+    /// ``SCP/economyVerifyPaymentReceipts`` forwarder. The path dispatches an
+    /// `EconomyCommand` to the supervisor, so a supervisor must be attached
+    /// first (mirrors the reference Rust test, which calls
+    /// `configure_local_transport` before the empty-batch call). The bridge
+    /// returns `{"all_valid":true,"results":[]}` — `all_valid` is vacuously
+    /// `true` for an empty batch and `results` is empty.
+    func testEconomyVerifyPaymentReceiptsEmptyBatch() async throws {
+        try scp.configureLocalTransport(localDid: "did:key:z6MkSwiftVerifyReceiptsEmptyTest")
+        let out = try await scp.economyVerifyPaymentReceipts(receiptsJson: "[]")
+        XCTAssertEqual(
+            out, "{\"all_valid\":true,\"results\":[]}",
+            "empty batch must return all_valid=true with an empty results array, got \(out)"
+        )
+    }
 }

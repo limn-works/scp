@@ -1,52 +1,54 @@
-//! Shared key exchange for coordinating Welcome messages and sender keys
-//! between separate `E2eCryptoProvider` instances.
+//! Shared key-exchange side channel for the full-stack harness.
 //!
-//! In production, Welcome messages travel over transport and sender keys are
-//! exchanged via the HPKE pull protocol. In tests, the `KeyExchange` struct
-//! acts as a side channel that bridges these materials between two independent
-//! crypto providers without requiring transport wiring.
+//! In a real deployment the joiner's key package, the MLS Welcome, the
+//! inviter-minted per-member access keys, and the MLS-wrapped sender-key
+//! distribution messages all travel over transport (relay, blob store, MLS
+//! management channel). In the in-process `FullStackNetwork` harness there is
+//! no shared transport between the creator's actor and the joiner's provider,
+//! so `KeyExchange` carries those bootstrap bytes between nodes.
+//!
+//! Everything stored here is wire bytes — there is no in-process MLS state
+//! (no `MlsMessageOut`, signer, or `OpenMLS` provider) crossing the channel.
+//! After ADR-049 commit 12c.9f the joiner generates and retains its own MLS
+//! signer state inside its [`MlsCryptoProvider`](scp_core::crypto::mls::provider::MlsCryptoProvider);
+//! only the serialized Welcome bytes need to travel.
 
 use std::collections::HashMap;
 
-use openmls::prelude::MlsMessageOut;
-use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::OpenMlsRustCrypto;
 use scp_core::crypto::access_keys::AccessKey;
-use scp_core::crypto::sender_keys::SenderKey;
 
-/// A Welcome message + the joiner's MLS signer and provider, captured when
-/// `add_member` is called on the adder's side. The joiner retrieves this to
-/// form their MLS group state via `join_group`.
-pub struct PendingWelcome {
-    /// The MLS Welcome message (HPKE-encrypted to the joiner's key package).
-    pub welcome: MlsMessageOut,
-    /// The joiner's MLS signature key pair (generated during `generate_key_package`).
-    pub signer: SignatureKeyPair,
-    /// The joiner's `OpenMLS` crypto+storage provider.
-    pub provider: OpenMlsRustCrypto,
-}
-
-/// Shared key exchange between `E2eCryptoProvider` instances.
+/// Shared key-exchange between `E2eCryptoProvider` instances.
 ///
-/// Thread-safe via external `std::sync::Mutex` wrapping. The exchange is
-/// keyed by `(context_id_bytes, joiner_did)` for Welcomes and
-/// `(context_id_hex, sender_did, target_did)` for sender keys.
+/// Thread-safe via an external `std::sync::Mutex` wrapping. Keyed by
+/// `([u8; 32] context_id, joiner_did)` for per-joiner bootstrap material and
+/// by `(context_id_str, joiner_did)` for access keys (which use the original
+/// string context ID, matching the access-key store's keying).
 pub struct KeyExchange {
-    /// Pending Welcome messages: `(context_id, joiner_did) -> PendingWelcome`.
-    welcomes: HashMap<([u8; 32], String), PendingWelcome>,
-    /// Sender keys deposited for target members:
-    /// `(context_id_hex, sender_did, target_did) -> SenderKey`.
-    sender_keys: HashMap<(String, String, String), SenderKey>,
-    /// Pending MLS commits for existing members to process.
-    /// `(context_id, target_did) -> Vec<commit_bytes>`.
-    /// When Alice adds Carol, she deposits the Commit for Bob to process
-    /// so Bob's MLS group advances to the same epoch.
-    pending_commits: HashMap<([u8; 32], String), Vec<Vec<u8>>>,
+    /// Joiner key packages: `(context_id, joiner_did) -> kp_bytes`.
+    /// The joiner deposits its TLS-serialized MLS `KeyPackage`; the inviter
+    /// takes it and feeds it to the real `add_member` path.
+    key_packages: HashMap<([u8; 32], String), Vec<u8>>,
+    /// Pending Welcomes: `(context_id, joiner_did) -> welcome_bytes`.
+    /// The inviter deposits the TLS-serialized MLS Welcome produced by
+    /// `add_member`; the joiner takes it and forms its group state.
+    welcomes: HashMap<([u8; 32], String), Vec<u8>>,
+    /// MLS-wrapped sender-key distribution messages for joiners:
+    /// `(context_id, joiner_did) -> Vec<wrapped_bytes>`. The inviter captures
+    /// these off its transport during `add_member` and deposits them; the
+    /// joiner MLS-opens each and processes the embedded sender key.
+    sender_key_messages: HashMap<([u8; 32], String), Vec<Vec<u8>>>,
+    /// Pending epoch-advance Commits for existing members:
+    /// `(context_id, member_did) -> Vec<commit_bytes>`. When the inviter adds
+    /// a new member every existing member must process the resulting Commit so
+    /// their MLS group advances to the new epoch. Raw TLS-serialized MLS
+    /// Commit bytes (not envelope-wrapped).
+    commits: HashMap<([u8; 32], String), Vec<Vec<u8>>>,
     /// Access keys deposited for joiners:
-    /// `(context_id_str, target_joiner_did) -> Vec<(member_did, AccessKey)>`.
-    /// When Alice adds Bob, she deposits ALL existing members' access keys
-    /// (including Bob's and her own) here so Bob can retrieve them during
-    /// `join_from_welcome`. Using a Vec allows multiple keys per joiner.
+    /// `(context_id_str, joiner_did) -> Vec<(member_did, AccessKey)>`.
+    /// When the inviter adds a joiner it deposits every existing member's
+    /// access key (including the joiner's own) so the joiner can both decrypt
+    /// inbound content and wrap outbound content. A `Vec` allows multiple
+    /// keys per joiner.
     access_keys: HashMap<(String, String), Vec<(String, AccessKey)>>,
 }
 
@@ -55,102 +57,118 @@ impl KeyExchange {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            key_packages: HashMap::new(),
             welcomes: HashMap::new(),
-            sender_keys: HashMap::new(),
-            pending_commits: HashMap::new(),
+            sender_key_messages: HashMap::new(),
+            commits: HashMap::new(),
             access_keys: HashMap::new(),
         }
     }
 
-    /// Deposits a Welcome message for a joiner to retrieve later.
+    /// Deposits a joiner key package for the inviter to pick up.
+    pub fn deposit_key_package(
+        &mut self,
+        context_id: [u8; 32],
+        joiner_did: &str,
+        kp_bytes: Vec<u8>,
+    ) {
+        self.key_packages
+            .insert((context_id, joiner_did.to_owned()), kp_bytes);
+    }
+
+    /// Takes (removes) the key package the given joiner deposited.
+    #[must_use]
+    pub fn take_key_package(&mut self, context_id: &[u8; 32], joiner_did: &str) -> Option<Vec<u8>> {
+        self.key_packages
+            .remove(&(*context_id, joiner_did.to_owned()))
+    }
+
+    /// Deposits a serialized Welcome for a joiner to retrieve.
     pub fn deposit_welcome(
         &mut self,
         context_id: [u8; 32],
         joiner_did: &str,
-        welcome: PendingWelcome,
+        welcome_bytes: Vec<u8>,
     ) {
         self.welcomes
-            .insert((context_id, joiner_did.to_owned()), welcome);
+            .insert((context_id, joiner_did.to_owned()), welcome_bytes);
     }
 
-    /// Takes (removes) the Welcome message for the given joiner.
-    ///
-    /// Returns `None` if no Welcome has been deposited for this
-    /// `(context_id, joiner_did)` pair.
-    pub fn take_welcome(
-        &mut self,
-        context_id: &[u8; 32],
-        joiner_did: &str,
-    ) -> Option<PendingWelcome> {
+    /// Takes (removes) the Welcome deposited for the given joiner.
+    #[must_use]
+    pub fn take_welcome(&mut self, context_id: &[u8; 32], joiner_did: &str) -> Option<Vec<u8>> {
         self.welcomes.remove(&(*context_id, joiner_did.to_owned()))
     }
 
-    /// Deposits a sender key for a target member to retrieve.
-    pub fn deposit_sender_key(
+    /// Deposits an MLS-wrapped sender-key distribution message for a joiner.
+    pub fn deposit_sender_key_message(
         &mut self,
-        context_id_hex: &str,
-        sender_did: &str,
-        target_did: &str,
-        key: SenderKey,
+        context_id: [u8; 32],
+        joiner_did: &str,
+        msg: Vec<u8>,
     ) {
-        self.sender_keys.insert(
-            (
-                context_id_hex.to_owned(),
-                sender_did.to_owned(),
-                target_did.to_owned(),
-            ),
-            key,
-        );
+        self.sender_key_messages
+            .entry((context_id, joiner_did.to_owned()))
+            .or_default()
+            .push(msg);
     }
 
-    /// Deposits a serialized MLS Commit for an existing group member to process.
-    ///
-    /// When a new member is added, the Commit must be distributed to all
-    /// existing members so their MLS groups advance to the new epoch.
+    /// Takes all MLS-wrapped sender-key distribution messages deposited for
+    /// the given joiner, in deposit order.
+    #[must_use]
+    pub fn take_sender_key_messages(
+        &mut self,
+        context_id: &[u8; 32],
+        joiner_did: &str,
+    ) -> Vec<Vec<u8>> {
+        self.sender_key_messages
+            .remove(&(*context_id, joiner_did.to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// Deposits a raw epoch-advance Commit for an existing member to process.
     pub fn deposit_commit(
         &mut self,
         context_id: [u8; 32],
-        target_did: &str,
+        member_did: &str,
         commit_bytes: Vec<u8>,
     ) {
-        self.pending_commits
-            .entry((context_id, target_did.to_owned()))
+        self.commits
+            .entry((context_id, member_did.to_owned()))
             .or_default()
             .push(commit_bytes);
     }
 
-    /// Takes all pending commits for the given member in a context.
-    ///
-    /// Returns the commit bytes in deposit order. The caller must process
-    /// them sequentially to advance the MLS group epoch correctly.
+    /// Takes all pending Commits for the given member, in deposit order.
+    #[must_use]
     pub fn take_commits(&mut self, context_id: &[u8; 32], member_did: &str) -> Vec<Vec<u8>> {
-        self.pending_commits
+        self.commits
             .remove(&(*context_id, member_did.to_owned()))
             .unwrap_or_default()
     }
 
-    /// Deposits an access key for a joiner to retrieve during `join_from_welcome`.
+    /// Deposits an access key for a joiner to retrieve during join.
     ///
-    /// The key is associated with `target_joiner_did` -- the DID of the member
-    /// who will pick it up. `member_did` identifies WHOSE access key this is.
-    /// Call once per existing member when adding a new joiner.
+    /// The key is associated with `joiner_did` (who picks it up).
+    /// `member_did` identifies whose access key this is. Call once per
+    /// existing member when adding a new joiner.
     pub fn deposit_access_key(
         &mut self,
         context_id: &str,
-        target_joiner_did: &str,
+        joiner_did: &str,
         member_did: &str,
         key: AccessKey,
     ) {
         self.access_keys
-            .entry((context_id.to_owned(), target_joiner_did.to_owned()))
+            .entry((context_id.to_owned(), joiner_did.to_owned()))
             .or_default()
             .push((member_did.to_owned(), key));
     }
 
     /// Takes (removes) all access keys deposited for the given joiner.
     ///
-    /// Returns `(member_did, AccessKey)` pairs. Returns an empty Vec if
-    /// no keys have been deposited for this joiner.
+    /// Returns `(member_did, AccessKey)` pairs, or an empty `Vec` if none.
+    #[must_use]
     pub fn take_access_keys(
         &mut self,
         context_id: &str,
@@ -159,29 +177,6 @@ impl KeyExchange {
         self.access_keys
             .remove(&(context_id.to_owned(), joiner_did.to_owned()))
             .unwrap_or_default()
-    }
-
-    /// Takes all sender keys deposited for the given target in a context.
-    ///
-    /// Returns `(sender_did, SenderKey)` pairs.
-    pub fn take_sender_keys(
-        &mut self,
-        context_id_hex: &str,
-        target_did: &str,
-    ) -> Vec<(String, SenderKey)> {
-        let mut result = Vec::new();
-        let keys_to_remove: Vec<_> = self
-            .sender_keys
-            .keys()
-            .filter(|(ctx, _, target)| ctx == context_id_hex && target == target_did)
-            .cloned()
-            .collect();
-        for key in keys_to_remove {
-            if let Some(sk) = self.sender_keys.remove(&key) {
-                result.push((key.1, sk));
-            }
-        }
-        result
     }
 }
 
