@@ -86,8 +86,6 @@
 //! finalization; the `_legacy` suffix is dropped because there is no
 //! per-context actor-shape twin to disambiguate against.
 
-use std::collections::HashMap;
-
 use scp_identity::DID;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::roles::{Capability, ContextRoleState, RoleAssignment};
@@ -466,7 +464,7 @@ pub fn get_access_key(
 pub fn get_all_access_keys(
     state: &PerContextState,
     context_id: &str,
-) -> HashMap<String, scp_protocol::crypto::access_keys::AccessKey> {
+) -> std::collections::HashMap<String, scp_protocol::crypto::access_keys::AccessKey> {
     state.access.access_key_store.get_all(context_id)
 }
 
