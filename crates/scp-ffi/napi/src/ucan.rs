@@ -4,7 +4,8 @@
 //!
 //! - `ucan_validate` — Validate a UCAN token for a required capability.
 //! - `ucan_mint` — Mint a new UCAN token for a context member with real
-//!   Ed25519 signing via `InMemoryKeyCustody`.
+//!   Ed25519 signing delegated to the creator identity's retained
+//!   `KeyCustody` (in-memory OR production callback custody).
 //! - `ucan_revoke` — Revoke a UCAN token.
 //!
 //! # Validation pipeline
@@ -30,7 +31,6 @@ use scp_ffi_common::error_codes as codes;
 use std::collections::HashMap;
 
 use napi_derive::napi;
-#[cfg(feature = "allow_in_memory_custody")]
 use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
 use scp_ffi_common::validate::{validate_capability_uri, validate_did, validate_ucan_token};
 
@@ -49,7 +49,6 @@ use scp_ffi_common::{
 use crate::context::NapiContextHandle;
 use crate::decrement_handle_count;
 use crate::error::ScpNapiError;
-#[cfg(feature = "allow_in_memory_custody")]
 use crate::increment_handle_count;
 use crate::runtime::NapiBridgeInstance;
 
@@ -296,98 +295,81 @@ pub(crate) async fn ucan_mint_on(
         }
     }
 
-    // In-memory custody is only available when `allow_in_memory_custody` is enabled.
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (bi, &handle, &member_did, &capabilities, &proofs);
-        Err(napi::Error::from(ScpNapiError::Permission {
-            message: "UCAN minting requires key custody -- the in_memory custody path                       is not available in this build. Enable allow_in_memory_custody                       for dev/desktop use.".to_owned(),
+    // Extract key custody and signing key from the context handle. Available
+    // for any context whose creator identity retains custody — in-memory OR a
+    // production callback custody (`identityCreateWithCustody`).
+    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Permission {
+            message: "UCAN minting requires key custody — the context creator identity has no \
+                  retained custody (it was externally loaded)"
+                .to_owned(),
             code: codes::PERM_3023.to_owned(),
-        }))
-    }
+        })
+    })?;
+    let signing_key = handle.signing_key.ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Permission {
+            message: "UCAN minting requires a signing key — the context creator identity \
+                  must have an active signing key"
+                .to_owned(),
+            code: codes::PERM_3023.to_owned(),
+        })
+    })?;
 
-    #[cfg(feature = "allow_in_memory_custody")]
-    {
-        // Extract key custody and signing key from the context handle.
-        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+    let creator_did = handle.creator_did();
+    let context_id = handle.context_id();
+
+    // Get ceiling from the context handle for mint-time enforcement (#339).
+    // Empty ceiling means the user passed `[]` — apply the default ceiling
+    // instead of `None` (which would mean unlimited). See #1419.
+    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
+    let ceiling = Some(if ceiling_strings.is_empty() {
+        scp_core::context::roles::default_ceiling().to_ucan_string_set()
+    } else {
+        ceiling_strings
+    });
+
+    let params = MintParams {
+        issuer_did: &creator_did,
+        issuer_key: &signing_key,
+        audience_did: &member_did,
+        context_id: &context_id,
+        capabilities: &capabilities,
+        lifetime_secs: 3600, // 1 hour default
+        not_before: None,
+        proofs: proofs.unwrap_or_default(),
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling,
+    };
+
+    // Sign the token by delegating to the retained `KeyCustody` via scp-core.
+    // napi-rs async functions already run on the tokio runtime, so we can
+    // await directly without spawning a separate task.
+    let token = mint_ucan(&params, custody.as_ref(), &scp_primitives::SystemClock)
+        .await
+        .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
-                message: "UCAN minting requires key custody — create the context with an \
-                      in_memory identity (identity_create(\"in_memory\"))"
-                    .to_owned(),
+                message: format!("UCAN minting failed: {e}"),
                 code: codes::PERM_3023.to_owned(),
             })
         })?;
-        let signing_key = handle.signing_key.ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Permission {
-                message: "UCAN minting requires a signing key — the context creator identity \
-                      must have an active signing key"
-                    .to_owned(),
-                code: codes::PERM_3023.to_owned(),
-            })
-        })?;
 
-        let creator_did = handle.creator_did();
-        let context_id = handle.context_id();
-
-        // Get ceiling from the context handle for mint-time enforcement (#339).
-        // Empty ceiling means the user passed `[]` — apply the default ceiling
-        // instead of `None` (which would mean unlimited). See #1419.
-        let ceiling_strings: std::collections::HashSet<String> =
-            handle.ceiling().into_iter().collect();
-        let ceiling = Some(if ceiling_strings.is_empty() {
-            scp_core::context::roles::default_ceiling().to_ucan_string_set()
-        } else {
-            ceiling_strings
-        });
-
-        let params = MintParams {
-            issuer_did: &creator_did,
-            issuer_key: &signing_key,
-            audience_did: &member_did,
-            context_id: &context_id,
-            capabilities: &capabilities,
-            lifetime_secs: 3600, // 1 hour default
-            not_before: None,
-            proofs: proofs.unwrap_or_default(),
-            facts: None,
-            key_scope: None,
-            signing_key_id: None,
-            ceiling,
-        };
-
-        // Sign the token using the real InMemoryKeyCustody via scp-core.
-        // napi-rs async functions already run on the tokio runtime, so we
-        // can await directly without spawning a separate task.
-        let token = mint_ucan(&params, custody.as_ref(), &scp_primitives::SystemClock)
-            .await
-            .map_err(|e| {
-                napi::Error::from(ScpNapiError::Permission {
-                    message: format!("UCAN minting failed: {e}"),
-                    code: codes::PERM_3023.to_owned(),
-                })
-            })?;
-
-        let data = NapiUcanTokenData {
+    let data = NapiUcanTokenData {
         token_id: token.payload.nnc.clone(),
         issuer: token.payload.iss.clone(),
         audience: token.payload.aud.clone(),
-        capabilities: token
-            .payload
-            .att
-            .iter()
-            .map(|a| a.with.clone())
-            .collect(),
+        capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
         #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
         expires_at: Some(token.payload.exp as f64),
     };
 
-        increment_handle_count();
-        Ok(NapiUcanToken {
-            data,
-            encoded: token.encoded,
-            instance_id: bi.instance_id(),
-        })
-    }
+    increment_handle_count();
+    Ok(NapiUcanToken {
+        data,
+        encoded: token.encoded,
+        instance_id: bi.instance_id(),
+    })
 }
 
 /// Per-bridge-instance implementation of [`ucan_delegate`].
@@ -409,26 +391,10 @@ pub(crate) async fn ucan_delegate_on(
         validate_capability_uri(cap).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     }
 
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (
-            bi,
-            &handle,
-            &delegator_did,
-            &delegatee_did,
-            &parent_token,
-            &capabilities,
-        );
-        Err(napi::Error::from(ScpNapiError::Permission {
-            message: "UCAN delegation requires key custody -- the in_memory custody path \
-                       is not available in this build. Enable allow_in_memory_custody \
-                       for dev/desktop use."
-                .to_owned(),
-            code: codes::PERM_3023.to_owned(),
-        }))
-    }
-
-    #[cfg(feature = "allow_in_memory_custody")]
+    // Delegation is available for any context whose delegator identity retains
+    // custody — in-memory OR a production callback custody
+    // (`identityCreateWithCustody`). The delegator's key is looked up from the
+    // identity registry below (NOT the context creator's key).
     {
         use scp_core::crypto::ucan::Attenuation;
         use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};

@@ -42,7 +42,6 @@ use napi::Error as NapiError;
 use napi_derive::napi;
 #[cfg(all(test, feature = "allow_in_memory_custody"))]
 use scp_identity::DidMethod;
-#[cfg(feature = "allow_in_memory_custody")]
 use scp_identity::{DhtClient, IdentityError};
 use scp_identity::{
     DidCache, DidDht, DidDocument, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier,
@@ -134,7 +133,6 @@ pub(crate) fn ensure_did_resolver_initialized_on(bi: &crate::runtime::NapiBridge
 /// errors are logged but do not fail identity creation.
 ///
 /// See issue #1144.
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) async fn publish_to_shared_dht_for(
     identity: &ScpIdentity,
     document: &DidDocument,
@@ -214,7 +212,6 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// a properly configured instance with the signing function wired to the
 /// custody's key material — dispatching through the enum so it works for both
 /// in-memory and callback custody.
-#[cfg(feature = "allow_in_memory_custody")]
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer(
     custody: &Arc<crate::custody::NapiKeyCustody>,
@@ -270,7 +267,11 @@ pub(crate) struct NapiIdentityInner {
     /// so it backs either an in-memory test key or a callback custody. Dropping
     /// the last `Arc` destroys all in-memory private keys. `None` for
     /// externally loaded identities (DID-string-only handles).
-    #[cfg(feature = "allow_in_memory_custody")]
+    ///
+    /// Available in production (not feature-gated): in the production
+    /// callback-custody path this holds the `Arc<NapiKeyCustody::Callback>`
+    /// so handle-based signing reaches the caller's custody. The field name
+    /// is historical — it backs any retained custody, not just in-memory.
     pub(crate) in_memory_custody: Option<Arc<crate::custody::NapiKeyCustody>>,
     /// Retained DID document for this identity.
     ///
@@ -424,18 +425,6 @@ impl NapiIdentity {
     #[napi]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn rotate_key(&self) -> napi::Result<Self> {
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        {
-            let _ = self;
-            Err(ScpNapiError::Identity {
-                message: "key rotation requires in-memory custody -- \
-                          enable allow_in_memory_custody"
-                    .to_owned(),
-                code: codes::IDENT_1007.to_owned(),
-            }
-            .into())
-        }
-        #[cfg(feature = "allow_in_memory_custody")]
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
 
@@ -525,12 +514,6 @@ impl NapiIdentity {
     #[napi(js_name = "addAgentKey")]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn add_agent_key(&self) -> napi::Result<Self> {
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        {
-            let _ = self;
-            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: codes::IDENT_1007.to_owned() }.into())
-        }
-        #[cfg(feature = "allow_in_memory_custody")]
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
 
@@ -620,12 +603,6 @@ impl NapiIdentity {
     #[napi(js_name = "rotateAgentKey")]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn rotate_agent_key(&self) -> napi::Result<Self> {
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        {
-            let _ = self;
-            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: codes::IDENT_1007.to_owned() }.into())
-        }
-        #[cfg(feature = "allow_in_memory_custody")]
         {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("rotateAgentKey")?;
@@ -715,12 +692,6 @@ impl NapiIdentity {
     #[napi(js_name = "removeAgentKey")]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn remove_agent_key(&self) -> napi::Result<Self> {
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        {
-            let _ = self;
-            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: codes::IDENT_1007.to_owned() }.into())
-        }
-        #[cfg(feature = "allow_in_memory_custody")]
         {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("removeAgentKey")?;
@@ -820,18 +791,6 @@ impl NapiIdentity {
     #[napi]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn migrate(&self) -> napi::Result<Self> {
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        {
-            let _ = self;
-            Err(ScpNapiError::Identity {
-                message: "identity migration requires in-memory custody -- \
-                          enable allow_in_memory_custody"
-                    .to_owned(),
-                code: codes::IDENT_1007.to_owned(),
-            }
-            .into())
-        }
-        #[cfg(feature = "allow_in_memory_custody")]
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
 
@@ -944,7 +903,6 @@ impl NapiIdentity {
 /// Callers pass `identity.identity_key` (not `active_signing_key`): the
 /// WASM bridge has only one key per identity, so byte-exact cross-bridge
 /// parity requires every bridge to expose the DID-deriving identity key.
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) async fn identity_verifying_key_hex(
     custody: &Arc<crate::custody::NapiKeyCustody>,
     handle: &scp_platform::traits::KeyHandle,
@@ -967,7 +925,6 @@ impl NapiIdentity {
 
     /// Returns the retained custody if this identity has live key material.
     /// Used by context creation for routing ID derivation (SCP-214).
-    #[cfg(feature = "allow_in_memory_custody")]
     #[allow(dead_code)]
     pub(crate) fn in_memory_custody(&self) -> Option<&crate::custody::NapiKeyCustody> {
         self.inner.in_memory_custody.as_deref()
@@ -987,7 +944,6 @@ impl NapiIdentity {
     /// error for externally loaded identities that have none. The custody is
     /// enum-dispatched so the agent-key paths work for both in-memory and
     /// callback-backed identities.
-    #[cfg(feature = "allow_in_memory_custody")]
     fn extract_in_memory_state(
         &self,
         operation: &str,

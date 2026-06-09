@@ -25,6 +25,10 @@ use scp_ffi_common::error_codes as codes;
 use scp_identity::DidMethod as _;
 use scp_primitives::Clock as _;
 
+// `Buffer` is referenced only by the in-memory-custody-gated full-stack test
+// methods (`fullstackSendMessage` / `fullstackDecryptMessage`); production
+// `identity_create` uses the fully-qualified path for its `testing_seed` arg.
+#[cfg(feature = "allow_in_memory_custody")]
 use napi::bindgen_prelude::Buffer;
 
 use crate::context::{
@@ -42,6 +46,7 @@ use crate::runtime::{NapiBridgeInstance, StorageConfig};
 #[cfg(feature = "server")]
 use crate::server::{NapiNodeHandle, NapiRelayHandle};
 use crate::sync::NapiSyncPolicy;
+#[cfg(feature = "allow_in_memory_custody")]
 use crate::testing::NapiFullStackNode;
 use crate::tools::{NapiToolDefinition, NapiToolVerificationResult};
 use crate::transport::{NapiReliabilityScore, NapiTransportManager, NapiTransportStatus};
@@ -316,12 +321,18 @@ impl Scp {
     /// only valid for `"in_memory"` custody; other custody types reject
     /// it with `SCP-VALID-7009`.
     #[napi(js_name = "identityCreate")]
+    // napi-rs requires `async` for the Promise return type. Without the
+    // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
+    // compiled out, so the bare build sees an await-free async fn.
+    #[cfg_attr(not(feature = "allow_in_memory_custody"), allow(clippy::unused_async))]
     pub async fn identity_create(
         &self,
         custody: String,
         testing_seed: Option<napi::bindgen_prelude::Buffer>,
     ) -> napi::Result<crate::identity::NapiIdentity> {
-        use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
+        #[cfg(feature = "allow_in_memory_custody")]
+        use crate::identity::NapiIdentityInner;
+        use crate::identity::ensure_did_resolver_initialized_on;
 
         validate_custody_type(&custody).map_err(NapiError::from)?;
 
@@ -487,11 +498,17 @@ impl Scp {
     /// Same as [`Self::identity_create`] but the resulting identity also
     /// includes an `#agent` verification method in the DID document.
     #[napi(js_name = "identityCreateWithAgentKey")]
+    // napi-rs requires `async` for the Promise return type. Without the
+    // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
+    // compiled out, so the bare build sees an await-free async fn.
+    #[cfg_attr(not(feature = "allow_in_memory_custody"), allow(clippy::unused_async))]
     pub async fn identity_create_with_agent_key(
         &self,
         custody: String,
     ) -> napi::Result<crate::identity::NapiIdentity> {
-        use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
+        #[cfg(feature = "allow_in_memory_custody")]
+        use crate::identity::NapiIdentityInner;
+        use crate::identity::ensure_did_resolver_initialized_on;
 
         validate_custody_type(&custody).map_err(NapiError::from)?;
 
@@ -600,7 +617,6 @@ impl Scp {
         js_name = "identityCreateWithCustody",
         ts_return_type = "Promise<NapiIdentity>"
     )]
-    #[cfg_attr(not(feature = "allow_in_memory_custody"), allow(unused_variables))]
     pub fn identity_create_with_custody<'env>(
         &self,
         env: &'env Env,
@@ -615,87 +631,74 @@ impl Scp {
         // custody callbacks the creation flow invokes. (An `async fn` taking
         // the `Function`s directly cannot compile: its future would capture
         // the non-`Send` callbacks.)
+        //
+        // This is a PRODUCTION path (not feature-gated): the identity registry
+        // retains the caller's callback custody so later signing / event-log /
+        // SCPID operations reach it, mirroring the PyO3 reference bridge. The
+        // cold-storage `InMemoryPreRotationCustody` is a separate substrate for
+        // the pre-rotation key only (ADR-003 §4b) — the caller's operational
+        // private keys never enter Rust ownership (ADR-006).
+        use scp_identity::DidDht;
 
-        // The identity registry (which retains the callback custody so later
-        // signing / event-log / SCPID operations can reach it) is compiled
-        // only under `allow_in_memory_custody`, matching every other
-        // key-bearing identity path in this bridge.
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        {
-            return Err(ScpNapiError::Identity {
-                message: "identityCreateWithCustody requires the allow_in_memory_custody \
-                          build feature (the identity registry that retains the callback \
-                          custody is gated on it)"
-                    .to_owned(),
-                code: codes::IDENT_1008.to_owned(),
-            }
-            .into());
-        }
+        use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
 
-        #[cfg(feature = "allow_in_memory_custody")]
-        {
-            use scp_identity::DidDht;
+        let bi_arc = Arc::clone(&self.inner);
+        ensure_did_resolver_initialized_on(&bi_arc);
 
-            use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
+        // Promote the JS callbacks to threadsafe functions on the JS
+        // thread (consuming the non-Send `Function`s). A malformed
+        // provider fails fast here, before any DID-creation work.
+        let callback = crate::custody::NapiCallbackKeyCustody::from_provider(provider)?;
+        let key_custody = Arc::new(crate::custody::NapiKeyCustody::Callback(callback));
 
-            let bi_arc = Arc::clone(&self.inner);
-            ensure_did_resolver_initialized_on(&bi_arc);
+        env.spawn_future(async move {
+            let bi = &*bi_arc;
+            let pre_rotation_custody =
+                Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+            let dht = DidDht::new();
+            let (scp_identity, document, pre_rotation_handle) = dht
+                .create(&*key_custody, pre_rotation_custody.as_ref())
+                .await
+                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-            // Promote the JS callbacks to threadsafe functions on the JS
-            // thread (consuming the non-Send `Function`s). A malformed
-            // provider fails fast here, before any DID-creation work.
-            let callback = crate::custody::NapiCallbackKeyCustody::from_provider(provider)?;
-            let key_custody = Arc::new(crate::custody::NapiKeyCustody::Callback(callback));
+            let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                &key_custody,
+                &scp_identity.identity_key,
+            )
+            .await;
 
-            env.spawn_future(async move {
-                let bi = &*bi_arc;
-                let pre_rotation_custody =
-                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let dht = DidDht::new();
-                let (scp_identity, document, pre_rotation_handle) = dht
-                    .create(&*key_custody, pre_rotation_custody.as_ref())
-                    .await
-                    .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+            crate::runtime::register_identity(
+                bi,
+                &scp_identity.did,
+                crate::runtime::NapiIdentityEntry {
+                    identity: scp_identity.clone(),
+                    custody: Arc::clone(&key_custody),
+                    document: document.clone(),
+                    identity_link_attestations: Vec::new(),
+                    pre_rotation_handle,
+                    pre_rotation_custody,
+                },
+            );
 
-                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
-                    &key_custody,
-                    &scp_identity.identity_key,
-                )
+            crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
                 .await;
 
-                crate::runtime::register_identity(
-                    bi,
-                    &scp_identity.did,
-                    crate::runtime::NapiIdentityEntry {
-                        identity: scp_identity.clone(),
-                        custody: Arc::clone(&key_custody),
-                        document: document.clone(),
-                        identity_link_attestations: Vec::new(),
-                        pre_rotation_handle,
-                        pre_rotation_custody,
-                    },
-                );
-
-                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
-                    .await;
-
-                let handle = crate::identity::NapiIdentity {
-                    inner: Arc::new(NapiIdentityInner {
-                        did: scp_identity.did.clone(),
-                        custody_type: "callback".to_owned(),
-                        scp_identity: Some(scp_identity),
-                        in_memory_custody: Some(key_custody),
-                        document: Some(document),
-                        bi: Arc::clone(&bi_arc),
-                        verifying_key_hex,
-                        instance_id: bi.instance_id(),
-                        rotation_event_json: None,
-                    }),
-                };
-                crate::increment_handle_count();
-                Ok(handle)
-            })
-        }
+            let handle = crate::identity::NapiIdentity {
+                inner: Arc::new(NapiIdentityInner {
+                    did: scp_identity.did.clone(),
+                    custody_type: "callback".to_owned(),
+                    scp_identity: Some(scp_identity),
+                    in_memory_custody: Some(key_custody),
+                    document: Some(document),
+                    bi: Arc::clone(&bi_arc),
+                    verifying_key_hex,
+                    instance_id: bi.instance_id(),
+                    rotation_event_json: None,
+                }),
+            };
+            crate::increment_handle_count();
+            Ok(handle)
+        })
     }
 
     /// Per-instance equivalent of `identity_load`.
@@ -717,36 +720,36 @@ impl Scp {
 
         let bi = &*self.inner;
 
-        #[cfg(feature = "allow_in_memory_custody")]
-        {
-            let local_result = crate::runtime::with_identity(bi, &did, |entry| {
-                Ok((
-                    entry.identity.clone(),
-                    Arc::clone(&entry.custody),
-                    entry.document.clone(),
-                ))
-            });
+        // Look the DID up in this instance's identity registry first. Hits for
+        // any locally created identity — in-memory or production callback
+        // custody — before falling back to DHT resolution.
+        let local_result = crate::runtime::with_identity(bi, &did, |entry| {
+            Ok((
+                entry.identity.clone(),
+                Arc::clone(&entry.custody),
+                entry.document.clone(),
+            ))
+        });
 
-            if let Ok((identity, custody, document)) = local_result {
-                let verifying_key_hex =
-                    crate::identity::identity_verifying_key_hex(&custody, &identity.identity_key)
-                        .await;
-                let handle = crate::identity::NapiIdentity {
-                    inner: Arc::new(NapiIdentityInner {
-                        did,
-                        custody_type: "in_memory".to_owned(),
-                        scp_identity: Some(identity),
-                        in_memory_custody: Some(custody),
-                        document: Some(document),
-                        bi: Arc::clone(&self.inner),
-                        verifying_key_hex,
-                        instance_id: bi.instance_id(),
-                        rotation_event_json: None,
-                    }),
-                };
-                crate::increment_handle_count();
-                return Ok(handle);
-            }
+        if let Ok((identity, custody, document)) = local_result {
+            let custody_type = custody.custody_type_label().to_owned();
+            let verifying_key_hex =
+                crate::identity::identity_verifying_key_hex(&custody, &identity.identity_key).await;
+            let handle = crate::identity::NapiIdentity {
+                inner: Arc::new(NapiIdentityInner {
+                    did,
+                    custody_type,
+                    scp_identity: Some(identity),
+                    in_memory_custody: Some(custody),
+                    document: Some(document),
+                    bi: Arc::clone(&self.inner),
+                    verifying_key_hex,
+                    instance_id: bi.instance_id(),
+                    rotation_event_json: None,
+                }),
+            };
+            crate::increment_handle_count();
+            return Ok(handle);
         }
 
         let dht = DidDht::new();
@@ -760,7 +763,6 @@ impl Scp {
                 did,
                 custody_type: "external".to_owned(),
                 scp_identity: None,
-                #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 document: Some(document),
                 bi: Arc::clone(&self.inner),
@@ -792,11 +794,8 @@ impl Scp {
 
         let bi = &*self.inner;
 
-        #[cfg(feature = "allow_in_memory_custody")]
         let local_doc =
             crate::runtime::with_identity(bi, &did, |entry| Ok(entry.document.clone())).ok();
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        let local_doc: Option<scp_identity::DidDocument> = None;
 
         let document = if let Some(doc) = local_doc {
             doc
@@ -839,106 +838,7 @@ impl Scp {
         })
     }
 
-    /// Per-instance equivalent of `identity_remove`.
-    ///
-    /// Drops retained key material for the DID. Idempotent — succeeds
-    /// silently when the DID is a syntactically valid DID not present in
-    /// the registry.
-    ///
-    /// # Errors
-    ///
-    /// Throws a validation error when `did` is not a syntactically valid
-    /// DID, mirroring the `PyO3` reference bridge's `identity_remove`.
-    #[cfg(feature = "allow_in_memory_custody")]
-    #[napi(js_name = "identityRemove")]
-    pub fn identity_remove(&self, did: String) -> napi::Result<()> {
-        scp_ffi_common::validate::validate_did(&did)
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-        crate::runtime::remove_identity(&self.inner, &did);
-        Ok(())
-    }
-
-    /// Per-instance equivalent of `identity_remove_if_present`.
-    ///
-    /// Returns `true` if the identity was present and removed.
-    ///
-    /// # Errors
-    ///
-    /// Throws a validation error when `did` is not a syntactically valid
-    /// DID, mirroring the `PyO3` reference bridge's
-    /// `identity_remove_if_present`.
-    #[cfg(feature = "allow_in_memory_custody")]
-    #[napi(js_name = "identityRemoveIfPresent")]
-    pub fn identity_remove_if_present(&self, did: String) -> napi::Result<bool> {
-        scp_ffi_common::validate::validate_did(&did)
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-        Ok(crate::runtime::remove_identity_if_present(
-            &self.inner,
-            &did,
-        ))
-    }
-
-    /// Per-instance equivalent of `identity_attest_device`.
-    ///
-    /// The attestation is device-local; the DID argument is retained for
-    /// API symmetry with the free function.
-    #[cfg(feature = "allow_in_memory_custody")]
-    #[napi(js_name = "identityAttestDevice")]
-    pub async fn identity_attest_device(&self, did: String) -> napi::Result<String> {
-        use base64::Engine;
-        use scp_platform::testing::InMemoryDeviceAttestation;
-        use scp_platform::traits::DeviceAttestation;
-
-        // Retained for API symmetry (spec §9.3) — the attestation itself is
-        // device-local and doesn't consult the identity's key material.
-        let _ = (&self.inner, did);
-
-        let attestation = InMemoryDeviceAttestation::new();
-        let token = attestation.attest().await.map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("device attestation failed: {e}"),
-                code: codes::IDENT_1010.to_owned(),
-            })
-        })?;
-        Ok(base64::engine::general_purpose::STANDARD.encode(token.as_bytes()))
-    }
-
-    /// Per-instance equivalent of `identity_verify_device_attestation`.
-    #[cfg(feature = "allow_in_memory_custody")]
-    #[napi(js_name = "identityVerifyDeviceAttestation")]
-    pub async fn identity_verify_device_attestation(
-        &self,
-        did: String,
-        token_base64: String,
-    ) -> napi::Result<bool> {
-        use base64::Engine;
-        use scp_platform::testing::InMemoryDeviceAttestation;
-        use scp_platform::traits::DeviceAttestation;
-
-        let _ = (&self.inner, did);
-
-        let token_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&token_base64)
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!("invalid base64 attestation token: {e}"),
-                    code: codes::IDENT_1011.to_owned(),
-                })
-            })?;
-
-        let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
-        let attestation = InMemoryDeviceAttestation::new();
-
-        attestation.verify(&token).await.map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("device attestation verification failed: {e}"),
-                code: codes::IDENT_1012.to_owned(),
-            })
-        })
-    }
-
     /// Per-instance equivalent of `identity_create_link_attestation`.
-    #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "identityCreateLinkAttestation")]
     #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
     pub async fn identity_create_link_attestation(
@@ -1040,7 +940,6 @@ impl Scp {
     }
 
     /// Per-instance equivalent of `identity_link_attestations`.
-    #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "identityLinkAttestations")]
     pub fn identity_link_attestations(&self, did: String) -> napi::Result<String> {
         crate::runtime::with_identity(&self.inner, &did, |entry| {
@@ -1055,7 +954,6 @@ impl Scp {
     }
 
     /// Per-instance equivalent of `identity_remove_link_attestation`.
-    #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "identityRemoveLinkAttestation")]
     pub fn identity_remove_link_attestation(
         &self,
@@ -3527,113 +3425,6 @@ impl Scp {
     }
 
     // -------------------------------------------------------------------
-    // Testing (full-stack E2E harness)
-    // -------------------------------------------------------------------
-
-    /// Per-instance equivalent of the free-function `fullstack_create_node`.
-    #[napi(js_name = "fullstackCreateNode")]
-    #[must_use]
-    pub fn fullstack_create_node(&self, did: String) -> NapiFullStackNode {
-        crate::testing::fullstack_create_node_on(&self.inner, did)
-    }
-
-    /// Per-instance equivalent of the free-function `fullstack_reset_network`.
-    #[napi(js_name = "fullstackResetNetwork")]
-    pub fn fullstack_reset_network(&self) {
-        crate::testing::fullstack_reset_network_on(&self.inner);
-    }
-
-    /// Per-instance equivalent of the free-function `fullstack_create_context`.
-    #[napi(js_name = "fullstackCreateContext")]
-    pub fn fullstack_create_context(
-        &self,
-        node: &NapiFullStackNode,
-        context_id: String,
-        ceiling_json: String,
-    ) -> napi::Result<String> {
-        crate::napi_check_handle!(&self.inner.core, node);
-        crate::testing::fullstack_create_context_on(&self.inner, node, context_id, ceiling_json)
-    }
-
-    /// Per-instance equivalent of the free-function `fullstack_add_member`.
-    #[napi(js_name = "fullstackAddMember")]
-    pub fn fullstack_add_member(
-        &self,
-        node: &NapiFullStackNode,
-        context_id: String,
-        member_did: String,
-    ) -> napi::Result<()> {
-        crate::napi_check_handle!(&self.inner.core, node);
-        crate::testing::fullstack_add_member_on(&self.inner, node, context_id, member_did)
-    }
-
-    /// Per-instance equivalent of the free-function `fullstack_join_from_welcome`.
-    #[napi(js_name = "fullstackJoinFromWelcome")]
-    pub fn fullstack_join_from_welcome(
-        &self,
-        node: &NapiFullStackNode,
-        context_id: String,
-    ) -> napi::Result<()> {
-        crate::napi_check_handle!(&self.inner.core, node);
-        crate::testing::fullstack_join_from_welcome_on(&self.inner, node, context_id)
-    }
-
-    /// Per-instance equivalent of the free-function `fullstack_sync_sender_keys`.
-    #[napi(js_name = "fullstackSyncSenderKeys")]
-    pub fn fullstack_sync_sender_keys(
-        &self,
-        node_a: &NapiFullStackNode,
-        node_b: &NapiFullStackNode,
-        context_id: String,
-    ) -> napi::Result<()> {
-        crate::napi_check_handle!(&self.inner.core, node_a, node_b);
-        crate::testing::fullstack_sync_sender_keys_on(&self.inner, node_a, node_b, context_id)
-    }
-
-    /// Per-instance equivalent of the free-function `fullstack_send_message`.
-    #[napi(js_name = "fullstackSendMessage")]
-    pub fn fullstack_send_message(
-        &self,
-        node: &NapiFullStackNode,
-        context_id: String,
-        payload: Buffer,
-    ) -> napi::Result<Buffer> {
-        crate::napi_check_handle!(&self.inner.core, node);
-        crate::testing::fullstack_send_message_on(&self.inner, node, context_id, payload)
-    }
-
-    /// Per-instance equivalent of the free-function `fullstack_decrypt_message`.
-    #[napi(js_name = "fullstackDecryptMessage")]
-    pub fn fullstack_decrypt_message(
-        &self,
-        node: &NapiFullStackNode,
-        context_id: String,
-        ciphertext: Buffer,
-        sender_did: String,
-    ) -> napi::Result<Buffer> {
-        crate::napi_check_handle!(&self.inner.core, node);
-        crate::testing::fullstack_decrypt_message_on(
-            &self.inner,
-            node,
-            context_id,
-            ciphertext,
-            sender_did,
-        )
-    }
-
-    /// Per-instance equivalent of the free-function `fullstack_remove_member`.
-    #[napi(js_name = "fullstackRemoveMember")]
-    pub fn fullstack_remove_member(
-        &self,
-        node: &NapiFullStackNode,
-        context_id: String,
-        member_did: String,
-    ) -> napi::Result<()> {
-        crate::napi_check_handle!(&self.inner.core, node);
-        crate::testing::fullstack_remove_member_on(&self.inner, node, context_id, member_did)
-    }
-
-    // -------------------------------------------------------------------
     // Media
     // -------------------------------------------------------------------
 
@@ -4024,7 +3815,6 @@ impl Scp {
     /// cross-bridge parity harness. Only accepted when scp-core is built
     /// with the `testing` feature; production builds reject any non-`null`
     /// value via `SCP-VALID-7008`.
-    #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "scpidSign")]
     pub fn scpid_sign(
         &self,
@@ -4052,6 +3842,223 @@ impl Scp {
         challenge_json: String,
     ) -> napi::Result<String> {
         crate::scpid::scpid_verify_on(&self.inner, response_json, challenge_json)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-memory-custody-only `Scp` methods.
+//
+// These methods are gated behind `allow_in_memory_custody` because they
+// depend on an in-memory *backend* (the in-memory identity registry teardown
+// helpers and the `InMemoryDeviceAttestation` software attestation backend),
+// or on the full-stack in-memory test network. They live in a SEPARATE
+// `#[napi] impl Scp` block so napi-rs emits their `_c_callback` registration
+// only when the feature is enabled — a single gated method inside the main
+// `#[napi] impl` block would leave a dangling registration reference in
+// production builds.
+//
+// Production callback-custody parity (registry retention, SCPID signing, link
+// attestations) lives in the main `impl Scp` block above and is NOT gated,
+// mirroring the PyO3 reference bridge.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi]
+impl Scp {
+    /// Per-instance equivalent of `identity_remove`.
+    ///
+    /// Drops retained key material for the DID. Idempotent — succeeds
+    /// silently when the DID is a syntactically valid DID not present in
+    /// the registry.
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error when `did` is not a syntactically valid
+    /// DID, mirroring the `PyO3` reference bridge's `identity_remove`.
+    #[napi(js_name = "identityRemove")]
+    pub fn identity_remove(&self, did: String) -> napi::Result<()> {
+        scp_ffi_common::validate::validate_did(&did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        crate::runtime::remove_identity(&self.inner, &did);
+        Ok(())
+    }
+
+    /// Per-instance equivalent of `identity_remove_if_present`.
+    ///
+    /// Returns `true` if the identity was present and removed.
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error when `did` is not a syntactically valid
+    /// DID, mirroring the `PyO3` reference bridge's
+    /// `identity_remove_if_present`.
+    #[napi(js_name = "identityRemoveIfPresent")]
+    pub fn identity_remove_if_present(&self, did: String) -> napi::Result<bool> {
+        scp_ffi_common::validate::validate_did(&did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        Ok(crate::runtime::remove_identity_if_present(
+            &self.inner,
+            &did,
+        ))
+    }
+
+    /// Per-instance equivalent of `identity_attest_device`.
+    ///
+    /// The attestation is device-local; the DID argument is retained for
+    /// API symmetry with the free function.
+    #[napi(js_name = "identityAttestDevice")]
+    pub async fn identity_attest_device(&self, did: String) -> napi::Result<String> {
+        use base64::Engine;
+        use scp_platform::testing::InMemoryDeviceAttestation;
+        use scp_platform::traits::DeviceAttestation;
+
+        // Retained for API symmetry (spec §9.3) — the attestation itself is
+        // device-local and doesn't consult the identity's key material.
+        let _ = (&self.inner, did);
+
+        let attestation = InMemoryDeviceAttestation::new();
+        let token = attestation.attest().await.map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("device attestation failed: {e}"),
+                code: codes::IDENT_1010.to_owned(),
+            })
+        })?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(token.as_bytes()))
+    }
+
+    /// Per-instance equivalent of `identity_verify_device_attestation`.
+    #[napi(js_name = "identityVerifyDeviceAttestation")]
+    pub async fn identity_verify_device_attestation(
+        &self,
+        did: String,
+        token_base64: String,
+    ) -> napi::Result<bool> {
+        use base64::Engine;
+        use scp_platform::testing::InMemoryDeviceAttestation;
+        use scp_platform::traits::DeviceAttestation;
+
+        let _ = (&self.inner, did);
+
+        let token_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&token_base64)
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: format!("invalid base64 attestation token: {e}"),
+                    code: codes::IDENT_1011.to_owned(),
+                })
+            })?;
+
+        let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        attestation.verify(&token).await.map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("device attestation verification failed: {e}"),
+                code: codes::IDENT_1012.to_owned(),
+            })
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_create_node`.
+    #[napi(js_name = "fullstackCreateNode")]
+    #[must_use]
+    pub fn fullstack_create_node(&self, did: String) -> NapiFullStackNode {
+        crate::testing::fullstack_create_node_on(&self.inner, did)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_reset_network`.
+    #[napi(js_name = "fullstackResetNetwork")]
+    pub fn fullstack_reset_network(&self) {
+        crate::testing::fullstack_reset_network_on(&self.inner);
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_create_context`.
+    #[napi(js_name = "fullstackCreateContext")]
+    pub fn fullstack_create_context(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        ceiling_json: String,
+    ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, node);
+        crate::testing::fullstack_create_context_on(&self.inner, node, context_id, ceiling_json)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_add_member`.
+    #[napi(js_name = "fullstackAddMember")]
+    pub fn fullstack_add_member(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        member_did: String,
+    ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, node);
+        crate::testing::fullstack_add_member_on(&self.inner, node, context_id, member_did)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_join_from_welcome`.
+    #[napi(js_name = "fullstackJoinFromWelcome")]
+    pub fn fullstack_join_from_welcome(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+    ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, node);
+        crate::testing::fullstack_join_from_welcome_on(&self.inner, node, context_id)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_sync_sender_keys`.
+    #[napi(js_name = "fullstackSyncSenderKeys")]
+    pub fn fullstack_sync_sender_keys(
+        &self,
+        node_a: &NapiFullStackNode,
+        node_b: &NapiFullStackNode,
+        context_id: String,
+    ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, node_a, node_b);
+        crate::testing::fullstack_sync_sender_keys_on(&self.inner, node_a, node_b, context_id)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_send_message`.
+    #[napi(js_name = "fullstackSendMessage")]
+    pub fn fullstack_send_message(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        payload: Buffer,
+    ) -> napi::Result<Buffer> {
+        crate::napi_check_handle!(&self.inner.core, node);
+        crate::testing::fullstack_send_message_on(&self.inner, node, context_id, payload)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_decrypt_message`.
+    #[napi(js_name = "fullstackDecryptMessage")]
+    pub fn fullstack_decrypt_message(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        ciphertext: Buffer,
+        sender_did: String,
+    ) -> napi::Result<Buffer> {
+        crate::napi_check_handle!(&self.inner.core, node);
+        crate::testing::fullstack_decrypt_message_on(
+            &self.inner,
+            node,
+            context_id,
+            ciphertext,
+            sender_did,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_remove_member`.
+    #[napi(js_name = "fullstackRemoveMember")]
+    pub fn fullstack_remove_member(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        member_did: String,
+    ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, node);
+        crate::testing::fullstack_remove_member_on(&self.inner, node, context_id, member_did)
     }
 }
 

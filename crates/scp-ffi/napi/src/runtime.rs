@@ -145,14 +145,16 @@ pub struct NapiBridgeInstance {
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
 
-    /// Retained identity state for in-memory custody DIDs.
+    /// Retained identity state for registered DIDs.
     ///
     /// Previously stored type-erased in `CoreFields::identity_registry`.
-    /// Feature-gated because only the `allow_in_memory_custody` build flag
-    /// pulls in [`OpaqueInMemoryKeyCustody`]. Cleared on shutdown — drops
-    /// the `Arc<OpaqueInMemoryKeyCustody>` values which zeroize their
-    /// underlying key material via `Drop`.
-    #[cfg(feature = "allow_in_memory_custody")]
+    /// Available in production (not feature-gated) so the callback-custody
+    /// path (`identity_create_with_custody`) can retain identity state,
+    /// mirroring the `PyO3` bridge. Entries hold an enum-dispatched
+    /// [`NapiKeyCustody`](crate::custody::NapiKeyCustody) — the `Callback`
+    /// variant in production, the `InMemory` variant only under
+    /// `allow_in_memory_custody`. Cleared on shutdown — dropping the entries
+    /// zeroizes any retained key material via the custody provider's `Drop`.
     pub(crate) identity_registry: Arc<DashMap<String, NapiIdentityEntry>>,
 
     /// Protocol repository used for trust aggregation + event log persistence.
@@ -260,7 +262,6 @@ impl NapiBridgeInstance {
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             mcp_server_registry: Arc::new(DashMap::new()),
@@ -287,7 +288,6 @@ impl NapiBridgeInstance {
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             mcp_server_registry: Arc::new(DashMap::new()),
@@ -383,7 +383,6 @@ impl NapiBridgeInstance {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
             mcp_server_registry: Arc::new(DashMap::new()),
@@ -495,12 +494,12 @@ impl BridgeInstanceCore for NapiBridgeInstance {
     }
 
     fn bridge_specific_shutdown(&self) {
-        // Clear typed registries. Dropping `Arc<OpaqueInMemoryKeyCustody>`
-        // values zeroizes any key material they hold via the custody
-        // provider's `Drop` impl (matching the behavior of the previous
-        // `clear_fn` closures).
+        // Clear typed registries. Dropping the `Arc<NapiKeyCustody>` values
+        // (callback custody in production, in-memory custody under
+        // `allow_in_memory_custody`) zeroizes any key material they hold via
+        // the custody provider's `Drop` impl (matching the behavior of the
+        // previous `clear_fn` closures).
         self.ucan_registry.clear();
-        #[cfg(feature = "allow_in_memory_custody")]
         self.identity_registry.clear();
         // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
         // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
@@ -1095,7 +1094,6 @@ impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvide
 /// material), and `DidDocument` so that bridge functions can look up any
 /// registered identity by DID — including `identity_load` and
 /// `identity_resolve` which need the document without DHT access (#1144 C6).
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) struct NapiIdentityEntry {
     /// The scp-core identity handle (DID string, key handles).
     pub(crate) identity: scp_identity::ScpIdentity,
@@ -1128,7 +1126,6 @@ pub(crate) struct NapiIdentityEntry {
 ///
 /// The registry is a typed `Arc<DashMap<String, NapiIdentityEntry>>` field
 /// on [`NapiBridgeInstance`].
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn identity_registry(bi: &NapiBridgeInstance) -> &DashMap<String, NapiIdentityEntry> {
     bi.identity_registry.as_ref()
 }
@@ -1142,7 +1139,6 @@ pub(crate) fn identity_registry(bi: &NapiBridgeInstance) -> &DashMap<String, Nap
 ///
 /// Overwrites any existing entry for the same DID (idempotent — supports
 /// key rotation where the same DID gets new key material).
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn register_identity(bi: &NapiBridgeInstance, did: &str, entry: NapiIdentityEntry) {
     identity_registry(bi).insert(did.to_owned(), entry);
 }
@@ -1153,7 +1149,6 @@ pub(crate) fn register_identity(bi: &NapiBridgeInstance, did: &str, entry: NapiI
 /// The old entry is removed and its key material is dropped.
 ///
 /// Idempotent: no-op if the DID is not present.
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn remove_identity(bi: &NapiBridgeInstance, did: &str) {
     identity_registry(bi).remove(did);
 }
@@ -1165,6 +1160,11 @@ pub(crate) fn remove_identity(bi: &NapiBridgeInstance, did: &str) {
 ///
 /// Provided as a cleanup mechanism for long-running processes alongside
 /// [`remove_identity`] which is unconditional.
+///
+/// Gated to match its sole consumer, the `Scp::identity_remove_if_present`
+/// method, which is itself gated behind `allow_in_memory_custody` (the
+/// in-memory-custody registry-teardown API surface, mirroring the `PyO3`
+/// bridge).
 #[cfg(feature = "allow_in_memory_custody")]
 #[must_use]
 pub(crate) fn remove_identity_if_present(bi: &NapiBridgeInstance, did: &str) -> bool {
@@ -1182,7 +1182,6 @@ pub(crate) fn remove_identity_if_present(bi: &NapiBridgeInstance, did: &str) -> 
 /// Returns `ScpNapiError::Identity` (SCP-IDENT-1001) if the DID is not found
 /// (the identity was not created via `identity_create` on this bridge).
 /// Aligned with the `PyO3` canonical bridge for cross-bridge parity.
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn with_identity<T, F>(
     bi: &NapiBridgeInstance,
     did: &str,
@@ -1213,7 +1212,6 @@ where
 ///
 /// Returns `ScpNapiError::Identity` (SCP-IDENT-1001) if the DID is not found.
 /// Aligned with the `PyO3` canonical bridge for cross-bridge parity.
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn with_identity_mut<T, F>(
     bi: &NapiBridgeInstance,
     did: &str,
@@ -1780,7 +1778,6 @@ mod tests {
             bi.ucan_registry.is_empty(),
             "ucan_registry must start empty"
         );
-        #[cfg(feature = "allow_in_memory_custody")]
         assert!(
             bi.identity_registry.is_empty(),
             "identity_registry must start empty"
