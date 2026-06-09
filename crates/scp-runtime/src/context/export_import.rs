@@ -58,7 +58,16 @@ use scp_protocol::context::ContextError;
 ///   key (`#active`/`#agent`, ADR-039). Signing the whole snapshot is total
 ///   by construction: every field the importer trusts is in the preimage, so
 ///   no field is forgeable.
-pub const CURRENT_EXPORT_VERSION: u32 = 3;
+/// - `4`: signed export over the **full canonical snapshot** with the export
+///   **scope discriminant** bound into the preimage. The digest is
+///   `SHA-256("SCP-CONTEXT-EXPORT-V1:" || [scope.tag_byte()] || JCS(snapshot))`
+///   (the single scope byte sits immediately after the domain separator and
+///   before the JCS bytes, §23.16.8, ADR-050). v3 left the envelope `scope`
+///   field unsigned, so a holder of a validly-signed `Public` export could flip
+///   it to `Full`; binding the scope byte makes that tamper fail signature
+///   verification by construction. SCP is pre-release with no deployed exports,
+///   so v3 is **not** accepted on import — the correct end state ships directly.
+pub const CURRENT_EXPORT_VERSION: u32 = 4;
 
 /// Maximum accepted serialized byte length of an incoming `ContextExport`
 /// envelope, enforced before any deserialization or canonical hashing.
@@ -200,6 +209,13 @@ pub struct ContextExport {
     /// [`CURRENT_EXPORT_VERSION`].
     pub version: u32,
     /// Unix timestamp (seconds) when the export was created.
+    ///
+    /// **Informational only — NOT load-bearing for replay protection.** This is
+    /// an unsigned envelope field; the importer derives no authoritative state
+    /// or freshness decision from it. Replay/rollback is guarded by the §23.17
+    /// sequence-floor invariants over the **signed** snapshot (e.g. `mls_epoch`
+    /// and per-sender monotonic counters), not by this timestamp. A future
+    /// reviewer must not mistake `exported_at` for a freshness control.
     pub exported_at: u64,
     /// DID of the identity that performed the export.
     pub exporter_did: DID,
@@ -238,6 +254,35 @@ pub enum ExportScope {
     Public,
 }
 
+impl ExportScope {
+    /// Stable scope discriminant byte folded into the signed snapshot preimage
+    /// (§23.16.8, ADR-050).
+    ///
+    /// The signed digest is
+    /// `SHA-256(CONTEXT_EXPORT_DOMAIN_SEPARATOR || [self.tag_byte()] || JCS(snapshot))`
+    /// (see [`ContextExport::canonical_snapshot_hash`]). Binding this byte into
+    /// the preimage means a tampered envelope scope (e.g. a validly-signed
+    /// `Public` export flipped to `Full`) makes the verifier recompute a
+    /// different digest than the creator signed, so the signature fails by
+    /// construction rather than by the hollow-context argument.
+    ///
+    /// The byte values are the shared
+    /// [`scp_protocol::context::EXPORT_SCOPE_TAG_FULL`] /
+    /// [`scp_protocol::context::EXPORT_SCOPE_TAG_PUBLIC`] constants, so the
+    /// native runtime and the WASM reference bridge use the identical mapping.
+    ///
+    /// **MUST NEVER change once shipped:** the byte is part of the signed
+    /// preimage; altering it would silently invalidate every previously
+    /// produced export signature. New scopes take new, never-reused values.
+    #[must_use]
+    pub const fn tag_byte(self) -> u8 {
+        match self {
+            Self::Full => scp_protocol::context::EXPORT_SCOPE_TAG_FULL,
+            Self::Public => scp_protocol::context::EXPORT_SCOPE_TAG_PUBLIC,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Canonical snapshot hash (spec §23.16.8)
 // ---------------------------------------------------------------------------
@@ -248,7 +293,12 @@ impl ContextExport {
     ///
     /// The digest is
     ///
-    /// `SHA-256("SCP-CONTEXT-EXPORT-V1:" || JCS(self.snapshot))`
+    /// `SHA-256("SCP-CONTEXT-EXPORT-V1:" || [self.scope.tag_byte()] || JCS(self.snapshot))`
+    ///
+    /// The single [`ExportScope::tag_byte`] sits immediately after the domain
+    /// separator and before the JCS snapshot bytes, binding the export scope
+    /// (`Full` = `0x00`, `Public` = `0x01`) into the signed preimage so a
+    /// tampered envelope scope fails verification by construction (ADR-050).
     ///
     /// where `JCS(self.snapshot)` is the RFC 8785 (JSON Canonicalization
     /// Scheme) canonical-JSON serialization of the **entire** embedded
@@ -298,6 +348,14 @@ impl ContextExport {
         })?;
         let mut hasher = Sha256::new();
         hasher.update(CONTEXT_EXPORT_DOMAIN_SEPARATOR.as_bytes());
+        // Bind the export scope discriminant into the signed preimage
+        // (§23.16.8, ADR-050). The single tag byte sits IMMEDIATELY after the
+        // domain separator and BEFORE the JCS snapshot bytes. The verifier
+        // sources `self.scope` from the received envelope, so flipping the
+        // envelope scope (e.g. a validly-signed `Public` export rewritten to
+        // `Full`) makes the recomputed digest diverge from the signed one and
+        // the signature fails — the scope is no longer an unsigned field.
+        hasher.update([self.scope.tag_byte()]);
         hasher.update(&snapshot_json);
         Ok(hasher.finalize().into())
     }
@@ -473,12 +531,14 @@ fn compute_entry_hash(
 ///
 /// Checks, in order:
 /// 1. Export version is **exactly** [`CURRENT_EXPORT_VERSION`]. Versions below
-///    it (the unsigned `1` and the enumerated-subset-signed `2`) and any
-///    future version are rejected with a distinct *version* error, because a
-///    sub-current export does not carry a full-snapshot signature and MUST NOT
-///    be trusted. The version error is distinct from the signature error so
-///    callers can tell "wrong format" apart from "signature forged"
-///    (§17.5 / `SCP-CTX-2093`).
+///    it (the unsigned `1`, the enumerated-subset-signed `2`, and the
+///    pre-scope-binding full-snapshot `3`) and any future version are rejected
+///    with a distinct *version* error
+///    ([`ContextError::ExportVersionUnsupported`], `SCP-CTX-2094`), because a
+///    non-current export is not verifiable under the current signed
+///    construction and MUST NOT be trusted. The version error is distinct from
+///    the signature error (`SCP-CTX-2093`) so callers can tell "wrong format"
+///    apart from "signature forged" (§17.5, §23.16.8).
 /// 2. Signer binding (§23.16.8 step 2): the envelope's `exporter_did` MUST
 ///    equal the snapshot's `role_state.creator_did`. An export whose declared
 ///    exporter is not the snapshot creator is rejected with
@@ -530,12 +590,16 @@ pub fn validate_export_for_import(
     // versions are all rejected here — distinct from a signature failure so
     // callers can tell "wrong format" apart from "signature forged".
     if export.version != CURRENT_EXPORT_VERSION {
-        return Err(ContextError::EventLogFailed(format!(
-            "unsupported export version: {}, required: {CURRENT_EXPORT_VERSION} \
-             (versions below {CURRENT_EXPORT_VERSION} predate the full-snapshot \
-             signature and are rejected as unverifiable)",
-            export.version
-        )));
+        return Err(ContextError::ExportVersionUnsupported {
+            reason: format!(
+                "unsupported export version: {}, required: {CURRENT_EXPORT_VERSION} \
+                 (versions below {CURRENT_EXPORT_VERSION} predate the current \
+                 scope-bound full-snapshot signature and are rejected as \
+                 unverifiable; this is a version error, distinct from a \
+                 signature-verification failure)",
+                export.version
+            ),
+        });
     }
 
     // 2. Signer binding (§23.16.8 step 2): exporter_did == creator_did. The
@@ -1328,13 +1392,16 @@ mod tests {
     }
 
     /// Regression guard for the signed/unsigned binding contract (ADR-050):
-    /// mutating an UNSIGNED envelope field on a validly-signed export must NOT
-    /// change the validation outcome. The signature covers only the snapshot,
-    /// so `exported_at` and `scope` (envelope-level, not in the signed preimage)
-    /// are inert: tampering them cannot forge acceptance OR cause spurious
-    /// rejection. This pins "no unsigned envelope field affects authoritative
-    /// state" — if a future change started deriving trusted state from one of
-    /// these fields, this test (or a sibling step) would need to fail it.
+    /// mutating a genuinely-UNSIGNED envelope field on a validly-signed export
+    /// must NOT change the validation outcome. `exported_at` is envelope-level
+    /// and NOT in the signed preimage, so tampering it cannot forge acceptance
+    /// OR cause spurious rejection. (The `scope` field is NO LONGER unsigned —
+    /// it is bound into the signed preimage via [`ExportScope::tag_byte`], so a
+    /// scope flip now fails verification; that is covered by the dedicated
+    /// `tampered_scope_rejected_with_signature_error` test, not here.) This pins
+    /// "no genuinely-unsigned envelope field affects authoritative state" — if a
+    /// future change started deriving trusted state from `exported_at`, this
+    /// test (or a sibling step) would need to fail it.
     #[test]
     fn mutating_unsigned_envelope_fields_does_not_change_validation() {
         let ctx_id = "ctx-unsigned-envelope-inert";
@@ -1355,17 +1422,17 @@ mod tests {
         validate_export_for_import(&export, &test_verifying_key())
             .expect("baseline signed export must validate");
 
-        // Mutate ONLY unsigned envelope fields (not the signature, not the
-        // snapshot, not the event log, not the cross-checked envelope root).
+        // Mutate ONLY a genuinely-unsigned envelope field (not the signature,
+        // not the snapshot, not the event log, not the cross-checked envelope
+        // root, and NOT `scope` — `scope` is now in the signed preimage).
         let mut tampered = export.clone();
         tampered.exported_at = export.exported_at.wrapping_add(86_400);
-        tampered.scope = ExportScope::Public;
 
         // Validation outcome is unchanged — the mutation is provably ignored.
         validate_export_for_import(&tampered, &test_verifying_key()).expect(
-            "mutating unsigned envelope fields (exported_at, scope) must NOT \
-             change the validation outcome — they are not in the signed preimage \
-             and the importer derives no authoritative state from them",
+            "mutating the unsigned envelope field `exported_at` must NOT change \
+             the validation outcome — it is not in the signed preimage and the \
+             importer derives no authoritative state from it",
         );
     }
 
@@ -1663,8 +1730,24 @@ mod tests {
             "v1 must fail at version gate, got: {v1_msg}"
         );
         assert!(
-            !matches!(v1_err, ContextError::SnapshotSignatureInvalid { .. }),
-            "v1 rejection must be a version error, not a signature error"
+            v1_msg.contains("SCP-CTX-2094"),
+            "v1 version-gate rejection must carry the dedicated version code, got: {v1_msg}"
+        );
+        assert!(
+            matches!(v1_err, ContextError::ExportVersionUnsupported { .. }),
+            "v1 rejection must be the dedicated version-gate variant, not a \
+             signature/event-log error, got: {v1_err:?}"
+        );
+
+        // The pre-scope-binding full-snapshot format (v3) is also rejected at
+        // the version gate — its signature does not cover the scope discriminant.
+        let mut export_v3 = export_v1;
+        export_v3.version = 3;
+        let v3_err = validate_export_for_import(&export_v3, &test_verifying_key())
+            .expect_err("v3 export must be rejected");
+        assert!(
+            matches!(v3_err, ContextError::ExportVersionUnsupported { .. }),
+            "v3 rejection must be the dedicated version-gate variant, got: {v3_err:?}"
         );
 
         // Future versions are likewise rejected at the version gate.
@@ -1673,6 +1756,10 @@ mod tests {
         let v99_err = validate_export_for_import(&export_v99, &test_verifying_key())
             .expect_err("v99 export must be rejected");
         assert!(format!("{v99_err}").contains("unsupported export version"));
+        assert!(matches!(
+            v99_err,
+            ContextError::ExportVersionUnsupported { .. }
+        ));
     }
 
     // -------------------------------------------------------------------
@@ -1728,6 +1815,68 @@ mod tests {
         let msg = format!("{err}");
         assert!(!msg.contains("signed snapshot root mismatch"));
         assert!(!msg.contains("envelope merkle_root mismatch"));
+    }
+
+    /// §23.16.8 / ADR-050 scope-binding: flipping the envelope `scope` on a
+    /// validly-signed export MUST fail signature verification, because the scope
+    /// discriminant ([`ExportScope::tag_byte`]) is bound into the signed
+    /// preimage. An attacker holding a legitimately-signed export cannot rewrite
+    /// `Full` -> `Public` (or `Public` -> `Full`) and have it still verify: the
+    /// verifier recomputes `SHA-256(domain || [scope.tag_byte()] || JCS(...))`
+    /// from the *received* envelope scope, which no longer matches the digest
+    /// the creator signed. Tests both flip directions.
+    #[test]
+    fn tampered_scope_rejected_with_signature_error() {
+        for original in [ExportScope::Full, ExportScope::Public] {
+            let ctx_id = "ctx-tamper-scope";
+            let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+            // Public exports carry no event log; Full does. Build the log
+            // unconditionally — create_export discards it for Public scope.
+            let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+
+            let mut export = create_export(
+                test_snapshot(ctx_id),
+                event_log_data,
+                DID::from(TEST_CREATOR_DID),
+                original,
+                &scp_primitives::SystemClock,
+                sign_with_test_key,
+            )
+            .unwrap();
+
+            // Baseline: the untouched export validates under its real scope.
+            validate_export_for_import(&export, &test_verifying_key())
+                .expect("baseline signed export must validate before scope tamper");
+
+            // Flip ONLY the envelope scope discriminant — no re-signing (the
+            // attacker has no exporter key). The snapshot bytes are untouched.
+            let flipped = match original {
+                ExportScope::Full => ExportScope::Public,
+                ExportScope::Public => ExportScope::Full,
+            };
+            export.scope = flipped;
+            assert_ne!(
+                original.tag_byte(),
+                flipped.tag_byte(),
+                "flip must change the bound discriminant byte"
+            );
+
+            let err = validate_export_for_import(&export, &test_verifying_key())
+                .expect_err("flipping the signed-bound scope discriminant must be rejected");
+            assert!(
+                matches!(err, ContextError::SnapshotSignatureInvalid { .. }),
+                "scope flip ({original:?} -> {flipped:?}) must fail with \
+                 SnapshotSignatureInvalid, got: {err:?}"
+            );
+            // It is a SIGNATURE failure, not a version error or a root mismatch.
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("SCP-CTX-2093"),
+                "expected the signature-failure code, got: {msg}"
+            );
+            assert!(!msg.contains("unsupported export"));
+            assert!(!msg.contains("signed snapshot root mismatch"));
+        }
     }
 
     /// Round-trip: a signed export survives serialize -> deserialize ->
@@ -2276,11 +2425,13 @@ mod tests {
         // The export digest the code actually produces.
         let actual = export.canonical_snapshot_hash().unwrap();
 
-        // Recompute over the same JCS bytes with the EXPORT separator — must match.
+        // Recompute over the same JCS bytes with the EXPORT separator and the
+        // scope tag byte (§23.16.8, ADR-050) — must match.
         let snapshot_json = scp_protocol::jcs::to_vec(&export.snapshot).unwrap();
         let with_export_domain = {
             let mut hasher = Sha256::new();
             hasher.update(CONTEXT_EXPORT_DOMAIN_SEPARATOR.as_bytes());
+            hasher.update([export.scope.tag_byte()]);
             hasher.update(&snapshot_json);
             let d: [u8; 32] = hasher.finalize().into();
             d
@@ -2295,6 +2446,7 @@ mod tests {
         let with_sync_domain = {
             let mut hasher = Sha256::new();
             hasher.update(CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR.as_bytes());
+            hasher.update([export.scope.tag_byte()]);
             hasher.update(&snapshot_json);
             let d: [u8; 32] = hasher.finalize().into();
             d

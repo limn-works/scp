@@ -8,6 +8,7 @@ pub mod broadcast;
 pub mod broadcast_content;
 pub mod builder;
 pub mod close;
+pub mod export;
 pub mod governance;
 pub mod invitation;
 pub mod membership;
@@ -30,6 +31,7 @@ pub use broadcast::{
     AuthorState, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot, KeyRequestDecision,
 };
 pub use broadcast_content::{BroadcastContent, BroadcastContentError};
+pub use export::{EXPORT_SCOPE_TAG_FULL, EXPORT_SCOPE_TAG_PUBLIC};
 pub use governance::{
     AccessScope, CheckpointAttestationStatus, ConflictResolution, CosignedCheckpoint,
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
@@ -408,14 +410,36 @@ pub enum ContextError {
         /// Human-readable explanation of why the import was rejected.
         reason: String,
     },
+    /// A `ContextExport` was rejected because its format `version` is not the
+    /// current signed-export format (spec §23.16.8, §17.5; ADR-050).
+    ///
+    /// This is the **version gate**: it fires before any signature is checked,
+    /// when `version != CURRENT_EXPORT_VERSION`. Pre-signing formats (unsigned
+    /// v1, enumerated-subset-signed v2), the pre-scope-binding full-snapshot
+    /// format (v3), and any future version are all rejected here.
+    ///
+    /// Deliberately DISTINCT from [`Self::SnapshotSignatureInvalid`]
+    /// (`SCP-CTX-2093`, a *present-but-forged* signature) and from the generic
+    /// [`Self::EventLogFailed`]: a caller can tell "the export predates / does
+    /// not match the supported signed format" apart from "the signature did not
+    /// authenticate the snapshot". Mapped to canonical code `SCP-CTX-2094`
+    /// through every FFI bridge translator so callers can switch on `.code`.
+    #[error("SCP-CTX-2094: unsupported context export format version: {reason}")]
+    ExportVersionUnsupported {
+        /// Human-readable explanation including the observed and required
+        /// version numbers.
+        reason: String,
+    },
     /// The Ed25519 signature over an exported context snapshot failed
     /// verification against the exporter DID's resolved verification-method
     /// key (spec §23.16.8).
     ///
     /// Distinct from the event-log Merkle-chain failure (surfaced as
-    /// [`Self::EventLogFailed`]) and from the version gate: a `version` error
-    /// means the export predates snapshot signing (v1) and was rejected before
-    /// any signature was checked, whereas this error means the signature was
+    /// [`Self::EventLogFailed`]) and from the version gate
+    /// ([`Self::ExportVersionUnsupported`], `SCP-CTX-2094`): a version error
+    /// means the export does not match the current signed format and was
+    /// rejected before any signature was checked, whereas this error means the
+    /// signature was
     /// present but did not authenticate the embedded snapshot — i.e. the
     /// membership, roles, ceiling, member/suspended capabilities, threshold set
     /// or value, governance model, economic policy, consequence rules,
