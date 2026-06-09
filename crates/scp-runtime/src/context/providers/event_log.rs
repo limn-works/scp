@@ -126,10 +126,15 @@ impl ContextLog {
 /// prevent length-extension ambiguity (e.g., event="AB" + actor="CD" vs
 /// event="ABC" + actor="D" producing the same hash).
 ///
-/// When `payload` is `Some`, the canonical JSON representation is appended
-/// with a length prefix. When `None`, no additional bytes are hashed,
-/// preserving backward compatibility with entries created before payloads
-/// were introduced.
+/// When `payload` is `Some`, it is appended with a length prefix using
+/// deterministic `serde_json` serialization (object keys are serialized in
+/// `BTreeMap`-sorted order because the `preserve_order` feature is disabled).
+/// When `None`, no additional bytes are hashed, preserving backward
+/// compatibility with entries created before payloads were introduced.
+///
+/// This is the single canonical implementation shared with the export/import
+/// verifier (`context::export_import`), which calls it directly so the two
+/// paths can never silently diverge.
 /// Public alias for [`compute_entry_hash`] for test/mock use.
 #[must_use]
 pub fn entry_hash(
@@ -142,7 +147,7 @@ pub fn entry_hash(
     compute_entry_hash(event, actor_did, timestamp, prev_hash, payload)
 }
 
-fn compute_entry_hash(
+pub(crate) fn compute_entry_hash(
     event: &str,
     actor_did: &str,
     timestamp: u64,

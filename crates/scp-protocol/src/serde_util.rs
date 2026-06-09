@@ -441,7 +441,17 @@ pub mod serde_sorted_set {
         S: Serializer,
     {
         // Compute a deterministic sort key per element: its RFC 8785 canonical
-        // JSON bytes. A JCS failure (e.g. a future element type with a
+        // JSON bytes.
+        //
+        // Amplification note: this performs one extra JCS serialization per set
+        // element (O(n) in the number of elements), bounded by the export size
+        // cap enforced upstream before signing runs (native 64 MiB / WASM
+        // 16 MiB). Element types here are flat (no nested set-of-sets), so the
+        // per-element JCS work is proportional to total export size, not
+        // quadratic. If a nested set-of-sets element type is ever added,
+        // re-evaluate the amplification factor before relying on this bound.
+        //
+        // A JCS failure (e.g. a future element type with a
         // non-string, non-hex map key that JCS cannot canonicalize) MUST fail
         // loudly rather than collapse to an empty key — an empty key would make
         // the sort order depend on incidental iteration order, silently

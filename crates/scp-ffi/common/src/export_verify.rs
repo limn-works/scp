@@ -19,8 +19,9 @@
 //! The helper is closure-based so each bridge passes its own local-custody
 //! accessor and keeps its own error type (per-SDK idiom). The structured
 //! [`ExportVerifyError`] carries enough context for each bridge to format its
-//! own error message and map it to its own error code (`PyO3` maps every
-//! variant to `SCP-CTX-2093`).
+//! own error message and map it to its own error code. Every bridge,
+//! including `PyO3`, maps a snapshot *signature* failure to `SCP-CTX-2093`
+//! and an export *version* gate to `SCP-CTX-2094` — the two are distinct.
 //!
 //! Requires the `resolvers` feature (scp-core, ed25519-dalek). NOT available
 //! for WASM (ADR-034); the WASM bridge resolves keys via its own constrained

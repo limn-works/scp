@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use super::providers::event_log::compute_entry_hash;
 use super::state::ContextSnapshot;
 use crate::store::StoredValue;
 use scp_identity::DID;
@@ -485,49 +486,6 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
     }
 
     Ok(entries.last().map_or([0u8; 32], |e| e.hash))
-}
-
-/// Computes the SHA-256 hash for an event log entry.
-///
-/// Hash input: `"SCP-EXPORT-ENTRY:" || len(event) || event || len(actor_did)
-///   || actor_did || timestamp || prev_hash [|| len(payload_json) || payload_json]`
-///
-/// Uses big-endian u32 length prefixes before variable-length fields to
-/// prevent length-extension ambiguity.
-///
-/// This must be identical to
-/// [`providers::event_log::compute_entry_hash`](super::providers::event_log)
-/// to ensure verification produces the same hashes.
-fn compute_entry_hash(
-    event: &str,
-    actor_did: &str,
-    timestamp: u64,
-    prev_hash: &[u8; 32],
-    payload: Option<&serde_json::Value>,
-) -> [u8; 32] {
-    // Event names and DID strings are always well under u32::MAX bytes.
-    let event_len = u32::try_from(event.len()).unwrap_or(u32::MAX);
-    let actor_len = u32::try_from(actor_did.len()).unwrap_or(u32::MAX);
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EXPORT-ENTRY:");
-    hasher.update(event_len.to_be_bytes());
-    hasher.update(event.as_bytes());
-    hasher.update(actor_len.to_be_bytes());
-    hasher.update(actor_did.as_bytes());
-    hasher.update(timestamp.to_be_bytes());
-    hasher.update(prev_hash);
-    // Payload is included in the hash when present.
-    // Absent payloads contribute no bytes, preserving backward compat.
-    if let Some(val) = payload {
-        let json_bytes = serde_json::to_vec(val).unwrap_or_default();
-        let payload_len = u32::try_from(json_bytes.len()).unwrap_or(u32::MAX);
-        hasher.update(payload_len.to_be_bytes());
-        hasher.update(&json_bytes);
-    }
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
 }
 
 /// Validates a [`ContextExport`] for import readiness, including the

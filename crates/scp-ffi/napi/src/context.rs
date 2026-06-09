@@ -3733,6 +3733,22 @@ pub(crate) async fn context_export_on(
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
     let sup = crate::runtime::supervisor(bi)?;
 
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (sup, exporter_did);
+        return Err(NapiError::from(ScpNapiError::Permission {
+            message: "context export requires key custody to sign the snapshot \
+                      (§23.16.8) — in_memory custody feature is not enabled"
+                .to_owned(),
+            // This is a build/config permission condition (the signing capability
+            // is unavailable in this bundle), NOT a snapshot-signature failure.
+            // CTX_2093 is reserved for §23.16.8 signature verification rejection;
+            // tagging this config gate with it would make a caller catching 2093
+            // to detect a forged export misfire on a feature-disabled build.
+            code: codes::PERM_3001.to_owned(),
+        }));
+    }
+
     #[cfg(feature = "allow_in_memory_custody")]
     {
         // Resolve the exporter identity's custody provider and `#active` signing
@@ -3772,32 +3788,13 @@ pub(crate) async fn context_export_on(
             })
             .await
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-        return scp_core::context::export_import::serialize_export(&export).map_err(|e| {
+        scp_core::context::export_import::serialize_export(&export).map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("export serialization failed: {e}"),
                 code: codes::CTX_2030.to_owned(),
             })
-        });
+        })
     }
-
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (sup, exporter_did);
-        return Err(NapiError::from(ScpNapiError::Permission {
-            message: "context export requires key custody to sign the snapshot \
-                      (§23.16.8) — in_memory custody feature is not enabled"
-                .to_owned(),
-            // This is a build/config permission condition (the signing capability
-            // is unavailable in this bundle), NOT a snapshot-signature failure.
-            // CTX_2093 is reserved for §23.16.8 signature verification rejection;
-            // tagging this config gate with it would make a caller catching 2093
-            // to detect a forged export misfire on a feature-disabled build.
-            code: codes::PERM_3001.to_owned(),
-        }));
-    }
-
-    #[allow(unreachable_code)]
-    Ok(Vec::new())
 }
 
 /// Per-bridge-instance implementation of [`context_import`].

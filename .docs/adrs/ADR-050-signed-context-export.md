@@ -32,7 +32,9 @@ The export domain separator `"SCP-CONTEXT-EXPORT-V1:"` is its OWN separator, del
 
 The reference construction already exists in the WASM bridge (`crates/scp-ffi/wasm/src/manager.rs`, helper `wasm_export_snapshot_digest`): serialize the snapshot to canonical JSON via `serde_json_canonicalizer`, hash `domain-bytes || scope-tag-byte || snapshot-json` (the single export-scope discriminant byte sits immediately after the domain separator and before the JCS bytes), sign the digest.
 
-The native export format `version` is **4** (it incremented from 3, which signed the full snapshot but left the scope discriminant out of the preimage). The WASM bridge's JSON envelope `version` is an independent per-serializer integer; the two counters need not match. What converges across implementations is the *construction*, not the envelope integer.
+The native export format `version` is **4** (it incremented from 3, which signed the full snapshot but left the scope discriminant out of the preimage). The WASM bridge's JSON envelope `version` is an independent per-serializer integer (currently **5**); the two counters need not match. What converges across implementations is the *construction*, not the envelope integer.
+
+**Native ↔ WASM exports are mutually non-importable by design.** Because the native family serializes the envelope as MessagePack (`version` 4) and the WASM family serializes it as JSON (`version` 5), an export produced by one family is NOT byte-decodable — and therefore NOT importable — by the other. Only the *signing construction* converges across families (per *Set/Map canonicalization* above), never the serialized bytes. Concretely, a WASM-produced export fed to a native bridge is rejected at the version gate with `SCP-CTX-2094` (`ContextError::ExportVersionUnsupported`) — a *version* error, NOT a signature forgery (`SCP-CTX-2093`). Operationally this means: re-export within the same bridge family before transferring to a peer on a different family; there is no cross-family transcoding path, by design (ADR-034 constrains the WASM family to JSON, and the native family stays on MessagePack per §17.5).
 
 ## Alternatives considered
 
