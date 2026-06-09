@@ -1285,6 +1285,27 @@ impl Supervisor {
                     .map(|m| m.did.clone())
                     .min()
                     .unwrap_or_else(|| DID(context_id.clone()));
+                // Serialize the whole import replace sequence against every
+                // other same-id bootstrap (import/create/restore): the actor
+                // mailbox only serializes the `PrepareForReplace` turn, but the
+                // crypto-restore→spawn tail runs outside it. Acquired here —
+                // BEFORE the key-package-store probe and `build_actor_deps` —
+                // so the check-spawn-evict region is serialized as a unit. If
+                // the probe and spawn ran outside the guard (the
+                // `CreateContext` arm acquires the lock before building deps
+                // for exactly this reason), two concurrent same-`owning_did`
+                // imports could both observe `kp_store_newly_spawned = true`;
+                // one spawns and succeeds while the other clones the same
+                // handle, fails the post-verify guard, and its eviction tears
+                // down the store the successful import is using — splitting the
+                // single-use KeyPackage pool across two actors. Held across the
+                // probe, deps build, the entire `import_context` future, and
+                // the conditional eviction. Lock order is
+                // `bootstrap_spawn_lock` → `write_lock`: `build_actor_deps`
+                // reaches `key_package_store_for`, which takes `write_lock`
+                // strictly inside this guard, never the reverse. See
+                // `bootstrap_spawn_lock`.
+                let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
                 // Defense in depth: track whether `build_actor_deps` will
                 // newly spawn this identity's key-package store, so a
                 // post-verification import failure (e.g. epoch-floor
@@ -1292,7 +1313,10 @@ impl Supervisor {
                 // leave an orphaned actor + map entry behind. Eviction is
                 // safe only for an entry this op created: a pre-existing
                 // entry is shared with other contexts/identities and must
-                // not be torn down on our failure.
+                // not be torn down on our failure. The probe is now race-free
+                // under `bootstrap_spawn_lock` — no concurrent same-id import
+                // can interleave between this `contains_key` and the spawn in
+                // `build_actor_deps`.
                 let kp_store_newly_spawned = !self.key_package_stores.contains_key(&owning_did);
                 let deps = match self.build_actor_deps(&owning_did).await {
                     Ok(deps) => deps,
@@ -1305,12 +1329,6 @@ impl Supervisor {
                         return Outcome::err_mutated(sketch);
                     }
                 };
-                // Serialize the whole import replace sequence against every
-                // other same-id bootstrap (import/create/restore): the actor
-                // mailbox only serializes the `PrepareForReplace` turn, but the
-                // crypto-restore→spawn tail runs outside it. Held across the
-                // entire `import_context` future. See `bootstrap_spawn_lock`.
-                let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
                 // Box::pin — the per-variant import future crosses
                 // clippy's 16 KB stack budget (ContextExport ~2 KB +
                 // the full PerContextState-construction locals inside
@@ -6672,6 +6690,195 @@ mod tests {
             supervisor.key_package_stores.is_empty(),
             "rejected forged import must not leak a key-package-store entry"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Eviction-path coverage for the `ImportContext` dispatch arm.
+    //
+    // The forged-import test above exercises the verify-GATE (the
+    // export is rejected before `build_actor_deps`, so no key-package
+    // store is ever spawned). These two tests exercise the
+    // POST-verify rejection path: a VALIDLY-signed export that passes
+    // `validate_export_for_import` but is then rejected inside
+    // `lifecycle_helpers::import_context` by the live-context-overwrite
+    // guard (a live actor is already registered for the same id, so
+    // `dispatch_prepare_for_replace` returns `MembershipFailed`). That
+    // is the branch where `kp_store_newly_spawned` matters, and where
+    // the TOCTOU fix (probe + spawn + evict all under
+    // `bootstrap_spawn_lock`) keeps the eviction race-free.
+    //
+    // Invariants asserted:
+    //   1. A store this import NEWLY spawned is evicted on its failure
+    //      (no orphan).
+    //   2. A PRE-EXISTING/shared store is NOT torn down by this import's
+    //      failure (no wrongful teardown).
+    // -----------------------------------------------------------------
+
+    /// Spawn a LIVE (Active) encrypted-mode actor under the hex id key
+    /// `hex::encode(ctx_id_bytes)` and return the registry key. After
+    /// this, `lookup(&hex_key)` is `Some`, so an import targeting the
+    /// same id hits the live-context-overwrite guard.
+    async fn spawn_live_context(supervisor: &Arc<Supervisor>, ctx_id_bytes: [u8; 32]) -> String {
+        let deps = test_actor_deps(supervisor).await;
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:live-admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("drive live context to Active");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers the live context");
+        hex::encode(ctx_id_bytes)
+    }
+
+    /// Build a VALIDLY-signed full-scope export for `context_id` whose
+    /// roster contains exactly `owning_member` (so the import arm's
+    /// lex-min-member derivation resolves `owning_did == owning_member`).
+    /// Signed by `signing_key`; verifies under its public half.
+    fn signed_import_export_with_member(
+        context_id: &str,
+        creator: &str,
+        owning_member: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> crate::context::export_import::ContextExport {
+        use ed25519_dalek::Signer;
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        // The roster is the only input to `owning_did` selection. A
+        // single member makes it the deterministic lex-min, and a fresh
+        // DID guarantees it is NOT already in `key_package_stores`.
+        snapshot
+            .membership
+            .add_member(DID(owning_member.to_owned()), "member".to_owned(), vec![]);
+        // Event-log bytes keyed on the import path's own derivation so
+        // the recomputed Merkle root matches what the importer expects.
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+        crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_primitives::SystemClock,
+            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+        )
+        .expect("build a valid signed export")
+    }
+
+    /// A VALID import that is REJECTED post-verification (live-context
+    /// overwrite) must evict the key-package store IT newly spawned —
+    /// no orphaned actor/entry is left behind. This is the eviction
+    /// branch the forged-import test cannot reach (there the store is
+    /// never spawned).
+    #[tokio::test]
+    async fn rejected_import_evicts_only_its_newly_spawned_kp_store() {
+        let supervisor = supervisor_with_providers();
+        let ctx_id_bytes = [0x5Au8; 32];
+        let context_id = spawn_live_context(&supervisor, ctx_id_bytes).await;
+
+        let creator = "did:key:evict-test-creator";
+        // Fresh owning-member DID: not pre-seeded, so the import arm
+        // newly spawns its key-package store, then evicts it on the
+        // live-context rejection.
+        let owning_member = "did:key:aaa-evict-owning-member";
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let export =
+            signed_import_export_with_member(&context_id, creator, owning_member, &signing_key);
+
+        // Baseline: `spawn_live_context` builds deps for an admin DID,
+        // so the map already holds that store. The owning member's store
+        // must NOT yet exist — the import is what spawns it.
+        let baseline = supervisor.key_package_stores.len();
+        assert!(
+            !supervisor
+                .key_package_stores
+                .contains_key(&DID(owning_member.to_owned())),
+            "owning member's key-package store must not exist before the import"
+        );
+
+        let result = supervisor.import_context(export, &verifying_key).await;
+
+        // Live-context-overwrite rejection propagates from
+        // `import_context`.
+        assert!(
+            matches!(result, Err(ContextError::MembershipFailed(_))),
+            "import over a live context must be rejected, got {result:?}"
+        );
+        // The store this import spawned for `owning_member` must have
+        // been evicted on the failure path (no orphan).
+        assert!(
+            !supervisor
+                .key_package_stores
+                .contains_key(&DID(owning_member.to_owned())),
+            "the newly-spawned key-package store must be evicted on a rejected import"
+        );
+        // No net change to the store map: the only store the import
+        // touched was the one it spawned, and that was evicted.
+        assert_eq!(
+            supervisor.key_package_stores.len(),
+            baseline,
+            "a rejected import must leave the key-package-store count unchanged (no orphan)"
+        );
+    }
+
+    /// A rejected import must NOT tear down a PRE-EXISTING key-package
+    /// store shared with other contexts/identities: eviction is gated
+    /// on `kp_store_newly_spawned`, so when the owning store already
+    /// exists the rejection leaves it intact. This guards the invariant
+    /// the TOCTOU fix protects — a concurrent import's failure can never
+    /// evict a store another op is using.
+    #[tokio::test]
+    async fn rejected_import_preserves_preexisting_kp_store() {
+        let supervisor = supervisor_with_providers();
+        let ctx_id_bytes = [0x6Bu8; 32];
+        let context_id = spawn_live_context(&supervisor, ctx_id_bytes).await;
+
+        let creator = "did:key:preserve-test-creator";
+        let owning_member = "did:key:aaa-preserve-owning-member";
+        let owning_did = DID(owning_member.to_owned());
+
+        // Pre-seed the owning member's key-package store, simulating a
+        // store already in use by another context/import. The rejected
+        // import below must NOT evict it.
+        let preexisting = supervisor.key_package_store_for(&owning_did).await;
+        assert!(
+            supervisor.key_package_stores.contains_key(&owning_did),
+            "pre-seeded store registered"
+        );
+        let baseline = supervisor.key_package_stores.len();
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export =
+            signed_import_export_with_member(&context_id, creator, owning_member, &signing_key);
+
+        let result = supervisor.import_context(export, &verifying_key).await;
+        assert!(
+            matches!(result, Err(ContextError::MembershipFailed(_))),
+            "import over a live context must be rejected, got {result:?}"
+        );
+        // The pre-existing store must survive — `kp_store_newly_spawned`
+        // was false, so the eviction branch is skipped.
+        assert!(
+            supervisor.key_package_stores.contains_key(&owning_did),
+            "a pre-existing/shared key-package store must NOT be torn down by a rejected import"
+        );
+        assert_eq!(
+            supervisor.key_package_stores.len(),
+            baseline,
+            "no second actor spawned and none evicted; the pre-seeded store remains"
+        );
+        preexisting
+            .send_shutdown()
+            .await
+            .expect("pre-existing store handle is still live after the rejected import");
     }
 
     /// Helper mirroring `export_import::tests::create_event_log_data` —
