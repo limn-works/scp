@@ -179,4 +179,64 @@ struct InvocationHandleTests {
             Issue.record("unexpected error type: \(error)")
         }
     }
+
+    /// Bug 2 regression — the aggregate continuation must resolve even
+    /// when the pump resolves SYNCHRONOUSLY (inside `init`, before the
+    /// `aggregateTask` body has had a chance to attach its continuation).
+    /// Before the `AggregateResolverBox` fix, the resolver was a bare
+    /// captured `var` written by the (later-running) `aggregateTask` and
+    /// read by the pump; a synchronous resolve dropped the resolution and
+    /// `await handle.aggregate` hung forever. The box buffers the early
+    /// resolve and replays it on attach, so this must complete promptly.
+    @Test("aggregate resolves when pump resolves before the continuation attaches")
+    func aggregateResolvesUnderSynchronousResolveRace() async throws {
+        // The pump body runs synchronously during `init`; `resolveAggregate`
+        // is therefore invoked BEFORE `aggregateTask` attaches.
+        let handle = InvocationHandle { yieldChunk, resolveAggregate, _ in
+            let end = OutletStreamChunk(
+                requestId: Data(count: 16),
+                sequence: 0,
+                payload: .end(aggregate: "{\"raced\":true}", executionTimeMs: 3)
+            )
+            yieldChunk(end)
+            resolveAggregate(Aggregate(valueJson: "{\"raced\":true}", executionTimeMs: 3))
+        }
+        let agg = try await handle.aggregate
+        #expect(agg.valueJson == "{\"raced\":true}")
+        #expect(agg.executionTimeMs == 3)
+    }
+
+    /// Bug 2 regression — same race on the reject path. A synchronous
+    /// pre-attach reject must still surface through `await handle.aggregate`
+    /// rather than hanging the leaked continuation.
+    @Test("aggregate rejects when pump rejects before the continuation attaches")
+    func aggregateRejectsUnderSynchronousRejectRace() async {
+        let handle = InvocationHandle { _, _, rejectAggregate in
+            rejectAggregate(OutletError.executionFailed(message: "raced-boom", code: "SCP-TOOL-6200"))
+        }
+        do {
+            _ = try await handle.aggregate
+            Issue.record("expected aggregate to throw under the synchronous reject race")
+        } catch let OutletError.executionFailed(_, code) {
+            #expect(code == "SCP-TOOL-6200")
+        } catch {
+            Issue.record("unexpected error type: \(error)")
+        }
+    }
+
+    /// Bug 2 — single-resume invariant. The carrier resolves the
+    /// continuation exactly once; a resolve followed by a (losing) reject,
+    /// or duplicate resolves, must not double-resume the continuation
+    /// (which would trap at runtime). The first outcome wins.
+    @Test("aggregate carrier is single-resume — first outcome wins")
+    func aggregateCarrierIsSingleResume() async throws {
+        let handle = InvocationHandle { _, resolveAggregate, rejectAggregate in
+            resolveAggregate(Aggregate(valueJson: "{\"first\":1}", executionTimeMs: 0))
+            // Losing duplicates — must be no-ops, not a double-resume trap.
+            resolveAggregate(Aggregate(valueJson: "{\"second\":2}", executionTimeMs: 0))
+            rejectAggregate(OutletError.executionFailed(message: "late", code: "SCP-TOOL-6200"))
+        }
+        let agg = try await handle.aggregate
+        #expect(agg.valueJson == "{\"first\":1}")
+    }
 }
