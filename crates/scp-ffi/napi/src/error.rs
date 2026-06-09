@@ -207,6 +207,17 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2092.to_owned(),
             },
+            // §23.16.8 / ADR-050: signed-context-export signature verification
+            // failure (forged/tampered snapshot, exporter_did != creator_did,
+            // or unresolvable creator key). Surface the dedicated SCP-CTX-2093
+            // contract instead of falling through to the catch-all CTX_2001 so
+            // TypeScript callers can distinguish a forged export from a generic
+            // context error. The version gate is reported separately (a distinct
+            // version error, not this arm), per §23.16.8 / §17.5.
+            CE::SnapshotSignatureInvalid { .. } => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2093.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.

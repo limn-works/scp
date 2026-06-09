@@ -25,7 +25,7 @@ An agent with no prior context should be able to visit the SCP repository, under
 | 13 | Conformance suite spec | §26 | Language-independent test case definitions |
 | 14 | GovernanceAction table | §9.5.2 | All 30 variants with signed structure fields |
 | 15 | ContextParams table | §9.5.2 | All 17 fields tabulated |
-| 16 | Domain separators | §9.18.2 | 30 separators registered, code-verified |
+| 16 | Domain separators | §9.18.2 | 35 separators registered (incl. distinct sync-delta `SCP-CONTEXT-SNAPSHOT-V1:` and signed-export `SCP-CONTEXT-EXPORT-V1:`), code-verified |
 | 17 | Key derivation labels | §9.18.3 | HPKE info, HKDF salt/info, HMAC domains, MLS exporter |
 | 18 | Provenance system | §24 | Full specification with chain depth limits |
 | 19 | README.md | Root | Protocol overview, capabilities, architecture |

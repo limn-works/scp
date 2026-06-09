@@ -2612,6 +2612,135 @@ async fn resolve_napi_signing_key(
         })
 }
 
+/// Resolves the exporter identity's custody provider and `#active` signing-key
+/// handle for signing a context export snapshot (§23.16.8).
+///
+/// Unlike [`resolve_napi_signing_key`], this does NOT export raw private key
+/// bytes. It returns the [`NapiKeyCustody`](crate::custody::NapiKeyCustody)
+/// provider and the [`KeyHandle`](scp_platform::traits::KeyHandle) so the caller
+/// can delegate signing to [`KeyCustody::sign`], which dispatches to whichever
+/// backend backs this identity (in-memory OR JS callback custody). This is the
+/// path that lets keychain/HSM-shaped callback providers — which sign but cannot
+/// export key bytes — produce a signed export. Private key material never crosses
+/// the FFI boundary (ADR-006).
+///
+/// The `Arc<NapiKeyCustody>` is cloned out so the returned pair is `'static` and
+/// can be moved into the synchronous `export_context` sign closure.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` (SCP-CTX-2040) if the context handle carries
+/// no retained custody or no active signing-key handle.
+#[cfg(feature = "allow_in_memory_custody")]
+fn resolve_napi_export_signer(
+    handle: &NapiContextHandle,
+) -> napi::Result<(
+    Arc<crate::custody::NapiKeyCustody>,
+    scp_platform::traits::KeyHandle,
+)> {
+    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Context {
+            message: "no custody provider on context handle — context export \
+                      requires an identity created with custody"
+                .to_owned(),
+            code: codes::CTX_2040.to_owned(),
+        })
+    })?;
+    let key_handle = handle.signing_key.ok_or_else(|| {
+        NapiError::from(ScpNapiError::Context {
+            message: "no signing key on context handle — context export \
+                      requires an identity with an active signing key"
+                .to_owned(),
+            code: codes::CTX_2040.to_owned(),
+        })
+    })?;
+    Ok((Arc::clone(custody), key_handle))
+}
+
+/// Resolves the snapshot creator's Ed25519 verification key for
+/// snapshot-signature verification on context import (spec §23.16.8, ADR-050,
+/// ADR-039).
+///
+/// Per §23.16.8 step 1 the verifying key is derived from the snapshot's
+/// `creator_did` (`role_state.creator_did`), never from the unauthenticated
+/// envelope `exporter_did`. The runtime separately asserts
+/// `exporter_did == creator_did` (§23.16.8 step 2), so the bridge MUST resolve
+/// from the creator identity.
+///
+/// Resolution order (local-custody-first, then DID resolver) is shared across
+/// all non-WASM bridges via
+/// [`scp_ffi_common::export_verify::resolve_export_verifying_key`]:
+/// 1. **Local identity custody** — if the creator is a local identity (the
+///    common self-export case: a device importing a context it exported), the
+///    verifying key is derived directly from its `#active` custody signing key.
+///    This works even when the DID document has not been published to the DHT
+///    (in-memory identities are not auto-published) — fixing the prior bug
+///    where a self-export of an unpublished identity failed because the bridge
+///    went straight to the DID resolver.
+/// 2. **DID resolver** — otherwise resolve the creator DID's `#active` (then
+///    `#agent`, ADR-039 shared-DID model) verification-method key.
+///
+/// Fails closed: if the creator is neither local nor resolvable, the import is
+/// rejected with [`codes::CTX_2093`] rather than proceeding unverified.
+///
+/// `async` because deriving the verifying key from local custody requires an
+/// async `KeyCustody::public_key` call (the shared helper's `local_custody`
+/// closure is sync, so the local key is resolved up front and handed to the
+/// closure as a pre-computed value).
+async fn resolve_napi_creator_verifying_key(
+    bi: &NapiBridgeInstance,
+    creator_did: &str,
+) -> napi::Result<ed25519_dalek::VerifyingKey> {
+    let resolver = crate::runtime::did_resolver(bi).map(std::convert::AsRef::as_ref);
+
+    // Pre-resolve the local verifying key (async) so the shared helper's sync
+    // `local_custody` closure can return it without blocking. Only the public
+    // verifying key is derived — private key material never leaves custody
+    // (ADR-006). When the feature is disabled there is no local registry, so
+    // the local key is always `None` and resolution relies on the DID resolver.
+    #[cfg(feature = "allow_in_memory_custody")]
+    let local_key = resolve_napi_local_verifying_key(bi, creator_did).await;
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    let local_key: Option<ed25519_dalek::VerifyingKey> = None;
+
+    scp_ffi_common::export_verify::resolve_export_verifying_key(
+        resolver,
+        |_did| local_key,
+        creator_did,
+    )
+    .map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("{e}"),
+            code: codes::CTX_2093.to_owned(),
+        })
+    })
+}
+
+/// Derives the public Ed25519 verifying key for a DID from local key custody,
+/// or `None` when the DID is not a local identity on this bridge instance.
+///
+/// Uses the creator identity's `#active` signing-key handle
+/// ([`scp_identity::ScpIdentity::active_signing_key`]) — the verification
+/// method §23.16.8 designates as the export signer — and resolves its public
+/// half via [`KeyCustody::public_key`]. Only the public verifying key crosses
+/// out of custody; the private signing key is never materialized (ADR-006).
+#[cfg(feature = "allow_in_memory_custody")]
+async fn resolve_napi_local_verifying_key(
+    bi: &NapiBridgeInstance,
+    did: &str,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    let custody_and_key = crate::runtime::with_identity(bi, did, |e| {
+        Ok((e.custody.clone(), e.identity.active_signing_key))
+    })
+    .ok()?;
+    let (custody, key_handle) = custody_and_key;
+    // Resolve the public verifying key directly via `KeyCustody::public_key`
+    // (ADR-006) — no private-key materialization.
+    let public_key = custody.public_key(&key_handle).await.ok()?;
+    let key_bytes: [u8; 32] = public_key.as_bytes().try_into().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).ok()
+}
+
 /// Parses a hex-encoded proposal ID into a 32-byte array.
 fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
     let bytes = hex::decode(hex_str).map_err(|e| {
@@ -3607,47 +3736,91 @@ pub(crate) async fn context_reset_ttl_timer_on(
 /// Per-bridge-instance implementation of [`context_export`].
 ///
 /// Returns serialized `StoredValue<ContextExport>` bytes (§17.5) suitable for
-/// backup, migration, or transfer to another node. Routed through the ADR-049
-/// lifecycle dispatch surface.
+/// backup, migration, or transfer to another node.
+///
+/// Signs the exported snapshot's §23.16.8 canonical digest by delegating to the
+/// exporter identity's [`KeyCustody::sign`], which dispatches to whichever
+/// backend backs that identity — in-memory OR a JS callback custody
+/// (`identityCreateWithCustody`). The raw private key is never exported, so
+/// keychain/HSM-shaped callback providers that implement `sign` but not
+/// `exportSigningKeyBytes` can still produce a signed export. The signature is
+/// applied at this dispatch boundary because the runtime holds no custody key;
+/// `Supervisor::export_context` captures the unsigned snapshot from the actor
+/// and signs it here via the supplied closure (§23.16.8, ADR-050).
+///
+/// The retained custody and signing-key handle live on the context handle, which
+/// is only compiled under `allow_in_memory_custody` (matching every other
+/// key-bearing path in this bridge, including the `identityCreateWithCustody`
+/// callback path). Without the feature the export is rejected fail-closed rather
+/// than emitting an unsigned (and thus unverifiable) export.
 pub(crate) async fn context_export_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> napi::Result<Vec<u8>> {
-    use scp_core::context::actor::commands::LifecycleCommand;
     crate::napi_check_handle!(&bi.core, handle);
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
-    let context_id = handle.context_id.clone();
-
-    // Route through the ADR-049 lifecycle dispatch surface.
     let sup = crate::runtime::supervisor(bi)?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = LifecycleCommand::ExportContext {
-        context_id,
-        exporter_did,
-        reply: tx,
-    };
-    sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("supervisor dispatch_lifecycle_command failed: {e}"),
-            code: codes::CTX_2030.to_owned(),
-        })
-    })?;
-    let export = rx
-        .await
-        .map_err(|e| {
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        // Resolve the exporter identity's custody provider and `#active` signing
+        // key handle (NOT a raw exported key). Signing the §23.16.8 snapshot
+        // digest is delegated to `KeyCustody::sign`, which dispatches to whichever
+        // backend backs this identity — in-memory OR a JS callback custody
+        // (`identityCreateWithCustody`). This lets keychain/HSM-shaped callback
+        // providers — which implement `sign` but intentionally do NOT implement
+        // `exportSigningKeyBytes` — produce a signed export. Private key material
+        // never crosses the FFI boundary (ADR-006).
+        let (custody, key_handle) = resolve_napi_export_signer(handle)?;
+
+        // `export_context`'s `sign` closure is synchronous, but custody `sign` is
+        // async (a callback custody awaits a JS `ThreadsafeFunction`). Bridge the
+        // two with `block_in_place` + `block_on` on the current multi-thread
+        // runtime — the same pattern used by `identity_create_link_attestation`
+        // (see `scp.rs`). `context_export_on` already runs on a tokio worker, so a
+        // runtime handle is always present here.
+        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
             NapiError::from(ScpNapiError::Context {
-                message: format!("export_context shim reply dropped: {e}"),
+                message: format!("context export requires a tokio runtime: {e}"),
                 code: codes::CTX_2030.to_owned(),
             })
-        })?
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        })?;
 
-    scp_core::context::export_import::serialize_export(&export).map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("export serialization failed: {e}"),
-            code: codes::CTX_2030.to_owned(),
-        })
-    })
+        let export = sup
+            .export_context(&handle.context_id, exporter_did, |hash: &[u8; 32]| {
+                let signature =
+                    tokio::task::block_in_place(|| rt.block_on(custody.sign(&key_handle, hash)))?;
+                let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
+                    scp_platform::PlatformError::CustodyError(format!(
+                        "custody sign returned {} bytes, expected 64 (Ed25519)",
+                        signature.as_bytes().len()
+                    ))
+                })?;
+                Ok::<[u8; 64], scp_platform::PlatformError>(bytes)
+            })
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        return scp_core::context::export_import::serialize_export(&export).map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("export serialization failed: {e}"),
+                code: codes::CTX_2030.to_owned(),
+            })
+        });
+    }
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (sup, exporter_did);
+        return Err(NapiError::from(ScpNapiError::Permission {
+            message: "context export requires key custody to sign the snapshot \
+                      (§23.16.8) — in_memory custody feature is not enabled"
+                .to_owned(),
+            code: codes::CTX_2093.to_owned(),
+        }));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(Vec::new())
 }
 
 /// Per-bridge-instance implementation of [`context_import`].
@@ -3659,7 +3832,6 @@ pub(crate) async fn context_import_on(
     bi: &NapiBridgeInstance,
     data: Vec<u8>,
 ) -> napi::Result<String> {
-    use scp_core::context::actor::commands::LifecycleCommand;
     let export = scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("invalid export data: {e}"),
@@ -3668,34 +3840,41 @@ pub(crate) async fn context_import_on(
     })?;
     let context_id = export.snapshot.context_id.clone();
 
-    // Validate the exporter DID before passing to init_supervisor (#1324).
-    validate_did(&export.exporter_did.0).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    // Resolve the verification-method key for the snapshot's `creator_did`
+    // (§23.16.8 step 1, ADR-050) — NOT the unauthenticated envelope
+    // `exporter_did`. The runtime separately asserts
+    // `exporter_did == creator_did` (§23.16.8 step 2). Fail-closed: if no key
+    // resolves, the import is rejected — never imported unverified.
+    let creator_did = export.snapshot.role_state.creator_did.clone();
+    validate_did(&creator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let verifying_key = resolve_napi_creator_verifying_key(bi, &creator_did).await?;
 
-    // Ensure the Supervisor is initialized — context_import is a valid
-    // first operation (e.g. a device receiving exported context data).
-    // init_supervisor is idempotent (OnceLock — first call wins). #1073
-    // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_supervisor(bi, &export.exporter_did.0);
+    // Verify-before-init: validate the snapshot signature, signer binding,
+    // version gate, and Merkle chain BEFORE touching the bridge's Supervisor.
+    // `init_supervisor` seeds the MLS provider's credential identity from
+    // `creator_did`, and that OnceLock is first-call-wins. Seeding it from an
+    // unverified snapshot would let an attacker-crafted `creator_did` set the
+    // provider identity on a fresh bridge whose first operation is an import.
+    // Running the full verification here means the identity is only seeded from
+    // a cryptographically authenticated `creator_did`. `import_context` re-runs
+    // the same validation (authoritative path); the duplicate work is
+    // acceptable to keep the security ordering correct.
+    scp_core::context::export_import::validate_export_for_import(&export, &verifying_key)
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    // Ensure the Supervisor is initialized — context_import is a valid first
+    // operation (e.g. a device receiving exported context data).
+    // init_supervisor is idempotent (OnceLock — first call wins). Seeding from
+    // the now-verified `creator_did` is safe per the verify-before-init step
+    // above.
+    crate::runtime::init_supervisor(bi, &creator_did);
 
     let sup = crate::runtime::supervisor(bi)?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = LifecycleCommand::ImportContext {
-        export: Box::new(export),
-        reply: tx,
-    };
-    sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("supervisor dispatch_lifecycle_command failed: {e}"),
-            code: codes::CTX_2032.to_owned(),
-        })
-    })?;
-    rx.await
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("import_context shim reply dropped: {e}"),
-                code: codes::CTX_2032.to_owned(),
-            })
-        })?
+    // Route the import error through ScpNapiError so the typed
+    // ContextError::SnapshotSignatureInvalid arm surfaces SCP-CTX-2093
+    // (signature/version forgery) rather than the catch-all SCP-CTX-2001.
+    sup.import_context(export, &verifying_key)
+        .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(context_id)
 }
@@ -5071,5 +5250,107 @@ mod tests {
         // Forcibly clear the inner Option to simulate a double-take.
         let _ = guard.0.take();
         let _ = guard.disarm();
+    }
+
+    /// Exercises the full `context_export_on` -> `context_import_on` round-trip
+    /// for an identity whose key material is held in custody.
+    ///
+    /// This is the regression guard for routing export signing through
+    /// [`KeyCustody::sign`] (§23.16.8) instead of exporting a raw signing key:
+    /// the snapshot signature the closure produces MUST verify on import against
+    /// the creator identity's `#active` verifying key, or `import_context`
+    /// rejects it with `SnapshotSignatureInvalid` (SCP-CTX-2093). A passing
+    /// round-trip proves the custody-`sign` closure emits a spec-valid signature.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_export_signs_via_custody_and_round_trips() {
+        let scp = crate::scp::Scp::new().unwrap();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        let params_json = serde_json::json!({
+            // `context:close` is required so the creator can close the context
+            // before reimport (import_context needs a terminal state).
+            "ceiling": ["messages:read", "messages:write", "context:close"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let original_context_id = handle.context_id.clone();
+
+        // Export: the §23.16.8 snapshot digest is signed by `custody.sign`.
+        let data = super::context_export_on(&bi, &handle)
+            .await
+            .expect("context_export should succeed via custody sign");
+        assert!(!data.is_empty(), "export bytes must not be empty");
+
+        // Close so `import_context` sees a terminal state and allows reimport
+        // of the same context id (mirrors the addon round-trip test).
+        super::context_close_on(&bi, &handle, identity.inner.did.clone())
+            .await
+            .expect("context_close should succeed");
+
+        // Import verifies the snapshot signature against the creator's `#active`
+        // verifying key. Success proves the custody-produced signature is valid.
+        let imported_context_id = super::context_import_on(&bi, data)
+            .await
+            .expect("context_import should accept the custody-signed snapshot");
+        assert_eq!(
+            imported_context_id, original_context_id,
+            "imported context id must match the exported one"
+        );
+    }
+
+    /// Confirms the export signature is genuinely verified on import: flipping a
+    /// byte inside the serialized export (which lands in the signed snapshot
+    /// region) MUST cause `context_import_on` to fail. This proves the signature
+    /// produced via `custody.sign` is load-bearing, not decorative.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_import_rejects_tampered_custody_signed_export() {
+        let scp = crate::scp::Scp::new().unwrap();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "context:close"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+
+        let mut data = super::context_export_on(&bi, &handle)
+            .await
+            .expect("context_export should succeed via custody sign");
+        super::context_close_on(&bi, &handle, identity.inner.did.clone())
+            .await
+            .expect("context_close should succeed");
+
+        // Flip a byte near the front of the payload — inside the signed snapshot
+        // region — so the recomputed §23.16.8 digest no longer matches the
+        // signature. (The byte must be a real content byte, not framing.)
+        let mid = data.len() / 2;
+        data[mid] ^= 0xFF;
+
+        let result = super::context_import_on(&bi, data).await;
+        assert!(
+            result.is_err(),
+            "import of a tampered custody-signed export must be rejected"
+        );
     }
 }

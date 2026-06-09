@@ -304,6 +304,7 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         context_params: ctx.handle.params().clone(),
         membership: ctx.membership.clone(),
         role_state: ctx.role_state.clone(),
+        event_log_merkle_root: [0u8; 32],
         executed_proposals: ctx.governance.executed_proposals.keys().copied().collect(),
         ttl_remaining_secs,
         registered_tools: ctx.governance.registered_tools.clone(),

@@ -371,13 +371,18 @@ pub type CreateContextReply = oneshot::Sender<
 pub type CloseContextReply =
     oneshot::Sender<Result<crate::context::ttl::CloseResult, ContextError>>;
 
-/// Reply-channel type alias for [`LifecycleCommand::ExportContext`]. The
-/// reply carries a fully-populated
-/// [`ContextExport`](crate::context::export_import::ContextExport) —
-/// snapshot, Merkle event log, (currently empty) MLS state, and signed
-/// header.
+/// Reply-channel type alias for [`LifecycleCommand::ExportContext`].
+///
+/// The reply carries the UNSIGNED export building blocks captured from the
+/// actor-owned state: the `ContextSnapshot` and the serialized Merkle
+/// event-log data. The actor holds no custody/signing key, so the snapshot
+/// signature is applied by the dispatcher
+/// ([`Supervisor::export_context`](crate::context::supervisor::Supervisor::export_context))
+/// via [`create_export`](crate::context::export_import::create_export) once
+/// these blocks are returned — keeping the signature over the exact canonical
+/// bytes a verifier recomputes (§23.16.8, ADR-050).
 pub type ExportContextReply =
-    oneshot::Sender<Result<crate::context::export_import::ContextExport, ContextError>>;
+    oneshot::Sender<Result<(crate::context::state::ContextSnapshot, Vec<u8>), ContextError>>;
 
 /// Reply-channel type alias for [`LifecycleCommand::ImportContext`]. The
 /// reply carries the restored context's
@@ -578,6 +583,12 @@ pub enum LifecycleCommand {
         /// Fully-parsed context export — envelope has already been
         /// deserialized by the FFI bridge.
         export: Box<crate::context::export_import::ContextExport>,
+        /// Ed25519 verification-method key for the snapshot's `creator_did`
+        /// (§23.16.8 step 1, ADR-050). Resolved by the FFI bridge from the
+        /// snapshot `creator_did` — NEVER the unauthenticated envelope
+        /// `exporter_did`. The import path verifies the snapshot signature
+        /// against this key before restoring any state (verify-before-init).
+        verifying_key: Box<ed25519_dalek::VerifyingKey>,
         /// Oneshot reply channel. See [`ImportContextReply`].
         reply: ImportContextReply,
     },

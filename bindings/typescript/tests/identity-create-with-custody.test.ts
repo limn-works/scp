@@ -162,6 +162,16 @@ class CryptoKeychain implements KeyCustodyProvider {
   }
 }
 
+// A keychain that signs but REFUSES to export raw key bytes — the shape of a
+// real OS keychain / HSM / secure-enclave custody. `exportSigningKeyBytes`
+// throws, so any operation that depends on extracting the raw private key would
+// fail; only operations routed through the `sign` callback can succeed.
+class SignOnlyKeychain extends CryptoKeychain {
+  override exportSigningKeyBytes(_keyId: string): Uint8Array {
+    throw new Error("sign-only custody: raw key export is not permitted");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -190,6 +200,72 @@ if (!scpAvailable) {
         // Intentionally incomplete — only `sign` is present.
         const bad = { sign: () => new Uint8Array(64) } as unknown as KeyCustodyProvider;
         await expect(scp.identityCreateWithCustody(bad)).rejects.toThrow();
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
+
+    // Spec §23.16.8 / ADR-050: a context created under callback (platform)
+    // custody must be able to produce an Ed25519-signed export whose snapshot
+    // signature verifies on import. Export signing is delegated to the custody
+    // `sign` callback — NOT to raw key export — so a callback identity reaches
+    // parity with an in-memory one for signed export/import.
+    test("callback-custody identity exports a signed snapshot that imports", async () => {
+      const scp = new SCP();
+      try {
+        const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
+        const ctx = await scp.contextCreate(
+          identity,
+          JSON.stringify({
+            ceiling: ["messages:read", "context:close"],
+            memoryScope: "ephemeral",
+          }),
+        );
+
+        const data = await scp.contextExport(ctx);
+        expect(data.length).toBeGreaterThan(0);
+
+        // Close so import_context sees a terminal state and allows reimport.
+        await scp.contextClose(ctx, identity.did);
+
+        // Import verifies the snapshot signature against the creator's #active
+        // verifying key. Success proves the callback-custody-produced signature
+        // is spec-valid.
+        const importedContextId = await scp.contextImport(data);
+        expect(typeof importedContextId).toBe("string");
+        expect(importedContextId.length).toBeGreaterThan(0);
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
+
+    // The decisive regression guard: with a custody that signs but REFUSES to
+    // export raw key bytes (the keychain/HSM shape), export still succeeds
+    // because signing is routed through `KeyCustody::sign`. Under the previous
+    // raw-key-extraction path this export would have failed with an
+    // exportSigningKeyBytes error.
+    test("sign-only (no raw-key-export) custody can still produce a signed export", async () => {
+      const scp = new SCP();
+      try {
+        const identity = await scp.identityCreateWithCustody(new SignOnlyKeychain());
+        const ctx = await scp.contextCreate(
+          identity,
+          JSON.stringify({
+            ceiling: ["messages:read", "context:close"],
+            memoryScope: "ephemeral",
+          }),
+        );
+
+        // Must NOT throw: signing the §23.16.8 digest goes through the `sign`
+        // callback, never through the throwing `exportSigningKeyBytes`.
+        const data = await scp.contextExport(ctx);
+        expect(data.length).toBeGreaterThan(0);
+
+        await scp.contextClose(ctx, identity.did);
+
+        const importedContextId = await scp.contextImport(data);
+        expect(typeof importedContextId).toBe("string");
+        expect(importedContextId.length).toBeGreaterThan(0);
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }

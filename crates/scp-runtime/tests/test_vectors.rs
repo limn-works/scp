@@ -1209,6 +1209,7 @@ fn domain_separators_are_all_unique() {
         "SCP-COMMIT-RANGE-REQ-V1:",
         "SCP-COMMIT-RANGE-RESP-V1:",
         "SCP-CONTEXT-SNAPSHOT-V1:",
+        "SCP-CONTEXT-EXPORT-V1:",
         "SCP-CHALLENGE-REQ-V1:",
         "SCP-CHALLENGE-RESP-V1:",
         "SCP-CHALLENGE-VERIFY-V1:",

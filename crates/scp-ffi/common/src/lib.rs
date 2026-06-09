@@ -144,6 +144,14 @@ pub mod event_log;
 #[cfg(feature = "resolvers")]
 pub mod trust_store;
 
+// Shared signed-context-export verifying-key resolver (§23.16.8, ADR-050).
+// Local-custody-first then DID-resolver (#active/#agent) fallback. Closure-based
+// so each bridge keeps its own custody accessor and error type. Requires
+// scp-core + ed25519-dalek (behind `resolvers` feature). Not available for WASM
+// (ADR-034) — the WASM bridge resolves keys via its own constrained path.
+#[cfg(feature = "resolvers")]
+pub mod export_verify;
+
 // All resolver types below require the `resolvers` feature (scp-core, scp-identity, tokio).
 // WASM uses `default-features = false` to get only the `validate` module.
 #[cfg(feature = "resolvers")]

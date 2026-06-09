@@ -1724,6 +1724,7 @@ mod tests {
             context_params: ContextParams::default(),
             membership,
             role_state,
+            event_log_merkle_root: [0u8; 32],
             executed_proposals: std::collections::HashSet::new(),
             ttl_remaining_secs: Some(300),
             registered_tools: Vec::new(),
