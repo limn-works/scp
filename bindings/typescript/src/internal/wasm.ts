@@ -2112,7 +2112,7 @@ export function createWasmBridge(): Bridge {
           "payment-receipt verification requires a native client whose " +
           "bridge runs the payment adapter (the NAPI / Python / Swift / " +
           "Kotlin SDKs) per ADR-034.",
-        "SCP-ECON-12091",
+        "SCP-ECON-12095",
       );
     },
 

@@ -18,7 +18,7 @@
 package works.limn.scp
 
 import java.nio.file.Files
-import kotlin.test.assertContains
+import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
@@ -178,9 +178,10 @@ class ScpClassTest {
             // configure_local_transport before the empty-batch call). An
             // empty receipt batch needs no payment adapter, so it is the
             // clean happy path once the supervisor is attached — the bridge
-            // returns `{"results":[]}`.
+            // returns `{"all_valid":true,"results":[]}` (all_valid is
+            // vacuously true for an empty batch).
             scp.configureLocalTransport("did:key:z6MkKotlinVerifyReceiptsEmptyTest")
             val out = scp.economyVerifyPaymentReceipts("[]")
-            assertContains(out, "results")
+            assertEquals("{\"all_valid\":true,\"results\":[]}", out)
         }
 }

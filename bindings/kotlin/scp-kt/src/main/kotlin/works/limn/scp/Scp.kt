@@ -758,7 +758,16 @@ class SCP internal constructor(
             did = did,
         )
 
-    /** Forwards to [NativeScp.economyVerifyPaymentReceipts] on [inner]. */
+    /**
+     * Forwards to [NativeScp.economyVerifyPaymentReceipts] on [inner].
+     *
+     * Verifies a batch of payment receipts against the configured payment
+     * adapter. Maximum 10,000 receipts per call. Returns a JSON object
+     * `{"all_valid": <bool>, "results": [...]}`; `all_valid` is vacuously
+     * `true` for an empty batch. Each entry's `ok` means the adapter
+     * *responded* — NOT that the payment is valid; scan `valid`/`all_valid`
+     * for payment validity.
+     */
     suspend fun economyVerifyPaymentReceipts(receiptsJson: String): String =
         inner.economyVerifyPaymentReceipts(receiptsJson = receiptsJson)
 

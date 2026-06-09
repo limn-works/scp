@@ -1785,6 +1785,23 @@ export class SCP {
     )(contextId, senderDid, now, baseCost, thresholdsJson, floor ?? null, cap ?? null);
   }
 
+  /**
+   * Verifies a batch of payment receipts against the configured payment
+   * adapter. Maximum 10,000 receipts per call.
+   *
+   * Returns a JSON object `{"all_valid": <bool>, "results": [...]}`.
+   * `all_valid` is `true` iff every entry both reached the adapter
+   * (`ok === true`) and the adapter reported the receipt valid
+   * (`result.valid === true`); it is vacuously `true` for an empty batch.
+   * Each `results` entry is either `{"receipt_id", "ok": true, "valid",
+   * "result": <structured VerificationResult>}` on success or
+   * `{"ok": false, "error"}` on failure. `ok` means the adapter *responded*
+   * — NOT that the payment is valid; scan `valid`/`all_valid` for validity.
+   *
+   * @throws EconomicPolicyUnsupportedOnWasm on the WASM bridge — receipt
+   *   verification requires a native client whose bridge runs the payment
+   *   adapter (ADR-034).
+   */
   economyVerifyPaymentReceipts(receiptsJson: string): string {
     return (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
   }

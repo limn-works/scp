@@ -453,6 +453,13 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/economyVerifyPaymentReceipts`` on ``inner``.
+    ///
+    /// Verifies a batch of payment receipts against the configured payment
+    /// adapter. Maximum 10,000 receipts per call. Returns a JSON object
+    /// `{"all_valid": <bool>, "results": [...]}`; `all_valid` is vacuously
+    /// `true` for an empty batch. Each entry's `ok` means the adapter
+    /// *responded* — NOT that the payment is valid; scan `valid`/`all_valid`
+    /// for payment validity.
     func economyVerifyPaymentReceipts(receiptsJson: String) async throws -> String {
         try await inner.economyVerifyPaymentReceipts(receiptsJson: receiptsJson)
     }

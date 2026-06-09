@@ -439,15 +439,28 @@ impl crate::scp::PyScp {
     /// timeout budget and is the entry point commit 12 will keep after
     /// `ContextManager` is deleted.
     ///
+    /// Maximum 10,000 receipts per call.
+    ///
     /// # Arguments
     ///
     /// * `receipts_json` — JSON-encoded array of `PaymentReceipt` objects.
     ///
     /// # Returns
     ///
-    /// JSON string: array of per-receipt results. Each entry is either
-    /// `{"receipt_id": hex, "result": ...}` on success or
-    /// `{"error": "...", "code": "..."}` on failure.
+    /// A JSON object `{"all_valid": <bool>, "results": [...]}`. `all_valid`
+    /// is `true` iff every entry both reached the adapter (`ok == true`) and
+    /// the adapter reported the receipt valid (`result.valid == true`); it is
+    /// vacuously `true` for an empty batch. Each `results` entry is either
+    /// `{"receipt_id": <hex>, "ok": true, "valid": <bool>, "result": <structured
+    /// VerificationResult>}` on success or `{"ok": false, "error": "..."}` on
+    /// failure.
+    ///
+    /// `ok` means the adapter *responded* — NOT that the payment is valid.
+    /// Payment validity is carried by the per-entry `valid` field (and the
+    /// structured `result.valid`) and aggregated into top-level `all_valid`.
+    /// A caller scanning for failures must inspect `valid`/`all_valid`, not
+    /// `ok` — an invalid-but-reachable receipt has `ok == true`, `valid ==
+    /// false`.
     ///
     /// # Errors
     ///
@@ -494,21 +507,31 @@ impl crate::scp::PyScp {
 
             // Serialize results. Each entry is a
             // `Result<ReceiptVerification, ReceiptVerificationError>`.
+            // `ok` reports whether the adapter responded; payment validity
+            // is carried by `valid`/`result.valid` and aggregated into the
+            // top-level `all_valid` flag (vacuously true for an empty batch).
+            let mut all_valid = true;
             let entries: Vec<serde_json::Value> = results
                 .into_iter()
                 .map(|r| match r {
-                    Ok(v) => serde_json::json!({
-                        "ok": true,
-                        "receipt_id": hex::encode(v.receipt_id),
-                        "result": format!("{:?}", v.result),
-                    }),
-                    Err(e) => serde_json::json!({
-                        "ok": false,
-                        "error": format!("{e}"),
-                    }),
+                    Ok(v) => {
+                        if !v.result.valid {
+                            all_valid = false;
+                        }
+                        serde_json::json!({
+                            "receipt_id": hex::encode(v.receipt_id),
+                            "ok": true,
+                            "valid": v.result.valid,
+                            "result": v.result,
+                        })
+                    }
+                    Err(e) => {
+                        all_valid = false;
+                        serde_json::json!({ "ok": false, "error": format!("{e}") })
+                    }
                 })
                 .collect();
-            Ok(serde_json::json!({ "results": entries }).to_string())
+            Ok(serde_json::json!({ "all_valid": all_valid, "results": entries }).to_string())
         })
     }
 }

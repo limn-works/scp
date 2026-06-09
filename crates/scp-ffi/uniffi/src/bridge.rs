@@ -15144,8 +15144,18 @@ impl Scp {
     ///
     /// Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
     /// dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
-    /// supervisor, returning a JSON `{"results":[...]}` document with one
-    /// entry per receipt. Mirrors the `PyO3` reference bridge exactly.
+    /// supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
+    /// document with one entry per receipt. Mirrors the `PyO3` reference bridge
+    /// exactly. Maximum 10,000 receipts per call.
+    ///
+    /// `all_valid` is `true` iff every entry both reached the adapter (`ok ==
+    /// true`) and the adapter reported the receipt valid (`result.valid ==
+    /// true`); it is vacuously `true` for an empty batch. Each `results` entry
+    /// is either `{"receipt_id": <hex>, "ok": true, "valid": <bool>, "result":
+    /// <structured VerificationResult>}` on success or `{"ok": false, "error":
+    /// "..."}` on failure. `ok` means the adapter *responded* — NOT that the
+    /// payment is valid; callers scanning for failures must inspect
+    /// `valid`/`all_valid`.
     pub async fn economy_verify_payment_receipts(
         &self,
         receipts_json: String,
@@ -15193,21 +15203,32 @@ impl Scp {
 
                 // Serialize results. Each entry is a
                 // `Result<ReceiptVerification, ReceiptVerificationError>`.
+                // `ok` reports whether the adapter responded; payment validity
+                // is carried by `valid`/`result.valid` and aggregated into the
+                // top-level `all_valid` flag (vacuously true for an empty
+                // batch).
+                let mut all_valid = true;
                 let entries: Vec<serde_json::Value> = results
                     .into_iter()
                     .map(|r| match r {
-                        Ok(v) => serde_json::json!({
-                            "ok": true,
-                            "receipt_id": hex::encode(v.receipt_id),
-                            "result": format!("{:?}", v.result),
-                        }),
-                        Err(e) => serde_json::json!({
-                            "ok": false,
-                            "error": format!("{e}"),
-                        }),
+                        Ok(v) => {
+                            if !v.result.valid {
+                                all_valid = false;
+                            }
+                            serde_json::json!({
+                                "receipt_id": hex::encode(v.receipt_id),
+                                "ok": true,
+                                "valid": v.result.valid,
+                                "result": v.result,
+                            })
+                        }
+                        Err(e) => {
+                            all_valid = false;
+                            serde_json::json!({ "ok": false, "error": format!("{e}") })
+                        }
                     })
                     .collect();
-                Ok(serde_json::json!({ "results": entries }).to_string())
+                Ok(serde_json::json!({ "all_valid": all_valid, "results": entries }).to_string())
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -15593,7 +15614,9 @@ mod tests {
     }
 
     /// `economy_verify_payment_receipts` with an empty receipt array and an
-    /// attached supervisor returns the empty `{"results":[]}` document.
+    /// attached supervisor returns the empty
+    /// `{"all_valid":true,"results":[]}` document — `all_valid` is vacuously
+    /// `true` for an empty batch.
     #[tokio::test]
     async fn economy_verify_payment_receipts_empty_array_returns_empty_results() {
         let scp = scp_test();
@@ -15605,7 +15628,7 @@ mod tests {
             .economy_verify_payment_receipts("[]".to_owned())
             .await
             .expect("empty receipt array must verify successfully");
-        assert_eq!(out, r#"{"results":[]}"#);
+        assert_eq!(out, r#"{"all_valid":true,"results":[]}"#);
     }
 
     /// `economy_verify_payment_receipts` rejects a malformed payload with a
