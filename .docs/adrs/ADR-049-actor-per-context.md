@@ -203,7 +203,11 @@ Proposed on the grounds that the rest of the supervisor's mutable state lives be
 - **Per-identity state scattered.** Reader-side discipline required for `Arc<WrappingKeyPair>` (load → use → drop within same poll), enforced by CI.
 - **Saga `NeedsRepair` requires operator action.** Detection (`saga_repair_needed` metric), inspection, and `repair_saga(saga_id)` admin command are documented in a runbook that ships with the implementation commits (per the plan's doc-deliverables list), at `.docs/runbooks/saga-needs-repair.md`.
 - **Pre-existing dev-database snapshots do not load.** The schema-version check fails with `ContextError::UnsupportedSnapshotVersion`. No migration code; pre-1.0 has no deployed state to preserve.
-- **Test mocks rewritten.** The ~20 existing `impl ContextCryptoProvider` mocks migrate to `MlsBackend` (~10 methods) and/or `HpkeBackend` (~3 methods) — net smaller mock surface per test, more mocks overall because most tests touch both.
+- **Test infrastructure (as built).** The plan called for the ~20 existing `impl ContextCryptoProvider` mocks to migrate onto the new `MlsBackend`/`HpkeBackend` traits. What was actually built diverges and is recorded here so a fresh agent is not misled:
+  - `MockCrypto` and the `ContextCryptoProvider` trait were **deleted outright**, not migrated. There is no per-primitive mock backend in operational use.
+  - The runtime binds the **concrete `MlsCryptoProvider`** everywhere, including in tests. Test accommodations are `cfg!(any(test, feature = "testing"))`-gated *inside the concrete provider* (e.g. accepting `did:key`/`did:test` identities and a `None` key-package) rather than swapped in via a mock impl.
+  - The fullstack E2E harness was re-wired over the concrete provider plus a shared `KeyExchange` side-channel (commit `12c.9f`) that relays the Welcome/key material between independent nodes' `E2eCryptoProvider`s — there is no in-process mock crypto.
+  - The `MlsBackend` injection seam (`with_backends`) exists in the type surface but is **operationally dead**: no production or test path swaps a backend through it; the only coverage is `Arc::ptr_eq` identity asserts proving the seam wires the same instance. It is retained as a future injection point, not an active mock surface. Any future work that needs per-primitive crypto error injection should revive this seam rather than reintroduce a `ContextCryptoProvider`-style omnibus mock.
 - **~13 internal commits.** Large single atomic PR; expected 6–12 full-roster review rounds to double-zero.
 
 **WASM.** Unchanged. `scp-runtime` stays native-only per ADR-034. The actor model does not run in the browser with native parity; `scp-ffi/wasm` continues its re-implementation path.
@@ -250,6 +254,16 @@ Invariants to verify (documented in plan):
 6. Key zeroization — every secret-byte sequence wrapped in `Zeroizing` for its entire memory lifetime.
 7. UCAN validation unchanged.
 8. Spec compliance — any ambiguity is a spec gap, update spec first.
+
+## Follow-ups (sequenced, in the system of record)
+
+These are deferred work items surfaced by the implementation. They are recorded here — not only in commit messages and code comments — so they remain in the system of record.
+
+1. **Spawn-from-Welcome entrypoint.** A Supervisor entrypoint that spawns a per-context `ContextActor` from a *received* Welcome and injects the access/sender keys the joiner picks up while processing it. Without it, a Welcome-joined node has a populated `E2eCryptoProvider` (it can DECRYPT) but no actor-backed send `ContextHandle`, so any send fails closed with "context not found in node's handles" — only the unidirectional path (creator sends, joiner decrypts) works.
+
+   - **Sequencing / ownership.** This is the same gap as, and belongs to, the existing **Welcome-Delivery** effort (relay-mediated Welcome distribution across processes). The actor-spawn-on-Welcome step is the `scp-runtime` half of that work and should land as part of it, not as a standalone change.
+   - **Why deferred here.** The actor-per-context refactor deliberately scoped to the creator-side spawn paths (`create_context`, standing-context bootstrap). Adding a join-side spawn path that also threads picked-up keys into a fresh actor is its own design surface (key-injection ordering vs. the actor snapshot model in Decision 1/8/9) and was kept out of this ADR's atomic PR.
+   - **Tripwires already in place.** The fullstack bidirectional fail-closed assertions in the Python and TypeScript E2E suites are intentional reverse-tripwires: they assert the *current* one-way contract and will fail the moment joiner-send begins working, forcing them to be rewritten into real bidirectional roundtrips when this entrypoint lands. The PyO3 and NAPI `fullstack_join_from_welcome*` doc comments document the same contract.
 
 ## References
 

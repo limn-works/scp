@@ -101,6 +101,13 @@ class TestBobSendsAliceDecrypts:
         # Joiner-sends is not yet supported under the actor-per-context model
         # (no spawn-from-Welcome entrypoint — Welcome-Delivery work item). The
         # send must fail closed, not fake a roundtrip.
+        #
+        # INTENTIONAL TRIPWIRE: this positive fail-closed assertion verifies the
+        # CURRENT one-way contract and is meant to trip loudly the moment the
+        # behavior changes. When the Welcome-Delivery / spawn-from-Welcome
+        # entrypoint lands and joiner-send starts working, this assertion MUST be
+        # rewritten into a real bidirectional roundtrip (Bob sends, Alice
+        # decrypts) — not deleted or relaxed.
         with pytest.raises(RuntimeError, match="not found in node's handles"):
             scp._native.fullstack_send_message(bob, ctx_id, b"Hello from Bob via Python!")
 

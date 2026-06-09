@@ -665,9 +665,6 @@ impl Supervisor {
         &self.local_dids
     }
 
-    // NB: `&self.local_dids` is `&Arc<ArcSwap<_>>`; deref coercion yields the
-    // `&ArcSwap<_>` the signature promises.
-
     /// Cheap `Arc::clone` of the shared `local_dids` swap cell, handed to
     /// [`ActorDeps`] so every per-context actor reads from the SAME cell
     /// the supervisor writes to via [`Self::local_dids_ref`]. Sharing the
@@ -6463,7 +6460,7 @@ mod tests {
         );
         assert!(
             deps.local_dids.load().is_empty(),
-            "local_dids snapshots the fresh supervisor's empty set"
+            "local_dids shares the fresh supervisor's (empty) set"
         );
         deps.key_package_store
             .send_shutdown()

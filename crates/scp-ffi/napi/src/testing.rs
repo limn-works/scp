@@ -237,6 +237,15 @@ pub(crate) fn fullstack_add_member_on(
 }
 
 /// Per-bridge-instance implementation of [`fullstack_join_from_welcome`].
+///
+/// The joiner's `E2eCryptoProvider` processes the Welcome and picks up the
+/// access/sender keys so it can DECRYPT messages from the creator. It does
+/// NOT register a per-context send `ContextHandle`: the actor-per-context
+/// model has no spawn-from-Welcome entrypoint yet (the separate
+/// Welcome-Delivery work item), so a subsequent `fullstack_send_message` on a
+/// Welcome-joined node fails closed with "context not found in node's
+/// handles". The unidirectional path (creator sends, joiner decrypts) is
+/// fully supported.
 pub(crate) fn fullstack_join_from_welcome_on(
     bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,

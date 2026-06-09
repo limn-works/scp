@@ -224,9 +224,14 @@ fn fullstack_add_member_impl(
 
 /// Joins a context by retrieving the Welcome from the shared `KeyExchange`.
 ///
-/// After joining, the context is registered on the joiner's `ContextManager`
-/// with a `ContextHandle`, enabling subsequent `py_fullstack_send_message`
-/// and `py_fullstack_remove_member` calls on this node.
+/// The joiner's `E2eCryptoProvider` processes the Welcome and picks up the
+/// access/sender keys so it can DECRYPT messages from the creator. It does
+/// NOT register a per-context send `ContextHandle`: the actor-per-context
+/// model has no spawn-from-Welcome entrypoint yet (the separate
+/// Welcome-Delivery work item), so a subsequent `fullstack_send_message` on a
+/// Welcome-joined node fails closed with "context not found in node's
+/// handles". The unidirectional path (creator sends, joiner decrypts) is
+/// fully supported.
 fn fullstack_join_from_welcome_impl(
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,

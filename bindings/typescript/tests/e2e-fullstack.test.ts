@@ -153,6 +153,13 @@ if (addon === null) {
       // (no spawn-from-Welcome entrypoint — tracked as the Welcome-Delivery
       // work). The send must fail closed with a clean error rather than
       // silently producing unverifiable crypto.
+      //
+      // INTENTIONAL TRIPWIRE: this positive fail-closed assertion verifies the
+      // CURRENT one-way contract and is meant to trip loudly the moment the
+      // behavior changes. When the Welcome-Delivery / spawn-from-Welcome
+      // entrypoint lands and joiner-send starts working, this assertion MUST be
+      // rewritten into a real bidirectional roundtrip (Bob sends, Alice
+      // decrypts) — not deleted or relaxed.
       expect(() => scp.fullstackSendMessage(bob, ctxId, Buffer.from("Hello from Bob!"))).toThrow(
         /not found in node's handles/,
       );

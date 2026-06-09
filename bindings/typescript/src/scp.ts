@@ -215,7 +215,10 @@ export function __clampShutdownMillisForTests(timeoutSecs: number): number {
  *     accepts either shape.
  * - `sqlite` + `passphrase` forwards `path` and the `passphrase` string
  *   verbatim; the NAPI layer derives the SQLCipher key via Argon2id
- *   (spec §17.6). Exactly one of `key`/`passphrase` is forwarded.
+ *   (spec §17.6). Whichever of `key`/`passphrase` is present is forwarded;
+ *   the exactly-one (XOR) decision is deferred to the NAPI layer
+ *   (SCP-VALID-7005), so a caller that supplies BOTH reaches the guard and
+ *   is rejected rather than having one field silently dropped.
  *
  * Exported for tests so the wire format can be asserted without a live
  * native addon.
