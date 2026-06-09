@@ -38,6 +38,7 @@ use scp_event_log::proof::{Direction, prove_absence, prove_inclusion, verify_inc
 use scp_event_log::tree::{append_unsigned_event, event_count, root};
 use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
 
+use scp_protocol::context::EXPORT_SCOPE_TAG_FULL;
 use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
 use scp_protocol::context::governance::{
     AccessScope, ConflictResolution, GovernanceAction, GovernanceProposal, ProposalStatus,
@@ -5158,10 +5159,12 @@ impl WasmContextManager {
         canonicalize_snapshot_sets(&mut snapshot);
         let snapshot = snapshot;
 
-        // Serialize snapshot to RFC 8785 JCS canonical JSON for HMAC
-        // computation. The HMAC is computed over this stable serialization —
-        // NOT the full envelope — to avoid a circular dependency (envelope
-        // contains the MAC).
+        // Serialize snapshot to RFC 8785 JCS canonical JSON. This stable
+        // serialization feeds BOTH the primary Ed25519 snapshot-signature
+        // digest (SHA-256(domain || scope_tag || snapshot_jcs), §23.16.8) and
+        // the defense-in-depth HMAC below. Both are computed over the snapshot
+        // serialization — NOT the full envelope — to avoid a circular
+        // dependency (the envelope embeds both the MAC and the signature).
         let snapshot_json =
             serde_json_canonicalizer::to_vec(&snapshot).map_err(|e| ScpWasmError::Context {
                 message: format!("export snapshot serialization failed: {e}"),
@@ -5181,6 +5184,12 @@ impl WasmContextManager {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(WASM_EXPORT_SIGN_DOMAIN);
+            // Bind the export-scope discriminant into the preimage so a Full-scope
+            // signature can never be replayed as a Public-scope one (or vice versa)
+            // across bridges. WASM only ever produces Full-scope exports (the
+            // envelope has no scope field), so bind the shared FULL tag — using the
+            // scp-protocol constant so native and WASM cannot drift (§23.16.8).
+            hasher.update([EXPORT_SCOPE_TAG_FULL]);
             hasher.update(&snapshot_json);
             let digest: [u8; 32] = hasher.finalize().into();
             digest
@@ -5252,7 +5261,11 @@ impl WasmContextManager {
                     "incompatible export version: got {}, max supported is {WASM_EXPORT_VERSION}",
                     envelope.version
                 ),
-                code: codes::CTX_2032.to_owned(),
+                // Dedicated version-gate code (SCP-CTX-2094): the export format
+                // version is unsupported, distinct from a signature failure
+                // (SCP-CTX-2093). Lets a caller tell "wrong/newer format" apart
+                // from "tampered/forged signature".
+                code: codes::CTX_2094.to_owned(),
             });
         }
 
@@ -5264,11 +5277,16 @@ impl WasmContextManager {
         if envelope.version < WASM_EXPORT_VERSION {
             return Err(ScpWasmError::Context {
                 message: format!(
-                    "unsupported export version: {} predates snapshot signing — \
-                     required version is {WASM_EXPORT_VERSION} (refusing unverifiable import)",
+                    "unsupported export version: {} predates the current signed-export \
+                     format — required version is {WASM_EXPORT_VERSION} (refusing \
+                     unverifiable import)",
                     envelope.version
                 ),
-                code: codes::CTX_2032.to_owned(),
+                // Dedicated version-gate code (SCP-CTX-2094): the export format
+                // version predates the current signed-export preimage, so its
+                // signature was computed over a different construction and is not
+                // verifiable here. Distinct from a signature failure (CTX-2093).
+                code: codes::CTX_2094.to_owned(),
             });
         }
 
@@ -5371,6 +5389,9 @@ impl WasmContextManager {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(WASM_EXPORT_SIGN_DOMAIN);
+            // Bind the FULL export-scope tag identically to the producer
+            // (§23.16.8) so a freshly-exported WASM snapshot still verifies.
+            hasher.update([EXPORT_SCOPE_TAG_FULL]);
             hasher.update(snapshot_json);
             let digest: [u8; 32] = hasher.finalize().into();
             digest
@@ -5452,8 +5473,9 @@ impl WasmContextManager {
         // imported contexts that require a newer SDK than we support.
         parse_and_check_min_protocol_version(&snap.params_json)?;
 
-        // Validate v3 anti-replay fields (defense-in-depth; HMAC already
-        // covers tamper detection, but we validate shape and bounds to
+        // Validate v3 anti-replay fields (defense-in-depth; the Ed25519
+        // snapshot signature already covers tamper detection, but we validate
+        // shape and bounds to
         // fail loud, not silently accept malformed state).
         validate_imported_antispam_state(snap)?;
 
@@ -5823,7 +5845,7 @@ pub struct ContextMetadata {
 ///   v3 exports are NOT importable by v2 binaries because the version
 ///   check below rejects exports with `version > WASM_EXPORT_VERSION`,
 ///   which prevents silent loss of the new lossless state.
-const WASM_EXPORT_VERSION: u32 = 4;
+const WASM_EXPORT_VERSION: u32 = 5;
 
 /// Maximum byte length of a context-export envelope accepted by
 /// [`WasmContextManager::deserialize_and_verify_envelope`].
@@ -5862,11 +5884,14 @@ const WASM_EXPORT_SIGN_DOMAIN: &[u8] = b"SCP-CONTEXT-EXPORT-V1:";
 /// Serialized as JSON bytes. The version field enables forward-compatible
 /// deserialization: import rejects exports with version > `WASM_EXPORT_VERSION`.
 ///
-/// Integrity protection: `integrity_mac` contains an HMAC-SHA256 tag computed
-/// over the canonical JSON serialization of the `snapshot` field, keyed by an
-/// HKDF-derived key from the context creator's Ed25519 signing key. This
-/// prevents an attacker from crafting import payloads that grant themselves
-/// admin over a context.
+/// Integrity protection: the authoritative cross-party integrity proof is the
+/// mandatory Ed25519 `snapshot_signature` (§23.16.8) over
+/// `SHA-256(domain || scope_tag || snapshot_jcs)`. The `integrity_mac`
+/// HMAC-SHA256 tag is computed over the SAME snapshot preimage and is strictly
+/// defense-in-depth: it is fully subsumed by the signature and is verified only
+/// on self-import, when the creator's key is available in the local registry.
+/// It is retained transitionally and is NOT the authoritative integrity proof —
+/// the signature is. (A separate cleanup may remove the HMAC entirely.)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WasmContextExportEnvelope {
     /// Export format version.
@@ -5877,8 +5902,12 @@ struct WasmContextExportEnvelope {
     exporter_did: String,
     /// HMAC-SHA256 tag (hex-encoded) over the canonical JSON serialization of
     /// the `snapshot` field. Keyed by `HKDF(creator_signing_key,
-    /// info="scp-context-export-integrity-v1")`. Verified on import to prevent
-    /// tampering with membership, roles, or governance state.
+    /// info="scp-context-export-integrity-v1")`. Defense-in-depth ONLY: it
+    /// covers the identical preimage as the mandatory Ed25519
+    /// `snapshot_signature` and is fully subsumed by it. Verified only on
+    /// self-import (when the creator's key is locally available); skipped on
+    /// cross-party import, where the signature already provides integrity. It
+    /// is NOT the authoritative cross-party integrity proof — the signature is.
     integrity_mac: String,
     /// Ed25519 signature (hex-encoded, 64 bytes) by the creator's `#active`
     /// signing key over `SHA-256(SCP-CONTEXT-EXPORT-V1: || snapshot_jcs)`
@@ -6756,10 +6785,61 @@ mod tests {
     fn export_version_matches_signed_constant() {
         // The WASM JSON-envelope version is an independent per-serializer
         // integer (§23.16.8): it need NOT equal the native MessagePack
-        // export version. It is currently 4 — the version that introduced the
-        // Ed25519 full-snapshot signature. This test pins the constant so a
-        // change is deliberate.
-        assert_eq!(WASM_EXPORT_VERSION, 4);
+        // export version. It is currently 5 — the version that bound the
+        // export-scope discriminant into the Ed25519 signed preimage (v4
+        // introduced the full-snapshot signature). This test pins the constant
+        // so a change is deliberate.
+        assert_eq!(WASM_EXPORT_VERSION, 5);
+    }
+
+    /// **§23.16.8 version-gate:** an envelope whose version exceeds the current
+    /// supported version is rejected with the dedicated version-gate code
+    /// (SCP-CTX-2094), NOT a generic validation or signature-failure code.
+    #[test]
+    fn deserialize_rejects_newer_version_with_ctx_2094() {
+        let snapshot = make_minimal_valid_snapshot();
+        let envelope = WasmContextExportEnvelope {
+            version: WASM_EXPORT_VERSION + 1,
+            exported_at: 0,
+            exporter_did: snapshot.creator_did.clone(),
+            integrity_mac: String::new(),
+            snapshot_signature: String::new(),
+            snapshot,
+        };
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let err = WasmContextManager::deserialize_and_verify_envelope(&bytes).unwrap_err();
+        match err {
+            ScpWasmError::Context { ref code, .. } => {
+                assert_eq!(code, codes::CTX_2094);
+            }
+            other => panic!("expected version-gate Context error, got: {other:?}"),
+        }
+    }
+
+    /// **§23.16.8 version-gate:** an envelope whose version predates the current
+    /// signed-export format is rejected with SCP-CTX-2094 (its signature was
+    /// computed over a different preimage and cannot be verified here), distinct
+    /// from the signature-failure code SCP-CTX-2093.
+    #[test]
+    fn deserialize_rejects_older_version_with_ctx_2094() {
+        let snapshot = make_minimal_valid_snapshot();
+        let envelope = WasmContextExportEnvelope {
+            version: WASM_EXPORT_VERSION - 1,
+            exported_at: 0,
+            exporter_did: snapshot.creator_did.clone(),
+            integrity_mac: String::new(),
+            snapshot_signature: String::new(),
+            snapshot,
+        };
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let err = WasmContextManager::deserialize_and_verify_envelope(&bytes).unwrap_err();
+        match err {
+            ScpWasmError::Context { ref code, .. } => {
+                assert_eq!(code, codes::CTX_2094);
+                assert_ne!(code, codes::CTX_2093);
+            }
+            other => panic!("expected version-gate Context error, got: {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7301,6 +7381,7 @@ mod tests {
         let json = serde_json_canonicalizer::to_vec(&snap).unwrap();
         let mut hasher = Sha256::new();
         hasher.update(WASM_EXPORT_SIGN_DOMAIN);
+        hasher.update([EXPORT_SCOPE_TAG_FULL]);
         hasher.update(&json);
         hasher.finalize().into()
     }
