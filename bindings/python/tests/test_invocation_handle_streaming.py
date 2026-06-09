@@ -37,6 +37,7 @@ from scp_sdk.errors import (
 from scp_sdk.outlets import (
     Aggregate,
     InvocationHandle,
+    OutletNamespace,
     OutletStreamChunk,
 )
 
@@ -676,3 +677,184 @@ class TestRecheckLoopTeardown:
 
         assert handle.is_terminated is True
         assert recheck_cancelled.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Factory uses the running loop (get_running_loop), not a fresh loop
+# ---------------------------------------------------------------------------
+
+
+class TestFactoryRunningLoop:
+    """The synchronous ``invoke`` factory schedules its background pump on
+    the CALLER's running event loop.
+
+    The factory must use ``asyncio.get_running_loop()`` — never
+    ``new_event_loop()``. A fresh, never-run loop would schedule the pump
+    on a loop that is never driven, so ``await handle`` would hang
+    forever. These tests prove the pump actually runs (driven by the live
+    loop) and that the factory refuses to run outside a loop at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_shot_pump_runs_on_running_loop(self, monkeypatch: Any) -> None:
+        from scp_sdk import outlets as outlets_mod
+
+        def fake_invoke(
+            context_id: str,
+            outlet_id: str,
+            input: dict[str, Any],
+            invoker_did: str,
+            ucan_token: str | None,
+            proof_tokens: list[str] | None,
+            spending_ucan: str | None,
+        ) -> dict[str, Any]:
+            return {"ok": True}
+
+        class _FakeBridge:
+            context_outlet_invoke = staticmethod(fake_invoke)
+
+        # Both the module-level `_scp_core` (read directly inside the pump)
+        # and `_require_bridge()` resolve to the fake.
+        monkeypatch.setattr(outlets_mod, "_scp_core", _FakeBridge)
+
+        ns = OutletNamespace("did:dht:ctx", "did:dht:creator")
+        handle = ns.invoke(
+            "outlet-x",
+            {"in": 1},
+            ucan_token="ucan-token",
+        )
+        # If the pump were scheduled on a never-run loop this would hang;
+        # `wait_for` bounds the proof. The aggregate resolving is the
+        # evidence the pump ran on the live running loop.
+        agg = await asyncio.wait_for(handle, timeout=1.0)
+        assert agg.value == {"ok": True}
+
+    def test_invoke_outside_running_loop_raises_runtime_error(self, monkeypatch: Any) -> None:
+        # Calling the synchronous factory with NO running loop must raise
+        # RuntimeError from `get_running_loop()` rather than silently
+        # spinning up a fresh, never-run loop (the old broken fallback).
+        from scp_sdk import outlets as outlets_mod
+
+        class _FakeBridge:
+            @staticmethod
+            def context_outlet_invoke(*_a: Any, **_k: Any) -> dict[str, Any]:
+                return {"ok": True}
+
+        monkeypatch.setattr(outlets_mod, "_scp_core", _FakeBridge)
+
+        ns = OutletNamespace("did:dht:ctx", "did:dht:creator")
+        with pytest.raises(RuntimeError):
+            ns.invoke("outlet-x", {"in": 1}, ucan_token="ucan-token")
+
+
+# ---------------------------------------------------------------------------
+# aclose() re-raises the CALLER's own cancellation
+# ---------------------------------------------------------------------------
+
+
+class TestAcloseCancellationPropagation:
+    """``aclose()`` swallows the child tasks' expected cancellation but
+    must propagate a cancellation aimed at the CALLER's own task.
+
+    Swallowing the caller's cancellation would break structured
+    concurrency: an outer ``task.cancel()`` that lands while ``aclose()``
+    is awaiting a child task must still tear the caller down.
+    """
+
+    @pytest.mark.asyncio
+    async def test_aclose_swallows_child_cancellation(self) -> None:
+        # The normal case: aclose() cancels its own child tasks and the
+        # CancelledError they raise (child finishes in the cancelled
+        # state) is swallowed — aclose() completes normally.
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        handle = InvocationHandle(q, request_id="ba" * 16, invoker_did="did:dht:invoker")
+
+        async def _never_ending() -> None:
+            while True:
+                await asyncio.sleep(0.01)
+
+        handle._pump_task = asyncio.create_task(_never_ending())
+        await asyncio.sleep(0.02)
+
+        # Must NOT raise — the child's cancellation is expected and owned
+        # by aclose().
+        await handle.aclose()
+        assert handle.is_terminated is True
+
+    @pytest.mark.asyncio
+    async def test_aclose_reraises_caller_cancellation(self) -> None:
+        # A cancellation that interrupts aclose()'s `await task` but is NOT
+        # the awaited child's own cancellation (the child did not finish in
+        # the cancelled state) must propagate, not be swallowed. This is
+        # the caller's-own-cancellation case.
+        #
+        # Deterministic seam: a task-shaped stand-in whose `await` raises
+        # CancelledError while `cancelled()` reports False — exactly the
+        # signature of "an external cancel hit our await, the child is not
+        # itself cancelled". aclose() must re-raise on this shape.
+        class _ExternalCancelTask:
+            """Mimics an asyncio.Task whose await is interrupted by an
+            EXTERNAL cancellation. `cancelled()` stays False because the
+            task itself did not finish cancelled."""
+
+            def __init__(self) -> None:
+                self._cancel_calls = 0
+
+            def done(self) -> bool:
+                return False
+
+            def cancel(self) -> bool:
+                self._cancel_calls += 1
+                return True
+
+            def cancelled(self) -> bool:
+                # NOT cancelled — the CancelledError raised below belongs
+                # to the caller, not to this child task.
+                return False
+
+            def __await__(self):  # type: ignore[no-untyped-def]
+                async def _raise() -> None:
+                    raise asyncio.CancelledError
+
+                return _raise().__await__()
+
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        handle = InvocationHandle(q, request_id="bc" * 16, invoker_did="did:dht:invoker")
+        handle._pump_task = _ExternalCancelTask()  # type: ignore[assignment]
+
+        # aclose() must NOT swallow this CancelledError — it belongs to the
+        # caller (the awaited child is not `cancelled()`).
+        with pytest.raises(asyncio.CancelledError):
+            await handle.aclose()
+
+    @pytest.mark.asyncio
+    async def test_aclose_swallows_childs_own_cancellation(self) -> None:
+        # The mirror case: a child that finishes in the cancelled state
+        # (its own expected response to aclose()'s cancel) is swallowed —
+        # aclose() completes normally. Distinguishes from the caller's-own
+        # cancellation case above purely by `cancelled()`.
+        class _SelfCancelledTask:
+            def done(self) -> bool:
+                return False
+
+            def cancel(self) -> bool:
+                return True
+
+            def cancelled(self) -> bool:
+                # The child finished cancelled — this CancelledError is its
+                # OWN, owned by aclose(), and must be swallowed.
+                return True
+
+            def __await__(self):  # type: ignore[no-untyped-def]
+                async def _raise() -> None:
+                    raise asyncio.CancelledError
+
+                return _raise().__await__()
+
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        handle = InvocationHandle(q, request_id="bd" * 16, invoker_did="did:dht:invoker")
+        handle._recheck_task = _SelfCancelledTask()  # type: ignore[assignment]
+
+        # Must NOT raise — the child's own cancellation is owned by aclose.
+        await handle.aclose()
+        assert handle.is_terminated is True

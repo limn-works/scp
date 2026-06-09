@@ -633,15 +633,29 @@ class InvocationHandle:
         self._closed = True
         self._terminated = True
         for task in (self._recheck_task, self._pump_task):
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    # Swallow cancellation and any in-flight pump/recheck
-                    # error surfaced at cancel time — aclose() is a
-                    # best-effort resource release, not a result channel.
-                    pass
+            if task is None or task.done():
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                # A CancelledError here is EITHER the child's expected
+                # response to our `task.cancel()` (swallow — that is the
+                # whole point of aclose) OR a cancellation aimed at the
+                # CALLER's own task that interrupted our `await task`
+                # (must propagate — swallowing it would break the
+                # caller's cancellation). On Python >= 3.10 the reliable,
+                # version-portable discriminator is `task.cancelled()`:
+                # if the child finished in the cancelled state the error
+                # was its own; otherwise our await was interrupted from
+                # the outside and the cancellation belongs to the caller.
+                if not task.cancelled():
+                    raise
+            except Exception:
+                # Genuine in-flight pump/recheck error surfaced at cancel
+                # time — aclose() is a best-effort resource release, not a
+                # result channel, so swallow non-cancellation failures.
+                pass
 
     async def __aenter__(self) -> InvocationHandle:
         return self
@@ -1444,11 +1458,12 @@ class OutletNamespace:
             )
             q.put_nowait(None)
 
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        # Same running-loop requirement as the streaming factory: this
+        # synchronous `invoke` is only callable from inside a running
+        # event loop, so `get_running_loop()` is correct. A
+        # `new_event_loop()` fallback would schedule the pump on a loop
+        # that is never run, hanging the single-shot handle forever.
+        loop = asyncio.get_running_loop()
         handle = InvocationHandle(q, aggregate_schema=aggregate_schema)
         # Pump task ownership lives on the handle for the lifetime of the stream.
         handle._pump_task = loop.create_task(_pump())  # type: ignore[attr-defined]
@@ -1549,11 +1564,13 @@ class OutletNamespace:
                 # forever.
                 handle._mark_terminated()
 
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        # `invoke` is a synchronous factory that schedules the background
+        # pump + recheck tasks; it is only callable from inside a running
+        # event loop (the SDK's I/O model — `await handle` / `async for`
+        # drive the loop). `get_running_loop()` is therefore the correct
+        # accessor: a `new_event_loop()` fallback would schedule the pump
+        # on a loop that is never run, hanging the stream forever.
+        loop = asyncio.get_running_loop()
         handle = InvocationHandle(
             q,
             request_id=request_id_hex,
