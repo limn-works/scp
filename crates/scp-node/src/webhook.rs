@@ -20,6 +20,16 @@ static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Maximum number of retry attempts for failed webhook deliveries.
 const MAX_RETRIES: u32 = 3;
 
+/// Maximum number of per-event dispatch tasks the event consumer may have
+/// in flight at once. Mirrors [`WebhookDispatcher::MAX_TARGETS`]: a single
+/// event fans out to at most `MAX_TARGETS` targets, so this bounds the live
+/// task count to one event's worth of fan-out under saturation. Acts as the
+/// backpressure cap that keeps the consumer-owned `JoinSet` from growing
+/// without bound under sustained event rate (each dispatch can walk the full
+/// retry ladder — 3 attempts x 10s timeout plus backoff — so the in-flight
+/// set would otherwise grow as rate x latency x targets).
+const MAX_INFLIGHT_DISPATCHES: usize = 256;
+
 /// Initial retry delay in milliseconds (doubles on each retry).
 const INITIAL_RETRY_DELAY_MS: u64 = 500;
 
@@ -635,46 +645,84 @@ pub fn map_context_event(
 /// dropped) or the returned [`tokio::task::JoinHandle`] is aborted.
 /// Lagged events are logged and skipped.
 ///
-/// # Drain-vs-dispatch decoupling
+/// # Drain-vs-dispatch decoupling (bounded, consumer-owned)
 ///
 /// The supervisor's event channel is a single bounded broadcast shared across
 /// ALL contexts the node hosts. Dispatch is slow and adversary-influenced: a
 /// single unreachable or hostile webhook target walks the full retry ladder
-/// (exponential backoff plus per-attempt 10s timeouts), which can take several
-/// seconds per event. If the recv loop awaited each dispatch inline, one
-/// high-latency target on one context would stall the drain for the entire
-/// shared channel and silently evict another context's audit events
+/// (exponential backoff plus per-attempt 10s timeouts — up to ~31.5s per
+/// event), which can take many seconds. If the recv loop awaited each dispatch
+/// inline, one high-latency target on one context would stall the drain for the
+/// entire shared channel and silently evict another context's audit events
 /// (`member.left`, `MemberBlocked`, `governance.action`) before they were ever
 /// read.
 ///
-/// To keep the drain running at channel speed, each event's dispatch is moved
-/// onto its own [`tokio::spawn`]ed task and the loop proceeds to the next
-/// `recv()` immediately. The dispatcher is an [`Arc`], so it is cheaply cloned
-/// into each task. These dispatch tasks are best-effort: they are not tracked
-/// and die with the runtime when the node shuts down (the consumer's own
-/// lifecycle — cancellation/abort via the supervising `JoinSet` — tears the
-/// node down). `dispatch_event` owns all of its own error handling and retries
-/// and never panics, so a detached dispatch task cannot escape a panic. The
-/// per-event spawn is bounded by the cap-1024 broadcast burst, so it does not
-/// introduce an unbounded backlog primitive.
+/// To keep the drain running at channel speed WITHOUT leaking or unboundedly
+/// accumulating dispatch work, each event's dispatch is spawned onto a
+/// [`tokio::task::JoinSet`] **owned by this consumer task** and guarded by an
+/// [`Arc<tokio::sync::Semaphore`][`tokio::sync::Semaphore`] sized to
+/// [`MAX_INFLIGHT_DISPATCHES`]. Two invariants follow:
+///
+/// 1. **Bounded concurrency / backpressure.** An owned permit is acquired
+///    BEFORE each dispatch is spawned. Once `MAX_INFLIGHT_DISPATCHES` permits
+///    are out, the recv loop blocks on `acquire_owned()` until an in-flight
+///    dispatch finishes and returns its permit. The live dispatch-task count is
+///    therefore capped at the semaphore size regardless of event rate — there
+///    is no unbounded backlog primitive. (The broadcast channel's cap-1024
+///    buffer is drain depth, NOT in-flight task count; the semaphore is what
+///    actually bounds concurrency.) Saturation applies backpressure to the
+///    drain, which under sustained overload manifests as channel lag — surfaced
+///    by the `Lagged` arm below, not as silent memory growth.
+///
+/// 2. **Deterministic teardown on instance shutdown.** The `JoinSet` of
+///    dispatch tasks lives INSIDE this consumer's async block. The supervising
+///    `spawn_supervised_event_consumer` (in `scp-ffi/common`) aborts THIS
+///    consumer task when the bridge instance's cancellation token fires. Abort
+///    drops the consumer future, which drops the owned `JoinSet`, and dropping a
+///    `JoinSet` aborts every task it owns. So every outstanding dispatch task is
+///    torn down with the instance — they do NOT outlive it as detached tasks
+///    leaking `reqwest` clients and sockets across the process-global runtime
+///    (which is never dropped per-instance). On normal channel close we also
+///    `shutdown().await` the set for a best-effort drain before returning.
+///
+/// `dispatch_event` owns all of its own error handling and retries and never
+/// panics, so a dispatch task cannot escape a panic.
 pub fn spawn_event_consumer(
     mut rx: tokio::sync::broadcast::Receiver<(String, scp_core::context::membership::ContextEvent)>,
     dispatcher: Arc<WebhookDispatcher>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Consumer-owned set of in-flight dispatch tasks. Owned INSIDE this
+        // future so that aborting the consumer (instance shutdown) drops the
+        // set and tears down every outstanding dispatch task.
+        let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // Bounds the number of concurrently in-flight dispatch tasks. Owned and
+        // never closed, so `acquire_owned()` is effectively infallible.
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_DISPATCHES));
+
         loop {
+            // Reap completed dispatch tasks so the JoinSet does not retain
+            // finished handles between events.
+            while inflight.try_join_next().is_some() {}
+
             match rx.recv().await {
                 Ok((context_id, event)) => {
                     // `event_type` is a `&'static str`, so it moves into the
                     // dispatch task without allocation.
                     let (event_type, payload) = map_context_event(&event);
-                    // Decouple the drain from dispatch latency: spawn the
-                    // per-event dispatch so the next recv() proceeds at channel
-                    // speed and a slow target on one context cannot evict
-                    // another context's audit events. Best-effort: the task
-                    // dies with the runtime on shutdown.
+                    // Acquire a permit BEFORE spawning so saturation applies
+                    // backpressure (bounded) rather than spawning unboundedly.
+                    // The semaphore is owned and never closed, so this only
+                    // errors on a closed semaphore — treat that impossible case
+                    // as a stop signal without panicking.
+                    let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+                        break;
+                    };
                     let dispatcher = Arc::clone(&dispatcher);
-                    tokio::spawn(async move {
+                    inflight.spawn(async move {
+                        // Hold the permit for the lifetime of the dispatch; it
+                        // is released when this task completes, freeing a slot.
+                        let _permit = permit;
                         dispatcher
                             .dispatch_event(&context_id, event_type, payload)
                             .await;
@@ -701,6 +749,11 @@ pub fn spawn_event_consumer(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::info!("webhook event channel closed — consumer stopping");
+                    // Best-effort drain of in-flight dispatches before exiting.
+                    // (On instance-cancel abort this future is dropped instead,
+                    // which aborts the set; this arm covers the clean-close path
+                    // where all broadcast senders were dropped.)
+                    inflight.shutdown().await;
                     break;
                 }
             }

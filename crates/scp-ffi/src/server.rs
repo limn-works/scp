@@ -813,6 +813,47 @@ mod tests {
         node.shutdown();
     }
 
+    /// Regression guard on the `PyO3` reference bridge: after node startup the
+    /// production `Supervisor` must have its event broadcast channel enabled, so
+    /// `subscribe_events()` yields a receiver. This is the runtime counterpart
+    /// to the `NAPI`/`UniFFI` `node_startup_enables_context_event_channel`
+    /// tests. Before this assertion existed, `PyO3`'s "actually wired" guarantee
+    /// rested solely on a `pipeline_wiring.rs` string-match — the same false-green
+    /// that let the original cross-bridge webhook wiring drift go unnoticed
+    /// (only `PyO3` had been wired and no runtime test proved even that).
+    #[test]
+    fn node_startup_enables_context_event_channel() {
+        // Initialize the process-global tokio runtime the same way `rt()` does;
+        // `node_start_in_memory` fetches it via `crate::runtime()`.
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            // Production callers choose storage before node startup (spec §17.6 —
+            // the runtime never defaults storage). Mirror the SDK by selecting
+            // in-memory storage, which is the storage source `build_supervisor`
+            // derives `mls_storage` from.
+            let config = pyo3::types::PyDict::new(py);
+            config
+                .set_item("type", "in_memory")
+                .expect("set storage type");
+            let scp = crate::scp::PyScp::with_storage(py, &config)
+                .expect("in-memory storage config must construct");
+            let node = scp
+                .node_start_in_memory(py, None)
+                .expect("node startup must succeed");
+
+            let supervisor = crate::runtime::supervisor(&scp.inner)
+                .expect("Supervisor must be attached after node startup");
+            assert!(
+                supervisor.subscribe_events().is_some(),
+                "node startup must enable the Supervisor event channel so the \
+                 webhook dispatcher consumer can subscribe"
+            );
+
+            node.shutdown();
+        });
+    }
+
     #[test]
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-pyo3-node-test-{}", std::process::id()));

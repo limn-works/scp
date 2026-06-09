@@ -233,6 +233,71 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
     observed.expect("a MessageSent event must reach the subscriber before timeout");
 }
 
+/// A live `Supervisor` emitting a SECURITY/AUDIT event — `MemberLeft`, one of
+/// the variants the lag-warning flags as critical (spec §12.10.5) — reaches a
+/// `subscribe_events()` subscriber with the correct shape. The `MessageSent`
+/// test above proves the channel carries application traffic; this proves an
+/// actual audit event reaches the channel, which is the security-relevant
+/// guarantee the webhook dispatcher and Merkle event log both depend on.
+///
+/// Driving a leave is the simplest deterministic audit-event producer: the
+/// context creator (alice) leaves her own context, which emits a payload-free
+/// `MemberLeft { member_did: alice }` onto the broadcast channel.
+#[tokio::test]
+async fn supervisor_leave_emits_member_left_audit_event_to_subscriber() {
+    let (supervisor, _event_tx) = supervisor_with_event_channel();
+
+    let mut rx = supervisor
+        .subscribe_events()
+        .expect("event channel was enabled via with_providers");
+
+    let ctx_id = "ctx-audit-wire";
+    let params = ContextParams {
+        ceiling: messaging_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    let handle = supervisor
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .expect("context creation should succeed");
+    assert_eq!(handle.context_id(), ctx_id);
+
+    // Drive a real leave: alice (the creator, and sole member) leaves her own
+    // context. This is the producer — the actor emits a MemberLeft audit event
+    // onto the broadcast channel.
+    let leave_handle = ContextHandle::new(ctx_id.to_owned(), handle.params().clone());
+    supervisor
+        .leave_context(&leave_handle, &alice(), &alice())
+        .await
+        .expect("alice (creator) can leave her own context");
+
+    // Drain the channel until the MemberLeft audit event arrives (bounded — fail
+    // fast if the producer wire is broken). Other variants (e.g. MemberJoined
+    // emitted on create) may precede it.
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok((cid, event)) => {
+                    assert_eq!(cid, ctx_id, "events carry their originating context id");
+                    if let ContextEvent::MemberLeft { member_did } = &event {
+                        assert_eq!(
+                            member_did.as_ref(),
+                            alice().as_ref(),
+                            "the MemberLeft audit event must name the departing member"
+                        );
+                        break;
+                    }
+                }
+                Err(e) => panic!("channel error before observing MemberLeft: {e:?}"),
+            }
+        }
+    })
+    .await;
+
+    observed.expect("a MemberLeft audit event must reach the subscriber before timeout");
+}
+
 /// A `Supervisor` built without the event channel (the `test_supervisor` /
 /// `for_query_shim` shape) returns `None` from `subscribe_events()` rather than
 /// panicking — the defensive branch the FFI wiring relies on (ADR-049 §12a).

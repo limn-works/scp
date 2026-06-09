@@ -107,6 +107,26 @@ name = "content_access_integration"
 required-features = ["testing"]
 
 [[test]]
+name = "event_channel_producer"
+required-features = ["testing"]
+
+[[test]]
+name = "actor_saga_concurrent"
+required-features = ["testing"]
+
+[[test]]
+name = "actor_saga_coordinator"
+required-features = ["testing"]
+
+[[test]]
+name = "actor_saga_crash_recovery"
+required-features = ["testing"]
+
+[[test]]
+name = "content_access_governance_integration"
+required-features = ["testing"]
+
+[[test]]
 name = "ucan_validate_integration"
 required-features = ["testing"]
 
