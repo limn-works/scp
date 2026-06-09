@@ -2200,7 +2200,7 @@ impl MlsCryptoProvider {
     /// Returns the per-sender epoch high-water marks for a given context.
     ///
     /// Each `(sender_did, epoch)` pair represents the highest sender key epoch
-    /// seen from that participant.  Used by `ContextManager::import_context`
+    /// seen from that participant.  Used by `lifecycle_helpers::import_context`
     /// to capture the local floors **before** destroying existing crypto state
     /// so the incoming snapshot can be validated against them.
     ///

@@ -347,7 +347,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::import_context now calls validate_and_sanitize_snapshot on velocity tracker, hard-rate-limit token bucket, and spending nonce tracker (lifecycle.rs:864/879, batch-2 wiring). No direct SDK call site \u2014 invoked transitively from import_context.",
+          "notes": "Internal: lifecycle_helpers::import_context now calls validate_and_sanitize_snapshot on velocity tracker, hard-rate-limit token bucket, and spending nonce tracker (lifecycle_helpers.rs:1476/1490, batch-2 wiring). No direct SDK call site \u2014 invoked transitively from import_context.",
           "exemptions": {
             "python": "internal wiring inside import_context, not a separate SDK operation",
             "typescript": "internal wiring inside import_context, not a separate SDK operation",
@@ -403,7 +403,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.8): ContextManager::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI) or the WASM identity registry, failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. No direct SDK call site \u2014 invoked transitively from context_import.",
+          "notes": "Internal (spec \u00a723.16.8): lifecycle_helpers::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI) or the WASM identity registry, failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. No direct SDK call site \u2014 invoked transitively from context_import.",
           "exemptions": {
             "python": "internal wiring inside context_import, not a separate SDK operation",
             "typescript": "internal wiring inside context_import, not a separate SDK operation",
@@ -1935,7 +1935,7 @@
     },
     {
       "rule_id": "snapshot-validation-on-import",
-      "description": "`ContextManager::import_context` must call `validate_export_for_import` before touching event log or crypto state. Skipping validation lets a malformed or malicious snapshot install a broken MLS group or corrupt the Merkle chain.",
+      "description": "`lifecycle_helpers::import_context` must call `validate_export_for_import` before touching event log or crypto state. Skipping validation lets a malformed or malicious snapshot install a broken MLS group or corrupt the Merkle chain.",
       "applies_to": [
         "runtime"
       ],
@@ -1947,7 +1947,8 @@
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-runtime/src/context/lifecycle_helpers.rs:1257 import_context \u2192 validate_export_for_import"
+          "crates/scp-runtime/src/context/lifecycle_helpers.rs:1324 import_context \u2192 validate_export_for_import",
+          "crates/scp-runtime/src/context/supervisor/supervisor.rs:3750 import_context \u2192 validate_export_for_import (public API boundary, verify-before-dispatch)"
         ]
       }
     },

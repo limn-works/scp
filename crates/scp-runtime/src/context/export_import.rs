@@ -504,7 +504,9 @@ fn compute_entry_hash(
 ///    can drive each independently).
 ///
 /// Verification happens entirely before any caller reads a field of the
-/// snapshot into authoritative state ([`super::manager::ContextManager::import_context`]
+/// snapshot into authoritative state (the `lifecycle_helpers::import_context`
+/// free function — reached via
+/// [`Supervisor::import_context`](crate::context::supervisor::Supervisor::import_context) —
 /// calls this first), preserving verify-before-restore (ADR-050). The
 /// signature is checked before the Merkle chain so that an export with a
 /// forged snapshot is rejected with the signature error regardless of whether

@@ -5039,11 +5039,7 @@ impl WasmContextManager {
     ///
     /// Returns an error if the context is not registered or serialization fails.
     #[allow(clippy::too_many_lines)] // Exhaustive snapshot construction — every state field materialized inline.
-    pub fn export_context(
-        &self,
-        context_id: &str,
-        exporter_did: &str,
-    ) -> Result<Vec<u8>, ScpWasmError> {
+    pub fn export_context(&self, context_id: &str) -> Result<Vec<u8>, ScpWasmError> {
         let ctx = self.require_context(context_id)?;
 
         let members: Vec<WasmExportMember> = ctx
@@ -5200,7 +5196,15 @@ impl WasmContextManager {
         let envelope = WasmContextExportEnvelope {
             version: WASM_EXPORT_VERSION,
             exported_at,
-            exporter_did: exporter_did.to_owned(),
+            // The exporter is always the context creator — the snapshot is
+            // signed with the creator's #active key and the verifying key is
+            // resolved from `snapshot.creator_did` on import. Derive it here
+            // rather than accepting a caller-supplied value: a wrong caller
+            // value would only self-reject (exporter_did == creator_did is
+            // asserted on import), so there is no reason to expose it as a
+            // parameter. Mirrors the native bridges, which derive the exporter
+            // internally from the context's creator DID.
+            exporter_did: ctx.creator_did.clone(),
             integrity_mac,
             snapshot_signature,
             snapshot,

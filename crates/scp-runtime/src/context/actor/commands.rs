@@ -562,8 +562,11 @@ pub enum LifecycleCommand {
     },
 
     /// Exports a snapshot of the context for cross-instance transfer.
-    /// Mirrors
-    /// [`ContextManager::export_context`](crate::context::lifecycle_helpers::export_context).
+    /// The actor captures the unsigned snapshot + event-log blocks via the
+    /// `lifecycle_helpers::export_context_blocks` free function; the Ed25519
+    /// snapshot signature is produced at the dispatch boundary in
+    /// [`Supervisor::export_context`](crate::context::supervisor::Supervisor::export_context),
+    /// which holds the custody sign closure (the actor holds no key).
     ExportContext {
         /// Context identifier string.
         context_id: String,
@@ -574,7 +577,7 @@ pub enum LifecycleCommand {
     },
 
     /// Imports a previously exported context. Mirrors
-    /// [`ContextManager::import_context`](crate::context::lifecycle_helpers::import_context).
+    /// [`Supervisor::import_context`](crate::context::supervisor::Supervisor::import_context).
     ///
     /// The per-instance authorization-state wipe policy (C3) is enforced
     /// by the legacy method; the command carries the raw export and
