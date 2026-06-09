@@ -1008,21 +1008,25 @@ impl ContextManager {
             ));
         }
 
-        // §7.3.8 amount-caveat binding: replace the caller-supplied
-        // `estimated_cost` with the REAL per-invocation cost the runtime
-        // priced under the Phase 1 lock (`economy_pre_check`). Single-shot
+        // §7.3.8 amount-caveat binding: bind the §7.3.8 amount caveats to the
+        // REAL per-invocation cost the runtime priced under the Phase 1 lock
+        // (`economy_pre_check`), taking the MAX of the runtime-priced
+        // `action_cost` and the caller-supplied `estimated_cost`. Single-shot
         // bridges (PyO3 / NAPI / UniFFI) have no per-call price at the bridge
-        // layer and pass `estimated_cost: 0`, which would make
-        // `amount_max_per_call` always pass and `amount_max_cumulative` accrue
-        // 0 — the §7.3.8 amount caps would be inert on single-shot. The cost
-        // is only knowable here, after pricing, so the runtime is the correct
-        // layer to bind the amount caveats to it. The runtime owns the cost,
-        // so a bridge cannot under-report it. Streaming prices per-chunk
-        // through `build_stream_post_input_hook`'s `cost_per_chunk`, which is
-        // the streaming analogue of this assignment.
+        // layer and pass `estimated_cost: 0`, so `max(action_cost, 0)` ==
+        // `action_cost` — the amount caps bind to the real cost rather than
+        // staying inert at 0. The `max` (rather than an unconditional
+        // overwrite) means a bridge can never under-report the cost — the
+        // runtime-priced floor always wins — while a caller that supplies an
+        // explicit non-zero estimate (e.g. a unit test exercising the
+        // cumulative / per-action logic against a free outlet) still drives the
+        // caps. The cost is only knowable here, after pricing, so the runtime
+        // is the correct layer to bind the amount caveats to it. Streaming
+        // prices per-chunk through `build_stream_post_input_hook`'s
+        // `cost_per_chunk`, the streaming analogue of this assignment.
         let mut caveat_enforcement = caveat_enforcement;
         if let Some(enf) = caveat_enforcement.as_mut() {
-            enf.estimated_cost = action_cost;
+            enf.estimated_cost = enf.estimated_cost.max(action_cost);
         }
 
         // §7.3.8 fail-closed defense-in-depth: if the leaf caveats require a
