@@ -911,12 +911,19 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     /// `OutletError.streamAlreadyClosed` when the bridge reports the
     /// runtime-authoritative grant/cancel-after-close code
     /// `SCP-TOOL-6101` (slug `protocol.stream-already-closed`). All other
-    /// errors pass through unchanged. The bridge surfaces the code via a
-    /// UniFFI `ScpError.Tool(msg:code:)`; matching on the code (and the
-    /// slug embedded in the message as a fallback) is robust to the
-    /// generated error's shape.
+    /// errors pass through unchanged. The grant/cancel bridge functions
+    /// surface the code via a UniFFI `ScpError.Context(msg:code:)`; we also
+    /// read the code from `ScpError.Tool(msg:code:)` as defense-in-depth, and
+    /// fall back to the slug/code embedded in the message string so the
+    /// mapping stays robust to the generated error's shape.
     private static func mapControlPlaneError(_ error: Error) -> Error {
-        if case let ScpError.Tool(_, code) = error, code == "SCP-TOOL-6101" {
+        let typedCode: String?
+        switch error {
+        case let ScpError.Context(_, code): typedCode = code
+        case let ScpError.Tool(_, code): typedCode = code
+        default: typedCode = nil
+        }
+        if typedCode == "SCP-TOOL-6101" {
             return OutletError.streamAlreadyClosed()
         }
         let message = String(describing: error)

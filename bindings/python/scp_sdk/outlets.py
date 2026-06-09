@@ -814,6 +814,12 @@ class InvocationHandle:
             return item
         if item.payload_type == "error" and item.terminal:
             self._terminated = True
+            # Parity with Kotlin/Swift/TS: a no-code terminal Error chunk
+            # falls back to ``SCP-TOOL-6200`` (the same code the
+            # aggregate/raise path uses) so the iterate-path chunk object
+            # carries a code on every SDK.
+            if item.code is None:
+                item.code = "SCP-TOOL-6200"
             return item
         return item
 

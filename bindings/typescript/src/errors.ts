@@ -967,6 +967,14 @@ export function mapBridgeError(error: unknown): ScpError {
   if (Override !== undefined) {
     return new Override(message, code);
   }
+  // Parity with Python/Swift/Kotlin: if the bracketed-code override did not
+  // match, fall back to the runtime-authoritative slug embedded in the
+  // message so a §5.4.4 grant/cancel-after-close rejection still maps onto
+  // the typed `StreamAlreadyClosed`. NAPI always brackets the code today, so
+  // this is a latent-divergence guard rather than a live path.
+  if (message.includes("protocol.stream-already-closed")) {
+    return new StreamAlreadyClosed(message);
+  }
   for (const [prefix, ErrorClass] of ERROR_PREFIX_MAP) {
     if (code.startsWith(prefix)) {
       return new ErrorClass(message, code);

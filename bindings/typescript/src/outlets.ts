@@ -1103,7 +1103,10 @@ function bridgeChunkToSdk(chunk: BridgeOutletStreamChunk): OutletStreamChunk {
     case "error":
       return {
         ...base,
-        ...(chunk.code !== undefined && { code: chunk.code }),
+        // Parity with Kotlin/Swift: a no-code terminal Error chunk falls back
+        // to `SCP-TOOL-6200` (the same code the aggregate/raise path uses) so
+        // the iterate-path chunk object carries a code on every SDK.
+        code: chunk.code ?? "SCP-TOOL-6200",
         ...(chunk.message !== undefined && { message: chunk.message }),
         ...(chunk.terminal !== undefined && { terminal: chunk.terminal }),
       };

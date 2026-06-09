@@ -19,6 +19,7 @@ import {
   PermissionError,
   ScpError,
   StorageError,
+  StreamAlreadyClosed,
   TransportError,
   UcanPermissionError,
   ValidationError,
@@ -274,6 +275,36 @@ context 'ctx-paid' has an economic policy requiring payment",
     expect(err).toBeInstanceOf(ScpError);
     expect(err.code).toBe("SCP-ECON-12096");
     expect(err.message).toContain("WasmCannotValidateSpendingUcan");
+  });
+
+  it("maps a bracketed SCP-TOOL-6101 code to typed StreamAlreadyClosed", () => {
+    // §5.4.4:426 — the runtime-authoritative grant/cancel-after-close
+    // rejection surfaces with code SCP-TOOL-6101 / slug
+    // protocol.stream-already-closed and must map onto the typed
+    // StreamAlreadyClosed, matching Python/Swift/Kotlin.
+    const err = mapBridgeError(
+      new Error(
+        "[SCP-TOOL-6101] context error: credit grant rejected (protocol.stream-already-closed)",
+      ),
+    );
+    expect(err).toBeInstanceOf(StreamAlreadyClosed);
+    expect(err.code).toBe("SCP-TOOL-6101");
+  });
+
+  it("maps a slug-only stream-already-closed message to StreamAlreadyClosed", () => {
+    // Parity with Python/Swift/Kotlin: when the bracketed-code override
+    // does not match (e.g. a future Display shape that omits the code),
+    // the slug substring still routes onto StreamAlreadyClosed.
+    const err = mapBridgeError(new Error("credit grant rejected (protocol.stream-already-closed)"));
+    expect(err).toBeInstanceOf(StreamAlreadyClosed);
+    expect(err.code).toBe("SCP-TOOL-6101");
+  });
+
+  it("does not mask a non-6101 error as StreamAlreadyClosed", () => {
+    const err = mapBridgeError(new Error("[SCP-PERM-3020] permission error: not authorized"));
+    expect(err).not.toBeInstanceOf(StreamAlreadyClosed);
+    expect(err).toBeInstanceOf(PermissionError);
+    expect(err.code).toBe("SCP-PERM-3020");
   });
 
   it("falls back to ScpError for unknown error codes", () => {

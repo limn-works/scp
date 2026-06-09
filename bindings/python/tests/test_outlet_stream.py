@@ -343,6 +343,20 @@ class TestInvocationHandleControlPlane:
         translated = outlets_mod._translate_bridge_error(err)
         assert isinstance(translated, StreamAlreadyClosed)
 
+    def test_translate_bridge_error_non_6101_is_not_masked(self) -> None:
+        # Symmetry with the TS/Swift/Kotlin negative tests: a bridge error
+        # that is neither code SCP-TOOL-6101 nor slug
+        # protocol.stream-already-closed MUST pass through unchanged and
+        # never be masked as StreamAlreadyClosed.
+        class _FakeBridgeContextError(Exception):
+            pass
+
+        _FakeBridgeContextError.__name__ = "ContextError"
+        err = _FakeBridgeContextError("[SCP-PERM-3020] caller is not authorized")
+        translated = outlets_mod._translate_bridge_error(err)
+        assert not isinstance(translated, StreamAlreadyClosed)
+        assert "SCP-PERM-3020" in str(translated)
+
 
 # ---------------------------------------------------------------------------
 # OutletStreamChunk dataclass round-trip

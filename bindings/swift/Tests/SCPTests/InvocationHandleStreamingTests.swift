@@ -283,9 +283,11 @@ struct ControlPlaneBridgeErrorMappingTests {
             requestIdHex: String(repeating: "11", count: 16),
             invokerDid: "did:dht:invoker",
             grantCreditFn: { _, _, _ in
-                throw ScpError.Tool(
-                    msg: "[SCP-TOOL-6101] context error: credit grant rejected "
-                        + "(protocol.stream-already-closed)",
+                // The grant bridge function emits the runtime-authoritative
+                // rejection as `ScpError.Context` (see the UniFFI
+                // `outletStreamGrantCredit` export), so cover the REAL shape.
+                throw ScpError.Context(
+                    msg: "credit grant rejected (protocol.stream-already-closed)",
                     code: "SCP-TOOL-6101"
                 )
             },
@@ -310,6 +312,9 @@ struct ControlPlaneBridgeErrorMappingTests {
             requestIdHex: String(repeating: "22", count: 16),
             invokerDid: "did:dht:invoker",
             cancelFn: { _, _ in
+                // The cancel bridge function emits `ScpError.Context` in
+                // production; throwing `ScpError.Tool` here exercises the
+                // defense-in-depth `.Tool` branch of `mapControlPlaneError`.
                 throw ScpError.Tool(
                     msg: "[SCP-TOOL-6101] context error: cancel rejected "
                         + "(protocol.stream-already-closed)",
@@ -334,8 +339,10 @@ struct ControlPlaneBridgeErrorMappingTests {
             requestIdHex: String(repeating: "33", count: 16),
             invokerDid: "did:dht:invoker",
             grantCreditFn: { _, _, _ in
-                throw ScpError.Tool(
-                    msg: "[SCP-PERM-3020] caller is not authorized",
+                // Real production shape (`ScpError.Context`) with a non-6101
+                // code must pass through untouched.
+                throw ScpError.Context(
+                    msg: "caller is not authorized",
                     code: "SCP-PERM-3020"
                 )
             },
@@ -346,7 +353,7 @@ struct ControlPlaneBridgeErrorMappingTests {
             #expect(Bool(false), "expected throw")
         } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
             #expect(Bool(false), "non-6101 error must NOT map to streamAlreadyClosed: \(env)")
-        } catch let ScpError.Tool(_, code) {
+        } catch let ScpError.Context(_, code) {
             #expect(code == "SCP-PERM-3020")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
