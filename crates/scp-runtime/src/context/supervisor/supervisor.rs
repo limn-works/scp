@@ -1568,6 +1568,22 @@ impl Supervisor {
         // uses only `deps.payment_adapter`), so the two paths are
         // observably equivalent — routing chooses the serialization
         // point, not the work.
+        // Defense in depth: bound the receipt batch before either routing
+        // path. Each receipt fans out to a serial payment-adapter
+        // verification round-trip, so an unbounded batch is a
+        // denial-of-service vector. The FFI bridges enforce the same cap at
+        // their boundaries; this guards non-bridge and future callers. See
+        // [`MAX_RECEIPT_BATCH`](crate::economy::adapter::MAX_RECEIPT_BATCH).
+        if let EconomyCommand::VerifyPaymentReceipts { receipts, .. } = &cmd
+            && receipts.len() > crate::economy::adapter::MAX_RECEIPT_BATCH
+        {
+            return Err(ContextError::LimitExceeded(format!(
+                "receipt batch too large: {} (max {})",
+                receipts.len(),
+                crate::economy::adapter::MAX_RECEIPT_BATCH
+            )));
+        }
+
         if let Some(ctx_id) = Self::economy_command_context_id(&cmd) {
             let ctx_id_owned = ctx_id.to_owned();
             if let Some(actor) = self.lookup(&ctx_id_owned) {

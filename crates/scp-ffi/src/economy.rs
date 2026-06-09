@@ -466,6 +466,17 @@ impl crate::scp::PyScp {
         let receipts: Vec<scp_core::economy::PaymentReceipt> = serde_json::from_str(receipts_json)
             .map_err(|e| PyValueError::new_err(format!("invalid receipts JSON: {e}")))?;
 
+        // Bound the per-call batch before dispatch: each receipt fans out to a
+        // serial payment-adapter verification round-trip, so an unbounded batch
+        // is a denial-of-service vector. See `MAX_RECEIPT_BATCH`.
+        if receipts.len() > scp_core::economy::MAX_RECEIPT_BATCH {
+            return Err(PyValueError::new_err(format!(
+                "receipt batch too large: {} (max {})",
+                receipts.len(),
+                scp_core::economy::MAX_RECEIPT_BATCH
+            )));
+        }
+
         rt.block_on(async move {
             use scp_core::context::actor::commands::EconomyCommand;
 

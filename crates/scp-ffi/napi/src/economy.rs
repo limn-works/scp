@@ -405,6 +405,17 @@ pub(crate) fn economy_verify_payment_receipts_on(
     let receipts: Vec<scp_core::economy::PaymentReceipt> = serde_json::from_str(&receipts_json)
         .map_err(|e| validation_error(&format!("invalid receipts JSON: {e}")))?;
 
+    // Bound the per-call batch before dispatch: each receipt fans out to a
+    // serial payment-adapter verification round-trip, so an unbounded batch
+    // is a denial-of-service vector. See `MAX_RECEIPT_BATCH`.
+    if receipts.len() > scp_core::economy::MAX_RECEIPT_BATCH {
+        return Err(validation_error(&format!(
+            "receipt batch too large: {} (max {})",
+            receipts.len(),
+            scp_core::economy::MAX_RECEIPT_BATCH
+        )));
+    }
+
     let rt = crate::runtime();
     let sup = crate::runtime::supervisor(bi)?.clone();
 
@@ -576,6 +587,43 @@ mod tests {
         assert!(
             err.reason.contains("invalid receipts JSON"),
             "error should mention 'invalid receipts JSON': {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_payment_receipts_rejects_oversized_batch() {
+        use scp_core::economy::{
+            Amount, CurrencyCode, MAX_RECEIPT_BATCH, PaidActionType, PaymentReceipt,
+        };
+        use scp_identity::DID;
+
+        // Build one more than the cap of minimal-but-valid receipts. The cap
+        // check runs before any supervisor lookup, so a bare `new_napi()`
+        // instance (no supervisor) suffices — proving the oversized batch is
+        // rejected without dispatching to the payment adapter.
+        let receipts: Vec<PaymentReceipt> = (0..=MAX_RECEIPT_BATCH)
+            .map(|_| PaymentReceipt {
+                receipt_id: [0u8; 32],
+                payer: DID("did:key:alice".to_owned()),
+                payee: DID("did:key:bob".to_owned()),
+                amount: Amount::new(1),
+                currency: CurrencyCode(*b"USDC"),
+                action_type: PaidActionType::MessageSend,
+                context_id: None,
+                adapter_id: "noop".to_owned(),
+                adapter_proof: Vec::new(),
+                timestamp: 0,
+                signature: Vec::new(),
+            })
+            .collect();
+        assert_eq!(receipts.len(), MAX_RECEIPT_BATCH + 1);
+        let receipts_json = serde_json::to_string(&receipts).unwrap();
+
+        let bi = NapiBridgeInstance::new_napi();
+        let err = economy_verify_payment_receipts_on(&bi, receipts_json).unwrap_err();
+        assert!(
+            err.reason.contains("receipt batch too large"),
+            "error should mention 'receipt batch too large': {err:?}"
         );
     }
 

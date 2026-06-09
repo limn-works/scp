@@ -15158,6 +15158,20 @@ impl Scp {
                 code: codes::VALID_7050.to_owned(),
             })?;
 
+        // Bound the per-call batch before dispatch: each receipt fans out to a
+        // serial payment-adapter verification round-trip, so an unbounded batch
+        // is a denial-of-service vector. See `MAX_RECEIPT_BATCH`.
+        if receipts.len() > scp_core::economy::MAX_RECEIPT_BATCH {
+            return Err(ScpError::Validation {
+                msg: format!(
+                    "receipt batch too large: {} (max {})",
+                    receipts.len(),
+                    scp_core::economy::MAX_RECEIPT_BATCH
+                ),
+                code: codes::VALID_7050.to_owned(),
+            });
+        }
+
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
