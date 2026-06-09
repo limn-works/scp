@@ -228,16 +228,32 @@ export function __serializeStorageConfigForTests(config: StorageConfig): string 
 
 function serializeStorageConfig(config: StorageConfig): string {
   if (config.type === "sqlite") {
-    if ("passphrase" in config) {
-      // Passphrase mode (spec §17.6): forward the passphrase verbatim.
-      // The NAPI layer moves it into zeroizing memory and derives the
-      // SQLCipher key via Argon2id.
-      return JSON.stringify({ type: "sqlite", path: config.path, passphrase: config.passphrase });
+    // Forward whichever key-material fields are present, verbatim, so the
+    // NAPI layer remains the single authority on the `key` XOR `passphrase`
+    // mutual-exclusion rule (spec §17.6, SCP-VALID-7005). We must NOT
+    // short-circuit on the presence of one field and silently drop the
+    // other: a caller that bypasses the TS union type and supplies BOTH
+    // must reach the NAPI guard so it can reject them, rather than have the
+    // serializer quietly discard one and let an ambiguous config through.
+    const out: { type: "sqlite"; path: string; key?: number[] | string; passphrase?: string } = {
+      type: "sqlite",
+      path: config.path,
+    };
+    // `key` may be absent on the passphrase arm; access via a widened view
+    // so we forward it only when actually supplied.
+    const rawKey = (config as { key?: Uint8Array | string }).key;
+    if (rawKey !== undefined) {
+      // A Uint8Array must be normalized to a number[] because
+      // `JSON.stringify(Uint8Array)` yields an object, not an array.
+      out.key = typeof rawKey === "string" ? rawKey : Array.from(rawKey);
     }
-    // Raw-key mode: a Uint8Array must be normalized to a number[] because
-    // `JSON.stringify(Uint8Array)` yields an object, not an array.
-    const key = typeof config.key === "string" ? config.key : Array.from(config.key as Uint8Array);
-    return JSON.stringify({ type: "sqlite", path: config.path, key });
+    const passphrase = (config as { passphrase?: string }).passphrase;
+    if (passphrase !== undefined) {
+      // Passphrase mode (spec §17.6): forward verbatim. The NAPI layer moves
+      // it into zeroizing memory and derives the SQLCipher key via Argon2id.
+      out.passphrase = passphrase;
+    }
+    return JSON.stringify(out);
   }
   return JSON.stringify(config);
 }

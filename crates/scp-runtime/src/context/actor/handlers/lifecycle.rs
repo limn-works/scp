@@ -311,19 +311,25 @@ async fn handle_close_context_actor(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: String,
-    params: scp_protocol::context::params::ContextParams,
+    _params: scp_protocol::context::params::ContextParams,
     initiator_did: scp_identity::DID,
     reply: CloseContextReply,
 ) -> Outcome<()> {
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
-    }
+    // Drive the close through a CLONE of the actor's own `state.handle`,
+    // NOT a freshly-constructed `ContextHandle::new(...)`. `ContextHandle`
+    // is a thin `Arc<RwLock<ContextInner>>` newtype, so a clone SHARES the
+    // interior lifecycle state. `ttl::close_context` transitions that
+    // shared state Active -> Closing; reading it back through
+    // `state.handle` (e.g. the `import_context` replaceability gate's
+    // `state.handle.try_read_state()`) then observes the terminal state.
+    //
+    // A separate `ContextHandle::new` owned its OWN fresh `Arc`, so the
+    // Closing transition landed on a throwaway cell and `state.handle`
+    // stayed `Active` forever — which made export -> close -> import
+    // reject with "context already exists" (the gate saw a live context).
+    // The payload `params` is ignored: `state.handle` already carries the
+    // authoritative creation-time params, and they are immutable.
+    let handle = state.handle.clone();
 
     let close_fut =
         crate::context::lifecycle_helpers::close_context(state, deps, &handle, &initiator_did);

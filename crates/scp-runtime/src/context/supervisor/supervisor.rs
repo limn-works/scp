@@ -183,7 +183,17 @@ pub struct Supervisor {
     /// [`Self::write_lock`].
     pub(in crate::context::supervisor) standing_contexts: ArcSwap<HashMap<String, DID>>,
     /// Local identities. Grows once per `identity_add`; read-heavy.
-    pub(in crate::context::supervisor) local_dids: ArcSwap<HashSet<DID>>,
+    ///
+    /// Wrapped in `Arc<ArcSwap<_>>` (not a bare `ArcSwap`) so that every
+    /// per-context actor shares the SAME swap cell: [`ActorDeps`] receives
+    /// an `Arc::clone` of this field, not a snapshot copy. A bare
+    /// `ArcSwap` would force the actor-deps builder to take a point-in-time
+    /// `load_full()` snapshot, and any DID registered AFTER an actor is
+    /// spawned (e.g. the creator's DID, which `register_local_did` records
+    /// only after `context_create` has already spawned the actor) would be
+    /// invisible to that actor's `local_dids` view — breaking the
+    /// author-DID-controlled gate on broadcast key requests.
+    pub(in crate::context::supervisor) local_dids: Arc<ArcSwap<HashSet<DID>>>,
     /// Per-identity X25519 wrapping keys. Wrapped in `ArcSwap` so
     /// rotation is atomic; outer `DashMap` keyed by DID.
     pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>,
@@ -361,7 +371,7 @@ impl Supervisor {
         Self {
             actors: DashMap::new(),
             standing_contexts: ArcSwap::new(Arc::new(HashMap::new())),
-            local_dids: ArcSwap::new(Arc::new(HashSet::new())),
+            local_dids: Arc::new(ArcSwap::new(Arc::new(HashSet::new()))),
             wrapping_keys: DashMap::new(),
             persistence,
             write_lock: tokio::sync::Mutex::new(()),
@@ -642,14 +652,30 @@ impl Supervisor {
 
     /// Cheap reference to the supervisor's local-DID registry.
     ///
-    /// The field is `ArcSwap<HashSet<DID>>` per the master plan
+    /// The field is `Arc<ArcSwap<HashSet<DID>>>` per the master plan
     /// §Supervisor — read sites use `arc_swap.load()` (returns
     /// `Guard<Arc<HashSet>>`) or `arc_swap.load_full()` (returns
     /// `Arc<HashSet>`); write sites acquire [`Self::write_lock`] then
-    /// clone-update-store on the snapshot.
+    /// clone-update-store on the snapshot. The accessor returns the inner
+    /// `&ArcSwap` so callers see the same read/write surface regardless of
+    /// the outer `Arc` (which exists only so [`ActorDeps`] can share the
+    /// swap cell via `Arc::clone`).
     #[must_use]
-    pub(crate) const fn local_dids_ref(&self) -> &ArcSwap<HashSet<DID>> {
+    pub(crate) fn local_dids_ref(&self) -> &ArcSwap<HashSet<DID>> {
         &self.local_dids
+    }
+
+    // NB: `&self.local_dids` is `&Arc<ArcSwap<_>>`; deref coercion yields the
+    // `&ArcSwap<_>` the signature promises.
+
+    /// Cheap `Arc::clone` of the shared `local_dids` swap cell, handed to
+    /// [`ActorDeps`] so every per-context actor reads from the SAME cell
+    /// the supervisor writes to via [`Self::local_dids_ref`]. Sharing the
+    /// `Arc` (rather than snapshotting `load_full()` at spawn) is what lets
+    /// a DID registered after an actor spawns become visible to that actor.
+    #[must_use]
+    pub(crate) fn local_dids_shared(&self) -> Arc<ArcSwap<HashSet<DID>>> {
+        Arc::clone(&self.local_dids)
     }
 
     /// Cheap reference to the supervisor's standing-context tracking
@@ -914,7 +940,7 @@ impl Supervisor {
             event_tx: self.event_tx_ref().cloned(),
             key_resolver,
             payment_adapter: self.payment_adapter_ref().map(Arc::clone),
-            local_dids: Arc::new(arc_swap::ArcSwap::new(self.local_dids.load_full())),
+            local_dids: self.local_dids_shared(),
         })
     }
 
