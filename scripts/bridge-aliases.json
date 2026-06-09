@@ -3534,7 +3534,7 @@
       },
       {
         "canonical": "economy_verify_payment_receipts",
-        "reason": "Receipt verification dispatches EconomyCommand::VerifyPaymentReceipts to the runtime payment adapter (verify_dyn per receipt); WASM cannot link scp-runtime / the async payment adapter per ADR-034. Native-only (pyo3/napi/uniffi); the TS WASM bridge surfaces a fail-closed throw (SCP-ECON-12091)."
+        "reason": "Receipt verification dispatches EconomyCommand::VerifyPaymentReceipts to the runtime payment adapter (verify_dyn per receipt); WASM cannot link scp-runtime / the async payment adapter per ADR-034. Native-only (pyo3/napi/uniffi); the TS WASM bridge surfaces a fail-closed throw (SCP-ECON-12095)."
       },
       {
         "canonical": "transport_reliability",
