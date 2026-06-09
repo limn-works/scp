@@ -565,9 +565,23 @@ class InvocationHandle:
         self._invoker_did = invoker_did
         self._aggregate_schema = aggregate_schema
         # Terminal-chunk observed: set once an End / Error{terminal:true}
-        # chunk passes through the iterator or the aggregate await path.
-        # AC13 lifecycle guard rejects grant_credit / cancel after this.
+        # chunk is produced by the eager pump OR passes through the
+        # iterator / aggregate await path. AC13 lifecycle guard rejects
+        # grant_credit / cancel after this. Flipped by the pump (parity
+        # with the TypeScript / Swift eager pumps) so the receiver-side
+        # revocation re-check loop's ``while not handle.is_terminated``
+        # exits even when no consumer ever drains the stream.
         self._terminated = False
+        # Background tasks owned by the streaming handle: the chunk pump
+        # and the §5.4.5 receiver-side revocation re-check loop. Held so
+        # :meth:`aclose` can cancel them for a control-plane-only caller
+        # that opens the handle, uses grant_credit / cancel, and abandons
+        # it without ever consuming the chunk stream — otherwise the
+        # re-check loop would poll ``ucan_validate`` for the process
+        # lifetime. Assigned by the streaming factory after construction.
+        self._pump_task: asyncio.Task[None] | None = None
+        self._recheck_task: asyncio.Task[None] | None = None
+        self._closed = False
 
     @property
     def request_id(self) -> str | None:
@@ -586,6 +600,54 @@ class InvocationHandle:
         round-tripping the bridge for a known-dead session.
         """
         return self._terminated
+
+    def _mark_terminated(self) -> None:
+        """Flip the terminal flag.
+
+        Called by the eager pump when it produces a terminal chunk /
+        abnormal-closure sentinel, and by the consumer paths on terminal
+        observation. Idempotent. Flipping it from the pump lets the
+        receiver-side revocation re-check loop exit without a consumer
+        (parity with the TypeScript / Swift eager pumps).
+        """
+        self._terminated = True
+
+    async def aclose(self) -> None:
+        """Release the handle's background tasks (idempotent).
+
+        Cancels the chunk pump and the §5.4.5 receiver-side revocation
+        re-check loop, and marks the stream terminated so any later
+        :meth:`grant_credit` / :meth:`cancel` fail-closes with
+        :class:`StreamAlreadyClosed`.
+
+        A control-plane-only caller (``invoke`` → ``grant_credit`` →
+        abandon, without ever consuming the chunk stream) MUST call this
+        — idiomatically ``async with ctx.outlets.invoke(...) as handle:``
+        — so the re-check loop does not poll ``ucan_validate`` for the
+        process lifetime. Consuming the stream to its terminal chunk
+        already tears the loop down, so calling :meth:`aclose` afterward
+        is a harmless no-op.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._terminated = True
+        for task in (self._recheck_task, self._pump_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    # Swallow cancellation and any in-flight pump/recheck
+                    # error surfaced at cancel time — aclose() is a
+                    # best-effort resource release, not a result channel.
+                    pass
+
+    async def __aenter__(self) -> InvocationHandle:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self.aclose()
 
     def _guard(self, mode: str) -> None:
         if self._consumed is not None and self._consumed != mode:
@@ -1478,6 +1540,14 @@ class OutletNamespace:
                 q.put_nowait(_translate_bridge_error(exc))
             finally:
                 q.put_nowait(None)
+                # Flip the handle terminal flag from the eager pump
+                # (parity with the TypeScript / Swift eager pumps) so the
+                # receiver-side revocation re-check loop's
+                # ``while not handle.is_terminated`` exits even when no
+                # consumer ever drains the stream — closing the leak where
+                # a control-plane-only handle polled ``ucan_validate``
+                # forever.
+                handle._mark_terminated()
 
         try:
             loop = asyncio.get_event_loop()

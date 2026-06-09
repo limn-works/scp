@@ -541,3 +541,138 @@ class TestAbnormalClosure:
         assert len(observed) == 1
         assert observed[0].payload_type == "end"
         # No OutletExecutionError raised — iteration ended cleanly.
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 — receiver-side revocation re-check loop must not leak when the
+# handle is opened for its control plane only and never consumed.
+# ---------------------------------------------------------------------------
+
+
+class TestRecheckLoopTeardown:
+    """A streaming handle opened but never consumed must not leak its
+    §5.4.5 receiver-side revocation re-check loop.
+
+    Before the fix, ``is_terminated`` only flipped on the consumer paths
+    (``await handle`` / ``async for``), so the recheck loop's
+    ``while not handle.is_terminated`` polled ``ucan_validate`` for the
+    process lifetime when no consumer ever drained the stream. The fix
+    flips ``is_terminated`` from the eager pump (so a naturally-ended
+    stream stops the loop without a consumer) and adds ``aclose()`` (so a
+    control-plane-only caller can release the loop explicitly).
+    """
+
+    @pytest.mark.asyncio
+    async def test_eager_pump_terminal_lets_recheck_loop_exit_without_consumer(self) -> None:
+        # Simulate the production wiring: an eager pump that produces a
+        # terminal chunk + sentinel and flips the handle terminal flag,
+        # and a recheck loop that exits on ``not handle.is_terminated``.
+        # The stream is NEVER consumed. The recheck loop must still exit.
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        handle = InvocationHandle(q, request_id="ab" * 16, invoker_did="did:dht:invoker")
+
+        recheck_iterations = 0
+
+        async def _recheck_loop() -> None:
+            nonlocal recheck_iterations
+            # Mirrors the production loop's exit condition.
+            while not handle.is_terminated:
+                recheck_iterations += 1
+                await asyncio.sleep(0.001)
+
+        async def _eager_pump() -> None:
+            # Produce a terminal chunk + sentinel, then flip the flag —
+            # exactly what the production streaming pump's `finally` does.
+            q.put_nowait(_end_chunk(seq=0, aggregate={"v": 1}))
+            q.put_nowait(None)
+            handle._mark_terminated()
+
+        recheck = asyncio.create_task(_recheck_loop())
+        await _eager_pump()
+        # The loop must observe the flipped flag and exit promptly even
+        # though nothing consumed the queue.
+        await asyncio.wait_for(recheck, timeout=1.0)
+        assert handle.is_terminated is True
+        assert recheck.done()
+
+    @pytest.mark.asyncio
+    async def test_aclose_cancels_recheck_and_pump_and_fail_closes_control_plane(self) -> None:
+        # A control-plane-only caller (grant_credit then abandon) calls
+        # aclose() to release the background tasks. aclose() must cancel
+        # both, mark terminated, and make later grant_credit fail-closed.
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        handle = InvocationHandle(q, request_id="ac" * 16, invoker_did="did:dht:invoker")
+
+        pump_cancelled = asyncio.Event()
+        recheck_cancelled = asyncio.Event()
+
+        async def _never_ending_pump() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                pump_cancelled.set()
+                raise
+
+        async def _never_ending_recheck() -> None:
+            try:
+                # The real loop polls ucan_validate every tick forever
+                # while not terminated; emulate the unbounded poll.
+                while not handle.is_terminated:
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                recheck_cancelled.set()
+                raise
+
+        handle._pump_task = asyncio.create_task(_never_ending_pump())
+        handle._recheck_task = asyncio.create_task(_never_ending_recheck())
+
+        # Let the tasks start running.
+        await asyncio.sleep(0.02)
+        assert handle.is_terminated is False
+
+        await handle.aclose()
+
+        assert handle.is_terminated is True
+        assert pump_cancelled.is_set()
+        assert recheck_cancelled.is_set()
+        # Control plane fail-closes after close.
+        with pytest.raises(StreamAlreadyClosed):
+            await handle.grant_credit(Credit(5))
+
+    @pytest.mark.asyncio
+    async def test_aclose_is_idempotent(self) -> None:
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        handle = InvocationHandle(q, request_id="ad" * 16, invoker_did="did:dht:invoker")
+        # No background tasks attached — aclose() must still be a safe,
+        # repeatable no-op that marks the handle terminated.
+        await handle.aclose()
+        await handle.aclose()
+        assert handle.is_terminated is True
+
+    @pytest.mark.asyncio
+    async def test_async_context_manager_closes_handle(self) -> None:
+        # `async with ctx.outlets.invoke(...) as handle:` is the idiomatic
+        # control-plane-only pattern — the background tasks are released on
+        # block exit even though the chunk stream is never consumed.
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        handle = InvocationHandle(q, request_id="af" * 16, invoker_did="did:dht:invoker")
+
+        recheck_cancelled = asyncio.Event()
+
+        async def _never_ending_recheck() -> None:
+            try:
+                while not handle.is_terminated:
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                recheck_cancelled.set()
+                raise
+
+        handle._recheck_task = asyncio.create_task(_never_ending_recheck())
+        await asyncio.sleep(0.02)
+
+        async with handle as h:
+            assert h is handle
+
+        assert handle.is_terminated is True
+        assert recheck_cancelled.is_set()
