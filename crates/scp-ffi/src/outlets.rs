@@ -585,6 +585,151 @@ fn build_outlet_executor(
     }
 }
 
+/// Boxed, pinned, `Send` future returned by an outlet executor closure — the
+/// shape `ContextManager::invoke_outlet_with_economy` expects for its Phase-2
+/// dispatch.
+type BoxedOutletFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>>;
+
+/// Builds the Phase-2 executor closure for a CROSS-CONTEXT outlet invocation.
+///
+/// Mirrors [`build_outlet_executor`] but emits the cross-context echo shape
+/// (`source_context` / `target_context` / `chain_depth`) when no handler is
+/// registered in the target context. Extracted so
+/// [`py_outlet_invoke_cross_context`] stays under the per-function line ceiling
+/// while routing through the runtime's §7.3.8-enforcing economy entry point.
+fn build_cross_context_outlet_executor(
+    handler: Option<crate::runtime::OutletHandler>,
+    outlet_id: String,
+    source_context_id: String,
+    target_context_id: String,
+    chain_depth: u8,
+) -> impl FnOnce(serde_json::Value) -> BoxedOutletFuture {
+    move |input: serde_json::Value| {
+        let input_for_echo = input.clone();
+        Box::pin(async move {
+            handler.map_or_else(
+                || {
+                    Ok(serde_json::json!({
+                        "tool": outlet_id,
+                        "source_context": source_context_id,
+                        "target_context": target_context_id,
+                        "status": "validated",
+                        "chain_depth": chain_depth,
+                        "input_valid": true,
+                        "validated_input": input_for_echo,
+                    }))
+                },
+                |h| {
+                    h(input).map_err(|e| {
+                        format!("cross-context tool handler for '{outlet_id}' failed: {e}")
+                    })
+                },
+            )
+        })
+    }
+}
+
+/// Builds the Phase-2 executor closure for a SESSION outlet invocation.
+///
+/// Mirrors [`build_outlet_executor`] but emits the session echo shape
+/// (`session_id` / `call_count` / `session_state`) when no handler is
+/// registered. `prior_call_count` is the session's call count BEFORE this
+/// invocation, so the echoed `call_count` reflects the count after this
+/// (accepted) call. Extracted so [`py_outlet_session_invoke`] stays under the
+/// per-function line ceiling while routing through the runtime's
+/// §7.3.8-enforcing economy entry point.
+fn build_session_outlet_executor(
+    handler: Option<crate::runtime::OutletHandler>,
+    outlet_id: String,
+    session_id: String,
+    session_state: serde_json::Value,
+    prior_call_count: u64,
+) -> impl FnOnce(serde_json::Value) -> BoxedOutletFuture {
+    move |input: serde_json::Value| {
+        let input_for_echo = input.clone();
+        Box::pin(async move {
+            handler.map_or_else(
+                || {
+                    Ok(serde_json::json!({
+                        "tool": outlet_id,
+                        "session_id": session_id,
+                        "status": "validated",
+                        "call_count": prior_call_count.saturating_add(1),
+                        "session_state": session_state,
+                        "validated_input": input_for_echo,
+                    }))
+                },
+                |h| h(input).map_err(|e| format!("tool handler for '{outlet_id}' failed: {e}")),
+            )
+        })
+    }
+}
+
+/// Runs an outlet invocation through the runtime's §7.3.8-enforcing economy
+/// entry point, building the `CaveatEnforcement` bundle from the action UCAN's
+/// validated-narrowed caveats.
+///
+/// Shared by the cross-context and session single-shot bridge paths so both
+/// route through the IDENTICAL enforcement the primary `py_outlet_invoke` path
+/// uses: the runtime owns the counter store, prices the real per-invocation
+/// cost (overriding the `estimated_cost: 0` placeholder), and FAILS CLOSED on
+/// any counter-bearing cap it cannot enforce. `target_did` is `Some` for
+/// cross-context (the peer DID `allowed_target_dids` constrains) and `None`
+/// for intra-context session calls.
+#[allow(clippy::too_many_arguments)] // Mirrors the runtime economy entry point it forwards to.
+fn invoke_outlet_with_caveats<F>(
+    context_id: &str,
+    registry: &scp_core::context::outlets::OutletRegistry,
+    outlet_id: &str,
+    input_json: serde_json::Value,
+    invoker_did: &str,
+    effective_caveats: &scp_protocol::trust::caveats::InvocationCaveats,
+    action_ucan_cid: &str,
+    target_did: Option<&scp_primitives::DID>,
+    executor: F,
+) -> Result<serde_json::Value, ScpPyError>
+where
+    F: FnOnce(serde_json::Value) -> BoxedOutletFuture,
+{
+    let manager = crate::runtime::context_manager()?;
+    let invoker_did_typed: scp_primitives::DID = invoker_did.to_owned().into();
+    let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id);
+    let rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+
+    let caveat_enforcement = effective_caveats.requires_post_input_check().then(|| {
+        scp_core::context::manager::CaveatEnforcement {
+            caveats: effective_caveats,
+            ucan_cid: action_ucan_cid,
+            negotiated_adapter: None,
+            target_did,
+            estimated_cost: scp_core::economy::types::Amount::new(0),
+        }
+    });
+
+    let outcome = rt
+        .block_on(async {
+            manager
+                .invoke_outlet_with_economy(
+                    context_id,
+                    registry,
+                    &outlet_id_typed,
+                    input_json,
+                    &invoker_did_typed,
+                    None,
+                    None,
+                    executor,
+                    None,
+                    caveat_enforcement,
+                    None,
+                )
+                .await
+        })
+        .map_err(ScpPyError::from)?;
+    let _ = outcome.event;
+    Ok(outcome.output)
+}
+
 #[pyfunction]
 #[pyo3(name = "context_outlet_invoke")]
 #[pyo3(signature = (context_id, outlet_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
@@ -1163,62 +1308,65 @@ pub fn py_outlet_invoke_cross_context(
         .into());
     }
 
-    // Invoke the tool in the target context with echo mode.
-    let output_json = crate::runtime::with_context(target_context_id, |rt| {
-        let registration = rt.outlet_registry.get(outlet_id).ok_or_else(|| {
-            ScpPyError::context(format!(
-                "tool '{outlet_id}' not found in target context '{target_context_id}'"
+    // §7.3.8 cross-context single-shot caveat parity. The prior path
+    // dispatched directly via `with_context` and NEVER built a
+    // `CaveatEnforcement`, so a delegated UCAN's `max_calls` / `amount_*` /
+    // `rate_window` / `allowed_adapters` / `allowed_target_dids` / narrowed
+    // `input_schema` were ALL skipped — and cross-context is exactly where
+    // `allowed_target_dids` must bite. Route through
+    // `invoke_outlet_with_economy` (identical to the primary single-shot path)
+    // so the runtime owns the counter store, prices the real per-invocation
+    // cost, and FAILS CLOSED on any counter-bearing cap it cannot enforce.
+    // `resolve_action_caveats` recovers the validated `nb` + CID; parsing
+    // cannot fail here (`validate_outlet_ucan` already validated the string).
+    let (effective_caveats, action_ucan_cid) =
+        scp_ffi_common::caveats::resolve_action_caveats(ucan_token).map_err(ScpPyError::ucan)?;
+
+    // Snapshot the TARGET context's registry, handler, and creator DID before
+    // the runtime call (lock-split discipline). The target creator DID is the
+    // cross-context peer DID that `allowed_target_dids` constrains (§6.2).
+    let outlet_id_owned = outlet_id.to_owned();
+    let (registry, handler, target_creator_did) =
+        crate::runtime::with_context(target_context_id, |rt| {
+            if !rt.outlet_registry.contains(outlet_id) {
+                return Err(ScpPyError::context(format!(
+                    "tool '{outlet_id}' not found in target context '{target_context_id}'"
+                )));
+            }
+            Ok((
+                rt.outlet_registry.clone(),
+                rt.outlet_handlers.get(outlet_id).cloned(),
+                rt.creator_did.clone(),
             ))
         })?;
 
-        // Validate input against the tool's input schema.
-        scp_core::context::outlets::validate_value_against_schema(
-            &input_json,
-            &registration.schema.input_schema,
-        )
-        .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
+    // Cross-context executor: target handler when present, else the
+    // cross-context schema-only echo (preserving the prior output shape).
+    let executor = build_cross_context_outlet_executor(
+        handler,
+        outlet_id_owned.clone(),
+        source_context_id.to_owned(),
+        target_context_id.to_owned(),
+        chain_depth,
+    );
 
-        // Dispatch to handler or echo mode.
-        let output = if let Some(handler) = rt.outlet_handlers.get(outlet_id) {
-            let handler = handler.clone();
-            let out = handler(input_json.clone()).map_err(|e| {
-                ScpPyError::context(format!(
-                    "cross-context tool handler for '{outlet_id}' failed: {e}"
-                ))
-            })?;
+    // `target_did` is the ACTUAL cross-context peer DID (the target context's
+    // creator), so `allowed_target_dids` is enforced. Provenance is handled at
+    // the protocol level (scp-protocol::tools::invoke_cross_context).
+    let target_did_typed: scp_primitives::DID = target_creator_did.into();
+    let output = invoke_outlet_with_caveats(
+        target_context_id,
+        &registry,
+        &outlet_id_owned,
+        input_json,
+        invoker_did,
+        &effective_caveats,
+        &action_ucan_cid,
+        Some(&target_did_typed),
+        executor,
+    )?;
 
-            scp_core::context::outlets::validate_value_against_schema(
-                &out,
-                &registration.schema.output_schema,
-            )
-            .map_err(|msg| {
-                ScpPyError::validation(format!(
-                    "output validation failed for tool '{outlet_id}': {msg}"
-                ))
-            })?;
-
-            out
-        } else {
-            serde_json::json!({
-                "tool": outlet_id,
-                "source_context": source_context_id,
-                "target_context": target_context_id,
-                "status": "validated",
-                "chain_depth": chain_depth,
-                "input_valid": true,
-                "validated_input": input_json,
-            })
-        };
-
-        Ok(output)
-    })?;
-
-    // Provenance for cross-context tool invocations is now handled at the
-    // protocol level (scp-protocol::tools::invoke_cross_context). The bridge-
-    // level attach_cross_context_provenance was redundant and discarded its
-    // result, so it has been removed.
-
-    json_to_py_dict(py, &output_json)
+    json_to_py_dict(py, &output)
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,75 +1523,93 @@ pub fn py_outlet_session_invoke(
         proof_tokens.as_ref(),
     )?;
 
-    let output_json = crate::runtime::with_context(context_id, |rt| {
-        // Look up session.
-        let session = rt
-            .session_store
-            .get(session_id)
-            .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
+    // Phase A (locked): session lookup + expiry + defense-in-depth capability
+    // check, then snapshot the state the off-lock invocation needs. The actual
+    // invocation runs OUTSIDE this closure through `invoke_outlet_with_economy`
+    // so the §7.3.8 caveat gate (counter store + fail-closed) and real cost
+    // pricing apply — identical to the primary single-shot path. The prior
+    // session path dispatched the handler inline and NEVER built a
+    // `CaveatEnforcement`, so a delegated UCAN's caveats were all skipped.
+    let (outlet_id, current_state, prior_call_count, registry, handler) =
+        crate::runtime::with_context(context_id, |rt| {
+            let session = rt
+                .session_store
+                .get(session_id)
+                .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
 
-        // Check expiry.
-        let now_ms = scp_primitives::SystemClock.now_millis();
-        if session.is_expired(now_ms) {
-            rt.session_store.remove(session_id);
-            return Err(ScpPyError::context(format!(
-                "session '{session_id}' has expired"
-            )));
-        }
+            // Check expiry.
+            let now_ms = scp_primitives::SystemClock.now_millis();
+            if session.is_expired(now_ms) {
+                rt.session_store.remove(session_id);
+                return Err(ScpPyError::context(format!(
+                    "session '{session_id}' has expired"
+                )));
+            }
 
-        let outlet_id = session.outlet_id.clone();
-        let current_state = session.state.clone();
+            let outlet_id = session.outlet_id.clone();
+            let current_state = session.state.clone();
+            let prior_call_count = session.call_count;
 
-        // Defense-in-depth: check role-state capabilities in addition to the
-        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        if !scp_core::context::outlets::has_outlet_call_capability(
-            &rt.role_state,
-            invoker_did,
-            &outlet_id,
-        ) {
-            return Err(ScpPyError::ucan(format!(
-                "invoker '{invoker_did}' does not have ToolInvoke capability for '{outlet_id}'"
-            )));
-        }
+            // Defense-in-depth: check role-state capabilities in addition to
+            // the UCAN layer. See §7.2 and ADR-010 for the dual-check design.
+            if !scp_core::context::outlets::has_outlet_call_capability(
+                &rt.role_state,
+                invoker_did,
+                &outlet_id,
+            ) {
+                return Err(ScpPyError::ucan(format!(
+                    "invoker '{invoker_did}' does not have ToolInvoke capability for '{outlet_id}'"
+                )));
+            }
 
-        // Validate input against tool's input schema.
-        if let Some(registration) = rt.outlet_registry.get(&outlet_id) {
-            scp_core::context::outlets::validate_value_against_schema(
-                &input_json,
-                &registration.schema.input_schema,
-            )
-            .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
-        }
+            Ok((
+                outlet_id.clone(),
+                current_state,
+                prior_call_count,
+                rt.outlet_registry.clone(),
+                rt.outlet_handlers.get(&outlet_id).cloned(),
+            ))
+        })?;
 
-        // Execute via handler or echo mode, passing session state.
-        let (new_state, output) = if let Some(handler) = rt.outlet_handlers.get(&outlet_id) {
-            let handler = handler.clone();
-            let out = handler(input_json.clone()).map_err(|e| {
-                ScpPyError::context(format!("tool handler for '{outlet_id}' failed: {e}"))
-            })?;
-            (current_state, out)
-        } else {
-            let out = serde_json::json!({
-                "tool": outlet_id,
-                "session_id": session_id,
-                "status": "validated",
-                "call_count": session.call_count + 1,
-                "session_state": current_state,
-                "validated_input": input_json,
-            });
-            (current_state, out)
-        };
+    // §7.3.8 caveat enforcement bundle, recovered from the action UCAN's
+    // validated-narrowed `nb`. Parsing cannot fail here —
+    // `validate_outlet_ucan` already validated the same string.
+    let (effective_caveats, action_ucan_cid) =
+        scp_ffi_common::caveats::resolve_action_caveats(ucan_token).map_err(ScpPyError::ucan)?;
 
-        // Update session state and increment call count.
+    // Session executor: registered handler or session-aware schema-only echo.
+    let executor = build_session_outlet_executor(
+        handler,
+        outlet_id.clone(),
+        session_id.to_owned(),
+        current_state,
+        prior_call_count,
+    );
+
+    // Per-call session invocation: no cross-context target.
+    let output = invoke_outlet_with_caveats(
+        context_id,
+        &registry,
+        &outlet_id,
+        input_json,
+        invoker_did,
+        &effective_caveats,
+        &action_ucan_cid,
+        None,
+        executor,
+    )?;
+
+    // Phase B (locked): the invocation succeeded AND passed the §7.3.8 gate —
+    // advance the call count exactly once. State is preserved (handlers do not
+    // surface a new session state at this bridge layer), matching prior behavior.
+    crate::runtime::with_context(context_id, |rt| {
         if let Some(session) = rt.session_store.get_mut(session_id) {
-            session.state = new_state;
             session.call_count = session.call_count.saturating_add(1);
         }
-
-        Ok(output)
+        Ok(())
     })?;
 
-    json_to_py_dict(py, &output_json)
+    json_to_py_dict(py, &output)
 }
 
 /// Closes a stateful tool session.
