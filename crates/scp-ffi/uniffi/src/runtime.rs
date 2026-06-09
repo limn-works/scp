@@ -1224,6 +1224,16 @@ impl scp_core::context::persistence::ContextPersistence for ArcContextPersistenc
     }
 }
 
+/// Bounded capacity of the supervisor's `ContextEvent` broadcast channel.
+///
+/// Every production supervisor built here enables this channel so that local
+/// context events can be consumed by external sinks — notably the node's
+/// outbound webhook dispatcher (spec §12.10.5), wired in [`crate::server`] node
+/// startup. Lagging consumers drop the oldest events (logged, never panics);
+/// `1024` matches the documented default shared with the `PyO3` reference
+/// bridge.
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
 /// Constructs a fresh per-instance `Supervisor` with the given
 /// providers.
 ///
@@ -1240,6 +1250,14 @@ impl scp_core::context::persistence::ContextPersistence for ArcContextPersistenc
 /// provider — a single `SQLite` connection, not two. Callers pull
 /// the shared persistence from the embedded `CoreFields` via
 /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`].
+///
+/// The event broadcast channel is always enabled (capacity
+/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — e.g. the node webhook
+/// dispatcher — can subscribe via
+/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
+/// When no consumer subscribes, emitting into the channel is a cheap no-op: the
+/// retained sender has no receivers, so `send` returns `Err` and the event is
+/// simply dropped without blocking context operations.
 fn build_supervisor(
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
@@ -1252,6 +1270,10 @@ fn build_supervisor(
             Box::new(ArcContextPersistence::new(shared))
                 as Box<dyn scp_core::context::persistence::ContextPersistence>
         });
+    // Enable the event broadcast channel so `subscribe_events()` yields a
+    // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
+    // is dropped immediately; the retained sender keeps the channel open.
+    let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     // `mls_storage` is REQUIRED (non-Option): the runtime never defaults
     // storage; the bridge supplies it (spec §17.6 / ADR-049). It is the
     // single chosen Storage erased once into the `OpenMLS` view.
@@ -1262,7 +1284,7 @@ fn build_supervisor(
         not_configured_key_resolver(),
         persistence_box,
         None,
-        None,
+        Some(event_tx),
         None,
         mls_storage,
     )

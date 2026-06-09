@@ -138,6 +138,16 @@ Allow-list (sites that legitimately use these primitives):
 
 The clippy rule lands in commit 13 of the ADR-049 ladder (Phase 3 of the post-review-round-1 plan); commit 12 already conforms to the rule.
 
+### 12a. Event-channel observer surface
+
+The `Supervisor` owns a `broadcast::Sender<(String, ContextEvent)>` in a `OnceLock` (`event_tx`). `Supervisor::subscribe_events()` is the public, read-only observer surface: it returns `Some(broadcast::Receiver)` when the channel is enabled, `None` otherwise. The per-context actors emit `(context_id, ContextEvent)` onto this sender via `emit_event_into` (payloads stripped of plaintext first — see `strip_event_payload`); the FFI node-startup path subscribes once and drives the outbound webhook dispatcher (spec §12.10.5).
+
+This is lock-free-read-compliant under §Decision 12: `subscribe()` is called **once, at node startup**, not on a per-command read path. The `RwLock`-per-acquire cost that Decision 12 forbids is a hot-path concern — `subscribe_events()` is cold (one call per node), so it does not apply. The emit path itself touches only the `OnceLock`-resident sender (`broadcast::Sender::send` is lock-free for the fast path), consistent with the allowed read primitives.
+
+Production supervisors enable the channel **unconditionally** — each FFI bridge's `build_supervisor` passes `Some(event_tx)`, so `subscribe_events()` always yields a receiver in production. Query/test shims (e.g. `Supervisor::for_query_shim`) may construct a supervisor with no channel; for those `subscribe_events()` returns `None` and observers skip wiring rather than panic. The asymmetry is intentional: the channel exists to feed external sinks (webhooks, SDK listeners), which only matter when a node is actually running.
+
+**Scope of the current wiring.** The subscribe → map → dispatch path is wired end-to-end: a `ContextEvent` emitted by a context actor reaches the `WebhookDispatcher`. What is **not** yet wired in production is the dispatcher's *outbound target registration* — there is no operator-facing surface that registers webhook URLs/signing keys onto the dispatcher's target table. The dispatcher therefore holds zero targets at runtime, and `dispatch_event` is a no-op fan-out until such a surface exists; delivery is end-to-end only once an operator-facing target-registration API drives `WebhookDispatcher::register`. The event *plumbing* is complete and tested; actual outbound delivery is gated on that future operator-config surface. Until it lands, the only consumers exercising the full path are the integration tests, which register targets directly (see `scp-node/tests/webhook_event_wiring.rs`).
+
 ### 13. Lock-elimination validation gate (general rule)
 
 Every commit that deletes or splits a serializing primitive needs a Shuttle/stress test under realistic I/O jitter, asserting:

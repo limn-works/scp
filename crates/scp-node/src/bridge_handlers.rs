@@ -81,7 +81,13 @@ pub struct BridgeState {
 
     /// Outbound webhook dispatcher for delivering context events
     /// to registered bridge webhook endpoints (spec §12.2.1).
-    pub webhook_dispatcher: crate::webhook::WebhookDispatcher,
+    ///
+    /// Wrapped in `Arc` so the same dispatcher instance can be shared with
+    /// the local-event consumer task spawned via
+    /// [`spawn_event_consumer`](crate::webhook::spawn_event_consumer). Both
+    /// the inbound HTTP relay path (`process_webhook_event`) and the local
+    /// `Supervisor` event channel feed this single dispatcher (§12.10.5).
+    pub webhook_dispatcher: Arc<crate::webhook::WebhookDispatcher>,
 }
 
 /// A stored emitted message for tracking purposes.
@@ -113,8 +119,19 @@ impl BridgeState {
             processed_event_ids: RwLock::new(HashSet::new()),
             messages: RwLock::new(Vec::new()),
             message_sequence: RwLock::new(0),
-            webhook_dispatcher: crate::webhook::WebhookDispatcher::new(),
+            webhook_dispatcher: Arc::new(crate::webhook::WebhookDispatcher::new()),
         }
+    }
+
+    /// Returns a clonable handle to the outbound webhook dispatcher.
+    ///
+    /// Used by the node-level event wiring to share the dispatcher with the
+    /// local-event consumer task ([`spawn_event_consumer`](crate::webhook::spawn_event_consumer)),
+    /// so `Supervisor`-originated events reach the same dispatcher as the
+    /// inbound HTTP relay path (§12.10.5).
+    #[must_use]
+    pub fn webhook_dispatcher(&self) -> Arc<crate::webhook::WebhookDispatcher> {
+        Arc::clone(&self.webhook_dispatcher)
     }
 }
 

@@ -1197,6 +1197,111 @@ fn b3_webhook_dispatch_wired() {
         webhook_src.contains("validate_webhook_url"),
         "webhook module must include SSRF validation"
     );
+
+    // The consumer that bridges Supervisor events to the dispatcher must
+    // exist (§12.10.5). Without it, local context events can never reach
+    // registered webhooks — the dispatcher would only ever be fed by the
+    // inbound HTTP relay endpoint.
+    assert!(
+        webhook_src.contains("fn spawn_event_consumer"),
+        "webhook module must export spawn_event_consumer (local-event → dispatcher bridge)"
+    );
+    assert!(
+        webhook_src.contains("fn map_context_event"),
+        "webhook module must map ContextEvent variants to webhook event types"
+    );
+
+    // The consumer must be wired in production: the node exposes the wire, and
+    // the FFI node-startup path enables the Supervisor event channel and spawns
+    // the consumer. A string match here guards against the regression where the
+    // plumbing existed but was never connected.
+    assert!(
+        node_src.contains("fn wire_context_events"),
+        "ApplicationNode must expose wire_context_events to connect events to the dispatcher"
+    );
+
+    // The producer seam: the supervisor exposes the public subscribe surface
+    // that FFI node startup drives. After ADR-049 the event channel moved off
+    // the deleted ContextManager onto the Supervisor, so the live symbol is
+    // `Supervisor::subscribe_events` (the former `ContextManager::with_event_channel`
+    // accessor is gone).
+    let supervisor_src =
+        include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
+    assert!(
+        supervisor_src.contains("fn subscribe_events"),
+        "Supervisor must expose subscribe_events so the node webhook dispatcher \
+         consumer can subscribe (otherwise no events are dispatched)"
+    );
+
+    // Every non-WASM bridge (PyO3 reference, NAPI, UniFFI) must independently
+    // (a) enable the Supervisor event channel at supervisor construction and
+    // (b) wire the consumer into the dispatcher at node startup. The original
+    // wiring was first fixed only on PyO3; NAPI/UniFFI had structurally
+    // identical startup paths that were never wired, so local events never
+    // reached the dispatcher on Node/Bun/Swift/Kotlin. These per-bridge string
+    // matches guard against that drift recurring.
+    //
+    // The shared supervision seam (`spawn_supervised_event_consumer`) lives in
+    // `scp-ffi-common`; assert it exists so the consolidated wire cannot be
+    // silently inlined-and-diverged again.
+    let common_server_src = include_str!("../../../../crates/scp-ffi/common/src/server.rs");
+    assert!(
+        common_server_src.contains("fn spawn_supervised_event_consumer"),
+        "scp-ffi-common must expose the shared spawn_supervised_event_consumer \
+         supervision seam used by all bridges"
+    );
+    assert!(
+        common_server_src.contains("fn wire_and_supervise_context_events"),
+        "RunningNode must expose wire_and_supervise_context_events (shared \
+         subscribe → wire → supervise seam for all bridges)"
+    );
+
+    // PyO3 reference bridge.
+    let ffi_server_src = include_str!("../../../../crates/scp-ffi/src/server.rs");
+    assert!(
+        ffi_server_src.contains("wire_node_webhook_events")
+            && ffi_server_src.contains("wire_and_supervise_context_events"),
+        "PyO3 node startup must call wire_node_webhook_events into the shared \
+         wire_and_supervise_context_events seam so local events reach the \
+         webhook dispatcher"
+    );
+    let ffi_runtime_src = include_str!("../../../../crates/scp-ffi/src/runtime.rs");
+    assert!(
+        ffi_runtime_src.contains("EVENT_CHANNEL_CAPACITY")
+            && ffi_runtime_src.contains("Some(event_tx)"),
+        "PyO3 production Supervisor construction must enable the event channel \
+         (otherwise subscribe_events yields None and no events are dispatched)"
+    );
+
+    // NAPI bridge (Node.js/Bun).
+    let napi_server_src = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
+    assert!(
+        napi_server_src.contains("wire_and_supervise_context_events"),
+        "NAPI node startup must wire Supervisor events into the webhook \
+         dispatcher (regression guard on Node/Bun)"
+    );
+    let napi_runtime_src = include_str!("../../../../crates/scp-ffi/napi/src/runtime.rs");
+    assert!(
+        napi_runtime_src.contains("EVENT_CHANNEL_CAPACITY")
+            && napi_runtime_src.contains("Some(event_tx)"),
+        "NAPI production Supervisor construction must enable the event channel \
+         (otherwise subscribe_events yields None and no events are dispatched)"
+    );
+
+    // UniFFI bridge (Swift/Kotlin).
+    let uniffi_server_src = include_str!("../../../../crates/scp-ffi/uniffi/src/server.rs");
+    assert!(
+        uniffi_server_src.contains("wire_and_supervise_context_events"),
+        "UniFFI node startup must wire Supervisor events into the webhook \
+         dispatcher (regression guard on Swift/Kotlin)"
+    );
+    let uniffi_runtime_src = include_str!("../../../../crates/scp-ffi/uniffi/src/runtime.rs");
+    assert!(
+        uniffi_runtime_src.contains("EVENT_CHANNEL_CAPACITY")
+            && uniffi_runtime_src.contains("Some(event_tx)"),
+        "UniFFI production Supervisor construction must enable the event channel \
+         (otherwise subscribe_events yields None and no events are dispatched)"
+    );
 }
 
 // ===========================================================================

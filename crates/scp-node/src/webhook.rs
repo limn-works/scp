@@ -20,6 +20,28 @@ static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Maximum number of retry attempts for failed webhook deliveries.
 const MAX_RETRIES: u32 = 3;
 
+/// Maximum number of concurrent OUTER per-event dispatch tasks the event
+/// consumer may have in flight at once. Acts as the backpressure cap that
+/// keeps the consumer-owned `JoinSet` from growing without bound under
+/// sustained event rate (each dispatch can walk the full retry ladder — 3
+/// attempts x 10s timeout plus backoff — so the in-flight set would otherwise
+/// grow as rate x latency).
+///
+/// # True leaf-task ceiling
+///
+/// Each outer dispatch fans out to at most [`WebhookDispatcher::MAX_TARGETS`]
+/// per-target leaf HTTP tasks (the registry cap enforced by
+/// [`WebhookDispatcher::register`]). So the worst-case count of concurrent
+/// leaf HTTP tasks is `MAX_INFLIGHT_DISPATCHES * MAX_TARGETS`, NOT
+/// `MAX_INFLIGHT_DISPATCHES`: the semaphore bounds the outer layer, and
+/// `MAX_TARGETS` bounds the inner fan-out of each. Both layers are owned by
+/// `JoinSet`s — the consumer-owned set here for the outer dispatch tasks, and
+/// a locally-scoped set inside [`WebhookDispatcher::dispatch_event`] for the
+/// per-target leaf tasks — so an instance-shutdown abort tears down EVERY
+/// level. No detached leaf tasks survive shutdown leaking `reqwest` clients or
+/// sockets on the never-dropped process-global runtime.
+const MAX_INFLIGHT_DISPATCHES: usize = 256;
+
 /// Initial retry delay in milliseconds (doubles on each retry).
 const INITIAL_RETRY_DELAY_MS: u64 = 500;
 
@@ -342,13 +364,42 @@ pub struct WebhookDispatcher {
 
 impl WebhookDispatcher {
     /// Creates a new empty dispatcher with a hardened HTTP client.
+    ///
+    /// The client disables redirect following (`redirect::Policy::none()`) as
+    /// an SSRF defense: a webhook target that 30x-redirects to an internal
+    /// address must not be followed.
     #[must_use]
     pub fn new() -> Self {
+        // `reqwest::Client::builder().build()` only fails on process-wide,
+        // deterministic TLS-backend initialization — not on anything specific
+        // to this builder configuration. If it fails here, no redirect-none
+        // client is constructible on this process at all, so a panic-free node
+        // startup cannot simultaneously guarantee redirect-none on that
+        // unreachable path. We accept `Client::default()` there (which DOES
+        // follow redirects) rather than panic, because reaching it means TLS
+        // is already broken process-wide and no webhook can be delivered
+        // anyway. We do not retry the builder: a second attempt fails
+        // identically, so it would be dead code, not defense in depth.
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_default();
+        Self::with_client_for_test(client)
+    }
+
+    /// Creates a new empty dispatcher with a caller-provided HTTP client.
+    ///
+    /// **Test-only.** This bypasses the SSRF hardening that [`new`](Self::new)
+    /// applies (redirect disabling): the supplied client is used verbatim. It
+    /// exists so integration tests can pin a self-signed root for a local
+    /// HTTPS webhook receiver and resolve a test hostname to loopback. No
+    /// production path constructs a dispatcher this way — production callers
+    /// MUST use [`new`](Self::new). Mirrors the established
+    /// `RelayTransportDiscovery::with_client_for_test` seam in `scp-transport`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_client_for_test(client: reqwest::Client) -> Self {
         Self {
             targets: RwLock::new(HashMap::new()),
             client,
@@ -434,13 +485,27 @@ impl WebhookDispatcher {
             return;
         }
 
-        // Fan out dispatches concurrently.
+        // Fan out dispatches concurrently. The per-target tasks are owned by a
+        // locally-scoped `JoinSet` rather than detached via bare `tokio::spawn`.
+        // A `JoinSet` aborts every task it still owns when it is dropped, so if
+        // the surrounding outer dispatch task is aborted at the `.await` below
+        // (e.g. on instance shutdown, when `spawn_event_consumer`'s owning
+        // `JoinSet` is dropped), this future is dropped, `fanout` is dropped,
+        // and the in-flight per-target HTTP tasks are torn down with it. A bare
+        // `tokio::spawn` would instead DETACH them, letting them survive the
+        // shutdown for the full retry ladder while holding `reqwest` clients and
+        // sockets on the never-dropped process-global runtime.
+        //
+        // The fan-out width is already bounded by `MAX_TARGETS` (the registry
+        // cap enforced in `register`), so no additional semaphore is needed
+        // here — the `JoinSet` exists for deterministic teardown, not
+        // backpressure.
         let event = Arc::new(event);
-        let mut handles = Vec::with_capacity(matching.len());
+        let mut fanout: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         for (target_id, target) in matching {
             let event = Arc::clone(&event);
             let client = self.client.clone();
-            handles.push(tokio::spawn(async move {
+            fanout.spawn(async move {
                 let result =
                     dispatch_webhook(&target.url, &event, &target.signing_key, &client).await;
                 if result.success {
@@ -459,13 +524,13 @@ impl WebhookDispatcher {
                         "webhook dispatch failed"
                     );
                 }
-            }));
+            });
         }
 
-        // Await all dispatches (best-effort, ignore join errors).
-        for handle in handles {
-            let _ = handle.await;
-        }
+        // Await all per-target dispatches (best-effort, ignore join errors).
+        // If this `.await` point is aborted, `fanout` is dropped and its
+        // outstanding tasks are aborted rather than detached.
+        while fanout.join_next().await.is_some() {}
     }
 
     /// Returns the number of registered targets.
@@ -481,7 +546,7 @@ impl Default for WebhookDispatcher {
 }
 
 // ---------------------------------------------------------------------------
-// ContextEvent → webhook event mapping (#1539 AC3)
+// ContextEvent → webhook event mapping
 // ---------------------------------------------------------------------------
 
 /// Maps a [`scp_core::context::membership::ContextEvent`] to a `(event_type, payload)`
@@ -572,6 +637,10 @@ pub fn map_context_event(
         | ContextEvent::AppBound { .. }
         | ContextEvent::AppUnbound { .. }
         | ContextEvent::DegradedMode { .. }
+        // `WelcomeGenerated` is suppressed upstream in `emit_event_into`
+        // (state.rs): it carries MLS key material and is pushed to the receive
+        // buffer only, never sent on the broadcast channel. It therefore cannot
+        // reach this consumer; it is listed here solely for match exhaustiveness.
         | ContextEvent::WelcomeGenerated { .. }
         | ContextEvent::BufferOverflow { .. }
         | ContextEvent::SequenceGapDetected { .. }
@@ -601,27 +670,124 @@ pub fn map_context_event(
 /// The task runs until the receiver's channel is closed (all senders
 /// dropped) or the returned [`tokio::task::JoinHandle`] is aborted.
 /// Lagged events are logged and skipped.
+///
+/// # Drain-vs-dispatch decoupling (bounded, consumer-owned)
+///
+/// The supervisor's event channel is a single bounded broadcast shared across
+/// ALL contexts the node hosts. Dispatch is slow and adversary-influenced: a
+/// single unreachable or hostile webhook target walks the full retry ladder
+/// (exponential backoff plus per-attempt 10s timeouts — up to ~31.5s per
+/// event), which can take many seconds. If the recv loop awaited each dispatch
+/// inline, one high-latency target on one context would stall the drain for the
+/// entire shared channel and silently evict another context's audit events
+/// (`member.left`, `MemberBlocked`, `governance.action`) before they were ever
+/// read.
+///
+/// To keep the drain running at channel speed WITHOUT leaking or unboundedly
+/// accumulating dispatch work, each event's dispatch is spawned onto a
+/// [`tokio::task::JoinSet`] **owned by this consumer task** and guarded by an
+/// [`Arc<tokio::sync::Semaphore`][`tokio::sync::Semaphore`] sized to
+/// [`MAX_INFLIGHT_DISPATCHES`]. Two invariants follow:
+///
+/// 1. **Bounded concurrency / backpressure.** An owned permit is acquired
+///    BEFORE each dispatch is spawned. Once `MAX_INFLIGHT_DISPATCHES` permits
+///    are out, the recv loop blocks on `acquire_owned()` until an in-flight
+///    dispatch finishes and returns its permit. The live dispatch-task count is
+///    therefore capped at the semaphore size regardless of event rate — there
+///    is no unbounded backlog primitive. (The broadcast channel's cap-1024
+///    buffer is drain depth, NOT in-flight task count; the semaphore is what
+///    actually bounds concurrency.) Saturation applies backpressure to the
+///    drain, which under sustained overload manifests as channel lag — surfaced
+///    by the `Lagged` arm below, not as silent memory growth.
+///
+/// 2. **Deterministic teardown on instance shutdown — at BOTH layers.** The
+///    outer `JoinSet` of per-event dispatch tasks lives INSIDE this consumer's
+///    async block. The supervising `spawn_supervised_event_consumer` (in
+///    `scp-ffi/common`) aborts THIS consumer task when the bridge instance's
+///    cancellation token fires. Abort drops the consumer future, which drops
+///    the owned outer `JoinSet`, and dropping a `JoinSet` aborts every task it
+///    owns. Each outer dispatch task in turn owns its own locally-scoped
+///    `JoinSet` of per-target leaf HTTP tasks (see
+///    [`WebhookDispatcher::dispatch_event`]); aborting the outer task drops
+///    that inner set, which aborts its leaf tasks too. So every outstanding
+///    task at EVERY level is torn down with the instance — none outlive it as
+///    detached tasks leaking `reqwest` clients and sockets across the
+///    process-global runtime (which is never dropped per-instance). The inner
+///    fan-out is bounded by [`WebhookDispatcher::MAX_TARGETS`], so the
+///    worst-case concurrent leaf-task ceiling is
+///    `MAX_INFLIGHT_DISPATCHES * MAX_TARGETS`. On normal channel close we also
+///    `shutdown().await` the outer set for a best-effort drain before
+///    returning.
+///
+/// `dispatch_event` owns all of its own error handling and retries and never
+/// panics, so a dispatch task cannot escape a panic.
 pub fn spawn_event_consumer(
     mut rx: tokio::sync::broadcast::Receiver<(String, scp_core::context::membership::ContextEvent)>,
     dispatcher: Arc<WebhookDispatcher>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Consumer-owned set of in-flight dispatch tasks. Owned INSIDE this
+        // future so that aborting the consumer (instance shutdown) drops the
+        // set and tears down every outstanding dispatch task.
+        let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // Bounds the number of concurrently in-flight dispatch tasks. Owned and
+        // never closed, so `acquire_owned()` is effectively infallible.
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_DISPATCHES));
+
         loop {
+            // Reap completed dispatch tasks so the JoinSet does not retain
+            // finished handles between events.
+            while inflight.try_join_next().is_some() {}
+
             match rx.recv().await {
                 Ok((context_id, event)) => {
+                    // `event_type` is a `&'static str`, so it moves into the
+                    // dispatch task without allocation.
                     let (event_type, payload) = map_context_event(&event);
-                    dispatcher
-                        .dispatch_event(&context_id, event_type, payload)
-                        .await;
+                    // Acquire a permit BEFORE spawning so saturation applies
+                    // backpressure (bounded) rather than spawning unboundedly.
+                    // The semaphore is owned and never closed, so this only
+                    // errors on a closed semaphore — treat that impossible case
+                    // as a stop signal without panicking.
+                    let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+                        break;
+                    };
+                    let dispatcher = Arc::clone(&dispatcher);
+                    inflight.spawn(async move {
+                        // Hold the permit for the lifetime of the dispatch; it
+                        // is released when this task completes, freeing a slot.
+                        let _permit = permit;
+                        dispatcher
+                            .dispatch_event(&context_id, event_type, payload)
+                            .await;
+                    });
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    tracing::warn!(
+                    // The supervisor's event channel is a single bounded
+                    // broadcast shared across ALL contexts the node hosts. A
+                    // high-traffic context can evict another context's events
+                    // (member.left, MemberBlocked, governance.action) before
+                    // this consumer reads them — those webhook deliveries are
+                    // then silently lost. Escalate to error: security-relevant
+                    // audit events may have been dropped. Webhook delivery is
+                    // best-effort and MUST NOT be the sole audit channel; the
+                    // durable Merkle event log is authoritative (spec §12.10.5).
+                    tracing::error!(
                         count,
-                        "webhook event consumer lagged — {count} events dropped"
+                        "webhook event consumer lagged — {count} context events DROPPED \
+                         before delivery; security-relevant audit events (member.left, \
+                         MemberBlocked, governance.action) may have been lost. Webhook \
+                         delivery is lossy under load — rely on the durable Merkle event \
+                         log for audit, not webhooks (spec §12.10.5)"
                     );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::info!("webhook event channel closed — consumer stopping");
+                    // Best-effort drain of in-flight dispatches before exiting.
+                    // (On instance-cancel abort this future is dropped instead,
+                    // which aborts the set; this arm covers the clean-close path
+                    // where all broadcast senders were dropped.)
+                    inflight.shutdown().await;
                     break;
                 }
             }
@@ -972,7 +1138,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // End-to-end webhook integration test (#1539 AC6)
+    // End-to-end webhook integration test
     // -----------------------------------------------------------------------
 
     /// Captured HTTP request data from the local webhook server.
@@ -1084,7 +1250,7 @@ mod tests {
     }
 
     /// Full HTTP roundtrip: local server receives POST with valid Ed25519
-    /// signature, correct headers, and structured JSON body (#1539 AC6).
+    /// signature, correct headers, and structured JSON body.
     #[tokio::test]
     async fn webhook_integration_end_to_end() {
         let (addr, rx, server_handle) = start_webhook_server().await;
@@ -1117,7 +1283,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // ContextEvent mapping tests (#1539 AC3)
+    // ContextEvent mapping tests
     // -------------------------------------------------------------------
 
     #[test]
