@@ -365,6 +365,16 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: codes::CTX_2093.to_owned(),
             },
+            // §23.16.8 / §17.5 / ADR-050: the export format-version gate. This
+            // fires before any signature is checked (an unsupported/old format,
+            // e.g. pre-scope-binding v3), so surface the dedicated SCP-CTX-2094
+            // contract instead of the catch-all CTX_2001 — a caller can then
+            // distinguish "old/unsupported format" from a forged signature
+            // (CTX_2093) and from generic context errors.
+            CE::ExportVersionUnsupported { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2094.to_owned(),
+            },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for tool-economy and tool-invocation failures
             // (economy 12xxx, tool-invocation 6xxx). Recover the embedded
@@ -803,6 +813,19 @@ mod tests {
         }
         .into();
         assert_eq!(context_code_of(err), codes::CTX_2093);
+    }
+
+    /// §23.16.8 / §17.5 / ADR-050: the export format-version gate must surface
+    /// the dedicated SCP-CTX-2094 code, distinct from the SCP-CTX-2093 signature
+    /// failure and from the catch-all SCP-CTX-2001. A caller can then tell an
+    /// old/unsupported export format apart from a forged signature.
+    #[test]
+    fn export_version_unsupported_surfaces_ctx_2094() {
+        let err: ScpPyError = scp_core::context::ContextError::ExportVersionUnsupported {
+            reason: "unsupported export version: 3, required: 4".to_owned(),
+        }
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2094);
     }
 
     /// Defense against regression: an unrelated `ContextError` variant must
