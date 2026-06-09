@@ -178,6 +178,7 @@ pub mod economy {
     pub use scp_runtime::economy::integration;
     pub use scp_runtime::economy::integration::*;
     pub use scp_runtime::economy::receipt;
+    pub use scp_runtime::economy::receipt::verification_results_to_json;
 }
 
 pub mod discovery {

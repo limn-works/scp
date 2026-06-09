@@ -449,33 +449,11 @@ pub(crate) fn economy_verify_payment_receipts_on(
             })
         })?;
 
-        // Serialize results. Each entry is a
-        // `Result<ReceiptVerification, ReceiptVerificationError>`.
-        // `ok` reports whether the adapter responded; payment validity is
-        // carried by `valid`/`result.valid` and aggregated into the top-level
-        // `all_valid` flag (vacuously true for an empty batch).
-        let mut all_valid = true;
-        let entries: Vec<serde_json::Value> = results
-            .into_iter()
-            .map(|r| match r {
-                Ok(v) => {
-                    if !v.result.valid {
-                        all_valid = false;
-                    }
-                    serde_json::json!({
-                        "receipt_id": hex::encode(v.receipt_id),
-                        "ok": true,
-                        "valid": v.result.valid,
-                        "result": v.result,
-                    })
-                }
-                Err(e) => {
-                    all_valid = false;
-                    serde_json::json!({ "ok": false, "error": format!("{e}") })
-                }
-            })
-            .collect();
-        Ok(serde_json::json!({ "all_valid": all_valid, "results": entries }).to_string())
+        // Serialize via the single canonical helper shared by all bridges,
+        // so the JSON contract (string currency, numeric amount, `ok` vs
+        // `valid`/`all_valid` semantics) cannot drift across PyO3, napi, and
+        // UniFFI. See `scp_runtime::economy::receipt::verification_results_to_json`.
+        Ok(scp_core::economy::verification_results_to_json(results))
     })
 }
 
