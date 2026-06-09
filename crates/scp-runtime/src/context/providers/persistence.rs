@@ -190,6 +190,7 @@ mod tests {
             context_params: ContextParams::default(),
             membership: MembershipState::default(),
             role_state,
+            event_log_merkle_root: [0u8; 32],
             executed_proposals: HashSet::default(),
             ttl_remaining_secs: None,
             registered_tools: Vec::new(),

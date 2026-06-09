@@ -1238,7 +1238,11 @@ impl Supervisor {
                 let _ = reply.send(reply_result);
                 outcome
             }
-            LifecycleCommand::ImportContext { export, reply } => {
+            LifecycleCommand::ImportContext {
+                export,
+                verifying_key,
+                reply,
+            } => {
                 let context_id = export.snapshot.context_id.clone();
                 // ADR-049 Phase 2A finalization: scope the actor-shape
                 // deps to a deterministic member of the imported roster
@@ -1276,7 +1280,9 @@ impl Supervisor {
                 // the full PerContextState-construction locals inside
                 // the `import_context` body).
                 let fut = Box::pin(crate::context::lifecycle_helpers::import_context(
-                    &deps, *export,
+                    &deps,
+                    *export,
+                    &verifying_key,
                 ));
                 let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
                     .await
@@ -3594,6 +3600,107 @@ impl Supervisor {
         rx.await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::restore_context — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Exports the full state of a context as a transferable, signed
+    /// [`ContextExport`](crate::context::export_import::ContextExport)
+    /// (§23.16.8, ADR-050).
+    ///
+    /// The per-context actor captures the UNSIGNED export building blocks
+    /// (snapshot + Merkle event-log data) via the
+    /// [`LifecycleCommand::ExportContext`] mailbox turn; the snapshot is then
+    /// signed HERE, at the dispatch boundary, because the runtime holds no
+    /// custody key. The caller supplies a `sign` closure that produces an
+    /// Ed25519 signature over the canonical snapshot digest
+    /// (`SHA-256("SCP-CONTEXT-EXPORT-V1:" || JCS(snapshot))`) using the
+    /// exporter's custody key.
+    ///
+    /// The exporter MUST be the snapshot `creator_did` (the importer enforces
+    /// `exporter_did == creator_did`). The FFI bridge resolves the signing
+    /// key via `resolve_signing_key`, mirroring the governance signing path.
+    /// The closure receives the canonical digest computed over the final
+    /// (post–public-stripping) snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if the context does not exist, the actor reply
+    /// channel closes, event-log export or Merkle verification fails, canonical
+    /// hashing fails, or `sign` returns an error.
+    pub async fn export_context<F, E>(
+        self: &Arc<Self>,
+        context_id: &str,
+        exporter_did: DID,
+        sign: F,
+    ) -> Result<crate::context::export_import::ContextExport, ContextError>
+    where
+        F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
+        E: std::fmt::Display,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::ExportContext {
+            context_id: context_id.to_owned(),
+            exporter_did: exporter_did.clone(),
+            reply: tx,
+        };
+        self.dispatch_lifecycle_command(cmd).await?;
+        let (snapshot, event_log_data) = rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::export_context — actor reply channel closed".to_owned(),
+            )
+        })??;
+
+        // Sign at the dispatch boundary: the actor holds no custody key, so
+        // the FFI-supplied `sign` closure produces the Ed25519 signature over
+        // the canonical snapshot digest computed inside `create_export`
+        // (§23.16.8, ADR-050).
+        let clock = self.clock_ref().ok_or_else(|| {
+            ContextError::PersistenceFailed(
+                "Supervisor::export_context — clock provider not initialized".to_owned(),
+            )
+        })?;
+        crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            exporter_did,
+            crate::context::export_import::ExportScope::Full,
+            clock.as_ref(),
+            sign,
+        )
+    }
+
+    /// Imports a previously exported context (§23.16.8, ADR-050).
+    ///
+    /// Imports come from an UNTRUSTED source. `verifying_key` is the snapshot
+    /// `creator_did`'s resolved Ed25519 verification-method key (resolved by
+    /// the FFI bridge from `role_state.creator_did`, NEVER the unauthenticated
+    /// envelope `exporter_did`). The import path verifies the snapshot
+    /// signature, the signer binding (`exporter_did == creator_did`), the
+    /// version gate, and the Merkle chain against the SIGNED
+    /// `event_log_merkle_root` BEFORE restoring any state. A signature failure
+    /// rejects with [`ContextError::SnapshotSignatureInvalid`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the import handler, including
+    /// [`ContextError::SnapshotSignatureInvalid`] (signature/signer-binding/
+    /// version forgery) and the public-scope rejection.
+    pub async fn import_context(
+        self: &Arc<Self>,
+        export: crate::context::export_import::ContextExport,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<crate::context::ContextHandle, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::ImportContext {
+            export: Box::new(export),
+            verifying_key: Box::new(*verifying_key),
+            reply: tx,
+        };
+        self.dispatch_lifecycle_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::import_context — actor reply channel closed".to_owned(),
             )
         })?
     }

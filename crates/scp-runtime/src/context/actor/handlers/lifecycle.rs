@@ -144,7 +144,11 @@ async fn dispatch_actor_inner(
             exporter_did,
             reply,
         } => handle_export_context_actor(state, deps, context_id, exporter_did, reply),
-        LifecycleCommand::ImportContext { export, reply } => {
+        LifecycleCommand::ImportContext {
+            export,
+            verifying_key: _,
+            reply,
+        } => {
             // Bootstrap variant — see `CreateContext` arm comment.
             let err = ContextError::InvalidState(format!(
                 "ImportContext reached actor mailbox — context `{}` already has a registered actor",
@@ -357,17 +361,20 @@ fn handle_export_context_actor(
     state: &PerContextState,
     deps: &ActorDeps,
     _context_id: String,
-    exporter_did: scp_identity::DID,
+    _exporter_did: scp_identity::DID,
     reply: ExportContextReply,
 ) -> Outcome<()> {
-    // Export is sync and read-only — no timeout wrapping needed.
-    let result = crate::context::lifecycle_helpers::export_context(state, deps, exporter_did);
-    let outcome = match &result {
-        Ok(_) => Outcome::ok(()),
-        Err(e) => Outcome::err(outcome_error_sketch(e)),
-    };
-    let _ = reply.send(result);
-    outcome
+    // Export is sync and read-only — no timeout wrapping needed. The actor
+    // only captures the UNSIGNED export building blocks (snapshot + event-log
+    // data); the snapshot signature is applied at the dispatch boundary
+    // (`Supervisor::export_context`) where the FFI-supplied `sign` closure
+    // lives, since the runtime holds no custody key (§23.16.8, ADR-050). The
+    // capture is infallible (best-effort event-log export), but the reply
+    // channel carries `Result` for shape parity with the other lifecycle
+    // handlers.
+    let blocks = crate::context::lifecycle_helpers::export_context_blocks(state, deps);
+    let _ = reply.send(Ok(blocks));
+    Outcome::ok(())
 }
 
 // ---------------------------------------------------------------------------

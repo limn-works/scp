@@ -106,22 +106,32 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 // 1. export_context (per-context, read-only)
 // ---------------------------------------------------------------------------
 
-/// Exports a context's full state as a transferable
-/// [`ContextExport`](crate::context::export_import::ContextExport).
+/// Captures a context's full unsigned export building blocks from the
+/// actor-owned state (§23.16.8, ADR-050).
 ///
-/// Captures a `ContextSnapshot` from the actor-owned state, exports the
-/// event log via `deps.event_log`, and produces a signed export.
+/// Returns the `ContextSnapshot` and the serialized Merkle event-log data.
+/// The actor holds no custody/signing key, so the signature is NOT applied
+/// here — the caller ([`crate::context::supervisor::Supervisor::export_context`])
+/// invokes [`crate::context::export_import::create_export`] with the
+/// FFI-supplied `sign` closure once the actor mailbox returns these blocks.
+/// Splitting the read-only capture (inside the actor) from the signing
+/// (at the bridge boundary) preserves the actor-per-context model while
+/// keeping the signature over the exact canonical bytes a verifier recomputes.
 ///
-/// # Errors
+/// The snapshot's `mls_crypto_state` is empty on this portable export path;
+/// live MLS crypto state is carried only on the persistence/restore path.
+/// Whether portable export should include MLS crypto state is an open design
+/// decision (security tradeoff).
 ///
-/// Returns a transport-/persistence-level error from the underlying
-/// event-log export, or a crypto/clock failure during the signed-export
-/// build.
-pub fn export_context(
+/// The event-log export is best-effort (`unwrap_or_default`), matching the
+/// pre-actor `export_context` body, so this capture is infallible. Any signing
+/// or Merkle-verification failure surfaces later in
+/// [`create_export`](crate::context::export_import::create_export) at the
+/// dispatch boundary.
+pub fn export_context_blocks(
     state: &PerContextState,
     deps: &ActorDeps,
-    exporter_did: DID,
-) -> Result<crate::context::export_import::ContextExport, ContextError> {
+) -> (crate::context::state::ContextSnapshot, Vec<u8>) {
     let context_id = state.handle.context_id();
     let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
@@ -132,17 +142,7 @@ pub fn export_context(
         .export_event_log_data(&ctx_id_bytes)
         .unwrap_or_default();
 
-    // MLS state is empty until #333 (MLS integration) lands.
-    let mls_state = Vec::new();
-
-    crate::context::export_import::create_export(
-        snapshot,
-        event_log_data,
-        mls_state,
-        exporter_did,
-        crate::context::export_import::ExportScope::Full,
-        &*deps.clock,
-    )
+    (snapshot, event_log_data)
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,9 +1309,38 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
 pub async fn import_context(
     deps: &ActorDeps,
     export: crate::context::export_import::ContextExport,
+    verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<ContextHandle, ContextError> {
-    // 1. Validate export.
-    crate::context::export_import::validate_export_for_import(&export)?;
+    // 1. Validate export (version gate, snapshot signature, Merkle chain).
+    //
+    // Imports come from an UNTRUSTED source. The embedded snapshot's Ed25519
+    // signature is verified against `verifying_key` — the snapshot
+    // `creator_did`'s resolved `#active`/`#agent` verification-method key
+    // (§23.16.8, ADR-039, ADR-050) — before any state is restored. The
+    // importer also enforces `exporter_did == creator_did`. A signature
+    // failure (or signer-binding mismatch) rejects with
+    // `ContextError::SnapshotSignatureInvalid`, distinct from the event-log
+    // Merkle failure and from the version gate.
+    crate::context::export_import::validate_export_for_import(&export, verifying_key)?;
+
+    // `import_context` reconstructs authoritative context state and is only
+    // meaningful for a full-scope export. A public-scope export
+    // (`ExportScope::Public`) has its member list, governance config, and
+    // event log stripped (see `strip_snapshot_for_public`), so importing it
+    // would produce a degenerate stub context with no members and empty
+    // governance. Reject it explicitly so a public summary can never silently
+    // become an authoritative context. `scope` is an unsigned envelope field
+    // (inert to signature validation by design), so this is an
+    // import-orchestration policy check, not a signature concern.
+    if export.scope != crate::context::export_import::ExportScope::Full {
+        return Err(ContextError::InvalidState(format!(
+            "cannot import a {:?}-scope export — only full-scope exports carry the \
+             membership, governance, and event-log state required to reconstruct an \
+             authoritative context",
+            export.scope
+        )));
+    }
+
     // C3: Validate consequence rules on import. Uses
     // validate_against_config to enforce the opt-in gate for
     // RevokeAccess even on imported snapshots and rejects with the
@@ -1335,9 +1364,13 @@ pub async fn import_context(
     // and exits; we deterministically despawn its dead handle before the
     // fresh spawn below.
     if deps.supervisor.lookup(&context_id).is_some() {
+        // Crypto state is read from the SIGNED snapshot field (ADR-050: all
+        // importer-restored state lives in the signed preimage), never from
+        // an unsigned envelope blob. Validated by `validate_export_for_import`
+        // above.
         match deps
             .supervisor
-            .dispatch_prepare_for_replace(&context_id, export.mls_state.clone())
+            .dispatch_prepare_for_replace(&context_id, export.snapshot.mls_crypto_state.clone())
             .await
         {
             Ok(()) => {
@@ -1364,15 +1397,25 @@ pub async fn import_context(
                 }
                 // Slot vacant — restore crypto through the SAME floor-guarded
                 // path the actor handler uses, so the replay guard still runs.
-                restore_crypto_state_with_floor_guard(deps, &ctx_id_bytes, &export.mls_state)?;
+                // Read from the SIGNED snapshot field, never an unsigned
+                // envelope blob (ADR-050).
+                restore_crypto_state_with_floor_guard(
+                    deps,
+                    &ctx_id_bytes,
+                    &export.snapshot.mls_crypto_state,
+                )?;
             }
             Err(other) => return Err(other),
         }
     } else {
         // Fresh import (no existing actor): floor-guarded crypto restore (the
-        // empty-`mls_state` case is a no-op restore + floor merge inside the
-        // helper).
-        restore_crypto_state_with_floor_guard(deps, &ctx_id_bytes, &export.mls_state)?;
+        // empty-crypto-state case is a no-op restore + floor merge inside the
+        // helper). Read from the SIGNED snapshot field (ADR-050).
+        restore_crypto_state_with_floor_guard(
+            deps,
+            &ctx_id_bytes,
+            &export.snapshot.mls_crypto_state,
+        )?;
     }
 
     // 3. Import event log data if present.

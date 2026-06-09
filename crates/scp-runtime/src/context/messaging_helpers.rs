@@ -1134,6 +1134,7 @@ pub fn build_snapshot_from_state(
         context_params: state.handle.params().clone(),
         membership: state.membership.clone(),
         role_state: state.role_state.clone(),
+        event_log_merkle_root: [0u8; 32],
         executed_proposals: state
             .governance
             .executed_proposals
