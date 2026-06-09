@@ -659,12 +659,18 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
             chunkCont = cont
         }
         self.stream = stream
-        var resolveAggregate: ((Aggregate) -> Void)?
-        var rejectAggregate: ((Error) -> Void)?
+        // Resolve the aggregate continuation through a synchronized
+        // one-shot carrier rather than bare captured `var`s shared
+        // across two unordered Tasks. The carrier serializes the
+        // continuation attach (here, inside `aggregateTask`) against the
+        // pump's resolve/reject, buffers a resolve that lands before the
+        // attach, and is single-resume — so `await handle.aggregate`
+        // resolves exactly once even when the pump runs synchronously or
+        // wins the schedule. See `AggregateResolverBox`.
+        let resolverBox = AggregateResolverBox()
         aggregateTask = Task {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Aggregate, Error>) in
-                resolveAggregate = { cont.resume(returning: $0) }
-                rejectAggregate = { cont.resume(throwing: $0) }
+                resolverBox.attach(cont)
             }
         }
         let terminatedFlag = self.terminatedFlag
@@ -689,12 +695,12 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
             },
             { agg in
                 terminatedFlag.markTerminated()
-                resolveAggregate?(agg)
+                resolverBox.resolve(agg)
                 chunkCont?.finish()
             },
             { err in
                 terminatedFlag.markTerminated()
-                rejectAggregate?(err)
+                resolverBox.reject(err)
                 chunkCont?.finish(throwing: err)
             }
         )
@@ -1028,6 +1034,111 @@ private final class ConsumedModeBox: @unchecked Sendable {
             return
         }
         self.mode = mode
+    }
+}
+
+/// Internal — synchronized one-shot carrier for the aggregate
+/// continuation's resolve/reject side. Resolves the `aggregate`
+/// `CheckedContinuation` exactly once, regardless of the order in which
+/// the continuation is attached (by the `aggregateTask` body) versus the
+/// stream pump producing a terminal outcome.
+///
+/// Why this exists: the designated initializer spawns two unordered
+/// units of work — the `aggregateTask` (which attaches the continuation)
+/// and the pump `Task` (which calls `resolve`/`reject` when the stream
+/// reaches a terminal chunk). Capturing the resolver as a bare `var`
+/// shared across both created a data race: a synchronous (or unluckily
+/// scheduled) pump could call `resolve` BEFORE the `aggregateTask` had
+/// assigned the resolver, dropping the resolution and hanging
+/// `await handle.aggregate` forever (leaked continuation, TSan race,
+/// Swift-6 UB).
+///
+/// This box (a) serializes attach vs resolve behind an `NSLock`
+/// (analogous to `TerminatedFlag` / `ConsumedModeBox`), (b) BUFFERS a
+/// resolve that arrives before the continuation is attached and replays
+/// it the instant `attach` runs, and (c) is single-resume by
+/// construction — the first resolve/reject wins and every later one is a
+/// no-op, so the continuation is resumed exactly once.
+private final class AggregateResolverBox: @unchecked Sendable {
+    private enum Buffered {
+        case value(Aggregate)
+        case error(Error)
+    }
+
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Aggregate, Error>?
+    private var buffered: Buffered?
+    private var resolved = false
+
+    /// Attach the aggregate continuation. If a terminal outcome was
+    /// already buffered (the pump won the race), the continuation is
+    /// resumed immediately with that outcome and nothing is stored.
+    func attach(_ cont: CheckedContinuation<Aggregate, Error>) {
+        lock.lock()
+        if resolved {
+            // Defensive: `resolve`/`reject` already ran and consumed the
+            // buffered outcome but `attach` raced in afterward. The
+            // single-resume invariant means we must not stash this
+            // continuation (it would never be resumed). This path is not
+            // expected because the aggregate getter awaits the task whose
+            // body calls `attach`, but guarding it keeps the box correct
+            // under any scheduling.
+            lock.unlock()
+            return
+        }
+        if let pending = buffered {
+            buffered = nil
+            resolved = true
+            lock.unlock()
+            switch pending {
+            case let .value(agg):
+                cont.resume(returning: agg)
+            case let .error(err):
+                cont.resume(throwing: err)
+            }
+            return
+        }
+        continuation = cont
+        lock.unlock()
+    }
+
+    /// Resolve the aggregate with a value. First call wins; later calls
+    /// (resolve or reject) are no-ops.
+    func resolve(_ aggregate: Aggregate) {
+        lock.lock()
+        if resolved {
+            lock.unlock()
+            return
+        }
+        if let cont = continuation {
+            continuation = nil
+            resolved = true
+            lock.unlock()
+            cont.resume(returning: aggregate)
+            return
+        }
+        // Continuation not attached yet — buffer for replay in `attach`.
+        buffered = .value(aggregate)
+        lock.unlock()
+    }
+
+    /// Reject the aggregate with an error. First call wins; later calls
+    /// (resolve or reject) are no-ops.
+    func reject(_ error: Error) {
+        lock.lock()
+        if resolved {
+            lock.unlock()
+            return
+        }
+        if let cont = continuation {
+            continuation = nil
+            resolved = true
+            lock.unlock()
+            cont.resume(throwing: error)
+            return
+        }
+        buffered = .error(error)
+        lock.unlock()
     }
 }
 
