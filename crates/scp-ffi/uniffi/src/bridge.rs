@@ -4643,55 +4643,108 @@ pub async fn outlet_invoke_cross_context(
                     code: codes::TOOL_6002.to_owned(),
                 })?;
 
-            let registry = target_handle.outlet_registry.lock().await;
-            let registration = registry.get(&outlet_id).ok_or_else(|| ScpError::Tool {
-                msg: format!(
-                    "tool '{outlet_id}' not found in target context '{}'",
-                    target_handle.context_id
-                ),
-                code: codes::TOOL_6002.to_owned(),
-            })?;
-
-            scp_core::context::outlets::validate_value_against_schema(
-                &input_value,
-                &registration.schema.input_schema,
-            )
-            .map_err(|e| ScpError::Tool {
-                msg: format!("input validation failed: {e}"),
-                code: codes::TOOL_6002.to_owned(),
-            })?;
-
-            let output_schema = registration.schema.output_schema.clone();
-            drop(registry);
-
-            let handlers = target_handle.outlet_handlers.lock().await;
-            let output = if let Some(handler) = handlers.get(&outlet_id) {
-                let handler = handler.clone();
-                drop(handlers);
-                let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
-                    msg: format!("cross-context tool handler for '{outlet_id}' failed: {e}"),
-                    code: codes::TOOL_6002.to_owned(),
+            // §7.3.8 cross-context single-shot caveat parity. The prior path
+            // dispatched directly off the target handle and NEVER built a
+            // `CaveatEnforcement`, so a delegated UCAN's `max_calls` /
+            // `amount_*` / `rate_window` / `allowed_adapters` /
+            // `allowed_target_dids` / narrowed `input_schema` were ALL skipped
+            // — and cross-context is exactly where `allowed_target_dids` must
+            // bite. Route through `invoke_outlet_with_economy` (identical to the
+            // in-context `outlet_invoke` path) so the runtime owns the counter
+            // store, prices the real cost, and FAILS CLOSED on any
+            // counter-bearing cap it cannot enforce.
+            let (effective_caveats, action_ucan_cid) =
+                scp_ffi_common::caveats::resolve_action_caveats(&ucan_token).map_err(|e| {
+                    ScpError::Permission {
+                        msg: e,
+                        code: codes::PERM_3001.to_owned(),
+                    }
                 })?;
-                scp_core::context::outlets::validate_value_against_schema(&out, &output_schema)
-                    .map_err(|msg| ScpError::Tool {
-                        msg: format!("output validation failed for tool '{outlet_id}': {msg}"),
-                        code: codes::TOOL_6002.to_owned(),
-                    })?;
-                out
-            } else {
-                drop(handlers);
-                serde_json::json!({
-                    "tool": outlet_id,
-                    "source_context": source_handle.context_id,
-                    "target_context": target_handle.context_id,
-                    "status": "validated",
-                    "chain_depth": chain_depth,
-                    "invoker_did": identity.did,
-                    "validated_input": input_value,
-                })
+
+            let registry = {
+                let reg = target_handle.outlet_registry.lock().await;
+                reg.clone()
+            };
+            let handler = {
+                let handlers = target_handle.outlet_handlers.lock().await;
+                handlers.get(&outlet_id).cloned()
             };
 
-            serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+            // The target context's creator DID is the cross-context peer DID
+            // that `allowed_target_dids` constrains (§6.2).
+            let target_creator_did = target_handle.creator_did.clone();
+            let target_context_id = target_handle.context_id.clone();
+            let source_context_id = source_handle.context_id.clone();
+            let invoker_did_str = identity.did.clone();
+            let outlet_for_executor = outlet_id.clone();
+
+            // Cross-context executor: target handler when present, else the
+            // cross-context schema-only echo (preserving the prior output shape).
+            let executor = move |input: serde_json::Value| {
+                let handler = handler.clone();
+                let input_for_echo = input.clone();
+                let outlet_for_executor = outlet_for_executor.clone();
+                let source_context_id = source_context_id.clone();
+                let target_context_id = target_context_id.clone();
+                let invoker_did_str = invoker_did_str.clone();
+                async move {
+                    handler.map_or_else(
+                        || {
+                            Ok(serde_json::json!({
+                                "tool": outlet_for_executor,
+                                "source_context": source_context_id,
+                                "target_context": target_context_id,
+                                "status": "validated",
+                                "chain_depth": chain_depth,
+                                "invoker_did": invoker_did_str,
+                                "validated_input": input_for_echo,
+                            }))
+                        },
+                        |h| {
+                            h(input).map_err(|e| {
+                                format!("cross-context tool handler for '{outlet_for_executor}' failed: {e}")
+                            })
+                        },
+                    )
+                }
+            };
+
+            let manager = crate::runtime::context_manager_expect()?;
+            let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
+            let target_did_typed: scp_primitives::DID = target_creator_did.into();
+            let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
+
+            // `target_did` is the ACTUAL cross-context peer DID, so
+            // `allowed_target_dids` is enforced. The runtime overrides
+            // `estimated_cost` with the real per-invocation cost it prices.
+            let caveat_enforcement = effective_caveats.requires_post_input_check().then(|| {
+                scp_core::context::manager::CaveatEnforcement {
+                    caveats: &effective_caveats,
+                    ucan_cid: &action_ucan_cid,
+                    negotiated_adapter: None,
+                    target_did: Some(&target_did_typed),
+                    estimated_cost: scp_core::economy::types::Amount::new(0),
+                }
+            });
+
+            let outcome = manager
+                .invoke_outlet_with_economy(
+                    &target_handle.context_id,
+                    &registry,
+                    &outlet_id_typed,
+                    input_value,
+                    &invoker_did_typed,
+                    None,
+                    None,
+                    executor,
+                    None,
+                    caveat_enforcement,
+                    None,
+                )
+                .await
+                .map_err(ScpError::from)?;
+
+            serde_json::to_string(&outcome.output).map_err(|e| ScpError::Tool {
                 msg: format!("failed to serialize cross-context output: {e}"),
                 code: codes::TOOL_6013.to_owned(),
             })
@@ -4857,27 +4910,31 @@ pub async fn outlet_session_invoke(
                 proof_tokens.as_ref(),
             )?;
 
-            let mut store = handle.session_store.lock().await;
+            // Phase A (locked): session lookup + expiry, then snapshot the
+            // state the off-lock invocation needs.
+            let (outlet_id, current_state, prior_call_count) = {
+                let mut store = handle.session_store.lock().await;
+                let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
+                    msg: format!("session '{session_id}' not found"),
+                    code: codes::TOOL_6018.to_owned(),
+                })?;
 
-            let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
-                msg: format!("session '{session_id}' not found"),
-                code: codes::TOOL_6018.to_owned(),
-            })?;
+                // Check expiry.
+                let now_ms = scp_primitives::SystemClock.now_millis();
+                if session.is_expired(now_ms) {
+                    store.remove(&session_id);
+                    return Err(ScpError::Tool {
+                        msg: format!("session '{session_id}' has expired"),
+                        code: codes::TOOL_6019.to_owned(),
+                    });
+                }
 
-            // Check expiry.
-            let now_ms = scp_primitives::SystemClock.now_millis();
-            if session.is_expired(now_ms) {
-                store.remove(&session_id);
-                return Err(ScpError::Tool {
-                    msg: format!("session '{session_id}' has expired"),
-                    code: codes::TOOL_6019.to_owned(),
-                });
-            }
-
-            let outlet_id = session.outlet_id.clone();
-            let current_state = session.state.clone();
-            let call_count = session.call_count;
-            drop(store);
+                (
+                    session.outlet_id.clone(),
+                    session.state.clone(),
+                    session.call_count,
+                )
+            };
 
             let input_value: serde_json::Value =
                 serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
@@ -4885,51 +4942,110 @@ pub async fn outlet_session_invoke(
                     code: codes::TOOL_6002.to_owned(),
                 })?;
 
-            // Validate input against tool's input schema if tool is registered.
-            let registry = handle.outlet_registry.lock().await;
-            if let Some(registration) = registry.get(&outlet_id) {
-                scp_core::context::outlets::validate_value_against_schema(
-                    &input_value,
-                    &registration.schema.input_schema,
-                )
-                .map_err(|e| ScpError::Tool {
-                    msg: format!("input validation failed: {e}"),
-                    code: codes::TOOL_6002.to_owned(),
+            // §7.3.8 caveat parity: route the per-call invocation through
+            // `invoke_outlet_with_economy` so the §7.3.8 gate (counter store +
+            // fail-closed) and real cost pricing apply. The prior session path
+            // dispatched the handler inline and NEVER built a
+            // `CaveatEnforcement`, so a delegated UCAN's caveats were all
+            // skipped on per-call session invocations.
+            let (effective_caveats, action_ucan_cid) =
+                scp_ffi_common::caveats::resolve_action_caveats(&ucan_token).map_err(|e| {
+                    ScpError::Permission {
+                        msg: e,
+                        code: codes::PERM_3001.to_owned(),
+                    }
                 })?;
-            }
-            drop(registry);
 
-            // Execute via handler or echo mode.
-            let handlers = handle.outlet_handlers.lock().await;
-            let (new_state, output) = if let Some(handler) = handlers.get(&outlet_id) {
-                let handler = handler.clone();
-                drop(handlers);
-                let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
-                    msg: format!("tool handler for '{outlet_id}' failed: {e}"),
-                    code: codes::TOOL_6002.to_owned(),
-                })?;
-                (current_state, out)
-            } else {
-                drop(handlers);
-                let out = serde_json::json!({
-                    "tool": outlet_id,
-                    "session_id": session_id,
-                    "status": "validated",
-                    "call_count": call_count + 1,
-                    "invoker_did": identity.did,
-                    "validated_input": input_value,
-                });
-                (current_state, out)
+            let registry = {
+                let reg = handle.outlet_registry.lock().await;
+                reg.clone()
+            };
+            let handler = {
+                let handlers = handle.outlet_handlers.lock().await;
+                handlers.get(&outlet_id).cloned()
             };
 
-            // Update session state and increment call count.
-            let mut store = handle.session_store.lock().await;
-            if let Some(session) = store.get_mut(&session_id) {
-                session.state = new_state;
-                session.call_count = session.call_count.saturating_add(1);
+            let session_for_executor = session_id.clone();
+            let invoker_did_str = identity.did.clone();
+            let outlet_for_executor = outlet_id.clone();
+            let state_for_executor = current_state.clone();
+
+            // Session executor: registered handler or session-aware schema-only
+            // echo (preserving the prior output shape).
+            let executor = move |input: serde_json::Value| {
+                let handler = handler.clone();
+                let input_for_echo = input.clone();
+                let outlet_for_executor = outlet_for_executor.clone();
+                let session_for_executor = session_for_executor.clone();
+                let invoker_did_str = invoker_did_str.clone();
+                let state_for_executor = state_for_executor.clone();
+                async move {
+                    handler.map_or_else(
+                        || {
+                            Ok(serde_json::json!({
+                                "tool": outlet_for_executor,
+                                "session_id": session_for_executor,
+                                "status": "validated",
+                                "call_count": prior_call_count.saturating_add(1),
+                                "invoker_did": invoker_did_str,
+                                "session_state": state_for_executor,
+                                "validated_input": input_for_echo,
+                            }))
+                        },
+                        |h| {
+                            h(input).map_err(|e| {
+                                format!("tool handler for '{outlet_for_executor}' failed: {e}")
+                            })
+                        },
+                    )
+                }
+            };
+
+            let manager = crate::runtime::context_manager_expect()?;
+            let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
+            let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
+
+            // Per-call session invocation: no cross-context target. The runtime
+            // overrides `estimated_cost` with the real per-call cost.
+            let caveat_enforcement = effective_caveats.requires_post_input_check().then(|| {
+                scp_core::context::manager::CaveatEnforcement {
+                    caveats: &effective_caveats,
+                    ucan_cid: &action_ucan_cid,
+                    negotiated_adapter: None,
+                    target_did: None,
+                    estimated_cost: scp_core::economy::types::Amount::new(0),
+                }
+            });
+
+            let outcome = manager
+                .invoke_outlet_with_economy(
+                    &handle.context_id,
+                    &registry,
+                    &outlet_id_typed,
+                    input_value,
+                    &invoker_did_typed,
+                    None,
+                    None,
+                    executor,
+                    None,
+                    caveat_enforcement,
+                    None,
+                )
+                .await
+                .map_err(ScpError::from)?;
+
+            // Phase B (locked): the invocation succeeded AND passed the §7.3.8
+            // gate — advance the call count exactly once. State is preserved
+            // (handlers do not surface a new session state at this bridge
+            // layer), matching prior behavior.
+            {
+                let mut store = handle.session_store.lock().await;
+                if let Some(session) = store.get_mut(&session_id) {
+                    session.call_count = session.call_count.saturating_add(1);
+                }
             }
 
-            serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+            serde_json::to_string(&outcome.output).map_err(|e| ScpError::Tool {
                 msg: format!("failed to serialize session invoke output: {e}"),
                 code: codes::TOOL_6020.to_owned(),
             })
