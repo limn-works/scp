@@ -20,14 +20,26 @@ static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Maximum number of retry attempts for failed webhook deliveries.
 const MAX_RETRIES: u32 = 3;
 
-/// Maximum number of per-event dispatch tasks the event consumer may have
-/// in flight at once. Mirrors [`WebhookDispatcher::MAX_TARGETS`]: a single
-/// event fans out to at most `MAX_TARGETS` targets, so this bounds the live
-/// task count to one event's worth of fan-out under saturation. Acts as the
-/// backpressure cap that keeps the consumer-owned `JoinSet` from growing
-/// without bound under sustained event rate (each dispatch can walk the full
-/// retry ladder — 3 attempts x 10s timeout plus backoff — so the in-flight
-/// set would otherwise grow as rate x latency x targets).
+/// Maximum number of concurrent OUTER per-event dispatch tasks the event
+/// consumer may have in flight at once. Acts as the backpressure cap that
+/// keeps the consumer-owned `JoinSet` from growing without bound under
+/// sustained event rate (each dispatch can walk the full retry ladder — 3
+/// attempts x 10s timeout plus backoff — so the in-flight set would otherwise
+/// grow as rate x latency).
+///
+/// # True leaf-task ceiling
+///
+/// Each outer dispatch fans out to at most [`WebhookDispatcher::MAX_TARGETS`]
+/// per-target leaf HTTP tasks (the registry cap enforced by
+/// [`WebhookDispatcher::register`]). So the worst-case count of concurrent
+/// leaf HTTP tasks is `MAX_INFLIGHT_DISPATCHES * MAX_TARGETS`, NOT
+/// `MAX_INFLIGHT_DISPATCHES`: the semaphore bounds the outer layer, and
+/// `MAX_TARGETS` bounds the inner fan-out of each. Both layers are owned by
+/// `JoinSet`s — the consumer-owned set here for the outer dispatch tasks, and
+/// a locally-scoped set inside [`WebhookDispatcher::dispatch_event`] for the
+/// per-target leaf tasks — so an instance-shutdown abort tears down EVERY
+/// level. No detached leaf tasks survive shutdown leaking `reqwest` clients or
+/// sockets on the never-dropped process-global runtime.
 const MAX_INFLIGHT_DISPATCHES: usize = 256;
 
 /// Initial retry delay in milliseconds (doubles on each retry).
@@ -473,13 +485,27 @@ impl WebhookDispatcher {
             return;
         }
 
-        // Fan out dispatches concurrently.
+        // Fan out dispatches concurrently. The per-target tasks are owned by a
+        // locally-scoped `JoinSet` rather than detached via bare `tokio::spawn`.
+        // A `JoinSet` aborts every task it still owns when it is dropped, so if
+        // the surrounding outer dispatch task is aborted at the `.await` below
+        // (e.g. on instance shutdown, when `spawn_event_consumer`'s owning
+        // `JoinSet` is dropped), this future is dropped, `fanout` is dropped,
+        // and the in-flight per-target HTTP tasks are torn down with it. A bare
+        // `tokio::spawn` would instead DETACH them, letting them survive the
+        // shutdown for the full retry ladder while holding `reqwest` clients and
+        // sockets on the never-dropped process-global runtime.
+        //
+        // The fan-out width is already bounded by `MAX_TARGETS` (the registry
+        // cap enforced in `register`), so no additional semaphore is needed
+        // here — the `JoinSet` exists for deterministic teardown, not
+        // backpressure.
         let event = Arc::new(event);
-        let mut handles = Vec::with_capacity(matching.len());
+        let mut fanout: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         for (target_id, target) in matching {
             let event = Arc::clone(&event);
             let client = self.client.clone();
-            handles.push(tokio::spawn(async move {
+            fanout.spawn(async move {
                 let result =
                     dispatch_webhook(&target.url, &event, &target.signing_key, &client).await;
                 if result.success {
@@ -498,13 +524,13 @@ impl WebhookDispatcher {
                         "webhook dispatch failed"
                     );
                 }
-            }));
+            });
         }
 
-        // Await all dispatches (best-effort, ignore join errors).
-        for handle in handles {
-            let _ = handle.await;
-        }
+        // Await all per-target dispatches (best-effort, ignore join errors).
+        // If this `.await` point is aborted, `fanout` is dropped and its
+        // outstanding tasks are aborted rather than detached.
+        while fanout.join_next().await.is_some() {}
     }
 
     /// Returns the number of registered targets.
@@ -674,16 +700,24 @@ pub fn map_context_event(
 ///    drain, which under sustained overload manifests as channel lag — surfaced
 ///    by the `Lagged` arm below, not as silent memory growth.
 ///
-/// 2. **Deterministic teardown on instance shutdown.** The `JoinSet` of
-///    dispatch tasks lives INSIDE this consumer's async block. The supervising
-///    `spawn_supervised_event_consumer` (in `scp-ffi/common`) aborts THIS
-///    consumer task when the bridge instance's cancellation token fires. Abort
-///    drops the consumer future, which drops the owned `JoinSet`, and dropping a
-///    `JoinSet` aborts every task it owns. So every outstanding dispatch task is
-///    torn down with the instance — they do NOT outlive it as detached tasks
-///    leaking `reqwest` clients and sockets across the process-global runtime
-///    (which is never dropped per-instance). On normal channel close we also
-///    `shutdown().await` the set for a best-effort drain before returning.
+/// 2. **Deterministic teardown on instance shutdown — at BOTH layers.** The
+///    outer `JoinSet` of per-event dispatch tasks lives INSIDE this consumer's
+///    async block. The supervising `spawn_supervised_event_consumer` (in
+///    `scp-ffi/common`) aborts THIS consumer task when the bridge instance's
+///    cancellation token fires. Abort drops the consumer future, which drops
+///    the owned outer `JoinSet`, and dropping a `JoinSet` aborts every task it
+///    owns. Each outer dispatch task in turn owns its own locally-scoped
+///    `JoinSet` of per-target leaf HTTP tasks (see
+///    [`WebhookDispatcher::dispatch_event`]); aborting the outer task drops
+///    that inner set, which aborts its leaf tasks too. So every outstanding
+///    task at EVERY level is torn down with the instance — none outlive it as
+///    detached tasks leaking `reqwest` clients and sockets across the
+///    process-global runtime (which is never dropped per-instance). The inner
+///    fan-out is bounded by [`WebhookDispatcher::MAX_TARGETS`], so the
+///    worst-case concurrent leaf-task ceiling is
+///    `MAX_INFLIGHT_DISPATCHES * MAX_TARGETS`. On normal channel close we also
+///    `shutdown().await` the outer set for a best-effort drain before
+///    returning.
 ///
 /// `dispatch_event` owns all of its own error handling and retries and never
 /// panics, so a dispatch task cannot escape a panic.

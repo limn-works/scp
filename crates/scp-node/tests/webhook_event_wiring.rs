@@ -495,3 +495,219 @@ async fn consumer_drains_past_a_slow_target() {
     assert_eq!(body_json["context_id"], "ctx-fast");
     assert_eq!(body_json["payload"]["member_did"], "did:key:fast");
 }
+
+/// A running local HTTPS server that reports two lifecycle signals separately:
+/// when it has READ a full request (`received`), and — after a hold window — a
+/// boolean on `client_still_connected` reporting whether the client's
+/// connection is STILL OPEN at that point.
+///
+/// Connection liveness is detected by READING (not writing): a torn-down client
+/// closes the TLS connection (TCP FIN / TLS close-notify), which the server
+/// observes as `Ok(0)`/error on a read; a live client awaiting the response
+/// keeps the connection open with nothing more to send, so the read pends and
+/// times out. Reading is reliable here where writing is NOT — a single small
+/// write to a peer that has just closed can still succeed into the local socket
+/// buffer before any RST arrives, so write success is not proof the client is
+/// alive.
+///
+/// This lets a test distinguish "the client's in-flight HTTP task was torn down
+/// mid-flight" (`client_still_connected` reports `false`) from "the task ran on
+/// as a detached task that outlived shutdown" (`client_still_connected` reports
+/// `true`).
+struct TwoPhaseServer {
+    host: String,
+    addr: SocketAddr,
+    cert_pem: String,
+    received: tokio::sync::oneshot::Receiver<()>,
+    client_still_connected: tokio::sync::oneshot::Receiver<bool>,
+}
+
+/// Starts a [`TwoPhaseServer`]. After reading a full request it fires `received`,
+/// sleeps `response_delay`, then probes the connection with a short-timeout read
+/// and reports liveness on `client_still_connected` (`true` = read pended →
+/// connection still open; `false` = read saw EOF/error → connection torn down).
+async fn start_two_phase_server(response_delay: Duration) -> TwoPhaseServer {
+    let host = format!(
+        "webhook-{}.scp-test.invalid",
+        SERVER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let cert = rcgen::generate_simple_self_signed(vec![host.clone()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_der = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+
+    let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der], key_der)
+    .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel::<()>();
+    let (liveness_tx, liveness_rx) = tokio::sync::oneshot::channel::<bool>();
+    let received_tx = Arc::new(tokio::sync::Mutex::new(Some(received_tx)));
+    let liveness_tx = Arc::new(tokio::sync::Mutex::new(Some(liveness_tx)));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                continue;
+            };
+            let acceptor = acceptor.clone();
+            let received_tx = Arc::clone(&received_tx);
+            let liveness_tx = Arc::clone(&liveness_tx);
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 2048];
+                loop {
+                    match tls.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            raw.extend_from_slice(&buf[..n]);
+                            if has_complete_request(&raw) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Signal that the request was fully read.
+                let sender = received_tx.lock().await.take();
+                if let Some(tx) = sender {
+                    let _ = tx.send(());
+                }
+                // Hold the connection open for the delay window. The test aborts
+                // the consumer during this window; if the client's leaf HTTP task
+                // is torn down (not detached), the client closes its end here.
+                tokio::time::sleep(response_delay).await;
+                // Probe liveness by READING, not writing. A live client awaiting
+                // our (still-unsent) response has nothing more to send, so this
+                // read pends and times out → still connected. A torn-down client
+                // closed the connection, so the read returns EOF/error promptly →
+                // not connected. (Writing would be unreliable: a small write can
+                // succeed into the local buffer even after the peer closed.)
+                let still_connected = match tokio::time::timeout(
+                    Duration::from_millis(500),
+                    tls.read(&mut buf),
+                )
+                .await
+                {
+                    // Read pended past the probe window: peer is still there.
+                    Err(_elapsed) => true,
+                    // EOF or read error: peer closed the connection.
+                    Ok(Ok(0) | Err(_)) => false,
+                    // Unexpected extra bytes on an idle connection: treat as
+                    // still connected (the peer is clearly alive and sending).
+                    Ok(Ok(_)) => true,
+                };
+                let sender = liveness_tx.lock().await.take();
+                if let Some(tx) = sender {
+                    let _ = tx.send(still_connected);
+                }
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+
+    TwoPhaseServer {
+        host,
+        addr,
+        cert_pem,
+        received: received_rx,
+        client_still_connected: liveness_rx,
+    }
+}
+
+/// Inner-fan-out teardown guard: aborting the consumer (instance shutdown) must
+/// tear down the IN-FLIGHT per-target HTTP task, not detach it to outlive
+/// shutdown.
+///
+/// `WebhookDispatcher::dispatch_event` owns its per-target fan-out in a
+/// locally-scoped `JoinSet`. When the consumer task is aborted at its `.await`,
+/// the outer dispatch future is dropped, which drops that inner `JoinSet`, which
+/// aborts the per-target HTTP task. With the previous bare-`tokio::spawn`
+/// fan-out, the inner task was DETACHED and would run the full retry ladder
+/// after shutdown, holding a `reqwest` client and socket on the process-global
+/// runtime.
+///
+/// The server reads the request, holds for `HOLD`, then probes connection
+/// liveness via a read. The test waits for `received`, aborts the consumer, and
+/// asserts the server observes the client connection as CLOSED. If the inner
+/// task were detached (bare `tokio::spawn`), it would keep the connection open
+/// across shutdown and the probe would report it still connected.
+#[tokio::test]
+async fn consumer_abort_tears_down_in_flight_inner_dispatch() {
+    // Long enough that the consumer is reliably aborted (and the abort has
+    // propagated, closing the client connection) before the server probes
+    // liveness, but bounded so the test stays fast.
+    const HOLD: Duration = Duration::from_secs(2);
+
+    let server = start_two_phase_server(HOLD).await;
+    let client = trusting_client(&server.cert_pem, &server.host, server.addr);
+    let dispatcher = Arc::new(WebhookDispatcher::with_client_for_test(client));
+
+    let webhook_url = format!("https://{}:{}/hook", server.host, server.addr.port());
+    let registered = dispatcher
+        .register(
+            "held-bridge".to_owned(),
+            WebhookTarget {
+                url: webhook_url,
+                signing_key: SigningKey::from_bytes(&[5u8; 32]),
+                context_ids: vec!["ctx-held".to_owned()],
+            },
+        )
+        .await;
+    assert!(registered, "target registration should succeed");
+
+    let (tx, rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(1024);
+    let consumer = spawn_event_consumer(rx, Arc::clone(&dispatcher));
+
+    tx.send((
+        "ctx-held".to_owned(),
+        ContextEvent::MemberJoined {
+            member_did: DID::from("did:key:held"),
+            role_name: "member".to_owned(),
+        },
+    ))
+    .expect("send held event");
+
+    // Wait until the server has read the request and is holding the connection
+    // open — at this point the client's per-target HTTP task is in-flight,
+    // awaiting the (delayed) response.
+    tokio::time::timeout(Duration::from_secs(10), server.received)
+        .await
+        .expect("server should read the request before the hold window elapses")
+        .expect("received signal channel should yield");
+
+    // Simulate instance shutdown: abort the consumer task. This drops the outer
+    // dispatch future and, with it, the inner per-target `JoinSet` — aborting
+    // the in-flight HTTP task and closing the connection.
+    consumer.abort();
+
+    // After the hold the server probes connection liveness. The abort must have
+    // torn down the in-flight per-target HTTP task, closing the client end — so
+    // the server must observe the connection as CLOSED. A detached inner task
+    // (the old bare-`tokio::spawn` behavior) would have held the connection open
+    // across shutdown, and the probe would report `true`.
+    let still_connected =
+        tokio::time::timeout(HOLD + Duration::from_secs(5), server.client_still_connected)
+            .await
+            .expect("server should report connection liveness before the timeout")
+            .expect("liveness signal channel should yield");
+    assert!(
+        !still_connected,
+        "aborting the consumer must tear down the in-flight per-target HTTP task; \
+         the client connection must be closed after shutdown (a detached inner \
+         task would have kept it open)"
+    );
+}
