@@ -456,13 +456,14 @@ class InvocationHandle
          * synchronously, before the `suspend outletInvokeStream` open
          * resolves, so the real `request_id` is not known at construction
          * time. The namespace passes an unresolved [CompletableDeferred] and
-         * completes it from inside the pump coroutine as soon as
-         * `outletInvokeStream` returns; [grantCredit] / [cancel] await it
-         * before the terminal-state check. This closes the race
-         * deterministically — a caller may invoke `grantCredit` / `cancel`
-         * immediately after `invoke()` returns without losing to the
-         * bridge's first chunk. Mirrors the TypeScript `requestIdPromise`
-         * and the Swift `RequestIdBox`.
+         * completes it from inside the eager OPEN coroutine as soon as
+         * `outletInvokeStream` returns — not from a chunk pump (the Kotlin
+         * chunk path is a cold `Flow`, pulled only on consumption).
+         * [grantCredit] / [cancel] await it before the terminal-state check.
+         * This closes the race deterministically — a caller may invoke
+         * `grantCredit` / `cancel` immediately after `invoke()` returns
+         * without losing to the bridge's first chunk. Mirrors the TypeScript
+         * `requestIdPromise` and the Swift `RequestIdBox`.
          */
         private val requestIdDeferred: kotlinx.coroutines.Deferred<String?>? = null,
         /**
@@ -496,9 +497,17 @@ class InvocationHandle
          * via [aggregate], [asFlow] terminal-chunk observation, or
          * [close]. The production streaming namespace wires this to a
          * shared flag the receiver-side revocation re-check loop polls, so
-         * the loop's lifetime binds to the HANDLE terminal state (parity
-         * with the TypeScript `while (!sdkHandle.isTerminated)` loop)
-         * rather than to a consumer's `finally`. Runs at most once.
+         * the loop's lifetime binds to the HANDLE terminal state rather
+         * than to a consumer's `finally`. Runs at most once.
+         *
+         * Because the Kotlin chunk path is a cold `Flow` (chunks are
+         * pulled only when a consumer collects), an unconsumed streaming
+         * handle has no background pump to drive it to a terminal chunk —
+         * so its re-check loop is torn down by [close] / `use { }`, not by
+         * a self-terminating eager pump. The exit-flag polling mirrors the
+         * TypeScript `while (!sdkHandle.isTerminated)` loop only in the
+         * exit CONDITION; what flips the flag for an unconsumed handle is
+         * [close], not a pump.
          */
         private val onTerminalObserved: () -> Unit = {},
     ) : AutoCloseable {

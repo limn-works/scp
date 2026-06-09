@@ -59,9 +59,11 @@ import uniffi.scp.OutletStreamHandle
 // ---------------------------------------------------------------------------
 
 /**
- * Opaque per-stream cursor the production namespace pumps. Abstracts the
- * UniFFI `OutletStreamHandle` so the pump + control-plane wiring is
- * testable against a fake. `requestId()` returns the 32-char lowercase
+ * Opaque per-stream cursor the production namespace drains lazily from
+ * the cold chunk `Flow` (pulled only on consumption, not by a background
+ * pump). Abstracts the UniFFI `OutletStreamHandle` so the drain +
+ * control-plane wiring is testable against a fake. `requestId()` returns
+ * the 32-char lowercase
  * hex §5.4.5 `request_id`; `next()` yields the next chunk as the
  * cdylib-independent [StreamChunkSource] (the UniFFI `OutletStreamHandle`
  * adapter performs the record → source mapping), or `null` at
@@ -502,7 +504,13 @@ internal class BridgeBackedOutletNamespace internal constructor(
             )
         // Open eagerly (background) so `grantCredit` / `cancel` and the
         // revocation re-check loop resolve independent of chunk
-        // consumption — parity with the Swift / TS / Python factories.
+        // consumption. This is OPEN parity with the Swift / TS / Python
+        // factories — NOT pump parity: those SDKs additionally drain
+        // chunks eagerly, whereas Kotlin's chunk path is a cold `Flow`
+        // pulled only on consumption. An unconsumed Kotlin handle has no
+        // background pump driving it to a terminal chunk, so its re-check
+        // loop is released by `close()` / `use { }`, not by a
+        // self-terminating eager pump.
         opener.eagerOpen()
 
         return buildStreamingInvocationHandle(
