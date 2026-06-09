@@ -315,8 +315,13 @@ mod tests {
 
     #[test]
     fn new_rejects_wrong_method() {
+        // Use a method rejected in ALL build configurations. Under
+        // `cfg(test)`/`testing` the constructor also accepts `did:key:` and
+        // `did:test:` (fixture convenience for the inherent
+        // `MlsCryptoProvider` API), so the rejection test must use a method
+        // outside that set — `did:web:` is rejected in test and production.
         let result = ScpCredential::new(
-            "did:key:z6MkSomething".to_string(),
+            "did:web:example.com".to_string(),
             None,
             SigningKeyId::Active,
         );

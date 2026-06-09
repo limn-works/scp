@@ -2530,14 +2530,25 @@ mod tests {
     }
 
     #[test]
-    fn add_member_requires_key_package_bytes() {
+    fn add_member_rejects_malformed_key_package_bytes() {
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        // add_member with None should fail.
-        let result = provider.add_member(&ctx_id, "did:dht:z6MkBob", None);
-        assert!(result.is_err());
+        // Security intent: add_member must reject key material that is not a
+        // valid MLS KeyPackage. Garbage bytes fail TLS deserialization in
+        // BOTH production and test/testing builds — the `Some(bytes)` branch
+        // is not cfg-gated, so this rejection holds regardless of feature
+        // flags. (A `None` key package is, by design, accepted under the
+        // `testing` feature to drive the non-crypto pipeline; production
+        // builds — where `cfg!(any(test, feature = "testing"))` is false —
+        // still reject `None`. See `add_member`.)
+        let malformed: &[u8] = &[0xFF; 4];
+        let result = provider.add_member(&ctx_id, "did:dht:z6MkBob", Some(malformed));
+        assert!(
+            result.is_err(),
+            "add_member must reject malformed key package bytes: {result:?}"
+        );
     }
 
     #[test]
