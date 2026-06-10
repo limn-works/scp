@@ -391,126 +391,123 @@ pub(crate) async fn ucan_delegate_on(
         validate_capability_uri(cap).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     }
 
+    use scp_core::crypto::ucan::Attenuation;
+    use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
+    use scp_core::crypto::ucan::validate::parse_ucan;
+
     // Delegation is available for any context whose delegator identity retains
     // custody — in-memory OR a production callback custody
     // (`identityCreateWithCustody`). The delegator's key is looked up from the
     // identity registry below (NOT the context creator's key).
-    {
-        use scp_core::crypto::ucan::Attenuation;
-        use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
-        use scp_core::crypto::ucan::validate::parse_ucan;
+    let context_id = handle.context_id();
 
-        let context_id = handle.context_id();
+    // Parse the parent token.
+    let parsed_parent = parse_ucan(&parent_token).map_err(ScpNapiError::from)?;
 
-        // Parse the parent token.
-        let parsed_parent = parse_ucan(&parent_token).map_err(ScpNapiError::from)?;
+    // Defense-in-depth: verify delegator DID matches parent token's audience.
+    // The delegator must be the audience of the parent token to form a valid
+    // delegation chain (iss/aud linkage). scp-core enforces this too, but
+    // catching it at the bridge level provides clearer error messages and
+    // matches the WASM bridge's defense-in-depth check.
+    if delegator_did != parsed_parent.payload.aud {
+        return Err(napi::Error::from(ScpNapiError::Permission {
+            message: format!(
+                "delegator DID '{}' does not match parent token audience '{}'",
+                delegator_did, parsed_parent.payload.aud
+            ),
+            code: codes::PERM_3023.to_owned(),
+        }));
+    }
 
-        // Defense-in-depth: verify delegator DID matches parent token's audience.
-        // The delegator must be the audience of the parent token to form a valid
-        // delegation chain (iss/aud linkage). scp-core enforces this too, but
-        // catching it at the bridge level provides clearer error messages and
-        // matches the WASM bridge's defense-in-depth check.
-        if delegator_did != parsed_parent.payload.aud {
-            return Err(napi::Error::from(ScpNapiError::Permission {
-                message: format!(
-                    "delegator DID '{}' does not match parent token audience '{}'",
-                    delegator_did, parsed_parent.payload.aud
-                ),
-                code: codes::PERM_3023.to_owned(),
-            }));
-        }
-
-        // Build attenuated capabilities from the capability URI strings.
-        // Use CapabilityUri::from_str for validated parsing instead of ad-hoc
-        // string splitting.
-        let attenuations: Vec<Attenuation> = capabilities
-            .iter()
-            .map(|cap| {
-                let cap_uri_str = if cap.starts_with("scp:ctx:") {
-                    cap.clone()
-                } else {
-                    format!("scp:ctx:{context_id}/{cap}")
-                };
-                let parsed: CapabilityUri =
-                    cap_uri_str
-                        .parse()
-                        .map_err(|e: CoreUcanError| ScpNapiError::Permission {
-                            message: format!("invalid capability URI '{cap_uri_str}': {e}"),
-                            code: codes::PERM_3023.to_owned(),
-                        })?;
-                Ok(Attenuation {
-                    with: cap_uri_str,
-                    can: parsed.action().to_owned(),
-                })
-            })
-            .collect::<Result<Vec<_>, ScpNapiError>>()
-            .map_err(napi::Error::from)?;
-
-        // Get ceiling from the context handle for delegation-time enforcement (#339).
-        // Empty ceiling means the user passed `[]` — apply the default ceiling
-        // instead of `None` (which would mean unlimited). See #1419.
-        let ceiling_strings: std::collections::HashSet<String> =
-            handle.ceiling().into_iter().collect();
-        let ceiling = Some(if ceiling_strings.is_empty() {
-            scp_core::context::roles::default_ceiling().to_ucan_string_set()
-        } else {
-            ceiling_strings
-        });
-
-        // Look up the DELEGATOR's identity from the global identity registry.
-        // This is critical: the delegation must be signed with the delegator's
-        // Ed25519 key, NOT the context creator's key. The previous code used
-        // `handle.signing_key` (the context creator's key), which would produce
-        // tokens with invalid signatures when the delegator is not the creator.
-        let token = crate::runtime::with_identity(bi, &delegator_did, |entry| {
-            let params = DelegateParams {
-                parent_token: &parsed_parent,
-                delegator_did: &delegator_did,
-                delegator_key: &entry.identity.active_signing_key,
-                delegatee_did: &delegatee_did,
-                attenuated_capabilities: &attenuations,
-                lifetime_secs: 3600,
-                facts: None,
-                key_scope: None,
-                signing_key_id: None,
-                ceiling: ceiling.clone(),
+    // Build attenuated capabilities from the capability URI strings.
+    // Use CapabilityUri::from_str for validated parsing instead of ad-hoc
+    // string splitting.
+    let attenuations: Vec<Attenuation> = capabilities
+        .iter()
+        .map(|cap| {
+            let cap_uri_str = if cap.starts_with("scp:ctx:") {
+                cap.clone()
+            } else {
+                format!("scp:ctx:{context_id}/{cap}")
             };
-
-            // napi-rs async functions run on the tokio runtime, but
-            // `with_identity` holds a DashMap ref guard (sync). Use
-            // `tokio::task::block_in_place` to avoid nesting block_on calls.
-            let rt_handle = tokio::runtime::Handle::current();
-            let result = tokio::task::block_in_place(|| {
-                rt_handle.block_on(async {
-                    delegate_ucan(
-                        &params,
-                        entry.custody.as_ref(),
-                        &scp_primitives::SystemClock,
-                    )
-                    .await
-                })
-            });
-
-            result.map_err(ScpNapiError::from)
+            let parsed: CapabilityUri =
+                cap_uri_str
+                    .parse()
+                    .map_err(|e: CoreUcanError| ScpNapiError::Permission {
+                        message: format!("invalid capability URI '{cap_uri_str}': {e}"),
+                        code: codes::PERM_3023.to_owned(),
+                    })?;
+            Ok(Attenuation {
+                with: cap_uri_str,
+                can: parsed.action().to_owned(),
+            })
         })
+        .collect::<Result<Vec<_>, ScpNapiError>>()
         .map_err(napi::Error::from)?;
 
-        let data = NapiUcanTokenData {
-            token_id: token.payload.nnc.clone(),
-            issuer: token.payload.iss.clone(),
-            audience: token.payload.aud.clone(),
-            capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
-            #[allow(clippy::cast_precision_loss)]
-            expires_at: Some(token.payload.exp as f64),
+    // Get ceiling from the context handle for delegation-time enforcement (#339).
+    // Empty ceiling means the user passed `[]` — apply the default ceiling
+    // instead of `None` (which would mean unlimited). See #1419.
+    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
+    let ceiling = Some(if ceiling_strings.is_empty() {
+        scp_core::context::roles::default_ceiling().to_ucan_string_set()
+    } else {
+        ceiling_strings
+    });
+
+    // Look up the DELEGATOR's identity from the global identity registry.
+    // This is critical: the delegation must be signed with the delegator's
+    // Ed25519 key, NOT the context creator's key. The previous code used
+    // `handle.signing_key` (the context creator's key), which would produce
+    // tokens with invalid signatures when the delegator is not the creator.
+    let token = crate::runtime::with_identity(bi, &delegator_did, |entry| {
+        let params = DelegateParams {
+            parent_token: &parsed_parent,
+            delegator_did: &delegator_did,
+            delegator_key: &entry.identity.active_signing_key,
+            delegatee_did: &delegatee_did,
+            attenuated_capabilities: &attenuations,
+            lifetime_secs: 3600,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: ceiling.clone(),
         };
 
-        increment_handle_count();
-        Ok(NapiUcanToken {
-            data,
-            encoded: token.encoded,
-            instance_id: bi.instance_id(),
-        })
-    }
+        // napi-rs async functions run on the tokio runtime, but
+        // `with_identity` holds a DashMap ref guard (sync). Use
+        // `tokio::task::block_in_place` to avoid nesting block_on calls.
+        let rt_handle = tokio::runtime::Handle::current();
+        let result = tokio::task::block_in_place(|| {
+            rt_handle.block_on(async {
+                delegate_ucan(
+                    &params,
+                    entry.custody.as_ref(),
+                    &scp_primitives::SystemClock,
+                )
+                .await
+            })
+        });
+
+        result.map_err(ScpNapiError::from)
+    })
+    .map_err(napi::Error::from)?;
+
+    let data = NapiUcanTokenData {
+        token_id: token.payload.nnc.clone(),
+        issuer: token.payload.iss.clone(),
+        audience: token.payload.aud.clone(),
+        capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
+        #[allow(clippy::cast_precision_loss)]
+        expires_at: Some(token.payload.exp as f64),
+    };
+
+    increment_handle_count();
+    Ok(NapiUcanToken {
+        data,
+        encoded: token.encoded,
+        instance_id: bi.instance_id(),
+    })
 }
 
 /// Per-bridge-instance implementation of [`ucan_revoke`].

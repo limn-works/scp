@@ -3908,21 +3908,6 @@ impl Scp {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory-custody-only `Scp` methods.
-//
-// These methods are gated behind `allow_in_memory_custody` because they
-// depend on an in-memory *backend* (the in-memory identity registry teardown
-// helpers and the `InMemoryDeviceAttestation` software attestation backend),
-// or on the full-stack in-memory test network. They live in a SEPARATE
-// `#[napi] impl Scp` block so napi-rs emits their `_c_callback` registration
-// only when the feature is enabled — a single gated method inside the main
-// `#[napi] impl` block would leave a dangling registration reference in
-// production builds.
-//
-// Production callback-custody parity (registry retention, SCPID signing, link
-// attestations) lives in the main `impl Scp` block above and is NOT gated,
-// mirroring the PyO3 reference bridge.
-// ---------------------------------------------------------------------------
 // Relay/node startup `#[napi] Scp` methods. Moved into a separate
 // `#[cfg(feature = "server")] #[napi] impl Scp` block so napi-rs emits their
 // `_c_callback` registration references ONLY when `server` is enabled. A
@@ -3965,6 +3950,22 @@ impl Scp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// In-memory-custody-only `Scp` methods.
+//
+// These methods are gated behind `allow_in_memory_custody` because they
+// depend on an in-memory *backend* (the in-memory identity registry teardown
+// helpers and the `InMemoryDeviceAttestation` software attestation backend),
+// or on the full-stack in-memory test network. They live in a SEPARATE
+// `#[napi] impl Scp` block so napi-rs emits their `_c_callback` registration
+// only when the feature is enabled — a single gated method inside the main
+// `#[napi] impl` block would leave a dangling registration reference in
+// production builds.
+//
+// Production callback-custody parity (registry retention, SCPID signing, link
+// attestations) lives in the main `impl Scp` block above and is NOT gated,
+// mirroring the PyO3 reference bridge.
+// ---------------------------------------------------------------------------
 #[cfg(feature = "allow_in_memory_custody")]
 #[napi]
 impl Scp {

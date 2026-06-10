@@ -252,7 +252,7 @@ fn make_dht_with_signer(
 pub(crate) struct NapiIdentityInner {
     /// The DID string (e.g., `"did:dht:z6Mk..."`).
     pub(crate) did: String,
-    /// The custody type string: `"in_memory"`, `"platform"`, or `"software"`.
+    /// The custody type string: `"in_memory"`, `"callback"`, or `"external"`.
     pub(crate) custody_type: String,
     /// Retained `ScpIdentity` for in-memory custody paths.
     ///
@@ -341,7 +341,7 @@ impl NapiIdentity {
 
     /// Returns the custody type string for this identity.
     ///
-    /// One of: `"in_memory"`, `"platform"`, `"software"`.
+    /// One of: `"in_memory"`, `"callback"`, `"external"`.
     #[napi(getter, js_name = "custodyType")]
     #[must_use]
     pub fn custody_type(&self) -> String {
