@@ -670,7 +670,7 @@ let napiSkipReason = "";
 let napiAvailable = false;
 
 try {
-  const probe = new SCP();
+  const probe = new SCP({ storage: { type: "in_memory" } });
   // The Phase 4 refactor added `relayStartInMemory` — a rebuild without
   // those changes would miss the surface. Check before claiming the
   // bridge is usable.
@@ -680,7 +680,7 @@ try {
     napiAvailable = true;
   }
   // Always shut the probe down — it is disposable and never used by tests.
-  // Fresh `new SCP()` instances are minted per-test in the `beforeEach`
+  // Fresh `new SCP({ storage: { type: "in_memory" } })` instances are minted per-test in the `beforeEach`
   // below, so there is no shared NAPI state between tests.
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
@@ -710,7 +710,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     // relay transport so every contextSend / broadcastPublish publishes
     // encrypted payloads through the relay. Mirrors the pattern used
     // in `tests/real-napi.test.ts`.
-    scp = new SCP();
+    scp = new SCP({ storage: { type: "in_memory" } });
     relay = await scp.relayStartInMemory();
     const bootstrap = await scp.identityCreate("in_memory");
     await scp.configureRelayTransport(relay.relayUrl, bootstrap.did);
@@ -1849,7 +1849,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
   describe("Handle affinity error paths (real NAPI)", () => {
     it("SCP-PERM-3030 is raised when a handle crosses SCP instances", async () => {
-      const other = new SCP();
+      const other = new SCP({ storage: { type: "in_memory" } });
       try {
         const identity = await scp.identityCreate("in_memory");
         // `identity` belongs to `scp`. Feeding it to `other.contextCreate`
@@ -1866,7 +1866,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     });
 
     it("contextSend with a handle minted by another SCP is rejected", async () => {
-      const other = new SCP();
+      const other = new SCP({ storage: { type: "in_memory" } });
       try {
         const ours = await scp.identityCreate("in_memory");
         const ourCtx = await scp.contextCreate(
@@ -1973,7 +1973,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
 function napiIsUsable(): boolean {
   try {
-    const probe = new SCP();
+    const probe = new SCP({ storage: { type: "in_memory" } });
     probe.shutdown(1).catch(() => {});
     return true;
   } catch {
@@ -1985,8 +1985,8 @@ const describeStorageNapi = napiIsUsable() ? describe : describe.skip;
 
 describeStorageNapi("SCP storage integration (real NAPI)", () => {
   it("ephemeral (in_memory) storage — two fresh SCPs mint distinct identities", async () => {
-    const a = new SCP();
-    const b = new SCP();
+    const a = new SCP({ storage: { type: "in_memory" } });
+    const b = new SCP({ storage: { type: "in_memory" } });
     try {
       const idA = await a.identityCreate("in_memory");
       const idB = await b.identityCreate("in_memory");
@@ -2071,7 +2071,7 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
   });
 
   it("resume-after-suspend succeeds on a fresh ephemeral instance", async () => {
-    const fresh = new SCP();
+    const fresh = new SCP({ storage: { type: "in_memory" } });
     try {
       fresh.suspend();
       // resume() must resolve (post-#1678 async semantics).

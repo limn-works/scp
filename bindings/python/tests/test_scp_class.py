@@ -3,9 +3,9 @@
 The SCP class wraps `PyBridgeInstance` and is the Python-facing entry
 point for the multi-instance refactor.  Each test verifies:
 
-1. `SCP()` constructs successfully (fresh instance).
+1. `SCP({"type": "in_memory"})` constructs successfully (fresh instance).
 2. Phase 4 PR 4 (#1549) removed `SCP.default_instance()`; every
-   `SCP()` call must produce a distinct instance with a distinct id
+   `SCP({"type": "in_memory"})` call must produce a distinct instance with a distinct id
    (inverse invariant — no process-global default survives).
 3. `SCP.instance_id` is monotonic across new instances.
 4. Native `SCP.suspend()` / `.resume()` / `.shutdown(timeout)` drive
@@ -44,9 +44,35 @@ NativeValidationError = _scp_core.ValidationError
 
 
 def test_scp_constructs_successfully() -> None:
-    """`SCP()` must return an instance with a nonzero instance_id."""
-    scp = SCP()
+    """`SCP({"type": "in_memory"})` must return an instance with a nonzero instance_id."""
+    scp = SCP({"type": "in_memory"})
     assert scp.instance_id > 0, "new SCP instance must have a monotonic nonzero id"
+
+
+def test_bare_native_construction_is_typeerror() -> None:
+    """Storage selection is mandatory (spec §17.6): the native ``SCP``
+    constructor requires a config dict, so a zero-argument ``SCP()`` is a
+    ``TypeError`` — there is no silent in-memory default."""
+    with pytest.raises(TypeError):
+        SCP()  # type: ignore[call-arg]
+
+
+def test_bare_wrapper_construction_is_typeerror() -> None:
+    """The SDK wrapper ``scp_sdk.SCP`` also requires ``storage`` — a
+    zero-argument ``SCP()`` raises ``TypeError`` at the Python layer before
+    touching the native bridge."""
+    with pytest.raises(TypeError):
+        WrapperSCP()  # type: ignore[call-arg]
+
+
+def test_native_missing_type_raises_storage_8000() -> None:
+    """A config dict with no ``type`` is rejected fail-closed; the raised
+    ``ValidationError`` carries ``SCP-STORAGE-8000`` (spec §17.6)."""
+    with pytest.raises(NativeValidationError) as exc_info:
+        SCP({})
+    assert "SCP-STORAGE-8000" in str(exc_info.value), (
+        "missing-selection error must carry SCP-STORAGE-8000"
+    )
 
 
 def test_default_instance_is_absent() -> None:
@@ -64,28 +90,28 @@ def test_default_instance_is_absent() -> None:
 
 
 def test_instance_id_is_monotonic_across_new_instances() -> None:
-    """Each `SCP()` call produces a strictly greater instance_id."""
-    ids = [SCP().instance_id for _ in range(3)]
+    """Each `SCP({"type": "in_memory"})` call produces a strictly greater instance_id."""
+    ids = [SCP({"type": "in_memory"}).instance_id for _ in range(3)]
     for earlier, later in pairwise(ids):
         assert later > earlier, f"expected monotonic ids, got {ids}"
 
 
 def test_fresh_instances_have_distinct_ids() -> None:
-    """Every ``SCP()`` call must allocate a fresh, unique instance_id.
+    """Every ``SCP({"type": "in_memory"})`` call must allocate a fresh, unique instance_id.
 
     With no process-global default to reuse, the only way two bridges
     share an id is a monotonic-counter bug. Asserting distinctness
     keeps the allocator honest.
     """
-    a = SCP()
-    b = SCP()
+    a = SCP({"type": "in_memory"})
+    b = SCP({"type": "in_memory"})
     assert a.instance_id != b.instance_id, "two SCP() calls must produce distinct instance_ids"
     assert a.instance_id > 0 and b.instance_id > 0
 
 
 def test_suspend_resume_shutdown_lifecycle() -> None:
     """suspend/resume/shutdown must all succeed on a fresh instance."""
-    scp = SCP()
+    scp = SCP({"type": "in_memory"})
     scp.suspend()
     scp.resume()
     # Native `SCP.shutdown` takes unsigned milliseconds after the
@@ -95,7 +121,7 @@ def test_suspend_resume_shutdown_lifecycle() -> None:
 
 def test_shutdown_is_idempotent() -> None:
     """A second `shutdown()` call is a documented no-op."""
-    scp = SCP()
+    scp = SCP({"type": "in_memory"})
     scp.shutdown(1000)
     scp.shutdown(1000)  # Must not raise.
 
@@ -126,7 +152,7 @@ def test_configure_local_transport_succeeds_for_valid_did() -> None:
     Idempotent OnceLock semantics mean a fresh instance is used here so
     the wiring is unambiguous.
     """
-    scp = SCP()
+    scp = SCP({"type": "in_memory"})
     # Must not raise — a valid DID configures the loopback transport.
     scp.configure_local_transport("did:key:z6MkfreshLocalTransportTest")
 
@@ -137,7 +163,7 @@ def test_configure_local_transport_rejects_invalid_did() -> None:
     The PyO3 validator raises the native `_scp_core.ValidationError`
     before any `ContextManager` is attached.
     """
-    scp = SCP()
+    scp = SCP({"type": "in_memory"})
     with pytest.raises(_scp_core.ValidationError):
         scp.configure_local_transport("not-a-valid-did")
 
@@ -148,9 +174,9 @@ def test_petname_apply_event_and_counts() -> None:
     Mirrors the WASM `petname_apply_event` / `petname_did_count` /
     `petname_context_count` surface promoted to cross-bridge parity. The
     DID and context petname maps are per-owner and per-instance, so a
-    fresh `SCP()` starts empty.
+    fresh `SCP({"type": "in_memory"})` starts empty.
     """
-    scp = SCP()
+    scp = SCP({"type": "in_memory"})
     owner = "did:dht:zPyPetnameApply"
 
     assert scp.petname_did_count(owner) == 0
@@ -183,7 +209,7 @@ def test_petname_apply_event_matches_set_petname() -> None:
     The event-replay path and the convenience setter share the same
     backing `PetnameMap`, so the resolved DID list must match.
     """
-    scp = SCP()
+    scp = SCP({"type": "in_memory"})
     owner = "did:dht:zPyPetnameParity"
 
     scp.petname_apply_event(
@@ -198,14 +224,14 @@ def test_petname_apply_event_matches_set_petname() -> None:
 
 def test_petname_apply_event_rejects_malformed_json() -> None:
     """A malformed event JSON raises the native `_scp_core.ValidationError`."""
-    scp = SCP()
+    scp = SCP({"type": "in_memory"})
     with pytest.raises(NativeValidationError):
         scp.petname_apply_event("did:dht:zPyOwner", "not-valid-event-json")
 
 
 def test_petname_counts_reject_empty_owner() -> None:
     """Empty `owner_did` is rejected at the boundary for count queries."""
-    scp = SCP()
+    scp = SCP({"type": "in_memory"})
     with pytest.raises(NativeValidationError):
         scp.petname_did_count("")
     with pytest.raises(NativeValidationError):
@@ -219,7 +245,7 @@ def test_petname_rejects_malformed_owner() -> None:
     gate as the WASM bridge and the §4.7 ops, so all four bridges treat the
     per-identity petname partition key uniformly as a DID.
     """
-    scp = SCP()
+    scp = SCP({"type": "in_memory"})
     bad = "not-a-did"
     with pytest.raises(NativeValidationError):
         scp.petname_set(bad, "did:dht:z1", "test")
@@ -246,20 +272,20 @@ def test_petname_maps_are_per_instance() -> None:
     §1 per-instance isolation), keyed by owner DID.
     """
     owner = "did:dht:zPyPetnameIsolation"
-    a = SCP()
+    a = SCP({"type": "in_memory"})
     a.petname_apply_event(
         owner,
         '{"SetPetname": {"did": "did:dht:zCarol", "name": "carol"}}',
     )
     assert a.petname_did_count(owner) == 1
 
-    b = SCP()
+    b = SCP({"type": "in_memory"})
     assert b.petname_did_count(owner) == 0
 
 
 def test_repr_contains_instance_id() -> None:
-    """`repr(SCP())` must contain the instance_id for debugging."""
-    scp = SCP()
+    """`repr(SCP({"type": "in_memory"}))` must contain the instance_id for debugging."""
+    scp = SCP({"type": "in_memory"})
     assert str(scp.instance_id) in repr(scp)
 
 

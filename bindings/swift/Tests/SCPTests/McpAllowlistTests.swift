@@ -12,9 +12,9 @@ final class McpAllowlistTests: XCTestCase {
     // swiftlint:disable:next implicitly_unwrapped_optional
     var scp: SCP!
 
-    override func setUp() {
-        super.setUp()
-        scp = SCP()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        scp = try SCP(storage: .inMemory)
     }
 
     override func tearDown() async throws {
@@ -60,7 +60,7 @@ final class McpAllowlistTests: XCTestCase {
         XCTAssertTrue(aState.unrestricted, "instance a should be unrestricted")
 
         // Sibling instance must remain restricted (per-instance isolation).
-        let other = SCP()
+        let other = try SCP(storage: .inMemory)
         let bState = try other.mcpGetStdioAllowlist()
         XCTAssertFalse(bState.unrestricted, "instance b must remain restricted")
         try await other.shutdown(timeoutMillis: 1000)

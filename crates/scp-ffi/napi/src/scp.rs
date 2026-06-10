@@ -56,8 +56,9 @@ use crate::ucan::NapiUcanToken;
 /// ```js
 /// import { SCP } from '@limn-works/scp-ts-napi';
 ///
-/// const scp = new SCP();                 // fresh in-memory instance
-/// await scp.shutdown(5);                 // async graceful shutdown
+/// // Storage selection is required — there is no default (spec §17.6).
+/// const scp = new SCP('{"type":"in_memory"}'); // explicit dev/test storage
+/// await scp.shutdown(5n);                       // async graceful shutdown
 /// ```
 ///
 /// Phase 4 PR 4 (#1549, ADR-048) removed `SCP.default()` along with the
@@ -86,17 +87,22 @@ pub struct Scp {
 
 #[napi]
 impl Scp {
-    /// Constructs a fresh `SCP` instance with default in-memory state.
+    /// Constructs a fresh `SCP` instance from a JSON storage-config string.
     ///
-    /// Equivalent to [`NapiBridgeInstance::new_napi`]. Each call produces
-    /// a brand-new instance with its own `instance_id`, registries, and
-    /// transport state — no state is shared with any other `SCP`.
+    /// Storage selection is MANDATORY and fail-closed (spec §17.6): the
+    /// `config_json` argument is required (TypeScript / Bun callers must
+    /// pass it), and there is no default backend. This routes to the same
+    /// fail-closed parser as [`Self::with_storage`]; passing a config whose
+    /// `type` is missing or unrecognised is a `ValidationError`
+    /// (`SCP-STORAGE-8000` for the missing-selection case).
+    ///
+    /// Accepted shapes (see [`Self::with_storage`] for the full contract):
+    /// - `{"type":"in_memory"}` — encrypted in-memory storage (dev/test only).
+    /// - `{"type":"sqlite","path":...,"key"|"passphrase":...}` —
+    ///   SQLCipher-encrypted storage (production).
     #[napi(constructor)]
-    #[allow(clippy::new_without_default)] // napi constructor cannot take Default
-    pub fn new() -> napi::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(NapiBridgeInstance::new_napi()),
-        })
+    pub fn new(config_json: String) -> napi::Result<Self> {
+        Self::with_storage(config_json)
     }
 
     /// Constructs an `SCP` instance with a storage configuration.
@@ -135,10 +141,21 @@ impl Scp {
                 code: codes::VALID_7005.to_owned(),
             })
         })?;
+        // Storage selection is MANDATORY (spec §17.6): a missing `type` is
+        // not a silent in-memory default — it is `SCP-STORAGE-8000`.
         let ty = config_obj
             .get("type")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("in_memory");
+            .ok_or_else(|| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: "storage selection is required: missing 'type' — expected \
+                              {\"type\":\"in_memory\"} (development) or \
+                              {\"type\":\"sqlite\",\"path\":...,\"key\"|\"passphrase\":...} \
+                              (production). There is no default storage."
+                        .to_owned(),
+                    code: codes::STORAGE_8000.to_owned(),
+                })
+            })?;
         let storage = match ty {
             "in_memory" => StorageConfig::InMemory,
             "sqlite" => {
@@ -260,17 +277,16 @@ impl Scp {
 
     /// Constructs an `SCP` instance with a persistence provider placeholder.
     ///
-    /// PR 1 exposes this factory so SDK consumers can prepare for the
-    /// persistence-enabled path. The current implementation builds a fresh
-    /// in-memory instance identical to [`Self::new`]; PR 3 wires the
-    /// real [`scp_core::context::ContextPersistence`] plumbing through.
+    /// Without an exposed persistence type on the FFI surface yet, this
+    /// builds an EXPLICIT in-memory instance via
+    /// [`NapiBridgeInstance::new_napi`] (the internal in-memory builder) —
+    /// NOT a silent default. Callers who need durable persistence must use
+    /// [`Self::with_storage`] with the `sqlite` variant.
     #[napi(factory, js_name = "withPersistence")]
     pub fn with_persistence() -> napi::Result<Self> {
-        // Without an exposed persistence type on the FFI surface yet
-        // (Storage config lands in PR 3), fall back to the in-memory path.
-        // This preserves API shape for callers while keeping the
-        // constructor panic-free.
-        Self::new()
+        Ok(Self {
+            inner: Arc::new(NapiBridgeInstance::new_napi()),
+        })
     }
 
     /// Suspends this bridge instance (mobile backgrounding).
@@ -4118,6 +4134,27 @@ impl Scp {
     }
 }
 
+// Non-`#[napi]` impl block — Rust-only test affordance. Not exported to
+// TypeScript.
+impl Scp {
+    /// Constructs an `Scp` with EXPLICIT in-memory storage, for Rust-side
+    /// tests only.
+    ///
+    /// The public `#[napi(constructor)] new` takes a required JSON
+    /// storage-config string (spec §17.6 — storage selection is
+    /// mandatory). Rust unit tests want an infallible one-liner that
+    /// selects in-memory storage. This wraps
+    /// [`NapiBridgeInstance::new_napi`] (the internal in-memory builder) —
+    /// an explicit dev/test selection, NOT a silent default.
+    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[must_use]
+    pub fn new_in_memory_for_test() -> Self {
+        Self {
+            inner: Arc::new(NapiBridgeInstance::new_napi()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Recovery / custody-migration concurrency-cap tests (RED-PR5-002 /
 // BLACK-PR5-002, #1549).
@@ -4374,7 +4411,7 @@ mod petname_validation_tests {
     /// bridges would be looser than WASM on the same operation.
     #[test]
     fn petname_malformed_owner_rejected() {
-        let scp = Scp::new().unwrap();
+        let scp = Scp::new_in_memory_for_test();
         let bad = "not-a-did".to_owned();
         assert!(
             scp.petname_set(bad.clone(), "did:dht:z1".to_owned(), "test".to_owned())
@@ -4411,6 +4448,68 @@ mod petname_validation_tests {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod storage_mandatory_tests {
+    use super::*;
+
+    /// Storage selection is mandatory (spec §17.6): a JSON config object
+    /// with no `type` is rejected, and the error carries
+    /// `SCP-STORAGE-8000`. The NAPI constructor (`new SCP(config_json)`)
+    /// routes through `with_storage`, so this covers both surfaces.
+    #[test]
+    fn missing_type_is_rejected_with_storage_8000() {
+        let err = Scp::with_storage("{}".to_owned())
+            .err()
+            .expect("missing storage 'type' must be rejected — no default");
+        assert!(
+            err.reason.contains(codes::STORAGE_8000),
+            "missing-selection error must carry SCP-STORAGE-8000: {}",
+            err.reason
+        );
+    }
+
+    /// A `config_json` that is not a JSON object is rejected.
+    #[test]
+    fn non_object_config_is_rejected() {
+        assert!(
+            Scp::with_storage("\"in_memory\"".to_owned()).is_err(),
+            "a bare JSON string is not a valid storage config object"
+        );
+    }
+
+    /// The explicit `{"type":"in_memory"}` dev path constructs successfully
+    /// and yields a live instance with a non-zero monotonic id.
+    #[test]
+    fn in_memory_json_constructs_and_is_live() {
+        let scp = Scp::with_storage(r#"{"type":"in_memory"}"#.to_owned())
+            .expect("in_memory selection must construct");
+        let id: u64 = scp
+            .instance_id()
+            .parse()
+            .expect("instance_id is a u64 string");
+        assert!(
+            id > 0,
+            "constructed instance must expose a non-zero instance_id"
+        );
+    }
+
+    /// The `#[napi(constructor)]` entry point requires the config argument
+    /// and routes to the same fail-closed parser: missing `type` is
+    /// `SCP-STORAGE-8000`.
+    #[test]
+    fn constructor_requires_explicit_selection() {
+        let err = Scp::new("{}".to_owned())
+            .err()
+            .expect("constructor with empty config must be rejected");
+        assert!(
+            err.reason.contains(codes::STORAGE_8000),
+            "constructor missing-selection error must carry SCP-STORAGE-8000: {}",
+            err.reason
+        );
+    }
+}
+
 #[cfg(all(test, feature = "allow_in_memory_custody"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod identity_remove_validation_tests {
@@ -4423,7 +4522,7 @@ mod identity_remove_validation_tests {
     /// WASM on the same operation. Mirrors `petname_malformed_owner_rejected`.
     #[test]
     fn identity_remove_malformed_did_rejected() {
-        let scp = Scp::new().unwrap();
+        let scp = Scp::new_in_memory_for_test();
         let bad = "not-a-did".to_owned();
         assert!(
             scp.identity_remove(bad.clone()).is_err(),
@@ -4441,7 +4540,7 @@ mod identity_remove_validation_tests {
     /// returns `Ok(false)`.
     #[test]
     fn identity_remove_valid_absent_did_is_ok_noop() {
-        let scp = Scp::new().unwrap();
+        let scp = Scp::new_in_memory_for_test();
         let valid_absent = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest".to_owned();
         scp.identity_remove(valid_absent.clone())
             .expect("valid DID must not be rejected by identity_remove");

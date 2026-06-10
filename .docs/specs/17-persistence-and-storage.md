@@ -433,6 +433,10 @@ In-memory storage — `InMemoryStorage`, the FFI-layer `BridgeInMemoryStorage`, 
 
 In-memory storage loses all state on process restart. For SCP, that state includes MLS group state, identity keys, the event log, and provenance records. Losing it on restart contradicts the durability and provenance tenets directly: a restarted node would silently lose its cryptographic membership, its append-only audit trail, and its identity. Production deployments MUST use a durable, encrypted backend — `SqliteStorage` (SQLCipher) is the default.
 
+### Storage Selection Is Mandatory
+
+Storage selection is mandatory. Constructing an `SCP` without an explicit storage choice is an error (`SCP-STORAGE-8000`); there is no default. The two choices are `{type: in_memory}` (development) and `{type: sqlite, ...}` (production). Bridges that can express this requirement at compile time (e.g. the typed UniFFI `StorageConfig` constructor, the required Swift/Kotlin/TypeScript constructor argument) MUST do so; bridges that cannot (the dynamically-typed PyO3 dict, the JSON-string NAPI factory) MUST reject a missing selection at runtime with `SCP-STORAGE-8000`. No bridge or SDK may expose a zero-argument constructor that silently selects a storage backend on the caller's behalf.
+
 ### Storage Selection Fails Closed
 
 When a caller selects a durable storage backend (e.g. `Sqlite`) and the backend cannot be opened — bad path, insufficient permissions, corruption, or a wrong key/passphrase — the bridge or builder layer MUST return an error. Silent fallback to in-memory storage, or to no storage at all, is FORBIDDEN.

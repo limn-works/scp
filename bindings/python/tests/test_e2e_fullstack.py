@@ -33,7 +33,7 @@ try:
     # and are feature-gated behind ``allow_in_memory_custody``. Probe a
     # throwaway ``_scp_core.SCP`` instance for the migrated method rather than
     # the module — the free functions no longer exist.
-    _probe = _scp_core.SCP()
+    _probe = _scp_core.SCP({"type": "in_memory"})
     if not hasattr(_probe, "fullstack_create_node"):
         pytest.skip(
             "fullstack methods not available — rebuild with allow_in_memory_custody feature",

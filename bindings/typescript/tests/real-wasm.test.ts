@@ -14,7 +14,7 @@
  *    the 28 tests here exercised it directly and have no API to call.
  *
  * 2. ADR-048 + ADR-034 wired the caller-owned `SCP` class onto the NAPI
- *    bridge only. `new SCP()` is explicitly NOT supported on the WASM
+ *    bridge only. `new SCP({ storage: { type: "in_memory" } })` is explicitly NOT supported on the WASM
  *    build: attempting it throws `ValidationError` with code
  *    `SCP-VALID-7005`. The browser build of `@limn-works/scp-ts` has no
  *    multi-instance surface — `SCP` state and context handles are
@@ -22,7 +22,7 @@
  *
  * The residual tests in this file:
  *
- * - Assert that `new SCP()` throws `SCP-VALID-7005` whenever the
+ * - Assert that `new SCP({ storage: { type: "in_memory" } })` throws `SCP-VALID-7005` whenever the
  *   environment advertises itself as a non-Node runtime (i.e. the WASM
  *   build path). The check lives in `nativeScp()` inside `src/scp.ts`
  *   and runs before addon loading, so stubbing `process.versions.node`
@@ -42,14 +42,14 @@ import { describe, expect, test } from "bun:test";
 import { validateAdmission, validateBroadcastKeyHex } from "../src/index";
 
 // ---------------------------------------------------------------------------
-// 1. `new SCP()` throws `SCP-VALID-7005` on the WASM build path.
+// 1. `new SCP({ storage: { type: "in_memory" } })` throws `SCP-VALID-7005` on the WASM build path.
 // ---------------------------------------------------------------------------
 //
 // The SCP class constructor calls `nativeScp()`, which short-circuits
 // with `SCP-VALID-7005` when `process.versions.node` is unset — that is
 // the WASM build path. `nativeScp()` caches the resolved addon in a
 // module-level `_nativeScp`, so a simple in-process stub of
-// `process.versions` only fires the check on the first `new SCP()` in
+// `process.versions` only fires the check on the first `new SCP({ storage: { type: "in_memory" } })` in
 // a bun worker. Other test files (e.g. `scp-class.test.ts`,
 // `real-napi.test.ts`) race this one — whichever loads first wins the
 // cache, so the stub is unreliable within the same process.
@@ -75,7 +75,7 @@ describe("SCP class is unavailable on the WASM build path (ADR-034 / ADR-048)", 
       let code = null;
       let message = "";
       try {
-        new SCP();
+        new SCP({ storage: { type: "in_memory" } });
       } catch (err) {
         code = err && typeof err === "object" && "code" in err ? err.code : null;
         message = err && typeof err === "object" && "message" in err ? String(err.message) : "";

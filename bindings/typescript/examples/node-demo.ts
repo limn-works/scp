@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   console.log("SCP TypeScript SDK — Node.js/Bun Demo");
   console.log("======================================");
 
-  const scp = new SCP();
+  const scp = new SCP({ storage: { type: "in_memory" } });
   try {
     // ---- Step 1: Create identities ----
     step(1, "Create identities (in-memory custody)");

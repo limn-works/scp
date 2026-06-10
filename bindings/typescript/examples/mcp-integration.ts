@@ -14,7 +14,7 @@
 import { SCP, defineToolDefinition } from "../src/index";
 
 async function main(): Promise<void> {
-  const scp = new SCP();
+  const scp = new SCP({ storage: { type: "in_memory" } });
   try {
     const identity = await scp.identityCreate("in_memory");
 

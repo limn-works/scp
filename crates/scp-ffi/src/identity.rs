@@ -2295,7 +2295,7 @@ mod tests {
     }
 
     fn default_scp() -> crate::scp::PyScp {
-        crate::scp::PyScp::new()
+        crate::scp::PyScp::new_in_memory_for_test()
     }
 
     /// Verifies that `PyScp::identity_migrate` succeeds end-to-end.

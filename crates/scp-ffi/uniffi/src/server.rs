@@ -781,7 +781,7 @@ mod tests {
 
     #[test]
     fn relay_in_memory_starts_and_returns_url() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let relay = rt().block_on(scp.relay_start_in_memory()).unwrap();
         assert!(relay.relay_url().starts_with("ws://127.0.0.1:"));
         assert!(relay.relay_url().ends_with("/scp/v1"));
@@ -795,7 +795,7 @@ mod tests {
     fn relay_local_starts_and_returns_url() {
         let tmp =
             std::env::temp_dir().join(format!("scp-uniffi-relay-test-{}", std::process::id()));
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let relay = rt()
             .block_on(scp.relay_start_local(tmp.to_string_lossy().into_owned()))
             .unwrap();
@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn node_in_memory_starts_and_returns_did() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
         let url = node.relay_url();
         assert!(
@@ -830,7 +830,7 @@ mod tests {
     /// events never reached the dispatcher.
     #[test]
     fn node_startup_enables_context_event_channel() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
 
         let supervisor = scp
@@ -849,7 +849,7 @@ mod tests {
     #[test]
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-uniffi-node-test-{}", std::process::id()));
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let node = rt()
             .block_on(scp.node_start_local(
                 tmp.to_string_lossy().into_owned(),
@@ -871,7 +871,7 @@ mod tests {
 
     #[test]
     fn relay_shutdown_is_idempotent() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let relay = rt().block_on(scp.relay_start_in_memory()).unwrap();
         relay.shutdown();
         relay.shutdown();
@@ -879,7 +879,7 @@ mod tests {
 
     #[test]
     fn node_shutdown_is_idempotent() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
         node.shutdown();
         node.shutdown();
@@ -942,7 +942,7 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn node_in_memory_with_identity_uses_provided_did() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let identity = rt()
             .block_on(scp.identity_create("in_memory".to_owned(), None))
             .unwrap();
@@ -970,7 +970,7 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn node_local_with_identity_uses_provided_did() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let identity = rt()
             .block_on(scp.identity_create("in_memory".to_owned(), None))
             .unwrap();

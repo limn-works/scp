@@ -24,7 +24,7 @@ describe("IdentityAttestation", () => {
   let scp: SCP;
 
   beforeEach(() => {
-    scp = new SCP();
+    scp = new SCP({ storage: { type: "in_memory" } });
   });
 
   afterEach(async () => {

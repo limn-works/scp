@@ -30,7 +30,7 @@ import { SCP } from "../src/scp";
 let scpAvailable = false;
 let skipReason = "";
 try {
-  const probe = new SCP();
+  const probe = new SCP({ storage: { type: "in_memory" } });
   scpAvailable = true;
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
@@ -183,7 +183,7 @@ if (!scpAvailable) {
 } else {
   describe("SCP.identityCreateWithCustody (real NAPI)", () => {
     test("creates a did:dht identity backed by a JS custody provider", async () => {
-      const scp = new SCP();
+      const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const provider = new CryptoKeychain();
         const identity = await scp.identityCreateWithCustody(provider);
@@ -195,7 +195,7 @@ if (!scpAvailable) {
     });
 
     test("rejects a provider missing required methods", async () => {
-      const scp = new SCP();
+      const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         // Intentionally incomplete — only `sign` is present.
         const bad = { sign: () => new Uint8Array(64) } as unknown as KeyCustodyProvider;

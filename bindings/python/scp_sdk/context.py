@@ -8,7 +8,7 @@ Typical call-sites shape::
 
     from scp_sdk import SCP
 
-    with SCP() as scp:
+    with SCP(storage={"type": "in_memory"}) as scp:
         identity = await scp.identity_create("in_memory")
         ctx = await scp.context_create(identity.did, {"ceiling": ["core:send_message"]})
         await scp.context_send(ctx._raw_handle, identity.did, b"hello")

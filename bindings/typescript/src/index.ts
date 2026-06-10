@@ -9,7 +9,8 @@
  * ```typescript
  * import { SCP } from "@limn-works/scp-ts";
  *
- * const scp = new SCP();
+ * // Storage selection is required — there is no default (spec §17.6).
+ * const scp = new SCP({ storage: { type: "in_memory" } });
  * try {
  *   const identity = await scp.identityCreate("in_memory");
  *

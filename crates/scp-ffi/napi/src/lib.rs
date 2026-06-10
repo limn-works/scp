@@ -342,7 +342,7 @@ mod tests {
     //
     // Construction pattern:
     //
-    //   let scp = Scp::new().expect("construct");
+    //   let scp = Scp::new_in_memory_for_test();
     //   scp.suspend().expect("suspend");
     //   scp.resume().expect("resume");
     //
@@ -355,7 +355,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scp_class_suspend_resume_roundtrip() {
-        let scp = crate::scp::Scp::new().expect("Scp::new must succeed");
+        let scp = crate::scp::Scp::new_in_memory_for_test();
 
         // Sanity: a freshly constructed instance is neither suspended
         // nor shut down.
@@ -407,7 +407,7 @@ mod tests {
         // #1692: `Scp::shutdown` takes `napi::bindgen_prelude::BigInt`
         // (u64 on the wire). Build a zero-valued BigInt directly for
         // the test — in production callers pass a JS `bigint` literal.
-        let scp = crate::scp::Scp::new().expect("Scp::new must succeed");
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         scp.shutdown(napi::bindgen_prelude::BigInt {
             sign_bit: false,
             words: vec![0],

@@ -15,8 +15,9 @@ Example usage::
 
     from scp_sdk import SCP
 
-    # Construct a fresh instance with in-memory state.
-    with SCP() as scp:
+    # Storage selection is REQUIRED — there is no default (spec §17.6).
+    # Construct a fresh instance with explicit in-memory state.
+    with SCP(storage={"type": "in_memory"}) as scp:
         # scp.instance_id is a monotonic u64 unique per process.
         ...
 
@@ -284,7 +285,7 @@ class SCP:
     :meth:`ucan_mint`, and ~160 more). Pure protocol helpers that touch
     no registry state remain module-level free functions.
 
-    :class:`SCP` is a context manager: ``with SCP() as scp: ...`` calls
+    :class:`SCP` is a context manager: ``with SCP(storage={"type": "in_memory"}) as scp: ...`` calls
     :meth:`shutdown` with a 5-second timeout on exit.
     """
 
@@ -295,15 +296,18 @@ class SCP:
 
     def __init__(
         self,
-        *,
-        storage: StorageConfig | None = None,
+        storage: StorageConfig,
     ) -> None:
         """Construct a fresh :class:`SCP` instance.
 
-        :param storage: Optional storage configuration dict. Accepted shapes:
+        Storage selection is **mandatory** and fail-closed (spec §17.6):
+        there is no default backend, so ``storage`` is a required argument.
+        Calling ``SCP()`` with no argument raises ``TypeError``.
+
+        :param storage: Storage configuration dict. Accepted shapes:
 
             * ``{"type": "in_memory"}`` — ephemeral encrypted in-memory
-              storage (the default when ``storage`` is ``None``).
+              storage (development/test only).
             * ``{"type": "sqlite", "path": str, "key": bytes}`` —
               SQLCipher-encrypted on-disk storage at ``{path}/scp.db``
               using raw key material. ``key`` is the raw encryption key
@@ -321,8 +325,6 @@ class SCP:
             permission denied, corrupt file) also raises a
             ``ValidationError``: storage selection FAILS CLOSED (spec §17.6)
             and never silently degrades to in-memory.
-
-            When ``None``, defaults to in-memory storage.
         :raises ValidationError: If ``storage`` contains an unknown
             ``type``, is missing required fields for the selected variant,
             supplies both/neither of ``key``/``passphrase`` for ``sqlite``,
@@ -340,10 +342,7 @@ class SCP:
            covers the documented use cases.
         """
         cls = _native_cls()
-        if storage is not None:
-            self._native = cls.with_storage(storage)
-        else:
-            self._native = cls()
+        self._native = cls.with_storage(storage)
 
     @property
     def instance_id(self) -> int:

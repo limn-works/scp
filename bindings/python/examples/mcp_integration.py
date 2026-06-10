@@ -13,7 +13,7 @@ from scp_sdk.types import Capability, CustodyType, MemoryScope
 
 
 async def main() -> None:
-    with SCP() as scp:
+    with SCP(storage={"type": "in_memory"}) as scp:
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
 
         # Create a context with tool capabilities.

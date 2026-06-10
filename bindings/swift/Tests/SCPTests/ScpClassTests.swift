@@ -16,9 +16,9 @@ final class ScpClassTests: XCTestCase {
     // swiftlint:disable:next implicitly_unwrapped_optional
     var scp: SCP!
 
-    override func setUp() {
-        super.setUp()
-        scp = SCP()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        scp = try SCP(storage: .inMemory)
     }
 
     override func tearDown() async throws {
@@ -33,13 +33,28 @@ final class ScpClassTests: XCTestCase {
         XCTAssertGreaterThan(scp.instanceId, 0, "fresh SCP must have a non-zero monotonic id")
     }
 
+    /// Storage selection is mandatory (spec §17.6): the explicit in-memory
+    /// selection constructs a live instance. There is no zero-argument
+    /// `SCP()` initializer — a missing selection is a compile error (the
+    /// `init()` initializer was deleted), so this asserts the positive path.
+    func testExplicitInMemoryStorageConstructs() throws {
+        let explicit = try SCP(storage: .inMemory)
+        XCTAssertGreaterThan(
+            explicit.instanceId,
+            0,
+            "explicit in-memory selection must construct a live instance"
+        )
+        let viaFactory = try SCP.withStorage(.inMemory)
+        XCTAssertGreaterThan(viaFactory.instanceId, 0)
+    }
+
     /// Two fresh `SCP()` objects must have distinct ids.
     func testFreshInstancesHaveDistinctIds() async throws {
-        let second = SCP()
+        let second = try SCP(storage: .inMemory)
         XCTAssertNotEqual(
             scp.instanceId,
             second.instanceId,
-            "SCP() must allocate fresh instances, not reuse a cached handle"
+            "SCP must allocate fresh instances, not reuse a cached handle"
         )
         try await second.shutdown(timeoutMillis: 1000)
     }
@@ -75,7 +90,7 @@ final class ScpClassTests: XCTestCase {
     /// be idempotent on subsequent calls.
     func testShutdownIsIdempotent() async throws {
         // Already shut down by tearDown; directly exercise a fresh one here.
-        let extra = SCP()
+        let extra = try SCP(storage: .inMemory)
         try await extra.shutdown(timeout: 1)
         // Second call must not throw — the SDK surface treats
         // AlreadyShutDown as a harmless no-op.
@@ -290,7 +305,7 @@ final class ScpClassTests: XCTestCase {
         )
         XCTAssertEqual(try scp.petnameDidCount(ownerDid: owner), 1)
 
-        let other = SCP()
+        let other = try SCP(storage: .inMemory)
         defer { Task { try? await other.shutdown(timeoutMillis: 1000) } }
         XCTAssertEqual(try other.petnameDidCount(ownerDid: owner), 0)
     }
@@ -308,7 +323,7 @@ final class ScpClassTests: XCTestCase {
             bridgeCredentialKey: key
         )
 
-        let other = SCP()
+        let other = try SCP(storage: .inMemory)
         defer { Task { try? await other.shutdown(timeoutMillis: 1000) } }
         XCTAssertThrowsError(
             try other.bridgeCredentialRetrieve(

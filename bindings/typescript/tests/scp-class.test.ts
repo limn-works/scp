@@ -4,11 +4,11 @@
  * `SCP` is the caller-owned handle that wraps a `NapiBridgeInstance`.
  * Each `SCP` instance has a distinct `instanceId`. Since PR 4 (ADR-048),
  * there is no process-wide default instance — every caller constructs
- * an explicit `new SCP()`.
+ * an explicit `new SCP({ storage: { type: "in_memory" } })`.
  *
  * The tests verify:
- * - `new SCP()` constructs a fresh instance with a non-zero `instanceId`.
- * - Two fresh `new SCP()` instances have distinct `instanceId`s.
+ * - `new SCP({ storage: { type: "in_memory" } })` constructs a fresh instance with a non-zero `instanceId`.
+ * - Two fresh `new SCP({ storage: { type: "in_memory" } })` instances have distinct `instanceId`s.
  * - Lifecycle operations (`suspend()`, `resume()`, `shutdown()`) end-to-end.
  *
  * These tests run against the native NAPI bridge. If the platform-specific
@@ -19,7 +19,27 @@
 import { describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 
-import { __clampShutdownMillisForTests, __serializeStorageConfigForTests } from "../src/scp";
+import { __clampShutdownMillisForTests, __serializeStorageConfigForTests, SCP } from "../src/scp";
+
+// ---------------------------------------------------------------------------
+// Compile-time guard: storage selection is mandatory (spec §17.6).
+//
+// `new SCP()` with no argument — or with an options object that omits
+// `storage` — must be a TYPE error. The `@ts-expect-error` directives
+// below fail the typecheck (`tsc --noEmit -p tsconfig.test.json`) if the
+// constructor ever again accepts a missing storage selection. This block
+// is never executed (it is type-only), so it does not depend on the native
+// addon being present.
+// ---------------------------------------------------------------------------
+function __storageIsRequiredAtCompileTime(): void {
+  // @ts-expect-error storage selection is required — `new SCP()` must not compile.
+  void (() => new SCP());
+  // @ts-expect-error `storage` is a required field of ScpOptions.
+  void (() => new SCP({}));
+  // A valid explicit selection DOES type-check.
+  void (() => new SCP({ storage: { type: "in_memory" } }));
+}
+void __storageIsRequiredAtCompileTime;
 
 // ---------------------------------------------------------------------------
 // Load the raw native addon — `SCP` is exposed directly on the addon.
@@ -67,7 +87,7 @@ try {
 
 describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
   test("new SCP() constructs an instance with a non-zero instanceId", () => {
-    const scp = new addon.SCP();
+    const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     // instanceId is exposed as a string (u64 doesn't fit in a JS number).
     expect(typeof scp.instanceId).toBe("string");
     expect(scp.instanceId).not.toBe("0");
@@ -77,8 +97,8 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
   });
 
   test("two fresh new SCP() instances have distinct instanceIds", () => {
-    const a = new addon.SCP();
-    const b = new addon.SCP();
+    const a = new addon.SCP(JSON.stringify({ type: "in_memory" }));
+    const b = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     expect(a.instanceId).not.toBe(b.instanceId);
   });
 
@@ -91,6 +111,19 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
   test("SCP.withStorage rejects an unknown storage type", () => {
     expect(() => addon.SCP.withStorage(JSON.stringify({ type: "unknown_type" }))).toThrow(
       /unsupported storage type|SCP-VALID-7005/,
+    );
+  });
+
+  test("storage selection is mandatory — missing 'type' throws SCP-STORAGE-8000", () => {
+    // Spec §17.6: a config object with no `type` is rejected fail-closed.
+    expect(() => addon.SCP.withStorage(JSON.stringify({}))).toThrow(/SCP-STORAGE-8000/);
+  });
+
+  test("the raw NAPI constructor requires a config — empty config throws SCP-STORAGE-8000", () => {
+    // The `#[napi(constructor)]` entry point routes to the same fail-closed
+    // parser as `withStorage`.
+    expect(() => new (addon.SCP as new (c: string) => unknown)(JSON.stringify({}))).toThrow(
+      /SCP-STORAGE-8000/,
     );
   });
 
@@ -110,7 +143,7 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
     // Cross-instance rejection is enforced by the Rust-side
     // `check-handle-affinity` gate and exercised by the
     // `bridge_instance` tests in `crates/scp-ffi/common`.
-    const scp = new addon.SCP();
+    const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     if (typeof scp.identityCreate !== "function") {
       // Addon predates per-instance `identityCreate` — can't exercise
       // the affinity path here. Covered by the Rust-side test suite.
@@ -123,7 +156,7 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
   });
 
   test("suspend / resume round-trip succeeds", async () => {
-    const scp = new addon.SCP();
+    const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     expect(() => scp.suspend()).not.toThrow();
     // `resume()` is async since #1678 — the NAPI bridge chains
     // transport reconnect from pending relay URLs and persisted
@@ -136,8 +169,8 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
     // on one SCP and call a method on a DIFFERENT SCP with it so the
     // handle-affinity rejection path is exercised end-to-end, not only
     // in the Rust integration tests.
-    const scpA = new addon.SCP();
-    const scpB = new addon.SCP();
+    const scpA = new addon.SCP(JSON.stringify({ type: "in_memory" }));
+    const scpB = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     if (typeof scpA.identityCreate !== "function" || typeof scpB.contextCreate !== "function") {
       return; // addon predates per-instance identity/context — covered in Rust
     }
@@ -223,7 +256,7 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
   });
 
   test("shutdown(timeoutMillis) resolves without error", async () => {
-    const scp = new addon.SCP();
+    const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     // Native `SCP.shutdown` takes unsigned milliseconds after the #1549
     // Phase 4 unit unification. The NAPI binding widened the parameter
     // to `u64` (#1692), which napi-rs exposes as JS `BigInt` on the
@@ -235,7 +268,7 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
   });
 
   test("shutdown is idempotent — a second call resolves without error", async () => {
-    const scp = new addon.SCP();
+    const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     await expect(scp.shutdown(1000n)).resolves.toBeUndefined();
     // Second call should not throw — AlreadyShutDown maps to a harmless
     // lifecycle observation on the SDK surface.

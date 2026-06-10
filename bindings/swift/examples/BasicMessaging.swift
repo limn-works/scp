@@ -11,7 +11,7 @@ struct BasicMessaging {
     // swiftlint:disable:next function_body_length
     static func main() async throws {
         // Instantiate SCP (in_memory custody for examples).
-        let scp = SCP()
+        let scp = try SCP(storage: .inMemory)
         defer { Task { try? await scp.shutdown(timeout: 5) } }
 
         // Create two identities via the SDK wrapper function.

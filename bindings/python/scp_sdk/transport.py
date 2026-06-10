@@ -49,7 +49,7 @@ class TransportConfig:
 
     Example::
 
-        scp = SCP()
+        scp = SCP(storage={"type": "in_memory"})
         config = TransportConfig(relay_url="wss://relay.example.com")
         await scp.transport_connect(config.relay_url)
         status = await scp.transport_status()

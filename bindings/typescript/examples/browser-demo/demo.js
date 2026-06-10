@@ -3,7 +3,7 @@
  *
  * NOTE (Phase 4 PR 5, ADR-048 / ADR-034): the TypeScript SDK's caller-
  * owned `SCP` class (in `@limn-works/scp-ts`) is intentionally
- * NAPI-only. A browser build cannot `new SCP()`; attempting to do so
+ * NAPI-only. A browser build cannot construct `new SCP(...)`; attempting to do so
  * throws `ValidationError` with code `SCP-VALID-7005`. Browser consumers
  * call the raw WASM exports directly — as this demo does — or run their
  * code in a Bun / Node.js process with `@limn-works/scp-sdk-napi`

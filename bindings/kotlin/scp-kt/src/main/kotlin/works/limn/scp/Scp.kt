@@ -69,8 +69,8 @@ import uniffi.scp.Scp as NativeScp
  * at the FFI boundary.
  *
  * ```kotlin
- * // Fresh in-memory instance.
- * val scp = SCP()
+ * // Storage selection is required — there is no default (spec §17.6).
+ * val scp = SCP(StorageConfig.InMemory)
  *
  * // Graceful shutdown with a 1-second deadline for in-flight tasks.
  * val bridge = CoroutineBridge(...)
@@ -102,16 +102,17 @@ class SCP internal constructor(
     private val isShutdown: AtomicBoolean = AtomicBoolean(false)
 
     /**
-     * Constructs a fresh [SCP] with default in-memory state.
+     * Constructs a fresh [SCP] with an explicit storage configuration.
      *
-     * Equivalent to the UniFFI `Scp()` constructor. No state is shared
-     * with any other [SCP] instance.
+     * Storage selection is MANDATORY (spec §17.6): `storage` is a required
+     * argument — there is no zero-argument constructor and no default
+     * backend. Pass [StorageConfig.InMemory] for development/test or
+     * [StorageConfig.Sqlite] for production (use [withSqlite] for the
+     * common on-disk case).
      *
-     * @param storage Storage configuration. Defaults to
-     *   [StorageConfig.InMemory]; [StorageConfig.Sqlite] is also supported
-     *   (use [withSqlite] for the common on-disk case).
+     * @param storage Storage configuration. Required — no default.
      */
-    constructor(storage: StorageConfig = StorageConfig.InMemory) : this(NativeScp.withStorage(storage))
+    constructor(storage: StorageConfig) : this(NativeScp.withStorage(storage))
 
     /**
      * The monotonic identifier for this bridge instance, unique per

@@ -104,7 +104,7 @@ fn default_encrypted_params() -> ContextParams {
 
 #[tokio::test]
 async fn identity_create_in_memory_produces_valid_did() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let identity = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -120,7 +120,7 @@ async fn identity_create_in_memory_produces_valid_did() {
 
 #[tokio::test]
 async fn identity_create_rejects_unknown_custody() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let result = scp.identity_create("magic".to_owned(), None).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -133,7 +133,7 @@ async fn identity_create_rejects_unknown_custody() {
 
 #[tokio::test]
 async fn identity_rotate_key() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let identity = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -165,7 +165,7 @@ async fn identity_rotate_key() {
 
 #[tokio::test]
 async fn identity_agent_key_lifecycle() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     // Create without agent key
     let identity = scp
         .identity_create("in_memory".to_owned(), None)
@@ -205,7 +205,7 @@ async fn identity_agent_key_lifecycle() {
 
 #[tokio::test]
 async fn identity_migrate_preserves_attestations() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let identity = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -286,7 +286,7 @@ async fn identity_migrate_preserves_attestations() {
 
 #[tokio::test]
 async fn context_create_returns_active_context() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let identity = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -321,7 +321,7 @@ async fn context_create_returns_active_context() {
 
 #[tokio::test]
 async fn context_join_and_leave() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -368,7 +368,7 @@ async fn context_join_and_leave() {
 /// SCP-ECON-12061 code (mirrors PyO3/NAPI/WASM bridges).
 #[tokio::test]
 async fn context_join_rejects_malformed_spending_ucan_jwt() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -403,7 +403,7 @@ async fn context_join_rejects_malformed_spending_ucan_jwt() {
 /// manager.
 #[tokio::test]
 async fn context_join_accepts_none_spending_ucan_jwt() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -433,7 +433,7 @@ async fn context_join_accepts_none_spending_ucan_jwt() {
 /// is declared without the matching opt-in flag.
 #[tokio::test]
 async fn context_create_rejects_revoke_access_when_config_disallows() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -468,7 +468,7 @@ async fn context_create_rejects_revoke_access_when_config_disallows() {
 /// the context creation must succeed.
 #[tokio::test]
 async fn context_create_threads_consequence_rules_and_config() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -504,7 +504,7 @@ async fn context_create_threads_consequence_rules_and_config() {
 
 #[tokio::test]
 async fn context_send_message() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -525,7 +525,7 @@ async fn context_send_message() {
 
 #[tokio::test]
 async fn context_close_lifecycle() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -548,7 +548,7 @@ async fn context_close_lifecycle() {
 
 #[tokio::test]
 async fn context_drain_events_returns_vec() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -568,7 +568,7 @@ async fn context_drain_events_returns_vec() {
 
 #[tokio::test]
 async fn context_member_role_returns_role_for_creator() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -595,7 +595,7 @@ async fn context_member_role_returns_role_for_creator() {
 
 #[tokio::test]
 async fn context_ttl_operations() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -624,7 +624,7 @@ async fn context_ttl_operations() {
 
 #[tokio::test]
 async fn governance_execute_add_member() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -658,7 +658,7 @@ async fn governance_execute_add_member() {
 
 #[tokio::test]
 async fn broadcast_lifecycle() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -689,7 +689,7 @@ async fn broadcast_lifecycle() {
 
 #[tokio::test]
 async fn tool_register_and_verify() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -727,7 +727,7 @@ async fn tool_register_and_verify() {
 
 #[tokio::test]
 async fn ucan_mint_and_revoke() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -772,7 +772,7 @@ async fn ucan_mint_and_revoke() {
 
 #[tokio::test]
 async fn event_log_query_returns_events() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -793,7 +793,7 @@ async fn event_log_query_returns_events() {
 
 #[tokio::test]
 async fn discovery_parse_various_address_types() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     // Unscoped name (petname)
     let result = discovery_parse_address("alice".to_owned()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -832,7 +832,7 @@ async fn discovery_parse_various_address_types() {
 
 #[tokio::test]
 async fn discovery_normalize_trims_whitespace() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     let result = discovery_normalize_address("  alice  ".to_owned());
     assert!(!result.starts_with(' '), "Should trim leading whitespace");
     assert!(!result.ends_with(' '), "Should trim trailing whitespace");
@@ -840,7 +840,7 @@ async fn discovery_normalize_trims_whitespace() {
 
 #[tokio::test]
 async fn discovery_create_query_produces_json() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     let result = discovery_create_query(
         Some(vec!["tool:search".to_owned()]),
         Some(vec!["rust".to_owned()]),
@@ -858,7 +858,7 @@ async fn discovery_create_query_produces_json() {
 
 #[tokio::test]
 async fn sync_classify_offline_tiers() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     let now = 1_700_000_000u64;
 
     // Short offline (< TIER_1 = 14,400s)
@@ -876,7 +876,7 @@ async fn sync_classify_offline_tiers() {
 
 #[tokio::test]
 async fn sync_classify_offline_custom_thresholds() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     let now = 1_700_000_000u64;
 
     // Custom thresholds: tier1 = 120s, tier2 = 600s
@@ -899,7 +899,7 @@ async fn sync_classify_offline_custom_thresholds() {
 
 #[tokio::test]
 async fn provenance_attach_produces_json() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let result = scp
         .provenance_attach(
             "ctx-source".to_owned(),
@@ -919,7 +919,7 @@ async fn provenance_attach_produces_json() {
 
 #[tokio::test]
 async fn provenance_attach_increments_chain_depth() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let result = scp
         .provenance_attach(
             "ctx-source".to_owned(),
@@ -939,7 +939,7 @@ async fn provenance_attach_increments_chain_depth() {
 
 #[tokio::test]
 async fn provenance_check_chain_depth_within_limit() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     assert!(
         provenance_check_chain_depth(0, None),
         "Depth 0 should be within default limit"
@@ -961,7 +961,7 @@ async fn provenance_check_chain_depth_within_limit() {
 
 #[tokio::test]
 async fn evaluate_provenance_quality_returns_score() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     let score = evaluate_provenance_quality(
         Some("ctx-001".to_owned()),
         "persistent".to_owned(),
@@ -979,7 +979,7 @@ async fn evaluate_provenance_quality_returns_score() {
 
 #[tokio::test]
 async fn evaluate_provenance_quality_rejects_invalid_source_type() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     let result =
         evaluate_provenance_quality(None, "invalid_type".to_owned(), "active".to_owned(), vec![]);
     assert!(result.is_err(), "Invalid source type should be rejected");
@@ -991,7 +991,7 @@ async fn evaluate_provenance_quality_rejects_invalid_source_type() {
 
 #[tokio::test]
 async fn bridge_evaluate_trust_native() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     // Non-bridged, native transport → highest trust
     let level = bridge_evaluate_trust(false, true, "shadow".to_owned()).unwrap();
     assert!(level > 0, "Native trust level should be positive");
@@ -999,7 +999,7 @@ async fn bridge_evaluate_trust_native() {
 
 #[tokio::test]
 async fn bridge_evaluate_trust_shadow_vs_claimed() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     // Shadow bridged
     let shadow = bridge_evaluate_trust(true, false, "shadow".to_owned()).unwrap();
     // Claimed bridged
@@ -1013,7 +1013,7 @@ async fn bridge_evaluate_trust_shadow_vs_claimed() {
 
 #[tokio::test]
 async fn bridge_evaluate_trust_rejects_invalid_status() {
-    let _scp = Scp::new();
+    let _scp = Scp::new_in_memory_for_test();
     let result = bridge_evaluate_trust(true, false, "invalid".to_owned());
     assert!(result.is_err(), "Invalid shadow status should be rejected");
 }
@@ -1024,7 +1024,7 @@ async fn bridge_evaluate_trust_rejects_invalid_status() {
 
 #[tokio::test]
 async fn register_and_check_local_did() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let did = "did:dht:z6MkLocalTest123".to_owned();
     scp.register_local_did(did.clone())
         .await
@@ -1047,7 +1047,7 @@ async fn register_and_check_local_did() {
 // shutdown now goes through `SCP.shutdown(timeout_millis)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scp_shutdown_zero_timeout_returns_immediately() {
-    let scp = scp_ffi_uniffi::Scp::new();
+    let scp = scp_ffi_uniffi::Scp::new_in_memory_for_test();
     scp.shutdown(0).await.expect("shutdown(0) must succeed");
 }
 
@@ -1057,7 +1057,7 @@ async fn scp_shutdown_zero_timeout_returns_immediately() {
 
 #[tokio::test]
 async fn multiple_identities_produce_distinct_dids() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let id1 = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -1082,7 +1082,7 @@ async fn multiple_identities_produce_distinct_dids() {
 
 #[tokio::test]
 async fn context_create_with_all_governance_models() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let identity = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -1116,7 +1116,7 @@ async fn context_create_with_all_governance_models() {
 
 #[tokio::test]
 async fn context_create_with_all_memory_scopes() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let identity = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -1154,7 +1154,7 @@ async fn context_create_with_all_memory_scopes() {
 
 #[tokio::test]
 async fn invalid_did_rejected_at_bridge_boundary() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let identity = scp
         .identity_create("in_memory".to_owned(), None)
         .await
@@ -1182,7 +1182,7 @@ async fn invalid_did_rejected_at_bridge_boundary() {
 
 #[tokio::test]
 async fn transport_connect_rejects_plaintext_ws() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     // ws:// is not permitted from explicit source — only wss://
     let result = scp
         .transport_connect("ws://relay.example.com/scp/v1".to_owned())
@@ -1195,7 +1195,7 @@ async fn transport_connect_rejects_plaintext_ws() {
 
 #[tokio::test]
 async fn transport_connect_rejects_invalid_url() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     // Empty URL should fail validation
     let result = scp.transport_connect(String::new()).await;
     assert!(result.is_err(), "Empty URL should be rejected");
@@ -1203,7 +1203,7 @@ async fn transport_connect_rejects_invalid_url() {
 
 #[tokio::test]
 async fn transport_connect_returns_error_on_unreachable_relay() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     // Before #620, transport_connect returned connected=true without
     // establishing any WebSocket connection. Now it calls
     // NativeRelayAdapter::connect_sourced() and propagates connection

@@ -1962,8 +1962,13 @@ public func FfiConverterTypeRelayHandle_lower(_ value: RelayHandle) -> UnsafeMut
  *
  * Generated as `class SCP` in both Swift and Kotlin. Phase D (#1695,
  * ADR-048) deleted the process-wide default instance: every caller now
- * constructs an explicit `SCP()` and the handles it mints are rejected
+ * constructs an explicit `SCP` and the handles it mints are rejected
  * on any other instance via [`check-handle-affinity`][affinity].
+ *
+ * Storage selection is MANDATORY (spec §17.6): the only constructor is
+ * [`Self::with_storage`], which takes a typed [`StorageConfig`] — there
+ * is no zero-argument constructor, so a missing storage selection is a
+ * compile error in Swift and Kotlin.
  *
  * The native `shutdown` parameter is milliseconds (`u64`) — the SDK
  * wrappers present it as seconds for consumer ergonomics.
@@ -1973,7 +1978,7 @@ public func FfiConverterTypeRelayHandle_lower(_ value: RelayHandle) -> UnsafeMut
  * # Swift usage
  *
  * ```swift
- * let scp = SCP()                                // fresh in-memory instance
+ * let scp = try SCP.withStorage(.inMemory)       // explicit dev/test storage
  * let identity = try await scp.identityCreate(custody: "in_memory")
  * try await scp.shutdown(timeoutMillis: 5_000)   // graceful shutdown
  * ```
@@ -1981,7 +1986,7 @@ public func FfiConverterTypeRelayHandle_lower(_ value: RelayHandle) -> UnsafeMut
  * # Kotlin usage
  *
  * ```kotlin
- * val scp = SCP()                                // fresh in-memory instance
+ * val scp = SCP(StorageConfig.InMemory)          // explicit dev/test storage
  * val identity = scp.identityCreate(custody = "in_memory")
  * scp.shutdown(timeoutMillis = 5_000uL)          // suspend fun, graceful shutdown
  * ```
@@ -2402,8 +2407,18 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
      * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
-     * supervisor, returning a JSON `{"results":[...]}` document with one
-     * entry per receipt. Mirrors the `PyO3` reference bridge exactly.
+     * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
+     * document with one entry per receipt. Mirrors the `PyO3` reference bridge
+     * exactly. Maximum 10,000 receipts per call.
+     *
+     * `all_valid` is `true` iff every entry both reached the adapter (`ok ==
+     * true`) and the adapter reported the receipt valid (`result.valid ==
+     * true`); it is vacuously `true` for an empty batch. Each `results` entry
+     * is either `{"receipt_id": <hex>, "ok": true, "valid": <bool>, "result":
+     * <structured VerificationResult>}` on success or `{"ok": false, "error":
+     * "..."}` on failure. `ok` means the adapter *responded* — NOT that the
+     * payment is valid; callers scanning for failures must inspect
+     * `valid`/`all_valid`.
      */
     func economyVerifyPaymentReceipts(receiptsJson: String) async throws  -> String
     
@@ -3208,8 +3223,13 @@ public protocol ScpProtocol: AnyObject, Sendable {
  *
  * Generated as `class SCP` in both Swift and Kotlin. Phase D (#1695,
  * ADR-048) deleted the process-wide default instance: every caller now
- * constructs an explicit `SCP()` and the handles it mints are rejected
+ * constructs an explicit `SCP` and the handles it mints are rejected
  * on any other instance via [`check-handle-affinity`][affinity].
+ *
+ * Storage selection is MANDATORY (spec §17.6): the only constructor is
+ * [`Self::with_storage`], which takes a typed [`StorageConfig`] — there
+ * is no zero-argument constructor, so a missing storage selection is a
+ * compile error in Swift and Kotlin.
  *
  * The native `shutdown` parameter is milliseconds (`u64`) — the SDK
  * wrappers present it as seconds for consumer ergonomics.
@@ -3219,7 +3239,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
  * # Swift usage
  *
  * ```swift
- * let scp = SCP()                                // fresh in-memory instance
+ * let scp = try SCP.withStorage(.inMemory)       // explicit dev/test storage
  * let identity = try await scp.identityCreate(custody: "in_memory")
  * try await scp.shutdown(timeoutMillis: 5_000)   // graceful shutdown
  * ```
@@ -3227,7 +3247,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
  * # Kotlin usage
  *
  * ```kotlin
- * val scp = SCP()                                // fresh in-memory instance
+ * val scp = SCP(StorageConfig.InMemory)          // explicit dev/test storage
  * val identity = scp.identityCreate(custody = "in_memory")
  * scp.shutdown(timeoutMillis = 5_000uL)          // suspend fun, graceful shutdown
  * ```
@@ -3271,24 +3291,7 @@ open class Scp: ScpProtocol, @unchecked Sendable {
     public func uniffiClonePointer() -> UnsafeMutableRawPointer {
         return try! rustCall { uniffi_scp_ffi_uniffi_fn_clone_scp(self.pointer, $0) }
     }
-    /**
-     * Constructs a fresh `SCP` instance with default in-memory state.
-     *
-     * Each call produces a brand-new instance with a fresh monotonic
-     * `instance_id`, a fresh `CancellationToken`, and an empty
-     * `JoinSet`. Handles issued against this instance are incompatible
-     * with any other instance — the `CoreFields::check_handle` path
-     * surfaces the mismatch as `ScpError::Permission` with code
-     * `SCP-PERM-3030`.
-     */
-public convenience init() {
-    let pointer =
-        try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_constructor_scp_new($0
-    )
-}
-    self.init(unsafeFromRawPointer: pointer)
-}
+    // No primary constructor declared for this class.
 
     deinit {
         guard let pointer = pointer else {
@@ -4411,8 +4414,18 @@ open func economyBudgetRemaining(contextId: String, did: String)throws  -> UInt6
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
      * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
-     * supervisor, returning a JSON `{"results":[...]}` document with one
-     * entry per receipt. Mirrors the `PyO3` reference bridge exactly.
+     * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
+     * document with one entry per receipt. Mirrors the `PyO3` reference bridge
+     * exactly. Maximum 10,000 receipts per call.
+     *
+     * `all_valid` is `true` iff every entry both reached the adapter (`ok ==
+     * true`) and the adapter reported the receipt valid (`result.valid ==
+     * true`); it is vacuously `true` for an empty batch. Each `results` entry
+     * is either `{"receipt_id": <hex>, "ok": true, "valid": <bool>, "result":
+     * <structured VerificationResult>}` on success or `{"ok": false, "error":
+     * "..."}` on failure. `ok` means the adapter *responded* — NOT that the
+     * payment is valid; callers scanning for failures must inspect
+     * `valid`/`all_valid`.
      */
 open func economyVerifyPaymentReceipts(receiptsJson: String)async throws  -> String  {
     return
@@ -15180,7 +15193,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_remaining() != 32105) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 4503) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 16710) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 59132) {
@@ -15505,9 +15518,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_token_id() != 51675) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_new() != 52341) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_persistence() != 28565) {

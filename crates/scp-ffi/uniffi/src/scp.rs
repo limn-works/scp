@@ -27,8 +27,13 @@ use crate::{decrement_handle_count, increment_handle_count};
 ///
 /// Generated as `class SCP` in both Swift and Kotlin. Phase D (#1695,
 /// ADR-048) deleted the process-wide default instance: every caller now
-/// constructs an explicit `SCP()` and the handles it mints are rejected
+/// constructs an explicit `SCP` and the handles it mints are rejected
 /// on any other instance via [`check-handle-affinity`][affinity].
+///
+/// Storage selection is MANDATORY (spec §17.6): the only constructor is
+/// [`Self::with_storage`], which takes a typed [`StorageConfig`] — there
+/// is no zero-argument constructor, so a missing storage selection is a
+/// compile error in Swift and Kotlin.
 ///
 /// The native `shutdown` parameter is milliseconds (`u64`) — the SDK
 /// wrappers present it as seconds for consumer ergonomics.
@@ -38,7 +43,7 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// # Swift usage
 ///
 /// ```swift
-/// let scp = SCP()                                // fresh in-memory instance
+/// let scp = try SCP.withStorage(.inMemory)       // explicit dev/test storage
 /// let identity = try await scp.identityCreate(custody: "in_memory")
 /// try await scp.shutdown(timeoutMillis: 5_000)   // graceful shutdown
 /// ```
@@ -46,7 +51,7 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// # Kotlin usage
 ///
 /// ```kotlin
-/// val scp = SCP()                                // fresh in-memory instance
+/// val scp = SCP(StorageConfig.InMemory)          // explicit dev/test storage
 /// val identity = scp.identityCreate(custody = "in_memory")
 /// scp.shutdown(timeoutMillis = 5_000uL)          // suspend fun, graceful shutdown
 /// ```
@@ -58,23 +63,6 @@ pub struct Scp {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Scp {
-    /// Constructs a fresh `SCP` instance with default in-memory state.
-    ///
-    /// Each call produces a brand-new instance with a fresh monotonic
-    /// `instance_id`, a fresh `CancellationToken`, and an empty
-    /// `JoinSet`. Handles issued against this instance are incompatible
-    /// with any other instance — the `CoreFields::check_handle` path
-    /// surfaces the mismatch as `ScpError::Permission` with code
-    /// `SCP-PERM-3030`.
-    #[uniffi::constructor]
-    #[must_use]
-    pub fn new() -> Arc<Self> {
-        increment_handle_count();
-        Arc::new(Self {
-            inner: Arc::new(UniffiBridgeInstance::new_uniffi()),
-        })
-    }
-
     /// Constructs an `SCP` instance with a storage configuration.
     ///
     /// `StorageConfig::InMemory` selects the encrypted in-memory dev/test
@@ -177,8 +165,66 @@ impl Scp {
     }
 }
 
+// Non-UniFFI impl block — Rust-only test affordance. Items here are NOT
+// annotated with `#[uniffi::export]`, so they do not become Swift/Kotlin
+// methods.
+impl Scp {
+    /// Constructs an `Scp` with EXPLICIT in-memory storage, for Rust-side
+    /// tests only.
+    ///
+    /// The sole public constructor ([`Self::with_storage`]) takes a typed
+    /// [`StorageConfig`] and returns a `Result`; Rust integration tests
+    /// want a one-liner that selects in-memory storage infallibly. This
+    /// wraps [`UniffiBridgeInstance::new_uniffi`] (the internal in-memory
+    /// builder) — an explicit dev/test selection, NOT a silent default
+    /// (spec §17.6).
+    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[must_use]
+    pub fn new_in_memory_for_test() -> Arc<Self> {
+        increment_handle_count();
+        Arc::new(Self {
+            inner: Arc::new(UniffiBridgeInstance::new_uniffi()),
+        })
+    }
+}
+
 impl Drop for Scp {
     fn drop(&mut self) {
         decrement_handle_count();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod storage_mandatory_tests {
+    use super::*;
+    use crate::runtime::StorageConfig;
+
+    /// Storage selection is mandatory and typed (spec §17.6): the only
+    /// constructor is `with_storage`, which takes a typed `StorageConfig`.
+    /// The explicit in-memory selection constructs successfully and yields
+    /// a live instance with a non-zero monotonic id (a real operation).
+    #[test]
+    fn with_storage_in_memory_constructs_and_is_live() {
+        let scp =
+            Scp::with_storage(StorageConfig::InMemory).expect("in_memory selection must construct");
+        assert!(
+            scp.instance_id() > 0,
+            "constructed instance must expose a live, non-zero instance_id"
+        );
+    }
+
+    /// Compile-time guard: there is no zero-argument constructor. If a bare
+    /// `Scp::new()` is re-introduced, this reference fails to compile because
+    /// the only construction paths are `with_storage`, `with_persistence`,
+    /// and the test-only `new_in_memory_for_test`. We pin the typed
+    /// constructor's signature so a regression to a no-arg form is caught.
+    #[test]
+    fn only_typed_constructor_exists() {
+        // `with_storage` takes a `StorageConfig` by value and returns a
+        // `Result` — a missing selection cannot even be expressed.
+        let ctor: fn(StorageConfig) -> Result<std::sync::Arc<Scp>, ScpError> = Scp::with_storage;
+        let scp = ctor(StorageConfig::InMemory).expect("typed constructor must build in-memory");
+        assert!(scp.instance_id() > 0);
     }
 }

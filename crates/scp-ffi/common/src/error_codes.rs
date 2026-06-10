@@ -793,6 +793,24 @@ pub const VALID_7402: &str = "SCP-VALID-7402";
 pub const VALID_7403: &str = "SCP-VALID-7403";
 
 // -------------------------------------------------------------------------
+// Storage (SCP-STORAGE- 8000--8999)
+// -------------------------------------------------------------------------
+
+/// Storage selection required / no storage configured.
+///
+/// Returned when an `SCP` instance is constructed without an explicit
+/// storage choice. Storage selection is mandatory and fail-closed (spec
+/// §17.6): there is no default backend. The two valid selections are
+/// `{"type": "in_memory"}` (development) and
+/// `{"type": "sqlite", "path": ..., "key" | "passphrase": ...}`
+/// (production). Bridges that can require storage at compile time (the
+/// typed `UniFFI` constructor, the required Swift / Kotlin / TypeScript
+/// constructor argument) do so; the dynamically-typed bridges (the `PyO3`
+/// dict, the NAPI JSON-string factory) reject a missing selection at
+/// runtime with this code. No bridge silently defaults to in-memory.
+pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
+
+// -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------
 

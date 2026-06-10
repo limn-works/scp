@@ -503,6 +503,27 @@ impl PyBridgeInstance {
         }
     }
 
+    /// Constructs a `PyBridgeInstance` with explicit in-memory storage, for
+    /// Rust-side tests only.
+    ///
+    /// Equivalent to `with_storage_py(StorageConfig::InMemory)` but
+    /// infallible: in-memory construction performs no I/O and cannot fail,
+    /// so this returns `Self` directly without a `Result`. This is the
+    /// dev/test in-memory selection (spec §17.6), NOT a silent default —
+    /// the public `SCP(config)` constructor still requires an explicit
+    /// storage dict.
+    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[must_use]
+    pub fn new_in_memory_for_test() -> Self {
+        let instance = Self::new_py();
+        // OnceLock: first set wins. `new_py()` leaves this unset, so this set
+        // always succeeds.
+        let _ = instance
+            .storage_provider
+            .set(StorageProvider::new_in_memory_encrypted());
+        instance
+    }
+
     /// Constructs a new `PyBridgeInstance` with a persistence provider.
     ///
     /// Mirrors [`CoreFields::with_persistence`] — callers pass the same
@@ -1213,14 +1234,15 @@ fn build_supervisor(
 fn derive_mls_storage(
     bi: &PyBridgeInstance,
 ) -> Result<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>, ScpPyError> {
-    let provider = bi.storage_provider().ok_or_else(|| {
-        ScpPyError::context(
-            "storage-before-supervisor precondition failed: no storage provider \
+    let provider = bi
+        .storage_provider()
+        .ok_or_else(|| ScpPyError::ContextError {
+            message: "storage-before-supervisor precondition failed: no storage provider \
              set on the bridge instance — the runtime never defaults storage \
-             (spec §17.6). Select storage via SCP.with_storage({...}) first."
+             (spec §17.6). Select storage via SCP({...}) / SCP.with_storage({...}) first."
                 .to_owned(),
-        )
-    })?;
+            code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
+        })?;
     let adapter = scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
         Arc::new(provider.clone()),
     );

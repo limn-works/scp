@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn petname_set_and_resolve() {
         let owner = "did:dht:zNapiTest1".to_owned();
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         scp.petname_set(
             owner.clone(),
             "did:dht:zAlice".to_owned(),
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn petname_context_set_and_resolve() {
         let owner = "did:dht:zNapiTest2".to_owned();
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         scp.petname_set_context(owner.clone(), "ctx-napi-1".to_owned(), "work".to_owned())
             .unwrap();
         let json = scp
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn petname_apply_event_and_counts() {
         let owner = "did:dht:zNapiTestApply".to_owned();
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         scp.petname_apply_event(
             owner.clone(),
             r#"{"SetPetname": {"did": "did:dht:zAlice", "name": "alice"}}"#.to_owned(),
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn petname_apply_event_rejects_malformed_napi() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         assert!(
             scp.petname_apply_event("did:dht:zOwner".to_owned(), "nope".to_owned())
                 .is_err()
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn petname_counts_empty_owner_errors_napi() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         assert!(scp.petname_did_count(String::new()).is_err());
         assert!(scp.petname_context_count(String::new()).is_err());
     }
@@ -425,7 +425,7 @@ mod tests {
     fn handle_register_and_lookup_napi() {
         let ctx = "ctx-napi-handle-1".to_owned();
         let target = r#"{"type": "identity", "did": "did:dht:zNapiAlice"}"#.to_owned();
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let result = scp
             .handle_register(
                 ctx.clone(),

@@ -17,7 +17,7 @@
 import { SCP, type ToolDefinition, type UcanToken, defineToolDefinition } from "../src/index";
 
 async function main(): Promise<void> {
-  const scp = new SCP();
+  const scp = new SCP({ storage: { type: "in_memory" } });
   let relay: Awaited<ReturnType<SCP["relayStartInMemory"]>> | null = null;
   try {
     // 1. Start an in-memory relay.

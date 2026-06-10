@@ -15683,7 +15683,7 @@ mod tests {
     /// (#1549) deleted the free-function façade; tests now drive bridge
     /// logic through an owned `Scp` instance.
     fn scp_test() -> Arc<crate::scp::Scp> {
-        crate::scp::Scp::new()
+        crate::scp::Scp::new_in_memory_for_test()
     }
 
     /// Builds a synthetic `ContextHandle` stamped with `scp`'s own
@@ -15920,7 +15920,7 @@ mod tests {
     fn set_economic_policy_always_rejects_requires_governance() {
         // Phase D (#1695): use a fresh SCP instance and stamp the handle
         // with its instance_id so the per-instance affinity check accepts it.
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let handle = test_handle_for(&scp);
 
         // Initially None.
@@ -17772,7 +17772,7 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn transport_connect_routes_through_selector_ws_fallback() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         // An in-memory relay serves no `.well-known/scp`; QUIC is never
         // advertised, so a selector-routed connect must fail open to WS.
         let relay = runtime()
@@ -17798,7 +17798,7 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn add_relay_routes_through_selector_ws_fallback() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let relay = runtime()
             .block_on(scp.relay_start_in_memory())
             .expect("in-memory relay must start");
@@ -17841,7 +17841,7 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn configure_relay_transport_routes_through_selector_ws_fallback() {
-        let scp = crate::scp::Scp::new();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let relay = runtime()
             .block_on(scp.relay_start_in_memory())
             .expect("in-memory relay must start");

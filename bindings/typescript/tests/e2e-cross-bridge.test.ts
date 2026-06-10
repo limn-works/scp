@@ -39,7 +39,7 @@ let skipReason = "";
 try {
   // Load NAPI bridge
   const { createNativeBridge } = await import("../src/internal/native.js");
-  scp = new SCP();
+  scp = new SCP({ storage: { type: "in_memory" } });
   napiBridge = createNativeBridge(scp);
 
   // Node startup is now a per-instance `SCP.nodeStartInMemory()`

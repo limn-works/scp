@@ -313,7 +313,15 @@ pub struct NapiBridgeInstance {
 pub(crate) const RECOVERY_CONCURRENCY_CAP: usize = 2;
 
 impl NapiBridgeInstance {
-    /// Constructs a new `NapiBridgeInstance` with default in-memory state.
+    /// Constructs a new `NapiBridgeInstance` with EXPLICIT in-memory storage.
+    ///
+    /// This is the internal explicit in-memory builder (the dev/test
+    /// selection; spec §17.6). The public `SCP` constructor no longer calls
+    /// it implicitly — `new SCP(config)` requires an explicit storage dict
+    /// and routes in-memory only through `with_storage_napi(InMemory)`,
+    /// which delegates here. The ~63 internal `new_napi()` callers (parity
+    /// harness, tests, server bootstrap) keep using it directly as their
+    /// explicit in-memory selection.
     ///
     /// Allocates a fresh `CoreFields` (new `instance_id`, new
     /// `CancellationToken`, empty `JoinSet`) and populates the protocol

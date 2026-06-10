@@ -55,7 +55,7 @@ let skipReason = "";
 
 try {
   const { createNativeBridge } = await import("../src/internal/native.js");
-  scp = new SCP();
+  scp = new SCP({ storage: { type: "in_memory" } });
   bridge = createNativeBridge(scp);
   if (typeof (scp as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
     skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";

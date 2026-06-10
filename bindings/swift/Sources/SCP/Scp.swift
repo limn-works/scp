@@ -18,8 +18,12 @@ import Foundation
 
 /// Caller-owned SCP instance — the preferred SDK entry point.
 ///
+/// Storage selection is MANDATORY (spec §17.6): construct via
+/// ``init(storage:)`` / ``withStorage(_:)`` — there is no zero-argument
+/// `SCP()` initializer.
+///
 /// ```swift
-/// let scp = SCP()                                // fresh in-memory instance
+/// let scp = try SCP(storage: .inMemory)          // explicit dev/test storage
 /// try await scp.shutdown(timeout: 5.0)           // graceful shutdown
 /// ```
 ///
@@ -36,14 +40,6 @@ public final class SCP: @unchecked Sendable {
     /// to consumers.
     let inner: Scp
 
-    /// Constructs a fresh `SCP` instance with default in-memory state.
-    ///
-    /// Equivalent to the UniFFI `Scp()` constructor. No state is shared
-    /// with other `SCP` instances.
-    public init() {
-        inner = Scp()
-    }
-
     /// Wraps an already-existing UniFFI `Scp` handle. Internal — used by
     /// the `withStorage(_:)` factories so they can reuse the stored-handle
     /// path without leaking the opaque type.
@@ -53,11 +49,27 @@ public final class SCP: @unchecked Sendable {
 
     /// Constructs an `SCP` with an explicit storage configuration.
     ///
-    /// Phase 4 PR 3 (closes #1260 / #1491) added
-    /// ``StorageConfig/sqlite(path:key:)`` alongside the default
-    /// ``StorageConfig/inMemory`` variant; callers who want a Swift-native
-    /// `URL` + `Data` surface over the SQLite variant should prefer
-    /// ``SCP/withStorage(sqliteDir:key:)``.
+    /// Storage selection is MANDATORY (spec §17.6): this throwing
+    /// initializer is the sole public way to construct an `SCP`. There is
+    /// no zero-argument `SCP()` initializer — a missing storage selection
+    /// is a compile error.
+    ///
+    /// Pass ``StorageConfig/inMemory`` for development/test or
+    /// ``StorageConfig/sqlite(path:key:)`` for production; callers who want
+    /// a Swift-native `URL` + `Data` surface over the SQLite variant should
+    /// prefer ``SCP/withStorage(sqliteDir:key:)``.
+    ///
+    /// - Throws: ``ScpError`` if a durable backend cannot be opened
+    ///   (FAIL CLOSED, spec §17.6).
+    public init(storage: StorageConfig) throws {
+        inner = try Scp.withStorage(config: storage)
+    }
+
+    /// Constructs an `SCP` with an explicit storage configuration.
+    ///
+    /// Convenience static factory over ``init(storage:)`` —
+    /// ``StorageConfig/inMemory`` for development/test or
+    /// ``StorageConfig/sqlite(path:key:)`` for production.
     public static func withStorage(_ config: StorageConfig) throws -> SCP {
         try SCP(inner: Scp.withStorage(config: config))
     }

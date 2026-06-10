@@ -10,7 +10,8 @@
  * ```ts
  * import { SCP, Identity } from "@limn-works/scp-ts";
  *
- * const scp = new SCP();                 // fresh in-memory instance
+ * // Storage selection is required — there is no default (spec §17.6).
+ * const scp = new SCP({ storage: { type: "in_memory" } }); // dev/test storage
  * const identity = await scp.identityCreate("in_memory");
  * await scp.resume();                    // async — reconnects transport
  * await scp.shutdown(5);                 // graceful shutdown
@@ -74,7 +75,11 @@ type NativeAddon = RawNativeAddon & {
  * #1260 and #1491).
  */
 interface NativeScpCtor {
-  new (): NativeScpInstance;
+  // The native constructor now requires a JSON storage-config string
+  // (spec §17.6 — storage selection is mandatory). The SDK routes
+  // construction through `withStorage` rather than the raw `new`, so the
+  // raw constructor signature is kept here only for type accuracy.
+  new (configJson: string): NativeScpInstance;
   withStorage: (configJson: string) => NativeScpInstance;
 }
 
@@ -297,8 +302,13 @@ export type StorageConfig =
 
 /** Constructor options for `new SCP(...)`. */
 export interface ScpOptions {
-  /** Storage configuration. Defaults to in-memory when omitted. */
-  storage?: StorageConfig;
+  /**
+   * Storage configuration. **Required** — storage selection is mandatory
+   * and fail-closed (spec §17.6); there is no default backend. Use
+   * `{ type: "in_memory" }` for development/test or `{ type: "sqlite", ... }`
+   * for production.
+   */
+  storage: StorageConfig;
 }
 
 /**
@@ -442,10 +452,14 @@ export class SCP {
   /**
    * Constructs a fresh `SCP` instance.
    *
-   * @param options Optional constructor options.
+   * Storage selection is **mandatory** and fail-closed (spec §17.6):
+   * `options.storage` is required, so `new SCP()` (no argument) is a
+   * compile error. There is no default backend.
+   *
+   * @param options Constructor options; `options.storage` is required.
    * @throws {ValidationError} If no NAPI addon is available — code `SCP-VALID-7005`.
    */
-  constructor(options: ScpOptions = {}) {
+  constructor(options: ScpOptions) {
     // Test-only escape hatch: if a pre-built native handle is smuggled
     // via the (non-exported) `NATIVE_OVERRIDE` symbol, skip addon
     // loading entirely. Only reachable from `__constructScpWithNativeForTests`.
@@ -453,12 +467,11 @@ export class SCP {
     if (override !== undefined) {
       this.#native = override;
     } else {
+      // Storage selection is required — there is no in-memory default
+      // (spec §17.6). The native `withStorage` factory fails closed on a
+      // missing/unknown `type`.
       const NativeScp = nativeScp();
-      if (options.storage !== undefined) {
-        this.#native = NativeScp.withStorage(serializeStorageConfig(options.storage));
-      } else {
-        this.#native = new NativeScp();
-      }
+      this.#native = NativeScp.withStorage(serializeStorageConfig(options.storage));
     }
     // Expose the handle to sibling SDK modules via a module-local
     // WeakMap. Production code paths (~180 methods on this class) use
