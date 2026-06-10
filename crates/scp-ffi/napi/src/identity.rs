@@ -432,71 +432,69 @@ impl NapiIdentity {
     #[napi]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn rotate_key(&self) -> napi::Result<Self> {
-        {
-            let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
+        let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
 
-            let bi = &self.inner.bi;
+        let bi = &self.inner.bi;
 
-            // Read attestations + pre-rotation state BEFORE async operation
-            // (entry guaranteed to exist). `rotate_active_key` does not touch
-            // the pre-rotation key, so we reuse the existing handle/custody.
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(|e| {
-                    // Fail-fast rather than fabricate a synthetic
-                    // `(handle = 0, fresh empty custody)` pair: a fresh
-                    // empty custody would silently overwrite the
-                    // registered pre-rotation state, leaving the
-                    // identity un-migratable. Surface the real error
-                    // so the caller can recover.
-                    NapiError::from(e)
-                })?;
+        // Read attestations + pre-rotation state BEFORE async operation
+        // (entry guaranteed to exist). `rotate_active_key` does not touch
+        // the pre-rotation key, so we reuse the existing handle/custody.
+        let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
+            crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(|e| {
+                // Fail-fast rather than fabricate a synthetic
+                // `(handle = 0, fresh empty custody)` pair: a fresh
+                // empty custody would silently overwrite the
+                // registered pre-rotation state, leaving the
+                // identity un-migratable. Surface the real error
+                // so the caller can recover.
+                NapiError::from(e)
+            })?;
 
-            let dht = make_dht_with_signer(&custody);
-            let (new_identity, new_document) = dht
-                .rotate_active_key(&scp_identity, &document, &*custody)
-                .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        let dht = make_dht_with_signer(&custody);
+        let (new_identity, new_document) = dht
+            .rotate_active_key(&scp_identity, &document, &*custody)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-            let verifying_key_hex =
-                identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
+        let verifying_key_hex =
+            identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
 
-            // Update the identity registry with the rotated key handles.
-            crate::runtime::register_identity(
-                bi,
-                &new_identity.did,
-                crate::runtime::NapiIdentityEntry {
-                    identity: new_identity.clone(),
-                    custody: Arc::clone(&custody),
-                    document: new_document.clone(),
-                    identity_link_attestations: existing_attestations,
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                },
-            );
+        // Update the identity registry with the rotated key handles.
+        crate::runtime::register_identity(
+            bi,
+            &new_identity.did,
+            crate::runtime::NapiIdentityEntry {
+                identity: new_identity.clone(),
+                custody: Arc::clone(&custody),
+                document: new_document.clone(),
+                identity_link_attestations: existing_attestations,
+                pre_rotation_handle,
+                pre_rotation_custody,
+            },
+        );
 
-            let handle = Self {
-                inner: Arc::new(NapiIdentityInner {
-                    did: new_identity.did.clone(),
-                    custody_type: self.inner.custody_type.clone(),
-                    scp_identity: Some(new_identity),
-                    in_memory_custody: self.inner.in_memory_custody.clone(),
-                    document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi),
-                    verifying_key_hex,
-                    instance_id: self.inner.bi.instance_id(),
-                    rotation_event_json: None,
-                }),
-            };
-            increment_handle_count();
-            Ok(handle)
-        }
+        let handle = Self {
+            inner: Arc::new(NapiIdentityInner {
+                did: new_identity.did.clone(),
+                custody_type: self.inner.custody_type.clone(),
+                scp_identity: Some(new_identity),
+                in_memory_custody: self.inner.in_memory_custody.clone(),
+                document: Some(new_document),
+                bi: Arc::clone(&self.inner.bi),
+                verifying_key_hex,
+                instance_id: self.inner.bi.instance_id(),
+                rotation_event_json: None,
+            }),
+        };
+        increment_handle_count();
+        Ok(handle)
     }
 
     /// Adds an agent signing key to this identity (ADR-039).
@@ -521,71 +519,69 @@ impl NapiIdentity {
     #[napi(js_name = "addAgentKey")]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn add_agent_key(&self) -> napi::Result<Self> {
-        {
-            let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
+        let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
 
-            let bi = &self.inner.bi;
+        let bi = &self.inner.bi;
 
-            // Read attestations + pre-rotation state BEFORE async operation.
-            // `add_agent_key` does not touch the pre-rotation key.
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(|e| {
-                    // Fail-fast rather than fabricate a synthetic
-                    // `(handle = 0, fresh empty custody)` pair: a fresh
-                    // empty custody would silently overwrite the
-                    // registered pre-rotation state, leaving the
-                    // identity un-migratable. Surface the real error
-                    // so the caller can recover.
-                    NapiError::from(e)
-                })?;
+        // Read attestations + pre-rotation state BEFORE async operation.
+        // `add_agent_key` does not touch the pre-rotation key.
+        let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
+            crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(|e| {
+                // Fail-fast rather than fabricate a synthetic
+                // `(handle = 0, fresh empty custody)` pair: a fresh
+                // empty custody would silently overwrite the
+                // registered pre-rotation state, leaving the
+                // identity un-migratable. Surface the real error
+                // so the caller can recover.
+                NapiError::from(e)
+            })?;
 
-            let dht = make_dht_with_signer(&custody);
-            let (new_identity, new_document) = dht
-                .add_agent_key(&scp_identity, &document, &*custody)
-                .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        let dht = make_dht_with_signer(&custody);
+        let (new_identity, new_document) = dht
+            .add_agent_key(&scp_identity, &document, &*custody)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-            let verifying_key_hex =
-                identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
+        let verifying_key_hex =
+            identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
 
-            // Update the identity registry with the new key state so that
-            // bridge functions (ucan_delegate, etc.) see the updated identity.
-            crate::runtime::register_identity(
-                bi,
-                &new_identity.did,
-                crate::runtime::NapiIdentityEntry {
-                    identity: new_identity.clone(),
-                    custody: Arc::clone(&custody),
-                    document: new_document.clone(),
-                    identity_link_attestations: existing_attestations,
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                },
-            );
+        // Update the identity registry with the new key state so that
+        // bridge functions (ucan_delegate, etc.) see the updated identity.
+        crate::runtime::register_identity(
+            bi,
+            &new_identity.did,
+            crate::runtime::NapiIdentityEntry {
+                identity: new_identity.clone(),
+                custody: Arc::clone(&custody),
+                document: new_document.clone(),
+                identity_link_attestations: existing_attestations,
+                pre_rotation_handle,
+                pre_rotation_custody,
+            },
+        );
 
-            let handle = Self {
-                inner: Arc::new(NapiIdentityInner {
-                    did: new_identity.did.clone(),
-                    custody_type: self.inner.custody_type.clone(),
-                    scp_identity: Some(new_identity),
-                    in_memory_custody: self.inner.in_memory_custody.clone(),
-                    document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi),
-                    verifying_key_hex,
-                    instance_id: self.inner.bi.instance_id(),
-                    rotation_event_json: None,
-                }),
-            };
-            increment_handle_count();
-            Ok(handle)
-        }
+        let handle = Self {
+            inner: Arc::new(NapiIdentityInner {
+                did: new_identity.did.clone(),
+                custody_type: self.inner.custody_type.clone(),
+                scp_identity: Some(new_identity),
+                in_memory_custody: self.inner.in_memory_custody.clone(),
+                document: Some(new_document),
+                bi: Arc::clone(&self.inner.bi),
+                verifying_key_hex,
+                instance_id: self.inner.bi.instance_id(),
+                rotation_event_json: None,
+            }),
+        };
+        increment_handle_count();
+        Ok(handle)
     }
 
     /// Rotates the agent signing key for this identity (ADR-039).
@@ -610,71 +606,68 @@ impl NapiIdentity {
     #[napi(js_name = "rotateAgentKey")]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn rotate_agent_key(&self) -> napi::Result<Self> {
-        {
-            let (scp_identity, custody, document) =
-                self.extract_in_memory_state("rotateAgentKey")?;
+        let (scp_identity, custody, document) = self.extract_in_memory_state("rotateAgentKey")?;
 
-            let bi = &self.inner.bi;
+        let bi = &self.inner.bi;
 
-            // Read attestations + pre-rotation state BEFORE async operation.
-            // `rotate_agent_key` does not touch the pre-rotation key.
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(|e| {
-                    // Fail-fast rather than fabricate a synthetic
-                    // `(handle = 0, fresh empty custody)` pair: a fresh
-                    // empty custody would silently overwrite the
-                    // registered pre-rotation state, leaving the
-                    // identity un-migratable. Surface the real error
-                    // so the caller can recover.
-                    NapiError::from(e)
-                })?;
+        // Read attestations + pre-rotation state BEFORE async operation.
+        // `rotate_agent_key` does not touch the pre-rotation key.
+        let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
+            crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(|e| {
+                // Fail-fast rather than fabricate a synthetic
+                // `(handle = 0, fresh empty custody)` pair: a fresh
+                // empty custody would silently overwrite the
+                // registered pre-rotation state, leaving the
+                // identity un-migratable. Surface the real error
+                // so the caller can recover.
+                NapiError::from(e)
+            })?;
 
-            let dht = make_dht_with_signer(&custody);
-            let (new_identity, new_document) = dht
-                .rotate_agent_key(&scp_identity, &document, &*custody)
-                .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        let dht = make_dht_with_signer(&custody);
+        let (new_identity, new_document) = dht
+            .rotate_agent_key(&scp_identity, &document, &*custody)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-            let verifying_key_hex =
-                identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
+        let verifying_key_hex =
+            identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
 
-            // Update the identity registry with the rotated key state.
-            crate::runtime::register_identity(
-                bi,
-                &new_identity.did,
-                crate::runtime::NapiIdentityEntry {
-                    identity: new_identity.clone(),
-                    custody: Arc::clone(&custody),
-                    document: new_document.clone(),
-                    identity_link_attestations: existing_attestations,
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                },
-            );
+        // Update the identity registry with the rotated key state.
+        crate::runtime::register_identity(
+            bi,
+            &new_identity.did,
+            crate::runtime::NapiIdentityEntry {
+                identity: new_identity.clone(),
+                custody: Arc::clone(&custody),
+                document: new_document.clone(),
+                identity_link_attestations: existing_attestations,
+                pre_rotation_handle,
+                pre_rotation_custody,
+            },
+        );
 
-            let handle = Self {
-                inner: Arc::new(NapiIdentityInner {
-                    did: new_identity.did.clone(),
-                    custody_type: self.inner.custody_type.clone(),
-                    scp_identity: Some(new_identity),
-                    in_memory_custody: self.inner.in_memory_custody.clone(),
-                    document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi),
-                    verifying_key_hex,
-                    instance_id: self.inner.bi.instance_id(),
-                    rotation_event_json: None,
-                }),
-            };
-            increment_handle_count();
-            Ok(handle)
-        }
+        let handle = Self {
+            inner: Arc::new(NapiIdentityInner {
+                did: new_identity.did.clone(),
+                custody_type: self.inner.custody_type.clone(),
+                scp_identity: Some(new_identity),
+                in_memory_custody: self.inner.in_memory_custody.clone(),
+                document: Some(new_document),
+                bi: Arc::clone(&self.inner.bi),
+                verifying_key_hex,
+                instance_id: self.inner.bi.instance_id(),
+                rotation_event_json: None,
+            }),
+        };
+        increment_handle_count();
+        Ok(handle)
     }
 
     /// Removes the agent signing key from this identity (ADR-039).
@@ -699,71 +692,68 @@ impl NapiIdentity {
     #[napi(js_name = "removeAgentKey")]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn remove_agent_key(&self) -> napi::Result<Self> {
-        {
-            let (scp_identity, custody, document) =
-                self.extract_in_memory_state("removeAgentKey")?;
+        let (scp_identity, custody, document) = self.extract_in_memory_state("removeAgentKey")?;
 
-            let bi = &self.inner.bi;
+        let bi = &self.inner.bi;
 
-            // Read attestations + pre-rotation state BEFORE async operation.
-            // `remove_agent_key` does not touch the pre-rotation key.
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(|e| {
-                    // Fail-fast rather than fabricate a synthetic
-                    // `(handle = 0, fresh empty custody)` pair: a fresh
-                    // empty custody would silently overwrite the
-                    // registered pre-rotation state, leaving the
-                    // identity un-migratable. Surface the real error
-                    // so the caller can recover.
-                    NapiError::from(e)
-                })?;
+        // Read attestations + pre-rotation state BEFORE async operation.
+        // `remove_agent_key` does not touch the pre-rotation key.
+        let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
+            crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(|e| {
+                // Fail-fast rather than fabricate a synthetic
+                // `(handle = 0, fresh empty custody)` pair: a fresh
+                // empty custody would silently overwrite the
+                // registered pre-rotation state, leaving the
+                // identity un-migratable. Surface the real error
+                // so the caller can recover.
+                NapiError::from(e)
+            })?;
 
-            let dht = make_dht_with_signer(&custody);
-            let (new_identity, new_document) = dht
-                .remove_agent_key(&scp_identity, &document)
-                .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        let dht = make_dht_with_signer(&custody);
+        let (new_identity, new_document) = dht
+            .remove_agent_key(&scp_identity, &document)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-            let verifying_key_hex =
-                identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
+        let verifying_key_hex =
+            identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
 
-            // Update the identity registry with the post-removal key state.
-            crate::runtime::register_identity(
-                bi,
-                &new_identity.did,
-                crate::runtime::NapiIdentityEntry {
-                    identity: new_identity.clone(),
-                    custody: Arc::clone(&custody),
-                    document: new_document.clone(),
-                    identity_link_attestations: existing_attestations,
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                },
-            );
+        // Update the identity registry with the post-removal key state.
+        crate::runtime::register_identity(
+            bi,
+            &new_identity.did,
+            crate::runtime::NapiIdentityEntry {
+                identity: new_identity.clone(),
+                custody: Arc::clone(&custody),
+                document: new_document.clone(),
+                identity_link_attestations: existing_attestations,
+                pre_rotation_handle,
+                pre_rotation_custody,
+            },
+        );
 
-            let handle = Self {
-                inner: Arc::new(NapiIdentityInner {
-                    did: new_identity.did.clone(),
-                    custody_type: self.inner.custody_type.clone(),
-                    scp_identity: Some(new_identity),
-                    in_memory_custody: self.inner.in_memory_custody.clone(),
-                    document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi),
-                    verifying_key_hex,
-                    instance_id: self.inner.bi.instance_id(),
-                    rotation_event_json: None,
-                }),
-            };
-            increment_handle_count();
-            Ok(handle)
-        }
+        let handle = Self {
+            inner: Arc::new(NapiIdentityInner {
+                did: new_identity.did.clone(),
+                custody_type: self.inner.custody_type.clone(),
+                scp_identity: Some(new_identity),
+                in_memory_custody: self.inner.in_memory_custody.clone(),
+                document: Some(new_document),
+                bi: Arc::clone(&self.inner.bi),
+                verifying_key_hex,
+                instance_id: self.inner.bi.instance_id(),
+                rotation_event_json: None,
+            }),
+        };
+        increment_handle_count();
+        Ok(handle)
     }
 
     /// Migrates this identity to a new DID (Layer 2 DID rotation, spec §9.12).
@@ -798,96 +788,94 @@ impl NapiIdentity {
     #[napi]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn migrate(&self) -> napi::Result<Self> {
-        {
-            let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
+        let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
 
-            let bi = &self.inner.bi;
+        let bi = &self.inner.bi;
 
-            // Read attestations + pre-rotation state BEFORE async operation
-            // (entry guaranteed to exist now).
-            let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
-                crate::runtime::with_identity(bi, &self.inner.did, |e| {
-                    Ok((
-                        e.identity_link_attestations.clone(),
-                        e.pre_rotation_handle,
-                        Arc::clone(&e.pre_rotation_custody),
-                    ))
-                })
-                .map_err(NapiError::from)?;
+        // Read attestations + pre-rotation state BEFORE async operation
+        // (entry guaranteed to exist now).
+        let (existing_attestations, pre_rotation_handle, pre_rotation_custody) =
+            crate::runtime::with_identity(bi, &self.inner.did, |e| {
+                Ok((
+                    e.identity_link_attestations.clone(),
+                    e.pre_rotation_handle,
+                    Arc::clone(&e.pre_rotation_custody),
+                ))
+            })
+            .map_err(NapiError::from)?;
 
-            // Spec §3.7 / §9.12 (Compromise Recovery Protocol): the
-            // pre-rotation key whose hash equals the published
-            // `pre_rotation_commitment` is the only key that satisfies the
-            // `SHA-256(revealed_key) == commitment` invariant verified by
-            // `verify_migration`. The committed pre-rotation key is held in
-            // cold-storage `pre_rotation_custody`, referenced by
-            // `pre_rotation_handle`.
-            let rotated_at = scp_primitives::SystemClock.now_secs();
+        // Spec §3.7 / §9.12 (Compromise Recovery Protocol): the
+        // pre-rotation key whose hash equals the published
+        // `pre_rotation_commitment` is the only key that satisfies the
+        // `SHA-256(revealed_key) == commitment` invariant verified by
+        // `verify_migration`. The committed pre-rotation key is held in
+        // cold-storage `pre_rotation_custody`, referenced by
+        // `pre_rotation_handle`.
+        let rotated_at = scp_primitives::SystemClock.now_secs();
 
-            let dht = make_dht_with_signer(&custody);
-            let scp_identity::MigrationOutcome {
-                new_identity,
-                new_document,
-                rotation_event,
-                new_pre_rotation_handle,
-            } = dht
-                .migrate_identity(
-                    &scp_identity,
-                    &document,
-                    &pre_rotation_handle,
-                    pre_rotation_custody.as_ref(),
-                    &*custody,
-                    rotated_at,
-                )
-                .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        let dht = make_dht_with_signer(&custody);
+        let scp_identity::MigrationOutcome {
+            new_identity,
+            new_document,
+            rotation_event,
+            new_pre_rotation_handle,
+        } = dht
+            .migrate_identity(
+                &scp_identity,
+                &document,
+                &pre_rotation_handle,
+                pre_rotation_custody.as_ref(),
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-            let rotation_event_json = serde_json::to_string(&rotation_event).map_err(|e| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!("failed to serialize rotation event: {e}"),
-                    code: codes::IDENT_1004.to_owned(),
-                })
-            })?;
+        let rotation_event_json = serde_json::to_string(&rotation_event).map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("failed to serialize rotation event: {e}"),
+                code: codes::IDENT_1004.to_owned(),
+            })
+        })?;
 
-            let new_did = new_identity.did.clone();
+        let new_did = new_identity.did.clone();
 
-            let verifying_key_hex =
-                identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
+        let verifying_key_hex =
+            identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
 
-            // Remove the old identity and register the new one. The same
-            // pre-rotation custody Arc is reused (we don't mint a new
-            // custody per migration); only the handle changes to point at
-            // the freshly committed key.
-            crate::runtime::remove_identity(bi, &self.inner.did);
-            crate::runtime::register_identity(
-                bi,
-                &new_did,
-                crate::runtime::NapiIdentityEntry {
-                    identity: new_identity.clone(),
-                    custody: Arc::clone(&custody),
-                    document: new_document.clone(),
-                    identity_link_attestations: existing_attestations,
-                    pre_rotation_handle: new_pre_rotation_handle,
-                    pre_rotation_custody,
-                },
-            );
+        // Remove the old identity and register the new one. The same
+        // pre-rotation custody Arc is reused (we don't mint a new
+        // custody per migration); only the handle changes to point at
+        // the freshly committed key.
+        crate::runtime::remove_identity(bi, &self.inner.did);
+        crate::runtime::register_identity(
+            bi,
+            &new_did,
+            crate::runtime::NapiIdentityEntry {
+                identity: new_identity.clone(),
+                custody: Arc::clone(&custody),
+                document: new_document.clone(),
+                identity_link_attestations: existing_attestations,
+                pre_rotation_handle: new_pre_rotation_handle,
+                pre_rotation_custody,
+            },
+        );
 
-            let handle = Self {
-                inner: Arc::new(NapiIdentityInner {
-                    did: new_did,
-                    custody_type: self.inner.custody_type.clone(),
-                    scp_identity: Some(new_identity),
-                    in_memory_custody: self.inner.in_memory_custody.clone(),
-                    document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi),
-                    verifying_key_hex,
-                    instance_id: self.inner.bi.instance_id(),
-                    rotation_event_json: Some(rotation_event_json),
-                }),
-            };
-            increment_handle_count();
-            Ok(handle)
-        }
+        let handle = Self {
+            inner: Arc::new(NapiIdentityInner {
+                did: new_did,
+                custody_type: self.inner.custody_type.clone(),
+                scp_identity: Some(new_identity),
+                in_memory_custody: self.inner.in_memory_custody.clone(),
+                document: Some(new_document),
+                bi: Arc::clone(&self.inner.bi),
+                verifying_key_hex,
+                instance_id: self.inner.bi.instance_id(),
+                rotation_event_json: Some(rotation_event_json),
+            }),
+        };
+        increment_handle_count();
+        Ok(handle)
     }
 
     /// Returns the JSON-serialized `DidRotationEvent` if this handle was
