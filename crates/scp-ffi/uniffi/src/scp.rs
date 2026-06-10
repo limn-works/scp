@@ -232,6 +232,16 @@ mod storage_mandatory_tests {
     /// contain a second `fn() -> Arc<Scp>` constructor — a state this test
     /// exists to forbid by asserting the sole such builder is the testing-gated
     /// one.
+    ///
+    /// The signature coercion alone is necessary but NOT sufficient: a sibling
+    /// `#[uniffi::constructor] fn() -> Arc<Scp>` re-added next to `with_storage`
+    /// would still let `new_in_memory_for_test` coerce cleanly, so the
+    /// coercion would not catch it. To make this a REAL structural enforcement,
+    /// we additionally inspect this file's own source (compiled in via
+    /// `include_str!`) and assert that it contains EXACTLY ONE
+    /// `#[uniffi::constructor]` attribute, and that the no-arg testing helper
+    /// `new_in_memory_for_test` is NOT annotated with it. Re-introducing a
+    /// silent zero-arg `#[uniffi::constructor]` therefore FAILS this test.
     #[test]
     fn no_infallible_zero_arg_constructor() {
         // The sole infallible zero-argument builder is the testing-gated,
@@ -241,5 +251,84 @@ mod storage_mandatory_tests {
         let test_only_ctor: fn() -> std::sync::Arc<Scp> = Scp::new_in_memory_for_test;
         let scp = test_only_ctor();
         assert!(scp.instance_id() > 0);
+
+        // Structural guard (ratchet-style source-count, mirroring the
+        // string-count enforcement used elsewhere in the codebase): this file
+        // defines the `Scp` UniFFI surface, so the count of `#[uniffi::constructor]`
+        // ATTRIBUTES here is the count of constructors Swift/Kotlin can reach.
+        // We count only lines whose trimmed text STARTS WITH the attribute —
+        // excluding the prose `#[uniffi::constructor]` references inside `///`
+        // doc-comments and `//` line comments above (which begin with `/`).
+        const SRC: &str = include_str!("scp.rs");
+        let constructor_attrs = SRC
+            .lines()
+            .filter(|line| line.trim_start().starts_with("#[uniffi::constructor]"))
+            .count();
+        assert_eq!(
+            constructor_attrs, 1,
+            "exactly ONE `#[uniffi::constructor]` must exist on `Scp` (the typed, \
+             fallible `with_storage(StorageConfig) -> Result<...>`). Found {constructor_attrs}. \
+             A second constructor re-exposes a storage-selecting path to Swift/Kotlin \
+             (spec §17.6) — storage selection is mandatory and typed."
+        );
+
+        // The sole `#[uniffi::constructor]` must be `with_storage` returning a
+        // `Result`. Find the attribute, then assert the immediately-following
+        // non-blank line declares `with_storage` (after the inert
+        // `#[allow(...)]` attribute) and that its declared return type is a
+        // `Result`. This pins WHICH constructor the single attribute guards.
+        let lines: Vec<&str> = SRC.lines().collect();
+        let attr_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("#[uniffi::constructor]"))
+            .expect("the single `#[uniffi::constructor]` attribute must be present");
+        // Gather the attribute + signature lines until the opening brace.
+        let mut decl = String::new();
+        for line in &lines[attr_idx..] {
+            decl.push_str(line);
+            decl.push('\n');
+            if line.contains('{') {
+                break;
+            }
+        }
+        assert!(
+            decl.contains("pub fn with_storage(config: StorageConfig)"),
+            "the sole `#[uniffi::constructor]` must guard \
+             `with_storage(config: StorageConfig)`; got:\n{decl}"
+        );
+        assert!(
+            decl.contains("-> Result<Arc<Self>, ScpError>"),
+            "the sole `#[uniffi::constructor]` must be FALLIBLE \
+             (`-> Result<Arc<Self>, ScpError>`) so storage init can fail closed \
+             (spec §17.6); got:\n{decl}"
+        );
+
+        // The no-arg testing helper must NOT itself be a `#[uniffi::constructor]`.
+        // It is declared `pub fn new_in_memory_for_test()`; assert the source
+        // line preceding that declaration is not the constructor attribute.
+        let helper_idx = lines
+            .iter()
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("pub fn new_in_memory_for_test(")
+            })
+            .expect("the testing-gated `new_in_memory_for_test` helper must be present");
+        // Scan upward over inert attributes (`#[cfg(...)]`, `#[must_use]`) to the
+        // nearest preceding attribute/doc line; none of them may be the
+        // constructor attribute.
+        let preceding_is_constructor = lines[..helper_idx]
+            .iter()
+            .rev()
+            .take_while(|line| {
+                let t = line.trim_start();
+                t.starts_with("#[") || t.starts_with("///") || t.is_empty()
+            })
+            .any(|line| line.trim_start().starts_with("#[uniffi::constructor]"));
+        assert!(
+            !preceding_is_constructor,
+            "`new_in_memory_for_test` must NOT be annotated `#[uniffi::constructor]` — \
+             it is an explicit Rust-only dev/test selection, never a Swift/Kotlin \
+             constructor (spec §17.6)."
+        );
     }
 }
