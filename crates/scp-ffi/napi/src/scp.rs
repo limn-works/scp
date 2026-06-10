@@ -661,12 +661,20 @@ impl Scp {
     ///
     /// `provider` is a JS object implementing the `KeyCustodyProvider` record
     /// (`generateKeypair`, `sign`, `getPublicKey`, `destroyKey`, `dhAgree`,
-    /// `derivePseudonym`, `exportSigningKeyBytes`, `custodyType`). Private key
-    /// material never crosses into the Rust core (ADR-006): every crypto op is
-    /// marshalled back to the Node.js event loop via threadsafe functions and
-    /// awaited. This is the Node/Bun equivalent of the `UniFFI` bridge's
-    /// `identity_create_with_custody`, used to back a DID with an OS keychain,
-    /// hardware token, or HSM wrapper.
+    /// `derivePseudonym`, `exportSigningKeyBytes`, `custodyType`). Sign,
+    /// Diffie-Hellman, and pseudonym-derivation operations keep the private key
+    /// inside the caller's custody — those keys are never imported into the Rust
+    /// core (ADR-006); each such op is marshalled back to the Node.js event loop
+    /// via threadsafe functions and awaited. The `exportSigningKeyBytes` callback
+    /// is the exception: the `SigningKeyBytes`-based signing paths (UCAN mint,
+    /// SCPID, event-log checkpoint, and the join-time pseudonym announcement)
+    /// currently pull the raw 32-byte Ed25519 seed into Rust ownership, where it
+    /// is held in `Zeroizing` for the duration of the operation and wiped on
+    /// drop. That raw-export surface is tracked for migration to
+    /// `KeyCustody::sign`; context export already signs via `KeyCustody::sign`
+    /// (§23.16.8) and never exports the raw seed. This is the Node/Bun equivalent
+    /// of the `UniFFI` bridge's `identity_create_with_custody`, used to back a DID
+    /// with an OS keychain, hardware token, or HSM wrapper.
     ///
     /// The callbacks run on the JS thread; the pre-rotation seed is generated
     /// locally (it never traverses the consumer callbacks), per ADR-006.
@@ -693,8 +701,13 @@ impl Scp {
         // retains the caller's callback custody so later signing / event-log /
         // SCPID operations reach it, mirroring the PyO3 reference bridge. The
         // cold-storage `InMemoryPreRotationCustody` is a separate substrate for
-        // the pre-rotation key only (ADR-003 §4b) — the caller's operational
-        // private keys never enter Rust ownership (ADR-006).
+        // the pre-rotation key only (ADR-003 §4b). Sign / Diffie-Hellman /
+        // pseudonym-derivation operations keep the caller's private keys in
+        // custody (never imported into Rust) per ADR-006; the
+        // `SigningKeyBytes`-based paths (UCAN mint, SCPID, event-log checkpoint,
+        // join-time pseudonym announcement) are the exception — they export the
+        // raw seed into Rust (held in `Zeroizing`, wiped on drop), a surface
+        // tracked for migration to `KeyCustody::sign`.
         use scp_identity::DidDht;
 
         use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
