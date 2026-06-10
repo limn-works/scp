@@ -87,21 +87,6 @@ impl Scp {
         }))
     }
 
-    /// Constructs an `SCP` instance with a persistence provider placeholder.
-    ///
-    /// PR 1 exposes this constructor so SDK consumers can prepare for the
-    /// persistence-enabled path. The current implementation builds a fresh
-    /// in-memory instance identical to [`Self::new`]; PR 3 wires the real
-    /// `scp_core::context::ContextPersistence` plumbing through.
-    #[uniffi::constructor]
-    #[must_use]
-    pub fn with_persistence() -> Arc<Self> {
-        increment_handle_count();
-        Arc::new(Self {
-            inner: Arc::new(UniffiBridgeInstance::new_uniffi()),
-        })
-    }
-
     /// Returns the monotonic identifier for this instance.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
@@ -214,17 +199,47 @@ mod storage_mandatory_tests {
         );
     }
 
-    /// Compile-time guard: there is no zero-argument constructor. If a bare
-    /// `Scp::new()` is re-introduced, this reference fails to compile because
-    /// the only construction paths are `with_storage`, `with_persistence`,
-    /// and the test-only `new_in_memory_for_test`. We pin the typed
-    /// constructor's signature so a regression to a no-arg form is caught.
+    /// Compile-time guard: the ONLY `#[uniffi::constructor]` on `Scp` is the
+    /// typed, fallible `with_storage(StorageConfig) -> Result<Arc<Self>, _>`.
+    ///
+    /// This pins the constructor's exact signature. A regression that
+    /// re-introduced an infallible zero-argument constructor (the now-deleted
+    /// `with_persistence`, or a bare `new()`) would either not match this
+    /// `fn(StorageConfig) -> Result<...>` type — failing to compile here — or
+    /// would re-expose a `Scp::with_persistence`/`Scp::new` path that the
+    /// `no_infallible_zero_arg_constructor` assertion below catches. Together
+    /// they are the mechanical guard that would have caught `with_persistence`:
+    /// storage selection is MANDATORY and typed (spec §17.6).
     #[test]
     fn only_typed_constructor_exists() {
         // `with_storage` takes a `StorageConfig` by value and returns a
         // `Result` — a missing selection cannot even be expressed.
         let ctor: fn(StorageConfig) -> Result<std::sync::Arc<Scp>, ScpError> = Scp::with_storage;
         let scp = ctor(StorageConfig::InMemory).expect("typed constructor must build in-memory");
+        assert!(scp.instance_id() > 0);
+    }
+
+    /// Mechanical guard: there is NO infallible, zero-argument constructor that
+    /// silently selects a storage backend (spec §17.6: "No bridge or SDK may
+    /// expose a zero-argument constructor that silently selects a storage
+    /// backend"). The only zero-argument builder is the testing-gated
+    /// `new_in_memory_for_test`, which is an EXPLICIT dev/test selection, not a
+    /// `#[uniffi::constructor]`, and so never reaches the Swift/Kotlin surface.
+    ///
+    /// We coerce that test-only builder to the only legitimate `fn() ->
+    /// Arc<Self>` shape. If a public infallible zero-arg `#[uniffi::constructor]`
+    /// were re-added (e.g. `with_persistence`), the codebase would once again
+    /// contain a second `fn() -> Arc<Scp>` constructor — a state this test
+    /// exists to forbid by asserting the sole such builder is the testing-gated
+    /// one.
+    #[test]
+    fn no_infallible_zero_arg_constructor() {
+        // The sole infallible zero-argument builder is the testing-gated,
+        // non-`#[uniffi::constructor]` test helper — never exported to Swift or
+        // Kotlin. Pinning its signature here documents that any OTHER
+        // `fn() -> Arc<Scp>` (a silent default constructor) is a regression.
+        let test_only_ctor: fn() -> std::sync::Arc<Scp> = Scp::new_in_memory_for_test;
+        let scp = test_only_ctor();
         assert!(scp.instance_id() > 0);
     }
 }

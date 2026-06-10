@@ -1734,10 +1734,9 @@ class SCP internal constructor(
                 ),
             )
 
-        // NOTE: The bare UniFFI `Scp.withPersistence()` factory still
-        // exists for internal use; it constructs a fresh instance with
-        // no persistence attached and is not a useful entry point for
-        // SDK callers. Production persistence flows through
-        // [withStorage] / [withSqlite] and the `StorageConfig` enum.
+        // Storage selection is mandatory (spec §17.6): the only
+        // construction paths are [withStorage] / [withSqlite], both backed
+        // by the typed `StorageConfig` enum. There is no zero-argument
+        // factory that silently selects a backend.
     }
 }

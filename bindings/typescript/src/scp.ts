@@ -68,11 +68,10 @@ type NativeAddon = RawNativeAddon & {
 };
 
 /**
- * Raw NAPI `SCP` class type once resolved. `withPersistence` is
- * intentionally omitted from this interface — the native factory
- * still exists for internal use, but the SDK surface does not expose
- * it until a real `ContextPersistence` trait is wired through (see
- * #1260 and #1491).
+ * Raw NAPI `SCP` class type once resolved. The only construction paths
+ * are the `new (configJson)` constructor and the `withStorage` factory —
+ * both take an explicit JSON storage-config string (spec §17.6 — storage
+ * selection is mandatory). There is no zero-argument constructor.
  */
 interface NativeScpCtor {
   // The native constructor now requires a JSON storage-config string
@@ -460,6 +459,21 @@ export class SCP {
    * @throws {ValidationError} If no NAPI addon is available — code `SCP-VALID-7005`.
    */
   constructor(options: ScpOptions) {
+    // Runtime fail-closed guard (spec §17.6): the TS type makes
+    // `options.storage` mandatory, but a JS caller — or TS that defeats the
+    // types via `any` or a type-suppression directive — can still reach here
+    // with `new SCP()` or `new SCP({})`. Guard BEFORE dereferencing
+    // `options.storage`, so a missing selection surfaces the documented
+    // storage-selection error rather than a cryptic "cannot read properties
+    // of undefined" TypeError.
+    if (options == null) {
+      throw new ValidationError(
+        'storage selection is required: pass { storage: { type: "in_memory" } } ' +
+          '(development) or { storage: { type: "sqlite", ... } } (production). ' +
+          "There is no default storage.",
+        "SCP-STORAGE-8000",
+      );
+    }
     // Test-only escape hatch: if a pre-built native handle is smuggled
     // via the (non-exported) `NATIVE_OVERRIDE` symbol, skip addon
     // loading entirely. Only reachable from `__constructScpWithNativeForTests`.
@@ -468,8 +482,18 @@ export class SCP {
       this.#native = override;
     } else {
       // Storage selection is required — there is no in-memory default
-      // (spec §17.6). The native `withStorage` factory fails closed on a
-      // missing/unknown `type`.
+      // (spec §17.6). Guard the missing-selection case here so a JS/`any`
+      // caller gets the documented `SCP-STORAGE-8000` rather than the native
+      // factory's lower-level error; the native `withStorage` factory then
+      // fails closed on an unknown `type`.
+      if (options.storage === undefined) {
+        throw new ValidationError(
+          'storage selection is required: pass { storage: { type: "in_memory" } } ' +
+            '(development) or { storage: { type: "sqlite", ... } } (production). ' +
+            "There is no default storage.",
+          "SCP-STORAGE-8000",
+        );
+      }
       const NativeScp = nativeScp();
       this.#native = NativeScp.withStorage(serializeStorageConfig(options.storage));
     }

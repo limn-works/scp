@@ -99,31 +99,6 @@ impl PyScp {
     pub fn with_storage(py: Python<'_>, config: &Bound<'_, PyDict>) -> PyResult<Self> {
         Self::build_from_config(py, config)
     }
-
-    /// Constructs a new `SCP` instance with an explicit persistence provider.
-    ///
-    /// PR 1 does not expose a Python-side constructor for
-    /// `Box<dyn ContextPersistence>` (this requires wiring a Rust trait
-    /// across the FFI boundary, which lands in PR 3). This therefore
-    /// builds an explicit in-memory instance; callers who need real
-    /// persistence must use `SCP.with_storage({...})` (or `SCP({...})`)
-    /// with the `sqlite` variant.
-    ///
-    /// # Errors
-    ///
-    /// Raises `ValidationError` if the in-memory backend cannot be
-    /// constructed. Returns `PyResult` for API forward-compat.
-    #[staticmethod]
-    pub fn with_persistence(_py: Python<'_>) -> PyResult<Self> {
-        // No Python-accessible ContextPersistence impl yet — build an
-        // explicit in-memory instance (NOT a silent no-storage one;
-        // spec §17.6).
-        let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
-            .map_err(|e| ScpPyError::validation(e.to_string()))?;
-        Ok(Self {
-            inner: Arc::new(bi),
-        })
-    }
 }
 
 // Non-pyo3 impl block for the storage-config parser. Not annotated with
@@ -224,9 +199,17 @@ impl PyScp {
                 }
             }
             other => {
-                return Err(ScpPyError::validation(format!(
-                    "SCP.with_storage: unknown storage type {other:?} — expected \"in_memory\" or \"sqlite\""
-                ))
+                // An unknown `type` value is a storage-SELECTION error, not a
+                // within-variant field validation — surface the same selection
+                // code as a missing `type` (spec §17.6, `SCP-STORAGE-8000`).
+                return Err(ScpPyError::ValidationError {
+                    message: format!(
+                        "SCP storage selection is invalid: unknown 'type' {other:?} — expected \
+                         \"in_memory\" (development) or \"sqlite\" (production). \
+                         There is no default storage."
+                    ),
+                    code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
+                }
                 .into());
             }
         };
@@ -525,9 +508,11 @@ mod tests {
         });
     }
 
-    /// An unknown storage `type` is rejected (fail-closed; spec §17.6).
+    /// An unknown storage `type` is a storage-SELECTION error: rejected
+    /// fail-closed (spec §17.6) and carrying the same `SCP-STORAGE-8000`
+    /// code as a missing `type`, not a generic field-validation code.
     #[test]
-    fn unknown_type_is_rejected() {
+    fn unknown_type_is_rejected_with_storage_8000() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dict = PyDict::new(py);
@@ -537,8 +522,8 @@ mod tests {
                 Err(err) => err.to_string(),
             };
             assert!(
-                msg.contains("unknown storage type"),
-                "error must name the unknown type: {msg}"
+                msg.contains(scp_ffi_common::error_codes::STORAGE_8000),
+                "unknown-selection error must carry SCP-STORAGE-8000: {msg}"
             );
         });
     }

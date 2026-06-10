@@ -62,7 +62,7 @@ const PYO3_SERVER: &str = include_str!("../../../../crates/scp-ffi/src/server.rs
 // UniFFI bridge spans three files: the central `bridge.rs` (most ops),
 // `server.rs` (site-projection methods on the `Server` type), and `scp.rs`
 // which hosts the construction-time lifecycle surface on the `Scp` type
-// (`new` / `with_storage` / `with_persistence` / `suspend` / `resume` /
+// (`with_storage` / `suspend` / `resume` /
 // `shutdown`). All three must be embedded so the conformance test sees the
 // full UniFFI surface — without `scp.rs` the alias resolver flags
 // constructors like `with_storage` as phantom even though they are

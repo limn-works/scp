@@ -254,11 +254,14 @@ impl Scp {
                 }
             }
             other => {
+                // An unknown `type` value is a STORAGE-SELECTION error, not a
+                // within-variant field validation — surface the same selection
+                // code as a missing `type` (spec §17.6, `SCP-STORAGE-8000`).
                 return Err(napi::Error::from(ScpNapiError::Validation {
                     message: format!(
-                        "unsupported storage type: {other:?} — expected \"in_memory\" or \"sqlite\""
+                        "unknown storage selection: type {other:?} is not a valid backend — pass type \"in_memory\" (development) or \"sqlite\" (production). There is no default storage."
                     ),
-                    code: codes::VALID_7005.to_owned(),
+                    code: codes::STORAGE_8000.to_owned(),
                 }));
             }
         };
@@ -272,20 +275,6 @@ impl Scp {
         })?;
         Ok(Self {
             inner: Arc::new(bi),
-        })
-    }
-
-    /// Constructs an `SCP` instance with a persistence provider placeholder.
-    ///
-    /// Without an exposed persistence type on the FFI surface yet, this
-    /// builds an EXPLICIT in-memory instance via
-    /// [`NapiBridgeInstance::new_napi`] (the internal in-memory builder) —
-    /// NOT a silent default. Callers who need durable persistence must use
-    /// [`Self::with_storage`] with the `sqlite` variant.
-    #[napi(factory, js_name = "withPersistence")]
-    pub fn with_persistence() -> napi::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(NapiBridgeInstance::new_napi()),
         })
     }
 
@@ -4465,6 +4454,21 @@ mod storage_mandatory_tests {
         assert!(
             err.reason.contains(codes::STORAGE_8000),
             "missing-selection error must carry SCP-STORAGE-8000: {}",
+            err.reason
+        );
+    }
+
+    /// An UNKNOWN `type` value (e.g. `{"type":"bogus"}`) is a
+    /// storage-SELECTION error, so it carries `SCP-STORAGE-8000` — the same
+    /// code as a missing `type` — not a generic field-validation code.
+    #[test]
+    fn unknown_type_is_rejected_with_storage_8000() {
+        let err = Scp::with_storage(r#"{"type":"bogus"}"#.to_owned())
+            .err()
+            .expect("an unknown storage 'type' must be rejected");
+        assert!(
+            err.reason.contains(codes::STORAGE_8000),
+            "unknown-selection error must carry SCP-STORAGE-8000: {}",
             err.reason
         );
     }

@@ -19,6 +19,7 @@
 import { describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 
+import { ValidationError } from "../src/errors";
 import { __clampShutdownMillisForTests, __serializeStorageConfigForTests, SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
@@ -40,6 +41,42 @@ function __storageIsRequiredAtCompileTime(): void {
   void (() => new SCP({ storage: { type: "in_memory" } }));
 }
 void __storageIsRequiredAtCompileTime;
+
+// ---------------------------------------------------------------------------
+// Runtime fail-closed guard (spec §17.6): the compile-time guard above only
+// protects TS callers. A JS caller — or TS that defeats the types via `any`
+// or a type-suppression directive — can still reach the constructor with
+// `new SCP()` or `new SCP({})`. The SDK constructor must throw the documented
+// `SCP-STORAGE-8000` ValidationError, NOT a cryptic internal TypeError.
+// These tests run WITHOUT the native addon — the guard fires before any
+// addon load — mirroring the Python wrapper's
+// `test_bare_wrapper_construction_is_typeerror`.
+// ---------------------------------------------------------------------------
+describe("SCP constructor — runtime storage-selection guard (spec §17.6)", () => {
+  // The SDK constructor throws a `ValidationError` whose stable `code` is
+  // `SCP-STORAGE-8000` (carried in `.code`, not the human-readable message),
+  // so we assert on the typed error rather than a message regex.
+  function expectStorage8000(construct: () => unknown): void {
+    let thrown: unknown;
+    try {
+      construct();
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(ValidationError);
+    expect((thrown as ValidationError).code).toBe("SCP-STORAGE-8000");
+  }
+
+  test("new SCP({}) (storage omitted) throws SCP-STORAGE-8000", () => {
+    // biome-ignore lint/suspicious/noExplicitAny: defeating the type to exercise the JS-caller path
+    expectStorage8000(() => new SCP({} as any));
+  });
+
+  test("new SCP() (no argument) throws SCP-STORAGE-8000", () => {
+    // biome-ignore lint/suspicious/noExplicitAny: defeating the type to exercise the JS-caller path
+    expectStorage8000(() => new (SCP as any)());
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Load the raw native addon — `SCP` is exposed directly on the addon.
@@ -108,9 +145,11 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
     expect(scp.instanceId).not.toBe("0");
   });
 
-  test("SCP.withStorage rejects an unknown storage type", () => {
+  test("SCP.withStorage rejects an unknown storage type with SCP-STORAGE-8000", () => {
+    // Spec §17.6: an unknown `type` is a storage-SELECTION error, so it
+    // carries the same code as a missing `type`, not a field-validation code.
     expect(() => addon.SCP.withStorage(JSON.stringify({ type: "unknown_type" }))).toThrow(
-      /unsupported storage type|SCP-VALID-7005/,
+      /SCP-STORAGE-8000/,
     );
   });
 
@@ -125,12 +164,6 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
     expect(() => new (addon.SCP as new (c: string) => unknown)(JSON.stringify({}))).toThrow(
       /SCP-STORAGE-8000/,
     );
-  });
-
-  test("SCP.withPersistence returns a fresh instance", () => {
-    const scp = addon.SCP.withPersistence();
-    expect(typeof scp.instanceId).toBe("string");
-    expect(scp.instanceId).not.toBe("0");
   });
 
   test("handles minted by an SCP instance are stamped with its instanceId", async () => {

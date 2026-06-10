@@ -3303,21 +3303,6 @@ open class Scp: ScpProtocol, @unchecked Sendable {
 
     
     /**
-     * Constructs an `SCP` instance with a persistence provider placeholder.
-     *
-     * PR 1 exposes this constructor so SDK consumers can prepare for the
-     * persistence-enabled path. The current implementation builds a fresh
-     * in-memory instance identical to [`Self::new`]; PR 3 wires the real
-     * `scp_core::context::ContextPersistence` plumbing through.
-     */
-public static func withPersistence() -> Scp  {
-    return try!  FfiConverterTypeScp_lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_constructor_scp_with_persistence($0
-    )
-})
-}
-    
-    /**
      * Constructs an `SCP` instance with a storage configuration.
      *
      * `StorageConfig::InMemory` selects the encrypted in-memory dev/test
@@ -15518,9 +15503,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_token_id() != 51675) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_persistence() != 28565) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 20129) {
