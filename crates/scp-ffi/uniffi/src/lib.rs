@@ -853,7 +853,7 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn handle_count_tracks_live_opaque_objects() {
-        // HANDLE_COUNT is a process-global counter. These exact-delta assertions are
+        // HANDLE_COUNT is a process-global counter. These relative-delta assertions are
         // only sound when this test has the process to itself — i.e. under nextest's
         // per-test process isolation (CI's primary runner). Under shared-process
         // `cargo test`, concurrent tests in this binary mutate HANDLE_COUNT and make

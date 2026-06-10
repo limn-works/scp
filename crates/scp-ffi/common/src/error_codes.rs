@@ -86,7 +86,9 @@ pub const IDENT_1016: &str = "SCP-IDENT-1016";
 /// mint, UCAN delegate, event-log checkpoint, broadcast publish) when the
 /// identity was loaded externally with no retained custody, or the
 /// custody/handle is sign-only without the needed key material. Distinct from
-/// `IDENT_1001` (identity not registered).
+/// `IDENT_1001` (identity not registered). (UCAN delegate surfaces this on
+/// `UniFFI` only; the registry-based NAPI/PyO3 delegate paths surface
+/// `IDENT_1001` instead — see sdk-common.md.)
 pub const IDENT_1017: &str = "SCP-IDENT-1017";
 /// Identity agent key creation.
 pub const IDENT_1020: &str = "SCP-IDENT-1020";
