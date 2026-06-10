@@ -5238,7 +5238,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_export_signs_via_custody_and_round_trips() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
         let identity = scp
@@ -5290,7 +5290,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_import_rejects_tampered_custody_signed_export() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
         let identity = scp

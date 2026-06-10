@@ -249,7 +249,7 @@ private fun seedFromHex(hex: String): ByteArray {
 }
 
 private suspend fun opIdentityCreate(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val custody = args["custody"]?.jsonPrimitive?.content ?: "in_memory"
         val seed = args["seed_hex"]?.jsonPrimitive?.content?.let { seedFromHex(it) }
         val identity = scp.identityCreate(custody, seed)
@@ -264,7 +264,7 @@ private suspend fun opIdentityCreate(args: JsonObject): JsonObject =
     }
 
 private suspend fun opContextCreate(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val paramsArg = args["params"]?.jsonObject ?: buildJsonObject { }
         val mode = paramsArg["mode"]?.jsonPrimitive?.content ?: "encrypted"
         val identity = scp.identityCreate("in_memory", null)
@@ -278,7 +278,7 @@ private suspend fun opContextCreate(args: JsonObject): JsonObject =
 
 @Suppress("UnusedParameter")
 private suspend fun opInvalidCapability(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         // UniFFI `scpidSign` takes an opaque `Identity` handle (not a DID
         // string), so feed a real identity a malformed challenge: shape
         // validation rejects with SCP-IDENT-1038 before any DID lookup.
@@ -315,7 +315,7 @@ private suspend fun opInvalidCapability(args: JsonObject): JsonObject =
 
 @Suppress("UnusedParameter")
 private suspend fun opEventLogAppend(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val identity = scp.identityCreate("in_memory", null)
         val handle = scp.contextCreate(identity, buildContextParams())
         val events = scp.eventLogQuery(handle, null)
@@ -345,7 +345,7 @@ private val PARITY_TOOL_CEILING = listOf(
 
 @Suppress("UnusedParameter")
 private suspend fun opToolRegister(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val ceiling = ceilingFromArgs(args, PARITY_TOOL_CEILING)
         val identity = scp.identityCreate("in_memory", null)
         val handle = scp.contextCreate(identity, buildContextParams(ceiling))
@@ -370,7 +370,7 @@ private suspend fun opToolRegister(args: JsonObject): JsonObject =
     }
 
 private suspend fun opUcanMint(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val memberDid = args["member_did"]?.jsonPrimitive?.content
             ?: "did:dht:zparitymemberparitymemberparitymemberparitymember"
         val capabilities = (args["capabilities"] as? kotlinx.serialization.json.JsonArray)
@@ -388,7 +388,7 @@ private suspend fun opUcanMint(args: JsonObject): JsonObject =
     }
 
 private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         // UniFFI wraps parse_ucan errors with SCP-PERM-3002 (diverges from
         // PyO3/NAPI SCP-PERM-3001). The seed_operations.py OpSpec xfails
         // uniffi-kotlin for this op until the codes are aligned upstream.
@@ -432,7 +432,7 @@ private suspend fun opTransportStatus(args: JsonObject): JsonObject =
     // alongside the handle-taking `transportStatus(manager)`, matching the
     // PyO3 / NAPI / WASM probe contract. The parity harness drives the
     // handleless path so no relay fixture is needed on the UniFFI runners.
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val status = scp.transportManagerStatus()
         buildJsonObject {
             put("connected", JsonPrimitive(status.connected))
@@ -454,7 +454,7 @@ private const val FAKE_UNREGISTERED_DID =
 
 @Suppress("UnusedParameter")
 private suspend fun opUnregisteredDidRejected(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use {
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use {
         // UniFFI `scpidSign` takes an opaque `Identity` handle rather
         // than a DID string, so the bridge-local registry lookup path
         // the PyO3/NAPI/WASM bridges exercise is not reachable. Instead,
@@ -494,7 +494,7 @@ private suspend fun opUnregisteredDidRejected(args: JsonObject): JsonObject =
 
 @Suppress("UnusedParameter")
 private suspend fun opEventLogQueryFiltered(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val filter = args["filter"]?.jsonObject ?: buildJsonObject {
             put("event_type", JsonPrimitive("ContextCreated"))
         }
@@ -544,7 +544,7 @@ private fun patchChallengeForOverride(
 }
 
 private suspend fun opSignMessage(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val audience = args["audience"]?.jsonPrimitive?.content
             ?: "https://parity-test.example.com"
         val ttl = args["ttl_seconds"]?.jsonPrimitive?.longOrNull?.toULong() ?: 60uL

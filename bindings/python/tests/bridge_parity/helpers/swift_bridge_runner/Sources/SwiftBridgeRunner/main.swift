@@ -306,7 +306,7 @@ func seedFromHex(_ hex: String) -> Data? {
 }
 
 func opIdentityCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] {
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let custody = req.args["custody"]?.stringValue ?? "in_memory"
     let seed = req.args["seed_hex"]?.stringValue.flatMap { seedFromHex($0) }
     let identity = try await scp.identityCreate(custody: custody, testingSeed: seed)
@@ -321,7 +321,7 @@ func opIdentityCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] 
 }
 
 func opContextCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] {
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let paramsArg = req.args["params"]?.objectValue ?? [:]
     let mode = paramsArg["mode"]?.stringValue ?? "encrypted"
     let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
@@ -338,7 +338,7 @@ func opInvalidCapability(_ req: BridgeRequest) async throws -> [String: JSONValu
     // UniFFI `scpidSign` takes an `Identity` opaque handle; feed it a
     // malformed challenge to hit SCP-IDENT-1038 (shape validation) before
     // any DID lookup. Matches the other runners.
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let badChallenge = "{\"protocol\":\"scpid/1\",\"nonce\":\"00\",\"audience\":\"x\",\"issued_at\":0,\"expires_at\":0}"
     do {
         let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
@@ -371,7 +371,7 @@ func opInvalidCapability(_ req: BridgeRequest) async throws -> [String: JSONValu
 
 func opEventLogAppend(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
     let handle = try await scp.contextCreate(identity: identity, params: buildContextParams())
     let events = try await scp.eventLogQuery(handle: handle, filterJson: nil)
@@ -400,7 +400,7 @@ let parityToolCeiling = [
 ]
 
 func opToolRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let ceiling = ceilingFromArgs(req.args, default: parityToolCeiling)
     let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
     let handle = try await scp.contextCreate(
@@ -425,7 +425,7 @@ func opToolRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
 }
 
 func opUcanMint(_ req: BridgeRequest) async throws -> [String: JSONValue] {
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let memberDid = req.args["member_did"]?.stringValue
         ?? "did:dht:zparitymemberparitymemberparitymemberparitymember"
     let capabilities: [String]
@@ -455,7 +455,7 @@ func opUcanMint(_ req: BridgeRequest) async throws -> [String: JSONValue] {
 func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     // UniFFI wraps parse_ucan with SCP-PERM-3002. Xfail'd in
     // seed_operations.py against uniffi-swift.
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let ceiling = ceilingFromArgs(req.args, default: ["messages:read", "messages:write"])
     let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
     let handle = try await scp.contextCreate(
@@ -494,7 +494,7 @@ func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue]
     // alongside the handle-taking `transportStatus(manager:)`, matching the
     // PyO3 / NAPI / WASM probe contract. The parity harness drives the
     // handleless path so no relay fixture is needed on the UniFFI runners.
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let status = try await scp.transportManagerStatus()
     return [
         "connected": .bool(status.connected),
@@ -542,7 +542,7 @@ func opUnregisteredDidRejected(_ req: BridgeRequest) async throws -> [String: JS
 }
 
 func opEventLogQueryFiltered(_ req: BridgeRequest) async throws -> [String: JSONValue] {
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let filter: [String: JSONValue]
     if let obj = req.args["filter"]?.objectValue {
         filter = obj
@@ -601,7 +601,7 @@ func patchChallengeForOverride(_ challengeJson: String, override: Int64?) -> Str
 }
 
 func opSignMessage(_ req: BridgeRequest) async throws -> [String: JSONValue] {
-    let scp = Scp()
+    let scp = try Scp.withStorage(config: .inMemory)
     let audience = req.args["audience"]?.stringValue
         ?? "https://parity-test.example.com"
     let ttl = UInt64(req.args["ttl_seconds"]?.intValue ?? 60)

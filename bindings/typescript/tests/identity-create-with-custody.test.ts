@@ -211,7 +211,7 @@ if (!scpAvailable) {
     // `sign` callback — NOT to raw key export — so a callback identity reaches
     // parity with an in-memory one for signed export/import.
     test("callback-custody identity exports a signed snapshot that imports", async () => {
-      const scp = new SCP();
+      const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
         const ctx = await scp.contextCreate(
@@ -245,7 +245,7 @@ if (!scpAvailable) {
     // raw-key-extraction path this export would have failed with an
     // exportSigningKeyBytes error.
     test("sign-only (no raw-key-export) custody can still produce a signed export", async () => {
-      const scp = new SCP();
+      const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const identity = await scp.identityCreateWithCustody(new SignOnlyKeychain());
         const ctx = await scp.contextCreate(

@@ -1240,7 +1240,7 @@ async fn transport_connect_returns_error_on_unreachable_relay() {
 /// is reached and succeeds. Mirrors the `PyO3` reference round-trip test.
 #[tokio::test]
 async fn context_export_self_import_round_trip_succeeds() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     // In-memory identity — deliberately NOT published to any DID resolver, so
     // verification can ONLY succeed via the local-custody-first leg.
     let alice = scp
@@ -1292,7 +1292,7 @@ async fn context_export_self_import_round_trip_succeeds() {
 /// failure, not an unresolvable-key failure.
 #[tokio::test]
 async fn context_import_rejects_tampered_signature_with_2093() {
-    let scp = Scp::new();
+    let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
         .await

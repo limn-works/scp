@@ -6322,7 +6322,7 @@ mod tests {
         crate::init_runtime().ok();
 
         Python::with_gil(|py| {
-            let scp = crate::scp::PyScp::new();
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
             let bi = Arc::clone(&scp.inner);
 
             // Real identity with in-memory custody so `resolve_signing_key`
@@ -6569,7 +6569,7 @@ class SignOnlyCustody:
         crate::init_runtime().ok();
 
         Python::with_gil(|py| {
-            let scp = crate::scp::PyScp::new();
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
             let bi = Arc::clone(&scp.inner);
 
             // Create a real identity (registers DID document + registry entry +
