@@ -2033,11 +2033,11 @@ pub(crate) async fn broadcast_publish_on(
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish requires a signing key — identity has no active \
-                      signing key handle"
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish requires retained signing custody — identity has no \
+                      active signing key"
                 .to_owned(),
-            code: codes::PERM_3021.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
 
@@ -2182,11 +2182,11 @@ pub(crate) async fn broadcast_publish_asset_on(
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish asset requires a signing key — identity has no active \
-                      signing key handle"
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish asset requires retained signing custody — identity has \
+                      no active signing key"
                 .to_owned(),
-            code: codes::PERM_3021.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
 
@@ -2287,9 +2287,11 @@ pub(crate) async fn broadcast_publish_assets_on(
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish assets requires a signing key".to_owned(),
-            code: codes::PERM_3021.to_owned(),
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish assets requires retained signing custody — identity has \
+                      no active signing key"
+                .to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
 

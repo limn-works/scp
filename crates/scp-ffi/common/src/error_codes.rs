@@ -86,8 +86,7 @@ pub const IDENT_1016: &str = "SCP-IDENT-1016";
 /// mint, UCAN delegate, event-log checkpoint, broadcast publish) when the
 /// identity was loaded externally with no retained custody, or the
 /// custody/handle is sign-only without the needed key material. Distinct from
-/// `IDENT_1001` (identity not registered) and from `CTX_2040` (context-export
-/// operation errors).
+/// `IDENT_1001` (identity not registered).
 pub const IDENT_1017: &str = "SCP-IDENT-1017";
 /// Identity agent key creation.
 pub const IDENT_1020: &str = "SCP-IDENT-1020";

@@ -407,7 +407,7 @@ pub(crate) async fn ucan_delegate_on(
                 "delegator DID '{}' does not match parent token audience '{}'",
                 delegator_did, parsed_parent.payload.aud
             ),
-            code: codes::PERM_3021.to_owned(),
+            code: codes::PERM_3001.to_owned(),
         }));
     }
 
@@ -425,9 +425,9 @@ pub(crate) async fn ucan_delegate_on(
             let parsed: CapabilityUri =
                 cap_uri_str
                     .parse()
-                    .map_err(|e: CoreUcanError| ScpNapiError::Validation {
+                    .map_err(|e: CoreUcanError| ScpNapiError::Permission {
                         message: format!("invalid capability URI '{cap_uri_str}': {e}"),
-                        code: codes::VALID_7014.to_owned(),
+                        code: codes::PERM_3001.to_owned(),
                     })?;
             Ok(Attenuation {
                 with: cap_uri_str,

@@ -59,6 +59,14 @@ ScpError (root)
 | `SCP-ATTEST-9017` | Failed to re-serialize attestation to UTF-8 JSON |
 | `SCP-ATTEST-9018` | Cryptographic-class verification method not verifiable via browser fetch |
 
+### Registered SCP-IDENT- codes
+
+| Code | Description |
+|------|-------------|
+| `SCP-IDENT-1017` | Operation requires retained signing custody (identity loaded externally with no retained custody, or handle is sign-only). Surfaced by handle-borne bridges (NAPI/UniFFI → Swift/Kotlin/TS) for UCAN mint/delegate, event-log checkpoint, and broadcast publish. |
+
+**Cross-bridge note.** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise). Consumers that catch the `IdentityError` category are safe on every bridge; only code that switches on the exact code string must account for the `SCP-IDENT-1017` / `SCP-IDENT-1001` split.
+
 ## Stub and Placeholder Policy
 
 Code that does not fully implement its documented contract (acceptance criterion, ADR spec, or trait method) is a **stub**. Stubs are tolerated during phased implementation but must be traceable to the planning system.
