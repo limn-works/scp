@@ -974,8 +974,8 @@ impl NapiIdentity {
             .ok_or_else(|| {
                 NapiError::from(ScpNapiError::Identity {
                     message: format!(
-                        "{operation} requires in-memory custody — this identity uses \
-                         external custody"
+                        "{operation} requires retained key custody — this identity was \
+                         loaded without retained custody"
                     ),
                     code: codes::IDENT_1007.to_owned(),
                 })

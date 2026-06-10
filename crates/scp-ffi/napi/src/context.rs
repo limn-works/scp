@@ -3605,51 +3605,49 @@ pub(crate) async fn context_export_on(
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
     let sup = crate::runtime::supervisor(bi)?;
 
-    {
-        // Resolve the exporter identity's custody provider and `#active` signing
-        // key handle (NOT a raw exported key). Signing the §23.16.8 snapshot
-        // digest is delegated to `KeyCustody::sign`, which dispatches to whichever
-        // backend backs this identity — in-memory OR a JS callback custody
-        // (`identityCreateWithCustody`). This lets keychain/HSM-shaped callback
-        // providers — which implement `sign` but intentionally do NOT implement
-        // `exportSigningKeyBytes` — produce a signed export. Private key material
-        // never crosses the FFI boundary (ADR-006).
-        let (custody, key_handle) = resolve_napi_export_signer(handle)?;
+    // Resolve the exporter identity's custody provider and `#active` signing
+    // key handle (NOT a raw exported key). Signing the §23.16.8 snapshot
+    // digest is delegated to `KeyCustody::sign`, which dispatches to whichever
+    // backend backs this identity — in-memory OR a JS callback custody
+    // (`identityCreateWithCustody`). This lets keychain/HSM-shaped callback
+    // providers — which implement `sign` but intentionally do NOT implement
+    // `exportSigningKeyBytes` — produce a signed export. Private key material
+    // never crosses the FFI boundary (ADR-006).
+    let (custody, key_handle) = resolve_napi_export_signer(handle)?;
 
-        // `export_context`'s `sign` closure is synchronous, but custody `sign` is
-        // async (a callback custody awaits a JS `ThreadsafeFunction`). Bridge the
-        // two with `block_in_place` + `block_on` on the current multi-thread
-        // runtime — the same pattern used by `identity_create_link_attestation`
-        // (see `scp.rs`). `context_export_on` already runs on a tokio worker, so a
-        // runtime handle is always present here.
-        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("context export requires a tokio runtime: {e}"),
-                code: codes::CTX_2030.to_owned(),
-            })
-        })?;
-
-        let export = sup
-            .export_context(&handle.context_id, exporter_did, |hash: &[u8; 32]| {
-                let signature =
-                    tokio::task::block_in_place(|| rt.block_on(custody.sign(&key_handle, hash)))?;
-                let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
-                    scp_platform::PlatformError::CustodyError(format!(
-                        "custody sign returned {} bytes, expected 64 (Ed25519)",
-                        signature.as_bytes().len()
-                    ))
-                })?;
-                Ok::<[u8; 64], scp_platform::PlatformError>(bytes)
-            })
-            .await
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-        scp_core::context::export_import::serialize_export(&export).map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("export serialization failed: {e}"),
-                code: codes::CTX_2030.to_owned(),
-            })
+    // `export_context`'s `sign` closure is synchronous, but custody `sign` is
+    // async (a callback custody awaits a JS `ThreadsafeFunction`). Bridge the
+    // two with `block_in_place` + `block_on` on the current multi-thread
+    // runtime — the same pattern used by `identity_create_link_attestation`
+    // (see `scp.rs`). `context_export_on` already runs on a tokio worker, so a
+    // runtime handle is always present here.
+    let rt = tokio::runtime::Handle::try_current().map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("context export requires a tokio runtime: {e}"),
+            code: codes::CTX_2030.to_owned(),
         })
-    }
+    })?;
+
+    let export = sup
+        .export_context(&handle.context_id, exporter_did, |hash: &[u8; 32]| {
+            let signature =
+                tokio::task::block_in_place(|| rt.block_on(custody.sign(&key_handle, hash)))?;
+            let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
+                scp_platform::PlatformError::CustodyError(format!(
+                    "custody sign returned {} bytes, expected 64 (Ed25519)",
+                    signature.as_bytes().len()
+                ))
+            })?;
+            Ok::<[u8; 64], scp_platform::PlatformError>(bytes)
+        })
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    scp_core::context::export_import::serialize_export(&export).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("export serialization failed: {e}"),
+            code: codes::CTX_2030.to_owned(),
+        })
+    })
 }
 
 /// Per-bridge-instance implementation of [`context_import`].
