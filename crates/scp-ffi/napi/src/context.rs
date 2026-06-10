@@ -4197,6 +4197,12 @@ mod tests {
     use scp_core::context::governance::GovernanceAction;
     use scp_core::context::membership::KeyPackage;
     use scp_core::context::params::Capability;
+    // The feature-gated economy tests reference `codes::` directly (no
+    // `use super::*`); the ungated export tests reach `codes` through their
+    // in-fn `use super::*` glob (re-exporting the file-level alias). Gate the
+    // alias to its sole direct consumers so the ungated build does not see an
+    // unused import.
+    #[cfg(feature = "allow_in_memory_custody")]
     use scp_ffi_common::error_codes as codes;
     use scp_identity::DID;
     use std::sync::Arc;
@@ -5239,12 +5245,15 @@ mod tests {
         use scp_core::context::export_import::{deserialize_export, serialize_export};
 
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        crate::runtime::init_supervisor_for_test_on(&bi);
+        // Use a production-valid `did:dht:z*` MLS identity so context creation
+        // succeeds WITHOUT `scp-runtime/testing` — this test must genuinely
+        // exercise the no-in-memory-custody build, not the testing gate.
+        crate::runtime::init_production_supervisor_for_test_on(&bi);
         let sup = crate::runtime::supervisor(&bi).expect("supervisor initialized above");
         let sup = Arc::clone(sup);
 
         let custody = FakeExportCustody::new();
-        let creator = DID("did:key:z6MkCallbackExporter".to_owned());
+        let creator = DID("did:dht:z6MkCallbackExporter".to_owned());
         let ctx_id = format!("callback-export-{}", uuid::Uuid::new_v4());
 
         // `context:close` is required so the creator can close the context
@@ -5277,7 +5286,7 @@ mod tests {
         // identity). Success proves the callback-produced signature is
         // spec-valid (§23.16.8).
         let bi2 = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        crate::runtime::init_supervisor_for_test_on(&bi2);
+        crate::runtime::init_production_supervisor_for_test_on(&bi2);
         let sup2 = crate::runtime::supervisor(&bi2).expect("supervisor initialized above");
         let sup2 = Arc::clone(sup2);
 
@@ -5323,9 +5332,12 @@ mod tests {
     async fn context_export_fails_closed_without_retained_custody() {
         use super::*;
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        crate::runtime::init_supervisor_for_test_on(&bi);
+        // Production-valid `did:dht:z*` MLS identity so context creation
+        // succeeds WITHOUT `scp-runtime/testing` — this test must run in the
+        // no-in-memory-custody build it documents.
+        crate::runtime::init_production_supervisor_for_test_on(&bi);
 
-        let creator = DID("did:key:z6MkNoCustodyExporter".to_owned());
+        let creator = DID("did:dht:z6MkNoCustodyExporter".to_owned());
         let ctx_id = format!("no-custody-export-{}", uuid::Uuid::new_v4());
         let params = ContextParams {
             ceiling: vec![Capability::new("context:close")],

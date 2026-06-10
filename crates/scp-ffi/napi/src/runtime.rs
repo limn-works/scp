@@ -1216,6 +1216,41 @@ pub(crate) fn init_supervisor_for_test_on(bi: &NapiBridgeInstance) {
     bi.core.set_supervisor(supervisor_arc);
 }
 
+/// Like [`init_supervisor_for_test_on`] but wires the MLS provider with a
+/// production-valid `did:dht:z*` `local_did` instead of the `did:test:` value.
+///
+/// `MlsCryptoProvider::validate_creator_identity` only accepts `did:test:` /
+/// `did:key:` under `scp-runtime`'s `testing` feature; a `did:dht:z*` identity
+/// is accepted in plain production builds. Tests that exercise behavior which
+/// MUST hold WITHOUT the in-memory-custody / `testing` features (e.g. the
+/// custody-signed context-export path) use this so they genuinely run in the
+/// no-`testing` configuration rather than silently relying on the test gate.
+#[cfg(test)]
+pub(crate) fn init_production_supervisor_for_test_on(bi: &NapiBridgeInstance) {
+    if bi.core.has_supervisor() {
+        return;
+    }
+    let event_log = event_log_provider_from_existing_repo(bi);
+    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
+        tracing::error!(
+            "init_production_supervisor_for_test_on: storage-before-supervisor precondition \
+             failed — no mls_storage backend on the bridge instance"
+        );
+        return;
+    };
+    let supervisor_arc = build_supervisor_arc(
+        Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkNapiBridgeProductionTest".to_owned(),
+        )),
+        Box::new(scp_core::context::LocalTransportProvider),
+        event_log,
+        Box::new(NapiBridgePersistence::new()),
+        mls_storage,
+    );
+
+    bi.core.set_supervisor(supervisor_arc);
+}
+
 // ---------------------------------------------------------------------------
 // BridgeInMemoryStorage — previously defined locally with identical code.
 // Consolidated in `scp-ffi-common::bridge_runtime` (#1447). Imported via
