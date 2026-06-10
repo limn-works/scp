@@ -847,11 +847,8 @@ mod tests {
     /// Conformance (shutdown ordering): `HANDLE_COUNT` must reflect live
     /// handles accurately so `scp_shutdown` can block until safe to teardown.
     ///
-    /// `HANDLE_COUNT` is a process-global atomic. The exact-delta assertions
-    /// below are only sound when this test has the process to itself — i.e.
-    /// under nextest's per-test process isolation (CI's primary runner). Under
-    /// shared-process `cargo test`, concurrent tests in this binary mutate
-    /// `HANDLE_COUNT` and make the deltas racy, so the test skips there.
+    /// Skipped outside nextest — see the in-body note on `HANDLE_COUNT` process
+    /// isolation.
     /// Requires the `allow_in_memory_custody` feature (needs in-memory identity).
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]

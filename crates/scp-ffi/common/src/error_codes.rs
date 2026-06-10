@@ -417,6 +417,10 @@ pub const PERM_3002: &str = "SCP-PERM-3002";
 /// Capability delegation error.
 pub const PERM_3003: &str = "SCP-PERM-3003";
 /// Capability ceiling exceeded.
+///
+/// Currently has no active producer (the bridge sites that emitted it for the
+/// missing-signing-custody condition now use `IDENT_1017`). Retained for the
+/// capability-ceiling-exceeded condition should producers be reintroduced.
 pub const PERM_3004: &str = "SCP-PERM-3004";
 /// Role assignment error.
 pub const PERM_3005: &str = "SCP-PERM-3005";
@@ -433,6 +437,10 @@ pub const PERM_3011: &str = "SCP-PERM-3011";
 /// Provenance permission: capability check failed.
 pub const PERM_3012: &str = "SCP-PERM-3012";
 /// UCAN permission: issuer not authorized.
+///
+/// Currently has no active producer (the bridge sites that emitted it for the
+/// missing-signing-custody condition now use `IDENT_1017`). Retained for the
+/// issuer-not-authorized condition should producers be reintroduced.
 pub const PERM_3020: &str = "SCP-PERM-3020";
 /// UCAN permission: audience mismatch.
 ///
@@ -442,6 +450,13 @@ pub const PERM_3020: &str = "SCP-PERM-3020";
 /// audience-mismatch condition should producers be reintroduced.
 pub const PERM_3021: &str = "SCP-PERM-3021";
 /// UCAN permission: delegation chain invalid.
+///
+/// Currently has no active producer (the bridge sites that emitted it for the
+/// missing-signing-custody condition now use `IDENT_1017`). UCAN
+/// delegation-chain failures (`UcanError::DelegationChainBroken`) are currently
+/// classified as `PERM_3001` by `ucan_errors::ucan_error_code`. The semantic
+/// name is retained for the delegation-chain-invalid condition should producers
+/// be reintroduced.
 pub const PERM_3022: &str = "SCP-PERM-3022";
 /// Reserved; no active producer.
 ///

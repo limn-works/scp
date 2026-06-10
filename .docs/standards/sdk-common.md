@@ -59,13 +59,19 @@ ScpError (root)
 | `SCP-ATTEST-9017` | Failed to re-serialize attestation to UTF-8 JSON |
 | `SCP-ATTEST-9018` | Cryptographic-class verification method not verifiable via browser fetch |
 
-### Registered SCP-IDENT- codes
+### SCP-IDENT-1017 and its cross-bridge contract
+
+This section documents `SCP-IDENT-1017` (missing signing custody) and the
+per-bridge contract for how that one condition surfaces across the bridges. It
+is **not** the full registry of `SCP-IDENT-` codes — other `SCP-IDENT-` codes
+exist (for example, the pseudonym-derivation family `SCP-IDENT-1054`..`1057`)
+and are documented with their own features.
 
 | Code | Description |
 |------|-------------|
 | `SCP-IDENT-1017` | Operation requires retained signing custody (identity loaded externally with no retained custody, or handle is sign-only). Surfaced by handle-borne bridges for UCAN **mint** (NAPI + UniFFI), event-log **checkpoint** (NAPI + UniFFI), and **broadcast publish** (NAPI + UniFFI). UCAN **delegate** surfaces `SCP-IDENT-1017` on **UniFFI only**: NAPI resolves the delegator key from the identity registry and surfaces `SCP-IDENT-1001` on a registry miss (same structural reason as PyO3), so NAPI delegate does **not** surface `SCP-IDENT-1017`. |
 
-**Cross-bridge note.** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise). NAPI's UCAN **delegate** path resolves the delegator key from the same kind of identity registry and therefore also surfaces `SCP-IDENT-1001` (not `SCP-IDENT-1017`) on a registry miss — so the per-bridge split exists even *within* NAPI (mint → `SCP-IDENT-1017` vs. delegate → `SCP-IDENT-1001`). WASM surfaces the capability-absent condition for these signing paths as `SCP-PERM-3000` — it cannot sign in-Rust (ADR-034) and delegates signing to JS-side key custody, so this is a distinct condition from missing custody, not an `IDENT` code. Consumers that catch the `IdentityError` category are safe on every bridge for the missing-custody condition; only code that switches on the exact code string must account for these per-bridge splits.
+**Cross-bridge note.** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise). NAPI's UCAN **delegate** path resolves the delegator key from the same kind of identity registry and therefore also surfaces `SCP-IDENT-1001` (not `SCP-IDENT-1017`) on a registry miss — so the per-bridge split exists even *within* NAPI (mint → `SCP-IDENT-1017` vs. delegate → `SCP-IDENT-1001`). WASM surfaces the capability-absent condition for these signing paths as `SCP-PERM-3000` — it cannot sign in-Rust (ADR-034) and delegates signing to JS-side key custody, so this is a distinct condition from missing custody, not an `IDENT` code. On the **native bridges** (PyO3, NAPI, and UniFFI → Swift / Kotlin / TS-via-NAPI), consumers that catch the `IdentityError` category are safe for the missing-custody condition; only code that switches on the exact code string must account for the per-bridge code splits described above. **WASM is the exception:** it surfaces these capability-absent signing paths as `SCP-PERM-3000` — a `UcanPermissionError` (capability-absent per ADR-034), **not** an `IdentityError`. A WASM consumer must therefore handle the `UcanPermissionError` / `SCP-PERM-3000` case separately; catching `IdentityError` alone does **not** cover it.
 
 ## Stub and Placeholder Policy
 
