@@ -521,13 +521,24 @@ pub struct ContextSnapshot {
     /// Merkle-tree commitment over a fixed entry set. The chain verifier is
     /// pruning-tolerant: it does not validate the first entry's `prev_hash`
     /// (see `verify_merkle_chain`). The signature therefore guarantees that no
-    /// entry can be added, modified, or reordered and that the head is
-    /// authentic — but it does NOT attest full-history completeness. A holder
+    /// entry can be added, modified, reordered, or forged and that the head is
+    /// authentic — but it does NOT attest full-history *completeness*. A holder
     /// of a valid signed export can present a contiguous *suffix* of the log
-    /// (dropping early entries) and it still verifies against this signed head;
-    /// front-truncation to a valid suffix is indistinguishable from legitimate
-    /// pruning by design (binding a count or genesis would break legitimate
-    /// pruning).
+    /// (dropping the oldest entries) and it still verifies against this signed
+    /// head.
+    ///
+    /// This is NOT purely an audit-history concern. The imported pre-import
+    /// event-log entries are currently consumed by post-import enforcement: on
+    /// the first live action `event_log_entries_for_consequences` reads them as
+    /// "Source 1" to drive consequence evaluation and participation/standing.
+    /// A front-truncated (oldest-dropped) but validly-signed-head log can
+    /// therefore lower consequence counts and suppress an auto-suspend/demote/
+    /// ban — but only for consequence rules whose `window` exceeds the age of
+    /// the dropped entries. Under the default 1-5 minute matrix windows the
+    /// droppable old entries are already out-of-window, so this is inert by
+    /// default. Making import a true cold-start for enforcement (imported
+    /// history audit-only) is tracked as a planned hardening; until then do not
+    /// treat front-truncation as having no authoritative-state effect.
     ///
     /// All zeros when no event log is included (e.g. `ExportScope::Public`,
     /// broadcast-only contexts, or the live snapshot before export). Populated

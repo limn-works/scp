@@ -620,11 +620,21 @@ pub fn validate_export_for_import(
     //    Security scope: the signed root is the event-log hash-CHAIN HEAD, not
     //    a Merkle-tree commitment over all entries. `verify_merkle_chain` is
     //    pruning-tolerant (it does not validate entry[0].prev_hash), so a
-    //    contiguous SUFFIX of the log verifies against the signed head. The
-    //    signature thus attests that no entry was added/modified/reordered and
-    //    that the head is authentic, but NOT full-history completeness:
-    //    front-truncation to a valid suffix is indistinguishable from
-    //    legitimate pruning by design.
+    //    contiguous SUFFIX of the log (oldest entries dropped) verifies against
+    //    the signed head. The signature thus attests that no entry was
+    //    added/modified/reordered/forged and that the head is authentic, but
+    //    NOT full-history completeness.
+    //
+    //    This is not audit-only: the imported pre-import entries are consumed by
+    //    post-import enforcement — `event_log_entries_for_consequences` reads
+    //    them as "Source 1" to drive consequence/participation/standing on the
+    //    first live action. A front-truncated but valid-head log can thus lower
+    //    consequence counts and suppress an auto-suspend/demote/ban for rules
+    //    whose `window` exceeds the dropped entries' age (inert under the
+    //    default 1-5 minute matrix windows, where the droppable entries are
+    //    already out-of-window). A true cold-start for enforcement (imported
+    //    history audit-only) is a planned hardening; until then front-truncation
+    //    is not authoritative-state-neutral.
     if !bool::from(computed_root.ct_eq(&export.snapshot.event_log_merkle_root)) {
         return Err(ContextError::EventLogFailed(
             "signed snapshot root mismatch: recomputed event-log root does not \
