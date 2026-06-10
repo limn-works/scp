@@ -5966,6 +5966,46 @@ mod tests {
         verify_self_certification(&identity.did, &resolved.document).unwrap();
     }
 
+    /// DID↔key binding (self-certifying invariant). `verify_self_certification`
+    /// MUST reject a `(DID, document)` pair whose `#0` identity key does not
+    /// equal the key the DID suffix cryptographically commits to. This is the
+    /// invariant the signed-context-export verifier (§23.16.8) relies on: the
+    /// verifying key is resolved from the snapshot `creator_did`, so a `did:dht`
+    /// identity registered under DID `D` is guaranteed to hold the key `D`
+    /// commits to — a mismatched `(DID, key)` document cannot be accepted.
+    #[test]
+    fn verify_self_certification_rejects_mismatched_did_key_binding() {
+        // Two real (curve-valid) Ed25519 public keys. Real keys are required so
+        // the rejection is exercised at the DID↔key binding check, not at the
+        // earlier non-curve-point gate in `decode_multibase_key`.
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert_ne!(key_a, key_b);
+
+        // A valid did:dht that cryptographically commits to key A.
+        let did_a = format!("did:dht:z{}", zbase32::encode(&key_a));
+
+        // A document whose #0 identity key is the DIFFERENT key B.
+        let mismatched_doc = DidDocument::new(&did_a, &key_b, &key_b, &[0x44u8; 32]);
+
+        // The binding check must reject: the DID commits to A, the doc holds B.
+        let result = verify_self_certification(&did_a, &mismatched_doc);
+        assert!(
+            matches!(result, Err(IdentityError::SelfCertificationFailed(_))),
+            "verify_self_certification must reject a document whose #0 key does not \
+             match the DID suffix; got {result:?}"
+        );
+
+        // Sanity: the SAME key in both the DID suffix and the document passes,
+        // proving the rejection above is due to the mismatch, not a malformed doc.
+        let matched_doc = DidDocument::new(&did_a, &key_a, &key_a, &[0x44u8; 32]);
+        verify_self_certification(&did_a, &matched_doc).unwrap();
+    }
+
     #[tokio::test]
     async fn migrate_identity_drops_agent_key() {
         let custody = Arc::new(InMemoryKeyCustody::new());

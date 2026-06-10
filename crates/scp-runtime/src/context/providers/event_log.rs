@@ -117,19 +117,6 @@ impl ContextLog {
     }
 }
 
-/// Computes the SHA-256 hash for an event log entry.
-///
-/// Hash input: `"SCP-EXPORT-ENTRY:" || len(event) || event || len(actor_did)
-///   || actor_did || timestamp || prev_hash [|| len(payload_json) || payload_json]`
-///
-/// Uses big-endian u32 length prefixes before variable-length fields to
-/// prevent length-extension ambiguity (e.g., event="AB" + actor="CD" vs
-/// event="ABC" + actor="D" producing the same hash).
-///
-/// When `payload` is `Some`, the canonical JSON representation is appended
-/// with a length prefix. When `None`, no additional bytes are hashed,
-/// preserving backward compatibility with entries created before payloads
-/// were introduced.
 /// Public alias for [`compute_entry_hash`] for test/mock use.
 #[must_use]
 pub fn entry_hash(
@@ -142,7 +129,25 @@ pub fn entry_hash(
     compute_entry_hash(event, actor_did, timestamp, prev_hash, payload)
 }
 
-fn compute_entry_hash(
+/// Computes the SHA-256 hash for an event log entry.
+///
+/// Hash input: `"SCP-EXPORT-ENTRY:" || len(event) || event || len(actor_did)
+///   || actor_did || timestamp || prev_hash [|| len(payload_json) || payload_json]`
+///
+/// Uses big-endian u32 length prefixes before variable-length fields to
+/// prevent length-extension ambiguity (e.g., event="AB" + actor="CD" vs
+/// event="ABC" + actor="D" producing the same hash).
+///
+/// When `payload` is `Some`, it is appended with a length prefix using
+/// deterministic `serde_json` serialization (object keys are serialized in
+/// `BTreeMap`-sorted order because the `preserve_order` feature is disabled).
+/// When `None`, no additional bytes are hashed, preserving backward
+/// compatibility with entries created before payloads were introduced.
+///
+/// This is the single canonical implementation shared with the export/import
+/// verifier (`context::export_import`), which calls it directly so the two
+/// paths can never silently diverge.
+pub(crate) fn compute_entry_hash(
     event: &str,
     actor_did: &str,
     timestamp: u64,
@@ -1002,6 +1007,54 @@ mod tests {
         // Different actor_did produces different hash.
         let hash4 = compute_entry_hash("test", "did:key:z456", 1000, &[0u8; 32], None);
         assert_ne!(hash1, hash4);
+    }
+
+    /// Guards the determinism invariant that `compute_entry_hash` relies on:
+    /// payload JSON is serialized with object keys in `BTreeMap`-sorted order
+    /// because `serde_json`'s `preserve_order` feature is disabled workspace-wide.
+    ///
+    /// The two payloads below are parsed from JSON object strings whose keys are
+    /// written in DIFFERENT source orders. With `preserve_order` OFF,
+    /// `serde_json::Value::Object` is backed by a `BTreeMap`, so both strings
+    /// deserialize to the same sorted key order and `serde_json::to_vec` emits
+    /// identical bytes — the entry hashes match.
+    ///
+    /// If `preserve_order` were ever enabled, `Value::Object` would be backed by
+    /// an insertion-ordered `IndexMap`: the two strings would deserialize to
+    /// different orderings, serialize to different bytes, and produce DIFFERENT
+    /// hashes. This `assert_eq!` would then fail loudly, flagging that enabling
+    /// the feature breaks the signed Merkle root / cross-bridge signature
+    /// determinism. Parsing from differently-ordered strings (rather than
+    /// building a `Value` programmatically) is what genuinely exercises the
+    /// insertion-order-capturing deserialization path.
+    #[test]
+    fn entry_hash_is_payload_key_order_independent() {
+        let payload_ascending: serde_json::Value =
+            serde_json::from_str(r#"{"alpha":1,"beta":2,"gamma":3}"#).unwrap();
+        let payload_descending: serde_json::Value =
+            serde_json::from_str(r#"{"gamma":3,"beta":2,"alpha":1}"#).unwrap();
+
+        let hash_ascending = compute_entry_hash(
+            "PayloadEvent",
+            "did:key:zOrder",
+            1000,
+            &[0u8; 32],
+            Some(&payload_ascending),
+        );
+        let hash_descending = compute_entry_hash(
+            "PayloadEvent",
+            "did:key:zOrder",
+            1000,
+            &[0u8; 32],
+            Some(&payload_descending),
+        );
+
+        assert_eq!(
+            hash_ascending, hash_descending,
+            "entry hash must be independent of payload object key insertion \
+             order; a mismatch means serde_json's preserve_order feature was \
+             enabled, which would break signed Merkle root determinism"
+        );
     }
 
     #[test]

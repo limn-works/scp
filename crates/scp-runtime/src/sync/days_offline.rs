@@ -59,7 +59,12 @@ use scp_protocol::sync::{
 pub const MAX_EPOCH_GAP_FOR_SEQUENTIAL: u64 = scp_protocol::sync::MAX_SEQUENTIAL_COMMITS;
 
 /// Domain separator for `ContextSnapshot` canonical hash (§9.18.2, §23.16.4).
-pub const CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-SNAPSHOT-V1:";
+///
+/// Re-exported from [`crate::context::export_import`] so the literal has a
+/// single source of truth and cannot drift between the §23.16.4 sync-delta
+/// hash (used here) and the §23.16.8 signed-export hash (defined there) — both
+/// constructions share the same registered separator string (§9.18.2).
+pub use crate::context::export_import::CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR;
 
 /// Default snapshot interval in seconds (4 hours).
 ///

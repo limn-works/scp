@@ -354,6 +354,27 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: codes::CTX_2092.to_owned(),
             },
+            // §23.16.8 / ADR-050: signed-context-export signature verification
+            // failure (forged/tampered snapshot, exporter_did != creator_did,
+            // or unresolvable creator key). Surface the dedicated SCP-CTX-2093
+            // contract instead of falling through to the catch-all CTX_2001 so
+            // callers can distinguish a forged export from a generic context
+            // error. The version gate is reported separately (a distinct
+            // version error, not this arm), per §23.16.8 / §17.5.
+            CE::SnapshotSignatureInvalid { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2093.to_owned(),
+            },
+            // §23.16.8 / §17.5 / ADR-050: the export format-version gate. This
+            // fires before any signature is checked (an unsupported/old format,
+            // e.g. pre-scope-binding v3), so surface the dedicated SCP-CTX-2094
+            // contract instead of the catch-all CTX_2001 — a caller can then
+            // distinguish "old/unsupported format" from a forged signature
+            // (CTX_2093) and from generic context errors.
+            CE::ExportVersionUnsupported { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2094.to_owned(),
+            },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for tool-economy and tool-invocation failures
             // (economy 12xxx, tool-invocation 6xxx). Recover the embedded
@@ -772,5 +793,48 @@ mod tests {
     fn non_pre_rotation_identity_errors_keep_generic_envelope() {
         let err: ScpPyError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
         assert_eq!(code_of(err), codes::IDENT_1001);
+    }
+
+    /// Extracts the code from a `ScpPyError::ContextError` (or panics).
+    fn context_code_of(e: ScpPyError) -> String {
+        match e {
+            ScpPyError::ContextError { code, .. } => code,
+            other => panic!("expected ContextError, got {other:?}"),
+        }
+    }
+
+    /// §23.16.8 / ADR-050: a signed-context-export signature verification
+    /// failure must surface the dedicated SCP-CTX-2093 code, NOT the catch-all
+    /// SCP-CTX-2001. This is the documented contract a forged export must hit.
+    #[test]
+    fn snapshot_signature_invalid_surfaces_ctx_2093() {
+        let err: ScpPyError = scp_core::context::ContextError::SnapshotSignatureInvalid {
+            reason: "creator signature over snapshot did not verify".to_owned(),
+        }
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2093);
+    }
+
+    /// §23.16.8 / §17.5 / ADR-050: the export format-version gate must surface
+    /// the dedicated SCP-CTX-2094 code, distinct from the SCP-CTX-2093 signature
+    /// failure and from the catch-all SCP-CTX-2001. A caller can then tell an
+    /// old/unsupported export format apart from a forged signature.
+    #[test]
+    fn export_version_unsupported_surfaces_ctx_2094() {
+        let err: ScpPyError = scp_core::context::ContextError::ExportVersionUnsupported {
+            reason: "unsupported export version: 3, required: 4".to_owned(),
+        }
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2094);
+    }
+
+    /// Defense against regression: an unrelated `ContextError` variant must
+    /// still fall through to the catch-all SCP-CTX-2001 — the 2093 arm is
+    /// narrow and does not capture generic context failures.
+    #[test]
+    fn generic_context_error_keeps_ctx_2001() {
+        let err: ScpPyError =
+            scp_core::context::ContextError::MembershipFailed("nope".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2001);
     }
 }

@@ -1597,7 +1597,8 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-CHUNK-MSG-ID-V1:"` | Chunked message ID derivation | §9.10.3 |
 | `"SCP-COMMIT-RANGE-REQ-V1:"` | Commit range request signing | §23.16.2 |
 | `"SCP-COMMIT-RANGE-RESP-V1:"` | Commit range response signing | §23.16.3 |
-| `"SCP-CONTEXT-SNAPSHOT-V1:"` | Context snapshot signing | §23.16.4 |
+| `"SCP-CONTEXT-SNAPSHOT-V1:"` | Tier-2 sync-delta context snapshot signing | §23.16.4 |
+| `"SCP-CONTEXT-EXPORT-V1:"` | Signed context export snapshot signing | §23.16.8 |
 
 #### 9.18.3 Key Derivation and HPKE Labels
 

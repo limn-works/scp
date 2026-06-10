@@ -151,7 +151,7 @@ pub struct PyIdentity {
 impl PyIdentity {
     /// Returns the DID string for this identity.
     #[getter]
-    fn did(&self) -> &str {
+    pub(crate) fn did(&self) -> &str {
         &self.did
     }
 

@@ -14,6 +14,30 @@
 //! # Bounded variable-size
 //!
 //! - [`serde_bounded_bytes`] — Variable-size binary with a 512 KiB cap
+//!
+//! # Deterministic set serialization (signed-export canonicalization)
+//!
+//! - [`serde_sorted_set`] — serializes a `HashSet<T>` as a JSON/MessagePack
+//!   array whose elements are emitted in a deterministic, content-derived
+//!   order. RFC 8785 JCS (used to sign a `ContextExport`, spec §23.16.8)
+//!   canonicalizes JSON *object* member order but NOT *array* element order,
+//!   so a `HashSet` serialized with the default (iteration-order) serializer
+//!   produces a non-deterministic digest. Sorting the elements before
+//!   serialization makes the canonical JSON — and therefore the export
+//!   signature digest — byte-identical across runs **within a single
+//!   serializer/bridge-family** (ADR-050, the `BTreeSet` convention named in
+//!   §23.16.8). This is NOT a cross-family byte-equivalence claim: native
+//!   (`MessagePack`) and WASM (JSON) serialize structurally different snapshot
+//!   value types, so only the *construction* converges, not the digest bytes.
+//!   Deserialization
+//!   is order-independent for a set, so sorted serialization is always safe:
+//!   nothing correct can depend on a `HashSet`'s incidental iteration order.
+//! - [`serde_sorted_set_map`] — serializes a `HashMap<String, HashSet<T>>`
+//!   with the inner sets sorted (the outer string-keyed map is already
+//!   canonicalized by JCS object-key sorting).
+//! - [`serde_hex_keyed_map_32`] — serializes a `HashMap<[u8; 32], V>` as a
+//!   hex-keyed JSON object so its `[u8; 32]` keys are valid JSON object keys
+//!   that JCS can canonicalize (the keys are sorted by JCS object-key order).
 
 /// Maximum size for bounded binary fields (512 KiB).
 ///
@@ -379,6 +403,207 @@ pub mod serde_bounded_string_opt {
         }
 
         deserializer.deserialize_option(BoundedOptStringVisitor)
+    }
+}
+
+/// Serde module for `HashSet<T>` fields that must serialize deterministically.
+///
+/// Emits the set as an array whose elements are ordered by their canonical
+/// JSON (RFC 8785 JCS) byte sequence. Because JCS canonicalizes object-member
+/// order but leaves array order untouched, a `HashSet` serialized in iteration
+/// order yields a non-deterministic digest; ordering by canonical-JSON bytes
+/// makes the output stable across runs **within a single serializer/bridge-
+/// family** (not a cross-family byte-equivalence guarantee — see the
+/// module-level note and §23.16.8).
+///
+/// `T` is ordered by its own canonical-JSON serialization rather than by a
+/// `Ord` bound so the helper applies uniformly to set element types that do
+/// not implement `Ord` (e.g. [`crate::context::roles::Capability`]). The sort
+/// key is total and deterministic: two distinct elements that produced equal
+/// canonical JSON would be equal values (a contradiction for set members), so
+/// ties cannot occur in practice; a stable sort keeps any tie order fixed.
+///
+/// Deserialization restores into a `HashSet`, which is order-independent, so a
+/// snapshot persisted before this change still loads unchanged.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
+pub mod serde_sorted_set {
+    use std::collections::HashSet;
+    use std::hash::{BuildHasher, Hash};
+
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// Serializes a set as an array ordered by each element's canonical JSON.
+    pub fn serialize<T, H, S>(set: &HashSet<T, H>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        H: BuildHasher,
+        S: Serializer,
+    {
+        // Compute a deterministic sort key per element: its RFC 8785 canonical
+        // JSON bytes.
+        //
+        // Amplification note: this performs one extra JCS serialization per set
+        // element (O(n) in the number of elements), bounded by the export size
+        // cap enforced upstream before signing runs (native 64 MiB / WASM
+        // 16 MiB). Element types here are flat (no nested set-of-sets), so the
+        // per-element JCS work is proportional to total export size, not
+        // quadratic. If a nested set-of-sets element type is ever added,
+        // re-evaluate the amplification factor before relying on this bound.
+        //
+        // A JCS failure (e.g. a future element type with a
+        // non-string, non-hex map key that JCS cannot canonicalize) MUST fail
+        // loudly rather than collapse to an empty key — an empty key would make
+        // the sort order depend on incidental iteration order, silently
+        // breaking the determinism this helper exists to guarantee. Propagate
+        // it as a serialization error so the export-signing path aborts.
+        let mut keyed: Vec<(Vec<u8>, &T)> = set
+            .iter()
+            .map(|e| crate::jcs::to_vec(e).map(|bytes| (bytes, e)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                serde::ser::Error::custom(format!(
+                    "serde_sorted_set: element canonical-JSON (JCS) serialization \
+                     failed, cannot produce deterministic order: {e}"
+                ))
+            })?;
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut seq = serializer.serialize_seq(Some(keyed.len()))?;
+        for (_, element) in keyed {
+            seq.serialize_element(element)?;
+        }
+        seq.end()
+    }
+
+    /// Deserializes an array back into a `HashSet` (order-independent).
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<HashSet<T>, D::Error>
+    where
+        T: Deserialize<'de> + Eq + Hash,
+        D: Deserializer<'de>,
+    {
+        let v: Vec<T> = Vec::deserialize(deserializer)?;
+        Ok(v.into_iter().collect())
+    }
+}
+
+/// Serde module for `HashMap<String, HashSet<T>>` fields that must serialize
+/// deterministically.
+///
+/// The outer `String`-keyed map is already canonicalized by RFC 8785 JCS
+/// (object members are emitted in sorted key order), but each inner
+/// `HashSet<T>` value would serialize as an array in non-deterministic
+/// iteration order. This helper emits every inner set ordered by each
+/// element's canonical JSON (the same ordering as [`serde_sorted_set`]).
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
+pub mod serde_sorted_set_map {
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{BuildHasher, Hash};
+
+    use serde::ser::SerializeMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// Serializes the map with each inner set ordered by canonical JSON.
+    pub fn serialize<T, Hm, Hs, S>(
+        map: &HashMap<String, HashSet<T, Hs>, Hm>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        Hm: BuildHasher,
+        Hs: BuildHasher,
+        S: Serializer,
+    {
+        // Order the inner sets deterministically. The outer map's key order is
+        // re-sorted by JCS, so the serializer-side map order does not affect
+        // the canonical digest; we still emit it directly to avoid an extra
+        // allocation of the outer map.
+        struct SortedSet<'a, T, Hs>(&'a HashSet<T, Hs>);
+
+        impl<T: Serialize, Hs: BuildHasher> Serialize for SortedSet<'_, T, Hs> {
+            fn serialize<S2: Serializer>(&self, s: S2) -> Result<S2::Ok, S2::Error> {
+                super::serde_sorted_set::serialize(self.0, s)
+            }
+        }
+
+        let mut m = serializer.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            m.serialize_entry(k, &SortedSet(v))?;
+        }
+        m.end()
+    }
+
+    /// Deserializes back into a `HashMap<String, HashSet<T>>`.
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<HashMap<String, HashSet<T>>, D::Error>
+    where
+        T: Deserialize<'de> + Eq + Hash,
+        D: Deserializer<'de>,
+    {
+        let raw: HashMap<String, Vec<T>> = HashMap::deserialize(deserializer)?;
+        Ok(raw
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect())
+    }
+}
+
+/// Serde module for `HashMap<[u8; 32], V>` fields that must serialize
+/// deterministically and survive RFC 8785 JCS canonicalization.
+///
+/// A `[u8; 32]` map key serializes as a JSON *array*, which `serde_json`
+/// (and therefore `serde_json_canonicalizer`) rejects — JSON object keys must
+/// be strings. This helper emits the map as a JSON object keyed by the
+/// lowercase-hex encoding of each 32-byte key. JCS then canonicalizes the
+/// object by sorting those hex keys, so the digest is deterministic regardless
+/// of the source `HashMap`'s iteration order. Deserialization decodes the hex
+/// keys back to `[u8; 32]`.
+///
+/// Used for the signed context export (spec §23.16.8, ADR-050) where the whole
+/// `ContextSnapshot` — including its `[u8; 32]`-keyed governance maps — is fed
+/// through JCS to form the signed digest.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
+pub mod serde_hex_keyed_map_32 {
+    use std::collections::HashMap;
+    use std::hash::BuildHasher;
+
+    use serde::de::Error as _;
+    use serde::ser::SerializeMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// Serializes the map as a JSON object keyed by lowercase hex of each key.
+    pub fn serialize<V, H, S>(
+        map: &HashMap<[u8; 32], V, H>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        V: Serialize,
+        H: BuildHasher,
+        S: Serializer,
+    {
+        let mut m = serializer.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            m.serialize_entry(&hex::encode(k), v)?;
+        }
+        m.end()
+    }
+
+    /// Deserializes a hex-keyed object back into a `HashMap<[u8; 32], V>`.
+    pub fn deserialize<'de, V, D>(deserializer: D) -> Result<HashMap<[u8; 32], V>, D::Error>
+    where
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let raw: HashMap<String, V> = HashMap::deserialize(deserializer)?;
+        let mut out = HashMap::with_capacity(raw.len());
+        for (k, v) in raw {
+            let bytes = hex::decode(&k)
+                .map_err(|e| D::Error::custom(format!("invalid hex map key {k:?}: {e}")))?;
+            let arr: [u8; 32] = bytes.try_into().map_err(|b: Vec<u8>| {
+                D::Error::custom(format!("expected 32-byte map key, got {} bytes", b.len()))
+            })?;
+            out.insert(arr, v);
+        }
+        Ok(out)
     }
 }
 

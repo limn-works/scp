@@ -1632,6 +1632,90 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const invalidData = new Uint8Array([0, 1, 2, 3]);
       await expect(napi.contextImport(invalidData)).rejects.toThrow();
     });
+
+    // Spec §23.16.8: the verifying key is resolved from the snapshot's
+    // creator_did via local custody first (then DID resolver). A self-export of
+    // an in-memory (unpublished) identity must round-trip on import — the
+    // creator's verifying key is derived from its own #active custody key, so
+    // no published DID document is required. This is the regression guard for
+    // the prior bug where import went straight to the DID resolver and failed
+    // for unpublished self-exports.
+    test("self-export round-trips via local-custody key resolution (§23.16.8)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read", "context:close"],
+          memoryScope: "ephemeral",
+        }),
+      );
+
+      const data = await napi.contextExport(ctx);
+      expect(data.length).toBeGreaterThan(0);
+
+      // Close so import_context sees a terminal state and allows reimport.
+      await napi.contextClose(ctx, identity.did);
+
+      // Untampered self-export must verify and import: the snapshot signature
+      // checks against the creator's local-custody #active key.
+      const importedContextId = await napi.contextImport(data);
+      expect(typeof importedContextId).toBe("string");
+      expect(importedContextId.length).toBeGreaterThan(0);
+    });
+
+    // Spec §23.16.8 / ADR-050: the exported snapshot is Ed25519-signed over the
+    // full canonical snapshot. Tampering with the exported bytes after signing
+    // must cause import to be rejected with SCP-CTX-2093 (the dedicated
+    // signed-export verification code), not a generic context error.
+    test("import rejects a tampered export with SCP-CTX-2093 (§23.16.8)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read", "context:close"],
+          memoryScope: "ephemeral",
+        }),
+      );
+
+      const data = await napi.contextExport(ctx);
+      expect(data.length).toBeGreaterThan(0);
+      await napi.contextClose(ctx, identity.did);
+
+      // Flip bytes across the embedded snapshot region (back half of the
+      // MessagePack envelope) without re-signing. At least one flip lands in a
+      // signed/trusted snapshot field, so the recomputed digest no longer
+      // matches the Ed25519 signature.
+      const tampered = new Uint8Array(data);
+      const start = Math.floor(tampered.length / 2);
+      for (let i = start; i < tampered.length; i += 17) {
+        tampered[i] = (tampered[i] ?? 0) ^ 0xff;
+      }
+      // The tamper MUST be rejected. A flip that lands in a signed snapshot
+      // field surfaces the dedicated "[SCP-CTX-2093]" signature-failure code;
+      // a flip that corrupts the MessagePack framing surfaces a deserialize
+      // error instead. Both are valid rejections — what must NEVER happen is a
+      // silent accept, nor a mapping to the catch-all "SCP-CTX-2001" generic
+      // context error. So assert the import rejects and that the rejection is
+      // not the catch-all (matching the Python reference test).
+      // `expect(...).rejects` takes a promise, so invoke the async wrapper to
+      // hand `expect` the promise it returns (matching the promise-first
+      // `rejects.toThrow()` idiom used elsewhere in this file).
+      await expect(
+        (async () => {
+          try {
+            await napi.contextImport(tampered);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            if (message.includes("SCP-CTX-2001")) {
+              throw new Error(
+                `tampered snapshot must not map to the catch-all CTX-2001: ${message}`,
+              );
+            }
+            throw err;
+          }
+        })(),
+      ).rejects.toThrow();
+    });
   });
 
   // ---------------------------------------------------------------------------

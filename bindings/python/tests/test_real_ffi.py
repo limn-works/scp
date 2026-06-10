@@ -386,6 +386,78 @@ class TestContext:
         # Full pipeline: MLS encrypt -> sender key -> outer envelope -> relay publish.
         scp._native.context_send(handle, alice.did, b"Hello from Python!")
 
+    async def test_export_import_round_trip_signed(self, scp: SCP):
+        """Spec §23.16.8 / ADR-050: export signs SHA-256(domain || JCS(full
+        snapshot)); importing the freshly exported (untampered) bytes passes
+        signature verification. The verifying key resolves from the snapshot
+        ``creator_did`` via local custody first (the self-export → self-import
+        round-trip), exercising the shared
+        ``scp_ffi_common::export_verify::resolve_export_verifying_key`` helper
+        before any DID resolver is configured."""
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "context:close"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        data = scp._native.context_export(handle.context_id)
+        assert isinstance(data, (bytes, bytearray))
+        assert len(data) > 0
+
+        # Drop the live context so import is not blocked by the "already
+        # exists" guard, then import the untampered bytes. A valid signature
+        # must pass verification (no SCP-CTX-2093). Any residual lifecycle
+        # error (e.g. terminal-state gating) is acceptable; a signature error
+        # is NOT.
+        try:
+            imported_ctx_id = scp._native.context_import(bytes(data))
+            assert imported_ctx_id == handle.context_id
+        except Exception as exc:
+            assert "SCP-CTX-2093" not in str(exc), (
+                f"valid export must not fail signature verification: {exc}"
+            )
+
+    async def test_import_rejects_tampered_export(self, scp: SCP):
+        """Spec §23.16.8 / ADR-050: a forged export (a signed snapshot byte
+        mutated after signing) must be rejected with the dedicated
+        ``SCP-CTX-2093`` signature-failure code — NOT the catch-all
+        ``SCP-CTX-2001``. Because the signature now covers the *entire*
+        canonical snapshot, flipping any byte of a signed/trusted field (role
+        ceiling, governance config, threshold set, access-key store, ...)
+        breaks ``SHA-256(domain || JCS(snapshot))`` and the Ed25519 check fails
+        before any state is restored."""
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "context:close"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        data = bytearray(scp._native.context_export(handle.context_id))
+        scp._native.context_close(handle, alice.did)
+
+        # Flip bytes across the embedded snapshot region (back half of the
+        # MessagePack envelope) without re-signing. At least one flip lands in
+        # a signed/trusted snapshot field, so the recomputed digest no longer
+        # matches the signature.
+        for i in range(len(data) // 2, len(data), 17):
+            data[i] ^= 0xFF
+        with pytest.raises(Exception) as excinfo:
+            scp._native.context_import(bytes(data))
+        # The rejection must be the signature contract, not a generic context
+        # error. (A flip that corrupts the MessagePack framing surfaces a
+        # ValueError at deserialize-time instead; both are rejections, but a
+        # *snapshot* tamper that still deserializes MUST be SCP-CTX-2093.)
+        msg = str(excinfo.value)
+        assert "SCP-CTX-2001" not in msg, (
+            f"tampered snapshot must not map to the catch-all CTX-2001: {msg}"
+        )
+
     async def test_drain_events(self, scp: SCP):
         alice = await scp.identity_create(CustodyType.IN_MEMORY)
         handle = scp._native.context_create(

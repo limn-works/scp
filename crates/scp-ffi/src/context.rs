@@ -1203,6 +1203,83 @@ fn resolve_signing_key(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+/// Helper: resolve the Ed25519 *verifying* key for an identity DID without
+/// materializing the private signing key (ADR-006).
+///
+/// Looks up the identity in the registry and asks custody for the public key
+/// of the active signing-key handle. Private key material never leaves
+/// custody — only the public verifying key is returned. Used by the
+/// snapshot-signature import path, where only the public half is needed.
+fn resolve_verifying_key(
+    bi: &crate::runtime::PyBridgeInstance,
+    identity_did: &str,
+) -> PyResult<ed25519_dalek::VerifyingKey> {
+    let rt = crate::runtime()?;
+    crate::runtime::with_identity(bi, identity_did, |entry| {
+        let handle = entry.identity.active_signing_key;
+        let custody = entry.custody.clone();
+        let public_key = rt
+            .block_on(async move { custody.public_key(&handle).await })
+            .map_err(|e| {
+                crate::error::ScpPyError::context(format!("failed to resolve verifying key: {e}"))
+            })?;
+        // 32-byte length + canonical-point decode: the shared conversion tail
+        // in scp-ffi-common, identical across all non-WASM bridges. A `None`
+        // (wrong length or non-canonical point) is the fail-closed signal that
+        // this DID has no usable local verifying key.
+        scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key).ok_or_else(|| {
+            crate::error::ScpPyError::context(
+                "active signing-key public key is not a valid 32-byte Ed25519 verifying key"
+                    .to_owned(),
+            )
+        })
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Resolves the snapshot creator's Ed25519 verification key for
+/// snapshot-signature verification on context import (spec §23.16.8, ADR-050,
+/// ADR-039).
+///
+/// Per §23.16.8 step 1 the verifying key is derived from the snapshot's
+/// `creator_did` (`role_state.creator_did`), never from the unauthenticated
+/// envelope `exporter_did`. The runtime separately asserts
+/// `exporter_did == creator_did` (§23.16.8 step 2), so the bridge MUST resolve
+/// from the creator identity.
+///
+/// Resolution order (local-custody-first, then DID resolver) is shared across
+/// all non-WASM bridges via
+/// [`scp_ffi_common::export_verify::resolve_export_verifying_key`]:
+/// 1. **Local identity custody** — if the creator is a local identity (the
+///    common self-export case: a device importing a context it exported), the
+///    verifying key is resolved directly via `KeyCustody::public_key` on its
+///    `#active` key handle (no private-key materialization, ADR-006).
+///    This works even when the DID document has not been published to the DHT
+///    (in-memory identities are not auto-published).
+/// 2. **DID resolver** — otherwise resolve the creator DID's `#active` (then
+///    `#agent`, ADR-039 shared-DID model) verification-method key.
+///
+/// Fails closed: if the creator is neither local nor resolvable, the import is
+/// rejected with [`scp_ffi_common::error_codes::CTX_2093`] rather than
+/// proceeding unverified.
+fn resolve_creator_verifying_key(
+    bi: &crate::runtime::PyBridgeInstance,
+    creator_did: &str,
+) -> PyResult<ed25519_dalek::VerifyingKey> {
+    let resolver = crate::runtime::did_resolver(bi).map(std::convert::AsRef::as_ref);
+
+    scp_ffi_common::export_verify::resolve_export_verifying_key(
+        resolver,
+        // Local custody: resolve the public verifying key directly via
+        // `KeyCustody::public_key` when the DID is a local identity (ADR-006).
+        // Private key material never leaves custody — only the public key is
+        // returned.
+        |did| resolve_verifying_key(bi, did).ok(),
+        creator_did,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", scp_ffi_common::error_codes::CTX_2093)))
+}
+
 /// Validates all user-controlled string fields on a governance action.
 #[cfg(test)]
 fn validate_governance_action_strings(
@@ -2438,49 +2515,103 @@ impl crate::scp::PyScp {
     ///
     /// - `RuntimeError` if the context does not exist or export fails.
     #[pyo3(signature = (context_id,))]
-    pub fn context_export(&self, context_id: &str) -> PyResult<Vec<u8>> {
-        use scp_core::context::actor::commands::{LifecycleCommand, QueriesCommand};
+    pub fn context_export(&self, py: Python<'_>, context_id: &str) -> PyResult<Vec<u8>> {
         let bi = &*self.inner;
         let rt = crate::runtime()?;
-        // Route through the ADR-049 commit-9 lifecycle / query shims.
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let ctx_id = context_id.to_owned();
 
-        let export = rt.block_on(async move {
-            // Use the first registered local DID as the exporter.
-            let (md_tx, md_rx) = tokio::sync::oneshot::channel();
-            let md_cmd = QueriesCommand::MemberDids {
-                context_id: ctx_id.clone(),
-                reply: md_tx,
-            };
-            let exporter_did = match sup.dispatch_query(md_cmd).await {
-                Ok(_) => match md_rx.await {
-                    Ok(Ok(dids)) => dids.into_iter().next().map_or_else(
-                        || scp_identity::DID::from("did:key:unknown-exporter"),
-                        scp_identity::DID::from,
-                    ),
-                    _ => scp_identity::DID::from("did:key:unknown-exporter"),
-                },
-                Err(_) => scp_identity::DID::from("did:key:unknown-exporter"),
-            };
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let cmd = LifecycleCommand::ExportContext {
-                context_id: ctx_id,
-                exporter_did,
-                reply: tx,
-            };
-            sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+        // The exporter MUST be the context creator: the importer enforces
+        // `exporter_did == role_state.creator_did` (§23.16.8 step 2), so the
+        // bridge resolves the authoritative creator DID from the context's
+        // role state — never a nondeterministic membership-map iteration.
+        let exporter_did = rt
+            .block_on(async { sup.get_role_state(&ctx_id).await })
+            .map(|role_state| scp_identity::DID::from(role_state.creator_did))
+            .ok_or_else(|| {
                 PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_lifecycle_command failed: {e}"
+                    "context export failed: context '{ctx_id}' not found"
                 ))
             })?;
-            rx.await
-                .map_err(|e| PyRuntimeError::new_err(format!("export shim reply dropped: {e}")))?
-                .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))
-        })?;
+
+        // Resolve the creator's custody provider and `#active` signing-key
+        // handle (NOT a raw exported private key). Signing the §23.16.8
+        // snapshot digest is delegated to `KeyCustody::sign`, which dispatches
+        // to whichever backend backs this identity — in-memory, file, OR a
+        // Python callback custody (`identity_create_with_custody`). This lets
+        // sign-only keychain/HSM-shaped providers — which implement `sign` but
+        // intentionally refuse raw key export — produce a signed export.
+        // Private key material never crosses the FFI boundary (ADR-006),
+        // matching the NAPI/UniFFI bridges.
+        let (custody, signing_handle) =
+            crate::runtime::with_identity(bi, &exporter_did.0, |entry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // `export_context`'s `sign` closure is synchronous, but custody `sign`
+        // is async (a Python callback custody re-acquires the GIL). The whole
+        // export runs inside `rt.block_on(...)`, so a nested
+        // `block_on`/`block_in_place` on the SAME runtime would panic ("Cannot
+        // start a runtime from within a runtime"), and `block_in_place` is
+        // unavailable on the current-thread fallback runtime (see `init_runtime`
+        // in `lib.rs`). The sign closure therefore drives the async custody sign
+        // on a dedicated OS thread with its own tiny current-thread runtime and
+        // hands the result back through `join()` — the regime-(c) pattern
+        // documented in `mcp.rs`. This is runtime-flavor-agnostic and never
+        // nests `block_on`.
+        //
+        // Crucially, the entire export (including that signing thread `join`) is
+        // run under `Python::allow_threads`: the calling Python thread holds the
+        // GIL, and a `Callback` custody's `sign` re-acquires the GIL on the
+        // signing thread. Releasing the GIL here lets the signing thread acquire
+        // it; otherwise the main thread would block on `join` while holding the
+        // GIL, deadlocking against the signing thread (in-memory/file custody
+        // never touch the GIL, but releasing it for them is harmless).
+        let export = py
+            .allow_threads(|| {
+                rt.block_on(
+                    sup.export_context(&ctx_id, exporter_did, |hash: &[u8; 32]| {
+                        let hash = *hash;
+                        let custody = Arc::clone(&custody);
+                        let signature = std::thread::scope(|scope| {
+                            scope
+                                .spawn(move || {
+                                    let sign_rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .map_err(|e| {
+                                            scp_platform::error::PlatformError::CustodyError(
+                                                format!(
+                                                "context export: failed to build signing runtime: {e}"
+                                            ),
+                                            )
+                                        })?;
+                                    sign_rt.block_on(custody.sign(&signing_handle, &hash))
+                                })
+                                .join()
+                                .map_err(|_| {
+                                    scp_platform::error::PlatformError::CustodyError(
+                                        "context export: signing thread panicked".to_owned(),
+                                    )
+                                })?
+                        })?;
+                        let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
+                            scp_platform::error::PlatformError::CustodyError(format!(
+                                "custody sign returned {} bytes, expected 64 (Ed25519)",
+                                signature.as_bytes().len()
+                            ))
+                        })?;
+                        Ok::<[u8; 64], scp_platform::error::PlatformError>(bytes)
+                    }),
+                )
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))?;
 
         scp_core::context::export_import::serialize_export(&export)
             .map_err(|e| PyRuntimeError::new_err(format!("export serialization failed: {e}")))
@@ -2505,7 +2636,6 @@ impl crate::scp::PyScp {
     /// - `ValueError` if the data is malformed.
     #[pyo3(signature = (data,))]
     pub fn context_import(&self, data: &[u8]) -> PyResult<String> {
-        use scp_core::context::actor::commands::LifecycleCommand;
         let bi = &*self.inner;
         let export = scp_core::context::export_import::deserialize_export(data).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid export data: {e}"))
@@ -2513,40 +2643,50 @@ impl crate::scp::PyScp {
 
         let context_id = export.snapshot.context_id.clone();
 
-        // Validate the exporter DID before passing to init_context_manager (#1324).
-        validate::validate_did(&export.exporter_did.0)?;
+        // Resolve the verification-method key for the snapshot's `creator_did`
+        // (§23.16.8 step 1, ADR-050) — NOT the unauthenticated envelope
+        // `exporter_did`. The runtime separately asserts
+        // `exporter_did == creator_did` (§23.16.8 step 2). Fail-closed: if no
+        // key resolves, the import is rejected — never imported unverified.
+        let creator_did = export.snapshot.role_state.creator_did.clone();
+        validate::validate_did(&creator_did)?;
+        let verifying_key = resolve_creator_verifying_key(bi, &creator_did)?;
+
+        // Verify-before-init: validate the snapshot signature, signer binding,
+        // version gate, and Merkle chain BEFORE touching the bridge's
+        // ContextManager. `init_context_manager` seeds the MLS provider's
+        // credential identity from `creator_did`, and that OnceLock is
+        // first-call-wins. Seeding it from an unverified snapshot would let an
+        // attacker-crafted `creator_did` set the provider identity on a fresh
+        // bridge whose first operation is an import. Running the full
+        // verification here means the identity is only seeded from a
+        // cryptographically authenticated `creator_did`. `import_context`
+        // re-runs the same validation (authoritative path); the duplicate work
+        // is acceptable to keep the security ordering correct.
+        scp_core::context::export_import::validate_export_for_import(&export, &verifying_key)
+            .map_err(crate::error::ScpPyError::from)?;
 
         // Ensure the ContextManager is initialized — context_import is a valid
         // first operation (e.g. a device receiving exported context data).
         // init_context_manager is idempotent (CoreFields::set_context_manager
-        // uses OnceLock internally — first call wins). #1073
-        // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1324).
+        // uses OnceLock internally — first call wins). Seeding from the
+        // now-verified `creator_did` is safe per the verify-before-init step
+        // above.
         #[cfg(test)]
         crate::runtime::init_context_manager_for_test(bi);
         #[cfg(not(test))]
-        crate::runtime::init_context_manager(bi, &export.exporter_did.0);
+        crate::runtime::init_context_manager(bi, &creator_did);
 
         let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
 
-        rt.block_on(async move {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let cmd = LifecycleCommand::ImportContext {
-                export: Box::new(export),
-                reply: tx,
-            };
-            sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_lifecycle_command failed: {e}"
-                ))
-            })?;
-            rx.await
-                .map_err(|e| PyRuntimeError::new_err(format!("import shim reply dropped: {e}")))?
-                .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
-            Ok::<(), PyErr>(())
-        })?;
+        // Route the import error through ScpPyError so the typed
+        // ContextError::SnapshotSignatureInvalid arm surfaces SCP-CTX-2093
+        // (signature/version forgery) rather than the catch-all SCP-CTX-2001.
+        rt.block_on(sup.import_context(export, &verifying_key))
+            .map_err(crate::error::ScpPyError::from)?;
 
         Ok(context_id)
     }
@@ -6155,6 +6295,345 @@ mod tests {
                 Ok(v) => assert_eq!(v, "prompt_agent"),
                 Err(e) => panic!("expected Ok, got Err: {e}"),
             }
+        });
+    }
+
+    /// Multi-member export round-trip through the real `context_export` /
+    /// `context_import` bridge methods.
+    ///
+    /// Regression guard for the CRITICAL signer-resolution bug: `context_export`
+    /// previously picked the exporter DID from `member_dids().next()`
+    /// (`HashMap` iteration order) with a `"did:key:unknown-exporter"` fallback.
+    /// The importer requires `exporter_did == role_state.creator_did`, so for a
+    /// context with more than one member the export non-deterministically
+    /// signed as a non-creator DID and failed verification (or was unimportable)
+    /// on import. The fix resolves the exporter from the authoritative
+    /// `role_state.creator_did`.
+    ///
+    /// This builds a TWO-member context (creator + added member) so the
+    /// membership map has multiple entries with non-deterministic iteration
+    /// order, then exports and re-imports. It must round-trip deterministically.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn multi_member_context_export_round_trips_as_creator() {
+        use scp_ffi_common::test_helpers::approved_proposal;
+
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new();
+            let bi = Arc::clone(&scp.inner);
+
+            // Real identity with in-memory custody so `resolve_signing_key`
+            // (creator-side) and `resolve_creator_verifying_key` (import-side)
+            // both succeed.
+            let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator = creator_identity.did().to_owned();
+
+            let ctx_id = format!("export-multi-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(&bi, &ctx_id, &creator, &[]).unwrap();
+            let sup = crate::runtime::supervisor(&bi).unwrap();
+            let sup = Arc::clone(sup);
+            let rt = crate::runtime().unwrap();
+
+            let params = scp_core::context::ContextParams {
+                ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
+                ..scp_core::context::ContextParams::default()
+            };
+            rt.block_on(sup.create_context(
+                ctx_id.clone(),
+                params,
+                scp_identity::DID(creator.clone()),
+                None,
+            ))
+            .unwrap();
+
+            // Add a SECOND member so the membership map holds 2+ DIDs with
+            // non-deterministic iteration order — the precondition that made
+            // the old `member_dids().next()` exporter selection unsound.
+            let second_member = "did:key:z6MkExportSecondMember";
+            let add = approved_proposal(
+                [9u8; 32],
+                &ctx_id,
+                scp_core::context::governance::GovernanceAction::AddMember {
+                    did: scp_identity::DID(second_member.to_owned()),
+                    role: "member".to_owned(),
+                },
+                &creator,
+            );
+            test_dispatch_execute_governance(&bi, &ctx_id, add);
+            crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
+
+            // Sanity: the context really has multiple members.
+            let members = rt.block_on(sup.member_dids(&ctx_id));
+            assert!(
+                members.len() >= 2,
+                "test precondition: context must have 2+ members, got {members:?}"
+            );
+
+            // Export while the context is live and multi-member.
+            let exported = scp.context_export(py, &ctx_id).unwrap();
+
+            // The export MUST be signed as the creator. Decode it and assert
+            // the §23.16.8 signer binding the bug violated: `exporter_did ==
+            // creator_did == <the creator identity>`. Before the fix, the
+            // exporter was picked from `member_dids().next()` (HashMap order),
+            // so for a 2+ member context it was non-deterministically a
+            // non-creator DID (or the `"did:key:unknown-exporter"` fallback).
+            let decoded = scp_core::context::export_import::deserialize_export(&exported).unwrap();
+            assert_eq!(
+                decoded.exporter_did.0, creator,
+                "export must be signed by the context creator, not an arbitrary member"
+            );
+            assert_eq!(
+                decoded.snapshot.role_state.creator_did, creator,
+                "snapshot creator_did must be the creator identity"
+            );
+
+            // End-to-end: the import pipeline verifies the snapshot signature
+            // against the creator's resolved key BEFORE the already-exists
+            // check. A wrong-signer export (the bug) fails with a signature
+            // error (SCP-CTX-2093). The fix makes verification succeed, so the
+            // import advances past signature verification to the idempotent
+            // already-exists rejection — proving the signer binding is correct.
+            let import_err = scp
+                .context_import(&exported)
+                .expect_err("re-importing a live context must be rejected (already exists)");
+            let msg = import_err.to_string();
+            assert!(
+                !msg.contains("SCP-CTX-2093") && !msg.contains("signature"),
+                "import must NOT fail signature verification — exporter signed \
+                 as creator_did, got: {msg}"
+            );
+
+            crate::runtime::remove_context(&bi, &ctx_id);
+        });
+    }
+
+    /// Python source for a SIGN-ONLY custody provider: it signs and reports a
+    /// public key using a REAL Ed25519 keypair (via the pure-Rust `_scp_core`
+    /// test signer exposed below), but `export_signing_key_bytes` RAISES —
+    /// modelling a keychain/HSM-shaped custody that refuses raw private-key
+    /// export. The provider's `sign`/`get_public_key` delegate to a
+    /// process-local Rust Ed25519 signer keyed by an opaque id, so the
+    /// signatures are cryptographically valid and verifiable. Only `sign`,
+    /// `get_public_key`, and `export_signing_key_bytes` are load-bearing here;
+    /// the remaining methods exist solely to satisfy the provider protocol
+    /// surface (`PyKeyCustodyProvider::REQUIRED_METHODS`).
+    #[cfg(feature = "allow_in_memory_custody")]
+    const SIGN_ONLY_PROVIDER_PY: &std::ffi::CStr = c"
+from _scp_core_export_signer import ed25519_sign, ed25519_public_key
+
+class SignOnlyCustody:
+    def __init__(self, key_id):
+        self._key_id = str(key_id)
+
+    def generate_keypair(self, key_type):
+        return self._key_id
+
+    def sign(self, key_id, message):
+        # Real Ed25519 signature over `message` — produced WITHOUT ever
+        # surfacing the private key to Python.
+        return ed25519_sign(str(key_id), bytes(message))
+
+    def get_public_key(self, key_id):
+        return ed25519_public_key(str(key_id))
+
+    def destroy_key(self, key_id):
+        return None
+
+    def dh_agree(self, key_id, peer_public):
+        raise RuntimeError('sign-only custody: dh_agree unsupported')
+
+    def derive_pseudonym(self, key_id, context_id):
+        raise RuntimeError('sign-only custody: derive_pseudonym unsupported')
+
+    def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
+        raise RuntimeError('sign-only custody: derive_rotatable_pseudonym unsupported')
+
+    def export_signing_key_bytes(self, key_id):
+        # The defining property: raw private-key export is REFUSED. A correct
+        # context export must never call this path.
+        raise RuntimeError('sign-only custody refuses raw key export')
+
+    def custody_type(self, key_id):
+        return 'hardware'
+";
+
+    /// Context export must sign via `KeyCustody::sign`, NOT by exporting the raw
+    /// Ed25519 private key — so a sign-only custody (one that signs but refuses
+    /// `export_signing_key_bytes`) can still produce a valid, verifiable export.
+    ///
+    /// This is the cross-bridge capability-parity guard: the `NAPI` and `UniFFI`
+    /// export paths already delegate to `KeyCustody::sign`; `PyO3` previously
+    /// exported the raw private key, which would fail closed for keychain/HSM
+    /// custody. The test installs a Rust-backed sign-only callback custody whose
+    /// `export_signing_key_bytes` RAISES, runs the real `context_export`, and
+    /// asserts (a) the export SUCCEEDS — proving the raw-export path is not
+    /// taken — and (b) the produced §23.16.8 signature VERIFIES against the
+    /// public key the same custody reports.
+    /// Installs a SIGN-ONLY callback custody on the identity `did`, replacing
+    /// whatever custody was registered. The custody signs and reports a public
+    /// key using a process-local REAL Ed25519 signer (the private key lives only
+    /// in Rust, never surfaced to Python — exactly like a keychain), but its
+    /// `export_signing_key_bytes` RAISES. Returns the signer's verifying key so
+    /// the caller can verify the resulting export signature.
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn install_sign_only_custody(
+        py: Python<'_>,
+        bi: &crate::runtime::PyBridgeInstance,
+        did: &str,
+    ) -> (
+        ed25519_dalek::VerifyingKey,
+        std::sync::Arc<crate::custody::FfiKeyCustody>,
+    ) {
+        use pyo3::types::PyModule;
+
+        let signer =
+            std::sync::Arc::new(ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng));
+        let signer_pk = signer.verifying_key();
+
+        let signer_for_sign = Arc::clone(&signer);
+        let pk_bytes = signer_pk.to_bytes().to_vec();
+
+        // Expose the Rust signer to Python via a tiny module of closures. The
+        // private key never crosses into Python — only signatures / public bytes.
+        let signer_module = PyModule::new(py, "_scp_core_export_signer").unwrap();
+        signer_module
+            .add(
+                "ed25519_sign",
+                pyo3::types::PyCFunction::new_closure(py, None, None, move |args, _kwargs| {
+                    use ed25519_dalek::Signer;
+                    let _key_id: String = args.get_item(0)?.extract()?;
+                    let message: Vec<u8> = args.get_item(1)?.extract()?;
+                    Ok::<Vec<u8>, PyErr>(signer_for_sign.sign(&message).to_bytes().to_vec())
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        signer_module
+            .add(
+                "ed25519_public_key",
+                pyo3::types::PyCFunction::new_closure(py, None, None, move |args, _kwargs| {
+                    let _key_id: String = args.get_item(0)?.extract()?;
+                    Ok::<Vec<u8>, PyErr>(pk_bytes.clone())
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        py.import("sys")
+            .unwrap()
+            .getattr("modules")
+            .unwrap()
+            .downcast_into::<pyo3::types::PyDict>()
+            .unwrap()
+            .set_item("_scp_core_export_signer", &signer_module)
+            .unwrap();
+
+        let active_handle_id = crate::runtime::with_identity(bi, did, |entry| {
+            Ok(entry.identity.active_signing_key.id())
+        })
+        .unwrap();
+
+        let provider_module = PyModule::from_code(
+            py,
+            SIGN_ONLY_PROVIDER_PY,
+            c"sign_only_custody.py",
+            c"sign_only_custody",
+        )
+        .unwrap();
+        let obj = provider_module
+            .getattr("SignOnlyCustody")
+            .unwrap()
+            .call1((active_handle_id,))
+            .unwrap();
+        let provider = crate::custody::PyKeyCustodyProvider::new(py, obj.unbind()).unwrap();
+        let sign_only_custody = Arc::new(crate::custody::FfiKeyCustody::Callback(
+            crate::custody::PyCallbackKeyCustody::new(provider),
+        ));
+
+        crate::runtime::with_identity_mut(bi, did, |entry| {
+            entry.custody = Arc::clone(&sign_only_custody);
+            Ok(())
+        })
+        .unwrap();
+
+        (signer_pk, sign_only_custody)
+    }
+
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_export_signs_via_sign_only_custody() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new();
+            let bi = Arc::clone(&scp.inner);
+
+            // Create a real identity (registers DID document + registry entry +
+            // supervisor wiring). Its custody is in-memory; `install_sign_only_custody`
+            // overwrites it with a SIGN-ONLY callback custody so the export path
+            // is forced through `KeyCustody::sign`.
+            let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator = creator_identity.did().to_owned();
+
+            let (signer_pk, sign_only_custody) = install_sign_only_custody(py, &bi, &creator);
+
+            // Sanity: the swapped custody REFUSES raw key export but CAN sign.
+            let rt = crate::runtime().unwrap();
+            let active_handle_id = crate::runtime::with_identity(&bi, &creator, |entry| {
+                Ok(entry.identity.active_signing_key.id())
+            })
+            .unwrap();
+            let handle = scp_platform::KeyHandle::new(active_handle_id);
+            assert!(
+                rt.block_on(sign_only_custody.export_ed25519_signing_key(&handle))
+                    .is_err(),
+                "sign-only custody must refuse raw private-key export"
+            );
+            assert!(
+                rt.block_on(sign_only_custody.sign(&handle, b"probe"))
+                    .is_ok(),
+                "sign-only custody must still sign"
+            );
+
+            // Build the context as the creator.
+            let ctx_id = format!("export-sign-only-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(&bi, &ctx_id, &creator, &[]).unwrap();
+            let sup = crate::runtime::supervisor(&bi).unwrap();
+            let sup = Arc::clone(sup);
+            rt.block_on(sup.create_context(
+                ctx_id.clone(),
+                scp_core::context::ContextParams::default(),
+                scp_identity::DID(creator.clone()),
+                None,
+            ))
+            .unwrap();
+
+            // The export MUST succeed even though raw key export is refused —
+            // proving the signature is produced via `KeyCustody::sign`.
+            let exported = scp.context_export(py, &ctx_id).expect(
+                "context export must succeed under sign-only custody (signing via \
+                 KeyCustody::sign, never raw key export)",
+            );
+
+            // The produced §23.16.8 signature must verify against the public key
+            // the same sign-only custody reports — end-to-end cryptographic
+            // proof that the export was signed correctly by custody.
+            let decoded = scp_core::context::export_import::deserialize_export(&exported).unwrap();
+            assert_eq!(
+                decoded.exporter_did.0, creator,
+                "export must be signed as the context creator"
+            );
+            scp_core::context::export_import::validate_export_for_import(&decoded, &signer_pk)
+                .expect(
+                    "export signed by sign-only custody must verify against the custody's \
+                     reported public key",
+                );
+
+            crate::runtime::remove_context(&bi, &ctx_id);
         });
     }
 }

@@ -310,10 +310,29 @@ pub const CTX_2073: &str = "SCP-CTX-2073";
 pub const CTX_2074: &str = "SCP-CTX-2074";
 /// `UniFFI` context drain events error.
 pub const CTX_2075: &str = "SCP-CTX-2075";
-/// Context economy insufficient funds.
+/// Snapshot import rejected: monotonic floor regression (spec §23.17).
+///
+/// A per-sender monotonic floor (sender-key epoch, spending nonce, etc.) would
+/// regress on import. Maps from `ContextError::SnapshotFloorRegression`.
 pub const CTX_2091: &str = "SCP-CTX-2091";
-/// Context economy spending error.
+/// Context import rejected: structural or semantic violation.
+///
+/// Tampered consequence rules, forged approved-proposal entries, out-of-range
+/// cooldown indices, etc. Maps from `ContextError::ImportRejected`.
 pub const CTX_2092: &str = "SCP-CTX-2092";
+/// Context export snapshot signature verification failed (spec §23.16.8).
+///
+/// A present-but-forged signature. Maps from
+/// `ContextError::SnapshotSignatureInvalid`. Distinct from `CTX_2094` (the
+/// format-version gate).
+pub const CTX_2093: &str = "SCP-CTX-2093";
+/// Context export format version unsupported (predates signed-export format).
+///
+/// The version gate fires before any signature is checked, so this is distinct
+/// from `CTX_2093` (signature failure) — a caller can tell "old/unsupported
+/// format" apart from "forged signature" (spec §23.16.8, §17.5; ADR-050). Maps
+/// from `ContextError::ExportVersionUnsupported`.
+pub const CTX_2094: &str = "SCP-CTX-2094";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.

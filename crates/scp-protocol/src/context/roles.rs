@@ -374,6 +374,10 @@ impl std::fmt::Display for Capability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityCeiling {
     /// The set of capabilities permitted in this context.
+    ///
+    /// Serialized in a deterministic (content-sorted) order so the signed
+    /// context-export digest is reproducible (§23.16.8, ADR-050).
+    #[serde(with = "crate::serde_util::serde_sorted_set")]
     pub capabilities: HashSet<Capability>,
 }
 
@@ -490,6 +494,10 @@ pub struct RoleDefinition {
     pub name: String,
     /// The set of capabilities granted to participants with this role.
     /// Must be a subset of the context's capability ceiling.
+    ///
+    /// Serialized in a deterministic (content-sorted) order so the signed
+    /// context-export digest is reproducible (§23.16.8, ADR-050).
+    #[serde(with = "crate::serde_util::serde_sorted_set")]
     pub capabilities: HashSet<Capability>,
 }
 
@@ -790,12 +798,26 @@ pub struct ContextRoleState {
     /// Current role assignments: member DID -> assignment.
     pub assignments: HashMap<String, RoleAssignment>,
     /// Set of member DIDs currently in the context.
+    ///
+    /// Serialized in a deterministic (content-sorted) order so the signed
+    /// context-export digest is reproducible (§23.16.8, ADR-050).
+    #[serde(with = "crate::serde_util::serde_sorted_set")]
     pub members: HashSet<String>,
     /// Capabilities held by each member (derived from assignments).
+    ///
+    /// Each inner capability set is serialized in a deterministic
+    /// (content-sorted) order so the signed context-export digest is
+    /// reproducible (§23.16.8, ADR-050). The outer DID-keyed map is already
+    /// canonicalized by RFC 8785 JCS object-key sorting.
+    #[serde(with = "crate::serde_util::serde_sorted_set_map")]
     pub member_capabilities: HashMap<String, HashSet<Capability>>,
     /// Suspended capabilities per member DID. A member whose DID appears here
     /// is denied the listed capabilities even if their role grants them.
-    #[serde(default)]
+    ///
+    /// Each inner capability set is serialized in a deterministic
+    /// (content-sorted) order so the signed context-export digest is
+    /// reproducible (§23.16.8, ADR-050).
+    #[serde(default, with = "crate::serde_util::serde_sorted_set_map")]
     pub suspended_capabilities: HashMap<String, HashSet<Capability>>,
 }
 
