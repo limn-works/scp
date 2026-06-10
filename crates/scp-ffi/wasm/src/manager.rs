@@ -5833,6 +5833,16 @@ pub struct ContextMetadata {
 /// (block lists, key epochs) and the mandatory Ed25519 `snapshot_signature`
 /// (§23.16.8) whose preimage binds the export-scope discriminant. The byte value
 /// MUST NEVER be reused for an incompatible shape.
+///
+/// # Relationship to the native export version
+///
+/// This WASM version line (JSON envelope) is **intentionally independent** of
+/// the native bridge's `CURRENT_EXPORT_VERSION` (`MessagePack` `StoredValue`
+/// payload, currently 4). The two serializations are disjoint and mutually
+/// non-importable by construction (ADR-034): a native export fed to this WASM
+/// bridge is rejected at the version gate, never silently parsed. The two
+/// numbers are therefore **not** expected to match and must **not** be
+/// "reconciled" — only the signing construction converges, not the bytes.
 const WASM_EXPORT_VERSION: u32 = 5;
 
 /// Maximum byte length of a context-export envelope accepted by

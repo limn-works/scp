@@ -68,6 +68,16 @@ use scp_protocol::context::ContextError;
 ///   it to `Full`; binding the scope byte makes that tamper fail signature
 ///   verification by construction. SCP is pre-release with no deployed exports,
 ///   so v3 is **not** accepted on import — the correct end state ships directly.
+///
+/// # Relationship to the WASM export version
+///
+/// This native version line (`MessagePack`-encoded `StoredValue` payload) is
+/// **intentionally independent** of the WASM bridge's `WASM_EXPORT_VERSION`
+/// (JSON envelope, currently 5). The two serializations are disjoint and
+/// mutually non-importable by construction (ADR-034): a WASM export fed to a
+/// native bridge is rejected at the version gate, never silently parsed. The
+/// two numbers are therefore **not** expected to match and must **not** be
+/// "reconciled" — only the signing construction converges, not the bytes.
 pub const CURRENT_EXPORT_VERSION: u32 = 4;
 
 /// Maximum accepted serialized byte length of an incoming `ContextExport`
