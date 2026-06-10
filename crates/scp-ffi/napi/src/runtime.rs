@@ -1189,31 +1189,7 @@ fn event_log_provider_from_existing_repo(
 /// First-call-wins semantics via `CoreFields::set_supervisor`.
 #[cfg(test)]
 pub(crate) fn init_supervisor_for_test_on(bi: &NapiBridgeInstance) {
-    if bi.core.has_supervisor() {
-        return;
-    }
-    let event_log = event_log_provider_from_existing_repo(bi);
-    // The in-memory `mls_storage` backend is populated at construction
-    // (the dev/test affordance, spec §17.6). Read it directly; a missing
-    // backend fails closed.
-    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
-        tracing::error!(
-            "init_supervisor_for_test_on: storage-before-supervisor precondition failed — \
-             no mls_storage backend on the bridge instance"
-        );
-        return;
-    };
-    let supervisor_arc = build_supervisor_arc(
-        Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
-            "did:test:napi-bridge-test".to_owned(),
-        )),
-        Box::new(scp_core::context::LocalTransportProvider),
-        event_log,
-        Box::new(NapiBridgePersistence::new()),
-        mls_storage,
-    );
-
-    bi.core.set_supervisor(supervisor_arc);
+    init_supervisor_for_test_on_with_did(bi, "did:test:napi-bridge-test");
 }
 
 /// Like [`init_supervisor_for_test_on`] but wires the MLS provider with a
@@ -1227,20 +1203,34 @@ pub(crate) fn init_supervisor_for_test_on(bi: &NapiBridgeInstance) {
 /// no-`testing` configuration rather than silently relying on the test gate.
 #[cfg(test)]
 pub(crate) fn init_production_supervisor_for_test_on(bi: &NapiBridgeInstance) {
+    init_supervisor_for_test_on_with_did(bi, "did:dht:z6MkNapiBridgeProductionTest");
+}
+
+/// Shared body for the two test supervisor initializers above. Wires a
+/// per-instance `Supervisor` with test-only providers (local transport),
+/// using `local_did` as the MLS credential identity. First-call-wins via
+/// `has_supervisor`.
+///
+/// The in-memory `mls_storage` backend is populated at construction (the
+/// dev/test affordance, spec §17.6). Read it directly; a missing backend
+/// fails closed.
+#[cfg(test)]
+fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str) {
     if bi.core.has_supervisor() {
         return;
     }
     let event_log = event_log_provider_from_existing_repo(bi);
     let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
         tracing::error!(
-            "init_production_supervisor_for_test_on: storage-before-supervisor precondition \
-             failed — no mls_storage backend on the bridge instance"
+            local_did,
+            "init_supervisor_for_test_on: storage-before-supervisor precondition failed — \
+             no mls_storage backend on the bridge instance"
         );
         return;
     };
     let supervisor_arc = build_supervisor_arc(
         Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
-            "did:dht:z6MkNapiBridgeProductionTest".to_owned(),
+            local_did.to_owned(),
         )),
         Box::new(scp_core::context::LocalTransportProvider),
         event_log,
@@ -1371,8 +1361,9 @@ where
         .get(did)
         .ok_or_else(|| ScpNapiError::Identity {
             message: format!(
-                "identity '{did}' not found in registry — was it created with \
-                 identityCreate(\"in_memory\") in this process?"
+                "identity '{did}' is not registered on this bridge instance — \
+                 create it via identityCreate / identityCreateWithCustody, or it \
+                 was loaded externally without retained custody"
             ),
             code: codes::IDENT_1001.to_owned(),
         })?;
@@ -1401,8 +1392,9 @@ where
         .get_mut(did)
         .ok_or_else(|| ScpNapiError::Identity {
             message: format!(
-                "identity '{did}' not found in registry — was it created with \
-                 identityCreate(\"in_memory\") in this process?"
+                "identity '{did}' is not registered on this bridge instance — \
+                 create it via identityCreate / identityCreateWithCustody, or it \
+                 was loaded externally without retained custody"
             ),
             code: codes::IDENT_1001.to_owned(),
         })?;
