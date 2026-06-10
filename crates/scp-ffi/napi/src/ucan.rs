@@ -343,7 +343,7 @@ pub(crate) async fn ucan_mint_on(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
                 message: format!("UCAN minting failed: {e}"),
-                code: codes::PERM_3001.to_owned(),
+                code: scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned(),
             })
         })?;
 
@@ -427,7 +427,7 @@ pub(crate) async fn ucan_delegate_on(
                     .parse()
                     .map_err(|e: CoreUcanError| ScpNapiError::Permission {
                         message: format!("invalid capability URI '{cap_uri_str}': {e}"),
-                        code: codes::PERM_3001.to_owned(),
+                        code: scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned(),
                     })?;
             Ok(Attenuation {
                 with: cap_uri_str,

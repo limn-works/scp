@@ -612,7 +612,9 @@ interface BroadcastBindings {
      *   or [IdentityBindings.identityLoad] for the publishing author.
      * @param payload Raw message bytes to broadcast.
      * @throws BridgeException if publishing fails (e.g., author is not
-     *   the broadcast owner, context not active).
+     *   the broadcast owner, context not active), or with `SCP-IDENT-1017`
+     *   if the author identity retains no signing custody (externally
+     *   loaded).
      */
     fun broadcastPublish(
         contextHandle: Long,
@@ -1015,8 +1017,8 @@ interface UcanBindings {
      *   to grant (e.g., `["messages:write", "tool_invoke:*"]`).
      * @return The minted UCAN token string (JWT-encoded).
      * @throws BridgeException with `SCP-VALID-7000` if `memberDid` is
-     *   malformed, or with `SCP-PERM-3004` if the context lacks key
-     *   custody for signing.
+     *   malformed, or with `SCP-IDENT-1017` if the context creator
+     *   identity retains no signing custody (externally loaded).
      */
     fun ucanMint(
         contextHandle: Long,
@@ -1060,7 +1062,9 @@ interface UcanBindings {
      * @return The delegated UCAN token string (JWT-encoded).
      * @throws BridgeException with `SCP-PERM-3001` if delegation fails
      *   (capabilities wider than parent, invalid parent token, or
-     *   delegator is not the parent's audience).
+     *   delegator is not the parent's audience), or with `SCP-IDENT-1017`
+     *   if the delegator identity retains no signing custody (externally
+     *   loaded).
      */
     fun ucanDelegate(
         contextHandle: Long,
@@ -1134,9 +1138,9 @@ interface InfraBindings {
      * @return JSON-encoded checkpoint containing `context_id`,
      *   `sender_did`, `event_count`, `merkle_root`, `epoch`,
      *   `signature`, and `timestamp`.
-     * @throws BridgeException with `SCP-PERM-3008` if the identity
-     *   lacks key custody, or with `SCP-CTX-2027` if checkpoint
-     *   generation fails.
+     * @throws BridgeException with `SCP-IDENT-1017` if the identity
+     *   retains no signing custody (externally loaded), or with
+     *   `SCP-CTX-2027` if checkpoint generation fails.
      */
     fun eventLogCheckpoint(
         contextHandle: Long,
