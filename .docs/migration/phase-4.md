@@ -233,11 +233,18 @@ function runs a cheap runtime check and returns `SCP-PERM-3030` on
 mismatch. The check is enforced mechanically by
 `scripts/check-handle-affinity.sh`.
 
+The `instance_id` field is a Rust-inherent enforcement artifact, not a
+public property: handle types do **not** expose an `instanceId` getter
+(ADR-048 "Per-handle host-visible `instanceId` is NOT exposed on any
+bridge (PROHIBITION)"). Only the `SCP` class itself surfaces `instanceId`. Affinity
+is observed only through misuse — passing a handle to the wrong instance
+throws `SCP-PERM-3030`:
+
 ```swift
 let a = try SCP(storage: .inMemory)
 let b = try SCP(storage: .inMemory)
 let ctx = try await a.contextCreate(params)
-// ctx.instanceId == a.instanceId
+// ctx has no instanceId getter — affinity is enforced Rust-side.
 
 try await b.contextSend(ctx, payload)
 // throws ScpError.Permission(code: "SCP-PERM-3030")
@@ -287,7 +294,12 @@ def scp() -> scp_sdk.SCP:
 async def test_context_create(scp: scp_sdk.SCP) -> None:
     identity = await scp_sdk.Identity.create(scp, custody="in_memory")
     ctx = await scp_sdk.Context.create(scp, creator=identity, ...)
-    assert ctx.instance_id == scp.instance_id
+    # Handles expose no instanceId getter (ADR-048); affinity is observed
+    # via misuse — a handle from one SCP is rejected by another.
+    other = scp_sdk.SCP()
+    with pytest.raises(scp_sdk.ScpError, match="SCP-PERM-3030"):
+        await scp_sdk.Context.send(other, ctx, payload)
+    other.shutdown(5.0)
 ```
 
 ### TypeScript (bun test)
@@ -311,7 +323,11 @@ describe("lifecycle", () => {
   test("context_create", async () => {
     const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, params);
-    expect(ctx.instanceId).toBe(scp.instanceId);
+    // Handles expose no instanceId getter (ADR-048); affinity is observed
+    // via misuse — a handle from one SCP is rejected by another.
+    const other = new SCP();
+    await expect(other.contextSend(ctx, payload)).rejects.toThrow(/SCP-PERM-3030/);
+    await other.shutdown(5);
   });
 });
 ```
@@ -339,7 +355,17 @@ final class LifecycleTests: XCTestCase {
     func testContextCreate() async throws {
         try scp.registerLocalDid(didString)
         let ctx = try await scp.contextCreate(params)
-        XCTAssertEqual(ctx.instanceId, scp.instanceId)
+        // Handles expose no instanceId getter (ADR-048 PROHIBITION:
+        // "Per-handle host-visible instanceId is NOT exposed"); affinity is
+        // observed via misuse — a handle from one SCP rejected by another.
+        let other = SCP()
+        do {
+            try await other.contextSend(ctx, payload)
+            XCTFail("expected cross-instance handle misuse to throw")
+        } catch let ScpError.Permission(_, code) {
+            XCTAssertEqual(code, "SCP-PERM-3030")
+        }
+        try await other.shutdown(timeout: 5)
     }
 }
 ```
@@ -370,7 +396,15 @@ class LifecycleTests {
     fun `context_create`() = runBlocking {
         scp.registerLocalDid(didString)
         val ctx = scp.contextCreate(params)
-        assertEquals(scp.instanceId, ctx.instanceId)
+        // Handles expose no instanceId getter (ADR-048 PROHIBITION:
+        // "Per-handle host-visible instanceId is NOT exposed"); affinity is
+        // observed via misuse — a handle from one SCP rejected by another.
+        val other = SCP()
+        val ex = assertFailsWith<ScpException.Permission> {
+            other.contextSend(ctx, payload)
+        }
+        assertEquals("SCP-PERM-3030", ex.code)
+        other.shutdown(5.seconds)
     }
 }
 ```

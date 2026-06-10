@@ -240,13 +240,6 @@ impl NapiRelayHandle {
     pub fn shutdown(&self) {
         self.inner.shutdown();
     }
-
-    /// Returns the id of the `SCP` instance that minted this handle, as a
-    /// base-10 string.
-    #[napi(getter, js_name = "instanceId")]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
-    }
 }
 
 impl Drop for NapiRelayHandle {
@@ -490,13 +483,6 @@ impl NapiNodeHandle {
     #[napi]
     pub async fn http_url(&self) -> Option<String> {
         self.inner.http_url().await
-    }
-
-    /// Returns the id of the `SCP` instance that minted this handle, as a
-    /// base-10 string.
-    #[napi(getter, js_name = "instanceId")]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
     }
 }
 

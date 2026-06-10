@@ -144,11 +144,7 @@ async fn dispatch_actor_inner(
             exporter_did,
             reply,
         } => handle_export_context_actor(state, deps, context_id, exporter_did, reply),
-        LifecycleCommand::ImportContext {
-            export,
-            verifying_key: _,
-            reply,
-        } => {
+        LifecycleCommand::ImportContext { export, reply, .. } => {
             // Bootstrap variant — see `CreateContext` arm comment.
             let err = ContextError::InvalidState(format!(
                 "ImportContext reached actor mailbox — context `{}` already has a registered actor",

@@ -1039,7 +1039,11 @@ pub fn execute_remove_member(
         .access_key_store
         .remove(context_id, did.as_ref());
 
-    state.pseudonym_registry.remove(did);
+    // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
+    // broadcast context (which carries no peer registry).
+    if let Some(reg) = state.routing.peer_registry_mut() {
+        reg.remove(did);
+    }
 
     emit(
         state,

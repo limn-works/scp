@@ -76,6 +76,7 @@ use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::crypto::access_keys::AccessKeyStore;
 use scp_protocol::crypto::sender_keys::{NonceDedup, SenderKey, SenderKeyStore};
 use scp_protocol::envelope::{ReorderBuffer, SequenceTracker};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::context::ContextHandle;
@@ -524,6 +525,155 @@ impl Default for ContextCryptoState {
 }
 
 // ---------------------------------------------------------------------------
+// ContextRouting — discriminated union over the §9.10.4 routing strategy
+// ---------------------------------------------------------------------------
+
+/// Per-context routing strategy (§9.10.4, §5.14).
+///
+/// This is the *routing axis*: how outbound application ciphertext is
+/// addressed at the transport layer. It is orthogonal to
+/// [`ContextModeState`] (the *crypto axis*: MLS vs. per-author broadcast
+/// keys). The two MUST agree — an [`ContextModeState::Encrypted`] context
+/// is always [`ContextRouting::Pseudonymous`] and a
+/// [`ContextModeState::Broadcast`] context is always
+/// [`ContextRouting::Broadcast`]. Construction enforces this and the
+/// encrypted send path `debug_assert!`s it.
+///
+/// # Why an enum instead of `Option<[u8; 32]>` + a map
+///
+/// The previous shape carried `local_pseudonym: Option<[u8; 32]>` plus a
+/// free-standing `pseudonym_registry`. That made "encrypted context with no
+/// pseudonym" representable, and the send path papered over it by unioning
+/// the shared `context_routing_id(context_id)` into the fan-out — a value any
+/// relay can derive from the public context ID. A relay that received the
+/// identical MLS blob at the shared RID could correlate every sender in the
+/// context, defeating the unlinkability the pseudonym scheme exists to
+/// provide. Making "encrypted-without-pseudonym" *unrepresentable* deletes
+/// that fallback at the type level: an encrypted context always carries a
+/// real `local_pseudonym`, and application data only ever fans out to known
+/// peer pseudonyms.
+///
+/// Exactly one variant is present per context; there is no `Option` or
+/// "unknown" state. Constructors build the correct variant from
+/// [`crate::context::state::ContextModeState`]-equivalent mode information at
+/// creation / join / restore time.
+///
+/// `DID` is `#[serde(transparent)]` over `String`, so the serialized wire
+/// format for `pseudonym_registry` is a plain string-keyed map — wire
+/// compatible with the historical `HashMap<String, [u8; 32]>` snapshot field.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ContextRouting {
+    /// Encrypted (MLS) context. The local member's pseudonym routing ID is
+    /// pre-derived at the FFI boundary via `KeyCustody::derive_pseudonym`.
+    /// Peers' pseudonyms are learned via `PseudonymAnnouncement` MLS
+    /// application messages and keyed by DID so `send_message` can fan out
+    /// to each member's pseudonym.
+    Pseudonymous {
+        /// This member's pseudonym-derived routing ID.
+        ///
+        /// Private: the only constructors are [`ContextRouting::for_mode`] and
+        /// deserialization. Keeping the field private means external code cannot
+        /// build a `Pseudonymous` variant with an arbitrary (e.g. zero or
+        /// reserved) pseudonym outside the constructor's discipline, so the
+        /// "encrypted-without-a-real-pseudonym is unrepresentable" guarantee is
+        /// type-enforced rather than convention. Serde can still (de)serialize a
+        /// private field — the persisted wire format is unchanged.
+        #[serde(with = "serde_bytes")]
+        local_pseudonym: [u8; 32],
+        /// Known members' pseudonym routing IDs, keyed by DID. Private for the
+        /// same reason as `local_pseudonym`; mutate via [`peer_registry_mut`].
+        ///
+        /// [`peer_registry_mut`]: ContextRouting::peer_registry_mut
+        pseudonym_registry: HashMap<DID, [u8; 32]>,
+    },
+    /// Broadcast context. Uses `SHA-256(context_id)` as the shared routing ID
+    /// per spec §5.14; no pseudonym state is retained. Broadcast contexts are
+    /// still content-encrypted (per-author AES-256-GCM) — this enum splits on
+    /// the *routing strategy*, not on whether encryption is in use.
+    Broadcast,
+}
+
+impl ContextRouting {
+    /// Builds the routing variant for a context from its broadcast flag and
+    /// the caller-derived local pseudonym (§9.10.4, §5.14).
+    ///
+    /// Broadcast contexts ignore `local_pseudonym` and carry no pseudonym
+    /// state. Encrypted contexts embed the pseudonym verbatim and start with
+    /// an empty peer registry (peers are learned via `PseudonymAnnouncement`).
+    ///
+    /// Threading a concrete `[u8; 32]` (not an `Option`) through the encrypted
+    /// branch makes "encrypted context with no pseudonym" unrepresentable —
+    /// the FFI boundary hard-fails pseudonym derivation for encrypted contexts
+    /// before this is ever reached, so there is no silent fall-back to the
+    /// shared routing ID.
+    #[must_use]
+    pub fn for_mode(is_broadcast: bool, local_pseudonym: [u8; 32]) -> Self {
+        if is_broadcast {
+            Self::Broadcast
+        } else {
+            Self::Pseudonymous {
+                local_pseudonym,
+                pseudonym_registry: HashMap::new(),
+            }
+        }
+    }
+
+    /// Returns the local member's pseudonym routing ID for a pseudonymous
+    /// (encrypted) context, or `None` for a broadcast context.
+    #[must_use]
+    pub const fn local_pseudonym(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Pseudonymous {
+                local_pseudonym, ..
+            } => Some(*local_pseudonym),
+            Self::Broadcast => None,
+        }
+    }
+
+    /// Returns a read-only view of the peer pseudonym registry for a
+    /// pseudonymous (encrypted) context, or `None` for a broadcast context.
+    #[must_use]
+    pub const fn peer_registry(&self) -> Option<&HashMap<DID, [u8; 32]>> {
+        match self {
+            Self::Pseudonymous {
+                pseudonym_registry, ..
+            } => Some(pseudonym_registry),
+            Self::Broadcast => None,
+        }
+    }
+
+    /// Returns a mutable view of the peer pseudonym registry for a
+    /// pseudonymous (encrypted) context, or `None` for a broadcast context.
+    #[must_use]
+    pub const fn peer_registry_mut(&mut self) -> Option<&mut HashMap<DID, [u8; 32]>> {
+        match self {
+            Self::Pseudonymous {
+                pseudonym_registry, ..
+            } => Some(pseudonym_registry),
+            Self::Broadcast => None,
+        }
+    }
+
+    /// Returns `true` if this is a broadcast-routed context.
+    #[must_use]
+    pub const fn is_broadcast(&self) -> bool {
+        matches!(self, Self::Broadcast)
+    }
+
+    /// Sets the local member's pseudonym. No-op on a broadcast context, which
+    /// carries no pseudonym state.
+    pub const fn set_local_pseudonym(&mut self, p: [u8; 32]) {
+        if let Self::Pseudonymous {
+            local_pseudonym, ..
+        } = self
+        {
+            *local_pseudonym = p;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ContextModeState — discriminated union over encrypted / broadcast
 // ---------------------------------------------------------------------------
 
@@ -727,17 +877,16 @@ pub struct PerContextState {
     pub(crate) ttl: TtlState,
 
     // -----------------------------------------------------------------
-    // Pseudonyms (§9.10.4)
+    // Pseudonyms / routing (§9.10.4, §5.14)
     // -----------------------------------------------------------------
-    /// This member's pseudonym-derived routing ID for this context
-    /// (§9.10.4). `None` if the bridge did not supply a pseudonym.
-    /// Mirrors legacy `state::PerContextState::local_pseudonym`.
-    pub local_pseudonym: Option<[u8; 32]>,
-
-    /// Known members' pseudonym routing IDs, learned via
-    /// `PseudonymAnnouncement` MLS application messages. Mirrors legacy
-    /// `state::PerContextState::pseudonym_registry`.
-    pub pseudonym_registry: HashMap<DID, [u8; 32]>,
+    /// Per-context routing strategy (§9.10.4, §5.14).
+    ///
+    /// Encrypted contexts carry the member's pre-derived pseudonym routing
+    /// ID and a registry of peer pseudonyms keyed by DID. Broadcast contexts
+    /// use a shared routing ID and carry no pseudonym state. The variant is
+    /// fixed at creation / join / restore time and MUST agree with
+    /// [`Self::mode`](ContextModeState).
+    pub routing: ContextRouting,
 
     // -----------------------------------------------------------------
     // Anti-replay + reorder buffers (§9.8.2, §9.8.5)
@@ -918,6 +1067,18 @@ impl PerContextState {
             context_id_str.to_owned(),
             scp_protocol::context::ContextParams::default(),
         );
+        // Routing axis mirrors the crypto axis: encrypted ⇒ pseudonymous,
+        // broadcast ⇒ broadcast. Test fixtures start the pseudonymous
+        // registry empty with a zero local pseudonym; a real local pseudonym
+        // is supplied by the FFI boundary in production constructors.
+        let routing = if mode.is_broadcast() {
+            ContextRouting::Broadcast
+        } else {
+            ContextRouting::Pseudonymous {
+                local_pseudonym: [0u8; 32],
+                pseudonym_registry: HashMap::new(),
+            }
+        };
         Self {
             context_id,
             created_at,
@@ -935,8 +1096,7 @@ impl PerContextState {
             epoch: EpochState::new_fresh_for_actor(context_id_str),
             access: AccessControlState::new_empty_for_actor(),
             ttl: TtlState::new_fresh_for_actor(),
-            local_pseudonym: None,
-            pseudonym_registry: HashMap::new(),
+            routing,
             sequence_tracker: SequenceTracker::new(),
             reorder_buffer: ReorderBuffer::default(),
             pending_commits: VecDeque::new(),
@@ -997,6 +1157,80 @@ mod tests {
 
     fn test_admin() -> DID {
         DID("did:example:admin".to_owned())
+    }
+
+    /// §9.10.4: `ContextRouting::for_mode` makes "encrypted context with no
+    /// pseudonym" unrepresentable — the encrypted branch always carries a
+    /// concrete `[u8; 32]`, never an `Option`, and exposes peer-registry
+    /// accessors. The broadcast branch carries no pseudonym state at all.
+    #[test]
+    fn context_routing_for_mode_encrypted_carries_pseudonym_and_registry() {
+        let pseudonym = [11u8; 32];
+        let routing = ContextRouting::for_mode(false, pseudonym);
+        assert!(!routing.is_broadcast());
+        assert_eq!(routing.local_pseudonym(), Some(pseudonym));
+        assert!(routing.peer_registry().is_some_and(HashMap::is_empty));
+    }
+
+    #[test]
+    fn context_routing_for_mode_broadcast_has_no_pseudonym_state() {
+        let routing = ContextRouting::for_mode(true, [11u8; 32]);
+        assert!(routing.is_broadcast());
+        assert_eq!(routing.local_pseudonym(), None);
+        assert!(routing.peer_registry().is_none());
+    }
+
+    #[test]
+    fn set_local_pseudonym_updates_encrypted_noops_broadcast() {
+        let mut enc = ContextRouting::for_mode(false, [1u8; 32]);
+        enc.set_local_pseudonym([2u8; 32]);
+        assert_eq!(enc.local_pseudonym(), Some([2u8; 32]));
+
+        let mut bc = ContextRouting::Broadcast;
+        bc.set_local_pseudonym([2u8; 32]);
+        assert!(bc.is_broadcast(), "broadcast routing has no pseudonym slot");
+        assert_eq!(bc.local_pseudonym(), None);
+    }
+
+    #[test]
+    fn peer_registry_mut_inserts_for_encrypted_none_for_broadcast() {
+        let mut enc = ContextRouting::for_mode(false, [1u8; 32]);
+        enc.peer_registry_mut()
+            .expect("encrypted has a registry")
+            .insert(DID("did:key:peer".to_owned()), [4u8; 32]);
+        assert_eq!(enc.peer_registry().map(HashMap::len), Some(1));
+
+        let mut bc = ContextRouting::Broadcast;
+        assert!(bc.peer_registry_mut().is_none());
+    }
+
+    /// §9.10.4: `ContextRouting` round-trips through the snapshot serde format.
+    /// The `DID`-keyed registry serializes with plain string keys (DID is
+    /// `serde(transparent)`), so it is wire-compatible with the historical
+    /// `HashMap<String, [u8; 32]>` snapshot field.
+    #[test]
+    fn context_routing_serde_roundtrip() {
+        let mut routing = ContextRouting::for_mode(false, [5u8; 32]);
+        routing
+            .peer_registry_mut()
+            .expect("registry")
+            .insert(DID("did:key:peer".to_owned()), [6u8; 32]);
+        let json = serde_json::to_string(&routing).expect("serialize");
+        assert!(
+            json.contains("did:key:peer"),
+            "registry key serializes as a plain DID string: {json}"
+        );
+        let back: ContextRouting = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.local_pseudonym(), Some([5u8; 32]));
+        assert_eq!(
+            back.peer_registry()
+                .and_then(|r| r.get(&DID("did:key:peer".to_owned())).copied()),
+            Some([6u8; 32])
+        );
+
+        let bc_json = serde_json::to_string(&ContextRouting::Broadcast).expect("serialize");
+        let bc_back: ContextRouting = serde_json::from_str(&bc_json).expect("deserialize");
+        assert!(bc_back.is_broadcast());
     }
 
     #[test]
@@ -1073,8 +1307,7 @@ mod tests {
             epoch,
             access,
             ttl,
-            local_pseudonym,
-            pseudonym_registry,
+            routing,
             sequence_tracker,
             reorder_buffer,
             pending_commits,
@@ -1119,9 +1352,11 @@ mod tests {
         let _ = &access;
         let _ = &ttl;
 
-        // Pseudonyms.
-        assert!(local_pseudonym.is_none());
-        assert!(pseudonym_registry.is_empty());
+        // Routing — encrypted contexts are pseudonymous with an empty
+        // peer registry and a (zero, in the test fixture) local pseudonym.
+        assert!(!routing.is_broadcast());
+        assert!(routing.local_pseudonym().is_some());
+        assert!(routing.peer_registry().is_some_and(HashMap::is_empty));
 
         // Anti-replay + reorder buffers.
         let _ = &sequence_tracker;
@@ -1172,8 +1407,7 @@ mod tests {
             epoch: _,
             access: _,
             ttl: _,
-            local_pseudonym: _,
-            pseudonym_registry: _,
+            routing,
             sequence_tracker: _,
             reorder_buffer: _,
             pending_commits: _,
@@ -1189,6 +1423,12 @@ mod tests {
             lifecycle_state: _,
             mode,
         } = s;
+
+        // Routing axis must agree with the crypto axis: broadcast mode ⇒
+        // broadcast routing, with no pseudonym state.
+        assert!(routing.is_broadcast());
+        assert!(routing.local_pseudonym().is_none());
+        assert!(routing.peer_registry().is_none());
 
         match mode {
             ContextModeState::Broadcast(b) => {

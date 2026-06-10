@@ -231,7 +231,7 @@ if (!scpAvailable) {
         // Import verifies the snapshot signature against the creator's #active
         // verifying key. Success proves the callback-custody-produced signature
         // is spec-valid.
-        const importedContextId = await scp.contextImport(data);
+        const importedContextId = await scp.contextImport(data, identity.did);
         expect(typeof importedContextId).toBe("string");
         expect(importedContextId.length).toBeGreaterThan(0);
       } finally {
@@ -263,7 +263,7 @@ if (!scpAvailable) {
 
         await scp.contextClose(ctx._rawHandle, identity.did);
 
-        const importedContextId = await scp.contextImport(data);
+        const importedContextId = await scp.contextImport(data, identity.did);
         expect(typeof importedContextId).toBe("string");
         expect(importedContextId.length).toBeGreaterThan(0);
       } finally {

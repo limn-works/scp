@@ -109,11 +109,23 @@ const MAX_RETAINED_CHECKPOINTS: usize = 100;
 /// Returns the local member's pseudonym routing ID for a context
 /// (§9.10.4).
 ///
-/// Pure read — no `deps` reach. The actor's `state` already carries
-/// the per-context pseudonym slot.
-#[must_use]
-pub const fn local_pseudonym(state: &PerContextState) -> Option<[u8; 32]> {
-    state.local_pseudonym
+/// Pure read — no `deps` reach. The actor's `state` carries the per-context
+/// routing axis. Encrypted contexts return their pre-derived pseudonym;
+/// broadcast contexts have no per-member pseudonym (spec §5.14) and return
+/// [`ContextError::NotPseudonymousContext`] so callers can distinguish
+/// "broadcast — no pseudonym" from a value-present read rather than silently
+/// papering over the two with `None`.
+///
+/// # Errors
+///
+/// Returns [`ContextError::NotPseudonymousContext`] for a broadcast context.
+pub fn local_pseudonym(state: &PerContextState) -> Result<[u8; 32], ContextError> {
+    state
+        .routing
+        .local_pseudonym()
+        .ok_or_else(|| ContextError::NotPseudonymousContext {
+            context_id: state.handle.context_id().to_owned(),
+        })
 }
 
 /// Returns the broadcast key and epoch for an author in a broadcast

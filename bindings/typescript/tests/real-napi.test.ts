@@ -649,10 +649,18 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
     test("queries events with a MessageSent filter after send (relay transport)", async () => {
       const identity = await napi.identityCreate("in_memory");
+      const bob = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
-        JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write", "member:invite", "role:assign"],
+        }),
       );
+      // §9.10.4: a lone-member encrypted send is a no-op that records no
+      // MessageSent event. Add a peer and seed its per-member pseudonym so the
+      // send actually fans out and the MessageSent event is recorded.
+      await napi.contextJoin(ctx, bob.did);
+      await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
       await napi.contextSend(ctx, identity.did, new TextEncoder().encode("msg"));
 
       const events = await napi.eventLogQuery(ctx, { eventType: "MessageSent" });
@@ -1139,6 +1147,11 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(await napi.contextMemberCount(ctx)).toBe(2);
       expect(await napi.contextIsMember(ctx, bob.did)).toBe(true);
 
+      // Seed Bob's per-member pseudonym so the multi-member fan-out is
+      // registered; otherwise the send fails closed with SCP-CTX-2095
+      // ("pseudonym registry empty") per PR #1744 §9.10.4.
+      await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
+
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("hello bob"));
 
       const events = await napi.eventLogQuery(ctx, undefined);
@@ -1623,14 +1636,15 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // allows reimport.
       await napi.contextClose(ctx, identity.did);
 
-      const importedContextId = await napi.contextImport(data);
+      const importedContextId = await napi.contextImport(data, identity.did);
       expect(typeof importedContextId).toBe("string");
       expect(importedContextId.length).toBeGreaterThan(0);
     });
 
     test("import rejects invalid data", async () => {
+      const identity = await napi.identityCreate("in_memory");
       const invalidData = new Uint8Array([0, 1, 2, 3]);
-      await expect(napi.contextImport(invalidData)).rejects.toThrow();
+      await expect(napi.contextImport(invalidData, identity.did)).rejects.toThrow();
     });
 
     // Spec §23.16.8: the verifying key is resolved from the snapshot's
@@ -1658,7 +1672,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
       // Untampered self-export must verify and import: the snapshot signature
       // checks against the creator's local-custody #active key.
-      const importedContextId = await napi.contextImport(data);
+      const importedContextId = await napi.contextImport(data, identity.did);
       expect(typeof importedContextId).toBe("string");
       expect(importedContextId.length).toBeGreaterThan(0);
     });
@@ -1703,7 +1717,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await expect(
         (async () => {
           try {
-            await napi.contextImport(tampered);
+            await napi.contextImport(tampered, identity.did);
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             if (message.includes("SCP-CTX-2001")) {

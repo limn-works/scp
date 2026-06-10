@@ -631,8 +631,25 @@ export class SCP {
       // `bigint` (the field's declared `ts_type`).
       deriveRotatablePseudonym: ([keyId, contextId, epoch]: [string, number[], bigint]): number[] =>
         Array.from(provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch)),
-      exportSigningKeyBytes: (keyId: string): number[] =>
-        Array.from(provider.exportSigningKeyBytes(keyId)),
+      // A sign-only / hardware / secure-enclave custody throws here to signal it
+      // cannot export raw private-key bytes (ADR-006). Translate that into the
+      // native error channel by returning an empty array (the Rust bridge's
+      // 32-byte check then yields `Err`): §9.10.4 best-effort paths — e.g. the
+      // post-create / post-import `PseudonymAnnouncement`, which signs via the
+      // exported key — skip gracefully, while required callers surface a custody
+      // error. Returning a value rather than re-throwing keeps the provider's
+      // synchronous exception from leaking into the host's unhandled-exception
+      // tracking (which would spuriously fail tests) while preserving the
+      // fail-closed contract. Signing itself never uses this path — it goes
+      // through `KeyCustody::sign` — so sign-only custody can still produce a
+      // signed export.
+      exportSigningKeyBytes: (keyId: string): number[] => {
+        try {
+          return Array.from(provider.exportSigningKeyBytes(keyId));
+        } catch {
+          return [];
+        }
+      },
       custodyType: (keyId: string): string => provider.custodyType(keyId),
     };
     const raw = await (
@@ -909,6 +926,28 @@ export class SCP {
     );
   }
 
+  /**
+   * Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4) into
+   * this bridge's supervisor, simulating a delivered pseudonym announcement so
+   * multi-member encrypted sends do not fail closed with `SCP-CTX-2095`.
+   *
+   * Only available on builds compiled with the `allow_in_memory_custody`
+   * feature; never present in production builds.
+   */
+  async contextSeedPeerPseudonym(
+    handle: unknown,
+    peerDid: string,
+    pseudonym: Uint8Array | Buffer,
+  ): Promise<void> {
+    await (
+      this.#native.contextSeedPeerPseudonym as (
+        h: unknown,
+        p: string,
+        ps: Uint8Array | Buffer,
+      ) => Promise<void>
+    )(handle, peerDid, pseudonym);
+  }
+
   async contextLeave(handle: unknown, identityDid: string): Promise<void> {
     await (this.#native.contextLeave as (h: unknown, d: string) => Promise<void>)(
       handle,
@@ -1014,13 +1053,26 @@ export class SCP {
     return new Uint8Array(raw);
   }
 
-  async contextImport(data: Uint8Array | readonly number[]): Promise<string> {
+  /**
+   * Imports a context from a signed export (ADR-050) and re-homes it under the
+   * local member's identity.
+   *
+   * @param data Serialized `ContextExport` bytes, as produced by
+   *   {@link contextExport}.
+   * @param importerDid DID of the LOCAL member re-homing the context — the
+   *   caller's own identity, distinct from the snapshot creator. Used to derive
+   *   this member's own per-context pseudonym (§9.10.4). Must already be a
+   *   member of the imported snapshot, otherwise the import is rejected with
+   *   `SCP-CTX-2092`.
+   * @returns The imported context's id.
+   */
+  async contextImport(data: Uint8Array | readonly number[], importerDid: string): Promise<string> {
     const dataArray = ArrayBuffer.isView(data)
       ? Array.from(data as Uint8Array)
       : (data as readonly number[]);
-    return await (this.#native.contextImport as (d: readonly number[]) => Promise<string>)(
-      dataArray,
-    );
+    return await (
+      this.#native.contextImport as (d: readonly number[], did: string) => Promise<string>
+    )(dataArray, importerDid);
   }
 
   contextSetEconomicPolicy(handle: unknown, policyJson: string): void {
@@ -2135,6 +2187,28 @@ export class SCP {
       contextId,
       memberDid,
     );
+  }
+
+  /**
+   * Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4) into a
+   * full-stack node's supervisor, simulating a delivered pseudonym
+   * announcement so multi-member encrypted sends do not fail closed with
+   * `SCP-CTX-2095`.
+   */
+  fullstackSeedPeerPseudonym(
+    node: unknown,
+    contextId: string,
+    peerDid: string,
+    pseudonym: Uint8Array | Buffer,
+  ): void {
+    (
+      this.#native.fullstackSeedPeerPseudonym as (
+        n: unknown,
+        c: string,
+        p: string,
+        ps: Uint8Array | Buffer,
+      ) => void
+    )(node, contextId, peerDid, pseudonym);
   }
 
   // ───────────────────────────────────────────────────────────────────────

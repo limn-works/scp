@@ -181,6 +181,8 @@ class TestTwoPartyEncryptedMessaging:
         assert alice_did in members
         assert bob_did in members
 
+        scp._native.context_seed_peer_pseudonym(handle, bob_did, bytes([0x42] * 32))
+
         # Alice sends -- exercises the full pipeline:
         # inner envelope creation (Ed25519 signing) -> MLS encryption ->
         # sender key encryption -> outer envelope -> relay publish.
@@ -200,6 +202,9 @@ class TestTwoPartyEncryptedMessaging:
         )
 
         scp._native.context_join(handle, bob_did)
+
+        scp._native.context_seed_peer_pseudonym(handle, bob_did, bytes([0x42] * 32))
+        scp._native.context_seed_peer_pseudonym(handle, alice_did, bytes([0x41] * 32))
 
         # Alice sends
         scp._native.context_send(handle, alice_did, b"message from Alice")
@@ -235,6 +240,10 @@ class TestThreePartyEncryptedMessaging:
 
         assert scp._native.context_member_count(handle) == 3
 
+        scp._native.context_seed_peer_pseudonym(handle, bob_did, bytes([0x42] * 32))
+        scp._native.context_seed_peer_pseudonym(handle, carol_did, bytes([0x43] * 32))
+        scp._native.context_seed_peer_pseudonym(handle, alice_did, bytes([0x41] * 32))
+
         # Each participant sends
         for did, name in [(alice_did, "Alice"), (bob_did, "Bob"), (carol_did, "Carol")]:
             scp._native.context_send(handle, did, f"{name} says hello".encode())
@@ -262,6 +271,8 @@ class TestMultipleMessages:
         )
 
         scp._native.context_join(handle, bob_did)
+
+        scp._native.context_seed_peer_pseudonym(handle, bob_did, bytes([0x42] * 32))
 
         for i in range(5):
             scp._native.context_send(handle, alice_did, f"message {i}".encode())
@@ -481,6 +492,8 @@ class TestContextLifecycleWithRelay:
         # Join
         scp._native.context_join(handle, bob_did)
         assert scp._native.context_member_count(handle) == 2
+
+        scp._native.context_seed_peer_pseudonym(handle, bob_did, bytes([0x42] * 32))
 
         # Send
         scp._native.context_send(handle, alice_did, b"lifecycle test message")

@@ -74,6 +74,8 @@ class TestAliceToBobEncryptedRoundtrip:
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
 
+        scp._native.fullstack_seed_peer_pseudonym(alice, ctx_id, bob.did, bytes([0x42] * 32))
+
         plaintext = b"Hello from Alice via Python!"
         ciphertext = scp._native.fullstack_send_message(alice, ctx_id, plaintext)
 
@@ -128,6 +130,9 @@ class TestThreePartyGroup:
         scp._native.fullstack_add_member(alice, ctx_id, carol.did)
         scp._native.fullstack_join_from_welcome(carol, ctx_id)
 
+        scp._native.fullstack_seed_peer_pseudonym(alice, ctx_id, bob.did, bytes([0x42] * 32))
+        scp._native.fullstack_seed_peer_pseudonym(alice, ctx_id, carol.did, bytes([0x43] * 32))
+
         plaintext = b"Hello everyone from Python!"
         ciphertext = scp._native.fullstack_send_message(alice, ctx_id, plaintext)
 
@@ -152,6 +157,8 @@ class TestMultipleMessagesRoundtrip:
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
 
+        scp._native.fullstack_seed_peer_pseudonym(alice, ctx_id, bob.did, bytes([0x42] * 32))
+
         for i in range(5):
             plaintext = f"Message number {i}".encode()
             ciphertext = scp._native.fullstack_send_message(alice, ctx_id, plaintext)
@@ -171,22 +178,26 @@ class TestRemovedMemberCannotDecrypt:
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
 
+        scp._native.fullstack_seed_peer_pseudonym(alice, ctx_id, bob.did, bytes([0x42] * 32))
+
         # Bob can decrypt a pre-removal message.
         pre_msg = b"Before removal"
         pre_ct = scp._native.fullstack_send_message(alice, ctx_id, pre_msg)
         pre_dec = scp._native.fullstack_decrypt_message(bob, ctx_id, pre_ct, alice.did)
         assert bytes(pre_dec) == pre_msg
 
-        # Remove Bob.
+        # Remove Bob. Removal purges his pseudonym from the peer registry
+        # (§9.10.4), leaving Alice the lone member.
         scp._native.fullstack_remove_member(alice, ctx_id, bob.did)
 
-        # Alice sends after removal.
+        # §9.10.4 forward secrecy: a post-removal app-data send addresses no
+        # peer (Alice is now alone), so it is a no-op that produces NO ciphertext
+        # — Bob receives no post-removal application data at all, a strictly
+        # stronger guarantee than "Bob gets an undecryptable blob". The send
+        # helper surfaces the lone-member no-op as "no ciphertext captured".
         post_msg = b"After removal"
-        post_ct = scp._native.fullstack_send_message(alice, ctx_id, post_msg)
-
-        # Bob MUST NOT be able to decrypt (MLS forward secrecy).
-        with pytest.raises(RuntimeError):
-            scp._native.fullstack_decrypt_message(bob, ctx_id, post_ct, alice.did)
+        with pytest.raises(RuntimeError, match="no ciphertext captured"):
+            scp._native.fullstack_send_message(alice, ctx_id, post_msg)
 
 
 class TestCiphertextNonDeterministic:
@@ -200,6 +211,8 @@ class TestCiphertextNonDeterministic:
 
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
+
+        scp._native.fullstack_seed_peer_pseudonym(alice, ctx_id, bob.did, bytes([0x42] * 32))
 
         plaintext = b"same message twice"
 

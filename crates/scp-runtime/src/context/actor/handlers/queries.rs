@@ -81,8 +81,11 @@ pub(crate) async fn dispatch(
             context_id: _,
             reply,
         } => {
+            // §9.10.4: typed read — `Ok([u8; 32])` for encrypted contexts,
+            // `Err(NotPseudonymousContext)` for broadcast. Forward the Result
+            // verbatim so the typed error reaches the caller.
             let answer = queries_helpers::local_pseudonym(state);
-            let _ = reply.send(Ok(answer));
+            let _ = reply.send(answer);
             Outcome::ok(())
         }
 

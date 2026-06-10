@@ -1262,7 +1262,7 @@ async fn context_export_self_import_round_trip_succeeds() {
         .await
         .expect("context_export");
 
-    scp.context_close(handle.clone(), alice)
+    scp.context_close(handle.clone(), alice.clone())
         .await
         .expect("context_close");
 
@@ -1271,7 +1271,7 @@ async fn context_export_self_import_round_trip_succeeds() {
     // even though the DID was never published — exercising §23.16.8 step 1.
     // A valid signature MUST pass verification (no SCP-CTX-2093); a residual
     // lifecycle rejection is acceptable, a signature rejection is NOT.
-    match scp.context_import(exported).await {
+    match scp.context_import(exported, alice).await {
         Ok(imported_id) => assert_eq!(
             imported_id, context_id,
             "imported context id must match the exported context id"
@@ -1311,7 +1311,7 @@ async fn context_import_rejects_tampered_signature_with_2093() {
     // on "already exists" AFTER the signature check, but we want the signature
     // check itself to be the rejection cause. (Signature verification runs
     // first in import_context, so this ordering is robust either way.)
-    scp.context_close(handle.clone(), alice)
+    scp.context_close(handle.clone(), alice.clone())
         .await
         .expect("context_close");
 
@@ -1326,7 +1326,7 @@ async fn context_import_rejects_tampered_signature_with_2093() {
         .expect("re-serialize tampered export");
 
     let err = scp
-        .context_import(tampered)
+        .context_import(tampered, alice)
         .await
         .expect_err("tampered signature must be rejected");
 

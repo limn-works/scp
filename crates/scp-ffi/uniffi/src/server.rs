@@ -243,21 +243,34 @@ pub struct RelayHandle {
     inner: server::RunningRelay,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
-    /// every `#[uniffi::export]` entry that accepts a `RelayHandle`.
+    /// Affinity substrate: retained so that any future `#[uniffi::export]`
+    /// entry accepting a `RelayHandle` can gate on
+    /// `CoreFields::check_handle(handle.instance_id())`. No such entry exists
+    /// today (`RelayHandle` is only ever returned, never passed back in), so
+    /// the field has no live reader — hence `#[allow(dead_code)]`. It is NOT
+    /// host-visible (see ADR-048 — per-handle `instanceId` is not exported).
+    #[allow(dead_code)]
     pub(crate) instance_id: u64,
+}
+
+impl RelayHandle {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    ///
+    /// Rust-internal affinity substrate consumed by
+    /// `CoreFields::check_handle`. No caller passes a `RelayHandle` back
+    /// across the FFI boundary yet, so this has no live caller — hence
+    /// `#[allow(dead_code)]`. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
 }
 
 #[uniffi::export]
 impl RelayHandle {
-    /// Returns the monotonic identifier of the bridge instance that minted
-    /// this handle.
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-
     /// Returns the WebSocket URL clients should connect to
     /// (e.g., `ws://127.0.0.1:12345/scp/v1`).
     #[must_use]
@@ -315,23 +328,35 @@ pub struct NodeHandle {
     pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed at every `#[uniffi::export]` entry that accepts a
-    /// `NodeHandle` (e.g. `commit_deploy`, `rollback_deploy`,
-    /// `enable_site_projection`) via a direct
-    /// `self.bi.core.check_handle(...)` comparison.
+    /// Affinity substrate: retained so that any future `#[uniffi::export]`
+    /// entry accepting a `NodeHandle` can gate on
+    /// `CoreFields::check_handle(handle.instance_id())`. The existing
+    /// `NodeHandle` methods reach back through the owning `bi` Arc and never
+    /// re-check the minting instance via this field, so it has no live reader
+    /// today — hence `#[allow(dead_code)]`. It is NOT host-visible (see
+    /// ADR-048 — per-handle `instanceId` is not exported).
+    #[allow(dead_code)]
     pub(crate) instance_id: u64,
+}
+
+impl NodeHandle {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    ///
+    /// Rust-internal affinity substrate consumed by
+    /// `CoreFields::check_handle`. No caller passes a `NodeHandle` back across
+    /// the FFI boundary for an affinity check yet, so this has no live caller
+    /// — hence `#[allow(dead_code)]`. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
 }
 
 #[uniffi::export]
 impl NodeHandle {
-    /// Returns the monotonic identifier of the bridge instance that minted
-    /// this handle.
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-
     /// Returns the WebSocket URL clients should connect to for this node's
     /// relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
     #[must_use]

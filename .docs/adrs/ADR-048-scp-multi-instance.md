@@ -402,19 +402,44 @@ PR 3 closes the following issues:
 - **#1678** — Async `resume` + multi-relay reconnect.
 - **#1342** — UniFFI real crypto; `FfiBridgeCrypto` deleted.
 
-### Non-SCP handle `instanceId` getters — known low-risk enumeration surface
+### Per-handle host-visible `instanceId` is NOT exposed on any bridge (PROHIBITION)
 
-Every NAPI handle type (`NapiContextHandle`, `NapiIdentity`, `NapiUcanToken`, `NapiMcpServerHandle`, `NapiMcpClientHandle`, `NapiTestingHandle`, …) exposes a JS-visible `instanceId` getter via `#[napi(getter, js_name = "instanceId")]`. The getter returns the u64 as a JS string (u64 exceeds `Number.MAX_SAFE_INTEGER`) so the handle-affinity macro on the Rust side can read the value via `handle.instance_id()` — a separate inherent method used by `napi_check_handle!`.
+**Rule.** Non-`SCP`/`Scp` handle types (`ContextHandle`, `Identity`, `UcanToken`,
+`TransportManager`, `RelayHandle`, `NodeHandle`, the MCP server/client handles, the
+testing handle, …) MUST NOT expose a host-visible `instanceId` to JS, Swift, Kotlin, or
+Python. Concretely:
 
-The getter is **redundant with the Rust-side method for affinity enforcement** — the macro calls the inherent `instance_id()` method on the Rust type, not the JS property. The getter exists so JS-side test harnesses and diagnostic code can correlate handles to the `Scp` instance that minted them.
+- NAPI: no `#[napi(getter, js_name = "instanceId")]` on any handle type except the `Scp`
+  class itself.
+- UniFFI: no `#[uniffi::export]` on any per-handle `instance_id()` method except the
+  `Scp` class's. The inherent Rust method stays (un-exported, `pub(crate)`) wherever an
+  affinity call site consumes it; where no call site exists yet it is retained as
+  affinity substrate under `#[allow(dead_code)]`.
+- Only the `SCP`/`Scp` class exposes `instanceId` — the real, tested per-instance
+  identifier used to correlate handles to the instance that minted them.
 
-A defence-in-depth hardening would either:
-- mark the getters `#[napi(getter, skip)]` so the JS property is invisible at runtime (the Rust-side affinity check still sees the u64), or
-- gate the getter behind an authorisation check that verifies the caller holds the `Scp` instance that minted the handle.
+**Why affinity does not need host exposure.** Handle affinity is enforced entirely on the
+Rust side: every `SCP` method that accepts a handle calls
+`CoreFields::check_handle(handle.instance_id())` (NAPI: the `napi_check_handle!` macro),
+where `handle.instance_id()` is the *inherent* Rust method reading the
+`pub(crate) instance_id: u64` field. A mismatch surfaces to the host as
+`SCP-PERM-3030`. None of this requires the value to be readable from the host language —
+the host never needs to see the `u64`, only to receive the `SCP-PERM-3030` error when it
+misuses a handle across instances.
 
-Both impose friction on legitimate tooling (e.g. `handle.instanceId === scp.instanceId` assertions in SDK tests) without reducing the risk surface meaningfully: an attacker who can execute JS in-process already has FFI reach, so enumerating `instanceId` across handles yields no capability they do not already have.
-
-Documented here so future security reviewers don't re-litigate: the getter stays. Any migration must coordinate with the SDK test harnesses and the handle-affinity macro. PR #1690 retro LOW.
+**Supersedes the prior "the getter stays" note.** An earlier revision of this ADR
+documented the NAPI per-handle `instanceId` getters as a "known low-risk enumeration
+surface" and concluded they should stay, on the reasoning that an in-process attacker
+already has FFI reach so enumeration yields no new capability. That note is **superseded**.
+The getters/exports are removed because they were never designed (no plan or story
+specified them), had **zero production consumers** (the only NAPI consumer was a single
+tautological SDK test asserting `handle.instanceId === scp.instanceId`; UniFFI had none),
+and are **not affinity-load-bearing** (the inherent method + `check_handle` do all the
+work). Removing an undesigned, unconsumed, non-load-bearing surface is strictly better
+than retaining it — the "no new capability" argument justified keeping it but never
+required it. The history is preserved here so future reviewers see the reversal and its
+rationale rather than re-litigating. PR #1690 retro LOW (original note); superseded by the
+per-handle `instanceId` removal.
 
 ### `check-no-bridge-globals.sh` widened to function-local sharing primitives (PR #1699 review follow-up)
 

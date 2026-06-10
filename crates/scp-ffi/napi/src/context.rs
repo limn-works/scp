@@ -275,14 +275,6 @@ impl NapiContextHandle {
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
     }
-
-    /// Returns the id of the `SCP` instance that minted this handle, as a
-    /// base-10 string (u64 serialized as string to survive JS number limits).
-    #[napi(getter, js_name = "instanceId")]
-    #[must_use]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
-    }
 }
 
 impl NapiContextHandle {
@@ -385,23 +377,97 @@ pub struct NapiMessage {
 // Helper — pseudonym derivation (SCP-214 criterion 5)
 // ---------------------------------------------------------------------------
 
-/// Derives the pseudonym routing ID for a context (§9.10.4).
+/// Derives a member's per-context pseudonym routing ID for ENCRYPTED contexts
+/// (§9.10.4).
 ///
-/// Returns the 32-byte Ed25519 public key derived via
-/// `KeyCustody::derive_pseudonym`. The pseudonym is used as the member's
-/// per-context routing ID for encrypted contexts, replacing the shared
-/// `context_routing_id` to prevent relay-side correlation.
-async fn derive_context_pseudonym(identity: &NapiIdentity, context_id: &str) -> Option<[u8; 32]> {
-    let (scp_id, custody) = (
-        identity.inner.scp_identity.as_ref()?,
-        identity.inner.in_memory_custody.as_ref()?,
-    );
+/// An encrypted context with no real pseudonym is silently unusable — the
+/// member cannot send application data on a pseudonymous routing axis — so
+/// derivation failure MUST be a typed error rather than a swallowed `None`.
+/// Codes match the `PyO3` reference bridge exactly so the same failure yields the
+/// same `.code` across bridges: missing key material → SCP-IDENT-1054,
+/// derivation failure → SCP-IDENT-1055, wrong key length → SCP-IDENT-1057.
+///
+/// Un-gated for production (#1780): pseudonym derivation runs through retained
+/// callback custody (OS-keychain/HSM), exactly like the rest of the signing
+/// chain. The fail-closed boundary is the ABSENCE of retained custody
+/// (SCP-IDENT-1054), not a build feature.
+async fn derive_context_pseudonym_required(
+    identity: &NapiIdentity,
+    context_id: &str,
+) -> napi::Result<[u8; 32]> {
+    let (Some(scp_id), Some(custody)) = (
+        identity.inner.scp_identity.as_ref(),
+        identity.inner.in_memory_custody.as_ref(),
+    ) else {
+        return Err(NapiError::from(ScpNapiError::Identity {
+            message: "cannot derive pseudonym without retained key material — \
+                      encrypted contexts require a real per-member routing ID"
+                .to_owned(),
+            code: codes::IDENT_1054.to_owned(),
+        }));
+    };
+    derive_pseudonym_bytes(custody, &scp_id.identity_key, context_id).await
+}
+
+/// Core pseudonym-derivation sequence shared by every NAPI entry point.
+///
+/// Holds the single authoritative definition of the derivation-failure code
+/// contract (derivation failure → SCP-IDENT-1055, wrong key length →
+/// SCP-IDENT-1057). The missing-key-material code (SCP-IDENT-1054) is surfaced
+/// by the callers that resolve custody (which know whether the lookup came from
+/// a handle or the registry). Centralizing here mirrors the `PyO3` reference
+/// bridge so the 1054/1055/1057 contract cannot drift across create / join /
+/// import.
+async fn derive_pseudonym_bytes(
+    custody: &crate::custody::NapiKeyCustody,
+    identity_key: &scp_platform::KeyHandle,
+    context_id: &str,
+) -> napi::Result<[u8; 32]> {
     let pseudonym = custody
-        .derive_pseudonym(&scp_id.identity_key, context_id.as_bytes())
+        .derive_pseudonym(identity_key, context_id.as_bytes())
         .await
-        .ok()?;
-    let bytes: [u8; 32] = pseudonym.public_key.as_bytes().try_into().ok()?;
-    Some(bytes)
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("pseudonym derivation failed: {e}"),
+                code: codes::IDENT_1055.to_owned(),
+            })
+        })?;
+    let bytes: [u8; 32] = pseudonym.public_key.as_bytes().try_into().map_err(|_| {
+        NapiError::from(ScpNapiError::Identity {
+            message: "pseudonym public key must be 32 bytes".to_owned(),
+            code: codes::IDENT_1057.to_owned(),
+        })
+    })?;
+    Ok(bytes)
+}
+
+/// Resolves a member's per-context pseudonym from the bridge identity registry,
+/// hard-failing with the canonical identity codes.
+///
+/// Mirrors the `PyO3` reference bridge's `derive_member_pseudonym(bi, did,
+/// context_id)`: resolves the importer/joiner's custody + identity key from the
+/// registry (a miss is missing key material → SCP-IDENT-1054), then routes
+/// through [`derive_pseudonym_bytes`] for the 1055/1057 contract. Used by the
+/// (encrypted-only) IMPORT path and the encrypted JOIN path so the routing axis
+/// is never silently degraded to the reserved `[0u8; 32]` sentinel.
+async fn derive_member_pseudonym_required(
+    bi: &NapiBridgeInstance,
+    did: &str,
+    context_id: &str,
+) -> napi::Result<[u8; 32]> {
+    let custody_and_key = crate::runtime::with_identity(bi, did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.identity_key))
+    })
+    .map_err(|_| {
+        NapiError::from(ScpNapiError::Identity {
+            message: "cannot derive pseudonym without retained key material — \
+                      encrypted contexts require a real per-member routing ID"
+                .to_owned(),
+            code: codes::IDENT_1054.to_owned(),
+        })
+    })?;
+    let (custody, identity_key) = custody_and_key;
+    derive_pseudonym_bytes(&custody, &identity_key, context_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +617,20 @@ pub(crate) async fn context_create_on(
 
     // Derive the context-scoped pseudonym routing ID (§9.10.4, SCP-214 criterion 5).
     // Derived BEFORE create_context so it can be passed to the ContextManager.
-    let local_pseudonym = derive_context_pseudonym(identity, &context_id).await;
+    //
+    // ENCRYPTED contexts hard-fail derivation (a zero pseudonym produces a
+    // silently unusable context); BROADCAST contexts soft-fail to `None` (no
+    // per-member pseudonym, spec §5.14 — the runtime ignores the value). Branch
+    // on the authoritative resolved mode.
+    let create_is_broadcast = matches!(
+        context_params.mode,
+        scp_core::context::params::ContextMode::Broadcast
+    );
+    let local_pseudonym: Option<[u8; 32]> = if create_is_broadcast {
+        None
+    } else {
+        Some(derive_context_pseudonym_required(identity, &context_id).await?)
+    };
 
     // Route through the ADR-049 lifecycle dispatch surface
     // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
@@ -693,22 +772,24 @@ pub(crate) async fn context_join_on(
 
     // §9.10.4: Derive pseudonym for the joining member so it can be stored
     // in PerContextState and announced to other members.
-    // Extract custody + identity key from registry (sync), then derive
-    // the pseudonym asynchronously — avoids block_on inside an async fn.
+    //
+    // ENCRYPTED contexts hard-fail derivation: a soft-failed join into an
+    // encrypted context yields `None`, which the runtime maps to the reserved
+    // `[0u8; 32]` sentinel — peers reject any announce of a reserved value, so
+    // the joiner becomes permanently unaddressable with no error surfaced.
+    // Route through `derive_member_pseudonym_required` to propagate the
+    // canonical identity codes (1054/1055/1056/1057) at create/import
+    // granularity. BROADCAST contexts soft-fail to `None`: they carry no
+    // per-member pseudonym (spec §5.14) and the runtime ignores the value.
     let context_id = handle.context_id.clone();
-    let local_pseudonym: Option<[u8; 32]> = {
-        let custody_and_key = crate::runtime::with_identity(bi, &identity_did, |entry| {
-            Ok((entry.custody.clone(), entry.identity.identity_key))
-        })
-        .ok();
-        match custody_and_key {
-            Some((custody, identity_key)) => custody
-                .derive_pseudonym(&identity_key, context_id.as_bytes())
-                .await
-                .ok()
-                .and_then(|p| p.public_key.as_bytes().try_into().ok()),
-            None => None,
-        }
+    let join_is_broadcast = matches!(
+        core_handle.params().mode,
+        scp_core::context::params::ContextMode::Broadcast
+    );
+    let local_pseudonym: Option<[u8; 32]> = if join_is_broadcast {
+        None
+    } else {
+        Some(derive_member_pseudonym_required(bi, &identity_did, &context_id).await?)
     };
 
     // Route through the ADR-049 lifecycle dispatch surface.
@@ -907,6 +988,44 @@ pub(crate) async fn context_close_on(
     // same NapiBridgeInstance's core (not the process-global bridge).
     bi.core.remove_bridge_state(&handle.context_id);
     bi.core.remove_economy_state(&handle.context_id);
+
+    Ok(())
+}
+
+/// Per-bridge-instance implementation of `context_seed_peer_pseudonym`.
+///
+/// Test-only: seeds a peer's per-context pseudonym routing ID (§9.10.4) into
+/// this bridge's `Supervisor`, simulating a delivered `PseudonymAnnouncement`
+/// so multi-member encrypted sends do not fail closed with `SCP-CTX-2095`.
+/// Mirrors the runtime `Supervisor::seed_peer_pseudonym` test helper. Gated
+/// behind `allow_in_memory_custody` so it never ships in production builds.
+#[cfg(feature = "allow_in_memory_custody")]
+pub(crate) async fn context_seed_peer_pseudonym_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    peer_did: String,
+    pseudonym: napi::bindgen_prelude::Buffer,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
+
+    let pseudonym_bytes: &[u8] = &pseudonym;
+    if pseudonym_bytes.len() != 32 {
+        return Err(ScpNapiError::Context {
+            message: format!(
+                "pseudonym must be exactly 32 bytes, got {}",
+                pseudonym_bytes.len()
+            ),
+            code: codes::CTX_2095.to_owned(),
+        }
+        .into());
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(pseudonym_bytes);
+
+    let sup = crate::runtime::supervisor(bi)?;
+    sup.seed_peer_pseudonym(&handle.context_id, DID::from(peer_did.as_str()), arr)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
     Ok(())
 }
@@ -1239,8 +1358,13 @@ pub(crate) async fn context_subscribe_on(
                         reply: tx,
                     };
                     if sup.dispatch_query(cmd).await.is_ok() {
+                        // §9.10.4: the query now returns a typed
+                        // `Result<[u8; 32], _>` — `Ok` for encrypted contexts,
+                        // `Err(NotPseudonymousContext)` for broadcast. Map a
+                        // successful read to `Some`; any error (including the
+                        // broadcast case, already excluded above) to `None`.
                         match rx.await {
-                            Ok(Ok(p)) => p,
+                            Ok(Ok(p)) => Some(p),
                             _ => None,
                         }
                     } else {
@@ -3658,6 +3782,7 @@ pub(crate) async fn context_export_on(
 pub(crate) async fn context_import_on(
     bi: &NapiBridgeInstance,
     data: Vec<u8>,
+    importer_did: String,
 ) -> napi::Result<String> {
     let export = scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
@@ -3666,6 +3791,11 @@ pub(crate) async fn context_import_on(
         })
     })?;
     let context_id = export.snapshot.context_id.clone();
+    let imported_core_params = export.snapshot.context_params.clone();
+    let imported_is_broadcast = matches!(
+        imported_core_params.mode,
+        scp_core::context::params::ContextMode::Broadcast
+    );
 
     // Resolve the verification-method key for the snapshot's `creator_did`
     // (§23.16.8 step 1, ADR-050) — NOT the unauthenticated envelope
@@ -3674,6 +3804,10 @@ pub(crate) async fn context_import_on(
     // resolves, the import is rejected — never imported unverified.
     let creator_did = export.snapshot.role_state.creator_did.clone();
     validate_did(&creator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    // §9.10.4: the importer DID is DISTINCT from the snapshot creator — it
+    // identifies the local member re-homing the context and is the subject of
+    // pseudonym derivation. Validate it up front, before any state mutation.
+    validate_did(&importer_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let verifying_key = resolve_napi_creator_verifying_key(bi, &creator_did).await?;
 
     // Verify-before-init: validate the snapshot signature, signer binding,
@@ -3689,6 +3823,14 @@ pub(crate) async fn context_import_on(
     scp_core::context::export_import::validate_export_for_import(&export, &verifying_key)
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+    // §9.10.4 misuse-resistance: the importer MUST be a member of the now-
+    // verified snapshot, else its derived pseudonym routes to an ID no peer
+    // expects and the member is silently unaddressable. Reject loudly
+    // (SCP-CTX-2092). The creator is a member, so a creator re-homing its own
+    // context passes.
+    scp_core::context::export_import::ensure_importer_is_member(&export.snapshot, &importer_did)
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
     // Ensure the Supervisor is initialized — context_import is a valid first
     // operation (e.g. a device receiving exported context data).
     // init_supervisor is idempotent (OnceLock — first call wins). Seeding from
@@ -3696,13 +3838,71 @@ pub(crate) async fn context_import_on(
     // above.
     crate::runtime::init_supervisor(bi, &creator_did);
 
+    // §9.10.4: derive the importer's OWN per-context pseudonym before the
+    // runtime import. The runtime import path is encrypted-only (broadcast-mode
+    // exports are rejected upstream with SCP-CTX-2092), so a real pseudonym is
+    // ALWAYS required — derive it UNCONDITIONALLY, exactly like the PyO3
+    // reference bridge. Custody / derivation failure is a hard error carrying
+    // granular codes (missing material → 1054, derivation failure → 1055, wrong
+    // length → 1057, custody unavailable → 1056), never a silent zero-pseudonym
+    // fallback (which would reintroduce the relay-correlation vector) and never
+    // a `[0u8; 32]` sentinel for broadcast (which would make the member
+    // permanently unaddressable). Resolve the importer's custody+key from the
+    // DID registry, mirroring `context_join_on`.
+    let local_pseudonym: [u8; 32] =
+        derive_member_pseudonym_required(bi, &importer_did, &context_id).await?;
+
     let sup = crate::runtime::supervisor(bi)?;
-    // Route the import error through ScpNapiError so the typed
-    // ContextError::SnapshotSignatureInvalid arm surfaces SCP-CTX-2093
-    // (signature/version forgery) rather than the catch-all SCP-CTX-2001.
-    sup.import_context(export, &verifying_key)
+    // Dispatch the import carrying BOTH the creator verifying key
+    // (verify-before-init, §23.16.8) and the importer's derived pseudonym
+    // (§9.10.4). `import_context` re-runs the authoritative verification and
+    // surfaces the typed `ContextError` — including
+    // `SnapshotSignatureInvalid` (SCP-CTX-2093, signature/version forgery) and
+    // the §9.10.4 codes — through ScpNapiError rather than the catch-all
+    // SCP-CTX-2001.
+    sup.import_context(export, &verifying_key, Some(local_pseudonym))
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    // §9.10.4: emit a PseudonymAnnouncement so existing members learn this
+    // importer's per-context routing ID. Encrypted contexts only — broadcast
+    // contexts use the shared `broadcast_routing_id` and carry no pseudonym
+    // registry. Best-effort: a missing signing key just skips the announcement;
+    // without it, peers' pseudonym registries stay stale and app-data fan-out
+    // would miss this importer entirely until it re-announces (a plain send does
+    // NOT auto-announce — only a `PseudonymAnnouncement` payload reaches the
+    // shared routing ID).
+    if !imported_is_broadcast {
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let custody_and_key = crate::runtime::with_identity(bi, &importer_did, |entry| {
+                Ok((entry.custody.clone(), entry.identity.active_signing_key))
+            })
+            .ok();
+            if let Some((custody, key_handle)) = custody_and_key
+                && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
+            {
+                use scp_core::context::actor::commands::{
+                    MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                };
+                let sender_did = DID(importer_did);
+                let (atx, arx) = tokio::sync::oneshot::channel();
+                let ann_cmd = MessagingCommand::SendPseudonymAnnouncement {
+                    payload: Box::new(SendPseudonymAnnouncementPayload {
+                        context_id: context_id.clone(),
+                        params: imported_core_params,
+                        sender_did,
+                        signing_key: SigningKeyBytes::from_signing_key(&sk),
+                    }),
+                    reply: atx,
+                };
+                if sup.dispatch_command(&context_id, ann_cmd).await.is_ok() {
+                    let _ = arx.await;
+                }
+            }
+        }
+    }
+
     Ok(context_id)
 }
 
@@ -5171,7 +5371,8 @@ mod tests {
 
         // Import verifies the snapshot signature against the creator's `#active`
         // verifying key. Success proves the custody-produced signature is valid.
-        let imported_context_id = super::context_import_on(&bi, data)
+        // The importer is the same identity (self-import round-trip).
+        let imported_context_id = super::context_import_on(&bi, data, identity.inner.did.clone())
             .await
             .expect("context_import should accept the custody-signed snapshot");
         assert_eq!(
@@ -5218,7 +5419,7 @@ mod tests {
         let mid = data.len() / 2;
         data[mid] ^= 0xFF;
 
-        let result = super::context_import_on(&bi, data).await;
+        let result = super::context_import_on(&bi, data, identity.inner.did.clone()).await;
         assert!(
             result.is_err(),
             "import of a tampered custody-signed export must be rejected"
@@ -5329,7 +5530,7 @@ mod tests {
 
         let round_tripped = deserialize_export(&data).expect("deserialize_export should succeed");
         let imported = sup2
-            .import_context(round_tripped, &custody.verifying_key())
+            .import_context(round_tripped, &custody.verifying_key(), None)
             .await
             .expect("import_context should accept the callback-signed snapshot");
         assert_eq!(
@@ -5346,7 +5547,7 @@ mod tests {
         tampered[mid] ^= 0xFF;
         let result = match deserialize_export(&tampered) {
             Ok(export) => sup2
-                .import_context(export, &custody.verifying_key())
+                .import_context(export, &custody.verifying_key(), None)
                 .await
                 .map(|_| ()),
             // A flipped framing byte may fail deserialization outright — also a
@@ -5414,6 +5615,42 @@ mod tests {
         assert!(
             !msg.contains(codes::PERM_3001),
             "must NOT use the removed build-gate PERM-3001 code, got: {msg}"
+        );
+    }
+
+    /// §9.10.4: NAPI's `derive_member_pseudonym_required` HARD-FAILS a registry
+    /// miss with the canonical `SCP-IDENT-1054` (missing key material).
+    ///
+    /// This helper is the single deduped definition of the encrypted JOIN /
+    /// IMPORT derivation contract for the NAPI bridge — the join and import
+    /// paths both route through it so the 1054/1055/1057 codes cannot drift
+    /// across entry points. A registry miss (no identity registered for the
+    /// DID) resolves no custody, so the encrypted routing axis must hard-fail
+    /// rather than silently degrade to the reserved `[0u8; 32]` sentinel.
+    ///
+    /// Not false-green: the assertion drives the real helper against a fresh
+    /// bridge with no registered identities. If the helper's registry-miss arm
+    /// stopped mapping to `SCP-IDENT-1054` (e.g. reverted to the raw
+    /// `with_identity` `SCP-IDENT-1001`, or swallowed the miss to a zero
+    /// pseudonym), the `.code` assertion would fail.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn derive_member_pseudonym_required_registry_miss_is_typed_1054() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let err = super::derive_member_pseudonym_required(
+            &bi,
+            "did:dht:z6MkNoSuchNapiDeriveIdentity",
+            "ctx-encrypted-join",
+        )
+        .await
+        .expect_err("registry miss must hard-fail derivation");
+        // `napi::Error` renders the `ScpNapiError` Display, which embeds the
+        // `[SCP-IDENT-NNNN]` code prefix.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1054),
+            "expected missing-key-material code {}, got: {msg}",
+            codes::IDENT_1054
         );
     }
 }

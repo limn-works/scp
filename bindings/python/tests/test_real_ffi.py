@@ -413,7 +413,7 @@ class TestContext:
         # error (e.g. terminal-state gating) is acceptable; a signature error
         # is NOT.
         try:
-            imported_ctx_id = scp._native.context_import(bytes(data))
+            imported_ctx_id = scp._native.context_import(bytes(data), alice.did)
             assert imported_ctx_id == handle.context_id
         except Exception as exc:
             assert "SCP-CTX-2093" not in str(exc), (
@@ -448,7 +448,7 @@ class TestContext:
         for i in range(len(data) // 2, len(data), 17):
             data[i] ^= 0xFF
         with pytest.raises(Exception) as excinfo:
-            scp._native.context_import(bytes(data))
+            scp._native.context_import(bytes(data), alice.did)
         # The rejection must be the signature contract, not a generic context
         # error. (A flip that corrupts the MessagePack framing surfaces a
         # ValueError at deserialize-time instead; both are rejections, but a

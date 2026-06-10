@@ -375,8 +375,12 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/contextImport`` on ``inner``.
-    func contextImport(data: Data) async throws -> String {
-        try await inner.contextImport(data: data)
+    ///
+    /// `importerIdentity` supplies the §9.10.4 per-context pseudonym
+    /// derivation material so the importing member routes under its OWN routing
+    /// ID rather than inheriting the exporter's local-instance pseudonym.
+    func contextImport(data: Data, importerIdentity: Identity) async throws -> String {
+        try await inner.contextImport(data: data, importerIdentity: importerIdentity)
     }
 
     /// Forwards to ``Scp/contextIsMember`` on ``inner``.

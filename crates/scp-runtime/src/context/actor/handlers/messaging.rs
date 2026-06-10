@@ -104,6 +104,29 @@ pub async fn dispatch(
             )
             .await
         }
+        #[cfg(feature = "testing")]
+        MessagingCommand::SeedPeerPseudonym {
+            context_id: _,
+            member_did,
+            pseudonym,
+            reply,
+        } => {
+            // §9.10.4 test seam: record a peer pseudonym exactly as a
+            // delivered `PseudonymAnnouncement` would. Broadcast contexts carry
+            // no peer registry — reject so a mis-targeted test fails loudly.
+            let result = if let Some(reg) = state.routing.peer_registry_mut() {
+                reg.insert(member_did, pseudonym);
+                Ok(())
+            } else {
+                Err(
+                    scp_protocol::context::ContextError::NotPseudonymousContext {
+                        context_id: state.handle.context_id().to_owned(),
+                    },
+                )
+            };
+            let _ = reply.send(result);
+            crate::context::actor::Outcome::ok(())
+        }
         MessagingCommand::ReportDegradedMode {
             context_id,
             compat,

@@ -348,11 +348,6 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         checkpoint_events_since: ctx.checkpoint_events_since,
         checkpoint_last_time_secs: ctx.checkpoint_last_time_secs,
         generation: ctx.generation,
-        local_pseudonym: ctx.local_pseudonym,
-        pseudonym_registry: ctx
-            .pseudonym_registry
-            .iter()
-            .map(|(did, p)| (did.to_string(), *p))
-            .collect(),
+        routing: ctx.routing.clone(),
     }
 }

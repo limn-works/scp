@@ -207,6 +207,11 @@ if (bridge === null || scp === null) {
       expect(members).toContain(alice.did);
       expect(members).toContain(bob.did);
 
+      // Seed Bob's per-member pseudonym so the multi-member fan-out is
+      // registered; otherwise the send fails closed with SCP-CTX-2095
+      // ("pseudonym registry empty") per PR #1744 §9.10.4.
+      await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
+
       // Alice sends a message -- full pipeline:
       // inner envelope (Ed25519 signing) -> MLS encryption ->
       // sender key encryption -> outer envelope -> relay publish.
@@ -230,6 +235,12 @@ if (bridge === null || scp === null) {
       );
 
       await napi.contextJoin(ctx, bob.did);
+
+      // Both Alice and Bob send, so each sender needs the other party's
+      // per-member pseudonym registered; otherwise the send fails closed with
+      // SCP-CTX-2095 ("pseudonym registry empty") per PR #1744 §9.10.4.
+      await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
+      await napi.contextSeedPeerPseudonym(ctx, alice.did, new Uint8Array(32).fill(0x41));
 
       // Both Alice and Bob can send through the relay without error.
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("message from Alice"));
@@ -262,6 +273,13 @@ if (bridge === null || scp === null) {
       const count = await napi.contextMemberCount(ctx);
       expect(count).toBe(3);
 
+      // All three members send, so every sender needs the other parties'
+      // per-member pseudonyms registered; otherwise the send fails closed with
+      // SCP-CTX-2095 ("pseudonym registry empty") per PR #1744 §9.10.4.
+      await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
+      await napi.contextSeedPeerPseudonym(ctx, carol.did, new Uint8Array(32).fill(0x43));
+      await napi.contextSeedPeerPseudonym(ctx, alice.did, new Uint8Array(32).fill(0x41));
+
       // Each member sends through the relay -- all succeed.
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("hello from Alice"));
       await napi.contextSend(ctx, bob.did, new TextEncoder().encode("hello from Bob"));
@@ -288,6 +306,11 @@ if (bridge === null || scp === null) {
       );
 
       await napi.contextJoin(ctx, bob.did);
+
+      // Seed Bob's per-member pseudonym so the fan-out is registered before the
+      // loop; otherwise each send fails closed with SCP-CTX-2095 ("pseudonym
+      // registry empty") per PR #1744 §9.10.4.
+      await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
 
       // Send 5 messages -- all should succeed through the relay.
       for (let i = 0; i < 5; i++) {
@@ -513,6 +536,11 @@ if (bridge === null || scp === null) {
       // Join
       await napi.contextJoin(ctx, bob.did);
       expect(await napi.contextMemberCount(ctx)).toBe(2);
+
+      // Seed Bob's per-member pseudonym so the fan-out is registered before the
+      // send; otherwise it fails closed with SCP-CTX-2095 ("pseudonym registry
+      // empty") per PR #1744 §9.10.4.
+      await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
 
       // Send through relay
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("test message"));

@@ -762,6 +762,14 @@ async fn tier3_governance_revoke_write_access_broadcast() {
     assert_eq!(status, ProposalStatus::Approved);
     assert!(manager.is_member(ctx_id, AUTHOR).await);
 
+    // §9.10.4: seed the author's pseudonym so the encrypted multi-member send
+    // below has a non-empty routing registry (in production the author
+    // announces this; the single-node test seeds it directly).
+    manager
+        .seed_peer_pseudonym(ctx_id, author_did(), [7u8; 32])
+        .await
+        .expect("seed peer pseudonym");
+
     // --- Governance Revoke { access: AccessScope::Both } on Author ---
 
     let revoke = GovernanceAction::RevokeAccess {
@@ -1469,6 +1477,18 @@ async fn governance_tier_stacking_via_context_manager() {
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
     assert!(manager.is_member(ctx_id, DAVE).await);
+
+    // §9.10.4: seed peer pseudonyms so multi-member encrypted sends have a
+    // non-empty routing registry. In production each peer announces its
+    // routing ID via a `PseudonymAnnouncement`; this single-node test hosts
+    // only one member's view, so the registry is seeded directly (the same
+    // mutation a delivered announcement performs).
+    for (member, tag) in [(bob(), 2u8), (dave(), 3u8)] {
+        manager
+            .seed_peer_pseudonym(ctx_id, member, [tag; 32])
+            .await
+            .expect("seed peer pseudonym");
+    }
 
     // --- Governance (Tier 3): write revocation on Dave ---
 

@@ -83,9 +83,16 @@ fn per_context_state_encrypted_public_fields_accessible() {
     assert!(s.broadcast_context.is_none());
     assert!(s.migration_state.is_none());
 
-    // Pseudonyms.
-    assert!(s.local_pseudonym.is_none());
-    assert_eq!(s.pseudonym_registry.len(), 0);
+    // Routing (§9.10.4): an encrypted context is pseudonymous with an empty
+    // peer registry and a (zero, in the test fixture) local pseudonym.
+    assert!(!s.routing.is_broadcast());
+    assert!(s.routing.local_pseudonym().is_some());
+    assert_eq!(
+        s.routing
+            .peer_registry()
+            .map(std::collections::HashMap::len),
+        Some(0)
+    );
 
     // Anti-replay + reorder buffers.
     let _ = &s.sequence_tracker;
