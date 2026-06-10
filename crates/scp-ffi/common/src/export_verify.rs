@@ -142,6 +142,25 @@ where
     })
 }
 
+/// Decodes a platform [`PublicKey`](scp_platform::PublicKey) into an Ed25519
+/// [`VerifyingKey`], enforcing the 32-byte length and canonical-point validity.
+///
+/// This is the byte-conversion tail shared by every non-WASM bridge's
+/// local-custody verifying-key resolver: each bridge looks up the identity in
+/// its own registry and calls `KeyCustody::public_key` (its own HEAD), then
+/// funnels the resulting public key through this helper. Only the public
+/// verifying key is handled here; private key material never reaches this path
+/// (ADR-006).
+///
+/// Returns `None` when the key is not exactly 32 bytes or is not a valid
+/// (decompressable) Ed25519 verifying key — the fail-closed signal each bridge
+/// maps to "this DID has no usable local custody key."
+#[must_use]
+pub fn verifying_key_from_public_key(pk: &scp_platform::PublicKey) -> Option<VerifyingKey> {
+    let bytes: [u8; 32] = pk.as_bytes().try_into().ok()?;
+    VerifyingKey::from_bytes(&bytes).ok()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -243,5 +262,27 @@ mod tests {
         let err = resolve_export_verifying_key(Some(&resolver), |_did| None, "did:dht:zCreator")
             .unwrap_err();
         assert!(matches!(err, ExportVerifyError::InvalidKey { .. }));
+    }
+
+    #[test]
+    fn verifying_key_from_public_key_roundtrips_valid_key() {
+        let expected = fixed_signing_key().verifying_key();
+        let pk = scp_platform::PublicKey::new(expected.to_bytes().to_vec());
+        let got = verifying_key_from_public_key(&pk).expect("valid 32-byte Ed25519 key");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn verifying_key_from_public_key_rejects_wrong_length() {
+        // 31 bytes — fails the [u8; 32] length check before point decode.
+        let pk = scp_platform::PublicKey::new(vec![0u8; 31]);
+        assert!(verifying_key_from_public_key(&pk).is_none());
+    }
+
+    #[test]
+    fn verifying_key_from_public_key_rejects_non_canonical_point() {
+        // 32 bytes that are not a decompressable Edwards point.
+        let pk = scp_platform::PublicKey::new(non_canonical_key_bytes().to_vec());
+        assert!(verifying_key_from_public_key(&pk).is_none());
     }
 }

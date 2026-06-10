@@ -516,6 +516,19 @@ pub struct ContextSnapshot {
     /// received `event_log_data` and compares it to THIS signed value
     /// (`validate_export_for_import`).
     ///
+    /// **Security scope — chain head, not history completeness.** This root
+    /// is the event-log hash-*chain* HEAD (the last entry's `hash`), not a
+    /// Merkle-tree commitment over a fixed entry set. The chain verifier is
+    /// pruning-tolerant: it does not validate the first entry's `prev_hash`
+    /// (see `verify_merkle_chain`). The signature therefore guarantees that no
+    /// entry can be added, modified, or reordered and that the head is
+    /// authentic — but it does NOT attest full-history completeness. A holder
+    /// of a valid signed export can present a contiguous *suffix* of the log
+    /// (dropping early entries) and it still verifies against this signed head;
+    /// front-truncation to a valid suffix is indistinguishable from legitimate
+    /// pruning by design (binding a count or genesis would break legitimate
+    /// pruning).
+    ///
     /// All zeros when no event log is included (e.g. `ExportScope::Public`,
     /// broadcast-only contexts, or the live snapshot before export). Populated
     /// by `create_export` for `ExportScope::Full`. `#[serde(default)]` so live

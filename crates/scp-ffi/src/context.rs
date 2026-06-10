@@ -1223,13 +1223,15 @@ fn resolve_verifying_key(
             .map_err(|e| {
                 crate::error::ScpPyError::context(format!("failed to resolve verifying key: {e}"))
             })?;
-        let key_bytes: [u8; 32] = public_key.as_bytes().try_into().map_err(|_| {
+        // 32-byte length + canonical-point decode: the shared conversion tail
+        // in scp-ffi-common, identical across all non-WASM bridges. A `None`
+        // (wrong length or non-canonical point) is the fail-closed signal that
+        // this DID has no usable local verifying key.
+        scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key).ok_or_else(|| {
             crate::error::ScpPyError::context(
-                "active signing-key public key is not 32 bytes".to_owned(),
+                "active signing-key public key is not a valid 32-byte Ed25519 verifying key"
+                    .to_owned(),
             )
-        })?;
-        ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|e| {
-            crate::error::ScpPyError::context(format!("invalid Ed25519 verifying key: {e}"))
         })
     })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))

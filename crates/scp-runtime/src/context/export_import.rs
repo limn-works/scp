@@ -616,6 +616,15 @@ pub fn validate_export_for_import(
     //    an attacker holding a valid signed snapshot cannot substitute a
     //    different internally-consistent event log, because its recomputed
     //    root would not match the signed value. See §23.16.4 / §23.16.8.
+    //
+    //    Security scope: the signed root is the event-log hash-CHAIN HEAD, not
+    //    a Merkle-tree commitment over all entries. `verify_merkle_chain` is
+    //    pruning-tolerant (it does not validate entry[0].prev_hash), so a
+    //    contiguous SUFFIX of the log verifies against the signed head. The
+    //    signature thus attests that no entry was added/modified/reordered and
+    //    that the head is authentic, but NOT full-history completeness:
+    //    front-truncation to a valid suffix is indistinguishable from
+    //    legitimate pruning by design.
     if !bool::from(computed_root.ct_eq(&export.snapshot.event_log_merkle_root)) {
         return Err(ContextError::EventLogFailed(
             "signed snapshot root mismatch: recomputed event-log root does not \

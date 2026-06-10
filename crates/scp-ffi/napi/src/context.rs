@@ -2707,10 +2707,10 @@ async fn resolve_napi_local_verifying_key(
     .ok()?;
     let (custody, key_handle) = custody_and_key;
     // Resolve the public verifying key directly via `KeyCustody::public_key`
-    // (ADR-006) — no private-key materialization.
+    // (ADR-006) — no private-key materialization. The 32-byte length and
+    // canonical-point decode are the shared conversion tail in scp-ffi-common.
     let public_key = custody.public_key(&key_handle).await.ok()?;
-    let key_bytes: [u8; 32] = public_key.as_bytes().try_into().ok()?;
-    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).ok()
+    scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
 }
 
 /// Parses a hex-encoded proposal ID into a 32-byte array.

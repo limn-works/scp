@@ -4877,8 +4877,9 @@ async fn resolve_local_custody_verifying_key(
     };
 
     let public_key = custody.0.public_key(&key_handle).await.ok()?;
-    let key_bytes: [u8; 32] = public_key.as_bytes().try_into().ok()?;
-    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).ok()
+    // 32-byte length + canonical-point decode: the shared conversion tail in
+    // scp-ffi-common, identical across all non-WASM bridges.
+    scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
 }
 
 /// No-custody build: local identities are never resolvable from in-memory
