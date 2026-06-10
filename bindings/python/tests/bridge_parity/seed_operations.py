@@ -112,7 +112,7 @@ CONTEXT_ID_PATTERN = r"^[0-9a-f]{64}$"
 # agree on the code.
 #
 # Note: the valid-challenge + unregistered-DID path historically diverged
-# (PyO3 SCP-IDENT-1001, NAPI SCP-PERM-3023, WASM SCP-IDENT-1010). All three
+# across bridges (a mix of identity- and permission-domain codes). All three
 # bridges are now aligned on SCP-IDENT-1001 (identity-domain, identity-not-
 # found). The MVP op below exercises the malformed-challenge path per
 # ADR-046; the companion `unregistered_did_rejected` op locks the
@@ -362,8 +362,9 @@ OP_CONTEXT_CREATE = OpSpec(
 # pass a syntactically valid but never-created DID).
 #
 # Real divergence caught by the harness: three bridges, three codes.
-# PyO3 returned SCP-IDENT-1001 (reference); NAPI returned SCP-PERM-3023;
-# WASM returned SCP-IDENT-1010. Aligned across all three on
+# PyO3 returned SCP-IDENT-1001 (reference); NAPI and WASM each returned a
+# different code (a permission-domain code and SCP-IDENT-1010 respectively).
+# Aligned across all three on
 # SCP-IDENT-1001 for the unregistered-DID path; the op below exercises
 # the malformed-challenge path (SCP-IDENT-1038, shared), and
 # `OP_UNREGISTERED_DID_REJECTED` (op 11) locks in the IDENT-1001 path.
@@ -893,8 +894,8 @@ OP_EVENT_LOG_FILTERED = OpSpec(
 # (SCP-IDENT-1038) — the challenge JSON fails shape validation before any
 # DID lookup happens. This op exercises the OTHER historically-divergent
 # path: a VALID challenge paired with a well-formed but unregistered
-# DID. Before alignment, PyO3 returned SCP-IDENT-1001, NAPI returned
-# SCP-PERM-3023, and WASM returned SCP-IDENT-1010. All four bridges
+# DID. Before alignment, PyO3 returned SCP-IDENT-1001, NAPI returned a
+# permission-domain code, and WASM returned SCP-IDENT-1010. All four bridges
 # (PyO3, NAPI, WASM, UniFFI-Kotlin, UniFFI-Swift) now converge on
 # SCP-IDENT-1001 (identity-domain, identity-not-found) for this path.
 #
@@ -948,6 +949,40 @@ OP_UNREGISTERED_DID_REJECTED = OpSpec(
     # pin is what catches that mode.
     expected_values=(("error.code", EXPECTED_UNREGISTERED_DID_CODE),),
 )
+
+
+# ---------------------------------------------------------------------------
+# Per-bridge expectation: missing-signing-custody (externally-loaded identity)
+#
+# This is a DOCUMENTED per-SDK divergence, not a parity op. The condition is
+# "an operation that must sign (UCAN mint/delegate, event-log checkpoint,
+# broadcast publish) is invoked for an identity/handle that retains no signing
+# custody — e.g. the creator identity was loaded externally." The expected
+# code differs by bridge BY DESIGN (ADR-048 §7 per-SDK idiom):
+#
+#   - NAPI / UniFFI (Swift, Kotlin): handle-borne custody. The mint/delegate/
+#     checkpoint/broadcast paths read custody off the opaque context/identity
+#     handle; a `None` custody surfaces the canonical SCP-IDENT-1017
+#     ("requires retained signing custody").
+#   - PyO3: registry-based custody. The mint/delegate paths resolve the signing
+#     key from the bridge-local identity registry via `with_identity`; an
+#     absent entry surfaces SCP-IDENT-1001 ("identity not registered"). A
+#     registered PyO3 identity always has custody, so there is no separate
+#     IDENT-1017 path on this bridge.
+#   - WASM: cannot sign in-Rust (ADR-034); its sign paths use a distinct code.
+#
+# These expectations are positively asserted by per-bridge inline tests
+# (NAPI `crates/scp-ffi/napi/src/{ucan,event_log}.rs`, UniFFI
+# `crates/scp-ffi/uniffi/src/bridge.rs`) and the TypeScript SDK test
+# (`bindings/typescript/tests/errors.test.ts`). They are NOT expressible as a
+# cross-bridge equality op here: (a) the codes diverge by design, so an
+# equality comparator would force a false match, and (b) the no-custody handle
+# is not reachable through the public SDK flow the parity runners drive — a
+# normal `context_create` always stamps the creator's retained custody onto the
+# returned handle. Pinning the codes per-bridge in the runner protocol would
+# require synthetic handle construction the JSON-RPC runner does not expose.
+# Committed codes: handle-borne bridges (NAPI/UniFFI) -> SCP-IDENT-1017;
+# PyO3 -> SCP-IDENT-1001.
 
 
 # ---------------------------------------------------------------------------

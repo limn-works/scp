@@ -4297,21 +4297,20 @@ async fn ucan_mint_impl(
     runtime()
         .spawn(async move {
             // Extract key custody and signing key from the context handle.
-            let custody =
-                handle
-                    .in_memory_custody
-                    .as_ref()
-                    .ok_or_else(|| ScpError::Permission {
-                        msg: "UCAN minting requires key custody — create the context with \
-                              an in_memory identity (identity_create(\"in_memory\"))"
-                            .to_owned(),
-                        code: codes::PERM_3004.to_owned(),
-                    })?;
-            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
-                msg: "UCAN minting requires a signing key — the context creator identity \
-                          must have an active signing key"
+            let custody = handle
+                .in_memory_custody
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: "UCAN minting requires retained signing custody — the context \
+                              creator identity has no retained custody (it was externally loaded)"
+                        .to_owned(),
+                    code: codes::IDENT_1017.to_owned(),
+                })?;
+            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Identity {
+                msg: "UCAN minting requires retained signing custody — the context creator \
+                          identity has no active signing key"
                     .to_owned(),
-                code: codes::PERM_3004.to_owned(),
+                code: codes::IDENT_1017.to_owned(),
             })?;
 
             let params = scp_core::crypto::ucan::mint::MintParams {
@@ -4373,13 +4372,13 @@ async fn ucan_mint_impl(
     _capabilities: Vec<String>,
     _proofs: Option<Vec<String>>,
 ) -> Result<Arc<UcanToken>, ScpError> {
-    Err(ScpError::Permission {
-        msg: "UCAN minting requires key custody — the in_memory custody path \
+    Err(ScpError::Identity {
+        msg: "UCAN minting requires retained signing custody — the in_memory custody path \
                   is not available in this build. Enable the \
                   \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
                   a KeyCustodyProvider for production."
             .to_owned(),
-        code: codes::PERM_3004.to_owned(),
+        code: codes::IDENT_1017.to_owned(),
     })
 }
 
@@ -4399,21 +4398,20 @@ async fn ucan_delegate_impl(
             use scp_core::crypto::ucan::validate::parse_ucan;
 
             // Extract key custody and signing key from the context handle.
-            let custody =
-                handle
-                    .in_memory_custody
-                    .as_ref()
-                    .ok_or_else(|| ScpError::Permission {
-                        msg: "UCAN delegation requires key custody — create the context with \
-                              an in_memory identity (identity_create(\"in_memory\"))"
-                            .to_owned(),
-                        code: codes::PERM_3004.to_owned(),
-                    })?;
-            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
-                msg: "UCAN delegation requires a signing key — the context creator identity \
-                          must have an active signing key"
+            let custody = handle
+                .in_memory_custody
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: "UCAN delegation requires retained signing custody — the context \
+                              creator identity has no retained custody (it was externally loaded)"
+                        .to_owned(),
+                    code: codes::IDENT_1017.to_owned(),
+                })?;
+            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Identity {
+                msg: "UCAN delegation requires retained signing custody — the context creator \
+                          identity has no active signing key"
                     .to_owned(),
-                code: codes::PERM_3004.to_owned(),
+                code: codes::IDENT_1017.to_owned(),
             })?;
 
             // Parse the parent token.
@@ -4503,13 +4501,13 @@ async fn ucan_delegate_impl(
     _parent_token: String,
     _capabilities: Vec<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
-    Err(ScpError::Permission {
-        msg: "UCAN delegation requires key custody — the in_memory custody path \
+    Err(ScpError::Identity {
+        msg: "UCAN delegation requires retained signing custody — the in_memory custody path \
                   is not available in this build. Enable the \
                   \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
                   a KeyCustodyProvider for production."
             .to_owned(),
-        code: codes::PERM_3004.to_owned(),
+        code: codes::IDENT_1017.to_owned(),
     })
 }
 
@@ -4532,11 +4530,11 @@ async fn event_log_checkpoint_impl(
                 identity
                     .in_memory_custody
                     .as_ref()
-                    .ok_or_else(|| ScpError::Permission {
-                        msg: "event log checkpoint requires key custody — create the identity \
-                              with in_memory custody (identity_create(\"in_memory\"))"
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "event log checkpoint requires retained signing custody — this \
+                              identity has no retained custody (it was externally loaded)"
                             .to_owned(),
-                        code: codes::PERM_3008.to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
                     })?;
             let core_id = identity
                 .core_id
@@ -4615,13 +4613,13 @@ async fn event_log_checkpoint_impl(
     _identity: Arc<Identity>,
     _epoch: u64,
 ) -> Result<Checkpoint, ScpError> {
-    Err(ScpError::Permission {
-        msg: "event log checkpoint requires key custody — the in_memory custody path \
-                  is not available in this build. Enable the \
+    Err(ScpError::Identity {
+        msg: "event log checkpoint requires retained signing custody — the in_memory custody \
+                  path is not available in this build. Enable the \
                   \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
                   a KeyCustodyProvider for production."
             .to_owned(),
-        code: codes::PERM_3008.to_owned(),
+        code: codes::IDENT_1017.to_owned(),
     })
 }
 
@@ -4675,11 +4673,11 @@ async fn event_log_checkpoint_by_did_impl(
                 identity
                     .in_memory_custody
                     .as_ref()
-                    .ok_or_else(|| ScpError::Permission {
-                        msg: "event log checkpoint requires key custody — create the identity \
-                              with in_memory custody (identity_create(\"in_memory\"))"
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "event log checkpoint requires retained signing custody — this \
+                              identity has no retained custody (it was externally loaded)"
                             .to_owned(),
-                        code: codes::PERM_3008.to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
                     })?;
             let core_id = identity
                 .core_id
@@ -4759,13 +4757,13 @@ async fn event_log_checkpoint_by_did_impl(
     _did: String,
     _epoch: u64,
 ) -> Result<Checkpoint, ScpError> {
-    Err(ScpError::Permission {
-        msg: "event log checkpoint requires key custody — the in_memory custody path \
-                  is not available in this build. Enable the \
+    Err(ScpError::Identity {
+        msg: "event log checkpoint requires retained signing custody — the in_memory custody \
+                  path is not available in this build. Enable the \
                   \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
                   a KeyCustodyProvider for production."
             .to_owned(),
-        code: codes::PERM_3008.to_owned(),
+        code: codes::IDENT_1017.to_owned(),
     })
 }
 
@@ -10162,12 +10160,13 @@ impl Scp {
                     #[cfg(feature = "allow_in_memory_custody")]
                     {
                         let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
-                            ScpError::Permission {
-                                msg: "broadcast publish requires key custody — create the \
-                                          identity with identity_create(\"in_memory\") or \
+                            ScpError::Identity {
+                                msg: "broadcast publish requires retained signing custody — this \
+                                          identity has no retained custody (it was externally \
+                                          loaded). Use identity_create(\"in_memory\") or \
                                           identity_create_with_custody()"
                                     .to_owned(),
-                                code: codes::PERM_3021.to_owned(),
+                                code: codes::IDENT_1017.to_owned(),
                             }
                         })?;
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -10193,12 +10192,12 @@ impl Scp {
                     #[cfg(not(feature = "allow_in_memory_custody"))]
                     {
                         let _ = (signing_key_handle, payload, did);
-                        return Err(ScpError::Permission {
-                            msg: "broadcast publish requires key custody — use \
+                        return Err(ScpError::Identity {
+                            msg: "broadcast publish requires retained signing custody — use \
                                       identity_create_with_custody() to inject a platform \
                                       custody provider"
                                 .to_owned(),
-                            code: codes::PERM_3022.to_owned(),
+                            code: codes::IDENT_1017.to_owned(),
                         });
                     }
                 }
@@ -10325,12 +10324,13 @@ impl Scp {
                     #[cfg(feature = "allow_in_memory_custody")]
                     {
                         let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
-                            ScpError::Permission {
-                                msg: "broadcast publish asset requires key custody — create the \
-                                      identity with identity_create(\"in_memory\") or \
+                            ScpError::Identity {
+                                msg: "broadcast publish asset requires retained signing custody — \
+                                      this identity has no retained custody (it was externally \
+                                      loaded). Use identity_create(\"in_memory\") or \
                                       identity_create_with_custody()"
                                     .to_owned(),
-                                code: codes::PERM_3021.to_owned(),
+                                code: codes::IDENT_1017.to_owned(),
                             }
                         })?;
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -10356,12 +10356,12 @@ impl Scp {
                     #[cfg(not(feature = "allow_in_memory_custody"))]
                     {
                         let _ = (content, signing_key_handle, did);
-                        return Err(ScpError::Permission {
-                            msg: "broadcast publish asset requires key custody — use \
+                        return Err(ScpError::Identity {
+                            msg: "broadcast publish asset requires retained signing custody — use \
                                   identity_create_with_custody() to inject a platform \
                                   custody provider"
                                 .to_owned(),
-                            code: codes::PERM_3022.to_owned(),
+                            code: codes::IDENT_1017.to_owned(),
                         });
                     }
                 };
@@ -10515,9 +10515,12 @@ impl Scp {
                         #[cfg(feature = "allow_in_memory_custody")]
                         {
                             let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
-                                ScpError::Permission {
-                                    msg: "broadcast publish assets requires key custody".to_owned(),
-                                    code: codes::PERM_3021.to_owned(),
+                                ScpError::Identity {
+                                    msg: "broadcast publish assets requires retained signing \
+                                          custody — this identity has no retained custody (it was \
+                                          externally loaded)"
+                                        .to_owned(),
+                                    code: codes::IDENT_1017.to_owned(),
                                 }
                             })?;
                             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -10545,9 +10548,12 @@ impl Scp {
                         #[cfg(not(feature = "allow_in_memory_custody"))]
                         {
                             let _ = (content, signing_key_handle, &did);
-                            return Err(ScpError::Permission {
-                                msg: "broadcast publish assets requires key custody".to_owned(),
-                                code: codes::PERM_3022.to_owned(),
+                            return Err(ScpError::Identity {
+                                msg: "broadcast publish assets requires retained signing custody \
+                                      — this identity has no retained custody (it was externally \
+                                      loaded)"
+                                    .to_owned(),
+                                code: codes::IDENT_1017.to_owned(),
                             });
                         }
                     };
@@ -18398,6 +18404,78 @@ mod tests {
         assert!(
             !checkpoint.signature.is_empty(),
             "a successful checkpoint must carry a signature"
+        );
+    }
+
+    // ----- Missing-signing-custody → SCP-IDENT-1017 -----
+    //
+    // A context handle / identity that retains no custody (externally loaded:
+    // `in_memory_custody`, `signing_key`, `callback_custody` all `None`) must
+    // reject UCAN mint, UCAN delegate, and event-log checkpoint with the
+    // canonical missing-signing-custody code — not an overloaded
+    // permission/nonce code.
+
+    #[tokio::test]
+    async fn ucan_mint_without_retained_custody_returns_ident_1017() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+
+        let result = ucan_mint_impl(
+            handle,
+            "did:dht:z6MkMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("mint without retained custody must fail")
+        };
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains(codes::IDENT_1017),
+            "expected SCP-IDENT-1017, got: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ucan_delegate_without_retained_custody_returns_ident_1017() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+
+        // The handle-borne custody check fires before any parent-token parsing.
+        let result = ucan_delegate_impl(
+            handle,
+            "did:dht:z6MkDelegator".to_owned(),
+            "did:dht:z6MkDelegatee".to_owned(),
+            "header.payload.signature".to_owned(),
+            vec!["messages:write".to_owned()],
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("delegate without retained custody must fail")
+        };
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains(codes::IDENT_1017),
+            "expected SCP-IDENT-1017, got: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_log_checkpoint_without_retained_custody_returns_ident_1017() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+        let identity = test_identity_for(&scp);
+
+        let result =
+            event_log_checkpoint_impl(Arc::clone(&scp.inner), handle, identity, 1u64).await;
+        let Err(err) = result else {
+            panic!("checkpoint without retained custody must fail")
+        };
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains(codes::IDENT_1017),
+            "expected SCP-IDENT-1017, got: {err_str}"
         );
     }
 }

@@ -2025,11 +2025,11 @@ pub(crate) async fn broadcast_publish_on(
 
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastPayload};
     let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish requires key custody — this identity has no retained \
-                      custody (it was externally loaded)"
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish requires retained signing custody — this identity has no \
+                      retained custody (it was externally loaded)"
                 .to_owned(),
-            code: codes::PERM_3020.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
@@ -2174,11 +2174,11 @@ pub(crate) async fn broadcast_publish_asset_on(
 
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
     let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish asset requires key custody — this identity has no \
-                      retained custody (it was externally loaded)"
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish asset requires retained signing custody — this identity \
+                      has no retained custody (it was externally loaded)"
                 .to_owned(),
-            code: codes::PERM_3020.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
@@ -2279,9 +2279,11 @@ pub(crate) async fn broadcast_publish_assets_on(
 
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
     let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish assets requires key custody".to_owned(),
-            code: codes::PERM_3020.to_owned(),
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish assets requires retained signing custody — this identity \
+                      has no retained custody (it was externally loaded)"
+                .to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {

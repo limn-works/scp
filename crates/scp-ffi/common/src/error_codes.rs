@@ -79,6 +79,16 @@ pub const IDENT_1015: &str = "SCP-IDENT-1015";
 /// `identity_verify_device_attestation` method is not exposed on the
 /// native bridge.
 pub const IDENT_1016: &str = "SCP-IDENT-1016";
+/// Operation requires retained signing custody, which this identity/handle
+/// lacks.
+///
+/// Surfaced by operations that must sign with the creator/identity key (UCAN
+/// mint, UCAN delegate, event-log checkpoint, broadcast publish) when the
+/// identity was loaded externally with no retained custody, or the
+/// custody/handle is sign-only without the needed key material. Distinct from
+/// `IDENT_1001` (identity not registered) and from `CTX_2040` (context-export
+/// operation errors).
+pub const IDENT_1017: &str = "SCP-IDENT-1017";
 /// Identity agent key creation.
 pub const IDENT_1020: &str = "SCP-IDENT-1020";
 /// Identity DID document error.
@@ -429,7 +439,12 @@ pub const PERM_3020: &str = "SCP-PERM-3020";
 pub const PERM_3021: &str = "SCP-PERM-3021";
 /// UCAN permission: delegation chain invalid.
 pub const PERM_3022: &str = "SCP-PERM-3022";
-/// UCAN permission: nonce replay detected.
+/// Reserved; no active producer.
+///
+/// Formerly overloaded by the NAPI bridge for the missing-signing-custody
+/// condition (now `IDENT_1017`). Genuine UCAN nonce replay
+/// (`UcanError::NonceReused`) is classified as `PERM_3001` by
+/// `ucan_errors::ucan_error_code`.
 pub const PERM_3023: &str = "SCP-PERM-3023";
 /// Handle affinity violation — handle from a different SCP instance.
 pub const PERM_3030: &str = "SCP-PERM-3030";

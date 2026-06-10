@@ -291,19 +291,19 @@ pub(crate) async fn ucan_mint_on(
     // for any context whose creator identity retains custody — in-memory OR a
     // production callback custody (`identityCreateWithCustody`).
     let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Permission {
-            message: "UCAN minting requires key custody — the context creator identity has no \
-                  retained custody (it was externally loaded)"
+        napi::Error::from(ScpNapiError::Identity {
+            message: "UCAN minting requires retained signing custody — the context creator \
+                  identity has no retained custody (it was externally loaded)"
                 .to_owned(),
-            code: codes::PERM_3023.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Permission {
-            message: "UCAN minting requires a signing key — the context creator identity \
-                  must have an active signing key"
+        napi::Error::from(ScpNapiError::Identity {
+            message: "UCAN minting requires retained signing custody — the context creator \
+                  identity has no active signing key"
                 .to_owned(),
-            code: codes::PERM_3023.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
 
@@ -343,7 +343,7 @@ pub(crate) async fn ucan_mint_on(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
                 message: format!("UCAN minting failed: {e}"),
-                code: codes::PERM_3023.to_owned(),
+                code: codes::PERM_3001.to_owned(),
             })
         })?;
 
@@ -407,7 +407,7 @@ pub(crate) async fn ucan_delegate_on(
                 "delegator DID '{}' does not match parent token audience '{}'",
                 delegator_did, parsed_parent.payload.aud
             ),
-            code: codes::PERM_3023.to_owned(),
+            code: codes::PERM_3021.to_owned(),
         }));
     }
 
@@ -425,9 +425,9 @@ pub(crate) async fn ucan_delegate_on(
             let parsed: CapabilityUri =
                 cap_uri_str
                     .parse()
-                    .map_err(|e: CoreUcanError| ScpNapiError::Permission {
+                    .map_err(|e: CoreUcanError| ScpNapiError::Validation {
                         message: format!("invalid capability URI '{cap_uri_str}': {e}"),
-                        code: codes::PERM_3023.to_owned(),
+                        code: codes::VALID_7014.to_owned(),
                     })?;
             Ok(Attenuation {
                 with: cap_uri_str,
@@ -1264,6 +1264,49 @@ mod tests {
         assert!(
             !runtime::remove_identity_if_present(&bi, &did),
             "remove_identity_if_present should return false for absent identity"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Missing-signing-custody → SCP-IDENT-1017
+    //
+    // A context handle whose creator identity retains no custody (externally
+    // loaded: `in_memory_custody` / `signing_key` both `None`) must reject UCAN
+    // mint with the canonical missing-signing-custody code, not an overloaded
+    // permission/nonce code.
+    //
+    // NOTE: the NAPI `ucan_delegate_on` path resolves the delegator key from
+    // the identity registry (`with_identity`), so its no-custody condition
+    // surfaces as the registry-miss SCP-IDENT-1001, not IDENT-1017. The
+    // delegate→IDENT-1017 routing is a UniFFI-shaped concern (handle-borne
+    // custody) and is covered by the UniFFI inline test.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_without_retained_custody_returns_ident_1017() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-no-custody-mint".to_owned(),
+            "did:dht:z6MkCreatorNoCustody".to_owned(),
+        );
+
+        let result = ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("mint without retained custody must fail")
+        };
+        let reason = err.reason.clone();
+        assert!(
+            reason.contains("SCP-IDENT-1017"),
+            "expected SCP-IDENT-1017, got: {reason}"
         );
     }
 }
