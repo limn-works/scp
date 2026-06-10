@@ -842,21 +842,38 @@ mod tests {
     }
 
     /// Verifies that the handle reference counter tracks live opaque objects
-    /// and returns to the pre-test baseline after all handles are dropped.
+    /// and that dropping a handle decrements the counter.
     ///
     /// Conformance (shutdown ordering): `HANDLE_COUNT` must reflect live
     /// handles accurately so `scp_shutdown` can block until safe to teardown.
     ///
-    /// Tests one handle at a time to avoid interference from concurrent tests
-    /// that also modify the global counter.
+    /// `HANDLE_COUNT` is a process-global atomic. The exact-delta assertions
+    /// below are only sound when this test has the process to itself — i.e.
+    /// under nextest's per-test process isolation (CI's primary runner). Under
+    /// shared-process `cargo test`, concurrent tests in this binary mutate
+    /// `HANDLE_COUNT` and make the deltas racy, so the test skips there.
     /// Requires the `allow_in_memory_custody` feature (needs in-memory identity).
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn handle_count_tracks_live_opaque_objects() {
+        // HANDLE_COUNT is a process-global counter. These exact-delta assertions are
+        // only sound when this test has the process to itself — i.e. under nextest's
+        // per-test process isolation (CI's primary runner). Under shared-process
+        // `cargo test`, concurrent tests in this binary mutate HANDLE_COUNT and make
+        // the deltas racy, so skip there rather than assert an unsound invariant.
+        if std::env::var_os("NEXTEST").is_none() {
+            eprintln!(
+                "skipping handle_count_tracks_live_opaque_objects: requires nextest \
+                 per-test process isolation (HANDLE_COUNT is a shared process global)"
+            );
+            return;
+        }
+
         let rt = runtime();
 
-        // Measure create → drop for a single handle. The delta across a single
-        // create/drop is guaranteed regardless of concurrent test activity.
+        // Measure create → drop for a single handle. Under nextest's process
+        // isolation this test owns HANDLE_COUNT, so the create/drop deltas are
+        // deterministic.
         let before_create = HANDLE_COUNT.load(Ordering::SeqCst);
         let id = rt
             .block_on(scp_test().identity_create("in_memory".to_owned(), None))
