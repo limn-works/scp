@@ -28,10 +28,16 @@
 //!
 //! # Key custody
 //!
+//! The production custody path is `identityCreateWithCustody(provider)`, which
+//! wires a caller-supplied `KeyCustodyProvider` (keychain/HSM-backed). Identities
+//! created this way report `custodyType == "callback"`, since key material
+//! stays behind the provider and never enters this bridge's heap.
+//!
 //! `"in_memory"` custody stores key material in heap memory via
-//! `InMemoryKeyCustody`. This is suitable for testing and CLI usage but NOT
-//! for production on devices with HSM capability. Production callers should
-//! use `"platform"` custody, which requires a wired `KeyCustodyProvider`.
+//! `InMemoryKeyCustody`. It is dev/test-only and gated behind the
+//! `allow_in_memory_custody` feature; identities created this way report
+//! `custodyType == "in_memory"`. Externally loaded identities (DID-string only,
+//! no retained key material) report `custodyType == "external"`.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` and ADR-039.
 
@@ -960,7 +966,7 @@ impl NapiIdentity {
                 NapiError::from(ScpNapiError::Identity {
                     message: format!(
                         "{operation} requires retained crypto state — this identity was \
-                         externally loaded and has no in-memory key material"
+                         externally loaded and has no retained key material"
                     ),
                     code: codes::IDENT_1007.to_owned(),
                 })
