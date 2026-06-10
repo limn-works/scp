@@ -176,6 +176,25 @@ pub const IDENT_1052: &str = "SCP-IDENT-1052";
 /// idiom). Phase-1 surface is JUST this code + the error message body.
 pub const IDENT_1053: &str = "SCP-IDENT-1053";
 
+// -----------------------------------------------------------------------
+// Per-context pseudonym derivation errors (§9.10.4).
+//
+// Surfaced by all native bridges (PyO3, napi-rs, UniFFI) on the
+// context_create / context_join / context_import lifecycle entry points
+// when deriving the caller's per-member routing pseudonym from custody-held
+// identity key material. Encrypted / pseudonymous contexts hard-fail on
+// derivation error; broadcast contexts (spec §5.14) skip derivation entirely.
+// -----------------------------------------------------------------------
+
+/// Pseudonym derivation: identity missing core key material.
+pub const IDENT_1054: &str = "SCP-IDENT-1054";
+/// Pseudonym derivation failed (custody/KDF error).
+pub const IDENT_1055: &str = "SCP-IDENT-1055";
+/// Pseudonym derivation: no custody provider available.
+pub const IDENT_1056: &str = "SCP-IDENT-1056";
+/// Pseudonym derivation: derived public key was not 32 bytes.
+pub const IDENT_1057: &str = "SCP-IDENT-1057";
+
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
 // -------------------------------------------------------------------------
@@ -333,6 +352,14 @@ pub const CTX_2093: &str = "SCP-CTX-2093";
 /// format" apart from "forged signature" (spec §23.16.8, §17.5; ADR-050). Maps
 /// from `ContextError::ExportVersionUnsupported`.
 pub const CTX_2094: &str = "SCP-CTX-2094";
+/// Pseudonym registry empty — peers have not announced routing IDs (§9.10.4).
+///
+/// Maps from `ContextError::PseudonymRegistryEmpty`.
+pub const CTX_2095: &str = "SCP-CTX-2095";
+/// Per-member pseudonym requested for a non-pseudonymous (broadcast) context (§5.14).
+///
+/// Maps from `ContextError::NotPseudonymousContext`.
+pub const CTX_2096: &str = "SCP-CTX-2096";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.

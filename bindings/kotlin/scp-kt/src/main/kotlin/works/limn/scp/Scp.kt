@@ -568,8 +568,15 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.contextHandleTtlExpiry] on [inner]. */
     suspend fun contextHandleTtlExpiry(handle: ContextHandle) = inner.contextHandleTtlExpiry(handle = handle)
 
-    /** Forwards to [NativeScp.contextImport] on [inner]. */
-    suspend fun contextImport(data: ByteArray): String = inner.contextImport(data = data)
+    /**
+     * Forwards to [NativeScp.contextImport] on [inner].
+     *
+     * [importerIdentity] supplies the §9.10.4 per-context pseudonym derivation
+     * material so the importing member routes under its OWN routing ID rather
+     * than inheriting the exporter's local-instance pseudonym.
+     */
+    suspend fun contextImport(data: ByteArray, importerIdentity: Identity): String =
+        inner.contextImport(data = data, importerIdentity = importerIdentity)
 
     /** Forwards to [NativeScp.contextIsMember] on [inner]. */
     suspend fun contextIsMember(

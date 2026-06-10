@@ -1185,10 +1185,28 @@ export function createWasmBridge(): Bridge {
       return await wasm.context_export(handle);
     },
 
-    async contextImport(data: Uint8Array): Promise<string> {
+    async contextImport(data: Uint8Array, _importerDid: string): Promise<string> {
       const wasm = getWasm();
       // WASM import takes Uint8Array directly — no base64 conversion needed.
+      // §9.10.4 / ADR-034: the WASM bridge has no per-member pseudonym routing
+      // (shared routing IDs only), so `importerDid` is intentionally ignored.
       return await wasm.context_import(data);
+    },
+
+    // §9.10.4 / ADR-034: the WASM bridge uses shared routing IDs and has no
+    // per-member pseudonym registry, so there is nothing to seed. This test-only
+    // helper is never used on the WASM path; reject loudly if it ever is.
+    contextSeedPeerPseudonym(
+      _handle: BridgeContextHandle,
+      _peerDid: string,
+      _pseudonym: Uint8Array,
+    ): Promise<void> {
+      return Promise.reject(
+        new Error(
+          "contextSeedPeerPseudonym is not supported on the WASM bridge " +
+            "(ADR-034: shared routing IDs, no per-member pseudonym registry)",
+        ),
+      );
     },
 
     // Drain events

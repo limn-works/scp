@@ -236,7 +236,20 @@ export interface Bridge {
 
   // Context export/import
   contextExport(handle: BridgeContextHandle): Promise<Uint8Array>;
-  contextImport(data: Uint8Array): Promise<string>;
+  // §9.10.4: `importerDid` identifies the importing member so the native
+  // bridge can derive that identity's per-context pseudonym routing ID. The
+  // WASM bridge ignores it (ADR-034: shared routing IDs, no pseudonym path).
+  contextImport(data: Uint8Array, importerDid: string): Promise<string>;
+
+  // §9.10.4 test-only: inject a peer's per-member pseudonym routing ID into this
+  // context's registry (simulating the peer's PseudonymAnnouncement) so a
+  // co-located encrypted send can fan out to it. Native-only; feature-gated to
+  // dev/test builds. Not present on the WASM bridge.
+  contextSeedPeerPseudonym(
+    handle: BridgeContextHandle,
+    peerDid: string,
+    pseudonym: Uint8Array,
+  ): Promise<void>;
 
   // Drain events
   contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]>;

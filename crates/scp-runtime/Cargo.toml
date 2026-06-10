@@ -134,6 +134,10 @@ required-features = ["testing"]
 name = "envelope_validation_integration"
 required-features = ["testing"]
 
+[[test]]
+name = "pseudonym_routing_integration"
+required-features = ["testing"]
+
 [[example]]
 name = "identity"
 

@@ -221,6 +221,18 @@ async fn setup_threshold_context_with_dave(ctx_id: &str) -> std::sync::Arc<Super
         "Dave should be a member after governance approval"
     );
 
+    // §9.10.4: seed peer pseudonyms so multi-member encrypted sends have a
+    // non-empty routing registry. In production each peer announces its
+    // routing ID via a `PseudonymAnnouncement`; this single-node test hosts
+    // only one member's view, so the registry is seeded directly (the same
+    // mutation a delivered announcement performs).
+    for (member, tag) in [(bob(), 2u8), (carol(), 3u8), (dave(), 4u8)] {
+        manager
+            .seed_peer_pseudonym(ctx_id, member, [tag; 32])
+            .await
+            .expect("seed peer pseudonym");
+    }
+
     manager
 }
 

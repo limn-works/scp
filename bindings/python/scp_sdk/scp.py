@@ -890,14 +890,20 @@ class SCP:
         """Delegate to ``_scp_core.SCP.context_handle_ttl_expiry``."""
         return await asyncio.to_thread(self._native.context_handle_ttl_expiry, handle)
 
-    async def context_import(self, data: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.context_import`` (returns :class:`Context`)."""
+    async def context_import(self, data: Any, importer_did: str) -> Any:
+        """Delegate to ``_scp_core.SCP.context_import`` (returns :class:`Context`).
+
+        ``importer_did`` is the DID of the identity importing the context; the
+        bridge derives that identity's per-context pseudonym routing ID
+        (§9.10.4) so the importer fans out under its own routing ID rather than
+        inheriting the exporter's local-instance pseudonym.
+        """
         from scp_sdk.context import Context
 
-        raw = await asyncio.to_thread(self._native.context_import, data)
+        raw = await asyncio.to_thread(self._native.context_import, data, importer_did)
         if raw is None:
             return None
-        return Context(raw)
+        return Context(raw, identity_did=importer_did)
 
     async def context_is_member(self, handle: Any, did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_is_member``."""

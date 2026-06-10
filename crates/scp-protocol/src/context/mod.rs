@@ -534,6 +534,58 @@ pub enum ContextError {
     /// translators.
     #[error("SCP-CTX-2133: transport timeout: {0}")]
     TransportTimeout(String),
+
+    /// An application-data send into an encrypted multi-member context found
+    /// an empty peer pseudonym registry (§9.10.4): no peer has announced its
+    /// per-context routing ID yet, so there is nobody to fan the ciphertext
+    /// out to.
+    ///
+    /// Distinct from a transport failure — the send was *aborted before* any
+    /// transport call so the economy ticket and sequence reservation are
+    /// rolled back, leaving the context unchanged. Raising a typed error
+    /// (rather than silently succeeding with zero sends) lets callers
+    /// distinguish "peers have not announced yet; retry after the
+    /// `PseudonymAnnouncement` bootstrap completes" from a genuine delivery
+    /// failure, and prevents the historic silent-drop that masked a
+    /// bidirectional bootstrap deadlock.
+    ///
+    /// Single-member encrypted contexts with an empty registry succeed as a
+    /// no-op (nobody to fan out to) — this variant is not raised for them.
+    /// Announcements themselves use the shared-RID bootstrap channel and are
+    /// never subject to this error.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2095` through every FFI bridge
+    /// translator.
+    #[error(
+        "SCP-CTX-2095: pseudonym registry empty for context '{context_id}' \
+         (member_count={member_count}) — peers have not announced routing IDs; \
+         app-data send aborted to avoid silent drop"
+    )]
+    PseudonymRegistryEmpty {
+        /// The affected context ID.
+        context_id: String,
+        /// Current member count at rejection time.
+        member_count: usize,
+    },
+
+    /// A per-member pseudonym was requested for a context that does not use
+    /// pseudonymous routing — a broadcast context (§5.14). Broadcast contexts
+    /// route on the derivable shared `SHA-256(context_id)` RID and carry no
+    /// per-member pseudonym state, so there is nothing to return.
+    ///
+    /// Callers that want to handle both routing strategies should check the
+    /// context mode first.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2096` through every FFI bridge
+    /// translator.
+    #[error(
+        "SCP-CTX-2096: context '{context_id}' is not a pseudonymous context — \
+         broadcast contexts have no per-member pseudonym"
+    )]
+    NotPseudonymousContext {
+        /// The affected context ID.
+        context_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

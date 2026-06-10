@@ -664,6 +664,39 @@ pub fn validate_export_for_import(
     Ok(())
 }
 
+/// §9.10.4 misuse-resistance: verify the importer is a member of the exported
+/// snapshot before its per-context pseudonym is derived.
+///
+/// Encrypted app-data routes to each member's per-member pseudonym routing ID.
+/// If the importer is not in the snapshot's membership, the pseudonym it derives
+/// addresses a routing ID no peer expects — leaving the importer silently
+/// unaddressable rather than failing visibly. Reject loudly with the structural
+/// import-rejection code (`SCP-CTX-2092`) instead. The snapshot creator is
+/// itself a member, so a creator re-homing its own context passes this check.
+///
+/// Call AFTER [`validate_export_for_import`] (so the snapshot membership is
+/// cryptographically authenticated) and BEFORE deriving the importer pseudonym.
+///
+/// # Errors
+///
+/// Returns [`ContextError::ImportRejected`] (canonical code `SCP-CTX-2092`) when
+/// `importer_did` is not present in the snapshot's membership.
+pub fn ensure_importer_is_member(
+    snapshot: &ContextSnapshot,
+    importer_did: &str,
+) -> Result<(), ContextError> {
+    if snapshot.membership.contains(importer_did) {
+        Ok(())
+    } else {
+        Err(ContextError::ImportRejected {
+            reason: format!(
+                "importer '{importer_did}' is not a member of the exported context; \
+                 only a member can re-home it and derive a routable pseudonym (§9.10.4)"
+            ),
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public metadata stripping for ExportScope::Public
 // ---------------------------------------------------------------------------
@@ -774,10 +807,12 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // Generation counter is local runtime state — no meaning to a
         // public observer. Always zero in public scope.
         generation: 0,
-        // §9.10.4: pseudonym state is local-instance routing state —
-        // no meaning to a public observer. Always empty/None in public scope.
-        local_pseudonym: None,
-        pseudonym_registry: HashMap::new(),
+        // §9.10.4: pseudonym state is local-instance routing state with no
+        // meaning to a public observer. Redact to the no-pseudonym
+        // `Broadcast` placeholder — it carries no routing secret. (Public
+        // snapshots are never imported back into a live encrypted context, so
+        // the routing axis is irrelevant here.)
+        routing: crate::context::actor::state::ContextRouting::Broadcast,
     })
 }
 
@@ -963,8 +998,42 @@ mod tests {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
-            local_pseudonym: None,
-            pseudonym_registry: HashMap::new(),
+            routing: crate::context::actor::state::ContextRouting::Broadcast,
+        }
+    }
+
+    #[test]
+    fn ensure_importer_is_member_accepts_members_rejects_non_members() {
+        use scp_identity::DID;
+
+        let mut snapshot = test_snapshot("member-check-ctx");
+        // A real snapshot carries the creator in its membership; mirror that, plus
+        // a second ordinary member.
+        snapshot.membership.add_member(
+            DID(TEST_CREATOR_DID.to_owned()),
+            "admin".to_owned(),
+            vec![],
+        );
+        snapshot.membership.add_member(
+            DID("did:key:alice".to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+
+        // An ordinary member is accepted.
+        ensure_importer_is_member(&snapshot, "did:key:alice").expect("a member must be accepted");
+        // The creator re-homing its own context is accepted (creator is a member).
+        ensure_importer_is_member(&snapshot, TEST_CREATOR_DID)
+            .expect("the creator (a member) must be accepted");
+
+        // A non-member is rejected with the structural import-rejection error,
+        // naming the offending DID — never a silent dead-pseudonym derivation.
+        match ensure_importer_is_member(&snapshot, "did:key:mallory") {
+            Err(ContextError::ImportRejected { reason }) => {
+                assert!(reason.contains("not a member"), "reason: {reason}");
+                assert!(reason.contains("did:key:mallory"), "reason: {reason}");
+            }
+            other => panic!("non-member import must be rejected, got {other:?}"),
         }
     }
 
@@ -1023,6 +1092,36 @@ mod tests {
             }
             other => panic!("expected deserialization EventLogFailed, got: {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // §9.10.4 degraded-snapshot routing default (FIX 6b)
+    // -------------------------------------------------------------------
+
+    /// A `ContextSnapshot` persisted WITHOUT a `routing` field (pre-routing-
+    /// field snapshots, or `strip_snapshot_for_public` redactions) deserializes
+    /// with `routing == ContextRouting::Broadcast` via `default_context_routing`
+    /// and `#[serde(default)]`. This is the placeholder the restore path then
+    /// reconciles against the reconstructed mode (fail-closed for an encrypted
+    /// context, fine for a broadcast one).
+    #[test]
+    fn snapshot_without_routing_field_defaults_to_broadcast() {
+        let snapshot = test_snapshot("ctx-degraded-routing");
+        // Round-trip through JSON and DELETE the `routing` key to simulate a
+        // snapshot persisted before the field existed.
+        let mut value = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        let obj = value.as_object_mut().expect("snapshot serializes as a map");
+        assert!(
+            obj.remove("routing").is_some(),
+            "routing field present pre-strip"
+        );
+
+        let restored: ContextSnapshot =
+            serde_json::from_value(value).expect("deserialize snapshot with routing omitted");
+        assert!(
+            restored.routing.is_broadcast(),
+            "a snapshot missing the routing field must default to Broadcast (degraded placeholder)"
+        );
     }
 
     // -------------------------------------------------------------------

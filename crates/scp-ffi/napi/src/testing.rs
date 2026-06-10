@@ -91,13 +91,6 @@ impl NapiFullStackNode {
     pub fn did(&self) -> String {
         self.inner.did.to_string()
     }
-
-    /// Returns the id of the `SCP` instance that minted this node, as a
-    /// base-10 string.
-    #[napi(getter, js_name = "instanceId")]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,16 +356,11 @@ pub(crate) fn fullstack_send_message_on(
             code: codes::CRYPTO_4053.to_owned(),
         }));
     }
-    if sent.len() > 1 {
-        return Err(napi::Error::from(ScpNapiError::Crypto {
-            message: format!(
-                "expected 1 ciphertext after send, got {} — send_message should produce exactly one",
-                sent.len()
-            ),
-            code: codes::CRYPTO_4055.to_owned(),
-        }));
-    }
-
+    // §9.10.4: an encrypted send fans the SAME MLS ciphertext out to each peer's
+    // per-member pseudonym routing ID, so a multi-member context captures one
+    // entry per peer. The inner encrypted blob is identical across them and
+    // decryption ignores the outer routing ID, so any captured entry is a valid
+    // ciphertext that every member can decrypt. Return the first.
     Ok(Buffer::from(sent[0].1.clone()))
 }
 
@@ -439,6 +427,50 @@ pub(crate) fn fullstack_remove_member_on(
     // fullstack_send_message would see >1 ciphertext and fail the
     // single-ciphertext assertion.
     let _ = node.inner.take_sent_ciphertexts();
+
+    Ok(())
+}
+
+/// Per-bridge-instance implementation of [`fullstack_seed_peer_pseudonym`].
+///
+/// Test-only: seeds a peer's per-context pseudonym routing ID (§9.10.4) into
+/// this node's `Supervisor`, simulating a delivered `PseudonymAnnouncement` so
+/// multi-member encrypted sends do not fail closed with `SCP-CTX-2095`.
+/// Mirrors the runtime `Supervisor::seed_peer_pseudonym` test helper.
+pub(crate) fn fullstack_seed_peer_pseudonym_on(
+    bi: &NapiBridgeInstance,
+    node: &NapiFullStackNode,
+    context_id: String,
+    peer_did: String,
+    pseudonym: Buffer,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, node);
+
+    let pseudonym_bytes: &[u8] = &pseudonym;
+    if pseudonym_bytes.len() != 32 {
+        return Err(napi::Error::from(ScpNapiError::Context {
+            message: format!(
+                "pseudonym must be exactly 32 bytes, got {}",
+                pseudonym_bytes.len()
+            ),
+            code: codes::CTX_2095.to_owned(),
+        }));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(pseudonym_bytes);
+
+    let rt = crate::runtime();
+    rt.block_on(node.inner.manager.seed_peer_pseudonym(
+        &context_id,
+        scp_identity::DID::from(peer_did.as_str()),
+        arr,
+    ))
+    .map_err(|e| {
+        napi::Error::from(ScpNapiError::Context {
+            message: format!("failed to seed peer pseudonym: {e}"),
+            code: codes::CTX_2095.to_owned(),
+        })
+    })?;
 
     Ok(())
 }

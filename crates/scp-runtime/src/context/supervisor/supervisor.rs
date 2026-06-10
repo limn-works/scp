@@ -1277,6 +1277,7 @@ impl Supervisor {
             LifecycleCommand::ImportContext {
                 export,
                 verifying_key,
+                local_pseudonym,
                 reply,
             } => {
                 let context_id = export.snapshot.context_id.clone();
@@ -1373,6 +1374,7 @@ impl Supervisor {
                     &deps,
                     *export,
                     &verifying_key,
+                    local_pseudonym,
                 ));
                 let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
                     .await
@@ -3790,6 +3792,7 @@ impl Supervisor {
         self: &Arc<Self>,
         export: crate::context::export_import::ContextExport,
         verifying_key: &ed25519_dalek::VerifyingKey,
+        local_pseudonym: Option<[u8; 32]>,
     ) -> Result<crate::context::ContextHandle, ContextError> {
         // Verify-before-side-effect at the public API boundary: reject a
         // forged or malformed export before it is ever dispatched onto the
@@ -3806,6 +3809,7 @@ impl Supervisor {
         let cmd = LifecycleCommand::ImportContext {
             export: Box::new(export),
             verifying_key: Box::new(*verifying_key),
+            local_pseudonym,
             reply: tx,
         };
         self.dispatch_lifecycle_command(cmd).await?;
@@ -4983,6 +4987,42 @@ impl Supervisor {
         })?
     }
 
+    /// Test-only: directly seed a peer's per-context pseudonym routing ID
+    /// (§9.10.4) into the routing registry, bypassing the
+    /// `PseudonymAnnouncement` MLS round-trip.
+    ///
+    /// Single-node integration tests host one member's view of a context, so a
+    /// governance-added peer never gets to announce its pseudonym. This lets
+    /// such tests populate the registry the way a delivered announcement would,
+    /// so multi-member encrypted sends exercise real fan-out instead of failing
+    /// with [`ContextError::PseudonymRegistryEmpty`]. Gated behind `testing`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotPseudonymousContext`] if the context is broadcast.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn seed_peer_pseudonym(
+        &self,
+        context_id: &str,
+        member_did: DID,
+        pseudonym: [u8; 32],
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::SeedPeerPseudonym {
+            context_id: context_id.to_owned(),
+            member_did,
+            pseudonym,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::seed_peer_pseudonym — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Lists every governance proposal currently tracked by the
     /// context's engine via the actor mailbox.
     ///
@@ -5203,10 +5243,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the handler.
-    pub async fn local_pseudonym(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<[u8; 32]>, ContextError> {
+    pub async fn local_pseudonym(&self, context_id: &str) -> Result<[u8; 32], ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = QueriesCommand::LocalPseudonym {
             context_id: context_id.to_owned(),
@@ -6670,8 +6707,7 @@ mod tests {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
-            local_pseudonym: None,
-            pseudonym_registry: HashMap::new(),
+            routing: crate::context::actor::state::ContextRouting::Broadcast,
         }
     }
 
@@ -6713,7 +6749,7 @@ mod tests {
         // resolver returning the wrong creator key. Verification must fail.
         let wrong_key = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
 
-        let result = supervisor.import_context(export, &wrong_key).await;
+        let result = supervisor.import_context(export, &wrong_key, None).await;
 
         assert!(
             matches!(result, Err(ContextError::SnapshotSignatureInvalid { .. })),
@@ -6725,6 +6761,44 @@ mod tests {
         assert!(
             supervisor.key_package_stores.is_empty(),
             "rejected forged import must not leak a key-package-store entry"
+        );
+    }
+
+    /// §9.10.4 (FIX 1 runtime defense): a validly-signed BROADCAST-mode export
+    /// is rejected with `ImportRejected` (the import path is encrypted-only) —
+    /// NOT silently re-homed as an encrypted context with the reserved zero
+    /// pseudonym. Post-#1774 the signature must VERIFY first, so the export is
+    /// signed by the creator key and presented with the matching verifying key;
+    /// rejection then comes from the broadcast guard inside `import_context`.
+    #[tokio::test]
+    async fn import_rejects_broadcast_export() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let supervisor = supervisor_with_providers();
+        let creator = "did:key:broadcast-import-creator";
+        let mut snapshot = import_test_snapshot("broadcast-ctx", creator);
+        snapshot.context_params.mode = scp_protocol::context::ContextMode::Broadcast;
+        snapshot.routing = crate::context::actor::state::ContextRouting::Broadcast;
+        let event_log_data = create_event_log_data(&[0x22u8; 32], &["ContextCreated"]);
+
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_primitives::SystemClock,
+            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+        )
+        .expect("build a valid signed broadcast export");
+        let verifying_key = signing_key.verifying_key();
+
+        let result = supervisor
+            .import_context(export, &verifying_key, Some([0x42u8; 32]))
+            .await;
+        assert!(
+            matches!(result, Err(ContextError::ImportRejected { .. })),
+            "a broadcast-mode export must be rejected with ImportRejected; got {result:?}"
         );
     }
 
@@ -6839,7 +6913,9 @@ mod tests {
             "owning member's key-package store must not exist before the import"
         );
 
-        let result = supervisor.import_context(export, &verifying_key).await;
+        let result = supervisor
+            .import_context(export, &verifying_key, None)
+            .await;
 
         // Live-context-overwrite rejection propagates from
         // `import_context`.
@@ -6895,7 +6971,9 @@ mod tests {
         let export =
             signed_import_export_with_member(&context_id, creator, owning_member, &signing_key);
 
-        let result = supervisor.import_context(export, &verifying_key).await;
+        let result = supervisor
+            .import_context(export, &verifying_key, None)
+            .await;
         assert!(
             matches!(result, Err(ContextError::MembershipFailed(_))),
             "import over a live context must be rejected, got {result:?}"

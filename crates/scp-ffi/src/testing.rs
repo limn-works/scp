@@ -340,13 +340,11 @@ fn fullstack_send_message_impl<'py>(
             "no ciphertext captured after send",
         ));
     }
-    if sent.len() > 1 {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "expected 1 ciphertext after send, got {} — send_message should produce exactly one",
-            sent.len()
-        )));
-    }
-
+    // §9.10.4: an encrypted send fans the SAME MLS ciphertext out to each peer's
+    // per-member pseudonym routing ID, so a multi-member context captures one
+    // entry per peer. The inner encrypted blob is identical across them and
+    // decryption ignores the outer routing ID, so any captured entry is a valid
+    // ciphertext that every member can decrypt. Return the first.
     Ok(PyBytes::new(py, &sent[0].1))
 }
 
@@ -405,6 +403,47 @@ fn fullstack_remove_member_impl(
     // application messages, and must not bleed into the buffer that
     // py_fullstack_send_message checks for exactly-one application ciphertext.
     let _ = node.inner.take_sent_ciphertexts();
+
+    Ok(())
+}
+
+/// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4) into
+/// this node's `Supervisor`, bypassing the `PseudonymAnnouncement` MLS
+/// round-trip.
+///
+/// Single-node E2E tests host one member's view of a context, so a
+/// governance-added peer never gets to announce its pseudonym. This lets such
+/// tests populate the routing registry the way a delivered announcement would,
+/// so multi-member encrypted sends exercise real fan-out instead of failing
+/// closed with `SCP-CTX-2095`. Mirrors the runtime
+/// `Supervisor::seed_peer_pseudonym` test helper.
+fn fullstack_seed_peer_pseudonym_impl(
+    bi: &PyBridgeInstance,
+    node: &PyFullStackNode,
+    context_id: String,
+    peer_did: String,
+    pseudonym: Vec<u8>,
+) -> PyResult<()> {
+    crate::pyscp_check_handle!(&bi.core, node);
+
+    if pseudonym.len() != 32 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "pseudonym must be exactly 32 bytes, got {}",
+            pseudonym.len()
+        )));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&pseudonym);
+
+    let rt = crate::runtime()?;
+    rt.block_on(node.inner.manager.seed_peer_pseudonym(
+        &context_id,
+        scp_identity::DID::from(peer_did.as_str()),
+        arr,
+    ))
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to seed peer pseudonym: {e}"))
+    })?;
 
     Ok(())
 }
@@ -528,6 +567,23 @@ impl crate::scp::PyScp {
         crate::pyscp_check_handle!(&self.inner.core, node);
         let bi = &*self.inner;
         fullstack_remove_member_impl(bi, node, context_id, member_did)
+    }
+
+    /// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4)
+    /// into this node's `Supervisor`, simulating a delivered
+    /// `PseudonymAnnouncement` so multi-member encrypted sends do not fail
+    /// closed with `SCP-CTX-2095`.
+    #[pyo3(name = "fullstack_seed_peer_pseudonym")]
+    pub fn fullstack_seed_peer_pseudonym(
+        &self,
+        node: &PyFullStackNode,
+        context_id: String,
+        peer_did: String,
+        pseudonym: Vec<u8>,
+    ) -> PyResult<()> {
+        crate::pyscp_check_handle!(&self.inner.core, node);
+        let bi = &*self.inner;
+        fullstack_seed_peer_pseudonym_impl(bi, node, context_id, peer_did, pseudonym)
     }
 }
 
@@ -668,8 +724,23 @@ mod handle_affinity_tests {
         });
 
         // 7. fullstack_remove_member_impl
-        let r7 = fullstack_remove_member_impl(bi_b, &node_a, ctx, "did:dht:z6MkMember".to_owned());
+        let r7 = fullstack_remove_member_impl(
+            bi_b,
+            &node_a,
+            ctx.clone(),
+            "did:dht:z6MkMember".to_owned(),
+        );
         assert_perm_3030(r7, "fullstack_remove_member_impl");
+
+        // 8. fullstack_seed_peer_pseudonym_impl
+        let r8 = fullstack_seed_peer_pseudonym_impl(
+            bi_b,
+            &node_a,
+            ctx,
+            "did:dht:z6MkPeer".to_owned(),
+            vec![0u8; 32],
+        );
+        assert_perm_3030(r8, "fullstack_seed_peer_pseudonym_impl");
     }
 
     /// Sanity check: a node used against its own bridge instance passes

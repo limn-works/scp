@@ -2636,9 +2636,19 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `context_import`.
+    ///
+    /// `importer_did` identifies the importing member; the bridge resolves that
+    /// identity from its registry and derives the §9.10.4 per-context pseudonym
+    /// routing ID, so the importer routes under its OWN pseudonym rather than
+    /// inheriting the exporter's local-instance pseudonym. Mirrors the
+    /// `contextJoin` DID-string convention.
     #[napi(js_name = "contextImport")]
-    pub async fn context_import(&self, data: Vec<u8>) -> napi::Result<String> {
-        crate::context::context_import_on(&self.inner, data).await
+    pub async fn context_import(
+        &self,
+        data: Vec<u8>,
+        importer_did: String,
+    ) -> napi::Result<String> {
+        crate::context::context_import_on(&self.inner, data, importer_did).await
     }
 
     /// Per-instance equivalent of the free-function `context_set_economic_policy`.
@@ -4164,6 +4174,46 @@ impl Scp {
     ) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, node);
         crate::testing::fullstack_remove_member_on(&self.inner, node, context_id, member_did)
+    }
+
+    /// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4)
+    /// into this node's `Supervisor`, simulating a delivered
+    /// `PseudonymAnnouncement` so multi-member encrypted sends do not fail
+    /// closed with `SCP-CTX-2095`.
+    #[napi(js_name = "fullstackSeedPeerPseudonym")]
+    pub fn fullstack_seed_peer_pseudonym(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        peer_did: String,
+        pseudonym: Buffer,
+    ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, node);
+        crate::testing::fullstack_seed_peer_pseudonym_on(
+            &self.inner,
+            node,
+            context_id,
+            peer_did,
+            pseudonym,
+        )
+    }
+
+    /// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4) into
+    /// this bridge's `Supervisor`, simulating a delivered `PseudonymAnnouncement`
+    /// so multi-member encrypted sends do not fail closed with `SCP-CTX-2095`.
+    /// Lives in this `allow_in_memory_custody`-gated `#[napi] impl Scp` block
+    /// (never shipped in production) so napi-rs does not emit a dangling
+    /// `_c_callback` registration reference in bare builds.
+    #[napi(js_name = "contextSeedPeerPseudonym")]
+    pub async fn context_seed_peer_pseudonym(
+        &self,
+        handle: &NapiContextHandle,
+        peer_did: String,
+        pseudonym: Buffer,
+    ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
+        crate::context::context_seed_peer_pseudonym_on(&self.inner, handle, peer_did, pseudonym)
+            .await
     }
 }
 

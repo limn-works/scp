@@ -104,6 +104,19 @@ async fn fullstack_alice_to_bob_encrypted_message() {
     bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [4] Bob joined the context via Welcome message");
 
+    // 4b. Seed Bob's per-member pseudonym routing ID into Alice's manager
+    //     (§9.10.4). In production Bob announces it via a PseudonymAnnouncement;
+    //     here we inject it directly. Encrypted app-data now fans out to each
+    //     peer's pseudonym routing ID, never the shared context_routing_id, so
+    //     without this seed the send fails closed with PseudonymRegistryEmpty.
+    let bob_pseudonym = [0x42u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
+    println!("  [4b] Seeded Bob's pseudonym routing ID into Alice's manager");
+
     // 5. Alice sends an encrypted message through ContextManager.
     let plaintext = b"Hello Bob! This went through real MLS encryption.";
     alice.send_message(&handle, plaintext).await.unwrap();
@@ -117,10 +130,17 @@ async fn fullstack_alice_to_bob_encrypted_message() {
         "exactly one ciphertext should have been sent"
     );
     let (sent_routing_id, ciphertext) = &sent[0];
-    let expected_routing_id = context_routing_id(ctx_id);
+    // §9.10.4: app-data is addressed to Bob's per-member pseudonym routing ID,
+    // NEVER the shared context_routing_id (the deleted relay-correlation
+    // fallback).
     assert_eq!(
-        sent_routing_id, &expected_routing_id,
-        "transport routing ID must use domain-separated context_routing_id"
+        sent_routing_id, &bob_pseudonym,
+        "transport routing ID must be the peer's per-member pseudonym (§9.10.4)"
+    );
+    assert_ne!(
+        sent_routing_id,
+        &context_routing_id(ctx_id),
+        "app-data must NEVER be addressed to the shared context_routing_id (§9.10.4)"
     );
     assert_ne!(
         ciphertext.as_slice(),
@@ -198,27 +218,65 @@ async fn fullstack_three_party_group() {
     carol.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [3] Carol joined");
 
+    // Seed each peer's per-member pseudonym routing ID into Alice's manager
+    // (§9.10.4). A multi-member encrypted send fans out the SAME MLS ciphertext
+    // to EACH peer's pseudonym routing ID — never the shared context_routing_id;
+    // without these seeds the send fails closed with PseudonymRegistryEmpty.
+    let bob_pseudonym = [0x42u8; 32];
+    let carol_pseudonym = [0x43u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(CAROL_DID), carol_pseudonym)
+        .await
+        .unwrap();
+    println!("  [3b] Seeded Bob's and Carol's pseudonym routing IDs");
+
     // Alice sends a message — both Bob and Carol should be able to decrypt.
     let msg = b"Hello everyone!";
     alice.send_message(&handle, msg).await.unwrap();
     let sent = alice.take_sent_ciphertexts();
-    assert_eq!(sent.len(), 1);
-    let ciphertext = &sent[0].1;
-    println!(
-        "  [4] Alice sent message ({} bytes ciphertext)",
-        ciphertext.len()
+    // §9.10.4: fan-out produces one send per peer pseudonym (Bob + Carol = 2),
+    // never to the shared context_routing_id. Fan-out order is registry-iteration
+    // order (non-deterministic), so match each recipient's entry by routing ID.
+    assert_eq!(sent.len(), 2, "fan-out must address both peer pseudonyms");
+    let captured_routing_ids: std::collections::HashSet<[u8; 32]> =
+        sent.iter().map(|(rid, _)| *rid).collect();
+    assert_eq!(
+        captured_routing_ids,
+        std::collections::HashSet::from([bob_pseudonym, carol_pseudonym]),
+        "fan-out routing IDs must be exactly the two peer pseudonyms (§9.10.4)"
     );
+    assert!(
+        !captured_routing_ids.contains(&context_routing_id(ctx_id)),
+        "app-data must NEVER be addressed to the shared context_routing_id (§9.10.4)"
+    );
+    let bob_ciphertext = sent
+        .iter()
+        .find(|(rid, _)| rid == &bob_pseudonym)
+        .map(|(_, ct)| ct.clone())
+        .expect("a send addressed to Bob's pseudonym must exist");
+    let carol_ciphertext = sent
+        .iter()
+        .find(|(rid, _)| rid == &carol_pseudonym)
+        .map(|(_, ct)| ct.clone())
+        .expect("a send addressed to Carol's pseudonym must exist");
+    println!("  [4] Alice sent message (fan-out to {} peers)", sent.len());
 
-    // Bob decrypts.
+    // Bob decrypts his own captured ciphertext.
     let bob_decrypted = bob
-        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .decrypt_message(ctx_id, &ctx_bytes, &bob_ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(bob_decrypted.as_slice(), msg.as_slice());
     println!("  [5] Bob decrypted successfully");
 
-    // Carol decrypts.
+    // Carol decrypts her own captured ciphertext.
     let carol_decrypted = carol
-        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .decrypt_message(ctx_id, &ctx_bytes, &carol_ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(carol_decrypted.as_slice(), msg.as_slice());
     println!("  [6] Carol decrypted successfully");
@@ -247,12 +305,38 @@ async fn fullstack_governance_with_real_crypto() {
     bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [1] Context created, Bob joined");
 
+    // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
+    // Encrypted app-data fans out to each peer's pseudonym routing ID, never the
+    // shared context_routing_id; without this seed the pre-governance send fails
+    // closed with PseudonymRegistryEmpty. Removing Bob below purges his pseudonym
+    // from the peer registry, so the post-governance app-data send addresses no
+    // peer (the removal's MLS Commit is the only post-removal transport traffic).
+    let bob_pseudonym = [0x42u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
+
     // Alice sends a message before governance action.
     let msg1 = b"Before governance";
     alice.send_message(&handle, msg1).await.unwrap();
     let sent1 = alice.take_sent_ciphertexts();
+    assert_eq!(sent1.len(), 1, "pre-governance send addresses Bob only");
+    let (sent1_routing_id, sent1_ct) = &sent1[0];
+    // §9.10.4: app-data is addressed to Bob's per-member pseudonym, never the
+    // shared context_routing_id.
+    assert_eq!(
+        sent1_routing_id, &bob_pseudonym,
+        "pre-governance message must address Bob's per-member pseudonym (§9.10.4)"
+    );
+    assert_ne!(
+        sent1_routing_id,
+        &context_routing_id(ctx_id),
+        "app-data must NEVER be addressed to the shared context_routing_id (§9.10.4)"
+    );
     let decrypted1 = bob
-        .decrypt_message(ctx_id, &ctx_bytes, &sent1[0].1, ALICE_DID)
+        .decrypt_message(ctx_id, &ctx_bytes, sent1_ct, ALICE_DID)
         .unwrap();
     assert_eq!(decrypted1.as_slice(), msg1.as_slice());
     println!("  [2] Pre-governance message roundtrip verified");
@@ -268,23 +352,55 @@ async fn fullstack_governance_with_real_crypto() {
     assert!(remove_result.is_ok(), "Alice should be able to remove Bob");
     println!("  [3] Alice removed Bob via governance");
 
-    // Alice sends another message after removing Bob.
+    // Removing Bob broadcasts an MLS Commit (and possibly a rotated sender-key
+    // distribution) so remaining members advance their epoch. This is MLS
+    // GROUP-MANAGEMENT traffic and travels on the shared context_routing_id —
+    // which §9.10.4 permits for management messages (the prohibition is on
+    // APP-DATA carrying the shared RID). Capture every post-removal send here.
+    let removal_traffic = alice.take_sent_ciphertexts();
+    assert!(
+        !removal_traffic.is_empty(),
+        "removing Bob must broadcast at least one MLS management message \
+         (epoch-advance Commit) to remaining members"
+    );
+    // Every captured post-removal send is management traffic: it MUST be on the
+    // shared context_routing_id, never a per-member pseudonym (app-data routing).
+    for (routing_id, _) in &removal_traffic {
+        assert_eq!(
+            routing_id,
+            &context_routing_id(ctx_id),
+            "post-removal management traffic must use the shared \
+             context_routing_id (§9.10.4 permits management there); it must \
+             NEVER be addressed to a per-member pseudonym"
+        );
+    }
+
+    // Bob must NOT be able to open the removal Commit: he was just removed, so he
+    // cannot derive the post-removal epoch's keys (MLS forward secrecy). The
+    // first captured management blob is the epoch-advance Commit.
+    let commit_bytes = &removal_traffic[0].1;
+    let commit_decrypt = bob.decrypt_message(ctx_id, &ctx_bytes, commit_bytes, ALICE_DID);
+    assert!(
+        commit_decrypt.is_err(),
+        "Bob must NOT decrypt post-removal traffic (MLS forward secrecy)"
+    );
+    println!("  [4] Removal management traffic on shared RID; Bob cannot open it");
+
+    // Alice sends an application message after removing Bob. Bob's pseudonym was
+    // purged from the peer registry, leaving Alice the lone member. Under §9.10.4
+    // app-data fans out ONLY to peer pseudonyms, so a lone-member app-data send
+    // addresses no recipient: send_message returns Ok(()) as a true no-op and
+    // emits NO ciphertext. Bob receives no application data at all — a strictly
+    // stronger forward-secrecy guarantee than "Bob gets an undecryptable blob."
     let msg2 = b"After Bob removed";
     alice.send_message(&handle, msg2).await.unwrap();
     let sent2 = alice.take_sent_ciphertexts();
-    println!(
-        "  [4] Alice sent post-removal message ({} bytes)",
-        sent2[0].1.len()
-    );
-
-    // Bob should NOT be able to decrypt this message (MLS group epoch advanced,
-    // Bob's group state is stale).
-    let decrypt_result = bob.decrypt_message(ctx_id, &ctx_bytes, &sent2[0].1, ALICE_DID);
     assert!(
-        decrypt_result.is_err(),
-        "Bob must NOT decrypt after removal (MLS forward secrecy)"
+        sent2.is_empty(),
+        "post-removal lone-member app-data send must emit NO ciphertext \
+         (§9.10.4): Bob is no longer a peer, so nothing is addressed to him"
     );
-    println!("  [5] Bob correctly cannot decrypt post-removal message");
+    println!("  [5] Post-removal app-data send addressed no peer — no ciphertext");
 
     println!("\n  ✓ Governance + real crypto forward secrecy verified!\n");
 }
@@ -308,6 +424,18 @@ async fn fullstack_event_log_merkle_chain() {
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
     bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+
+    // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
+    // Encrypted app-data fans out to each peer's pseudonym routing ID; without
+    // this seed the sends below fail closed with PseudonymRegistryEmpty. This
+    // test only exercises the event-log Merkle chain, so the ciphertexts are
+    // drained, not inspected — one seed before the loop is all that is needed.
+    let bob_pseudonym = [0x42u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
 
     // Send 3 messages — each appends a MessageSent event to the log.
     for i in 0..3 {
@@ -372,15 +500,39 @@ async fn fullstack_multiple_messages_roundtrip() {
     alice.add_member(&handle, BOB_DID).await.unwrap();
     bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
 
+    // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
+    // Pseudonyms persist, so this is seeded once before the loop; every message
+    // fans out to this same peer pseudonym. Without it the sends fail closed with
+    // PseudonymRegistryEmpty.
+    let bob_pseudonym = [0x42u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
+
     // Send 5 messages and verify each roundtrips correctly.
     for i in 0..5u64 {
         let msg = format!("Message number {i}");
         alice.send_message(&handle, msg.as_bytes()).await.unwrap();
         let sent = alice.take_sent_ciphertexts();
+        // Two-party context: fan-out addresses exactly one peer (Bob).
         assert_eq!(sent.len(), 1);
+        let (sent_routing_id, ciphertext) = &sent[0];
+        // §9.10.4: each message is addressed to Bob's per-member pseudonym,
+        // never the shared context_routing_id.
+        assert_eq!(
+            sent_routing_id, &bob_pseudonym,
+            "message {i} must address Bob's per-member pseudonym (§9.10.4)"
+        );
+        assert_ne!(
+            sent_routing_id,
+            &context_routing_id(ctx_id),
+            "message {i} must NEVER address the shared context_routing_id (§9.10.4)"
+        );
 
         let decrypted = bob
-            .decrypt_message(ctx_id, &ctx_bytes, &sent[0].1, ALICE_DID)
+            .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&decrypted),
@@ -412,6 +564,18 @@ async fn fullstack_ciphertext_is_nondeterministic() {
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
     bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+
+    // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
+    // Encrypted app-data fans out to Bob's pseudonym routing ID; without this
+    // seed both sends below fail closed with PseudonymRegistryEmpty. The
+    // nondeterminism assertion inspects the ciphertext blob (sent[0].1), which
+    // is unaffected by the routing ID the send is addressed to.
+    let bob_pseudonym = [0x42u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
 
     // Send the same plaintext twice — ciphertexts must differ (random nonce).
     let msg = b"same message twice";
@@ -532,6 +696,18 @@ async fn full_stack_relay_encrypted_roundtrip() {
     bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [3] Context created and Bob joined via Welcome");
 
+    // 3b. Seed Bob's per-member pseudonym routing ID into Alice's manager
+    //     (§9.10.4). Encrypted app-data fans out to each peer's pseudonym
+    //     routing ID, never the shared context_routing_id; without this seed the
+    //     send fails closed with PseudonymRegistryEmpty.
+    let bob_pseudonym = [0x42u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
+    println!("  [3b] Seeded Bob's pseudonym routing ID into Alice's manager");
+
     // 4. Alice sends an encrypted message through ContextManager.
     //    ContextManager calls seal (real sender key + real MLS encryption +
     //    outer envelope wrapping) and CapturingTransport captures the bytes.
@@ -540,10 +716,16 @@ async fn full_stack_relay_encrypted_roundtrip() {
     let sent = alice.take_sent_ciphertexts();
     assert_eq!(sent.len(), 1, "exactly one ciphertext captured");
     let (sent_routing_id, ciphertext) = &sent[0];
-    let expected_routing_id = context_routing_id(ctx_id);
+    // §9.10.4: app-data is addressed to Bob's per-member pseudonym routing ID,
+    // NEVER the shared context_routing_id.
     assert_eq!(
-        sent_routing_id, &expected_routing_id,
-        "transport routing ID must use domain-separated context_routing_id"
+        sent_routing_id, &bob_pseudonym,
+        "transport routing ID must be the peer's per-member pseudonym (§9.10.4)"
+    );
+    assert_ne!(
+        sent_routing_id,
+        &context_routing_id(ctx_id),
+        "app-data must NEVER be addressed to the shared context_routing_id (§9.10.4)"
     );
     assert_ne!(
         ciphertext.as_slice(),
@@ -557,11 +739,12 @@ async fn full_stack_relay_encrypted_roundtrip() {
     );
 
     // 5. The captured bytes are a serialized OuterEnvelope. Deserialize to
-    //    extract the inner envelope for relay transport, then re-wrap with a
-    //    relay-specific routing ID.
+    //    extract the inner envelope for relay transport, then re-wrap with the
+    //    same per-member pseudonym routing ID the send addressed (§9.10.4): Bob
+    //    subscribes to his own pseudonym, the routing ID the relay delivers on.
     let captured_outer: scp_core::envelope::OuterEnvelope =
         rmp_serde::from_slice(ciphertext).unwrap();
-    let routing_id = expected_routing_id; // domain-separated context routing ID
+    let routing_id = bob_pseudonym; // Bob's per-member pseudonym routing ID
     let outer_envelope = create_outer_envelope(
         &routing_id,
         None,
@@ -680,6 +863,16 @@ async fn full_stack_relay_multiple_messages() {
     alice.add_member(&handle, BOB_DID).await.unwrap();
     bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
 
+    // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
+    // Pseudonyms persist, so this is seeded once before the send loop; every
+    // message in the context fans out to this same peer pseudonym.
+    let bob_pseudonym = [0x42u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
+
     let sourced = SourcedRelayUrl {
         url: relay_url,
         source: RelayUrlSource::DhtResolved,
@@ -691,7 +884,10 @@ async fn full_stack_relay_multiple_messages() {
         .await
         .unwrap();
 
-    let routing_id = context_routing_id(ctx_id);
+    // §9.10.4: app-data is addressed to Bob's per-member pseudonym, never the
+    // shared context_routing_id. Bob subscribes to his own pseudonym — the
+    // routing ID the relay delivers on.
+    let routing_id = bob_pseudonym;
     let bob_routing = RoutingId::new(routing_id);
     let mut stream = bob_adapter.subscribe(&bob_routing, None).await.unwrap();
 
@@ -703,7 +899,17 @@ async fn full_stack_relay_multiple_messages() {
         alice.send_message(&handle, msg.as_bytes()).await.unwrap();
         let sent = alice.take_sent_ciphertexts();
         assert_eq!(sent.len(), 1);
-        let ciphertext = &sent[0].1;
+        let (sent_routing_id, ciphertext) = (&sent[0].0, &sent[0].1);
+        // Each message addresses Bob's pseudonym, never the shared RID.
+        assert_eq!(
+            sent_routing_id, &bob_pseudonym,
+            "message {i} must address the peer's per-member pseudonym (§9.10.4)"
+        );
+        assert_ne!(
+            sent_routing_id,
+            &context_routing_id(ctx_id),
+            "message {i} must NEVER address the shared context_routing_id (§9.10.4)"
+        );
 
         // The captured bytes are a serialized OuterEnvelope. Extract the
         // encrypted_blob for relay transport.
@@ -756,6 +962,9 @@ async fn full_stack_relay_multiple_messages() {
 /// relay → decrypt) works correctly with multi-party MLS groups where all
 /// participants receive the same ciphertext from the relay.
 #[tokio::test]
+// Integration test exercises full stack through relay with per-member
+// pseudonym fan-out; splitting would fragment the sequential scenario.
+#[allow(clippy::too_many_lines)]
 async fn full_stack_relay_three_party() {
     println!("\n=== Full-stack relay: three-party group ===\n");
 
@@ -779,22 +988,71 @@ async fn full_stack_relay_three_party() {
     carol.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [1] Three-party context established");
 
+    // Seed each peer's per-member pseudonym routing ID into Alice's manager
+    // (§9.10.4). A multi-member encrypted send fans out the SAME MLS ciphertext
+    // to EACH peer's pseudonym routing ID — never the shared context_routing_id.
+    let bob_pseudonym = [0x42u8; 32];
+    let carol_pseudonym = [0x43u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(CAROL_DID), carol_pseudonym)
+        .await
+        .unwrap();
+
     // Alice sends message via ContextManager (real MLS + sender keys + envelope).
     let msg = b"Hello group, full stack through relay!";
     alice.send_message(&handle, msg).await.unwrap();
     let sent = alice.take_sent_ciphertexts();
-    assert_eq!(sent.len(), 1);
-    let ciphertext = &sent[0].1;
+    // §9.10.4: fan-out produces one send per peer pseudonym (Bob + Carol = 2),
+    // never to the shared context_routing_id. Fan-out order is registry-iteration
+    // order (non-deterministic), so match each recipient's entry by routing ID.
+    assert_eq!(sent.len(), 2, "fan-out must address both peer pseudonyms");
+    let captured_routing_ids: std::collections::HashSet<[u8; 32]> =
+        sent.iter().map(|(rid, _)| *rid).collect();
+    assert_eq!(
+        captured_routing_ids,
+        std::collections::HashSet::from([bob_pseudonym, carol_pseudonym]),
+        "fan-out routing IDs must be exactly the two peer pseudonyms (§9.10.4)"
+    );
+    assert!(
+        !captured_routing_ids.contains(&context_routing_id(ctx_id)),
+        "app-data must NEVER be addressed to the shared context_routing_id (§9.10.4)"
+    );
+    let bob_ciphertext = sent
+        .iter()
+        .find(|(rid, _)| rid == &bob_pseudonym)
+        .map(|(_, ct)| ct.clone())
+        .expect("a send addressed to Bob's pseudonym must exist");
+    let carol_ciphertext = sent
+        .iter()
+        .find(|(rid, _)| rid == &carol_pseudonym)
+        .map(|(_, ct)| ct.clone())
+        .expect("a send addressed to Carol's pseudonym must exist");
 
-    // Extract encrypted_blob from the captured OuterEnvelope for relay transport.
-    let captured_outer: scp_core::envelope::OuterEnvelope =
-        rmp_serde::from_slice(ciphertext).unwrap();
-    let routing_id = context_routing_id(ctx_id);
-    let outer = create_outer_envelope(
-        &routing_id,
+    // Extract each peer's encrypted_blob from its captured OuterEnvelope and
+    // re-wrap addressed to that peer's own pseudonym (the routing ID the relay
+    // delivers on for that recipient).
+    let bob_captured_outer: scp_core::envelope::OuterEnvelope =
+        rmp_serde::from_slice(&bob_ciphertext).unwrap();
+    let carol_captured_outer: scp_core::envelope::OuterEnvelope =
+        rmp_serde::from_slice(&carol_ciphertext).unwrap();
+    let bob_outer = create_outer_envelope(
+        &bob_pseudonym,
         None,
         3600,
-        captured_outer.encrypted_blob.clone(),
+        bob_captured_outer.encrypted_blob.clone(),
+    )
+    .unwrap();
+    let carol_outer = create_outer_envelope(
+        &carol_pseudonym,
+        None,
+        3600,
+        carol_captured_outer.encrypted_blob.clone(),
     )
     .unwrap();
 
@@ -803,44 +1061,46 @@ async fn full_stack_relay_three_party() {
         source: RelayUrlSource::DhtResolved,
     };
 
-    // Both Bob and Carol subscribe to the same routing ID.
+    // Bob and Carol each subscribe to their OWN pseudonym routing ID (§9.10.4).
     let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
         .await
         .unwrap();
     let carol_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
         .await
         .unwrap();
-    let routing = RoutingId::new(routing_id);
-    let mut bob_stream = bob_adapter.subscribe(&routing, None).await.unwrap();
-    let mut carol_stream = carol_adapter.subscribe(&routing, None).await.unwrap();
+    let bob_routing = RoutingId::new(bob_pseudonym);
+    let carol_routing = RoutingId::new(carol_pseudonym);
+    let mut bob_stream = bob_adapter.subscribe(&bob_routing, None).await.unwrap();
+    let mut carol_stream = carol_adapter.subscribe(&carol_routing, None).await.unwrap();
 
-    // Alice publishes to the relay.
+    // Alice publishes each peer's envelope to the relay.
     let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
         .await
         .unwrap();
-    alice_adapter.send(&outer).await.unwrap();
-    println!("  [2] Published to relay");
+    alice_adapter.send(&bob_outer).await.unwrap();
+    alice_adapter.send(&carol_outer).await.unwrap();
+    println!("  [2] Published per-peer envelopes to relay");
 
-    // Bob receives and verifies relay transit, then decrypts the original envelope.
+    // Bob receives on his pseudonym and verifies relay transit, then decrypts.
     let bob_received = receive_envelope(&mut bob_stream).await;
     assert_eq!(
-        bob_received.encrypted_blob, captured_outer.encrypted_blob,
+        bob_received.encrypted_blob, bob_captured_outer.encrypted_blob,
         "encrypted_blob must survive relay transit"
     );
     let bob_decrypted = bob
-        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .decrypt_message(ctx_id, &ctx_bytes, &bob_ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(bob_decrypted.as_slice(), msg.as_slice());
     println!("  [3] Bob decrypted from relay");
 
-    // Carol receives and verifies relay transit, then decrypts the original envelope.
+    // Carol receives on her pseudonym and verifies relay transit, then decrypts.
     let carol_received = receive_envelope(&mut carol_stream).await;
     assert_eq!(
-        carol_received.encrypted_blob, captured_outer.encrypted_blob,
+        carol_received.encrypted_blob, carol_captured_outer.encrypted_blob,
         "encrypted_blob must survive relay transit"
     );
     let carol_decrypted = carol
-        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .decrypt_message(ctx_id, &ctx_bytes, &carol_ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(carol_decrypted.as_slice(), msg.as_slice());
     println!("  [4] Carol decrypted from relay");

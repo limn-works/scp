@@ -215,6 +215,86 @@ fn make_dht_with_signer(
     ))
 }
 
+/// Derives this member's per-context pseudonymous routing ID (§9.10.4).
+///
+/// Single source of truth for the `UniFFI` bridge's pseudonym derivation,
+/// shared verbatim by `context_create`, `context_join`, and `context_import`
+/// (matching the `PyO3` `derive_member_pseudonym` and `NAPI`
+/// `derive_member_pseudonym_required` reference helpers). Encrypted contexts
+/// MUST carry a real pseudonym: a zero/sentinel value silently maps to the
+/// reserved `[0u8; 32]` routing ID, making the member permanently
+/// unaddressable with no surfaced error.
+///
+/// Custody resolution order: platform/software callback custody first, then
+/// (only in `allow_in_memory_custody` builds) the retained in-memory custody.
+/// Failures carry the cross-bridge contract codes: missing key material →
+/// `IDENT_1054`, derivation failure → `IDENT_1055`, custody unavailable in
+/// this build → `IDENT_1056`, wrong public-key length → `IDENT_1057`.
+///
+/// Callers gate this themselves: `context_create`/`context_join` skip it for
+/// broadcast contexts (soft `None`, spec §5.14), while `context_import` calls
+/// it unconditionally (the runtime import path is encrypted-only).
+async fn derive_member_pseudonym_required(
+    identity: &Identity,
+    context_id: &str,
+) -> Result<[u8; 32], ScpError> {
+    let identity_key = identity
+        .core_id
+        .as_ref()
+        .map(|id| id.identity_key)
+        .ok_or_else(|| ScpError::Identity {
+            msg: "cannot derive pseudonym without retained key material — \
+                  encrypted contexts require a real per-member routing ID"
+                .to_owned(),
+            code: codes::IDENT_1054.to_owned(),
+        })?;
+    let pseudonym = if let Some(ref cb) = identity.callback_custody {
+        cb.derive_pseudonym(&identity_key, context_id.as_bytes())
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("pseudonym derivation failed: {e}"),
+                code: codes::IDENT_1055.to_owned(),
+            })?
+    } else {
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let imc = identity
+                .in_memory_custody
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: "cannot derive pseudonym without retained key material — \
+                          encrypted contexts require a real per-member routing ID"
+                        .to_owned(),
+                    code: codes::IDENT_1054.to_owned(),
+                })?;
+            imc.0
+                .derive_pseudonym(&identity_key, context_id.as_bytes())
+                .await
+                .map_err(|e| ScpError::Identity {
+                    msg: format!("pseudonym derivation failed: {e}"),
+                    code: codes::IDENT_1055.to_owned(),
+                })?
+        }
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            return Err(ScpError::Identity {
+                msg: "pseudonym derivation requires custody — not available in \
+                      this build"
+                    .to_owned(),
+                code: codes::IDENT_1056.to_owned(),
+            });
+        }
+    };
+    pseudonym
+        .public_key
+        .as_bytes()
+        .try_into()
+        .map_err(|_| ScpError::Identity {
+            msg: "pseudonym public key must be 32 bytes".to_owned(),
+            code: codes::IDENT_1057.to_owned(),
+        })
+}
+
 // ---------------------------------------------------------------------------
 // CallbackKeyCustody — concrete adapter wrapping KeyCustodyProvider callback
 //
@@ -644,6 +724,16 @@ impl From<scp_core::context::ContextError> for ScpError {
             CE::ExportVersionUnsupported { .. } => Self::Context {
                 msg: format!("{e}"),
                 code: codes::CTX_2094.to_owned(),
+            },
+            // §9.10.4: pseudonym registry empty on a multi-member encrypted send.
+            CE::PseudonymRegistryEmpty { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2095.to_owned(),
+            },
+            // §9.10.4 / §5.14: per-member pseudonym requested for a broadcast context.
+            CE::NotPseudonymousContext { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2096.to_owned(),
             },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
@@ -1537,16 +1627,21 @@ pub struct Identity {
     pub(crate) pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
-#[uniffi::export]
 impl Identity {
     /// Returns the monotonic identifier of the bridge instance that minted
     /// this handle.
+    ///
+    /// Rust-internal only: consumed by `CoreFields::check_handle` for
+    /// per-instance handle affinity. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
+    pub(crate) const fn instance_id(&self) -> u64 {
         self.instance_id
     }
+}
 
+#[uniffi::export]
+impl Identity {
     /// Returns the DID string for this identity.
     #[must_use]
     pub fn did(&self) -> String {
@@ -2120,16 +2215,21 @@ impl std::fmt::Debug for ContextHandle {
     }
 }
 
-#[uniffi::export]
 impl ContextHandle {
     /// Returns the monotonic identifier of the bridge instance that minted
     /// this handle.
+    ///
+    /// Rust-internal only: consumed by `CoreFields::check_handle` for
+    /// per-instance handle affinity. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
+    pub(crate) const fn instance_id(&self) -> u64 {
         self.instance_id
     }
+}
 
+#[uniffi::export]
+impl ContextHandle {
     /// Returns the context's unique identifier.
     pub fn context_id(&self) -> String {
         self.context_id.clone()
@@ -2192,21 +2292,34 @@ pub struct UcanToken {
     pub(crate) encoded: String,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
-    /// every `#[uniffi::export]` entry that accepts a `UcanToken`.
+    /// Affinity substrate: retained so that any future `#[uniffi::export]`
+    /// entry accepting a `UcanToken` can gate on
+    /// `CoreFields::check_handle(token.instance_id())`. No such entry exists
+    /// today (`UcanToken` is only ever returned, never passed back in), so the
+    /// field has no live reader — hence `#[allow(dead_code)]`. It is NOT
+    /// host-visible (see ADR-048 — per-handle `instanceId` is not exported).
+    #[allow(dead_code)]
     pub(crate) instance_id: u64,
+}
+
+impl UcanToken {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    ///
+    /// Rust-internal affinity substrate consumed by
+    /// `CoreFields::check_handle`. No caller passes a `UcanToken` back across
+    /// the FFI boundary yet, so this has no live caller — hence
+    /// `#[allow(dead_code)]`. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
 }
 
 #[uniffi::export]
 impl UcanToken {
-    /// Returns the monotonic identifier of the bridge instance that minted
-    /// this handle.
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-
     /// Returns the token's stable metadata record.
     #[must_use]
     pub fn token_data(&self) -> UcanTokenData {
@@ -2330,16 +2443,21 @@ pub struct ReliabilityScoreRecord {
     pub total_failures: u64,
 }
 
-#[uniffi::export]
 impl TransportManager {
     /// Returns the monotonic identifier of the bridge instance that minted
     /// this handle.
+    ///
+    /// Rust-internal only: consumed by `CoreFields::check_handle` for
+    /// per-instance handle affinity. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
+    pub(crate) const fn instance_id(&self) -> u64 {
         self.instance_id
     }
+}
 
+#[uniffi::export]
+impl TransportManager {
     /// Returns the current transport connection status record.
     ///
     /// Reflects actual connection state: `connected` is `true` only if the
@@ -8154,33 +8272,22 @@ impl Scp {
                 // §9.10.4: Derive the context-scoped pseudonym routing ID via the
                 // retained KeyCustody BEFORE context creation so it can be passed
                 // to the ContextManager for per-member routing.
-                let local_pseudonym: Option<[u8; 32]> = if let Some(identity_key) =
-                    identity.core_id.as_ref().map(|id| &id.identity_key)
-                {
-                    let pseudonym = if let Some(ref cb) = callback_custody {
-                        cb.derive_pseudonym(identity_key, context_id.as_bytes())
-                            .await
-                            .ok()
-                    } else {
-                        #[cfg(feature = "allow_in_memory_custody")]
-                        {
-                            if let Some(ref imc) = identity.in_memory_custody {
-                                imc.0
-                                    .derive_pseudonym(identity_key, context_id.as_bytes())
-                                    .await
-                                    .ok()
-                            } else {
-                                None
-                            }
-                        }
-                        #[cfg(not(feature = "allow_in_memory_custody"))]
-                        {
-                            None
-                        }
-                    };
-                    pseudonym.and_then(|p| p.public_key.as_bytes().try_into().ok())
-                } else {
+                //
+                // ENCRYPTED contexts hard-fail derivation (a zero pseudonym
+                // produces a silently unusable context — the member cannot send
+                // app-data on a pseudonymous routing axis), carrying granular
+                // codes (missing material → 1054, derivation failure → 1055,
+                // wrong length → 1057, custody unavailable → 1056) that match the
+                // PyO3 reference. BROADCAST contexts soft-fail to `None` (no
+                // per-member pseudonym, spec §5.14 — the runtime ignores it).
+                let create_is_broadcast = matches!(
+                    core_params.mode,
+                    scp_core::context::params::ContextMode::Broadcast
+                );
+                let local_pseudonym: Option<[u8; 32]> = if create_is_broadcast {
                     None
+                } else {
+                    Some(derive_member_pseudonym_required(&identity, &context_id).await?)
                 };
 
                 // Route through the ADR-049 lifecycle dispatch surface
@@ -8416,33 +8523,25 @@ impl Scp {
 
                 // §9.10.4: Derive pseudonym for per-member routing. Uses the
                 // identity's custody provider (callback or in-memory).
-                let identity_key = identity.core_id.as_ref().map(|id| id.identity_key);
-                let local_pseudonym: Option<[u8; 32]> = if let Some(ik) = identity_key {
-                    let pseudonym = if let Some(ref cb) = identity.callback_custody {
-                        cb.derive_pseudonym(&ik, handle.context_id.as_bytes())
-                            .await
-                            .ok()
-                    } else {
-                        #[cfg(feature = "allow_in_memory_custody")]
-                        {
-                            if let Some(ref custody) = identity.in_memory_custody {
-                                custody
-                                    .0
-                                    .derive_pseudonym(&ik, handle.context_id.as_bytes())
-                                    .await
-                                    .ok()
-                            } else {
-                                None
-                            }
-                        }
-                        #[cfg(not(feature = "allow_in_memory_custody"))]
-                        {
-                            None
-                        }
-                    };
-                    pseudonym.and_then(|p| p.public_key.as_bytes().try_into().ok())
-                } else {
+                //
+                // ENCRYPTED contexts hard-fail derivation: a soft-failed join
+                // into an encrypted context yields `None`, which the runtime
+                // maps to the reserved `[0u8; 32]` sentinel — peers reject any
+                // announce of a reserved value, so the joiner becomes
+                // permanently unaddressable with no error surfaced. Carry the
+                // granular codes (missing material → 1054, derivation failure →
+                // 1055, wrong length → 1057, custody unavailable → 1056) at
+                // create/import granularity. BROADCAST contexts soft-fail to
+                // `None` (no per-member pseudonym, spec §5.14 — the runtime
+                // ignores it). Branch on the joined context's mode.
+                let join_is_broadcast = matches!(
+                    handle.core_context_params.mode,
+                    scp_core::context::params::ContextMode::Broadcast
+                );
+                let local_pseudonym: Option<[u8; 32]> = if join_is_broadcast {
                     None
+                } else {
+                    Some(derive_member_pseudonym_required(&identity, &handle.context_id).await?)
                 };
 
                 // Route through the ADR-049 lifecycle dispatch surface.
@@ -15524,10 +15623,25 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `context_import`.
-    pub async fn context_import(&self, data: Vec<u8>) -> Result<String, ScpError> {
+    ///
+    /// `importer_identity` supplies the §9.10.4 per-context pseudonym
+    /// derivation material — the importing member derives their OWN routing ID
+    /// rather than inheriting the exporter's local-instance pseudonym.
+    pub async fn context_import(
+        &self,
+        data: Vec<u8>,
+        importer_identity: Arc<Identity>,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(importer_identity.instance_id())
+            .map_err(ScpError::from)?;
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
+                let identity = importer_identity;
+                validate_did(&identity.did)?;
+
                 let export =
                     scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
                         ScpError::Context {
@@ -15536,6 +15650,11 @@ impl Scp {
                         }
                     })?;
                 let context_id = export.snapshot.context_id.clone();
+                let imported_core_params = export.snapshot.context_params.clone();
+                let imported_is_broadcast = matches!(
+                    imported_core_params.mode,
+                    scp_core::context::params::ContextMode::Broadcast
+                );
 
                 // Resolve the verification key for the snapshot's `creator_did`
                 // (§23.16.8 step 1, ADR-050) — NOT the unauthenticated envelope
@@ -15566,17 +15685,104 @@ impl Scp {
                 )
                 .map_err(ScpError::from)?;
 
+                // §9.10.4 misuse-resistance: the importer MUST be a member of
+                // the now-verified snapshot, else its derived pseudonym routes
+                // to an ID no peer expects and the member is silently
+                // unaddressable. Reject loudly (SCP-CTX-2092). The creator is a
+                // member, so a creator re-homing its own context passes.
+                scp_core::context::export_import::ensure_importer_is_member(
+                    &export.snapshot,
+                    &identity.did,
+                )
+                .map_err(ScpError::from)?;
+
                 // Ensure the ContextManager is initialized — context_import is
                 // a valid first operation. `init_context_manager_with_did` is
                 // idempotent (`OnceLock`). Seeding from the now-verified
                 // `creator_did` is safe per the verify-before-init step above.
                 bi.init_context_manager_with_did(&creator_did);
 
-                let manager = bi.context_manager_or_error()?;
-                manager
-                    .import_context(export, &verifying_key)
+                // §9.10.4: derive the importer's OWN per-context pseudonym
+                // before the runtime import. The importer is DISTINCT from the
+                // snapshot `creator_did`. The runtime import path is
+                // encrypted-only (broadcast-mode exports are rejected upstream
+                // with SCP-CTX-2092), so a real pseudonym is ALWAYS required —
+                // derive it UNCONDITIONALLY, exactly like the PyO3 reference
+                // bridge. Custody / derivation failure is a hard error carrying
+                // granular codes (missing material → 1054, derivation failure →
+                // 1055, wrong length → 1057), never a silent zero-pseudonym
+                // fallback and never a `[0u8; 32]` sentinel for broadcast (which
+                // would make the member permanently unaddressable).
+                let local_pseudonym: [u8; 32] =
+                    derive_member_pseudonym_required(&identity, &context_id).await?;
+
+                // Dispatch the import carrying BOTH the creator verifying key
+                // (verify-before-init, §23.16.8) and the importer's derived
+                // pseudonym (§9.10.4). `import_context` re-runs the
+                // authoritative verification and surfaces the typed
+                // `ContextError` (signature/version forgery + §9.10.4 codes)
+                // through `ScpError`.
+                let sup = bi.context_manager_or_error()?;
+                sup.import_context(export, &verifying_key, Some(local_pseudonym))
                     .await
                     .map_err(ScpError::from)?;
+
+                // §9.10.4: emit a PseudonymAnnouncement so existing members
+                // learn this importer's per-context routing ID. Encrypted
+                // contexts only — broadcast contexts use the shared
+                // `broadcast_routing_id` and carry no pseudonym registry.
+                // Best-effort: a missing signing key just skips the
+                // announcement, which peers recover on the importer's first
+                // send via lazy re-announcement.
+                if !imported_is_broadcast {
+                    let sk_opt: Option<ed25519_dalek::SigningKey> =
+                        if let Some(ref ik) = identity.core_id {
+                            if let Some(ref cb) = identity.callback_custody {
+                                cb.export_ed25519_signing_key(&ik.active_signing_key)
+                                    .await
+                                    .ok()
+                            } else {
+                                #[cfg(feature = "allow_in_memory_custody")]
+                                {
+                                    if let Some(ref custody) = identity.in_memory_custody {
+                                        custody
+                                            .0
+                                            .export_ed25519_signing_key(&ik.active_signing_key)
+                                            .await
+                                            .ok()
+                                    } else {
+                                        None
+                                    }
+                                }
+                                #[cfg(not(feature = "allow_in_memory_custody"))]
+                                {
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                    if let Some(sk) = sk_opt {
+                        use scp_core::context::actor::commands::{
+                            MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                        };
+                        let sender_did = scp_identity::DID(identity.did.clone());
+                        let (atx, arx) = tokio::sync::oneshot::channel();
+                        let ann_cmd = MessagingCommand::SendPseudonymAnnouncement {
+                            payload: Box::new(SendPseudonymAnnouncementPayload {
+                                context_id: context_id.clone(),
+                                params: imported_core_params,
+                                sender_did,
+                                signing_key: SigningKeyBytes::from_signing_key(&sk),
+                            }),
+                            reply: atx,
+                        };
+                        if sup.dispatch_command(&context_id, ann_cmd).await.is_ok() {
+                            let _ = arx.await;
+                        }
+                    }
+                }
+
                 Ok(context_id)
             })
             .await

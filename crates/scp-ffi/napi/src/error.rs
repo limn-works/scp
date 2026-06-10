@@ -227,6 +227,16 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2094.to_owned(),
             },
+            // §9.10.4: pseudonym registry empty on a multi-member encrypted send.
+            CE::PseudonymRegistryEmpty { .. } => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2095.to_owned(),
+            },
+            // §9.10.4 / §5.14: per-member pseudonym requested for a broadcast context.
+            CE::NotPseudonymousContext { .. } => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2096.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.

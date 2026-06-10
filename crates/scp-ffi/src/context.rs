@@ -35,6 +35,7 @@ use scp_platform::traits::KeyCustody;
 use scp_primitives::Clock;
 use tokio::sync::mpsc;
 
+use scp_ffi_common::error_codes as codes;
 use scp_ffi_common::html_escape_event_string;
 
 use crate::validate;
@@ -1280,6 +1281,78 @@ fn resolve_creator_verifying_key(
     .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", scp_ffi_common::error_codes::CTX_2093)))
 }
 
+/// Derives a member's OWN per-context pseudonym routing ID (§9.10.4).
+///
+/// Used by both the encrypted-context CREATE path and the (encrypted-only)
+/// IMPORT path: in each case a real pseudonym is REQUIRED for a usable
+/// encrypted context. Custody / derivation failure is a hard error carrying the
+/// canonical pseudonym-derivation identity codes (1054 missing key material,
+/// 1055 derivation failed, 1057 wrong key length) — never a silent
+/// zero-pseudonym fallback, which would reintroduce the relay-correlation
+/// vector by leaving the routing axis degraded. On import the exporter's
+/// pseudonym is local-instance state with no meaning to the importer, so it is
+/// re-derived from the importer's identity; on create the creator derives its
+/// own.
+///
+/// BROADCAST contexts MUST NOT call this — they carry no per-member pseudonym
+/// (spec §5.14) and a derivation failure there is not a real error. The create
+/// path branches on the context mode and only calls this for encrypted
+/// contexts.
+fn derive_member_pseudonym(
+    bi: &crate::runtime::PyBridgeInstance,
+    importer_did: &str,
+    context_id: &str,
+) -> PyResult<[u8; 32]> {
+    crate::runtime::with_identity(bi, importer_did, |entry| {
+        let rt = crate::runtime().map_err(|e| {
+            crate::error::ScpPyError::identity_with_code(
+                format!("runtime not available: {e}"),
+                codes::IDENT_1055,
+            )
+        })?;
+        let pseudonym = rt.block_on(async {
+            entry
+                .custody
+                .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                .await
+        });
+        let pk = pseudonym
+            .map_err(|e| {
+                crate::error::ScpPyError::identity_with_code(
+                    format!("pseudonym derivation failed: {e}"),
+                    codes::IDENT_1055,
+                )
+            })?
+            .public_key;
+        let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+            crate::error::ScpPyError::identity_with_code(
+                "pseudonym public key must be 32 bytes",
+                codes::IDENT_1057,
+            )
+        })?;
+        Ok(bytes)
+    })
+    .map_err(|e| {
+        // A registry miss surfaces `with_identity`'s generic SCP-IDENT-1001;
+        // remap it to the canonical "missing key material" code
+        // (SCP-IDENT-1054) so a caller switching on `.code` gets the same code
+        // for the same failure across bridges. Errors raised inside the closure
+        // already carry specific codes and pass through unchanged.
+        let mapped = match e {
+            crate::error::ScpPyError::IdentityError { message, code }
+                if code == codes::IDENT_1001 =>
+            {
+                crate::error::ScpPyError::identity_with_code(
+                    format!("{message} — cannot derive pseudonym without retained key material"),
+                    codes::IDENT_1054,
+                )
+            }
+            other => other,
+        };
+        PyErr::from(mapped)
+    })
+}
+
 /// Validates all user-controlled string fields on a governance action.
 #[cfg(test)]
 fn validate_governance_action_strings(
@@ -1780,38 +1853,34 @@ impl crate::scp::PyScp {
             |e| PyRuntimeError::new_err(format!("failed to register context state: {e}")),
         )?;
 
+        // Build scp-core ContextParams from the parsed PyContextParams. Built
+        // BEFORE pseudonym derivation so the context mode (the authoritative
+        // encrypted-vs-broadcast axis) governs the derivation policy.
+        let core_params = build_core_context_params(&parsed)?;
+        let create_is_broadcast = matches!(
+            core_params.mode,
+            scp_core::context::params::ContextMode::Broadcast
+        );
+
         // Delegate context creation to the shared ContextManager for lifecycle tracking.
         // §9.10.4: Derive pseudonym BEFORE context creation so it can be passed
         // to the ContextManager for per-member routing. The pseudonym derivation
         // is also reused for the known-contexts registry below.
-        let local_pseudonym: Option<[u8; 32]> =
-            crate::runtime::with_identity(bi, identity_did, |entry| {
-                let rt = crate::runtime().map_err(|e| {
-                    crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
-                })?;
-                let pseudonym = rt.block_on(async {
-                    entry
-                        .custody
-                        .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                        .await
-                });
-                let pk = pseudonym
-                    .map_err(|e| {
-                        crate::error::ScpPyError::identity(format!(
-                            "pseudonym derivation failed: {e}"
-                        ))
-                    })?
-                    .public_key;
-                let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                    crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
-                })?;
-                Ok(bytes)
-            })
-            .ok();
+        //
+        // ENCRYPTED contexts hard-fail derivation: a degraded (zero) pseudonym
+        // produces a silently unusable encrypted context (the member cannot
+        // send app-data on a pseudonymous routing axis), so propagate the
+        // canonical identity error. BROADCAST contexts soft-fail to `None`: they
+        // carry no per-member pseudonym (spec §5.14) and the runtime ignores the
+        // value.
+        let local_pseudonym: Option<[u8; 32]> = if create_is_broadcast {
+            None
+        } else {
+            Some(derive_member_pseudonym(bi, identity_did, &context_id)?)
+        };
 
-        // Build scp-core ContextParams from the parsed PyContextParams.
+        // Create the context via the shared ContextManager.
         {
-            let core_params = build_core_context_params(&parsed)?;
             let creator_did_owned = scp_identity::DID(identity_did.to_owned());
             let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
@@ -1999,39 +2068,34 @@ impl crate::scp::PyScp {
                 mls_key_package_bytes: Some(kp_bytes),
             };
 
-            // §9.10.4: Derive pseudonym for the joining member so it can be
-            // stored in PerContextState and announced to other members.
-            let local_pseudonym: Option<[u8; 32]> =
-                crate::runtime::with_identity(bi, identity_did, |entry| {
-                    let rt = crate::runtime().map_err(|e| {
-                        crate::error::ScpPyError::identity(format!("runtime init failed: {e}"))
-                    })?;
-                    let pseudonym = rt.block_on(async {
-                        entry
-                            .custody
-                            .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                            .await
-                    });
-                    let pk = pseudonym
-                        .map_err(|e| {
-                            crate::error::ScpPyError::identity(format!(
-                                "pseudonym derivation failed: {e}"
-                            ))
-                        })?
-                        .public_key;
-                    let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                        crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
-                    })?;
-                    Ok(bytes)
-                })
-                .ok();
-
             // Look up the ContextHandle from a completed create_context call.
             // The ContextManager stores PerContextState keyed by context_id.
             // We need the handle to delegate. Since the handle is stored in
             // ContextManager's internal state, we create a temporary handle
-            // matching the context's params for the join call.
+            // matching the context's params for the join call. Built BEFORE
+            // pseudonym derivation so the context mode governs the policy.
             let core_params = build_core_context_params(&handle.params)?;
+            let join_is_broadcast = matches!(
+                core_params.mode,
+                scp_core::context::params::ContextMode::Broadcast
+            );
+
+            // §9.10.4: Derive pseudonym for the joining member so it can be
+            // stored in PerContextState and announced to other members.
+            //
+            // ENCRYPTED contexts hard-fail derivation: a soft-failed join into
+            // an encrypted context yields `None`, which the runtime maps to the
+            // reserved `[0u8; 32]` sentinel — peers reject any announce of a
+            // reserved value, so the joiner becomes permanently unaddressable
+            // with no error surfaced. Propagate the canonical identity codes
+            // (1054/1055/1057) at the same granularity as create/import.
+            // BROADCAST contexts soft-fail to `None`: they carry no per-member
+            // pseudonym (spec §5.14) and the runtime ignores the value.
+            let local_pseudonym: Option<[u8; 32]> = if join_is_broadcast {
+                None
+            } else {
+                Some(derive_member_pseudonym(bi, identity_did, &context_id)?)
+            };
             let temp_handle =
                 scp_core::context::ContextHandle::new(context_id.clone(), core_params);
             // Transition the temp handle to Active to match the real state.
@@ -2091,6 +2155,65 @@ impl crate::scp::PyScp {
             // buffer and deliver to the FFI receive channel (#332).
             drain_and_deliver(bi, &context_id);
         }
+
+        Ok(())
+    }
+
+    /// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4)
+    /// into this bridge's `Supervisor`, bypassing the `PseudonymAnnouncement`
+    /// MLS round-trip.
+    ///
+    /// Single-member E2E tests host one view of a context, so a
+    /// governance-added peer never gets to announce its pseudonym. This lets
+    /// such tests populate the routing registry the way a delivered
+    /// announcement would, so multi-member encrypted sends exercise real
+    /// fan-out instead of failing closed with `SCP-CTX-2095`. Mirrors the
+    /// runtime `Supervisor::seed_peer_pseudonym` test helper.
+    ///
+    /// Gated behind `allow_in_memory_custody` so it never ships in production
+    /// builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ValueError` if `pseudonym` is not exactly 32 bytes, or
+    /// `RuntimeError` if the underlying supervisor call fails.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub fn context_seed_peer_pseudonym(
+        &self,
+        handle: &PyContextHandle,
+        peer_did: &str,
+        pseudonym: &[u8],
+    ) -> PyResult<()> {
+        let bi = &*self.inner;
+        crate::pyscp_check_handle!(&bi.core, handle);
+
+        if pseudonym.len() != 32 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "pseudonym must be exactly 32 bytes, got {}",
+                pseudonym.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(pseudonym);
+
+        let context_id = handle.context_id.clone();
+        let peer_did_owned = peer_did.to_owned();
+        let rt = crate::runtime()?;
+        let sup =
+            crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = sup.clone();
+
+        rt.block_on(async move {
+            sup.seed_peer_pseudonym(
+                &context_id,
+                scp_identity::DID::from(peer_did_owned.as_str()),
+                arr,
+            )
+            .await
+        })
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("ContextManager seed_peer_pseudonym failed: {e}"))
+        })?;
 
         Ok(())
     }
@@ -2625,6 +2748,11 @@ impl crate::scp::PyScp {
     /// # Arguments
     ///
     /// * `data` -- Serialized context export bytes.
+    /// * `importer_did` -- DID of the LOCAL member re-homing the context (the
+    ///   caller's own identity), distinct from the snapshot creator. Used to
+    ///   derive this member's own per-context pseudonym (§9.10.4). Must already
+    ///   be a member of the imported snapshot, otherwise the import is rejected
+    ///   with `SCP-CTX-2092`.
     ///
     /// # Returns
     ///
@@ -2634,8 +2762,8 @@ impl crate::scp::PyScp {
     ///
     /// - `RuntimeError` if deserialization, validation, or import fails.
     /// - `ValueError` if the data is malformed.
-    #[pyo3(signature = (data,))]
-    pub fn context_import(&self, data: &[u8]) -> PyResult<String> {
+    #[pyo3(signature = (data, importer_did))]
+    pub fn context_import(&self, data: &[u8], importer_did: &str) -> PyResult<String> {
         let bi = &*self.inner;
         let export = scp_core::context::export_import::deserialize_export(data).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid export data: {e}"))
@@ -2650,6 +2778,11 @@ impl crate::scp::PyScp {
         // key resolves, the import is rejected — never imported unverified.
         let creator_did = export.snapshot.role_state.creator_did.clone();
         validate::validate_did(&creator_did)?;
+        // §9.10.4: the importer DID is DISTINCT from the snapshot creator —
+        // it identifies the local member re-homing the context and is used to
+        // derive this member's own per-context pseudonym. Validate it up front,
+        // before any state mutation.
+        validate::validate_did(importer_did)?;
         let verifying_key = resolve_creator_verifying_key(bi, &creator_did)?;
 
         // Verify-before-init: validate the snapshot signature, signer binding,
@@ -2664,6 +2797,14 @@ impl crate::scp::PyScp {
         // re-runs the same validation (authoritative path); the duplicate work
         // is acceptable to keep the security ordering correct.
         scp_core::context::export_import::validate_export_for_import(&export, &verifying_key)
+            .map_err(crate::error::ScpPyError::from)?;
+
+        // §9.10.4 misuse-resistance: the importer MUST be a member of the now-
+        // verified snapshot, else its derived pseudonym routes to an ID no peer
+        // expects and the member is silently unaddressable. Reject loudly
+        // (SCP-CTX-2092). The creator is a member, so a creator re-homing its
+        // own context passes.
+        scp_core::context::export_import::ensure_importer_is_member(&export.snapshot, importer_did)
             .map_err(crate::error::ScpPyError::from)?;
 
         // Ensure the ContextManager is initialized — context_import is a valid
@@ -2682,11 +2823,64 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
 
-        // Route the import error through ScpPyError so the typed
-        // ContextError::SnapshotSignatureInvalid arm surfaces SCP-CTX-2093
-        // (signature/version forgery) rather than the catch-all SCP-CTX-2001.
-        rt.block_on(sup.import_context(export, &verifying_key))
-            .map_err(crate::error::ScpPyError::from)?;
+        // §9.10.4: derive the importer's OWN per-context pseudonym before the
+        // runtime import. See `derive_member_pseudonym` for the hard-error /
+        // no-fallback rationale. DISTINCT from `creator_did` — this is the
+        // local member re-homing the context, not the snapshot creator.
+        let local_pseudonym: [u8; 32] = derive_member_pseudonym(bi, importer_did, &context_id)?;
+
+        // §9.10.4: capture the imported context's params + mode before `export`
+        // is moved into the import call, so the post-import pseudonym
+        // announcement can build a temporary handle without re-reading state.
+        let imported_core_params = export.snapshot.context_params.clone();
+        let imported_is_broadcast = matches!(
+            imported_core_params.mode,
+            scp_core::context::params::ContextMode::Broadcast
+        );
+        // Resolve the importer's signing key for the post-import announcement
+        // (best-effort — a missing key just skips the announcement, which peers
+        // recover on the importer's first send via lazy re-announcement).
+        let announce_signing_key = resolve_signing_key(bi, importer_did).ok();
+        let context_id_for_announce = context_id.clone();
+
+        rt.block_on(async move {
+            // Dispatch the import carrying BOTH the creator verifying key
+            // (verify-before-init, §23.16.8) and the importer's derived
+            // pseudonym (§9.10.4). `import_context` re-runs the authoritative
+            // verification and routes the typed `ContextError` (SCP-CTX-2091/
+            // 2092/2093/2094, §9.10.4 codes) through the canonical converter so
+            // it reaches Python as a `ScpContextError` carrying `.code`.
+            sup.import_context(export, &verifying_key, Some(local_pseudonym))
+                .await
+                .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
+
+            // §9.10.4: emit a PseudonymAnnouncement so existing members learn
+            // this importer's per-context routing ID. Encrypted contexts only —
+            // broadcast contexts use the shared `broadcast_routing_id` and carry
+            // no pseudonym registry. Without this announcement peers' registries
+            // stay stale and app-data fan-out would miss the importer entirely.
+            if !imported_is_broadcast && let Some(sk) = announce_signing_key {
+                use scp_core::context::actor::commands::{
+                    MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                };
+                let sender_did = scp_identity::DID(importer_did.to_owned());
+                let ann_ctx_id = context_id_for_announce.clone();
+                let (atx, arx) = tokio::sync::oneshot::channel();
+                let ann_cmd = MessagingCommand::SendPseudonymAnnouncement {
+                    payload: Box::new(SendPseudonymAnnouncementPayload {
+                        context_id: ann_ctx_id.clone(),
+                        params: imported_core_params,
+                        sender_did,
+                        signing_key: SigningKeyBytes::from_signing_key(&sk),
+                    }),
+                    reply: atx,
+                };
+                if sup.dispatch_command(&ann_ctx_id, ann_cmd).await.is_ok() {
+                    let _ = arx.await;
+                }
+            }
+            Ok::<(), PyErr>(())
+        })?;
 
         Ok(context_id)
     }
@@ -4979,6 +5173,181 @@ mod tests {
         std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())
     }
 
+    /// §9.10.4: an ENCRYPTED `context_create` hard-fails pseudonym derivation.
+    ///
+    /// The encrypted create branch routes through `derive_member_pseudonym` with
+    /// `?`, so a derivation failure (here: no retained key material for the
+    /// creator DID — the identity is not in the bridge registry) propagates the
+    /// canonical typed identity error (`SCP-IDENT-1054`), never a silent
+    /// zero-pseudonym fallback that would leave the context unusable on the
+    /// pseudonymous routing axis. Driving the helper directly exercises the
+    /// exact seam the create/import/join paths share.
+    #[test]
+    fn encrypted_create_hard_fails_pseudonym_derivation_with_typed_code() {
+        let bi = __bi();
+        let err = derive_member_pseudonym(&bi, "did:dht:z6MkNoSuchIdentity", "ctx-encrypted")
+            .expect_err("encrypted derivation without key material must hard-fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-IDENT-1054"),
+            "expected missing-key-material code SCP-IDENT-1054, got: {msg}"
+        );
+    }
+
+    /// Builds an active `PyContextHandle` for the given mode, driving the real
+    /// `PyContextParams` parse so the handle carries an authoritative
+    /// `ContextMode` (the same axis `context_join` branches on at the mode
+    /// gate). Used by the encrypted-join hard-fail coverage below.
+    fn active_handle_for_mode(
+        bi: &crate::runtime::PyBridgeInstance,
+        creator_did: &str,
+        mode: &str,
+    ) -> PyContextHandle {
+        let params = Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("mode", mode).unwrap();
+            PyContextParams::from_py_dict(&dict).unwrap()
+        });
+        let handle = PyContextHandle::new(bi, "0".repeat(64), creator_did.to_owned(), params);
+        *handle.state.lock().unwrap() = "active".to_owned();
+        handle
+    }
+
+    /// §9.10.4 (PR-1744 main fix): an ENCRYPTED `context_join` HARD-FAILS
+    /// pseudonym derivation when the joiner has no retained key material.
+    ///
+    /// Drives the REAL `context_join` entry point (not an inline copy of the
+    /// gate). The joiner DID is unregistered, so when the encrypted branch at
+    /// the mode gate calls `derive_member_pseudonym(bi, joiner, ctx)?`, the
+    /// registry miss is remapped to the canonical `SCP-IDENT-1054`. Without
+    /// this hard-fail the join would soft-fail to `None`, which the runtime maps
+    /// to the reserved `[0u8; 32]` sentinel — peers reject any announce of a
+    /// reserved value, leaving the joiner permanently unaddressable with no
+    /// error surfaced.
+    ///
+    /// Not false-green: derivation runs BEFORE any context/MLS lookup, so the
+    /// `SCP-IDENT-1054` is raised by the derivation seam itself. If the
+    /// production mode gate were inverted (encrypted → `None`, broadcast →
+    /// derive), the encrypted join would skip derivation and this assertion
+    /// would fail — see the broadcast counterpart below which would then start
+    /// raising 1054.
+    #[test]
+    fn encrypted_join_hard_fails_pseudonym_derivation_with_typed_code() {
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+        let handle =
+            active_handle_for_mode(&bi_arc, "did:dht:z6MkEncryptedJoinCreator", "encrypted");
+        let err = scp
+            .context_join(&handle, "did:dht:z6MkNoSuchJoinerIdentity", None)
+            .expect_err("encrypted join without joiner key material must hard-fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-IDENT-1054"),
+            "expected encrypted-join missing-key-material code SCP-IDENT-1054, got: {msg}"
+        );
+    }
+
+    /// §5.14 / §9.10.4: a BROADCAST `context_join` SKIPS pseudonym derivation.
+    ///
+    /// Drives the REAL `context_join` entry point with the same unregistered
+    /// joiner DID as the encrypted test. Broadcast contexts carry no per-member
+    /// pseudonym, so the mode gate selects `None` and never calls
+    /// `derive_member_pseudonym`. The join proceeds past the derivation seam and
+    /// fails later for an UNRELATED reason (the standalone handle has no created
+    /// context in the supervisor) — the point is that the failure is NOT the
+    /// `SCP-IDENT-1054` derivation hard-fail.
+    ///
+    /// Not false-green: this is the inverse half of the gate pin. If the
+    /// production mode gate were inverted (broadcast → derive), this broadcast
+    /// join would call derivation on the unregistered joiner and start raising
+    /// `SCP-IDENT-1054`, failing this assertion. Together with the encrypted
+    /// test above, the pair fully pins the mode branch at `context.rs:2017`.
+    #[test]
+    fn broadcast_join_skips_pseudonym_derivation() {
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+        let handle =
+            active_handle_for_mode(&bi_arc, "did:dht:z6MkBroadcastJoinCreator", "broadcast");
+        // The join is expected to fail downstream (no created context backs the
+        // standalone handle), but it MUST NOT fail at the derivation seam.
+        let result = scp.context_join(&handle, "did:dht:z6MkNoSuchJoinerIdentity", None);
+        if let Err(err) = result {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("SCP-IDENT-1054")
+                    && !msg.contains("SCP-IDENT-1055")
+                    && !msg.contains("SCP-IDENT-1057"),
+                "broadcast join must skip derivation — got a derivation-code error: {msg}"
+            );
+        }
+    }
+
+    /// §5.14 / §9.10.4: the `context_create` MODE GATE at `context.rs:1799`
+    /// drives derivation policy — exercised through the REAL `context_create`
+    /// entry point, not an inline copy of the branch.
+    ///
+    /// Both sub-cases use an UNREGISTERED creator DID (no retained key material),
+    /// which makes the gate's effect directly observable:
+    /// - ENCRYPTED create routes through `derive_member_pseudonym(...)?`, so the
+    ///   registry miss HARD-FAILS with the canonical `SCP-IDENT-1054` — never a
+    ///   silent zero-pseudonym fallback that would leave the encrypted context
+    ///   unusable on the pseudonymous routing axis.
+    /// - BROADCAST create selects `None` (spec §5.14: no per-member pseudonym),
+    ///   never touches custody, and SUCCEEDS into an active handle.
+    ///
+    /// Not false-green: the previous version of this test copied the production
+    /// `if create_is_broadcast { None } else { Some(derive...) }` branch inline
+    /// and asserted against its own copy, so inverting the production gate would
+    /// not have failed it. This version calls `context_create` itself. If the
+    /// production gate at `:1799` were inverted (broadcast → derive, encrypted →
+    /// `None`), the broadcast create would hard-fail `SCP-IDENT-1054` and the
+    /// encrypted create would succeed — both assertions below would flip.
+    #[test]
+    fn context_create_mode_gate_drives_pseudonym_derivation() {
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+
+        // ENCRYPTED create with an unregistered creator HARD-FAILS at the
+        // derivation seam the gate selects for encrypted contexts.
+        let encrypted_err = Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("mode", "encrypted").unwrap();
+            scp.context_create("did:dht:z6MkNoSuchCreateCreatorEnc", &dict)
+                .expect_err("encrypted create without creator key material must hard-fail")
+                .to_string()
+        });
+        assert!(
+            encrypted_err.contains("SCP-IDENT-1054"),
+            "expected encrypted-create missing-key-material code SCP-IDENT-1054, got: {encrypted_err}"
+        );
+
+        // BROADCAST create with the SAME unregistered-creator condition SUCCEEDS
+        // — the gate selects `None` and never calls derivation.
+        let handle = Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("mode", "broadcast").unwrap();
+            // Broadcast contexts require MemoryScope::Full (spec §5.14).
+            dict.set_item("memory_scope", "full").unwrap();
+            scp.context_create("did:dht:z6MkNoSuchCreateCreatorBcast", &dict)
+                .expect("broadcast create must succeed without pseudonym derivation")
+        });
+        assert_eq!(
+            handle.state().unwrap(),
+            "active",
+            "broadcast create yields an active context handle"
+        );
+        assert_eq!(handle.mode(), "broadcast", "handle reflects broadcast mode");
+    }
+
     /// Test helper: dispatch `GovernanceCommand::ExecuteGovernanceAction`
     /// through the per-instance supervisor (ADR-049 actor model).
     fn test_dispatch_execute_governance(
@@ -6398,7 +6767,7 @@ mod tests {
             // import advances past signature verification to the idempotent
             // already-exists rejection — proving the signer binding is correct.
             let import_err = scp
-                .context_import(&exported)
+                .context_import(&exported, &creator)
                 .expect_err("re-importing a live context must be rejected (already exists)");
             let msg = import_err.to_string();
             assert!(

@@ -1623,10 +1623,18 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.eventLogQuery with a MessageSent filter (snake_case key) finds the sent event", async () => {
       const identity = await scp.identityCreate("in_memory");
+      const bob = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         identity,
-        JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write", "member:invite", "role:assign"],
+        }),
       );
+      // §9.10.4: a lone-member encrypted send is a no-op that records no
+      // MessageSent event. Add a peer and seed its per-member pseudonym so the
+      // send actually fans out and the MessageSent event is recorded.
+      await scp.contextJoin(ctx._rawHandle, bob.did);
+      await scp.contextSeedPeerPseudonym(ctx._rawHandle, bob.did, new Uint8Array(32).fill(0x42));
       await scp.contextSend(ctx._rawHandle, identity.did, new TextEncoder().encode("one"));
       // The SCP surface dispatches the filter JSON verbatim; the Rust
       // bridge deserializes with snake_case so we supply `event_type`.
@@ -1758,12 +1766,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // Close the context first so import_context's TOCTOU gate (see
       // #1479) treats the existing entry as terminal and allows reimport.
       await scp.contextClose(ctx._rawHandle, identity.did);
-      const importedId = await scp.contextImport(data);
+      const importedId = await scp.contextImport(data, identity.did);
       expect(importedId.length).toBeGreaterThan(0);
     });
 
     it("scp.contextImport rejects malformed data", async () => {
-      await expect(scp.contextImport(new Uint8Array([0, 1, 2, 3]))).rejects.toThrow();
+      const identity = await scp.identityCreate("in_memory");
+      await expect(scp.contextImport(new Uint8Array([0, 1, 2, 3]), identity.did)).rejects.toThrow();
     });
   });
 
@@ -1913,6 +1922,11 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       await scp.contextJoin(ctx._rawHandle, bob.did);
       expect(await scp.contextMemberCount(ctx._rawHandle)).toBe(2);
       expect(await scp.contextIsMember(ctx._rawHandle, bob.did)).toBe(true);
+
+      // Seed Bob's per-member pseudonym so the multi-member fan-out is
+      // registered; otherwise the send fails closed with SCP-CTX-2095
+      // ("pseudonym registry empty") per PR #1744 §9.10.4.
+      await scp.contextSeedPeerPseudonym(ctx._rawHandle, bob.did, new Uint8Array(32).fill(0x42));
 
       await scp.contextSend(ctx._rawHandle, alice.did, new TextEncoder().encode("hello bob"));
 

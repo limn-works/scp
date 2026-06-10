@@ -185,6 +185,16 @@ impl ScpPyError {
         }
     }
 
+    /// Identity error with the given message and an explicit canonical code.
+    /// Used by the §9.10.4 pseudonym-derivation paths to carry the specific
+    /// `SCP-IDENT-1054..1057` codes instead of the generic identity code.
+    pub fn identity_with_code(msg: impl Into<String>, code: &str) -> Self {
+        Self::IdentityError {
+            message: msg.into(),
+            code: code.to_owned(),
+        }
+    }
+
     /// Context error with the given message and the generic context code.
     pub fn context(msg: impl Into<String>) -> Self {
         Self::ContextError {
@@ -374,6 +384,16 @@ impl From<scp_core::context::ContextError> for ScpPyError {
             CE::ExportVersionUnsupported { .. } => Self::ContextError {
                 message: format!("{e}"),
                 code: codes::CTX_2094.to_owned(),
+            },
+            // §9.10.4: pseudonym registry empty on a multi-member encrypted send.
+            CE::PseudonymRegistryEmpty { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2095.to_owned(),
+            },
+            // §9.10.4 / §5.14: per-member pseudonym requested for a broadcast context.
+            CE::NotPseudonymousContext { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2096.to_owned(),
             },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for tool-economy and tool-invocation failures

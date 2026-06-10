@@ -525,11 +525,6 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         checkpoint_events_since: state.checkpoint_events_since,
         checkpoint_last_time_secs: state.checkpoint_last_time_secs,
         generation: state.generation,
-        local_pseudonym: state.local_pseudonym,
-        pseudonym_registry: state
-            .pseudonym_registry
-            .iter()
-            .map(|(did, p)| (did.to_string(), *p))
-            .collect(),
+        routing: state.routing.clone(),
     }
 }

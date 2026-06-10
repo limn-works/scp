@@ -276,6 +276,33 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// Test-only: directly seed a peer's per-context pseudonym routing ID
+    /// (§9.10.4) into the routing registry, bypassing the
+    /// `PseudonymAnnouncement` MLS round-trip.
+    ///
+    /// Single-node integration tests host exactly one member's view of a
+    /// context, so a peer added via governance never gets an opportunity to
+    /// announce its pseudonym (there is no peer node to send the
+    /// announcement). This command lets such tests populate the registry the
+    /// same way a delivered announcement would, so multi-member encrypted
+    /// `send_message` calls can exercise their real fan-out instead of failing
+    /// closed with [`ContextError::PseudonymRegistryEmpty`].
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    SeedPeerPseudonym {
+        /// Context identifier.
+        context_id: String,
+        /// The peer member whose routing ID is being recorded.
+        member_did: scp_identity::DID,
+        /// The peer's per-context pseudonym routing ID.
+        pseudonym: [u8; 32],
+        /// Oneshot reply channel. Replies `Ok(())` once the registry is
+        /// updated, or `Err` if the context is broadcast-routed.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
     /// Record that a received envelope triggered degraded-mode (spec
     /// §13.6) for a context. Emits a `DegradedMode` event into the
     /// per-context receive buffer (and the supervisor's optional event
@@ -592,6 +619,22 @@ pub enum LifecycleCommand {
         /// `exporter_did`. The import path verifies the snapshot signature
         /// against this key before restoring any state (verify-before-init).
         verifying_key: Box<ed25519_dalek::VerifyingKey>,
+        /// The importing member's derived per-context pseudonym routing ID
+        /// (§9.10.4). Import is encrypted-only, so a real pseudonym is required
+        /// for a usable import.
+        ///
+        /// Hard-failing on a missing pseudonym is the FFI boundary's
+        /// responsibility: every native bridge derives this via
+        /// `KeyCustody::derive_pseudonym` and returns an error rather than
+        /// passing `None`. The runtime itself does NOT hard-fail on `None` — it
+        /// maps `None` to the reserved zero sentinel (`[0u8; 32]`) through
+        /// `build_routing`, a degraded-but-safe state (the sentinel is a
+        /// reserved routing value the member cannot announce until a real
+        /// pseudonym is set, and the send path never unions the shared routing
+        /// ID into fan-out). A `None` therefore only arises from a non-FFI
+        /// caller (e.g. a test fixture) and yields a routable-but-not-yet-
+        /// announced member, not a silent shared-RID fallback.
+        local_pseudonym: Option<[u8; 32]>,
         /// Oneshot reply channel. See [`ImportContextReply`].
         reply: ImportContextReply,
     },
@@ -2127,13 +2170,14 @@ pub enum QueriesCommand {
         /// Oneshot reply channel carrying the current lifecycle state.
         reply: oneshot::Sender<Result<scp_protocol::context::ContextState, ContextError>>,
     },
-    /// Pseudonym routing ID for the local member (§9.10.4).
-    /// `Ok(None)` iff no pseudonym is set. Read-only.
+    /// Pseudonym routing ID for the local member (§9.10.4). Read-only.
+    /// `Err(NotPseudonymousContext)` for a broadcast context, which carries
+    /// no per-member pseudonym.
     LocalPseudonym {
         /// Context identifier string (matches the legacy API).
         context_id: String,
         /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<Option<[u8; 32]>, ContextError>>,
+        reply: oneshot::Sender<Result<[u8; 32], ContextError>>,
     },
     /// Broadcast key + epoch for a locally-controlled author in a
     /// broadcast context. Read-only.

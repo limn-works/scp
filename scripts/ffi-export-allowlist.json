@@ -136,6 +136,12 @@
       "reason": "Getter for the context id on a handle/result type."
     },
     {
+      "name": "context_seed_peer_pseudonym",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "test-fixture",
+      "reason": "§9.10.4 pseudonym-announcement injection for E2E tests; feature-gated (allow_in_memory_custody) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
+    },
+    {
       "name": "creator_did",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",
@@ -532,6 +538,12 @@
       "reason": "FullStackNetwork E2E test scaffolding; test fixture, not a protocol operation."
     },
     {
+      "name": "fullstack_seed_peer_pseudonym",
+      "path": "crates/scp-ffi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "§9.10.4 pseudonym-announcement injection for E2E tests; feature-gated test-only FullStackNode helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
+    },
+    {
       "name": "fullstack_reset_network",
       "path": "crates/scp-ffi/src/testing.rs",
       "kind": "test-fixture",
@@ -642,12 +654,6 @@
       "reason": "Boolean getter: whether an identity has an agent key."
     },
     {
-      "name": "instance_id",
-      "path": "crates/scp-ffi/uniffi/src/bridge.rs",
-      "kind": "lifecycle",
-      "reason": "Per-instance identity accessor; instance lifecycle, not a parity operation."
-    },
-    {
       "name": "is_connected",
       "path": "crates/scp-ffi/uniffi/src/bridge.rs",
       "kind": "getter",
@@ -738,12 +744,6 @@
       "reason": "Getter for the HTTP URL on a started Node handle."
     },
     {
-      "name": "instance_id",
-      "path": "crates/scp-ffi/uniffi/src/server.rs",
-      "kind": "lifecycle",
-      "reason": "Per-instance identity accessor; instance lifecycle, not a parity operation."
-    },
-    {
       "name": "is_shutdown",
       "path": "crates/scp-ffi/uniffi/src/server.rs",
       "kind": "lifecycle",
@@ -812,12 +812,6 @@
       "reason": "Getter for governance config on a metadata result type."
     },
     {
-      "name": "instance_id_js",
-      "path": "crates/scp-ffi/napi/src/context.rs",
-      "kind": "lifecycle",
-      "reason": "JS-cased per-instance identity accessor (napi js_name); instance lifecycle, not a parity operation."
-    },
-    {
       "name": "member_count",
       "path": "crates/scp-ffi/napi/src/context.rs",
       "kind": "getter",
@@ -872,12 +866,6 @@
       "reason": "Boolean getter: whether an identity has an agent key."
     },
     {
-      "name": "instance_id_js",
-      "path": "crates/scp-ffi/napi/src/identity.rs",
-      "kind": "lifecycle",
-      "reason": "JS-cased per-instance identity accessor (napi js_name); instance lifecycle, not a parity operation."
-    },
-    {
       "name": "rotation_event_json",
       "path": "crates/scp-ffi/napi/src/identity.rs",
       "kind": "getter",
@@ -902,12 +890,6 @@
       "reason": "Getter for a handle id on a result type."
     },
     {
-      "name": "instance_id_js",
-      "path": "crates/scp-ffi/napi/src/mcp.rs",
-      "kind": "lifecycle",
-      "reason": "JS-cased per-instance identity accessor (napi js_name); instance lifecycle, not a parity operation."
-    },
-    {
       "name": "context_cancel_subscription",
       "path": "crates/scp-ffi/napi/src/scp.rs",
       "kind": "bridge-specific",
@@ -918,6 +900,12 @@
       "path": "crates/scp-ffi/napi/src/scp.rs",
       "kind": "getter",
       "reason": "Getter for context/identity migration state on a result type."
+    },
+    {
+      "name": "context_seed_peer_pseudonym",
+      "path": "crates/scp-ffi/napi/src/scp.rs",
+      "kind": "test-fixture",
+      "reason": "§9.10.4 pseudonym-announcement injection for E2E tests; feature-gated (allow_in_memory_custody) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
     },
     {
       "name": "fullstack_add_member",
@@ -954,6 +942,12 @@
       "path": "crates/scp-ffi/napi/src/scp.rs",
       "kind": "test-fixture",
       "reason": "FullStackNetwork E2E test scaffolding; test fixture, not a protocol operation."
+    },
+    {
+      "name": "fullstack_seed_peer_pseudonym",
+      "path": "crates/scp-ffi/napi/src/scp.rs",
+      "kind": "test-fixture",
+      "reason": "§9.10.4 pseudonym-announcement injection for E2E tests; feature-gated test-only FullStackNode helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
     },
     {
       "name": "fullstack_reset_network",
@@ -1016,12 +1010,6 @@
       "reason": "Getter for the HTTP URL on a started Node handle."
     },
     {
-      "name": "instance_id_js",
-      "path": "crates/scp-ffi/napi/src/server.rs",
-      "kind": "lifecycle",
-      "reason": "JS-cased per-instance identity accessor (napi js_name); instance lifecycle, not a parity operation."
-    },
-    {
       "name": "is_shutdown",
       "path": "crates/scp-ffi/napi/src/server.rs",
       "kind": "lifecycle",
@@ -1056,18 +1044,6 @@
       "path": "crates/scp-ffi/napi/src/testing.rs",
       "kind": "getter",
       "reason": "Getter for the DID string on a result type."
-    },
-    {
-      "name": "instance_id_js",
-      "path": "crates/scp-ffi/napi/src/testing.rs",
-      "kind": "lifecycle",
-      "reason": "JS-cased per-instance identity accessor (napi js_name); instance lifecycle, not a parity operation."
-    },
-    {
-      "name": "instance_id_js",
-      "path": "crates/scp-ffi/napi/src/transport.rs",
-      "kind": "lifecycle",
-      "reason": "JS-cased per-instance identity accessor (napi js_name); instance lifecycle, not a parity operation."
     },
     {
       "name": "is_connected",
@@ -1116,12 +1092,6 @@
       "path": "crates/scp-ffi/napi/src/ucan.rs",
       "kind": "getter",
       "reason": "Getter for an entity id on a result type."
-    },
-    {
-      "name": "instance_id_js",
-      "path": "crates/scp-ffi/napi/src/ucan.rs",
-      "kind": "lifecycle",
-      "reason": "JS-cased per-instance identity accessor (napi js_name); instance lifecycle, not a parity operation."
     },
     {
       "name": "issuer",

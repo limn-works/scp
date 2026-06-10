@@ -84,7 +84,7 @@ use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::actor::state::{
-    ContextCryptoState, ContextLifecycleState, ContextModeState, PerContextState,
+    ContextCryptoState, ContextLifecycleState, ContextModeState, ContextRouting, PerContextState,
     RecvSequenceTracker,
 };
 use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
@@ -101,6 +101,34 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 // contexts DashMap is still the production source of truth — subsequent
 // finalization commits delete the DashMap and route bootstrap through
 // `spawn_actor_with_state`.
+
+// ---------------------------------------------------------------------------
+// §9.10.4 routing construction helpers
+// ---------------------------------------------------------------------------
+
+/// Builds the [`ContextRouting`] axis for a context from its broadcast flag
+/// and the FFI-derived local pseudonym (§9.10.4, §5.14).
+///
+/// Broadcast contexts ignore the pseudonym and route on the derivable shared
+/// RID (§5.14). Encrypted contexts (§9.10.4) embed the member's pseudonym
+/// verbatim into the [`ContextRouting::Pseudonymous`] variant — which is the
+/// type-level guarantee that an encrypted context can NEVER be in a
+/// "no-pseudonym, fall back to the shared routing ID" state.
+///
+/// The FFI production boundary derives a real pseudonym via
+/// `KeyCustody::derive_pseudonym` and hard-fails before reaching the runtime.
+/// A `None` reaching here therefore comes only from a not-yet-announced
+/// bootstrap path (e.g. a test fixture or a context created before
+/// announcement); it is mapped to the `[0u8; 32]` sentinel. That sentinel is a
+/// *reserved* routing value: the member cannot announce it (the ingest path
+/// rejects reserved pseudonyms) until a real pseudonym is set via
+/// [`ContextRouting::set_local_pseudonym`], and the send path never unions the
+/// shared routing ID into app-data fan-out — so a zero local pseudonym cannot
+/// reopen the relay-correlation hole. It simply means "this member has not
+/// derived/announced its pseudonym yet."
+fn build_routing(is_broadcast: bool, local_pseudonym: Option<[u8; 32]>) -> ContextRouting {
+    ContextRouting::for_mode(is_broadcast, local_pseudonym.unwrap_or([0u8; 32]))
+}
 
 // ---------------------------------------------------------------------------
 // 1. export_context (per-context, read-only)
@@ -288,8 +316,11 @@ pub async fn leave_context(
         .access_key_store
         .remove(&context_id, member_did.as_ref());
 
-    // §9.10.4: remove the departing member's pseudonym routing ID.
-    state.pseudonym_registry.remove(member_did);
+    // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
+    // a broadcast context (which carries no peer registry).
+    if let Some(reg) = state.routing.peer_registry_mut() {
+        reg.remove(member_did);
+    }
 
     // Emit MemberLeft event to receive buffer.
     let left_event = ContextEvent::MemberLeft {
@@ -470,10 +501,12 @@ pub async fn close_context_with_key(
     state.broadcast_context = None;
 
     // §9.10.4: clear pseudonym state on close. The local pseudonym is
-    // derived from secret key material; zeroing it prevents leaking
-    // the routing ID after context teardown.
-    state.local_pseudonym = None;
-    state.pseudonym_registry.clear();
+    // derived from secret key material; dropping it (by collapsing the
+    // routing axis to the no-pseudonym `Broadcast` variant) prevents leaking
+    // the routing ID or any learned peer pseudonyms after context teardown.
+    // The context is terminal at this point, so the routing axis no longer
+    // needs to agree with the (also torn-down) crypto axis.
+    state.routing = ContextRouting::Broadcast;
 
     // Participation decay: clear participation cache and cooldown state
     // on context close (#1530).
@@ -765,8 +798,10 @@ pub async fn join_context(
     }
 
     // Phase 4.5: Store local pseudonym after membership mutation succeeds.
+    // §9.10.4: `set_local_pseudonym` is a no-op on a broadcast context (which
+    // carries no pseudonym state), so this only updates encrypted contexts.
     if let Some(pseudonym) = local_pseudonym {
-        state.local_pseudonym = Some(pseudonym);
+        state.routing.set_local_pseudonym(pseudonym);
     }
 
     // Phase 5: Capture the escrow hold after all mutations succeeded.
@@ -1059,11 +1094,17 @@ pub async fn create_context(
     // `params.mode == ContextMode::Broadcast`.
     let context_id_bytes = state::context_id_to_bytes(&context_id);
     let actor_members: HashSet<DID> = initial_members.clone();
-    let mode = if broadcast_context.is_some() {
+    let create_is_broadcast = broadcast_context.is_some();
+    let mode = if create_is_broadcast {
         ContextModeState::Broadcast(Box::<crate::context::actor::state::BroadcastState>::default())
     } else {
         ContextModeState::Encrypted(Box::<ContextCryptoState>::default())
     };
+    // §9.10.4: build the routing axis from the (authoritative) mode and the
+    // FFI-derived local pseudonym. The enum makes "encrypted context without a
+    // pseudonym" unrepresentable in live state; broadcast contexts ignore the
+    // pseudonym entirely. See `build_routing` for the `None`/sentinel rationale.
+    let create_routing = build_routing(create_is_broadcast, local_pseudonym);
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
@@ -1137,10 +1178,10 @@ pub async fn create_context(
         checkpoint_last_time_secs: deps.clock.now_secs(),
         checkpoints: Vec::new(),
         merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
-        // §9.10.4: pseudonym routing. Only meaningful for encrypted
-        // contexts; broadcast contexts ignore this field.
-        local_pseudonym,
-        pseudonym_registry: HashMap::new(),
+        // §9.10.4: pseudonym routing axis. Encrypted contexts carry the
+        // member's pseudonym + an empty peer registry; broadcast contexts
+        // carry no pseudonym state.
+        routing: create_routing,
         // ADR-049 commit 8: fresh actor-shape tracker at creation.
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 Phase 2A finalization keystone (commit 12 phase 2A
@@ -1318,6 +1359,7 @@ pub async fn import_context(
     deps: &ActorDeps,
     export: crate::context::export_import::ContextExport,
     verifying_key: &ed25519_dalek::VerifyingKey,
+    local_pseudonym: Option<[u8; 32]>,
 ) -> Result<ContextHandle, ContextError> {
     // 1. Validate export (version gate, snapshot signature, Merkle chain).
     //
@@ -1360,6 +1402,26 @@ pub async fn import_context(
         &export.snapshot.consequence_rules,
         &export.snapshot.context_params.consequence_config,
     )?;
+
+    // §9.10.4: the import path is encrypted-only. Every imported context is
+    // re-homed with `broadcast_context: None`, `mode = Encrypted`, and a
+    // pseudonymous routing axis (see the `import_routing` construction below).
+    // A broadcast-mode export has no per-member pseudonym (spec §5.14) and
+    // cannot be re-homed as encrypted without silently fabricating routing
+    // state, so reject it loudly with the canonical SCP-CTX-2092 envelope
+    // rather than accepting it and degrading the routing axis. All four bridges
+    // therefore fail import on a broadcast export identically (by `.code`).
+    if matches!(
+        export.snapshot.context_params.mode,
+        scp_protocol::context::params::ContextMode::Broadcast
+    ) {
+        return Err(ContextError::ImportRejected {
+            reason: "broadcast-mode contexts cannot be imported — import is \
+                     encrypted-only (§9.10.4); broadcast contexts carry no \
+                     per-member pseudonym routing state"
+                .to_owned(),
+        });
+    }
 
     let context_id = export.snapshot.context_id.clone();
     let ctx_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
@@ -1547,6 +1609,13 @@ pub async fn import_context(
         .members()
         .map(|m| m.did.clone())
         .collect();
+    // §9.10.4: the import path is encrypted-only — broadcast-mode exports are
+    // rejected at the top of this function (SCP-CTX-2092), so the routing axis
+    // is always pseudonymous. The FFI import boundary derives and supplies a
+    // real pseudonym (hard-failing otherwise); a `None` only arises from a
+    // not-yet-announced non-FFI bootstrap path (e.g. a test fixture) and maps to
+    // the reserved sentinel via `build_routing` (see its doc comment).
+    let import_routing = build_routing(false, local_pseudonym);
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
@@ -1639,9 +1708,12 @@ pub async fn import_context(
         checkpoints: Vec::new(),
         // Fresh Merkle tree for imported contexts.
         merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
-        // §9.10.4: pseudonym state is local-instance — wiped on import.
-        local_pseudonym: None,
-        pseudonym_registry: HashMap::new(),
+        // §9.10.4: the importer derives their OWN pseudonym — the exporter's
+        // is local-instance state with no meaning here. The peer registry
+        // starts empty; the importer re-announces and learns peers' pseudonyms
+        // via incoming announcements. The import path is encrypted-only
+        // (`mode = Encrypted` below), so a real pseudonym is required.
+        routing: import_routing,
         // ADR-049 commit 8: fresh actor-shape tracker on import.
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 Phase 2A finalization keystone: import path is
@@ -1897,11 +1969,36 @@ pub async fn restore_context(
         .members()
         .map(|m| m.did.clone())
         .collect();
-    let mode = if broadcast_ctx.is_some() {
+    let restored_is_broadcast = broadcast_ctx.is_some();
+    let mode = if restored_is_broadcast {
         ContextModeState::Broadcast(Box::<crate::context::actor::state::BroadcastState>::default())
     } else {
         ContextModeState::Encrypted(Box::<ContextCryptoState>::default())
     };
+    // §9.10.4: the snapshot persists a `routing` variant; the live mode is
+    // reconstructed independently from whether broadcast state reloaded. The
+    // two MUST agree. A snapshot whose persisted routing variant contradicts
+    // its reconstructed mode is either corrupt or tampered (e.g. a broadcast
+    // snapshot carrying a pseudonymous routing record that would silently
+    // redirect app-data fan-out) — fail the restore closed rather than load a
+    // context whose routing axis disagrees with its crypto axis.
+    if ctx_snapshot.routing.is_broadcast() != restored_is_broadcast {
+        return Err(ContextError::PersistenceFailed(format!(
+            "restore: snapshot routing variant (broadcast={}) contradicts \
+             reconstructed mode (broadcast={restored_is_broadcast}) for context '{context_id}'",
+            ctx_snapshot.routing.is_broadcast()
+        )));
+    }
+    // The persisted routing variant is authoritative: the agreement check above
+    // already proved `ctx_snapshot.routing.is_broadcast()` matches the
+    // reconstructed mode, so no rebuild is needed — move the snapshot's variant
+    // through verbatim. For encrypted contexts this carries the persisted local
+    // pseudonym and peer registry; an empty / zero pseudonym is acceptable here
+    // (the local member re-announces its real pseudonym after restore, and peers
+    // re-announce theirs, exactly as a cold restore starts). `ContextRouting`'s
+    // `Pseudonymous` fields are private, which is precisely why a destructure-
+    // and-rebuild is no longer possible here — and why it is no longer needed.
+    let restored_routing = ctx_snapshot.routing;
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
@@ -1986,12 +2083,7 @@ pub async fn restore_context(
         checkpoint_last_time_secs: ctx_snapshot.checkpoint_last_time_secs,
         checkpoints: Vec::new(),
         merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
-        local_pseudonym: ctx_snapshot.local_pseudonym,
-        pseudonym_registry: ctx_snapshot
-            .pseudonym_registry
-            .into_iter()
-            .map(|(did_str, p)| (scp_identity::DID(did_str), p))
-            .collect(),
+        routing: restored_routing,
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 Phase 2A finalization keystone: restore path rehydrates
         // pending sagas / Welcome scratchpads as fresh — the legacy
@@ -2298,5 +2390,350 @@ pub fn shutdown_all_contexts_sync(supervisor: &crate::context::supervisor::Super
                  skipping shutdown — per-actor resources will leak"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod restore_reconcile_tests {
+    //! §9.10.4 fail-closed restore reconciliation.
+    //!
+    //! `restore_context` reconstructs the live context mode independently from
+    //! whether broadcast state reloaded, then asserts the persisted `routing`
+    //! variant agrees with it. A snapshot whose persisted routing axis
+    //! contradicts its reconstructed crypto axis is corrupt or tampered — for
+    //! example a broadcast snapshot carrying a pseudonymous routing record that
+    //! would silently redirect app-data fan-out. These tests drive the REAL
+    //! `restore_context` path (not serde defaulting) against snapshots harvested
+    //! from a real `create_context`, with the routing axis deliberately set to
+    //! agree or disagree with the reconstructed mode.
+
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::large_futures,
+        // Test-only capturing persistence: the `Mutex<HashMap>` is never held
+        // across `.await` (writes/reads are synchronous trait methods), so a
+        // plain `std::sync::Mutex` is the right tool. The runtime's actor path
+        // bans it (ADR-049); test fixtures are explicitly exempt. See
+        // crates/scp-runtime/clippy.toml.
+        clippy::disallowed_types
+    )]
+
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use scp_identity::DID;
+    use scp_platform::testing::InMemoryStorage;
+    use scp_protocol::context::broadcast::BroadcastContextSnapshot;
+    use scp_protocol::context::params::{ContextMode, ContextParams};
+    use scp_protocol::context::{ContextError, builder::ContextCreationError};
+
+    use crate::context::actor::state::ContextRouting;
+    use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+    use crate::context::persistence::ContextPersistence;
+    use crate::context::state::ContextSnapshot;
+    use crate::context::supervisor::supervisor::Supervisor;
+    use crate::context::{ContextHandle, lifecycle_helpers};
+
+    type PersistErr = Box<dyn std::error::Error + Send + Sync>;
+
+    /// Connected no-op transport — `create_context` publishes through it.
+    struct OkTransport;
+    impl ContextTransportProvider for OkTransport {
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn publish_context(
+            &self,
+            _id: &[u8; 32],
+            _params: &ContextParams,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn send_message(&self, _id: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
+            Ok(())
+        }
+    }
+
+    struct OkEventLog;
+    impl ContextEventLogProvider for OkEventLog {
+        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: &str,
+            _actor: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Captures every snapshot/broadcast write so a real `create_context` can be
+    /// used to harvest a fully-formed, validation-passing `ContextSnapshot`.
+    #[derive(Default)]
+    struct CapturingPersistence {
+        contexts: Mutex<HashMap<String, ContextSnapshot>>,
+        broadcasts: Mutex<HashMap<String, BroadcastContextSnapshot>>,
+    }
+    impl ContextPersistence for CapturingPersistence {
+        fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), s.clone());
+            Ok(())
+        }
+        fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+            Ok(self.contexts.lock().unwrap().get(id).cloned())
+        }
+        fn persist_broadcast(
+            &self,
+            id: &str,
+            s: &BroadcastContextSnapshot,
+        ) -> Result<(), PersistErr> {
+            self.broadcasts
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), s.clone());
+            Ok(())
+        }
+        fn load_broadcast(&self, id: &str) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
+            Ok(self.broadcasts.lock().unwrap().get(id).cloned())
+        }
+        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
+            Ok(())
+        }
+        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+            Ok(self.contexts.lock().unwrap().keys().cloned().collect())
+        }
+    }
+
+    /// Boxed handle over a shared `Arc<CapturingPersistence>` so the supervisor
+    /// can write through it while the test reads the harvested snapshot from the
+    /// same backing store.
+    struct SharedCapture(Arc<CapturingPersistence>);
+    impl ContextPersistence for SharedCapture {
+        fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
+            self.0.persist_context(id, s)
+        }
+        fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+            self.0.load_context(id)
+        }
+        fn persist_broadcast(
+            &self,
+            id: &str,
+            s: &BroadcastContextSnapshot,
+        ) -> Result<(), PersistErr> {
+            self.0.persist_broadcast(id, s)
+        }
+        fn load_broadcast(&self, id: &str) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
+            self.0.load_broadcast(id)
+        }
+        fn delete_context(&self, id: &str) -> Result<(), PersistErr> {
+            self.0.delete_context(id)
+        }
+        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+            self.0.list_persisted_contexts()
+        }
+    }
+
+    /// Serves a single fixed snapshot (+ optional broadcast) for the
+    /// `restore_context` under test. The reconstructed mode is `Encrypted` when
+    /// `broadcast` is `None` and `Broadcast` when it is `Some`, independent of
+    /// the snapshot's `routing` variant — which is exactly the axis the
+    /// reconciliation cross-checks.
+    struct ServingPersistence {
+        snapshot: ContextSnapshot,
+        broadcast: Option<BroadcastContextSnapshot>,
+    }
+    impl ContextPersistence for ServingPersistence {
+        fn persist_context(&self, _id: &str, _s: &ContextSnapshot) -> Result<(), PersistErr> {
+            Ok(())
+        }
+        fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+            Ok(Some(self.snapshot.clone()))
+        }
+        fn persist_broadcast(
+            &self,
+            _id: &str,
+            _s: &BroadcastContextSnapshot,
+        ) -> Result<(), PersistErr> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _id: &str,
+        ) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
+            Ok(self.broadcast.clone())
+        }
+        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
+            Ok(())
+        }
+        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+            Ok(vec![])
+        }
+    }
+
+    fn mls_storage() -> Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
+        Arc::new(
+            crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                InMemoryStorage::new(),
+            )),
+        )
+    }
+
+    fn build_supervisor(persistence: Box<dyn ContextPersistence>) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkRestoreReconcile".to_owned(),
+        ));
+        Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(OkEventLog),
+            Arc::new(|_: &DID| None),
+            Some(persistence),
+            None,
+            None,
+            None,
+            mls_storage(),
+        )
+    }
+
+    /// Creates a real context of the requested mode and returns the harvested
+    /// snapshot plus its broadcast snapshot (if any).
+    async fn harvest_snapshot(
+        is_broadcast: bool,
+    ) -> (ContextSnapshot, Option<BroadcastContextSnapshot>) {
+        let capture = Arc::new(CapturingPersistence::default());
+        // Box the same Arc-backed capture so we can both write (via supervisor)
+        // and read (via this handle) the harvested snapshot.
+        let supervisor = build_supervisor(Box::new(SharedCapture(Arc::clone(&capture))));
+        let ctx_id = if is_broadcast {
+            "harvest-bcast"
+        } else {
+            "harvest-enc"
+        };
+        let params = if is_broadcast {
+            ContextParams {
+                mode: ContextMode::Broadcast,
+                // Broadcast contexts only support `MemoryScope::Full`.
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..ContextParams::default()
+            }
+        } else {
+            ContextParams {
+                mode: ContextMode::Encrypted,
+                ..ContextParams::default()
+            }
+        };
+        let pseudonym = if is_broadcast { None } else { Some([7u8; 32]) };
+        supervisor
+            .create_context(
+                ctx_id.to_owned(),
+                params,
+                DID("did:dht:z6MkHarvestCreator".to_owned()),
+                pseudonym,
+            )
+            .await
+            .expect("create_context should succeed");
+
+        let snapshot = capture
+            .contexts
+            .lock()
+            .unwrap()
+            .get(ctx_id)
+            .cloned()
+            .expect("create_context must persist a snapshot");
+        let broadcast = capture.broadcasts.lock().unwrap().get(ctx_id).cloned();
+        (snapshot, broadcast)
+    }
+
+    /// Drives `restore_context` against a snapshot whose `routing` variant and
+    /// reconstructed mode are independently chosen. `serve_broadcast` decides
+    /// the reconstructed mode (Some → Broadcast, None → Encrypted).
+    async fn restore_with(
+        mut snapshot: ContextSnapshot,
+        routing: ContextRouting,
+        serve_broadcast: Option<BroadcastContextSnapshot>,
+        restore_ctx_id: &str,
+    ) -> Result<(), ContextError> {
+        snapshot.context_id = restore_ctx_id.to_owned();
+        snapshot.routing = routing;
+        let serving = ServingPersistence {
+            snapshot,
+            broadcast: serve_broadcast,
+        };
+        let supervisor = build_supervisor(Box::new(serving));
+        let deps = supervisor
+            .build_actor_deps(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
+            .await
+            .expect("build_actor_deps");
+        let handle = ContextHandle::new(restore_ctx_id.to_owned(), ContextParams::default());
+        lifecycle_helpers::restore_context(&deps, restore_ctx_id, &handle).await
+    }
+
+    /// Case 1: reconstructed mode ENCRYPTED (no broadcast state) but the
+    /// persisted routing variant is `Broadcast` → fail closed.
+    #[tokio::test]
+    async fn restore_rejects_broadcast_routing_on_encrypted_reconstruction() {
+        let (enc_snapshot, _) = harvest_snapshot(false).await;
+        let err = restore_with(
+            enc_snapshot,
+            ContextRouting::for_mode(true, [0u8; 32]),
+            None,
+            "restore-case-broadcast-routing-encrypted-mode",
+        )
+        .await
+        .expect_err("routing/mode disagreement must fail closed");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(_)),
+            "expected PersistenceFailed, got {err:?}"
+        );
+    }
+
+    /// Case 2 (inverse): reconstructed mode BROADCAST (broadcast state reloads)
+    /// but the persisted routing variant is `Pseudonymous` → fail closed.
+    #[tokio::test]
+    async fn restore_rejects_pseudonymous_routing_on_broadcast_reconstruction() {
+        let (bcast_snapshot, bcast_state) = harvest_snapshot(true).await;
+        let bcast_state = bcast_state.expect("broadcast create must persist broadcast state");
+        let err = restore_with(
+            bcast_snapshot,
+            ContextRouting::for_mode(false, [9u8; 32]),
+            Some(bcast_state),
+            "restore-case-pseudonymous-routing-broadcast-mode",
+        )
+        .await
+        .expect_err("routing/mode disagreement must fail closed");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(_)),
+            "expected PersistenceFailed, got {err:?}"
+        );
+    }
+
+    /// Case 3 (positive): persisted routing variant AGREES with the
+    /// reconstructed mode (encrypted snapshot, Pseudonymous routing, no
+    /// broadcast state) → restore succeeds.
+    #[tokio::test]
+    async fn restore_succeeds_when_routing_agrees_with_mode() {
+        let (enc_snapshot, _) = harvest_snapshot(false).await;
+        let routing = enc_snapshot.routing.clone();
+        restore_with(
+            enc_snapshot,
+            routing,
+            None,
+            "restore-case-agreeing-encrypted",
+        )
+        .await
+        .expect("routing agreeing with mode must restore Ok");
     }
 }

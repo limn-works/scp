@@ -509,6 +509,20 @@ async fn context_manager_creates_usable_context() {
     bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  Bob joined from Welcome");
 
+    // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
+    // Encrypted app-data fans out to each peer's pseudonym routing ID; in
+    // production Bob announces it via a PseudonymAnnouncement. Without this seed
+    // the send fails closed with PseudonymRegistryEmpty.
+    alice
+        .manager
+        .seed_peer_pseudonym(
+            ctx_id,
+            scp_identity::DID::from("did:dht:z6MkBobUsability"),
+            [0x42u8; 32],
+        )
+        .await
+        .unwrap();
+
     // Alice sends a message.
     let msg = b"Hello from usability test!";
     alice.send_message(&handle, msg).await.unwrap();
@@ -599,23 +613,54 @@ async fn context_create_produces_active_context_with_members() {
 
     let network = FullStackNetwork::new();
     let key_resolver: KeyResolver = Arc::new(|_did| None);
-    let alice = network.create_node("did:dht:z6MkAlice6b", key_resolver);
+    let alice = network.create_node("did:dht:z6MkAlice6b", key_resolver.clone());
+    let bob = network.create_node("did:dht:z6MkBob6b", key_resolver);
 
+    // RoleAssign / MemberInvite are required for add_member (the admin assigns
+    // the new member's role).
     let params = ContextParams {
         mode: ContextMode::Encrypted,
-        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::RoleAssign,
+            Capability::MemberInvite,
+        ],
         ..ContextParams::default()
     };
 
-    let handle = alice.create_context("api-test-ctx", params).await.unwrap();
+    let ctx_id = "api-test-ctx";
+    let handle = alice.create_context(ctx_id, params).await.unwrap();
 
     // Context must be Active, not some default/empty state.
     let state = handle.try_read_state().unwrap();
     assert_eq!(state, ContextState::Active, "context should be Active");
     println!("  Context state: {state:?}");
 
-    // Context handle should be usable for sending (even if nobody is
-    // subscribed yet).
+    // Add Bob and have him join so the encrypted context has a real peer to
+    // address. Under §9.10.4 encrypted app-data fans out to each peer's
+    // per-member pseudonym routing ID — a lone-member send is a deliberate
+    // no-op — so a sendable context that produces a ciphertext needs a member.
+    let ctx_bytes = scp_core::context::context_id_bytes(ctx_id);
+    alice
+        .add_member(&handle, "did:dht:z6MkBob6b")
+        .await
+        .unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+
+    // Seed Bob's per-member pseudonym (in production Bob announces it via a
+    // PseudonymAnnouncement).
+    alice
+        .manager
+        .seed_peer_pseudonym(
+            ctx_id,
+            scp_identity::DID::from("did:dht:z6MkBob6b"),
+            [0x42u8; 32],
+        )
+        .await
+        .unwrap();
+
+    // Context handle is usable for sending: the send fans out to Bob's pseudonym.
     let send_result = alice.send_message(&handle, b"test message").await;
     assert!(send_result.is_ok(), "sending to a context should succeed");
     println!("  Send succeeded");

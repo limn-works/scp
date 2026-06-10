@@ -174,14 +174,6 @@ impl NapiUcanToken {
     pub fn expires_at(&self) -> Option<f64> {
         self.data.expires_at
     }
-
-    /// Returns the id of the `SCP` instance that minted this token, as a
-    /// base-10 string (u64 serialized as string to survive JS number limits).
-    #[napi(getter, js_name = "instanceId")]
-    #[must_use]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
-    }
 }
 
 impl Drop for NapiUcanToken {

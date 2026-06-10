@@ -54,8 +54,8 @@ pub use outcome::Outcome;
 pub use sequence::{SendSequenceTracker, SequenceReservation};
 pub use state::{
     AuthorKeyEntry, BroadcastRecvTracker, BroadcastState, ContextCryptoState, ContextEventLog,
-    ContextLifecycleState, ContextModeState, PendingBroadcastKeyRotation, PerContextState,
-    RecvSequenceTracker, WelcomeProcessing, WrappingKeyPair,
+    ContextLifecycleState, ContextModeState, ContextRouting, PendingBroadcastKeyRotation,
+    PerContextState, RecvSequenceTracker, WelcomeProcessing, WrappingKeyPair,
 };
 
 /// Re-export of [`scp_protocol::context::ContextError`] for handler-side
@@ -707,6 +707,13 @@ impl ContextActor {
                 ack_not_impl(
                     reply,
                     "messaging::report_degraded_mode (use Supervisor::dispatch_command during commits 8-11)",
+                );
+            }
+            #[cfg(feature = "testing")]
+            ContextCommand::Messaging(MessagingCommand::SeedPeerPseudonym { reply, .. }) => {
+                ack_not_impl(
+                    reply,
+                    "messaging::seed_peer_pseudonym (test-only — use Supervisor::dispatch_command)",
                 );
             }
             ContextCommand::Lifecycle(sub) => Self::skeleton_dispatch_lifecycle(sub),
@@ -1517,6 +1524,221 @@ mod tests {
             .build_actor_deps(&DID("did:example:actor-with-state-test".to_owned()))
             .await
             .expect("build_actor_deps")
+    }
+
+    // -----------------------------------------------------------------------
+    // §9.10.4 direct-ingest-site behavioral tests.
+    //
+    // `deliver_message_and_drain_buffered` is the IN-ORDER ingest entry point.
+    // It delegates the four-step pseudonym-announcement validation to the shared
+    // `ingest_pseudonym_announcement` core (the same boundary the buffered site
+    // uses) and maps the outcome to its OWN convention: `Recorded` → `Ok(true)`
+    // (after advancing the sequence tracker + draining the reorder buffer),
+    // `Rejected` → `Err(PermissionDenied)`. These tests drive a real
+    // `PseudonymAnnouncement` through that function against a real
+    // `PerContextState` + `ActorDeps`, asserting both the registry state and the
+    // direct-site return convention.
+    // -----------------------------------------------------------------------
+
+    const DIRECT_ALICE: &str = "did:dht:z6MkAliceDirect";
+    const DIRECT_BOB: &str = "did:dht:z6MkBobDirect";
+
+    /// Build an encrypted test state where `member` is a writable context
+    /// member (so the direct ingest path's membership + capability gates pass)
+    /// and the handle is `Active` (so `require_active` passes).
+    async fn writable_encrypted_state(ctx_byte: u8, member: &str) -> state::PerContextState {
+        use scp_protocol::context::roles::Capability;
+        use std::collections::HashSet;
+
+        let st = state::PerContextState::new_for_test_encrypted(
+            [ctx_byte; 32],
+            1_700_000_000,
+            scp_identity::DID(member.to_owned()),
+        );
+        // The in-order ingest path requires the context to be Active.
+        st.handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .await
+            .expect("transition test handle to Active");
+        let mut st = st;
+        st.membership.add_member(
+            scp_identity::DID(member.to_owned()),
+            "member".to_owned(),
+            Vec::new(),
+        );
+        st.members.insert(scp_identity::DID(member.to_owned()));
+        st.role_state.members.insert(member.to_owned());
+        let mut caps = HashSet::new();
+        caps.insert(Capability::MessagesWrite);
+        st.role_state
+            .member_capabilities
+            .insert(member.to_owned(), caps);
+        st
+    }
+
+    /// Lowercase-hex of a repeated byte — the context-id string the test state's
+    /// delivery path uses.
+    fn ctx_hex(byte: u8) -> String {
+        let mut s = String::with_capacity(64);
+        for _ in 0..32 {
+            use std::fmt::Write;
+            let _ = write!(s, "{byte:02x}");
+        }
+        s
+    }
+
+    /// Minimal `InnerEnvelope` — `deliver_message_and_drain_buffered` reads only
+    /// `sequence` + `timestamp` off it (the message body is the `plaintext`
+    /// argument; the signature is verified upstream of this helper). All
+    /// `InnerEnvelope` fields are `pub`, so a struct literal is the simplest
+    /// faithful fixture.
+    fn minimal_inner(
+        ctx: &str,
+        sender: &str,
+        sequence: u64,
+    ) -> scp_protocol::envelope::inner::InnerEnvelope {
+        scp_protocol::envelope::inner::InnerEnvelope {
+            version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+            context_id: ctx.to_owned(),
+            sender_did: sender.to_owned(),
+            epoch: 0,
+            generation: 0,
+            sequence,
+            timestamp: 1_700_000_000,
+            message_type: scp_protocol::envelope::inner::MessageType::Content,
+            payload_hash: [0u8; 32],
+            payload: Vec::new(),
+            provenance: None,
+            provenance_hash: [0u8; 32],
+            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signature: [0u8; 64],
+            extensions: std::collections::HashMap::new(),
+        }
+    }
+
+    fn announcement_bytes(member_did: &str, pseudonym: [u8; 32]) -> Vec<u8> {
+        use crate::context::state::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+        let ann = PseudonymAnnouncement {
+            tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+            member_did: member_did.to_owned(),
+            pseudonym,
+        };
+        rmp_serde::to_vec_named(&ann).expect("serialize announcement")
+    }
+
+    #[tokio::test]
+    async fn direct_legitimate_announcement_records_and_returns_consumed() {
+        let deps = new_test_deps().await;
+        let mut state = writable_encrypted_state(0x31, DIRECT_ALICE).await;
+        let ctx = ctx_hex(0x31);
+        let ctx_bytes = [0x31u8; 32];
+        let pseudonym = [0x42u8; 32];
+        let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
+
+        let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+            &mut state,
+            &deps,
+            &ctx,
+            &ctx_bytes,
+            DIRECT_ALICE,
+            &inner,
+            &announcement_bytes(DIRECT_ALICE, pseudonym),
+            true,
+        )
+        .expect("a legitimate announcement is consumed, not an error");
+        assert!(consumed, "an announcement is reported as consumed (true)");
+        let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
+        assert_eq!(
+            reg.get(&scp_identity::DID(DIRECT_ALICE.to_owned())),
+            Some(&pseudonym)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_forged_did_announcement_errors_permission_denied() {
+        let deps = new_test_deps().await;
+        let mut state = writable_encrypted_state(0x32, DIRECT_ALICE).await;
+        let ctx = ctx_hex(0x32);
+        let ctx_bytes = [0x32u8; 32];
+        // Authenticated sender is ALICE, but the announcement claims BOB.
+        let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
+
+        let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+            &mut state,
+            &deps,
+            &ctx,
+            &ctx_bytes,
+            DIRECT_ALICE,
+            &inner,
+            &announcement_bytes(DIRECT_BOB, [0x42u8; 32]),
+            true,
+        );
+        assert!(
+            matches!(result, Err(ContextError::PermissionDenied(_))),
+            "the direct ingest site maps a rejection to PermissionDenied; got {result:?}"
+        );
+        assert!(
+            state
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .is_empty(),
+            "a rejected announcement must not touch the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_reserved_value_announcement_errors_permission_denied() {
+        let deps = new_test_deps().await;
+        let mut state = writable_encrypted_state(0x33, DIRECT_ALICE).await;
+        let ctx = ctx_hex(0x33);
+        let ctx_bytes = [0x33u8; 32];
+        let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
+
+        let result = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+            &mut state,
+            &deps,
+            &ctx,
+            &ctx_bytes,
+            DIRECT_ALICE,
+            &inner,
+            &announcement_bytes(DIRECT_ALICE, [0u8; 32]), // zero sentinel = reserved
+            true,
+        );
+        assert!(
+            matches!(result, Err(ContextError::PermissionDenied(_))),
+            "a reserved routing-ID value is rejected on the direct path; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_same_did_reannounce_succeeds_and_updates_registry() {
+        let deps = new_test_deps().await;
+        let mut state = writable_encrypted_state(0x34, DIRECT_ALICE).await;
+        let ctx = ctx_hex(0x34);
+        let ctx_bytes = [0x34u8; 32];
+
+        for (seq, rid) in [(1u64, [0x42u8; 32]), (2u64, [0x43u8; 32])] {
+            let inner = minimal_inner(&ctx, DIRECT_ALICE, seq);
+            let consumed = crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+                &mut state,
+                &deps,
+                &ctx,
+                &ctx_bytes,
+                DIRECT_ALICE,
+                &inner,
+                &announcement_bytes(DIRECT_ALICE, rid),
+                true,
+            )
+            .expect("same-DID re-announce must succeed");
+            assert!(consumed);
+        }
+        let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
+        assert_eq!(
+            reg.get(&scp_identity::DID(DIRECT_ALICE.to_owned())),
+            Some(&[0x43u8; 32]),
+            "a same-DID re-announce updates the registry to the rotated routing ID"
+        );
     }
 
     /// `ContextActor::new` constructs an actor that owns `PerContextState`

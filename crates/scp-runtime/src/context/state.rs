@@ -802,15 +802,49 @@ pub struct ContextSnapshot {
     /// deserialize as `0` via `#[serde(default)]`.
     #[serde(default)]
     pub generation: u64,
-    /// This member's pseudonym-derived routing ID for this context (§9.10.4).
-    /// Pre-derived by the FFI bridge. `None` for legacy snapshots and
-    /// broadcast contexts.
-    #[serde(default)]
-    pub local_pseudonym: Option<[u8; 32]>,
-    /// Known members' pseudonym routing IDs (§9.10.4), learned via
-    /// `PseudonymAnnouncement` MLS messages. Keyed by member DID string.
-    #[serde(default)]
-    pub pseudonym_registry: HashMap<String, [u8; 32]>,
+    /// Per-context routing strategy (§9.10.4, §5.14).
+    ///
+    /// Encrypted contexts persist the member's pseudonym routing ID and the
+    /// learned peer registry; broadcast contexts persist
+    /// [`ContextRouting::Broadcast`] and carry no pseudonym state.
+    ///
+    /// Degraded / pre-routing-field snapshots (those persisted before this
+    /// field existed, or `strip_snapshot_for_public` redactions) default to
+    /// [`ContextRouting::Broadcast`] via [`default_context_routing`] — a
+    /// no-pseudonym placeholder that carries no routing secret.
+    ///
+    /// The restore path does NOT silently coerce this placeholder onto an
+    /// encrypted context. It reconstructs the *real* mode (encrypted vs
+    /// broadcast, derived from whether broadcast crypto state reloaded) and
+    /// requires the persisted `routing.is_broadcast()` to AGREE with it. A
+    /// degraded snapshot of a *broadcast* context restores fine (placeholder
+    /// `Broadcast` agrees with the reconstructed broadcast mode). A degraded
+    /// snapshot of an *encrypted* context FAILS CLOSED: the placeholder
+    /// `Broadcast` disagrees with the reconstructed encrypted mode, so restore
+    /// returns [`ContextError::PersistenceFailed`](scp_protocol::context::ContextError::PersistenceFailed)
+    /// rather than loading a context whose routing axis contradicts its crypto
+    /// axis. This is acceptable pre-1.0 (no deployed data, no persisted
+    /// encrypted snapshots predating this field); the alternative — defaulting
+    /// to a fabricated pseudonymous variant — would mask snapshot corruption.
+    /// On a non-degraded restore the persisted variant is moved through
+    /// verbatim; an empty `pseudonym_registry` simply means peers must
+    /// re-announce, the same state a cold restore always starts from.
+    #[serde(default = "default_context_routing")]
+    pub routing: crate::context::actor::state::ContextRouting,
+}
+
+/// Default routing variant for degraded / pre-routing-field snapshots.
+///
+/// Returns [`ContextRouting::Broadcast`] — a placeholder that carries no
+/// pseudonym secret. The restore path requires this to agree with the
+/// reconstructed mode (§9.10.4): a degraded *broadcast* snapshot restores
+/// fine, but a degraded *encrypted* snapshot fails closed
+/// ([`ContextError::PersistenceFailed`](scp_protocol::context::ContextError::PersistenceFailed))
+/// rather than silently loading an encrypted context with a broadcast routing
+/// axis. This default therefore never downgrades an encrypted context's
+/// routing — it surfaces the corruption instead.
+const fn default_context_routing() -> crate::context::actor::state::ContextRouting {
+    crate::context::actor::state::ContextRouting::Broadcast
 }
 
 /// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)

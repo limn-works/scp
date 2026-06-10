@@ -117,6 +117,10 @@ fn alice() -> DID {
     DID::from("did:dht:z6MkAlice")
 }
 
+fn bob() -> DID {
+    DID::from("did:dht:z6MkBob")
+}
+
 /// Builds a `Supervisor` with the event broadcast channel **enabled** —
 /// `test_supervisor` passes `event_tx = None`, so this test must wire the
 /// channel explicitly via `with_providers` to exercise the producer path.
@@ -151,6 +155,9 @@ fn messaging_ceiling() -> Vec<Capability> {
     vec![
         Capability::new("messages:read"),
         Capability::new("messages:write"),
+        Capability::new("governance:propose"),
+        Capability::new("governance:vote"),
+        Capability::new("role:assign"),
     ]
 }
 
@@ -166,9 +173,16 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
         .expect("event channel was enabled via with_providers");
 
     let ctx_id = "ctx-producer-wire";
+    // Threshold governance with Alice + Bob so the context can become
+    // multi-member: a lone-member encrypted send fans out to zero recipients
+    // and is a no-op (no MessageSent), so the producer wire must be exercised by
+    // a send that has a REAL recipient (§9.10.4).
     let params = ContextParams {
         ceiling: messaging_ceiling(),
-        governance: GovernanceModel::SingleAdmin,
+        governance: GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![alice(), bob()],
+        },
         ..ContextParams::default()
     };
     let handle = supervisor
@@ -176,6 +190,31 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
         .await
         .expect("context creation should succeed");
     assert_eq!(handle.context_id(), ctx_id);
+
+    // Add Bob via threshold governance so the encrypted send has a real fan-out
+    // target, then seed his pseudonym (production: Bob announces it).
+    let sk_alice = signing_key_for_did(&alice());
+    let sk_bob = signing_key_for_did(&bob());
+    let (prop, _, _) = supervisor
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            scp_protocol::context::governance::GovernanceAction::AddMember {
+                did: bob(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .expect("proposing AddMember should succeed");
+    supervisor
+        .vote_on_proposal(ctx_id, &prop.proposal_id, &bob(), true, &sk_bob)
+        .await
+        .expect("Bob voting to approve his own add should succeed");
+    supervisor
+        .seed_peer_pseudonym(ctx_id, bob(), [0x42u8; 32])
+        .await
+        .expect("seeding Bob's pseudonym should succeed");
 
     // Drive a real send. This is the producer: the actor emits a MessageSent
     // ContextEvent (payload stripped) onto the broadcast channel.
