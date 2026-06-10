@@ -422,26 +422,13 @@ pub(crate) fn event_log_checkpoint_on(
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
     crate::napi_check_handle!(&bi.core, handle, identity);
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (bi, &handle, &identity, &epoch);
-        Err(napi::Error::from(ScpNapiError::Permission {
-            message: "event log checkpoint requires key custody -- the in_memory custody path \
-                       is not available in this build. Enable allow_in_memory_custody \
-                       for dev/desktop use."
-                .to_owned(),
-            code: codes::PERM_3023.to_owned(),
-        }))
-    }
-
-    #[cfg(feature = "allow_in_memory_custody")]
     {
         crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
         let custody = identity.inner.in_memory_custody.as_ref().ok_or_else(|| {
             napi::Error::from(ScpNapiError::Permission {
-                message: "event log checkpoint requires key custody — create the identity \
-                      with in_memory custody (identity_create(\"in_memory\"))"
+                message: "event log checkpoint requires key custody — this identity has no \
+                      retained custody (it was externally loaded)"
                     .to_owned(),
                 code: codes::PERM_3023.to_owned(),
             })
@@ -506,19 +493,6 @@ pub(crate) fn event_log_checkpoint_by_did_on(
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
     crate::napi_check_handle!(&bi.core, handle);
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (bi, &handle, &did, &epoch);
-        Err(napi::Error::from(ScpNapiError::Permission {
-            message: "event log checkpoint requires key custody -- the in_memory custody path \
-                       is not available in this build. Enable allow_in_memory_custody \
-                       for dev/desktop use."
-                .to_owned(),
-            code: codes::PERM_3023.to_owned(),
-        }))
-    }
-
-    #[cfg(feature = "allow_in_memory_custody")]
     {
         crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
@@ -576,7 +550,6 @@ pub(crate) fn event_log_checkpoint_by_did_on(
 /// Validates that an f64 epoch value is non-negative and returns it as u64.
 ///
 /// Returns `napi::Error` with `SCP-VALID-7040` if the value is negative.
-#[cfg(feature = "allow_in_memory_custody")]
 fn validate_non_negative_epoch(epoch: f64) -> napi::Result<u64> {
     if epoch < 0.0 || !epoch.is_finite() {
         return Err(napi::Error::from(ScpNapiError::Validation {
@@ -695,40 +668,34 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
     fn validate_epoch_accepts_zero() {
         assert_eq!(validate_non_negative_epoch(0.0).unwrap(), 0);
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
     fn validate_epoch_accepts_positive() {
         assert_eq!(validate_non_negative_epoch(42.0).unwrap(), 42);
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
     fn validate_epoch_rejects_negative() {
         let result = validate_non_negative_epoch(-1.0);
         assert!(result.is_err(), "negative epoch should error");
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
     fn validate_epoch_rejects_negative_infinity() {
         let result = validate_non_negative_epoch(f64::NEG_INFINITY);
         assert!(result.is_err(), "NEG_INFINITY epoch should error");
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
     fn validate_epoch_rejects_f64_min() {
         let result = validate_non_negative_epoch(f64::MIN);
         assert!(result.is_err(), "f64::MIN epoch should error");
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
     fn validate_epoch_negative_error_contains_code() {
         let result = validate_non_negative_epoch(-42.0);
         let err = result.unwrap_err();
@@ -742,14 +709,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
     fn validate_epoch_rejects_nan() {
         let result = validate_non_negative_epoch(f64::NAN);
         assert!(result.is_err(), "NaN epoch should error");
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
     fn validate_epoch_rejects_positive_infinity() {
         let result = validate_non_negative_epoch(f64::INFINITY);
         assert!(result.is_err(), "INFINITY epoch should error");

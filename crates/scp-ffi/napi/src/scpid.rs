@@ -10,12 +10,10 @@
 use scp_ffi_common::error_codes as codes;
 use std::time::Duration;
 
-#[cfg(feature = "allow_in_memory_custody")]
 use scp_core::identity::scpid_sign as core_sign;
 use scp_core::identity::{
     ScpIdChallenge, ScpIdResponse, scpid_challenge as core_challenge, scpid_verify as core_verify,
 };
-#[cfg(feature = "allow_in_memory_custody")]
 use scp_identity::SigningKeyId;
 
 use crate::error::ScpNapiError;
@@ -64,7 +62,6 @@ pub(crate) fn scpid_challenge_on(
 /// It is only accepted when scp-core is built with the `testing` feature
 /// (cross-bridge parity harness, ADR-046); production builds reject any
 /// non-`null` value.
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn scpid_sign_on(
     bi: &NapiBridgeInstance,
     did: String,
@@ -196,7 +193,6 @@ pub(crate) fn scpid_verify_on(
 
 /// Parses a signing key ID string (`"#active"` or `"#agent"`) into a
 /// [`SigningKeyId`] enum.
-#[cfg(feature = "allow_in_memory_custody")]
 fn parse_signing_key_id(s: &str) -> napi::Result<SigningKeyId> {
     match s {
         "#active" => Ok(SigningKeyId::Active),
@@ -234,10 +230,15 @@ mod tests {
     use super::*;
     use crate::runtime::NapiBridgeInstance;
     use scp_ffi_common::error_codes as codes;
-    use std::sync::Arc;
 
+    // In-memory-custody-only helpers — used solely by the feature-gated
+    // `scpid_sign` tests that register an identity via the in-memory backend.
+    #[cfg(feature = "allow_in_memory_custody")]
     use scp_identity::resolver::DualLayerResolver;
+    #[cfg(feature = "allow_in_memory_custody")]
     use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier};
+    #[cfg(feature = "allow_in_memory_custody")]
+    use std::sync::Arc;
 
     fn test_bi() -> NapiBridgeInstance {
         NapiBridgeInstance::new_napi()
