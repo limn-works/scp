@@ -20,7 +20,6 @@ use scp_identity::DID;
 use scp_primitives::Clock;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
 
 use scp_ffi_common::validate::validate_did;
@@ -116,11 +115,15 @@ pub struct NapiContextHandle {
     /// Retained custody for UCAN signing — shares the creator identity's
     /// `Arc<NapiKeyCustody>` so context-level signing uses the same key
     /// material (and works for callback-backed identities too).
-    #[cfg(feature = "allow_in_memory_custody")]
+    ///
+    /// Available in production (not feature-gated): in the production
+    /// callback-custody path this carries the creator identity's retained
+    /// `Arc<NapiKeyCustody::Callback>`. The field name is historical — it
+    /// backs any retained custody, not just in-memory. `None` when the context
+    /// creator was an externally loaded (DID-string-only) identity.
     pub(crate) in_memory_custody: Option<Arc<crate::custody::NapiKeyCustody>>,
-    /// Handle to the creator's active signing key for UCAN minting.
-    /// Only read inside `#[cfg(feature = "allow_in_memory_custody")]` blocks.
-    #[allow(dead_code)]
+    /// Handle to the creator's active signing key for UCAN minting and
+    /// context-export signing.
     pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
     /// The scp-core `ContextHandle` for this context, used for manager delegation.
     pub(crate) core_handle: Option<ContextHandle>,
@@ -348,7 +351,6 @@ impl NapiContextHandle {
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            #[cfg(feature = "allow_in_memory_custody")]
             in_memory_custody: None,
             signing_key: None,
             core_handle: None,
@@ -389,7 +391,6 @@ pub struct NapiMessage {
 /// `KeyCustody::derive_pseudonym`. The pseudonym is used as the member's
 /// per-context routing ID for encrypted contexts, replacing the shared
 /// `context_routing_id` to prevent relay-side correlation.
-#[cfg(feature = "allow_in_memory_custody")]
 async fn derive_context_pseudonym(identity: &NapiIdentity, context_id: &str) -> Option<[u8; 32]> {
     let (scp_id, custody) = (
         identity.inner.scp_identity.as_ref()?,
@@ -401,12 +402,6 @@ async fn derive_context_pseudonym(identity: &NapiIdentity, context_id: &str) -> 
         .ok()?;
     let bytes: [u8; 32] = pseudonym.public_key.as_bytes().try_into().ok()?;
     Some(bytes)
-}
-
-/// Fallback for non-custody builds — always returns `None`.
-#[cfg(not(feature = "allow_in_memory_custody"))]
-async fn derive_context_pseudonym(_identity: &NapiIdentity, _context_id: &str) -> Option<[u8; 32]> {
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +452,6 @@ pub(crate) async fn context_create_on(
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
     // Extract key custody and signing key from the identity handle.
-    #[cfg(feature = "allow_in_memory_custody")]
     let in_memory_custody = identity.inner.in_memory_custody.clone();
     let signing_key = identity
         .inner
@@ -631,7 +625,6 @@ pub(crate) async fn context_create_on(
         promotion_policy,
         governance,
         economic_policy,
-        #[cfg(feature = "allow_in_memory_custody")]
         in_memory_custody,
         signing_key,
         core_handle: Some(core_handle),
@@ -704,24 +697,17 @@ pub(crate) async fn context_join_on(
     // the pseudonym asynchronously — avoids block_on inside an async fn.
     let context_id = handle.context_id.clone();
     let local_pseudonym: Option<[u8; 32]> = {
-        #[cfg(feature = "allow_in_memory_custody")]
-        {
-            let custody_and_key = crate::runtime::with_identity(bi, &identity_did, |entry| {
-                Ok((entry.custody.clone(), entry.identity.identity_key))
-            })
-            .ok();
-            match custody_and_key {
-                Some((custody, identity_key)) => custody
-                    .derive_pseudonym(&identity_key, context_id.as_bytes())
-                    .await
-                    .ok()
-                    .and_then(|p| p.public_key.as_bytes().try_into().ok()),
-                None => None,
-            }
-        }
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        {
-            None
+        let custody_and_key = crate::runtime::with_identity(bi, &identity_did, |entry| {
+            Ok((entry.custody.clone(), entry.identity.identity_key))
+        })
+        .ok();
+        match custody_and_key {
+            Some((custody, identity_key)) => custody
+                .derive_pseudonym(&identity_key, context_id.as_bytes())
+                .await
+                .ok()
+                .and_then(|p| p.public_key.as_bytes().try_into().ok()),
+            None => None,
         }
     };
 
@@ -759,36 +745,33 @@ pub(crate) async fn context_join_on(
     // Best-effort: if signing key is not available, skip silently. Routes
     // through the ADR-049 commit-8 messaging shim.
     if local_pseudonym.is_some() {
-        #[cfg(feature = "allow_in_memory_custody")]
+        // Extract custody + key handle from registry (sync), then export
+        // the signing key asynchronously — avoids block_on inside async fn.
+        let custody_and_key = crate::runtime::with_identity(bi, &identity_did, |e| {
+            Ok((e.custody.clone(), e.identity.active_signing_key))
+        })
+        .ok();
+        if let Some((custody, key_handle)) = custody_and_key
+            && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
         {
-            // Extract custody + key handle from registry (sync), then export
-            // the signing key asynchronously — avoids block_on inside async fn.
-            let custody_and_key = crate::runtime::with_identity(bi, &identity_did, |e| {
-                Ok((e.custody.clone(), e.identity.active_signing_key))
-            })
-            .ok();
-            if let Some((custody, key_handle)) = custody_and_key
-                && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
-            {
-                use scp_core::context::actor::commands::{
-                    MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-                };
-                let sender_did = DID(identity_did.clone());
-                let ann_ctx_id = context_id.clone();
-                let ann_params = core_handle.params().clone();
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = MessagingCommand::SendPseudonymAnnouncement {
-                    payload: Box::new(SendPseudonymAnnouncementPayload {
-                        context_id: ann_ctx_id.clone(),
-                        params: ann_params,
-                        sender_did,
-                        signing_key: SigningKeyBytes::from_signing_key(&sk),
-                    }),
-                    reply: tx,
-                };
-                if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
-                    let _ = rx.await;
-                }
+            use scp_core::context::actor::commands::{
+                MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+            };
+            let sender_did = DID(identity_did.clone());
+            let ann_ctx_id = context_id.clone();
+            let ann_params = core_handle.params().clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = MessagingCommand::SendPseudonymAnnouncement {
+                payload: Box::new(SendPseudonymAnnouncementPayload {
+                    context_id: ann_ctx_id.clone(),
+                    params: ann_params,
+                    sender_did,
+                    signing_key: SigningKeyBytes::from_signing_key(&sk),
+                }),
+                reply: tx,
+            };
+            if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
+                let _ = rx.await;
             }
         }
     }
@@ -956,7 +939,6 @@ pub(crate) async fn context_send_on(
     // Validate inner envelope signing via the retained KeyCustody
     // (SCP-214 criterion 6). Ensures the identity's active signing key
     // can produce a valid Ed25519 signature before sending.
-    #[cfg(feature = "allow_in_memory_custody")]
     if let (Some(custody), Some(signing_key)) = (&handle.in_memory_custody, handle.signing_key) {
         let context_id = handle.context_id.clone();
         let sender_did_str = identity_did.clone();
@@ -990,11 +972,7 @@ pub(crate) async fn context_send_on(
     // ContextManager can produce a valid inner envelope signature. Passing
     // None would cause the encrypted send path to fail with "signing key
     // required".
-    #[cfg(feature = "allow_in_memory_custody")]
     let resolved_signing_key = resolve_napi_signing_key(handle).await.ok();
-
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    let resolved_signing_key: Option<ed25519_dalek::SigningKey> = None;
 
     // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
     let spending_ucan = spending_ucan_jwt
@@ -1921,65 +1899,50 @@ pub(crate) async fn broadcast_publish_on(
     let context_id = handle.context_id.clone();
     let author_did = DID(author_did);
 
-    #[cfg(feature = "allow_in_memory_custody")]
-    {
-        use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastPayload};
-        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-            NapiError::from(ScpNapiError::Permission {
-                message: "broadcast publish requires key custody — create the identity with \
-                          identityCreate(\"in_memory\")"
-                    .to_owned(),
-                code: codes::PERM_3020.to_owned(),
-            })
-        })?;
-        let signing_key = handle.signing_key.ok_or_else(|| {
-            NapiError::from(ScpNapiError::Permission {
-                message: "broadcast publish requires a signing key — identity has no active \
-                          signing key handle"
-                    .to_owned(),
-                code: codes::PERM_3021.to_owned(),
-            })
-        })?;
-
-        // Route through the ADR-049 broadcast dispatch surface with custody.
-        // Publish requires the custody-bearing variant because the
-        // `KeyCustody` trait is not dyn-safe and cannot cross the actor
-        // mailbox.
-        let sup = crate::runtime::supervisor(bi)?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = BroadcastCommand::PublishBroadcast {
-            payload: Box::new(PublishBroadcastPayload {
-                context_id,
-                author_did,
-                payload,
-                signing_key_handle: signing_key,
-            }),
-            reply: tx,
-        };
-        sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
-            .await
-            .map_err(|e| {
-                napi::Error::from_reason(format!(
-                    "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                ))
-            })?;
-        rx.await
-            .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-    }
-
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (context_id, author_did, payload);
-        return Err(NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish requires key custody — in_memory custody feature is \
-                      not enabled"
+    use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastPayload};
+    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Permission {
+            message: "broadcast publish requires key custody — this identity has no retained \
+                      custody (it was externally loaded)"
                 .to_owned(),
-            code: codes::PERM_3022.to_owned(),
-        }));
-    }
+            code: codes::PERM_3020.to_owned(),
+        })
+    })?;
+    let signing_key = handle.signing_key.ok_or_else(|| {
+        NapiError::from(ScpNapiError::Permission {
+            message: "broadcast publish requires a signing key — identity has no active \
+                      signing key handle"
+                .to_owned(),
+            code: codes::PERM_3021.to_owned(),
+        })
+    })?;
 
-    #[allow(unreachable_code)]
+    // Route through the ADR-049 broadcast dispatch surface with custody.
+    // Publish requires the custody-bearing variant because the
+    // `KeyCustody` trait is not dyn-safe and cannot cross the actor
+    // mailbox.
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::PublishBroadcast {
+        payload: Box::new(PublishBroadcastPayload {
+            context_id,
+            author_did,
+            payload,
+            signing_key_handle: signing_key,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+        .await
+        .map_err(|e| {
+            napi::Error::from_reason(format!(
+                "supervisor dispatch_broadcast_command_with_custody failed: {e}"
+            ))
+        })?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
     Ok(())
 }
 
@@ -2072,10 +2035,7 @@ pub(crate) async fn broadcast_publish_asset_on(
     let deploy_id_str = deploy_id.as_ref().map_or_else(String::new, Clone::clone);
     // Clone etag when custody feature is enabled — it's needed again in the
     // return value after `content` consumes the clone.
-    #[cfg(feature = "allow_in_memory_custody")]
     let etag_for_metadata = etag.clone();
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    let etag_for_metadata = etag;
     let content = scp_core::context::BroadcastContent {
         version: scp_core::context::BROADCAST_CONTENT_VERSION,
         metadata: scp_core::context::ContentMetadata {
@@ -2088,80 +2048,64 @@ pub(crate) async fn broadcast_publish_asset_on(
         body: asset.body,
     };
 
-    #[cfg(feature = "allow_in_memory_custody")]
-    {
-        use scp_core::context::actor::commands::{
-            BroadcastCommand, PublishBroadcastContentPayload,
-        };
-        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-            NapiError::from(ScpNapiError::Permission {
-                message: "broadcast publish asset requires key custody — create the identity with \
-                          identityCreate(\"in_memory\")"
-                    .to_owned(),
-                code: codes::PERM_3020.to_owned(),
-            })
-        })?;
-        let signing_key = handle.signing_key.ok_or_else(|| {
-            NapiError::from(ScpNapiError::Permission {
-                message: "broadcast publish asset requires a signing key — identity has no active \
-                          signing key handle"
-                    .to_owned(),
-                code: codes::PERM_3021.to_owned(),
-            })
-        })?;
-
-        // Route through the ADR-049 commit-11 broadcast shim with custody.
-        let sup = crate::runtime::supervisor(bi)?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = BroadcastCommand::PublishBroadcastContent {
-            payload: Box::new(PublishBroadcastContentPayload {
-                context_id,
-                author_did: author_did_val,
-                content,
-                signing_key_handle: signing_key,
-            }),
-            reply: tx,
-        };
-        sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
-            .await
-            .map_err(|e| {
-                napi::Error::from_reason(format!(
-                    "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                ))
-            })?;
-        let envelope = rx
-            .await
-            .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-        let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("failed to serialize envelope for blob_id: {e}"),
-                code: codes::CTX_2043.to_owned(),
-            })
-        })?;
-        let blob_id = {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(&envelope_bytes))
-        };
-
-        Ok(NapiPublishResult {
-            blob_id,
-            etag,
-            deploy_id: deploy_id_str,
-        })
-    }
-
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (context_id, author_did_val, content, deploy_id_str);
-        Err(NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish asset requires key custody — in_memory custody feature is \
-                      not enabled"
+    use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
+    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Permission {
+            message: "broadcast publish asset requires key custody — this identity has no \
+                      retained custody (it was externally loaded)"
                 .to_owned(),
-            code: codes::PERM_3022.to_owned(),
-        }))
-    }
+            code: codes::PERM_3020.to_owned(),
+        })
+    })?;
+    let signing_key = handle.signing_key.ok_or_else(|| {
+        NapiError::from(ScpNapiError::Permission {
+            message: "broadcast publish asset requires a signing key — identity has no active \
+                      signing key handle"
+                .to_owned(),
+            code: codes::PERM_3021.to_owned(),
+        })
+    })?;
+
+    // Route through the ADR-049 commit-11 broadcast shim with custody.
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::PublishBroadcastContent {
+        payload: Box::new(PublishBroadcastContentPayload {
+            context_id,
+            author_did: author_did_val,
+            content,
+            signing_key_handle: signing_key,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+        .await
+        .map_err(|e| {
+            napi::Error::from_reason(format!(
+                "supervisor dispatch_broadcast_command_with_custody failed: {e}"
+            ))
+        })?;
+    let envelope = rx
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("failed to serialize envelope for blob_id: {e}"),
+            code: codes::CTX_2043.to_owned(),
+        })
+    })?;
+    let blob_id = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(&envelope_bytes))
+    };
+
+    Ok(NapiPublishResult {
+        blob_id,
+        etag,
+        deploy_id: deploy_id_str,
+    })
 }
 
 /// Per-bridge-instance implementation of [`broadcast_publish_assets`].
@@ -2209,110 +2153,94 @@ pub(crate) async fn broadcast_publish_assets_on(
         })
     })?;
 
-    #[cfg(feature = "allow_in_memory_custody")]
-    {
-        use scp_core::context::actor::commands::{
-            BroadcastCommand, PublishBroadcastContentPayload,
-        };
-        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-            NapiError::from(ScpNapiError::Permission {
-                message: "broadcast publish assets requires key custody".to_owned(),
-                code: codes::PERM_3020.to_owned(),
-            })
-        })?;
-        let signing_key = handle.signing_key.ok_or_else(|| {
-            NapiError::from(ScpNapiError::Permission {
-                message: "broadcast publish assets requires a signing key".to_owned(),
-                code: codes::PERM_3021.to_owned(),
-            })
-        })?;
-
-        // Route each asset through the ADR-049 commit-11 broadcast shim
-        // with custody.
-        let sup = crate::runtime::supervisor(bi)?;
-        let mut results = Vec::with_capacity(assets.len());
-        for asset in assets {
-            let content_path = scp_core::context::ContentPath::new(asset.path).map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("invalid path: {e}"),
-                    code: codes::CTX_2040.to_owned(),
-                })
-            })?;
-            let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("invalid content_type: {e}"),
-                    code: codes::CTX_2041.to_owned(),
-                })
-            })?;
-
-            let etag = scp_core::context::compute_etag(&asset.body);
-            let content = scp_core::context::BroadcastContent {
-                version: scp_core::context::BROADCAST_CONTENT_VERSION,
-                metadata: scp_core::context::ContentMetadata {
-                    path: Some(content_path),
-                    content_type: Some(mime_type),
-                    deploy_id: Some(deploy_id_val.clone()),
-                    etag: Some(etag.clone()),
-                    immutable: false,
-                },
-                body: asset.body,
-            };
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let cmd = BroadcastCommand::PublishBroadcastContent {
-                payload: Box::new(PublishBroadcastContentPayload {
-                    context_id: context_id.clone(),
-                    author_did: author_did_val.clone(),
-                    content,
-                    signing_key_handle: signing_key,
-                }),
-                reply: tx,
-            };
-            sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
-                .await
-                .map_err(|e| {
-                    napi::Error::from_reason(format!(
-                        "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                    ))
-                })?;
-            let envelope = rx
-                .await
-                .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-            let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("failed to serialize envelope for blob_id: {e}"),
-                    code: codes::CTX_2043.to_owned(),
-                })
-            })?;
-            let blob_id = {
-                use sha2::{Digest, Sha256};
-                hex::encode(Sha256::digest(&envelope_bytes))
-            };
-
-            results.push(NapiPublishResult {
-                blob_id,
-                etag,
-                deploy_id: deploy_id_val.clone(),
-            });
-        }
-        Ok(NapiBatchPublishResult {
-            results,
-            deploy_id: deploy_id_val,
+    use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
+    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Permission {
+            message: "broadcast publish assets requires key custody".to_owned(),
+            code: codes::PERM_3020.to_owned(),
         })
-    }
+    })?;
+    let signing_key = handle.signing_key.ok_or_else(|| {
+        NapiError::from(ScpNapiError::Permission {
+            message: "broadcast publish assets requires a signing key".to_owned(),
+            code: codes::PERM_3021.to_owned(),
+        })
+    })?;
 
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (context_id, author_did_val, deploy_id_val, assets);
-        Err(NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish assets requires key custody — in_memory custody feature \
-                      is not enabled"
-                .to_owned(),
-            code: codes::PERM_3022.to_owned(),
-        }))
+    // Route each asset through the ADR-049 commit-11 broadcast shim
+    // with custody.
+    let sup = crate::runtime::supervisor(bi)?;
+    let mut results = Vec::with_capacity(assets.len());
+    for asset in assets {
+        let content_path = scp_core::context::ContentPath::new(asset.path).map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("invalid path: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            })
+        })?;
+        let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("invalid content_type: {e}"),
+                code: codes::CTX_2041.to_owned(),
+            })
+        })?;
+
+        let etag = scp_core::context::compute_etag(&asset.body);
+        let content = scp_core::context::BroadcastContent {
+            version: scp_core::context::BROADCAST_CONTENT_VERSION,
+            metadata: scp_core::context::ContentMetadata {
+                path: Some(content_path),
+                content_type: Some(mime_type),
+                deploy_id: Some(deploy_id_val.clone()),
+                etag: Some(etag.clone()),
+                immutable: false,
+            },
+            body: asset.body,
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::PublishBroadcastContent {
+            payload: Box::new(PublishBroadcastContentPayload {
+                context_id: context_id.clone(),
+                author_did: author_did_val.clone(),
+                content,
+                signing_key_handle: signing_key,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+            .await
+            .map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "supervisor dispatch_broadcast_command_with_custody failed: {e}"
+                ))
+            })?;
+        let envelope = rx
+            .await
+            .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+        let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("failed to serialize envelope for blob_id: {e}"),
+                code: codes::CTX_2043.to_owned(),
+            })
+        })?;
+        let blob_id = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&envelope_bytes))
+        };
+
+        results.push(NapiPublishResult {
+            blob_id,
+            etag,
+            deploy_id: deploy_id_val.clone(),
+        });
     }
+    Ok(NapiBatchPublishResult {
+        results,
+        deploy_id: deploy_id_val,
+    })
 }
 
 /// Per-bridge-instance implementation of [`broadcast_block_subscriber`].
@@ -2553,7 +2481,6 @@ pub(crate) async fn context_execute_governance_action_on(
 ///
 /// The NAPI handle retains `in_memory_custody` and `signing_key` (`KeyHandle`)
 /// from the creating identity. This function exports the raw key bytes.
-#[cfg(feature = "allow_in_memory_custody")]
 async fn resolve_napi_signing_key(
     handle: &NapiContextHandle,
 ) -> napi::Result<ed25519_dalek::SigningKey> {
@@ -2603,7 +2530,6 @@ async fn resolve_napi_signing_key(
 ///
 /// Returns `ScpNapiError::Context` (SCP-CTX-2040) if the context handle carries
 /// no retained custody or no active signing-key handle.
-#[cfg(feature = "allow_in_memory_custody")]
 fn resolve_napi_export_signer(
     handle: &NapiContextHandle,
 ) -> napi::Result<(
@@ -2668,12 +2594,10 @@ async fn resolve_napi_creator_verifying_key(
     // Pre-resolve the local verifying key (async) so the shared helper's sync
     // `local_custody` closure can return it without blocking. Only the public
     // verifying key is derived — private key material never leaves custody
-    // (ADR-006). When the feature is disabled there is no local registry, so
-    // the local key is always `None` and resolution relies on the DID resolver.
-    #[cfg(feature = "allow_in_memory_custody")]
+    // (ADR-006). Returns `None` when the creator DID is not a locally retained
+    // identity on this bridge instance, in which case resolution relies on the
+    // DID resolver.
     let local_key = resolve_napi_local_verifying_key(bi, creator_did).await;
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    let local_key: Option<ed25519_dalek::VerifyingKey> = None;
 
     scp_ffi_common::export_verify::resolve_export_verifying_key(
         resolver,
@@ -2696,7 +2620,6 @@ async fn resolve_napi_creator_verifying_key(
 /// method §23.16.8 designates as the export signer — and resolves its public
 /// half via [`KeyCustody::public_key`]. Only the public verifying key crosses
 /// out of custody; the private signing key is never materialized (ADR-006).
-#[cfg(feature = "allow_in_memory_custody")]
 async fn resolve_napi_local_verifying_key(
     bi: &NapiBridgeInstance,
     did: &str,
@@ -2756,85 +2679,68 @@ pub(crate) async fn context_governance_propose_on(
 
     let action_name = action.variant_name();
 
-    #[cfg(feature = "allow_in_memory_custody")]
-    {
-        use scp_core::context::actor::commands::{
-            GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
-        };
+    use scp_core::context::actor::commands::{
+        GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
+    };
 
-        let signing_key = resolve_napi_signing_key(handle).await?;
+    let signing_key = resolve_napi_signing_key(handle).await?;
 
-        let did = DID(proposer_did);
-        let context_id = handle.context_id.clone();
+    let did = DID(proposer_did);
+    let context_id = handle.context_id.clone();
 
-        // Route through the ADR-049 commit-10 governance shim
-        // ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command))
-        // rather than calling `ContextManager::propose_governance_action_checked`
-        // directly.
-        let sup = crate::runtime::supervisor(bi)?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = GovernanceCommand::ProposeGovernanceActionChecked {
-            payload: Box::new(ProposeGovernanceActionPayload {
-                context_id: context_id.clone(),
-                proposer_did: did,
-                action,
-                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
-            }),
-            reply: tx,
-        };
-        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+    // Route through the ADR-049 commit-10 governance shim
+    // ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command))
+    // rather than calling `ContextManager::propose_governance_action_checked`
+    // directly.
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::ProposeGovernanceActionChecked {
+        payload: Box::new(ProposeGovernanceActionPayload {
+            context_id: context_id.clone(),
+            proposer_did: did,
+            action,
+            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+        }),
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
+            code: codes::CTX_2041.to_owned(),
+        })
+    })?;
+    let outcome = rx
+        .await
+        .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
-                message: format!("supervisor dispatch_governance_command failed: {e}"),
+                message: format!("governance proposal shim reply dropped: {e}"),
+                code: codes::CTX_2041.to_owned(),
+            })
+        })?
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("governance proposal failed: {e}"),
                 code: codes::CTX_2041.to_owned(),
             })
         })?;
-        let outcome = rx
-            .await
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("governance proposal shim reply dropped: {e}"),
-                    code: codes::CTX_2041.to_owned(),
-                })
-            })?
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("governance proposal failed: {e}"),
-                    code: codes::CTX_2041.to_owned(),
-                })
-            })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-            tracing::warn!(
-                context_id = %context_id,
-                action = action_name,
-                error = %e,
-                "failed to sync role state after governance proposal"
-            );
-        }
-
-        let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-        let response = serde_json::json!({
-            "proposal_id": hex::encode(outcome.proposal.proposal_id),
-            "status": format!("{:?}", outcome.status),
-            "execution_result": result_str,
-        });
-        return Ok(response.to_string());
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
+        tracing::warn!(
+            context_id = %context_id,
+            action = action_name,
+            error = %e,
+            "failed to sync role state after governance proposal"
+        );
     }
 
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (handle, action, action_name, proposer_did);
-        return Err(NapiError::from(ScpNapiError::Permission {
-            message: "governance proposal requires key custody — in_memory custody feature \
-                      is not enabled"
-                .to_owned(),
-            code: codes::CTX_2040.to_owned(),
-        }));
-    }
+    let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
 
-    #[allow(unreachable_code)]
-    Ok(String::new())
+    let response = serde_json::json!({
+        "proposal_id": hex::encode(outcome.proposal.proposal_id),
+        "status": format!("{:?}", outcome.status),
+        "execution_result": result_str,
+    });
+    Ok(response.to_string())
 }
 
 /// Per-bridge-instance implementation of [`context_governance_approve`].
@@ -2847,74 +2753,57 @@ pub(crate) async fn context_governance_approve_on(
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
-    #[cfg(feature = "allow_in_memory_custody")]
-    {
-        use scp_core::context::actor::commands::{
-            GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
-        };
+    use scp_core::context::actor::commands::{
+        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+    };
 
-        let signing_key = resolve_napi_signing_key(handle).await?;
+    let signing_key = resolve_napi_signing_key(handle).await?;
 
-        let did = DID(voter_did);
-        let context_id = handle.context_id.clone();
+    let did = DID(voter_did);
+    let context_id = handle.context_id.clone();
 
-        // Route through the ADR-049 governance dispatch surface.
-        let sup = crate::runtime::supervisor(bi)?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = GovernanceCommand::ApproveGovernanceProposal {
-            payload: Box::new(VoteOnProposalPayload {
-                context_id: context_id.clone(),
-                proposal_id,
-                voter_did: did,
-                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
-            }),
-            reply: tx,
-        };
-        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+    // Route through the ADR-049 governance dispatch surface.
+    let sup = crate::runtime::supervisor(bi)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::ApproveGovernanceProposal {
+        payload: Box::new(VoteOnProposalPayload {
+            context_id: context_id.clone(),
+            proposal_id,
+            voter_did: did,
+            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+        }),
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
+            code: codes::CTX_2042.to_owned(),
+        })
+    })?;
+    let status = rx
+        .await
+        .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
-                message: format!("supervisor dispatch_governance_command failed: {e}"),
+                message: format!("governance approval shim reply dropped: {e}"),
+                code: codes::CTX_2042.to_owned(),
+            })
+        })?
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("governance approval failed: {e}"),
                 code: codes::CTX_2042.to_owned(),
             })
         })?;
-        let status = rx
-            .await
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("governance approval shim reply dropped: {e}"),
-                    code: codes::CTX_2042.to_owned(),
-                })
-            })?
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("governance approval failed: {e}"),
-                    code: codes::CTX_2042.to_owned(),
-                })
-            })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to sync role state after governance approval"
-            );
-        }
-
-        return Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string());
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "failed to sync role state after governance approval"
+        );
     }
 
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (handle, proposal_id, voter_did);
-        return Err(NapiError::from(ScpNapiError::Permission {
-            message: "governance approval requires key custody — in_memory custody feature \
-                      is not enabled"
-                .to_owned(),
-            code: codes::CTX_2040.to_owned(),
-        }));
-    }
-
-    #[allow(unreachable_code)]
-    Ok(String::new())
+    Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
 /// Per-bridge-instance implementation of [`context_governance_reject`].
@@ -2927,73 +2816,56 @@ pub(crate) async fn context_governance_reject_on(
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
-    #[cfg(feature = "allow_in_memory_custody")]
-    {
-        use scp_core::context::actor::commands::{
-            GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
-        };
-        let signing_key = resolve_napi_signing_key(handle).await?;
+    use scp_core::context::actor::commands::{
+        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+    };
+    let signing_key = resolve_napi_signing_key(handle).await?;
 
-        let did = DID(voter_did);
-        let sup = crate::runtime::supervisor(bi)?;
-        let context_id = handle.context_id.clone();
+    let did = DID(voter_did);
+    let sup = crate::runtime::supervisor(bi)?;
+    let context_id = handle.context_id.clone();
 
-        // Route through the ADR-049 governance dispatch surface.
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = GovernanceCommand::RejectGovernanceProposal {
-            payload: Box::new(VoteOnProposalPayload {
-                context_id: context_id.clone(),
-                proposal_id,
-                voter_did: did,
-                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
-            }),
-            reply: tx,
-        };
-        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+    // Route through the ADR-049 governance dispatch surface.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::RejectGovernanceProposal {
+        payload: Box::new(VoteOnProposalPayload {
+            context_id: context_id.clone(),
+            proposal_id,
+            voter_did: did,
+            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+        }),
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
+            code: codes::CTX_2043.to_owned(),
+        })
+    })?;
+    let status = rx
+        .await
+        .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
-                message: format!("supervisor dispatch_governance_command failed: {e}"),
+                message: format!("governance reject shim reply dropped: {e}"),
+                code: codes::CTX_2043.to_owned(),
+            })
+        })?
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("governance rejection failed: {e}"),
                 code: codes::CTX_2043.to_owned(),
             })
         })?;
-        let status = rx
-            .await
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("governance reject shim reply dropped: {e}"),
-                    code: codes::CTX_2043.to_owned(),
-                })
-            })?
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("governance rejection failed: {e}"),
-                    code: codes::CTX_2043.to_owned(),
-                })
-            })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to sync role state after governance rejection"
-            );
-        }
-
-        return Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string());
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "failed to sync role state after governance rejection"
+        );
     }
 
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (handle, proposal_id, voter_did);
-        return Err(NapiError::from(ScpNapiError::Permission {
-            message: "governance rejection requires key custody — in_memory custody feature \
-                      is not enabled"
-                .to_owned(),
-            code: codes::CTX_2040.to_owned(),
-        }));
-    }
-
-    #[allow(unreachable_code)]
-    Ok(String::new())
+    Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
 /// Per-bridge-instance implementation of [`context_governance_withdraw`].
@@ -3720,11 +3592,11 @@ pub(crate) async fn context_reset_ttl_timer_on(
 /// `Supervisor::export_context` captures the unsigned snapshot from the actor
 /// and signs it here via the supplied closure (§23.16.8, ADR-050).
 ///
-/// The retained custody and signing-key handle live on the context handle, which
-/// is only compiled under `allow_in_memory_custody` (matching every other
-/// key-bearing path in this bridge, including the `identityCreateWithCustody`
-/// callback path). Without the feature the export is rejected fail-closed rather
-/// than emitting an unsigned (and thus unverifiable) export.
+/// The retained custody and signing-key handle live on the context handle. If
+/// the handle has no retained custody (e.g. the context creator was an
+/// externally loaded, DID-string-only identity), the export is rejected
+/// fail-closed by `resolve_napi_export_signer` (`CTX_2040`) rather than emitting
+/// an unsigned (and thus unverifiable) export.
 pub(crate) async fn context_export_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -3733,23 +3605,6 @@ pub(crate) async fn context_export_on(
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
     let sup = crate::runtime::supervisor(bi)?;
 
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    {
-        let _ = (sup, exporter_did);
-        return Err(NapiError::from(ScpNapiError::Permission {
-            message: "context export requires key custody to sign the snapshot \
-                      (§23.16.8) — in_memory custody feature is not enabled"
-                .to_owned(),
-            // This is a build/config permission condition (the signing capability
-            // is unavailable in this bundle), NOT a snapshot-signature failure.
-            // CTX_2093 is reserved for §23.16.8 signature verification rejection;
-            // tagging this config gate with it would make a caller catching 2093
-            // to detect a forged export misfire on a feature-disabled build.
-            code: codes::PERM_3001.to_owned(),
-        }));
-    }
-
-    #[cfg(feature = "allow_in_memory_custody")]
     {
         // Resolve the exporter identity's custody provider and `#active` signing
         // key handle (NOT a raw exported key). Signing the §23.16.8 snapshot
@@ -4513,7 +4368,6 @@ mod tests {
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            #[cfg(feature = "allow_in_memory_custody")]
             in_memory_custody: None,
             signing_key: None,
             core_handle: None,
@@ -5325,6 +5179,192 @@ mod tests {
         assert!(
             result.is_err(),
             "import of a tampered custody-signed export must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Production callback-custody export sign chain (NO `allow_in_memory_custody`)
+    //
+    // These tests compile and run in the BARE production build. They prove the
+    // un-gated §23.16.8 export sign/verify chain works for a non-in-memory,
+    // callback-shaped signer (the `identityCreateWithCustody` keychain/HSM
+    // case) and that the fail-closed boundary is the ABSENCE of retained
+    // custody (CTX_2040 from `resolve_napi_export_signer`), not a build flag.
+    // -----------------------------------------------------------------------
+
+    /// A minimal Rust signer that stands in for a production callback custody
+    /// (`identityCreateWithCustody`): it can `sign` the §23.16.8 canonical
+    /// digest and expose its public verifying key, but holds NO in-memory
+    /// `KeyCustody` backend and intentionally cannot export raw key bytes — the
+    /// keychain/HSM shape. It is a plain Rust struct, not a `NapiKeyCustody`, so
+    /// it needs no live JS `Env`/`ThreadsafeFunction` and exercises the exact
+    /// fallible sign-closure shape `context_export_on` hands to
+    /// `Supervisor::export_context`.
+    struct FakeExportCustody {
+        signing_key: ed25519_dalek::SigningKey,
+    }
+
+    impl FakeExportCustody {
+        fn new() -> Self {
+            // Deterministic seed for reproducibility; a real callback custody
+            // would back this with a keychain/HSM private key.
+            Self {
+                signing_key: ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]),
+            }
+        }
+
+        /// Mirrors `KeyCustody::sign` over the §23.16.8 digest. A real callback
+        /// custody can fail (the JS callback may throw), so the `Result` is part
+        /// of the contract even though this in-test signer is infallible.
+        #[allow(clippy::unnecessary_wraps)]
+        fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64], std::convert::Infallible> {
+            use ed25519_dalek::Signer;
+            Ok(self.signing_key.sign(digest).to_bytes())
+        }
+
+        fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+            self.signing_key.verifying_key()
+        }
+    }
+
+    /// Drives the production export sign/verify chain with a non-in-memory
+    /// `FakeExportCustody` — the same `Supervisor::export_context` sign-closure +
+    /// `serialize_export` / `deserialize_export` + `Supervisor::import_context`
+    /// path that `context_export_on` / `context_import_on` delegate to. Proves a
+    /// callback-shaped (non-exportable) signer produces a spec-valid §23.16.8
+    /// signature that round-trips, and that a tampered snapshot is rejected.
+    /// Runs WITHOUT `allow_in_memory_custody`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn callback_custody_export_round_trips_and_rejects_tamper_without_feature() {
+        use scp_core::context::export_import::{deserialize_export, serialize_export};
+
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let sup = crate::runtime::supervisor(&bi).expect("supervisor initialized above");
+        let sup = Arc::clone(sup);
+
+        let custody = FakeExportCustody::new();
+        let creator = DID("did:key:z6MkCallbackExporter".to_owned());
+        let ctx_id = format!("callback-export-{}", uuid::Uuid::new_v4());
+
+        // `context:close` is required so the creator can close the context
+        // before reimport (import needs a terminal state).
+        let params = ContextParams {
+            ceiling: vec![Capability::new("context:close")],
+            ..ContextParams::default()
+        };
+        let handle = test_dispatch_create_context(&bi, &ctx_id, params, creator.clone()).await;
+
+        // Export: sign the §23.16.8 digest via the callback-shaped custody — the
+        // exact closure shape `context_export_on` passes to `export_context`.
+        let export = sup
+            .export_context(&ctx_id, creator.clone(), |digest: &[u8; 32]| {
+                custody.sign(digest)
+            })
+            .await
+            .expect("export_context should succeed via callback-shaped sign closure");
+        let data = serialize_export(&export).expect("serialize_export should succeed");
+        assert!(!data.is_empty(), "serialized export must not be empty");
+
+        // `handle` (the source context) is dropped — not needed past export.
+        let _ = handle;
+
+        // Import into a FRESH bridge instance (the realistic "transfer to
+        // another node" path) so the import does not collide with the live
+        // source context slot. The snapshot signature is verified against the
+        // creator's verifying key (the callback custody's public key — what
+        // `resolve_napi_local_verifying_key` returns for a registered callback
+        // identity). Success proves the callback-produced signature is
+        // spec-valid (§23.16.8).
+        let bi2 = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi2);
+        let sup2 = crate::runtime::supervisor(&bi2).expect("supervisor initialized above");
+        let sup2 = Arc::clone(sup2);
+
+        let round_tripped = deserialize_export(&data).expect("deserialize_export should succeed");
+        let imported = sup2
+            .import_context(round_tripped, &custody.verifying_key())
+            .await
+            .expect("import_context should accept the callback-signed snapshot");
+        assert_eq!(
+            imported.context_id(),
+            ctx_id,
+            "imported context id must match the exported one"
+        );
+
+        // Tamper: flip a byte inside the signed snapshot region so the
+        // recomputed §23.16.8 digest no longer matches the signature. Import
+        // MUST reject — proving the callback signature is load-bearing.
+        let mut tampered = data.clone();
+        let mid = tampered.len() / 2;
+        tampered[mid] ^= 0xFF;
+        let result = match deserialize_export(&tampered) {
+            Ok(export) => sup2
+                .import_context(export, &custody.verifying_key())
+                .await
+                .map(|_| ()),
+            // A flipped framing byte may fail deserialization outright — also a
+            // valid rejection of the tampered payload.
+            Err(e) => Err(e),
+        };
+        assert!(
+            result.is_err(),
+            "import of a tampered callback-signed export must be rejected"
+        );
+    }
+
+    /// Proves the fail-closed boundary is the ABSENCE of retained custody, not a
+    /// build feature: `context_export_on` on a `NapiContextHandle` whose
+    /// `in_memory_custody` is `None` (e.g. an externally loaded, DID-string-only
+    /// creator) is rejected with `CTX_2040` by `resolve_napi_export_signer` —
+    /// never with the old build-gate PERM-3001, and never an unsigned export.
+    /// Runs WITHOUT `allow_in_memory_custody`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_export_fails_closed_without_retained_custody() {
+        use super::*;
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+
+        let creator = DID("did:key:z6MkNoCustodyExporter".to_owned());
+        let ctx_id = format!("no-custody-export-{}", uuid::Uuid::new_v4());
+        let params = ContextParams {
+            ceiling: vec![Capability::new("context:close")],
+            ..ContextParams::default()
+        };
+        let core_handle = test_dispatch_create_context(&bi, &ctx_id, params, creator.clone()).await;
+
+        // Build a handle with NO retained custody — the externally-loaded shape.
+        let handle = NapiContextHandle {
+            context_id: ctx_id.clone(),
+            state: std::sync::Mutex::new(ContextState::Active),
+            creator_did: creator.0.clone(),
+            mode: "Encrypted".to_owned(),
+            ceiling: vec![],
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            in_memory_custody: None,
+            signing_key: None,
+            core_handle: Some(core_handle),
+            subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
+            subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bi: std::sync::Arc::clone(&bi),
+            instance_id: bi.instance_id(),
+        };
+
+        let err = super::context_export_on(&bi, &handle)
+            .await
+            .expect_err("export with no retained custody must fail closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::CTX_2040),
+            "expected CTX_2040 (absent-custody fail-closed), got: {msg}"
+        );
+        assert!(
+            !msg.contains(codes::PERM_3001),
+            "must NOT use the removed build-gate PERM-3001 code, got: {msg}"
         );
     }
 }

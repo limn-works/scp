@@ -519,10 +519,11 @@ impl Drop for NapiNodeHandle {
 ///
 /// # Errors
 ///
-/// Returns `napi::Error` if:
-/// - The `allow_in_memory_custody` feature is not enabled.
-/// - The DID is not found in the identity registry.
-#[cfg(feature = "allow_in_memory_custody")]
+/// Returns `napi::Error` if the DID is not found in the identity registry.
+///
+/// Works for any locally registered identity — in-memory OR a production
+/// callback custody (`identityCreateWithCustody`) — since signing dispatches
+/// through the enum-typed `NapiKeyCustody`.
 #[allow(clippy::type_complexity)]
 fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeIdentity> {
     use std::sync::Arc;
@@ -576,13 +577,6 @@ fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeI
         })
     })
     .map_err(napi::Error::from)
-}
-
-#[cfg(not(feature = "allow_in_memory_custody"))]
-fn build_node_identity(_bi: &NapiBridgeInstance, _did: &str) -> napi::Result<NodeIdentity> {
-    Err(NapiError::from_reason(
-        "identity portability requires in-memory custody — enable allow_in_memory_custody",
-    ))
 }
 
 // ---------------------------------------------------------------------------

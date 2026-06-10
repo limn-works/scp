@@ -44,7 +44,13 @@ scp-identity = { path = "../../scp-identity" }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
-scp-platform = { path = "../../scp-platform", features = ["encrypting", "filesystem", "sqlite"] }
+# `testing` is enabled unconditionally (matching the PyO3 bridge) so the
+# identity registry, retained-custody state, and the cold-storage
+# `InMemoryPreRotationCustody` are available in production builds. These types
+# back the production callback-custody path (`identityCreateWithCustody`) —
+# `allow_in_memory_custody` remains a pure code-level gate over the in-memory
+# custody *backend* only, not over the registry/retention machinery. See ADR-006.
+scp-platform = { path = "../../scp-platform", features = ["testing", "encrypting", "filesystem", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-testing = { path = "../../scp-testing", optional = true }
 scp-transport = { path = "../../scp-transport" }

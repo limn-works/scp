@@ -422,6 +422,22 @@ impl fmt::Debug for NapiKeyCustody {
 }
 
 impl NapiKeyCustody {
+    /// Returns the custody-type label for handle reporting (`"in_memory"` for
+    /// the in-memory test backend, `"callback"` for caller-provided callback
+    /// custody).
+    ///
+    /// This is a cheap, sync variant discriminator — distinct from the async
+    /// [`KeyCustody::custody_type`] trait method, which reports the
+    /// per-key-handle [`CustodyType`] (hardware/software/in-memory) the
+    /// underlying provider declares.
+    pub(crate) const fn custody_type_label(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(_) => "in_memory",
+            Self::Callback(_) => "callback",
+        }
+    }
+
     /// Exports the raw Ed25519 signing key for the given handle, dispatching
     /// through the active variant. Mirrors the inherent helper on the `PyO3`
     /// `FfiKeyCustody` enum (required by SCPID signing, event-log

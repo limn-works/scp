@@ -81,6 +81,11 @@ fn set_transport_manager_on(
 /// # Errors
 ///
 /// Returns `ScpNapiError::Transport` if the lock is poisoned.
+///
+/// Gated to match its sole caller, the `server`-gated node auto-wiring path
+/// in `server.rs` (`mod server` is `#[cfg(feature = "server")]`). Without the
+/// gate the function is dead code in `--no-default-features` builds.
+#[cfg(feature = "server")]
 pub(crate) fn set_transport_manager_arc_on(
     bi: &NapiBridgeInstance,
     manager: Arc<scp_transport::TransportManager>,
