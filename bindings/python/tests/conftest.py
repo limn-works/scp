@@ -41,7 +41,7 @@ def scp() -> Iterator:
         pytest.skip("scp_sdk not importable — run maturin develop first")
 
     try:
-        instance = SCP()
+        instance = SCP(storage={"type": "in_memory"})
     except Exception as exc:
         pytest.skip(f"SCP() construction failed — extension not built: {exc}")
 

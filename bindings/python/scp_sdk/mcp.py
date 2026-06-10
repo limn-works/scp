@@ -311,7 +311,7 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
         transport,
     )
 
-    with SCP() as scp:
+    with SCP(storage={"type": "in_memory"}) as scp:
         # Step 1: Load the identity.
         await scp.identity_load(did)
 

@@ -477,7 +477,7 @@ class TestDefaultStdioAllowlist:
 class TestStdioAllowlistApi:
     """Tests for the per-instance allowlist methods on :class:`SCP`.
 
-    These tests use a real ``SCP()`` instance — each test
+    These tests use a real ``SCP(storage={"type": "in_memory"})`` instance — each test
     constructs its own and so runs in parallel safely. Cross-instance
     isolation is exercised by
     :class:`TestStdioAllowlistInstanceIsolation` below.
@@ -487,7 +487,7 @@ class TestStdioAllowlistApi:
         """Calling with no binaries should not raise (early return)."""
         from scp_sdk.scp import SCP
 
-        scp = SCP()
+        scp = SCP(storage={"type": "in_memory"})
         # Should not raise.
         scp.mcp_configure_stdio_allowlist()
         scp.mcp_configure_stdio_allowlist(additional_binaries=[])
@@ -495,14 +495,14 @@ class TestStdioAllowlistApi:
     def test_disable_requires_confirmation(self) -> None:
         from scp_sdk.scp import SCP
 
-        scp = SCP()
+        scp = SCP(storage={"type": "in_memory"})
         with pytest.raises(ValidationError, match="i_trust_all_commands"):
             scp.mcp_disable_stdio_allowlist()
 
     def test_disable_rejects_false_confirmation(self) -> None:
         from scp_sdk.scp import SCP
 
-        scp = SCP()
+        scp = SCP(storage={"type": "in_memory"})
         with pytest.raises(ValidationError, match="i_trust_all_commands"):
             scp.mcp_disable_stdio_allowlist(i_trust_all_commands=False)
 
@@ -510,7 +510,7 @@ class TestStdioAllowlistApi:
         """A fresh SCP instance has the default allowlist active."""
         from scp_sdk.scp import SCP
 
-        scp = SCP()
+        scp = SCP(storage={"type": "in_memory"})
         scp.mcp_reset_stdio_allowlist()
         state = scp.mcp_get_stdio_allowlist()
         assert "unrestricted" in state
@@ -521,7 +521,7 @@ class TestStdioAllowlistApi:
     def test_configure_adds_binaries(self) -> None:
         from scp_sdk.scp import SCP
 
-        scp = SCP()
+        scp = SCP(storage={"type": "in_memory"})
         scp.mcp_configure_stdio_allowlist(additional_binaries=["my-mcp-server"])
         state = scp.mcp_get_stdio_allowlist()
         assert "my-mcp-server" in state["allowed"]
@@ -529,7 +529,7 @@ class TestStdioAllowlistApi:
     def test_disable_enters_unrestricted(self) -> None:
         from scp_sdk.scp import SCP
 
-        scp = SCP()
+        scp = SCP(storage={"type": "in_memory"})
         scp.mcp_disable_stdio_allowlist(i_trust_all_commands=True)
         state = scp.mcp_get_stdio_allowlist()
         assert state["unrestricted"] is True
@@ -545,8 +545,8 @@ class TestStdioAllowlistInstanceIsolation:
     def test_disable_does_not_leak_across_instances(self) -> None:
         from scp_sdk.scp import SCP
 
-        a = SCP()
-        b = SCP()
+        a = SCP(storage={"type": "in_memory"})
+        b = SCP(storage={"type": "in_memory"})
 
         a.mcp_disable_stdio_allowlist(i_trust_all_commands=True)
 
@@ -561,8 +561,8 @@ class TestStdioAllowlistInstanceIsolation:
     def test_configure_does_not_leak_across_instances(self) -> None:
         from scp_sdk.scp import SCP
 
-        a = SCP()
-        b = SCP()
+        a = SCP(storage={"type": "in_memory"})
+        b = SCP(storage={"type": "in_memory"})
 
         a.mcp_configure_stdio_allowlist(additional_binaries=["custom-a"])
 

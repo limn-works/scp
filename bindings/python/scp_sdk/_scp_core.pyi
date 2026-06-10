@@ -261,14 +261,14 @@ class NodeHandle:
 class SCP:
     """Caller-owned SCP bridge instance (ADR-048 multi-instance).
 
-    Construct via ``SCP()`` / :meth:`with_storage` / :meth:`with_persistence`.
+    Storage selection is mandatory (spec §17.6): construct via
+    ``SCP(config)`` / :meth:`with_storage` with an explicit storage-config
+    dict. Bare ``SCP()`` raises ``TypeError`` — there is no default backend.
     Phase 4 PR 4 (#1549) removed the process-global ``default_instance``
     factory; every caller now owns an explicit bridge instance.
     """
 
-    def __new__(cls) -> SCP: ...
-    @staticmethod
-    def with_persistence() -> SCP: ...
+    def __new__(cls, config: dict[str, Any]) -> SCP: ...
     @staticmethod
     def with_storage(config: dict[str, Any]) -> SCP: ...
     @property

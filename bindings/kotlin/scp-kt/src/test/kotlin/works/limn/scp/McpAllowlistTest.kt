@@ -12,6 +12,7 @@
 
 package works.limn.scp
 
+import uniffi.scp.StorageConfig
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -53,7 +54,7 @@ class McpAllowlistTest {
     @BeforeEach
     fun setUp() {
         assumeTrue(nativeAvailable, skipReason)
-        scp = SCP()
+        scp = SCP(StorageConfig.InMemory)
     }
 
     @AfterEach
@@ -101,7 +102,7 @@ class McpAllowlistTest {
         assertTrue(aState.unrestricted, "instance a must report unrestricted after opt-in disable")
 
         // Sibling instance must remain restricted (per-instance isolation).
-        val other = SCP()
+        val other = SCP(StorageConfig.InMemory)
         try {
             val bState = other.mcpGetStdioAllowlist()
             assertFalse(bState.unrestricted, "instance b must remain restricted")

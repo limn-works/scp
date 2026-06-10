@@ -231,8 +231,10 @@ async function loadNapiAddon(): Promise<typeof napiAddon> {
  */
 async function newNapiScp(): Promise<AnyBridge> {
   const addon = await loadNapiAddon();
+  // Storage selection is required (spec §17.6): the raw NAPI constructor
+  // takes a JSON storage-config string. Parity ops use explicit in-memory.
   // biome-ignore lint/suspicious/noExplicitAny: raw constructor is untyped
-  return new (addon.SCP as new () => any)();
+  return new (addon.SCP as new (configJson: string) => any)('{"type":"in_memory"}');
 }
 
 async function loadWasm(): Promise<{ raw: AnyBridge }> {

@@ -52,9 +52,9 @@ from scp_sdk import Identity, Context
 identity = await Identity.create(custody="in_memory")
 ctx = await Context.create(creator=identity, ...)
 
-# After Phase 4 PR 5
+# After Phase 4 PR 5 — storage selection is required (spec §17.6)
 from scp_sdk import SCP
-with SCP() as scp:
+with SCP(storage={"type": "in_memory"}) as scp:
     identity = await scp.identity_create("in_memory")
     ctx = await scp.context_create(identity.did, {...})
 ```
@@ -65,9 +65,9 @@ import { Identity, Context } from "@limn-works/scp-ts";
 const identity = await Identity.create({ custody: "in_memory" });
 const ctx = await Context.create(identity, { ceiling, memoryScope });
 
-// After Phase 4 PR 5
+// After Phase 4 PR 5 — storage selection is required (spec §17.6)
 import { SCP } from "@limn-works/scp-ts";
-const scp = new SCP();
+const scp = new SCP({ storage: { type: "in_memory" } });
 try {
   const identity = await scp.identityCreate("in_memory");
   const ctx = await scp.contextCreate(identity.did, {...});
@@ -165,8 +165,8 @@ a DID to have been registered via `scp.registerLocalDid(…)` first.
 let scp = SCP()
 try await scp.contextCreate(params)
 
-// After
-let scp = SCP()
+// After — storage selection is required (spec §17.6)
+let scp = try SCP(storage: .inMemory)
 try scp.registerLocalDid(didString)
 try await scp.contextCreate(params)
 ```
@@ -216,11 +216,11 @@ ContextManager, transport manager, and monotonic `instance_id`.
 ```python
 from scp_sdk import SCP
 
-scp = SCP()                                    # default (in-memory)
-scp = SCP(storage={"type": "in_memory"})       # explicit
+# Storage selection is REQUIRED — there is no default (spec §17.6).
+scp = SCP(storage={"type": "in_memory"})       # development / test
 scp = SCP(storage={"type": "sqlite",
                     "path": "/var/scp.db",
-                    "key": sqlcipher_key_32b})
+                    "key": sqlcipher_key_32b})  # production
 ```
 
 ### `instance_id: u64`
@@ -234,8 +234,8 @@ mismatch. The check is enforced mechanically by
 `scripts/check-handle-affinity.sh`.
 
 ```swift
-let a = SCP()
-let b = SCP()
+let a = try SCP(storage: .inMemory)
+let b = try SCP(storage: .inMemory)
 let ctx = try await a.contextCreate(params)
 // ctx.instanceId == a.instanceId
 
@@ -277,7 +277,7 @@ import scp_sdk
 @pytest.fixture
 def scp() -> scp_sdk.SCP:
     """Per-test SCP instance. Function-scope ⇒ fresh per test."""
-    instance = scp_sdk.SCP()
+    instance = scp_sdk.SCP(storage={"type": "in_memory"})
     yield instance
     instance.shutdown(5.0)
 ```
@@ -301,7 +301,7 @@ describe("lifecycle", () => {
   let scp: SCP;
 
   beforeEach(() => {
-    scp = new SCP();
+    scp = new SCP({ storage: { type: "in_memory" } });
   });
 
   afterEach(async () => {
@@ -327,7 +327,7 @@ final class LifecycleTests: XCTestCase {
 
     override func setUp() async throws {
         try await super.setUp()
-        scp = SCP()
+        scp = try SCP(storage: .inMemory)
     }
 
     override func tearDown() async throws {
@@ -358,7 +358,7 @@ class LifecycleTests {
 
     @BeforeEach
     fun setUp() {
-        scp = SCP()
+        scp = SCP(StorageConfig.InMemory)
     }
 
     @AfterEach

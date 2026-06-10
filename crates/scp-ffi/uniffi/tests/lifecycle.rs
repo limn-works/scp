@@ -29,12 +29,12 @@ use scp_ffi_uniffi::Scp;
 ///
 /// Phase 4 PR 4 demolition (#1549): the free-function `scp_suspend` /
 /// `scp_resume` façade exports were deleted along with the process-wide
-/// default bridge — tests now drive a freshly constructed `Scp::new()`
+/// default bridge — tests now drive a freshly constructed `Scp::new_in_memory_for_test()`
 /// instance through `.suspend()` / `.resume()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scp_suspend_resume_roundtrip() {
-    // Phase D (#1695): `Scp::default_instance` deleted — use `Scp::new()`.
-    let scp = Scp::new();
+    // Phase D (#1695): `Scp::default_instance` deleted — use `Scp::new_in_memory_for_test()`.
+    let scp = Scp::new_in_memory_for_test();
 
     // Case 1: suspend/resume on a freshly-initialised instance.
     scp.suspend().expect("scp.suspend must succeed");

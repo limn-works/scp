@@ -9,7 +9,7 @@ import SCP
 @main
 struct ToolInvocation {
     static func main() async throws {
-        let scp = SCP()
+        let scp = try SCP(storage: .inMemory)
         defer { Task { try? await scp.shutdown(timeout: 5) } }
 
         let identity = try await scp.identityCreate(custody: "in_memory")

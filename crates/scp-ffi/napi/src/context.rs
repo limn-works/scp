@@ -4870,7 +4870,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_threads_consequence_rules_and_config() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
         let identity = scp
@@ -4922,7 +4922,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_rejects_revoke_access_when_config_disallows() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
         let identity = scp
@@ -4961,7 +4961,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_rejects_malformed_spending_ucan_jwt() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
         let identity = scp
@@ -5003,7 +5003,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_accepts_none_spending_ucan_jwt() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
         let identity = scp
@@ -5238,7 +5238,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_export_signs_via_custody_and_round_trips() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
         let identity = scp
@@ -5290,7 +5290,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_import_rejects_tampered_custody_signed_export() {
-        let scp = crate::scp::Scp::new().unwrap();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
         let identity = scp

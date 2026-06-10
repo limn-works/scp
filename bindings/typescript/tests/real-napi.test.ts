@@ -56,7 +56,7 @@ try {
   // Phase 4 surface. The probe SCP is discarded immediately — each test
   // will mint its own.
   ({ createNativeBridge } = await import("../src/internal/native.js"));
-  const probe = new SCP();
+  const probe = new SCP({ storage: { type: "in_memory" } });
   if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
     skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
     createNativeBridge = null;
@@ -121,7 +121,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // affinity guard (#1549 Phase 4) ensures the new bridge only
     // accepts handles minted by this SCP — cross-instance reuse
     // from an earlier test would be rejected with SCP-PERM-3030.
-    scpInstance = new SCP();
+    scpInstance = new SCP({ storage: { type: "in_memory" } });
     napi = makeBridge(scpInstance);
 
     // Start an in-memory relay on an ephemeral port. Post-ADR-048 this

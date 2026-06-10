@@ -30,7 +30,7 @@ use pyo3::Python;
 ///
 /// Phase 4 PR 4 demolition (#1549): the free-function `scp_suspend` /
 /// `scp_resume` exports were deleted along with the process-wide default
-/// bridge — tests now drive a freshly constructed `PyScp::new()`
+/// bridge — tests now drive a freshly constructed `PyScp::new_in_memory_for_test()`
 /// instance through `.suspend()` / `.resume()`.
 #[test]
 fn scp_suspend_resume_roundtrip() {
@@ -51,7 +51,7 @@ fn scp_suspend_resume_roundtrip() {
         // `instance_id`. Phase D (#1695) deleted the prior
         // `DEFAULT_BRIDGE_INSTANCE`, so there is no shared bridge for
         // this test to accidentally mutate.
-        let scp = PyScp::new();
+        let scp = PyScp::new_in_memory_for_test();
 
         // Case 1: suspend/resume on a freshly-initialised instance must
         // succeed.

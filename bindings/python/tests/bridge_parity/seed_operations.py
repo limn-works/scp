@@ -13,7 +13,7 @@ the Bun runner's dispatch. The library is append-only.
 
 Storage-required model (ADR-049 / spec §17.6): any op that creates a
 context MUST first attach a supervisor backed by a storage backend. The
-PyO3 runtime never defaults storage and `SCP()` (bare constructor) carries
+PyO3 runtime never defaults storage and `SCP({"type": "in_memory"})` (bare constructor) carries
 none, so a context op on a bare instance fail-closes with SCP-CTX-2001.
 Such ops use `OpContext.attached_scp()`, which calls
 `configure_local_transport(did)` — the bridge-layer DEV affordance that
@@ -24,7 +24,7 @@ call: NAPI/UniFFI seed their in-memory `mls_storage` at CONSTRUCTION TIME
 manager (ADR-034). Both sides therefore end up backed by an in-memory store
 and emit identical canonical output. See `OpContext.attached_scp` for the
 full rationale. Non-context ops (identity_create, scpid_sign error paths,
-transport_status) need no supervisor and keep the bare `SCP()` constructor.
+transport_status) need no supervisor and keep the bare `SCP({"type": "in_memory"})` constructor.
 
 Current op library: 11 ops. The first 5 are the MVP per ADR-046;
 ops 6-10 cover tool registration, UCAN mint/validate-error, transport
@@ -157,7 +157,7 @@ class OpContext:
 
         Storage-required model (ADR-049 / spec §17.6): the PyO3 runtime
         never defaults storage, and `PyBridgeInstance::new_py` (the bare
-        `SCP()` constructor) carries no storage backend. Any context /
+        `SCP({"type": "in_memory"})` constructor) carries no storage backend. Any context /
         event-log / tool / UCAN-with-context op therefore needs a
         supervisor attached *with* a storage backend first, otherwise the
         supervisor build fails closed and the op surfaces SCP-CTX-2001.
@@ -185,7 +185,7 @@ class OpContext:
         Returns the attached `SCP` instance and the created identity so
         callers can reference `identity.did`.
         """
-        scp = self.scp_core.SCP()
+        scp = self.scp_core.SCP({"type": "in_memory"})
         identity = (
             scp.identity_create("in_memory", seed)
             if seed is not None
@@ -271,7 +271,7 @@ EXPECTED_SEEDED_DID = "did:dht:zjerxoow7gsm8suaqfsc86txbreganh7chorzwwh4crbh7imb
 
 def _py_identity_create(ctx: OpContext) -> dict[str, Any]:
     seed = bytes.fromhex(PARITY_SEED_HEX)
-    scp = ctx.scp_core.SCP()
+    scp = ctx.scp_core.SCP({"type": "in_memory"})
     identity = scp.identity_create("in_memory", seed)
     return {
         "did": identity.did,
@@ -371,7 +371,7 @@ OP_CONTEXT_CREATE = OpSpec(
 
 
 def _py_invalid_sign(ctx: OpContext) -> dict[str, Any]:
-    scp = ctx.scp_core.SCP()
+    scp = ctx.scp_core.SCP({"type": "in_memory"})
     try:
         scp.scpid_sign(
             "did:dht:znevercreatednevercreatednevercreatednevercreated",
@@ -517,7 +517,7 @@ def _pinned_challenge_json(audience: str = "https://parity-test.example.com") ->
 
 def _py_sign_message(ctx: OpContext) -> dict[str, Any]:
     seed = bytes.fromhex(PARITY_SEED_HEX)
-    scp = ctx.scp_core.SCP()
+    scp = ctx.scp_core.SCP({"type": "in_memory"})
     identity = scp.identity_create("in_memory", seed)
     challenge_json = _pinned_challenge_json()
     response_json = scp.scpid_sign(
@@ -810,7 +810,7 @@ OP_UCAN_VALIDATE_MALFORMED = OpSpec(
 
 
 def _py_transport_status(ctx: OpContext) -> dict[str, Any]:
-    scp = ctx.scp_core.SCP()
+    scp = ctx.scp_core.SCP({"type": "in_memory"})
     status = scp.transport_status()
     return {
         "connected": status.connected,
@@ -919,7 +919,7 @@ OP_EVENT_LOG_FILTERED = OpSpec(
 
 
 def _py_unregistered_did_rejected(ctx: OpContext) -> dict[str, Any]:
-    scp = ctx.scp_core.SCP()
+    scp = ctx.scp_core.SCP({"type": "in_memory"})
     challenge_json = _pinned_challenge_json()
     try:
         scp.scpid_sign(FAKE_UNREGISTERED_DID, "#active", challenge_json)

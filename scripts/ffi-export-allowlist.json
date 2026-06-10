@@ -442,12 +442,6 @@
       "reason": "Instance lifecycle (suspend); not a parity operation."
     },
     {
-      "name": "with_persistence",
-      "path": "crates/scp-ffi/src/scp.rs",
-      "kind": "lifecycle",
-      "reason": "Storage-backed constructor variant; instance lifecycle, not a parity operation."
-    },
-    {
       "name": "__repr__",
       "path": "crates/scp-ffi/src/server.rs",
       "kind": "dunder",
@@ -714,12 +708,6 @@
       "reason": "Per-instance identity accessor; instance lifecycle, not a parity operation."
     },
     {
-      "name": "new",
-      "path": "crates/scp-ffi/uniffi/src/scp.rs",
-      "kind": "lifecycle",
-      "reason": "Scp constructor; instance lifecycle, not a parity operation."
-    },
-    {
       "name": "resume",
       "path": "crates/scp-ffi/uniffi/src/scp.rs",
       "kind": "lifecycle",
@@ -736,12 +724,6 @@
       "path": "crates/scp-ffi/uniffi/src/scp.rs",
       "kind": "lifecycle",
       "reason": "Instance lifecycle (suspend); not a parity operation."
-    },
-    {
-      "name": "with_persistence",
-      "path": "crates/scp-ffi/uniffi/src/scp.rs",
-      "kind": "lifecycle",
-      "reason": "Storage-backed constructor variant; instance lifecycle, not a parity operation."
     },
     {
       "name": "did",
@@ -1020,12 +1002,6 @@
       "path": "crates/scp-ffi/napi/src/scp.rs",
       "kind": "lifecycle",
       "reason": "Instance lifecycle (suspend); not a parity operation."
-    },
-    {
-      "name": "with_persistence",
-      "path": "crates/scp-ffi/napi/src/scp.rs",
-      "kind": "lifecycle",
-      "reason": "Storage-backed constructor variant; instance lifecycle, not a parity operation."
     },
     {
       "name": "did",

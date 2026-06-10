@@ -17,11 +17,11 @@
 //!
 //! # Lifecycle
 //!
-//! 1. `Scp::new` (or `Scp::with_storage` / `Scp::with_persistence`)
-//!    constructs a fresh `UniffiBridgeInstance`; per-instance setup
-//!    (e.g. `init_context_manager_with_did`, transport setup) happens
-//!    lazily on the first `Scp::identity_create` / `context_create` /
-//!    `context_join` call.
+//! 1. `Scp::with_storage` (the sole public constructor; storage selection
+//!    is mandatory, spec §17.6) constructs a fresh `UniffiBridgeInstance`;
+//!    per-instance setup (e.g. `init_context_manager_with_did`, transport
+//!    setup) happens lazily on the first `Scp::identity_create` /
+//!    `context_create` / `context_join` call.
 //! 2. `Scp::method(...)` delegates to methods on
 //!    `UniffiBridgeInstance` (`context_manager_expect`, `with_ucan_state`,
 //!    `ensure_ucan_registered`, `did_resolver`, etc.) — all per-instance,
@@ -1352,7 +1352,7 @@ mod tests {
 
     // Phase D (#1695): `default_instance_is_same_arc` deleted —
     // `DEFAULT_BRIDGE_INSTANCE` no longer exists. The new invariant is that
-    // each `Scp::new()` returns a distinct `Arc<UniffiBridgeInstance>`
+    // each `Scp::new_in_memory_for_test()` returns a distinct `Arc<UniffiBridgeInstance>`
     // (see `test_uniffi_bridge_instance_unique_ids` below) and that a
     // handle minted by one `Scp` fails `check_handle` on a different
     // `Scp` (see `test_handle_affinity_rejects_cross_instance`).

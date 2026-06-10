@@ -11,7 +11,7 @@
 import { SCP } from "../src/index";
 
 async function main(): Promise<void> {
-  const scp = new SCP();
+  const scp = new SCP({ storage: { type: "in_memory" } });
   try {
     // Create two identities (in_memory custody for examples).
     const alice = await scp.identityCreate("in_memory");

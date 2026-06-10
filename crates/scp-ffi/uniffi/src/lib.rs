@@ -584,7 +584,7 @@ mod tests {
     /// Returns a fresh `Scp` instance for tests. Phase 4 PR 4 demolition
     /// (#1549) deleted the free-function façade.
     fn scp_test() -> std::sync::Arc<crate::scp::Scp> {
-        crate::scp::Scp::new()
+        crate::scp::Scp::new_in_memory_for_test()
     }
 
     #[test]

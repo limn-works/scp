@@ -30,7 +30,7 @@ import { SCP } from "../src/scp";
 let scpAvailable = false;
 let skipReason = "";
 try {
-  const probe = new SCP();
+  const probe = new SCP({ storage: { type: "in_memory" } });
   scpAvailable = true;
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
@@ -183,7 +183,7 @@ if (!scpAvailable) {
 } else {
   describe("SCP.identityCreateWithCustody (real NAPI)", () => {
     test("creates a did:dht identity backed by a JS custody provider", async () => {
-      const scp = new SCP();
+      const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const provider = new CryptoKeychain();
         const identity = await scp.identityCreateWithCustody(provider);
@@ -195,7 +195,7 @@ if (!scpAvailable) {
     });
 
     test("rejects a provider missing required methods", async () => {
-      const scp = new SCP();
+      const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         // Intentionally incomplete — only `sign` is present.
         const bad = { sign: () => new Uint8Array(64) } as unknown as KeyCustodyProvider;
@@ -211,7 +211,7 @@ if (!scpAvailable) {
     // `sign` callback — NOT to raw key export — so a callback identity reaches
     // parity with an in-memory one for signed export/import.
     test("callback-custody identity exports a signed snapshot that imports", async () => {
-      const scp = new SCP();
+      const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
         const ctx = await scp.contextCreate(
@@ -245,7 +245,7 @@ if (!scpAvailable) {
     // raw-key-extraction path this export would have failed with an
     // exportSigningKeyBytes error.
     test("sign-only (no raw-key-export) custody can still produce a signed export", async () => {
-      const scp = new SCP();
+      const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const identity = await scp.identityCreateWithCustody(new SignOnlyKeychain());
         const ctx = await scp.contextCreate(

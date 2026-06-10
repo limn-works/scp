@@ -21,7 +21,7 @@ import { describe, expect, it } from "bun:test";
 import { SCP } from "../src/scp";
 
 // Best-effort detection of whether the NAPI addon is available. We
-// attempt a cheap `new SCP()` inside a try/catch — if the addon is
+// attempt a cheap `new SCP({ storage: { type: "in_memory" } })` inside a try/catch — if the addon is
 // structurally unavailable (missing platform optionalDependency), the
 // native bridge loader throws a `TransportError` and we skip. This
 // keeps the test file runnable in environments where the native addon
@@ -29,7 +29,7 @@ import { SCP } from "../src/scp";
 // platform package) without hard-failing the suite.
 function napiAvailable(): boolean {
   try {
-    const probe = new SCP();
+    const probe = new SCP({ storage: { type: "in_memory" } });
     probe.shutdown(1).catch(() => {});
     return true;
   } catch {
@@ -41,7 +41,7 @@ const describeNapi = napiAvailable() ? describe : describe.skip;
 
 describeNapi("bridge lifecycle (SCP.suspend / SCP.resume)", () => {
   it("SCP.suspend on a fresh instance is a no-op", async () => {
-    const scp = new SCP();
+    const scp = new SCP({ storage: { type: "in_memory" } });
     try {
       // BridgeInstance::suspend() short-circuits on is_shutdown() and
       // on uninitialized state, so suspend on a fresh instance resolves.
@@ -52,7 +52,7 @@ describeNapi("bridge lifecycle (SCP.suspend / SCP.resume)", () => {
   });
 
   it("SCP.resume on a fresh instance is a no-op; on shut-down instance rejects", async () => {
-    const scp = new SCP();
+    const scp = new SCP({ storage: { type: "in_memory" } });
     try {
       await scp.resume();
     } catch (err) {

@@ -5019,7 +5019,7 @@ mod tests {
         spending_json: Option<&str>,
         trusted_dids_json: Option<&str>,
     ) -> PyResult<String> {
-        let scp = crate::scp::PyScp::new();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
         scp.evaluate_invitation(
             params_json,
             inviter_did,
@@ -5574,7 +5574,7 @@ mod tests {
         );
 
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
-        let scp = crate::scp::PyScp::new();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
         let result = scp.set_economic_policy(&mut handle, json);
         assert!(
             result.is_err(),
@@ -5588,7 +5588,7 @@ mod tests {
         // The handle must be stamped with the same bridge instance that
         // services the `get_economic_policy` call; otherwise
         // `pyscp_check_handle!` rejects it with `SCP-PERM-3030`.
-        let scp = crate::scp::PyScp::new();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
         let handle = PyContextHandle::new(
             &scp.inner,
             "ctx-econ-3".to_owned(),
@@ -5604,7 +5604,7 @@ mod tests {
     #[test]
     fn get_economic_policy_some() {
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
-        let scp = crate::scp::PyScp::new();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
         let handle = PyContextHandle::new(
             &scp.inner,
             "ctx-econ-4".to_owned(),
@@ -5814,7 +5814,7 @@ mod tests {
         // Use the SAME bridge instance for FFI-state registration, actor
         // creation, the handle stamp, and the `context_close` call — the
         // handle-affinity check rejects a mismatched instance.
-        let scp = crate::scp::PyScp::new();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
         let bi = scp.inner.clone();
 
         crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
@@ -6322,7 +6322,7 @@ mod tests {
         crate::init_runtime().ok();
 
         Python::with_gil(|py| {
-            let scp = crate::scp::PyScp::new();
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
             let bi = Arc::clone(&scp.inner);
 
             // Real identity with in-memory custody so `resolve_signing_key`
@@ -6569,7 +6569,7 @@ class SignOnlyCustody:
         crate::init_runtime().ok();
 
         Python::with_gil(|py| {
-            let scp = crate::scp::PyScp::new();
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
             let bi = Arc::clone(&scp.inner);
 
             // Create a real identity (registers DID document + registry entry +

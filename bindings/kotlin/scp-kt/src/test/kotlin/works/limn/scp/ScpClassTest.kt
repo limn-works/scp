@@ -17,6 +17,7 @@
 
 package works.limn.scp
 
+import uniffi.scp.StorageConfig
 import java.nio.file.Files
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
@@ -72,7 +73,7 @@ class ScpClassTest {
     @BeforeEach
     fun setUp() {
         assumeTrue(nativeAvailable, skipReason)
-        scp = SCP()
+        scp = SCP(StorageConfig.InMemory)
     }
 
     @AfterEach
@@ -82,6 +83,22 @@ class ScpClassTest {
         // is swallowed), so this is safe even if the test already called
         // shutdown() explicitly.
         runBlocking { scp.shutdown(bridge(), 1.seconds) }
+    }
+
+    // ── mandatory storage selection (spec §17.6) ──────────────────
+
+    @Test
+    fun `explicit in-memory storage selection constructs a live instance`() {
+        assumeTrue(nativeAvailable, skipReason)
+        // Storage selection is mandatory: `StorageConfig.InMemory` is the
+        // explicit dev/test selection. There is no zero-argument `SCP()`
+        // constructor (the default was removed), so a missing selection is a
+        // compile error; this asserts the positive path.
+        val explicit = SCP(StorageConfig.InMemory)
+        assertTrue(
+            explicit.instanceId > 0u,
+            "explicit in-memory selection must construct a live instance",
+        )
     }
 
     // ── withSqlite ────────────────────────────────────────────────
@@ -158,7 +175,7 @@ class ScpClassTest {
     @Test
     fun `fresh SCP instances have distinct ids`() =
         runTest {
-            val second = SCP()
+            val second = SCP(StorageConfig.InMemory)
             assertNotEquals(
                 scp.instanceId,
                 second.instanceId,

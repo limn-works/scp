@@ -3386,8 +3386,8 @@ mod tests {
     fn allowlist_disable_does_not_leak_across_instances_pyo3() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let a = crate::scp::PyScp::new();
-            let b = crate::scp::PyScp::new();
+            let a = crate::scp::PyScp::new_in_memory_for_test();
+            let b = crate::scp::PyScp::new_in_memory_for_test();
 
             a.mcp_disable_stdio_allowlist()
                 .expect("disable on a should succeed");
@@ -3422,8 +3422,8 @@ mod tests {
     fn allowlist_configure_does_not_leak_across_instances_pyo3() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let a = crate::scp::PyScp::new();
-            let b = crate::scp::PyScp::new();
+            let a = crate::scp::PyScp::new_in_memory_for_test();
+            let b = crate::scp::PyScp::new_in_memory_for_test();
 
             a.mcp_configure_stdio_allowlist(vec!["custom-a".to_owned()])
                 .expect("configure on a");

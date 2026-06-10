@@ -57,7 +57,7 @@ try {
   // Verify that fullstack methods are available (feature-gated on the SCP
   // class). Instantiate a throwaway SCP because feature-gated methods are
   // defined on the class, not on the addon module.
-  const probe = new addon.SCP();
+  const probe = new addon.SCP(JSON.stringify({ type: "in_memory" }));
   if (typeof probe.fullstackCreateNode !== "function") {
     throw new Error(
       "SCP.fullstackCreateNode not found — rebuild with allow_in_memory_custody feature",
@@ -81,7 +81,7 @@ if (addon === null) {
     let scp: any;
 
     beforeEach(() => {
-      scp = new addon.SCP();
+      scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     });
 
     afterEach(async () => {

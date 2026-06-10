@@ -13,7 +13,7 @@ from scp_sdk.types import Capability, CustodyType, MemoryScope
 
 
 async def main() -> None:
-    with SCP() as scp:
+    with SCP(storage={"type": "in_memory"}) as scp:
         # Create two identities (in_memory custody for examples).
         alice = await scp.identity_create(CustodyType.IN_MEMORY)
         bob = await scp.identity_create(CustodyType.IN_MEMORY)

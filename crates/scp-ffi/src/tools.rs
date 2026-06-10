@@ -1656,7 +1656,7 @@ mod tests {
     use scp_ffi_common::error_codes as codes;
 
     fn default_scp() -> crate::scp::PyScp {
-        crate::scp::PyScp::new()
+        crate::scp::PyScp::new_in_memory_for_test()
     }
 
     #[test]

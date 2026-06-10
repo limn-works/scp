@@ -11,7 +11,7 @@ Usage::
     from scp_sdk.types import CustodyType
 
     # Caller-owned instance — every operation routes through scp.*
-    with SCP() as scp:
+    with SCP(storage={"type": "in_memory"}) as scp:
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
 
 See ``.docs/adrs/phase-3.md`` ADR-014 and ADR-048 for the full SDK design.

@@ -31,7 +31,7 @@ Every language SDK exposes a class named exactly `SCP`:
 `SCP` wraps an owned `Arc<BridgeInstance>`. Instance state — ContextManager, identity registry, UCAN registry, MCP registries, transport manager, known-contexts cache, rate limiters, economy trackers, petname/handle/scope registries — lives on that instance. Operations that touch instance state become methods on `SCP`:
 
 ```python
-scp = scp_sdk.SCP()               # new
+scp = scp_sdk.SCP(storage={"type": "in_memory"})  # storage selection is mandatory (spec §17.6)
 identity = scp.identity_create(…) # method, not module-level function
 context = scp.context_create(…)
 ```

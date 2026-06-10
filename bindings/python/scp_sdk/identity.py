@@ -11,7 +11,7 @@ Call sites shape::
     from scp_sdk import SCP, Identity
     from scp_sdk.types import CustodyType
 
-    with SCP() as scp:
+    with SCP(storage={"type": "in_memory"}) as scp:
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
         # identity is an Identity wrapper — use identity.did / identity.custody_type
         rotated = await scp.identity_rotate_key(identity._raw_handle)

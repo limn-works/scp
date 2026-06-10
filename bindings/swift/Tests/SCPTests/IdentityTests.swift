@@ -14,9 +14,9 @@ final class IdentityTests: XCTestCase {
     // swiftlint:disable:next implicitly_unwrapped_optional
     var scp: SCP!
 
-    override func setUp() {
-        super.setUp()
-        scp = SCP()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        scp = try SCP(storage: .inMemory)
     }
 
     override func tearDown() async throws {

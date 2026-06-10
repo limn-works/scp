@@ -103,7 +103,7 @@ public nonisolated enum McpClientConfig: Sendable {
 /// ## Usage
 ///
 /// ```swift
-/// let scp = SCP()
+/// let scp = try SCP(storage: .inMemory)
 /// let client = try await McpClient.connect(
 ///     scp: scp,
 ///     config: .stdio(command: "uvx", args: ["some-mcp-server"])

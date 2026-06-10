@@ -9,8 +9,9 @@
 //! ```python
 //! from scp_sdk import SCP
 //!
-//! scp = SCP()          # fresh instance — no shared process-global state
-//! scp.shutdown(1000)   # graceful shutdown (milliseconds)
+//! # Storage selection is required — there is no default (spec §17.6).
+//! scp = SCP({"type": "in_memory"})   # explicit dev/test in-memory storage
+//! scp.shutdown(1000)                 # graceful shutdown (milliseconds)
 //! ```
 //!
 //! Phase D (#1695) deleted the default-instance infrastructure: there is
@@ -40,28 +41,17 @@ pub struct PyScp {
 
 #[pymethods]
 impl PyScp {
-    /// Constructs a new `SCP` instance with its own `PyBridgeInstance`.
-    ///
-    /// Each call produces a brand-new instance with a fresh monotonic
-    /// `instance_id`, a fresh `CancellationToken`, and an empty
-    /// `JoinSet`. Handles issued against this instance are incompatible
-    /// with any other instance — the affinity check at every FFI entry
-    /// point surfaces a mismatch as `PermissionError` (`SCP-PERM-3030`).
-    /// Phase D (#1695, ADR-048) deleted the prior `default_instance()`
-    /// factory and `DEFAULT_BRIDGE_INSTANCE` static; there is no
-    /// process-global bridge anymore.
-    #[new]
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(PyBridgeInstance::new_py()),
-        }
-    }
-
     /// Constructs a new `SCP` instance configured by a storage-config dict.
     ///
+    /// Storage selection is MANDATORY and fail-closed (spec §17.6): there
+    /// is no zero-argument constructor and no default backend. Bare
+    /// `SCP()` raises `TypeError` (the `config` argument is required);
+    /// passing a dict whose `type` is missing or unrecognised raises
+    /// `ValidationError`.
+    ///
     /// Accepted shapes:
-    /// - `{"type": "in_memory"}` — encrypted in-memory storage (ephemeral).
+    /// - `{"type": "in_memory"}` — encrypted in-memory storage (ephemeral,
+    ///   development/test only).
     /// - `{"type": "sqlite", "path": "/path/to/dir", "key": b"\x00..."}`
     ///   — SQLCipher-encrypted storage at `{path}/scp.db`. `key` must be a
     ///   `bytes` object holding raw encryption key material (32 bytes
@@ -74,7 +64,14 @@ impl PyScp {
     /// For the `sqlite` type, exactly ONE of `key` or `passphrase` must be
     /// supplied — both-present or neither raises `ValidationError`.
     ///
-    /// Unknown types or malformed shapes raise `ValidationError`.
+    /// Each call produces a brand-new instance with a fresh monotonic
+    /// `instance_id`, a fresh `CancellationToken`, and an empty
+    /// `JoinSet`. Handles issued against this instance are incompatible
+    /// with any other instance — the affinity check at every FFI entry
+    /// point surfaces a mismatch as `PermissionError` (`SCP-PERM-3030`).
+    /// Phase D (#1695, ADR-048) deleted the prior `default_instance()`
+    /// factory and `DEFAULT_BRIDGE_INSTANCE` static; there is no
+    /// process-global bridge anymore.
     ///
     /// # Errors
     ///
@@ -82,15 +79,53 @@ impl PyScp {
     /// recognised storage variant, or if required fields for the selected
     /// variant are missing or wrongly typed (including supplying both or
     /// neither of `key`/`passphrase` for `sqlite`).
+    #[new]
+    pub fn new(py: Python<'_>, config: &Bound<'_, PyDict>) -> PyResult<Self> {
+        Self::build_from_config(py, config)
+    }
+
+    /// Constructs a new `SCP` instance configured by a storage-config dict.
+    ///
+    /// Alias for the constructor (`SCP(config)`) — retained so the SDK
+    /// wrapper and existing callers can spell the storage selection as
+    /// `SCP.with_storage({...})`. Both surfaces fold into the same
+    /// fail-closed dict parser; there is no behavioural difference.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` under the same conditions as the
+    /// constructor.
     #[staticmethod]
-    pub fn with_storage(_py: Python<'_>, config: &Bound<'_, PyDict>) -> PyResult<Self> {
+    pub fn with_storage(py: Python<'_>, config: &Bound<'_, PyDict>) -> PyResult<Self> {
+        Self::build_from_config(py, config)
+    }
+}
+
+// Non-pyo3 impl block for the storage-config parser. Not annotated with
+// `#[pymethods]`, so it does not become a Python attribute — it is the
+// shared fail-closed dict parser that both the `#[new]` constructor and
+// the `with_storage` staticmethod delegate to (spec §17.6 — storage
+// selection is mandatory; bare `SCP()` is a `TypeError` because `config`
+// is a required positional argument).
+impl PyScp {
+    /// Parses a storage-config dict into a [`StorageConfig`] and builds the
+    /// bridge instance. Fail-closed: a missing or unknown `type`, or
+    /// malformed `sqlite` key material, is a `ValidationError`.
+    fn build_from_config(_py: Python<'_>, config: &Bound<'_, PyDict>) -> PyResult<Self> {
         let storage_type: String = match config.get_item("type")? {
             Some(v) => v.extract()?,
             None => {
-                return Err(ScpPyError::validation(
-                    "SCP.with_storage: missing required key 'type' — expected \"in_memory\" or \"sqlite\""
+                // Storage selection is mandatory (spec §17.6): a missing
+                // `type` is the selection-required case, carried by
+                // SCP-STORAGE-8000 rather than the generic validation code.
+                return Err(ScpPyError::ValidationError {
+                    message: "SCP storage selection is required: missing key 'type' — expected \
+                     {\"type\": \"in_memory\"} (development) or \
+                     {\"type\": \"sqlite\", \"path\": ..., \"key\"|\"passphrase\": ...} \
+                     (production). There is no default storage."
                         .to_owned(),
-                )
+                    code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
+                }
                 .into());
             }
         };
@@ -164,9 +199,17 @@ impl PyScp {
                 }
             }
             other => {
-                return Err(ScpPyError::validation(format!(
-                    "SCP.with_storage: unknown storage type {other:?} — expected \"in_memory\" or \"sqlite\""
-                ))
+                // An unknown `type` value is a storage-SELECTION error, not a
+                // within-variant field validation — surface the same selection
+                // code as a missing `type` (spec §17.6, `SCP-STORAGE-8000`).
+                return Err(ScpPyError::ValidationError {
+                    message: format!(
+                        "SCP storage selection is invalid: unknown 'type' {other:?} — expected \
+                         \"in_memory\" (development) or \"sqlite\" (production). \
+                         There is no default storage."
+                    ),
+                    code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
+                }
                 .into());
             }
         };
@@ -176,28 +219,10 @@ impl PyScp {
             inner: Arc::new(bi),
         })
     }
+}
 
-    /// Constructs a new `SCP` instance with an explicit persistence provider.
-    ///
-    /// PR 1 does not expose a Python-side constructor for
-    /// `Box<dyn ContextPersistence>` (this requires wiring a Rust trait
-    /// across the FFI boundary, which lands in PR 3). Passing `None`
-    /// therefore produces a plain `new()` instance; callers who need
-    /// real persistence must use `SCP.with_storage(...)` until PR 3
-    /// lands.
-    ///
-    /// # Errors
-    ///
-    /// Currently cannot fail. Returns `PyResult` for API forward-compat.
-    #[staticmethod]
-    pub fn with_persistence(_py: Python<'_>) -> PyResult<Self> {
-        // PR 1 minimal: no Python-accessible ContextPersistence impl yet.
-        // This matches the PyO3 signature pattern documented in the plan.
-        Ok(Self {
-            inner: Arc::new(PyBridgeInstance::new_py()),
-        })
-    }
-
+#[pymethods]
+impl PyScp {
     /// Returns the monotonic identifier for this instance.
     #[getter]
     #[must_use]
@@ -297,12 +322,6 @@ impl PyScp {
     }
 }
 
-impl Default for PyScp {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // Non-pyo3 impl block — exposes internals for Rust consumers (integration
 // tests and downstream bridge glue). Items here do NOT become Python
 // attributes because they're not annotated with `#[pymethods]`.
@@ -327,6 +346,25 @@ impl PyScp {
     #[must_use]
     pub const fn from_bridge_instance(inner: Arc<PyBridgeInstance>) -> Self {
         Self { inner }
+    }
+
+    /// Constructs a `PyScp` with explicit in-memory storage, for Rust-side
+    /// tests only.
+    ///
+    /// The public constructor (`SCP(config)`) requires a storage-config
+    /// dict and a GIL; Rust integration/unit tests want a one-liner that
+    /// selects in-memory storage without building a `PyDict`. This wraps
+    /// the equivalent of `SCP({"type": "in_memory"})` — an explicit
+    /// dev/test selection, NOT a silent default (spec §17.6).
+    ///
+    /// In-memory construction is infallible (it cannot perform any I/O), so
+    /// this never returns an error and never panics.
+    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[must_use]
+    pub fn new_in_memory_for_test() -> Self {
+        Self {
+            inner: Arc::new(PyBridgeInstance::new_in_memory_for_test()),
+        }
     }
 }
 
@@ -426,6 +464,66 @@ mod tests {
             assert!(
                 msg.contains("missing key material"),
                 "error must explain the missing key material: {msg}"
+            );
+        });
+    }
+
+    /// Storage selection is mandatory (spec §17.6): a config dict missing
+    /// the `type` key is rejected, and the error carries the storage
+    /// selection-required code `SCP-STORAGE-8000`.
+    #[test]
+    fn missing_type_is_rejected_with_storage_8000() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            // No "type" key at all — the mandatory selection is absent.
+            let msg = match PyScp::with_storage(py, &dict) {
+                Ok(_) => panic!("missing storage 'type' must be rejected — no default"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                msg.contains(scp_ffi_common::error_codes::STORAGE_8000),
+                "missing-selection error must carry SCP-STORAGE-8000: {msg}"
+            );
+        });
+    }
+
+    /// The explicit `{"type": "in_memory"}` dev path constructs successfully
+    /// and yields a live instance with a non-zero monotonic id (it can run a
+    /// real operation — reading `instance_id`).
+    #[test]
+    fn in_memory_dict_constructs_and_is_live() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("type", "in_memory").expect("set type");
+            let scp = match PyScp::with_storage(py, &dict) {
+                Ok(scp) => scp,
+                Err(err) => panic!("in_memory selection must construct: {err}"),
+            };
+            assert!(
+                scp.instance_id() > 0,
+                "constructed instance must expose a live, non-zero instance_id"
+            );
+        });
+    }
+
+    /// An unknown storage `type` is a storage-SELECTION error: rejected
+    /// fail-closed (spec §17.6) and carrying the same `SCP-STORAGE-8000`
+    /// code as a missing `type`, not a generic field-validation code.
+    #[test]
+    fn unknown_type_is_rejected_with_storage_8000() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("type", "redis").expect("set type");
+            let msg = match PyScp::with_storage(py, &dict) {
+                Ok(_) => panic!("unknown storage type must be rejected"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                msg.contains(scp_ffi_common::error_codes::STORAGE_8000),
+                "unknown-selection error must carry SCP-STORAGE-8000: {msg}"
             );
         });
     }

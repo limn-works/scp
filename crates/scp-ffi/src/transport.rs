@@ -677,7 +677,7 @@ pub fn register_transport(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
 
     fn default_scp() -> crate::scp::PyScp {
-        crate::scp::PyScp::new()
+        crate::scp::PyScp::new_in_memory_for_test()
     }
 
     #[test]
