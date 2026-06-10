@@ -927,6 +927,12 @@ mod tests {
     /// `transport_connect_on` must route through the instance selector and
     /// connect via WebSocket fallback against a relay that advertises no QUIC.
     /// After the call the bridge instance must own a transport manager.
+    ///
+    /// Requires the `server` feature: it spins up an in-memory relay via
+    /// `scp_ffi_common::server::start_relay_in_memory`, which only exists under
+    /// `#[cfg(feature = "server")]`. The bare (`--no-default-features`) test
+    /// target must still compile, so this fn is server-gated.
+    #[cfg(feature = "server")]
     #[test]
     fn transport_connect_routes_through_selector_ws_fallback() {
         let rt = crate::runtime();
@@ -960,6 +966,10 @@ mod tests {
 
     /// `transport_add_relay_on` must route through the instance selector and
     /// add a second WS-fallback adapter to the manager.
+    ///
+    /// Server-gated: depends on `scp_ffi_common::server::start_relay_in_memory`
+    /// (`#[cfg(feature = "server")]`), so the bare test target compiles.
+    #[cfg(feature = "server")]
     #[test]
     fn transport_add_relay_routes_through_selector_ws_fallback() {
         let rt = crate::runtime();
@@ -990,6 +1000,10 @@ mod tests {
 
     /// `configure_relay_transport_on` must route through the instance selector
     /// and install a `RelayTransportProvider` over the WS-fallback adapter.
+    ///
+    /// Server-gated: depends on `scp_ffi_common::server::start_relay_in_memory`
+    /// (`#[cfg(feature = "server")]`), so the bare test target compiles.
+    #[cfg(feature = "server")]
     #[test]
     fn configure_relay_transport_routes_through_selector_ws_fallback() {
         let rt = crate::runtime();

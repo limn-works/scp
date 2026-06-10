@@ -4194,7 +4194,14 @@ fn parse_template_id_napi(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use scp_core::context::ContextParams;
+    // Sole consumers are the `allow_in_memory_custody`-gated governance/role
+    // tests below; gate the import so the bare/production test target has no
+    // unused import.
+    #[cfg(feature = "allow_in_memory_custody")]
     use scp_core::context::governance::GovernanceAction;
+    // Consumed only by the `allow_in_memory_custody`-gated membership helper +
+    // test; gate the import so the bare/production test target is warning-clean.
+    #[cfg(feature = "allow_in_memory_custody")]
     use scp_core::context::membership::KeyPackage;
     use scp_core::context::params::Capability;
     // The feature-gated economy tests reference `codes::` directly (no
@@ -4207,6 +4214,10 @@ mod tests {
     use scp_identity::DID;
     use std::sync::Arc;
 
+    // Sole consumers are the `allow_in_memory_custody`-gated role-sync tests
+    // below; gate the import so the bare/production test target has no unused
+    // import.
+    #[cfg(feature = "allow_in_memory_custody")]
     use scp_ffi_common::test_helpers::approved_proposal;
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
@@ -4236,7 +4247,9 @@ mod tests {
     }
 
     /// Test helper: dispatch `LifecycleCommand::JoinContext` through the
-    /// supervisor.
+    /// supervisor. Only the `allow_in_memory_custody`-gated membership tests
+    /// call it, so it is gated to keep the bare test target warning-clean.
+    #[cfg(feature = "allow_in_memory_custody")]
     async fn test_dispatch_join_context(
         bi: &crate::runtime::NapiBridgeInstance,
         handle: &scp_core::context::ContextHandle,
@@ -4261,7 +4274,9 @@ mod tests {
     }
 
     /// Test helper: dispatch `QueriesCommand::MemberCount` through the
-    /// supervisor.
+    /// supervisor. Only the `allow_in_memory_custody`-gated membership test
+    /// calls it, so it is gated to keep the bare test target warning-clean.
+    #[cfg(feature = "allow_in_memory_custody")]
     async fn test_dispatch_member_count(
         bi: &crate::runtime::NapiBridgeInstance,
         ctx_id: &str,
@@ -4279,7 +4294,10 @@ mod tests {
     }
 
     /// Test helper: dispatch `GovernanceCommand::ExecuteGovernanceAction`
-    /// through the supervisor.
+    /// through the supervisor. Only the `allow_in_memory_custody`-gated
+    /// role-sync tests call it, so it is gated to keep the bare test target
+    /// warning-clean.
+    #[cfg(feature = "allow_in_memory_custody")]
     async fn test_dispatch_execute_governance(
         bi: &crate::runtime::NapiBridgeInstance,
         ctx_id: &str,
@@ -4327,6 +4345,15 @@ mod tests {
     /// Verifies that member count queries return the live member
     /// count — not a hardcoded value.  After creation the count is 1 (the
     /// creator); after a join it becomes 2.
+    ///
+    /// Gated on `allow_in_memory_custody`: this test wires the supervisor with a
+    /// `did:test:` MLS identity (`init_supervisor_for_test_on`) and `did:key:`
+    /// member DIDs, which `MlsCryptoProvider::validate_creator_identity` only
+    /// accepts under `scp-runtime`'s `testing` feature (pulled in transitively
+    /// via `allow_in_memory_custody` → `dep:scp-testing` → `scp-core/testing`).
+    /// It is NOT part of the feature-free export surface; the production/bare
+    /// test target must not run it.
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -4409,6 +4436,10 @@ mod tests {
     // Role state sync after governance (#560)
     // -----------------------------------------------------------------------
 
+    // Gated on `allow_in_memory_custody`: uses `did:test:` MLS identity +
+    // `did:key:` member DIDs, accepted only under `scp-runtime/testing`
+    // (transitively enabled by `allow_in_memory_custody`). Not feature-free.
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_change_role() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -4461,6 +4492,10 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
+    // Gated on `allow_in_memory_custody`: uses `did:test:` MLS identity +
+    // `did:key:` member DIDs, accepted only under `scp-runtime/testing`
+    // (transitively enabled by `allow_in_memory_custody`). Not feature-free.
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_add_member() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -4507,6 +4542,10 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
+    // Gated on `allow_in_memory_custody`: uses `did:test:` MLS identity +
+    // `did:key:` member DIDs, accepted only under `scp-runtime/testing`
+    // (transitively enabled by `allow_in_memory_custody`). Not feature-free.
+    #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_remove_member() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
