@@ -1257,10 +1257,13 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
 
 /// Retained identity state for a single DID in the NAPI bridge.
 ///
-/// Stores the `ScpIdentity` (key handles), `InMemoryKeyCustody` (key
-/// material), and `DidDocument` so that bridge functions can look up any
-/// registered identity by DID — including `identity_load` and
-/// `identity_resolve` which need the document without DHT access (#1144 C6).
+/// Stores the `ScpIdentity` (key handles), retained custody — the
+/// [`NapiKeyCustody`](crate::custody::NapiKeyCustody) enum, either the
+/// `InMemory` test variant (key material) or the `Callback` production variant
+/// (delegating to a caller-supplied `KeyCustodyProvider`) — and `DidDocument`
+/// so that bridge functions can look up any registered identity by DID —
+/// including `identity_load` and `identity_resolve` which need the document
+/// without DHT access (#1144 C6).
 pub(crate) struct NapiIdentityEntry {
     /// The scp-core identity handle (DID string, key handles).
     pub(crate) identity: scp_identity::ScpIdentity,
@@ -1299,9 +1302,13 @@ pub(crate) fn identity_registry(bi: &NapiBridgeInstance) -> &DashMap<String, Nap
 
 /// Registers an identity in the bridge instance's identity registry.
 ///
-/// Called by `identity_create` and `identity_create_with_agent_key` after
-/// successfully creating an identity. Bridge functions (`ucan_delegate`)
-/// look up the retained `InMemoryKeyCustody` and `KeyHandle`s via
+/// Called by `identity_create`, `identity_create_with_agent_key`, and
+/// `identity_create_with_custody` after successfully creating an identity, and
+/// by the key-rotation and migration paths (`rotate_key`, `rotate_agent_key`,
+/// `migrate`) which re-register under the same or new DID. Bridge functions
+/// (`ucan_delegate`) look up the retained custody — the
+/// [`NapiKeyCustody`](crate::custody::NapiKeyCustody) enum (in-memory test
+/// variant or callback production variant) — and `KeyHandle`s via
 /// [`with_identity`].
 ///
 /// Overwrites any existing entry for the same DID (idempotent — supports

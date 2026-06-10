@@ -320,8 +320,9 @@ pub(crate) struct NapiIdentityInner {
 
 /// An SCP identity handle exposed to JavaScript (Node.js/Bun).
 ///
-/// Wraps the DID string and retains key material for in-memory custody paths.
-/// Platform custody paths use an injected `KeyCustodyProvider`.
+/// Wraps the DID string and retains key material for the in-memory (dev/test)
+/// custody path. The production custody path is `identityCreateWithCustody`,
+/// which injects a caller-supplied `KeyCustodyProvider` (keychain/HSM-backed).
 ///
 /// # JS usage
 ///
