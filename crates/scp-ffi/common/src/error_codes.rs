@@ -435,6 +435,11 @@ pub const PERM_3012: &str = "SCP-PERM-3012";
 /// UCAN permission: issuer not authorized.
 pub const PERM_3020: &str = "SCP-PERM-3020";
 /// UCAN permission: audience mismatch.
+///
+/// Reserved; no active producer. UCAN audience-mismatch
+/// (`UcanError::AudienceMismatch`) is currently classified as `PERM_3001` by
+/// `ucan_errors::ucan_error_code`. The semantic name is retained for the
+/// audience-mismatch condition should producers be reintroduced.
 pub const PERM_3021: &str = "SCP-PERM-3021";
 /// UCAN permission: delegation chain invalid.
 pub const PERM_3022: &str = "SCP-PERM-3022";

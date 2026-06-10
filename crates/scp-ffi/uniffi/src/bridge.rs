@@ -10118,18 +10118,24 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let sup = bi.context_manager_or_error()?;
                 let did: scp_identity::DID = identity.did.clone().into();
 
+                // Validate retained signing custody before depending on
+                // supervisor state, so an externally-loaded identity surfaces
+                // the missing-custody condition deterministically.
                 let core_id = identity
                     .core_id
                     .as_ref()
-                    .ok_or_else(|| ScpError::Permission {
-                        msg: "broadcast publish requires a fully created identity with key handles"
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "broadcast publish requires retained signing custody — this \
+                              identity was loaded externally and has no retained signing key \
+                              material"
                             .to_owned(),
-                        code: codes::PERM_3020.to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
                     })?;
                 let signing_key_handle = core_id.active_signing_key;
+
+                let sup = bi.context_manager_or_error()?;
 
                 use scp_core::context::actor::commands::{
                     BroadcastCommand, PublishBroadcastPayload,
@@ -10234,32 +10240,40 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let sup = bi.context_manager_or_error()?;
                 let did: scp_identity::DID = identity.did.clone().into();
 
+                // Validate retained signing custody before depending on
+                // supervisor state, so an externally-loaded identity surfaces
+                // the missing-custody condition deterministically.
                 let core_id = identity
                     .core_id
                     .as_ref()
-                    .ok_or_else(|| ScpError::Permission {
-                        msg:
-                            "broadcast publish asset requires a fully created identity with key handles"
-                                .to_owned(),
-                        code: codes::PERM_3020.to_owned(),
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "broadcast publish asset requires retained signing custody — this \
+                              identity was loaded externally and has no retained signing key \
+                              material"
+                            .to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
                     })?;
                 let signing_key_handle = core_id.active_signing_key;
 
+                let sup = bi.context_manager_or_error()?;
+
                 // Validate fields.
                 let content_path =
-                    scp_core::context::ContentPath::new(asset.path).map_err(|e| ScpError::Context {
-                        msg: format!("invalid path: {e}"),
-                        code: codes::CTX_2040.to_owned(),
+                    scp_core::context::ContentPath::new(asset.path).map_err(|e| {
+                        ScpError::Context {
+                            msg: format!("invalid path: {e}"),
+                            code: codes::CTX_2040.to_owned(),
+                        }
                     })?;
-                let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
-                    ScpError::Context {
-                        msg: format!("invalid content_type: {e}"),
-                        code: codes::CTX_2041.to_owned(),
-                    }
-                })?;
+                let mime_type =
+                    scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
+                        ScpError::Context {
+                            msg: format!("invalid content_type: {e}"),
+                            code: codes::CTX_2041.to_owned(),
+                        }
+                    })?;
                 // Auto-generate deploy_id when None, matching batch behavior.
                 let deploy_id = Some(deploy_id.unwrap_or_else(|| {
                     use sha2::{Digest, Sha256};
@@ -10274,9 +10288,11 @@ impl Scp {
                     hex::encode(&Sha256::digest(hasher.finalize())[..16])
                 }));
                 if let Some(ref did_str) = deploy_id {
-                    scp_core::context::validate_deploy_id(did_str).map_err(|e| ScpError::Context {
-                        msg: format!("invalid deploy_id: {e}"),
-                        code: codes::CTX_2042.to_owned(),
+                    scp_core::context::validate_deploy_id(did_str).map_err(|e| {
+                        ScpError::Context {
+                            msg: format!("invalid deploy_id: {e}"),
+                            code: codes::CTX_2042.to_owned(),
+                        }
                     })?;
                 }
 
@@ -10423,18 +10439,24 @@ impl Scp {
 
         runtime()
             .spawn(async move {
-                let sup = bi.context_manager_or_error()?;
                 let did: scp_identity::DID = identity.did.clone().into();
 
+                // Validate retained signing custody before depending on
+                // supervisor state, so an externally-loaded identity surfaces
+                // the missing-custody condition deterministically.
                 let core_id = identity
                     .core_id
                     .as_ref()
-                    .ok_or_else(|| ScpError::Permission {
-                        msg: "broadcast publish assets requires a fully created identity"
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "broadcast publish assets requires retained signing custody — this \
+                              identity was loaded externally and has no retained signing key \
+                              material"
                             .to_owned(),
-                        code: codes::PERM_3020.to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
                     })?;
                 let signing_key_handle = core_id.active_signing_key;
+
+                let sup = bi.context_manager_or_error()?;
 
                 use scp_core::context::actor::commands::{
                     BroadcastCommand, PublishBroadcastContentPayload,
@@ -18471,6 +18493,28 @@ mod tests {
             event_log_checkpoint_impl(Arc::clone(&scp.inner), handle, identity, 1u64).await;
         let Err(err) = result else {
             panic!("checkpoint without retained custody must fail")
+        };
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains(codes::IDENT_1017),
+            "expected SCP-IDENT-1017, got: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_publish_without_retained_custody_returns_ident_1017() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+        // `test_identity_for` builds an externally-loaded identity
+        // (`core_id: None`), so broadcast publish trips the missing
+        // signing-custody gate before reaching the relay.
+        let identity = test_identity_for(&scp);
+
+        let result = scp
+            .broadcast_publish(handle, identity, b"hello".to_vec())
+            .await;
+        let Err(err) = result else {
+            panic!("broadcast publish without retained custody must fail")
         };
         let err_str = err.to_string();
         assert!(

@@ -5657,4 +5657,34 @@ mod tests {
             codes::IDENT_1054
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_publish_without_retained_custody_returns_ident_1017() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        // `test_active_on` leaves `in_memory_custody`/`signing_key` as `None`
+        // (an externally-loaded identity), so broadcast publish trips the
+        // missing signing-custody gate before reaching the relay.
+        let handle = super::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-no-custody-broadcast".to_owned(),
+            "did:dht:z6MkCreatorNoCustodyBroadcast".to_owned(),
+        );
+
+        let result = super::broadcast_publish_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkAuthor".to_owned(),
+            b"hi".to_vec(),
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("broadcast publish without retained custody must fail")
+        };
+        let reason = err.reason.clone();
+        assert!(
+            reason.contains("SCP-IDENT-1017"),
+            "expected SCP-IDENT-1017, got: {reason}"
+        );
+    }
 }
