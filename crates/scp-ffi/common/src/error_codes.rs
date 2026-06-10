@@ -31,7 +31,14 @@
 
 /// Generic identity error.
 pub const IDENT_1000: &str = "SCP-IDENT-1000";
-/// Identity operation failed.
+/// Identity operation failed (generic identity error category).
+///
+/// Also the code surfaced when an identity is not registered / has no retained
+/// state on the bridge instance: the registry-miss path that the NAPI and
+/// `PyO3` bridges take in `with_identity` / `with_identity_mut` when the DID was
+/// never created on this bridge. For registry-based key resolution this is where
+/// missing signing custody manifests, in contrast to the handle-borne
+/// `IDENT_1017` (see sdk-common.md).
 pub const IDENT_1001: &str = "SCP-IDENT-1001";
 /// Identity not found.
 pub const IDENT_1002: &str = "SCP-IDENT-1002";
