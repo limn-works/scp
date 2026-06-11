@@ -51,6 +51,39 @@
 #     suspend_all(                 — strips a member's ENTIRE capability set
 #     suspend_capabilities(        — strips a subset of a member's capabilities
 #     membership.remove_member(    — removes a member's authorization
+#     threshold_signers.retain(    — REMOVES a governance threshold signer
+#                                    (execute_remove_signer / the
+#                                    reconfigure-governance RemoveInactiveSigner
+#                                    arm). `.push` is UPWARD (execute_add_signer,
+#                                    allowlisted) and is deliberately NOT a
+#                                    marker — only the removal is downward.
+#     threshold_value=             — lowers/raises the governance threshold
+#                                    (execute_modify_threshold / the
+#                                    reconfigure-governance ReduceThreshold arm).
+#                                    A weaker threshold rolled back in is a
+#                                    downward governance-control transition.
+#     role_state.ceiling=          — REPLACES the capability ceiling
+#                                    (apply_pending_ceiling_modification, a
+#                                    NON-`execute_` leaf that lowers the
+#                                    effective ceiling — Seam 1/black-hat). A
+#                                    crash that restores the prior, broader
+#                                    ceiling re-grants removed authority.
+#
+#     The last two use the `=` ASSIGNMENT form (matched against the
+#     assignment-normalized line; see `normalize_assign`) so the WRITE is
+#     flagged but a read (`ceiling.contains`, `threshold_value > n`) or a
+#     comparison (`threshold_value == n`) is not.
+#
+#     DELIBERATELY NOT A MARKER — `system_assign_role(`: it is
+#     direction-AGNOSTIC (it is the single role-write primitive used for BOTH
+#     upward grants — execute_add_member, join_context_membership — and downward
+#     demotions — execute_change_role, execute_transfer_admin). Adding it would
+#     false-flag the upward/neutral callers (a HIT, since the HIT rule does not
+#     consult the governance allowlist) and the borrowed-state consequence
+#     helper enforce_assign_role. Its DOWNWARD callers are already `execute_*`
+#     leaves that persist fail-closed, so the round-9 fail-closed-by-DEFAULT
+#     governance-leaf rule (GOVHIT) already re-flags either if it regressed to
+#     best-effort — they need no marker.
 #
 #   Anti-replay marker:
 #     executed_proposals.insert(   — marks a governance proposal as executed
@@ -233,7 +266,10 @@ spending_nonce_tracker.check_and_record( \
 suspend_all( \
 suspend_capabilities( \
 membership.remove_member( \
-executed_proposals.insert("
+executed_proposals.insert( \
+threshold_signers.retain( \
+threshold_value= \
+role_state.ceiling="
 
 # Allowlisted pass-through MUTATION HELPERS (acknowledging caller persists).
 # Those that are CALL-STYLE pass-throughs (callers route a Class-S mutation
@@ -353,6 +389,23 @@ scan_file() {
         -v DELEGATES="$PERSIST_DELEGATES" -v FC_FUNCS="${FC_FUNCS:-}" \
         -v MUTATORS="$MUTATORS" -v CLASSC="$CLASS_C_EXCEPTIONS" \
         -v GOVLEAVES="$CLASS_C_GOVERNANCE_LEAVES" '
+    # normalize_assign — collapse whitespace around a bare assignment `=` so a
+    # space-free ASSIGNMENT marker (`threshold_value=`, `role_state.ceiling=`)
+    # matches the downward-auth write `x = y` but NOT a read or a comparison.
+    # The relational / equality operators are protected first (mapped to control
+    # bytes) so `==`, `!=`, `>=`, `<=` are never seen as a bare `=` — an
+    # assignment marker therefore cannot false-match a comparison such as
+    # `threshold_value == n`. (The protected bytes need not be restored: no
+    # marker contains them.)
+    function normalize_assign(s,   t) {
+        t = s
+        gsub(/==/, "\x01", t)
+        gsub(/!=/, "\x02", t)
+        gsub(/>=/, "\x03", t)
+        gsub(/<=/, "\x04", t)
+        gsub(/[[:space:]]*=[[:space:]]*/, "=", t)
+        return t
+    }
     BEGIN {
         in_block = 0
         seen_test = 0
@@ -387,7 +440,26 @@ scan_file() {
     {
         raw = $0
 
-        if (raw ~ /#\[cfg\(test\)\]/) { seen_test = 1 }
+        # Trailing test-MODULE cutoff: once a top-level (column-0) test-gated
+        # module opens, every line below it is test code and is not scanned.
+        # The trailing test module is gated by a column-0 attribute in one of
+        # these forms:
+        #     #[cfg(test)]
+        #     #[cfg(all(test, feature = "testing"))]   (e.g. lifecycle_helpers)
+        #     #[cfg(any(test, feature = "testing"))]   (e.g. context/mod.rs)
+        # The column-0 anchor (`^`) is deliberate: an INTERSPERSED testing-only
+        # accessor (a single `#[cfg(any(test, ..))]` / `#[cfg(feature =
+        # "testing")]` fn sitting INSIDE an impl/among production fns, always
+        # indented) must NOT trigger the "skip rest of file" cutoff, or the
+        # production fns BELOW it (e.g. the reserve_tool_economy consume sites in
+        # tools_helpers.rs) would stop being scanned and the gate would go
+        # vacuous. Indented test gates are left in the production stream; they
+        # carry no Class-S marker, and the assignment markers (normalize_assign)
+        # only fire on real writes. Every column-0 test gate in the scan tree is
+        # verified to be a TRAILING module (no column-0 production fn follows).
+        if (raw ~ /^#\[cfg\(test\)\]/ \
+            || raw ~ /^#\[cfg\(all\(test[,)]/ \
+            || raw ~ /^#\[cfg\(any\(test[,)]/) { seen_test = 1 }
         if (seen_test) next
 
         line = raw
@@ -440,10 +512,20 @@ scan_file() {
         # Within a function body, look for Class-S mutation markers, the
         # fail-closed persist, AND the best-effort persist (round-9 keystone:
         # a governance leaf that best-effort-persists must be allowlisted).
-        # Markers are matched as literal substrings.
+        # Markers are matched as literal substrings against an
+        # assignment-normalized copy of the line: whitespace around a bare `=`
+        # is collapsed (`x = y` -> `x=y`) so a space-free ASSIGNMENT marker
+        # (e.g. `threshold_value=`, `role_state.ceiling=`) matches the
+        # downward-auth write while NOT matching a read or a comparison. The
+        # relational/equality operators `== != >= <=` are protected first, so an
+        # assignment marker can never false-match a comparison (e.g.
+        # `threshold_value == n`). Markers without `=` (the original tracker /
+        # suspend / remove_member / executed_proposals set) are unaffected —
+        # collapsing `=` spacing cannot newly match a marker that has no `=`.
         if (in_fn) {
+            mline = normalize_assign(line)
             for (mi = 1; mi <= nm; mi++) {
-                if (marr[mi] != "" && index(line, marr[mi]) > 0) { fn_mutates = 1; break }
+                if (marr[mi] != "" && index(mline, marr[mi]) > 0) { fn_mutates = 1; break }
             }
             if (line ~ /persist_state_fail_closed[[:space:]]*\(/) fn_failclosed = 1
             if (line ~ /persist_state_best_effort[[:space:]]*\(/) fn_besteffort = 1
@@ -713,7 +795,15 @@ run_scan() {
 #       downward-auth marker (the round-7 miss, reverted);
 #   (6) a `.record()` chokepoint-BYPASS handler IS caught (P1-B);
 #   (7) the allowlist-hole attempt (a new pass-through helper allowlisted but
-#       NOT added to MUTATORS) IS caught by the P1-A coupling check.
+#       NOT added to MUTATORS) IS caught by the P1-A coupling check;
+#   (11) a best-effort NON-`execute_` ceiling-lowering leaf IS caught via the
+#        `role_state.ceiling=` assignment marker (Seam-1 / black-hat);
+#   (12) a downward threshold mutation INLINED in a `dispatch_*` fn IS caught
+#        via the `threshold_value=` assignment marker (Seam-2);
+#   (13) an UPWARD signer add (`.push` + a `threshold_value >` read) is NOT
+#        flagged — the threshold markers fire only on removal / assignment;
+#   (14) a fail-closed signer removal (`.retain` + fail-closed persist) is NOT
+#        flagged.
 # Set NO_CLASS_S_SELFTEST=1 to skip (not recommended).
 # ---------------------------------------------------------------------------
 self_test() {
@@ -761,6 +851,50 @@ self_test() {
         printf '    persist_state_best_effort(state, deps, ctx);\n'
         printf '}\n'
     } > "$fdir/bypass.rs"
+
+    # (11) Seam-1/black-hat — a NON-`execute_` ceiling-lowering leaf
+    # (apply_pending_ceiling_modification-shaped) reverted to best-effort MUST
+    # be caught by the `role_state.ceiling=` ASSIGNMENT marker. Its real name is
+    # not `execute_*`, so ONLY the mutation marker (not the GOVHIT rule) sees it.
+    {
+        printf 'pub async fn apply_ceiling_fixture() {\n'
+        printf '    state.role_state.ceiling = CapabilityCeiling::new(lowered);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/ceiling.rs"
+
+    # (12) Seam-2 — a downward threshold mutation INLINED in a `dispatch_*` fn
+    # (a non-`execute_` name) with a best-effort persist MUST be caught by the
+    # `threshold_value=` ASSIGNMENT marker (the GOVHIT rule keys on `execute_*`
+    # and would miss this).
+    {
+        printf 'pub fn dispatch_threshold_fixture() {\n'
+        printf '    state.governance.threshold_value = weaker;\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/dispatch_threshold.rs"
+
+    # (13) UPWARD signer add (execute_add_signer-shaped `.push`) MUST NOT be
+    # flagged by the new threshold markers — only `.retain` (removal) is a
+    # marker, `.push` is not, and the `threshold_value >`/`>=` reads normalize
+    # to non-`=` forms. Persists best-effort (it is genuinely upward). Named
+    # non-`execute_` so the GOVHIT rule cannot mask a false HIT here.
+    {
+        printf 'pub fn add_signer_upward_fixture() {\n'
+        printf '    if state.governance.threshold_value > remaining { return; }\n'
+        printf '    state.governance.threshold_signers.push(did.clone());\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/add_signer.rs"
+
+    # (14) Downward signer REMOVAL fail-closed (execute_remove_signer-shaped)
+    # MUST NOT be flagged — `.retain` is a marker but the fn fail-closes.
+    {
+        printf 'pub fn remove_signer_fixture() {\n'
+        printf '    state.governance.threshold_signers.retain(|s| s != did);\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+    } > "$fdir/remove_signer.rs"
 
     # (8) Round-9 keystone — a governance leaf that persists BEST-EFFORT and is
     # NOT in CLASS_C_GOVERNANCE_LEAVES MUST be caught (GOVHIT). This models a
@@ -816,6 +950,37 @@ self_test() {
         printf '%sSELF-TEST FAILED%s: a direct spending_nonce_tracker.record() bypass was\n' \
             "$C_RED" "$C_RESET" >&2
         printf 'NOT caught — the P1-B chokepoint-bypass marker is not wired.\n' >&2
+        rc=1
+    fi
+    # (11) Seam-1/black-hat: a best-effort NON-`execute_` ceiling-lowering leaf
+    # MUST be caught via the `role_state.ceiling=` assignment marker.
+    if ! grep -q $'^HIT\t.*\tapply_ceiling_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a best-effort ceiling-lowering leaf was NOT caught\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '— the `role_state.ceiling=` downward-auth assignment marker is not wired.\n' >&2
+        rc=1
+    fi
+    # (12) Seam-2: a downward threshold mutation INLINED in a `dispatch_*` fn
+    # (non-`execute_` name, best-effort) MUST be caught via `threshold_value=`.
+    if ! grep -q $'^HIT\t.*\tdispatch_threshold_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a best-effort inlined downward threshold mutation in\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'a dispatch_* fn was NOT caught — the `threshold_value=` marker is not wired.\n' >&2
+        rc=1
+    fi
+    # (13) UPWARD signer add (`.push` + a `threshold_value >` read) MUST NOT be
+    # flagged — `.push` is not a marker and the comparison normalizes to non-`=`.
+    if grep -q $'^HIT\t.*\tadd_signer_upward_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: an UPWARD signer add was wrongly flagged — a\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'threshold marker false-matched `.push` or a `threshold_value >` read.\n' >&2
+        rc=1
+    fi
+    # (14) Downward signer REMOVAL that fail-closes MUST NOT be flagged.
+    if grep -q $'^HIT\t.*\tremove_signer_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a fail-closed signer removal was wrongly flagged\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'despite persisting fail-closed (the `.retain` marker ignored the persist).\n' >&2
         rc=1
     fi
     # (8) Round-9 keystone: a best-effort governance leaf NOT in the allowlist
