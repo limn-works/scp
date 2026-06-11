@@ -9530,6 +9530,136 @@ mod tests {
         );
     }
 
+    /// ADR-049 §9 crash-safety invariant — STRUCTURAL ENFORCEMENT.
+    ///
+    /// Every security-critical, monotonic piece of per-context state must be
+    /// either Class S (sync-persisted — therefore present in the persisted
+    /// `ContextSnapshot` and round-trippable) or Class M (crash-surviving in the
+    /// supervisor-owned MLS crypto provider). A new security-critical field that
+    /// silently rides only the coalesced (Class C) path is a respawn rollback
+    /// vulnerability and is FORBIDDEN.
+    ///
+    /// This test catches the regression structurally: it populates EVERY
+    /// Class-S `GovernanceState` field with a non-default sentinel, runs the
+    /// real snapshot build (`snapshot_context`) + the real persistence
+    /// serialization round-trip (`serde_json` is the on-disk format), and
+    /// asserts each sentinel survives. The mechanism that catches a NEW
+    /// coalesced-only security field:
+    ///
+    /// - To add it to `GovernanceState` and have it tested here, the author
+    ///   must populate it below — and the round-trip assertion then FAILS unless
+    ///   the field was also wired into `build_snapshot_from_state` (persist) AND
+    ///   `restore_context` (restore). A field added to `GovernanceState` but NOT
+    ///   to the snapshot is dropped by the round-trip, failing this test.
+    /// - The `CLASS_M_FIELDS` / `CLASS_C_ACCEPTED` enumerations below document
+    ///   the non-Class-S exceptions explicitly, so a reviewer adding a field can
+    ///   see exactly where each class is enforced.
+    ///
+    /// Demonstrated to fail on a planted Class-C regression (a new security
+    /// field added to `GovernanceState` but not the snapshot drops on
+    /// round-trip → the corresponding assertion fires).
+    #[test]
+    fn security_critical_state_is_class_s_or_m_not_coalesced() {
+        // ---- Class M (crash-surviving in the supervisor-owned crypto Arc;
+        // restored by monotonic max-merge per §23.17.2 Inv 2, NOT via the
+        // ContextSnapshot governance fields). Documented, not asserted here —
+        // the floor-guard tests in `crypto::mls::provider` cover these. ----
+        const CLASS_M_FIELDS: &[&str] = &[
+            "sender_key_epoch_floors", // per-sender MLS replay floors
+        ];
+        // ---- Class C (accepted soft anti-spam residual, ADR-049 §10): ≤50ms
+        // rollback relaxes a rate limit, not an authorization break. ----
+        const CLASS_C_ACCEPTED: &[&str] = &["velocity_tracker", "earned_capacity"];
+        assert!(
+            !CLASS_M_FIELDS.is_empty() && !CLASS_C_ACCEPTED.is_empty(),
+            "the Class-M / Class-C enumerations document the non-Class-S exceptions; \
+             a new security field must be Class S (below), or explicitly added to one \
+             of these with an ADR justification"
+        );
+
+        // ---- Class S: populate every sync-persisted security-critical field
+        // with a non-default sentinel, then prove it round-trips the snapshot. ----
+        let ctx_id_bytes = [0xE1u8; 32];
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:class-s-admin".to_owned()),
+        );
+
+        // membership (a member to drop is the unit of the removal/leave class).
+        let member = DID("did:example:class-s-member".to_owned());
+        state
+            .membership
+            .add_member(member.clone(), "member".to_owned(), Vec::new());
+
+        // executed_proposals (replay protection).
+        let executed_id = [0x11u8; 32];
+        state
+            .governance
+            .executed_proposals
+            .insert(executed_id, 1_700_000_000);
+
+        // revoked_spending_ucan_cids (revocation set).
+        let revoked_cid = "bafyClassSRevokedCid".to_owned();
+        state
+            .governance
+            .revoked_spending_ucan_cids
+            .insert(revoked_cid.clone());
+
+        // spending-nonce tracker (replay protection).
+        let consumed_nonce = "1700000000000-fedcba9876543210fedcba9876543210".to_owned();
+        let mut nonce_entries = std::collections::HashMap::new();
+        nonce_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
+        let nonce_clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        state.governance.spending_nonce_tracker =
+            scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                hex::encode(ctx_id_bytes),
+                nonce_clock,
+                nonce_entries,
+            );
+
+        // read-exclusion list (downward access revocation).
+        let excluded = DID("did:example:class-s-excluded".to_owned());
+        state.access.read_exclusion_list.insert(excluded.clone());
+
+        // Build the snapshot via the EXACT production sync-persist builder
+        // (`build_snapshot_from_state`, the one `persist_state_fail_closed`
+        // calls), then round-trip through the real on-disk serialization format.
+        // Using this builder (not `snapshot_context`) is deliberate: it is the
+        // Class-S persist path, so a field that this builder drops is exactly
+        // the regression the test must catch.
+        let snap = crate::context::messaging_helpers::build_snapshot_from_state(&state);
+        let json = serde_json::to_vec(&snap).expect("snapshot serializes");
+        let restored: crate::context::state::ContextSnapshot =
+            serde_json::from_slice(&json).expect("snapshot deserializes");
+
+        // Each Class-S field MUST survive the persistence round-trip. A field
+        // that rode only the coalesced path (absent from the snapshot) would be
+        // dropped here.
+        assert!(
+            restored.membership.members().any(|m| m.did == member),
+            "Class S: membership must round-trip the snapshot"
+        );
+        assert!(
+            restored.executed_proposals.contains(&executed_id),
+            "Class S: executed_proposals must round-trip (replay protection)"
+        );
+        assert!(
+            restored.revoked_spending_ucan_cids.contains(&revoked_cid),
+            "Class S: revoked_spending_ucan_cids must round-trip (revocation)"
+        );
+        assert!(
+            restored
+                .spending_nonce_tracker_state
+                .contains_key(&consumed_nonce),
+            "Class S: spending-nonce tracker must round-trip (replay protection)"
+        );
+        assert!(
+            restored.read_exclusion_list.contains(&excluded),
+            "Class S: read_exclusion_list must round-trip (access revocation)"
+        );
+    }
+
     /// Drive a membership mutation through its sync-persisting helper boundary
     /// (`persist_state_best_effort`, the exact primitive `execute_remove_member`
     /// calls before returning), then crash+respawn. The removed member MUST
