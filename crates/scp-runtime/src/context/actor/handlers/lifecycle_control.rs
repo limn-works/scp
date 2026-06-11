@@ -105,7 +105,11 @@ fn handle_prepare_for_replace(
         return Outcome::ok(());
     }
 
-    // Security invariant: never overwrite a LIVE context.
+    // Security invariant: never overwrite a LIVE context. A `Poisoned`
+    // context (ADR-049 §10) is dead — its actor exhausted the respawn budget
+    // and is no longer serving the context — so it is replaceable, exactly
+    // like the terminal states. Including it here lets an import / replace
+    // recover a poisoned id without first requiring an operator `clear_poison`.
     let replaceable = state.handle.try_read_state().is_some_and(|s| {
         matches!(
             s,
@@ -113,6 +117,7 @@ fn handle_prepare_for_replace(
                 | ContextState::Closed
                 | ContextState::Expired
                 | ContextState::Tombstoned
+                | ContextState::Poisoned
         )
     });
     if !replaceable {

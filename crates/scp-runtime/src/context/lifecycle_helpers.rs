@@ -2339,6 +2339,12 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         // handle leaks (context stays discoverable via `lookup` /
         // `actor_ids` after "shutdown") and the task never exits.
         supervisor.despawn_actor(ctx_id).await;
+        // Clean shutdown: reap the (non-poison) crash-window entry so it does
+        // not leak past teardown (ADR-049 §10). A poisoned entry is preserved
+        // — its dormant-poison signal survives a shutdown so a subsequent
+        // lookup still reports the poison until an operator clears it or the
+        // process restarts.
+        supervisor.reap_crash_window(ctx_id);
     }
 
     // Supervisor-level state clear. Acquired under the write_lock once
