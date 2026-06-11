@@ -2,7 +2,10 @@ import Foundation
 
 // ContextState and ContextHandleProtocol are now defined by UniFFI in ScpBindings.swift.
 //
-// UniFFI ContextState: .creating, .active, .closing, .closed, .expired
+// UniFFI ContextState: .creating, .active, .closing, .closed, .expired,
+//   .migratingOut, .tombstoned, .poisoned (all 8 states — see ADR-049 §10 for
+//   .poisoned; `mapStateString` below maps every one, defaulting fail-safe to
+//   .poisoned for an unreadable/unrecognized state).
 // UniFFI ContextHandleProtocol: contextId() -> String, creatorDid() -> String, state() throws -> String
 // UniFFI MessageListener: onMessage(message:), onError(error:), onComplete()
 
@@ -229,16 +232,36 @@ public actor Context {
         if let initialState {
             state = initialState
         } else {
-            // UniFFI ContextHandleProtocol.state() throws, so use try? with a fallback.
-            let stateString = (try? handle.state()) ?? "active"
-            switch stateString {
-            case "creating": state = .creating
-            case "active": state = .active
-            case "closing": state = .closing
-            case "closed": state = .closed
-            case "expired": state = .expired
-            default: state = .active
-            }
+            // UniFFI ContextHandleProtocol.state() throws, so use try? with a
+            // fallback. The fallback is `.poisoned` (NOT `.active`): a handle
+            // whose state cannot be read, or that reports an unrecognized
+            // string, must never present as a live/usable context. Per ADR-049
+            // §10 the authoritative crash/poison signal is the error code on
+            // the next per-context operation; this cached getter is best-effort
+            // and fails safe to a non-active state.
+            state = Context.mapStateString((try? handle.state()) ?? "poisoned")
+        }
+    }
+
+    /// Maps the FFI lifecycle-state string to ``ContextState``.
+    ///
+    /// An unrecognized or unreadable state fails safe to ``ContextState/poisoned``
+    /// rather than ``ContextState/active``: per ADR-049 §10 the cached
+    /// ``state`` getter is best-effort, and an unknown context must never be
+    /// reported as live. The authoritative crash/poison signal is the
+    /// `SCP-CTX-2134`/`2135` error code surfaced on the next per-context
+    /// operation, not this getter.
+    static func mapStateString(_ stateString: String) -> ContextState {
+        switch stateString {
+        case "creating": return .creating
+        case "active": return .active
+        case "closing": return .closing
+        case "closed": return .closed
+        case "expired": return .expired
+        case "migrating_out": return .migratingOut
+        case "tombstoned": return .tombstoned
+        case "poisoned": return .poisoned
+        default: return .poisoned
         }
     }
 

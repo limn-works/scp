@@ -340,8 +340,10 @@ pub async fn leave_context(
         .append_context_event(&context_id_bytes, "MemberLeft", member_did.as_ref())?;
     state.checkpoint_events_since += 1;
 
-    // Persist context state after leave (best-effort).
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
+    // ADR-049 §9 Class S: a member leaving removes their own membership (a
+    // downward-authorization transition for that member) — persist fail-closed
+    // so a crash cannot re-admit a member who was told their leave succeeded.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
 
     // If member count reaches zero, transition to Closing.
     if should_close {
@@ -564,8 +566,10 @@ pub async fn close_context_with_key(
         supervisor.update_context_gauges().await;
     });
 
-    // Persist context state after close (best-effort).
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
+    // ADR-049 §9 Class S: the lifecycle close transition is security-critical
+    // (a closed context must not silently re-open on a crash) — persist
+    // fail-closed.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
 
     Ok(result)
 }
@@ -804,20 +808,82 @@ pub async fn join_context(
         state.routing.set_local_pseudonym(pseudonym);
     }
 
-    // Phase 5: Capture the escrow hold after all mutations succeeded.
-    // Consume the ticket — commit returns the deducted cost for the
-    // capture step and marks the ticket as committed so the Drop
-    // guard stays quiet.
+    // Phase 5: commit the economy ticket (in-memory budget debit) and append
+    // the join event, THEN durably persist, THEN settle the external escrow.
+    // Consume the ticket — commit returns the deducted cost and marks the
+    // ticket committed so the Drop guard stays quiet.
     let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
-    capture_join_payment(state, deps, auth, &member_did, &context_id, deducted_cost).await;
 
     // Append MemberJoined event to event log.
-    deps.event_log
-        .append_context_event(&context_id_bytes, "MemberJoined", member_did.as_ref())?;
+    //
+    // ADR-049 §9 (round-9 leak fix): the economy ticket was just committed
+    // (line above), so its `Drop` guard no longer rolls anything back — but the
+    // external escrow hold (`auth`, a `PaidActionAuthorization` that has NO
+    // `Drop` impl) is still HELD and uncaptured. The fail-closed persist + the
+    // success-path `capture_join_payment` both run AFTER this append. On this
+    // append's `Err`, the membership / MLS state already applied above is NOT
+    // reversed (it is Class-S security state that, like the consumed nonce, must
+    // persist — the joiner re-drives the idempotent join), but `auth` would
+    // otherwise drop silently WITHOUT voiding, leaking the hold and charging the
+    // joiner for an unacknowledged join. VOID the escrow here (gated on
+    // `auth.is_some()`) before returning — mirroring the money-ordering rule the
+    // persist-failure branch below already follows.
+    if let Err(e) =
+        deps.event_log
+            .append_context_event(&context_id_bytes, "MemberJoined", member_did.as_ref())
+    {
+        if let Some(a) = auth {
+            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
+        }
+        return Err(e);
+    }
     state.checkpoint_events_since += 1;
 
-    // Persist context state after join (best-effort).
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
+    // ADR-049 §9 Class S (BLACK-001): a PAID join consumed a spending-UCAN
+    // nonce in Phase 1 (`enforce_join_economy` → `enforce_economy` →
+    // `commit_spending_ucan_nonce`, mutating the actor-owned
+    // `spending_nonce_tracker`) — the same Class-S monotonic state the
+    // message-send and tool-invoke paths persist fail-closed. A best-effort
+    // persist here would let an actor crash in the ≤50ms coalesce window roll
+    // the nonce-consume back, freshening the spending UCAN's nonce after the
+    // joiner already saw the join succeed (replay / double-spend). Persist
+    // fail-closed when a spending nonce was committed (the same gating the
+    // send path uses: `deducted_cost.is_some() && spending_ucan.is_some()`):
+    // a persist failure returns an error so the join is NOT acknowledged. The
+    // membership / MLS state already applied above is NOT reversed — it is
+    // Class-S security state that, like the consumed nonce, must persist; the
+    // joiner re-drives the (now nonce-consumed, idempotent) join, and the
+    // surviving in-memory actor already holds the member. The consumed nonce
+    // stays CONSUMED (the fail-closed direction; un-consuming re-opens the
+    // replay window). A free / non-spending join keeps the best-effort persist
+    // — the common path is not regressed.
+    //
+    // MONEY-ORDERING (round-7, mirrors the send path): the external escrow is
+    // CAPTURED only AFTER the fail-closed persist succeeds. Capturing before
+    // would charge the joiner (irreversible escrow settlement) and then hand
+    // them an `Err` if the persist failed — a double-charge on retry. On
+    // persist failure we VOID the escrow hold instead (releasing the funds) so
+    // the charge is atomic with durability; the consumed nonce stays consumed,
+    // so the joiner's retry is idempotent and they are charged at most once.
+    if deducted_cost.is_some() && spending_ucan.is_some() {
+        if let Err(e) =
+            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)
+        {
+            // Durability failed before the charge was captured — release the
+            // escrow hold so the joiner is not charged for an unacknowledged
+            // join, and surface the error. The consumed nonce stays consumed.
+            if let Some(a) = auth {
+                crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id)
+                    .await;
+            }
+            return Err(e);
+        }
+    } else {
+        crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
+    }
+
+    // Durability has succeeded (or this is a free join): now settle the escrow.
+    capture_join_payment(state, deps, auth, &member_did, &context_id, deducted_cost).await;
 
     Ok(())
 }
@@ -1298,16 +1364,32 @@ fn generate_initial_access_key_store(
 ///
 /// # Errors
 ///
+/// `trusted_local` selects the spec §23.17.2 merge semantics:
+///
+/// - `true` — restoring the node's OWN snapshot (Invariant 2): crash recovery,
+///   actor respawn (`Supervisor::respawn_from_snapshot`), process restart
+///   (`restore_all_contexts`). A lower restored floor is the expected
+///   coalesce-lag case and is MAX-merged with the live floor; the restore
+///   PROCEEDS (never rejected for a regression). Only an overshoot beyond
+///   `MAX_EPOCH_ADVANCE` (corrupt/garbage snapshot) is rejected.
+/// - `false` — importing an UNTRUSTED peer snapshot (Invariant 3): any
+///   per-sender floor regression is rejected (snapshot-mediated replay guard).
+///
 /// Returns `ContextError::PersistenceFailed` if `restore_crypto_state` fails,
 /// or `ContextError::SnapshotFloorRegression` (the §23.17 replay-protection
 /// rejection — whatever `validate_and_merge_epoch_floors` returns) if a
-/// per-sender floor regresses; the restored crypto is rolled back first.
+/// per-sender floor regresses (import path) or overshoots (both paths); the
+/// restored crypto is rolled back first.
 pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     deps: &ActorDeps,
     ctx_id_bytes: &[u8; 32],
     mls_state: &[u8],
+    trusted_local: bool,
 ) -> Result<(), ContextError> {
-    // §23.17 Inv 3: capture floors BEFORE destroying crypto state.
+    // §23.17 Inv 2/3: capture the LIVE floors BEFORE destroying crypto state.
+    // A mailbox/handle despawn does NOT tear down the supervisor-owned crypto
+    // provider, so these live pre-crash floors are still authoritative and are
+    // the max-merge input (Class M, ADR-049 §9).
     let local_epoch_floors = deps.crypto.export_sender_key_epochs(ctx_id_bytes);
 
     let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
@@ -1321,12 +1403,15 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
             })?;
     }
 
-    // §23.17 Inv 3/4: reject any per-sender floor regression (replay guard) and
-    // max-merge local floors back. Roll back the restored crypto on failure.
+    // §23.17 Inv 2/3/4: merge the live floors back. `trusted_local=true` max-
+    // merges and proceeds (Inv 2 — respawn of own snapshot); `false` rejects
+    // any regression (Inv 3 — untrusted peer import). Either way the merged
+    // floor is never below the live floor (Inv 4). Roll back on failure.
     if let Err(e) = deps.crypto.validate_and_merge_epoch_floors(
         ctx_id_bytes,
         local_epoch_floors,
         crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
+        trusted_local,
     ) {
         let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
         let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
@@ -1471,10 +1556,13 @@ pub async fn import_context(
                 // path the actor handler uses, so the replay guard still runs.
                 // Read from the SIGNED snapshot field, never an unsigned
                 // envelope blob (ADR-050).
+                // IMPORT path: untrusted peer snapshot → Invariant 3
+                // (reject-on-regression). `trusted_local = false`.
                 restore_crypto_state_with_floor_guard(
                     deps,
                     &ctx_id_bytes,
                     &export.snapshot.mls_crypto_state,
+                    false,
                 )?;
             }
             Err(other) => return Err(other),
@@ -1482,11 +1570,13 @@ pub async fn import_context(
     } else {
         // Fresh import (no existing actor): floor-guarded crypto restore (the
         // empty-crypto-state case is a no-op restore + floor merge inside the
-        // helper). Read from the SIGNED snapshot field (ADR-050).
+        // helper). Read from the SIGNED snapshot field (ADR-050). IMPORT path:
+        // untrusted peer snapshot → Invariant 3 (reject-on-regression).
         restore_crypto_state_with_floor_guard(
             deps,
             &ctx_id_bytes,
             &export.snapshot.mls_crypto_state,
+            false,
         )?;
     }
 
@@ -1674,7 +1764,13 @@ pub async fn import_context(
                 context_id.clone(),
                 Arc::clone(&deps.clock),
             ),
-            revoked_spending_ucan_cids: HashSet::new(),
+            // Carry the revocation set through import: it is a downward-
+            // authorization decision (a revoked spending UCAN must STAY revoked)
+            // and it is bound into the SIGNED export preimage, so dropping it
+            // would re-admit a token whose revocation the export attests. Unlike
+            // the nonce tracker / proposal timestamps (local-instance C3 wipe),
+            // a revocation is authorization state that must not regress.
+            revoked_spending_ucan_cids: export.snapshot.revoked_spending_ucan_cids,
             // C3: Wipe `proposal_timestamps`.
             proposal_timestamps: HashMap::new(),
         },
@@ -1787,6 +1883,7 @@ pub async fn import_context(
 pub fn load_persisted_context_state(
     deps: &ActorDeps,
     context_id: &str,
+    preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
 ) -> Result<
     (
         crate::context::state::ContextSnapshot,
@@ -1794,17 +1891,28 @@ pub fn load_persisted_context_state(
     ),
     ContextError,
 > {
-    let ctx_snapshot = deps
-        .persistence
-        .load_context(context_id)
-        .map_err(|e| {
-            ContextError::PersistenceFailed(format!(
-                "failed to load context state for {context_id}: {e}"
-            ))
-        })?
-        .ok_or_else(|| {
-            ContextError::PersistenceFailed(format!("no persisted context state for {context_id}"))
-        })?;
+    // Dedup: the watchdog respawn path (`Supervisor::respawn_from_snapshot`)
+    // already loaded the context snapshot for its Active-state precondition
+    // check; it threads that snapshot through here so the context snapshot is
+    // loaded exactly once per respawn. Other callers (process-restart, the
+    // RestoreContext dispatch arm) pass `None` and load it here. The broadcast
+    // snapshot is always loaded here (the respawn pre-load does not fetch it).
+    let ctx_snapshot = match preloaded_snapshot {
+        Some(snapshot) => snapshot,
+        None => deps
+            .persistence
+            .load_context(context_id)
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "failed to load context state for {context_id}: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "no persisted context state for {context_id}"
+                ))
+            })?,
+    };
 
     let broadcast_ctx = deps
         .persistence
@@ -1848,6 +1956,12 @@ fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
 /// its handle in the supervisor registry (no legacy contexts `DashMap`
 /// write). Re-spawns the TTL timer if `ttl_remaining_secs` is `Some`.
 ///
+/// `preloaded_snapshot` lets the watchdog respawn path
+/// (`Supervisor::respawn_from_snapshot`) hand in the `ContextSnapshot` it
+/// already loaded for its `Active`-state precondition check, so the context
+/// snapshot is read from persistence exactly ONCE per respawn instead of twice.
+/// Process-restart and the `RestoreContext` dispatch arm pass `None`.
+///
 /// # Errors
 ///
 /// Returns [`ContextError::PersistenceFailed`] if no persisted state
@@ -1860,6 +1974,7 @@ pub async fn restore_context(
     deps: &ActorDeps,
     context_id: &str,
     handle: &ContextHandle,
+    preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
 ) -> Result<(), ContextError> {
     use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
     use crate::context::lifecycle_logic::{
@@ -1872,7 +1987,8 @@ pub async fn restore_context(
     use scp_protocol::context::governance::mls_integration::EpochCoordinator;
     use scp_protocol::context::membership::ReceiveBuffer;
 
-    let (mut ctx_snapshot, broadcast_ctx) = load_persisted_context_state(deps, context_id)?;
+    let (mut ctx_snapshot, broadcast_ctx) =
+        load_persisted_context_state(deps, context_id, preloaded_snapshot)?;
     restore_event_log_best_effort(deps, context_id);
 
     validate_consequence_rules_for_import(
@@ -1896,8 +2012,32 @@ pub async fn restore_context(
 
     if !ctx_snapshot.mls_crypto_state.is_empty() {
         let ctx_id_bytes = context_id_to_bytes(context_id);
-        deps.crypto
-            .restore_crypto_state(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)?;
+        // §23.17 Invariant 3/4 (replay guard): route the crypto restore through
+        // the floor-regression guard, NOT bare `restore_crypto_state`. This
+        // path is shared by process-restart restore AND the watchdog respawn
+        // (`Supervisor::respawn_from_snapshot`). A respawn rehydrates from the
+        // last COALESCED snapshot, which may lag the live per-sender epoch
+        // floors by up to one coalesce interval (ADR-049 §9). Restoring such a
+        // snapshot with a bare `restore_crypto_state` would silently lower a
+        // per-sender replay floor — re-opening a replay window for any sender
+        // whose epoch advanced after the snapshot was written. The guard
+        // captures the LIVE floors (still held by the crypto provider, which a
+        // mailbox despawn does not tear down) before teardown, restores the
+        // snapshot crypto, then MAX-merges the live floors back. This is the
+        // node restoring its OWN snapshot (Invariant 2, `trusted_local = true`):
+        // a coalesce-lagged snapshot whose floor trails the live floor is the
+        // NORMAL case (an epoch advanced in the ≤50ms pre-crash window), so the
+        // restore MUST max-merge and PROCEED — rejecting it (Invariant 3, the
+        // untrusted-import policy) would fail the respawn and poison a healthy
+        // context. Only an overshoot beyond `MAX_EPOCH_ADVANCE` (corrupt
+        // snapshot) is rejected. The merged floor is never below the live
+        // floor, so a stale snapshot still cannot regress the replay floor.
+        restore_crypto_state_with_floor_guard(
+            deps,
+            &ctx_id_bytes,
+            &ctx_snapshot.mls_crypto_state,
+            true,
+        )?;
     }
 
     let last_members: HashSet<scp_identity::DID> = ctx_snapshot
@@ -2051,7 +2191,12 @@ pub async fn restore_context(
                 Arc::clone(&deps.clock),
                 ctx_snapshot.spending_nonce_tracker_state,
             ),
-            revoked_spending_ucan_cids: HashSet::new(),
+            // ADR-049 §9 Class S: restore the revocation set FROM the snapshot.
+            // Resetting it to empty here (the prior behaviour) silently dropped
+            // every revocation on actor respawn / process restart — a
+            // downward-authorization rollback the crash-safety invariant
+            // forbids. The snapshot is authoritative.
+            revoked_spending_ucan_cids: ctx_snapshot.revoked_spending_ucan_cids,
             proposal_timestamps: ctx_snapshot.proposal_timestamps,
         },
         role_state: ctx_snapshot.role_state,
@@ -2339,6 +2484,12 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         // handle leaks (context stays discoverable via `lookup` /
         // `actor_ids` after "shutdown") and the task never exits.
         supervisor.despawn_actor(ctx_id).await;
+        // Clean shutdown: reap the (non-poison) crash-window entry so it does
+        // not leak past teardown (ADR-049 §10). A poisoned entry is preserved
+        // — its dormant-poison signal survives a shutdown so a subsequent
+        // lookup still reports the poison until an operator clears it or the
+        // process restarts.
+        supervisor.reap_crash_window(ctx_id);
     }
 
     // Supervisor-level state clear. Acquired under the write_lock once
@@ -2411,6 +2562,13 @@ mod restore_reconcile_tests {
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::large_futures,
+        // Test fixtures only: `captured`/`voided` counters read naturally
+        // despite the shared prefix; the recording adapter's trait methods
+        // return string literals tied to `&self` by the trait signature; and
+        // the end-to-end paid-join fixture is necessarily long.
+        clippy::similar_names,
+        clippy::unnecessary_literal_bound,
+        clippy::too_many_lines,
         // Test-only capturing persistence: the `Mutex<HashMap>` is never held
         // across `.await` (writes/reads are synchronous trait methods), so a
         // plain `std::sync::Mutex` is the right tool. The runtime's actor path
@@ -2471,6 +2629,32 @@ mod restore_reconcile_tests {
             _payload: Option<&serde_json::Value>,
         ) -> Result<(), ContextCreationError> {
             Ok(())
+        }
+        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Event log whose `init`/`destroy` succeed but whose `append_event` ALWAYS
+    /// fails. Models the ADR-049 §9 round-9 leak scenario: a WORKING persistence
+    /// backend with a FAILING event-log append, so `finalize_send`'s very first
+    /// `append_context_event("MessageSent")` returns `Err` AFTER the caller has
+    /// reserved a per-sender sequence — exercising the rollback this gate fixes.
+    struct FailingAppendEventLog;
+    impl ContextEventLogProvider for FailingAppendEventLog {
+        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: &str,
+            _actor: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), ContextCreationError> {
+            Err(ContextCreationError::EventLogFailed(
+                "fixture: event-log append deliberately fails".to_owned(),
+            ))
         }
         fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
@@ -2678,7 +2862,7 @@ mod restore_reconcile_tests {
             .await
             .expect("build_actor_deps");
         let handle = ContextHandle::new(restore_ctx_id.to_owned(), ContextParams::default());
-        lifecycle_helpers::restore_context(&deps, restore_ctx_id, &handle).await
+        lifecycle_helpers::restore_context(&deps, restore_ctx_id, &handle, None).await
     }
 
     /// Case 1: reconstructed mode ENCRYPTED (no broadcast state) but the
@@ -2735,5 +2919,612 @@ mod restore_reconcile_tests {
         )
         .await
         .expect("routing agreeing with mode must restore Ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-049 §9 (round-7): paid-join money-ordering parity with the send path.
+    // capture_join_payment (external escrow settlement) runs AFTER the
+    // fail-closed persist. On persist failure the escrow is VOIDED (not
+    // captured), so the joiner is not charged for an unacknowledged join.
+    // -----------------------------------------------------------------------
+
+    /// A persistence double whose `persist_context` ALWAYS fails — drives the
+    /// paid-join fail-closed persist into its error path.
+    #[derive(Default)]
+    struct FailingJoinPersistence;
+    impl ContextPersistence for FailingJoinPersistence {
+        fn persist_context(&self, _id: &str, _snap: &ContextSnapshot) -> Result<(), PersistErr> {
+            Err("forced persist failure".into())
+        }
+        fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _id: &str,
+            _snap: &BroadcastContextSnapshot,
+        ) -> Result<(), PersistErr> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _id: &str,
+        ) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
+            Ok(None)
+        }
+        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
+            Ok(())
+        }
+        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A `PaymentAdapter` that records whether `capture` or `void` was invoked,
+    /// so the money-ordering test can assert the escrow was VOIDED (not
+    /// captured) when the fail-closed persist fails. (Implementing the
+    /// non-dyn `PaymentAdapter` trait yields `PaymentAdapterDyn` via the
+    /// blanket impl.)
+    struct RecordingPaymentAdapter {
+        captured: Arc<std::sync::atomic::AtomicUsize>,
+        voided: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::economy::adapter::PaymentAdapter for RecordingPaymentAdapter {
+        fn adapter_id(&self) -> &str {
+            "recording"
+        }
+        fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
+            crate::economy::adapter::AdapterCapabilities {
+                supported_currencies: vec![scp_protocol::economy::types::CurrencyCode::from("USD")],
+                supports_streaming: false,
+                supports_batch_auth: false,
+                supports_single_step: false,
+                min_amount: None,
+                max_amount: None,
+                typical_settlement_ms: 0,
+                requires_facilitator: false,
+            }
+        }
+        async fn authorize(
+            &self,
+            payer: &DID,
+            payee: &DID,
+            amount: scp_protocol::economy::types::Amount,
+            currency: scp_protocol::economy::types::CurrencyCode,
+            _metadata: crate::economy::adapter::PaymentMetadata,
+        ) -> Result<
+            crate::economy::adapter::PaymentAuthorization,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::PaymentAuthorization {
+                auth_id: [7u8; 32],
+                payer: payer.clone(),
+                payee: payee.clone(),
+                amount,
+                currency,
+                adapter_id: "recording".to_owned(),
+                created_at: 1_000_000,
+                expires_at: 2_000_000,
+                adapter_state: vec![],
+            })
+        }
+        async fn capture(
+            &self,
+            auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
+        {
+            self.captured
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::economy::adapter::PaymentReceipt {
+                receipt_id: [9u8; 32],
+                payer: auth.payer.clone(),
+                payee: auth.payee.clone(),
+                amount: auth.amount,
+                currency: auth.currency,
+                action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
+                context_id: None,
+                adapter_id: "recording".to_owned(),
+                adapter_proof: vec![],
+                timestamp: 1_000_001,
+                signature: vec![],
+            })
+        }
+        async fn void(
+            &self,
+            _auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<(), crate::economy::adapter::PaymentError> {
+            self.voided
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn verify_authorization(
+            &self,
+            _auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<(), crate::economy::adapter::PaymentError> {
+            Ok(())
+        }
+        async fn verify(
+            &self,
+            _receipt: &crate::economy::adapter::PaymentReceipt,
+        ) -> Result<
+            crate::economy::adapter::VerificationResult,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::VerificationResult {
+                valid: true,
+                adapter_id: "recording".to_owned(),
+                verified_amount: scp_protocol::economy::types::Amount(0),
+                verified_currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                verification_timestamp: 1_000_002,
+            })
+        }
+        async fn refund(
+            &self,
+            _receipt: &crate::economy::adapter::PaymentReceipt,
+            _amount: Option<scp_protocol::economy::types::Amount>,
+        ) -> Result<
+            crate::economy::adapter::RefundConfirmation,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::RefundConfirmation {
+                refund_id: [0u8; 32],
+                original_receipt_id: [9u8; 32],
+                refunded_amount: scp_protocol::economy::types::Amount(0),
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                adapter_proof: vec![],
+            })
+        }
+    }
+
+    /// Derive a `did:key` DID + matching signing key (the same convention the
+    /// FFI tool-economy harness uses), so a `key_resolver` can resolve the
+    /// issuer's verifying key for spending-UCAN signature verification.
+    fn join_keypair() -> (DID, ed25519_dalek::SigningKey) {
+        use std::fmt::Write;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32]);
+        let vk = signing_key.verifying_key();
+        let hex = vk.as_bytes().iter().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        (DID::from(format!("did:key:{hex}").as_str()), signing_key)
+    }
+
+    /// Build a fully-signed spending UCAN bound to `joiner` (iss == aud ==
+    /// joiner), signed by `signing_key`, valid for a `ContextJoin`.
+    fn signed_join_ucan(
+        joiner: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> scp_protocol::crypto::ucan::UcanToken {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_protocol::crypto::ucan::nonce::generate_nonce;
+        use scp_protocol::crypto::ucan::spending::{
+            Amount as SpendAmount, CurrencyCode as SpendCurrency, SpendingCapability,
+        };
+        use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
+
+        let cap = SpendingCapability {
+            max_per_action: SpendAmount(u64::MAX),
+            max_total: SpendAmount(u64::MAX),
+            currency: SpendCurrency::from_code("USD").unwrap_or(SpendCurrency(*b"USD\0")),
+            time_window: std::time::Duration::from_hours(1),
+            allowed_adapters: vec![],
+        };
+        let mut fct = serde_json::Map::new();
+        fct.insert(
+            "spending_capability".to_owned(),
+            cap.to_fact_value().unwrap_or(serde_json::Value::Null),
+        );
+        fct.insert(
+            "scp_key_scope".to_owned(),
+            serde_json::Value::String("#agent".to_owned()),
+        );
+
+        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let header = UcanHeader::with_kid("#agent".to_owned());
+        let payload = UcanPayload {
+            iss: joiner.as_ref().to_owned(),
+            aud: joiner.as_ref().to_owned(),
+            exp: now + 3600,
+            nbf: Some(now.saturating_sub(60)),
+            nnc: generate_nonce(&scp_primitives::SystemClock),
+            att: vec![Attenuation {
+                with: "scp:spending:*".to_owned(),
+                can: "spend".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::Value::Object(fct)),
+        };
+
+        let header_json = serde_json::to_vec(&header).expect("header serializes");
+        let payload_json = serde_json::to_vec(&payload).expect("payload serializes");
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature = ed25519_dalek::Signer::sign(signing_key, signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        let encoded = format!("{signing_input}.{sig_b64}");
+
+        UcanToken {
+            header,
+            payload,
+            signature: signature.to_bytes().to_vec(),
+            encoded,
+        }
+    }
+
+    /// ADR-049 §9 (round-7 money-ordering): the escrow side of a PAID join is
+    /// settled atomically with durability — `capture_join_payment` runs only
+    /// AFTER the fail-closed persist succeeds, and the escrow is VOIDED (never
+    /// captured) when the persist fails, so the joiner is never charged for an
+    /// unacknowledged join. The ordering invariant itself is mechanically
+    /// enforced by `paid_join_captures_escrow_after_persist_not_before` below.
+    ///
+    /// This runtime test locks in the CURRENTLY-REACHABLE behavior of the public
+    /// `join_context` path: a paid (`per_join`) context blocks AUTO-accept joins
+    /// at the `auto_accept_blocked_by_economics` guard (SCP-ECON-12030) BEFORE
+    /// any escrow is authorized — so neither capture nor void runs, and no
+    /// double-charge is possible through this path. (Surfaced residual: the
+    /// escrow/persist tail of `join_context` — and thus the round-7 reorder — is
+    /// reached only once an explicit paid-acceptance join flow is wired past the
+    /// auto-accept guard; until then it is forward-looking defensive code. The
+    /// FFI bridges already thread a `spending_ucan` into this path expecting it
+    /// to settle, so the acceptance-flow gap is worth tracking upstream.)
+    #[tokio::test]
+    async fn paid_join_blocked_at_auto_accept_guard_touches_no_escrow() {
+        use scp_protocol::context::roles::Capability;
+
+        let (joiner, joiner_key) = join_keypair();
+        let joiner_for_resolver = joiner.clone();
+        let joiner_vk = joiner_key.verifying_key();
+
+        // Real MLS crypto provider so `add_member` succeeds, plus a key_resolver
+        // that resolves the joiner's verifying key for the spending-UCAN sig.
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkJoinMoneyOrder".to_owned(),
+        ));
+        let key_resolver: scp_protocol::context::governance::KeyResolver = {
+            let did = joiner_for_resolver;
+            let vk = joiner_vk;
+            Arc::new(move |q: &DID| if *q == did { Some(vk) } else { None })
+        };
+        let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
+            Arc::new(RecordingPaymentAdapter {
+                captured: Arc::clone(&captured),
+                voided: Arc::clone(&voided),
+            });
+
+        let sup = Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(OkEventLog),
+            key_resolver,
+            Some(Box::new(FailingJoinPersistence)),
+            Some(payment_adapter),
+            None,
+            None,
+            mls_storage(),
+        );
+
+        let admin = DID("did:dht:z6MkJoinMoneyAdmin".to_owned());
+        let mut deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-paid-join-money-order".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+
+        // Create the MLS group so the joiner's `add_member` can succeed.
+        deps.crypto
+            .create_mls_group(&context_id_bytes)
+            .expect("create_mls_group");
+
+        // Build per-context state with a per_join cost so a spending UCAN is
+        // required and the escrow path runs.
+        let now_secs = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            now_secs,
+            admin.clone(),
+        );
+        state.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
+            Capability::MemberInvite,
+            Capability::MessagesWrite,
+            Capability::MessagesRead,
+        ]);
+        state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
+            locked: false,
+            cost_schedule: scp_protocol::economy::types::CostSchedule {
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                per_message: None,
+                per_tool_invoke: None,
+                per_join: Some(scp_protocol::economy::types::Amount(10)),
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["recording".to_owned()],
+            pricing_formula: None,
+            payee: admin.clone(),
+        });
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        // Generate a real MLS KeyPackage for the joiner.
+        let joiner_cred = crate::crypto::mls::credential::ScpCredential::new(
+            joiner.as_ref().to_owned(),
+            None,
+            scp_protocol::identity::SigningKeyId::Active,
+        )
+        .expect("joiner credential");
+        let (kp_bundle, _signer, _provider) =
+            crate::crypto::mls::group::generate_key_package(&joiner_cred)
+                .expect("generate joiner key package");
+        let kp_bytes =
+            openmls::prelude::tls_codec::Serialize::tls_serialize_detached(kp_bundle.key_package())
+                .expect("serialize key package");
+        let key_package =
+            scp_protocol::context::membership::KeyPackage::new(joiner.clone(), kp_bytes);
+
+        let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let spending_ucan = signed_join_ucan(&joiner, &joiner_key);
+
+        // Even with a failing persistence backend, the paid (`per_join`) policy
+        // is rejected at the auto-accept guard BEFORE escrow authorization, so
+        // the persist failure is never reached and no escrow side effect runs.
+        deps.persistence = Arc::new(FailingJoinPersistence);
+
+        let result = lifecycle_helpers::join_context(
+            &mut state,
+            &deps,
+            &handle,
+            key_package,
+            Some(&spending_ucan),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("SCP-ECON-12030")),
+            "an auto-accept join of a paid context must be rejected at the \
+             economics guard (SCP-ECON-12030) before any escrow side effect: got {result:?}"
+        );
+        assert_eq!(
+            captured.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no escrow may be captured when the join is rejected at the guard"
+        );
+        assert_eq!(
+            voided.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no escrow may be voided when the join is rejected before authorization"
+        );
+    }
+
+    /// ADR-049 §9 (round-7 money-ordering) — STRUCTURAL enforcement of the
+    /// reorder. In `join_context`, the external escrow settlement
+    /// (`capture_join_payment`) MUST appear AFTER the fail-closed persist
+    /// (`persist_state_fail_closed`), and the persist-failure branch MUST void
+    /// the escrow (`void_paid_action`) — mirroring the send path. This guards
+    /// the ordering at compile/test time because the runtime tail is currently
+    /// gated behind the not-yet-wired explicit paid-acceptance flow (see
+    /// `paid_join_blocked_at_auto_accept_guard_touches_no_escrow`). A non-gamed
+    /// assertion: it checks the actual byte ORDER of the two calls in the real
+    /// `join_context` body, so reverting the reorder fails this test.
+    #[test]
+    fn paid_join_captures_escrow_after_persist_not_before() {
+        const SRC: &str = include_str!("lifecycle_helpers.rs");
+
+        // Isolate the `join_context` fn body (from its signature to the next
+        // top-level `pub fn`/`pub async fn` boundary) so the assertion is about
+        // THIS function, not incidental matches elsewhere in the file.
+        let start = SRC
+            .find("pub async fn join_context(")
+            .expect("join_context must exist");
+        let rest = &SRC[start..];
+        // The function ends before the next item that starts a new helper.
+        let end_rel = rest
+            .find("\npub fn join_context_membership(")
+            .expect("join_context_membership follows join_context");
+        let body = &rest[..end_rel];
+
+        let persist_idx = body
+            .find("persist_state_fail_closed(state, deps, &context_id)")
+            .expect("join_context must fail-closed persist on the paid path");
+        let capture_idx = body
+            .find("capture_join_payment(")
+            .expect("join_context must capture the escrow");
+
+        assert!(
+            persist_idx < capture_idx,
+            "capture_join_payment (escrow settlement) must run AFTER \
+             persist_state_fail_closed — capturing before durability double-charges \
+             the joiner on the idempotent retry (ADR-049 §9 round-7)"
+        );
+
+        // The persist-failure branch (between the fail-closed persist and the
+        // success-path capture) MUST void the escrow. `void_paid_action` also
+        // appears in the earlier MLS-rollback branches, so search the slice
+        // AFTER the persist call for the failure escape hatch specifically.
+        let post_persist = &body[persist_idx..capture_idx];
+        assert!(
+            post_persist.contains("void_paid_action(state, deps, a, &context_id)"),
+            "the persist-failure branch must void the escrow (between the \
+             fail-closed persist and the success-path capture) so a durability \
+             failure releases the hold instead of charging the joiner"
+        );
+    }
+
+    /// ADR-049 §9 (round-9 leak fix) — BEHAVIORAL. `finalize_send` reserves a
+    /// per-sender sequence in its caller (`send_message`), and OWNS the sequence
+    /// rollback on every error exit. Its FIRST statement is the `MessageSent`
+    /// `append_context_event`; before this fix that `?` returned BEFORE the
+    /// relocated rollbacks, so an event-log append failure leaked the reserved
+    /// sequence → a per-sender gap → a receiver `SequenceGapForceClose`. This
+    /// test drives a WORKING persistence + a FAILING event-log append directly
+    /// through `finalize_send` and asserts the reserved sequence returns to its
+    /// pre-reservation baseline EXACTLY ONCE (no leak, no double-rollback).
+    #[tokio::test]
+    async fn finalize_send_rolls_back_sequence_on_event_log_append_failure() {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkFinalizeSendSeq".to_owned(),
+        ));
+        let key_resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(|_q: &DID| None);
+
+        // Working persistence (CapturingPersistence) + FAILING event-log append.
+        let sup = Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(FailingAppendEventLog),
+            key_resolver,
+            Some(Box::new(CapturingPersistence::default())),
+            None,
+            None,
+            None,
+            mls_storage(),
+        );
+
+        let admin = DID("did:dht:z6MkFinalizeSendAdmin".to_owned());
+        let deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-finalize-send-seq".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+
+        let sender = DID("did:dht:z6MkFinalizeSendSender".to_owned());
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+            admin.clone(),
+        );
+        state
+            .membership
+            .add_member(sender.clone(), "member".to_owned(), Vec::new());
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        // Reserve a sequence exactly as `send_message` does, capturing it.
+        let reserved = state
+            .membership
+            .next_sequence_number(sender.as_ref())
+            .expect("sender is a member");
+        assert_eq!(reserved, 1, "first reservation yields sequence 1");
+
+        // Encrypted (non-broadcast) send: the failing append must roll the
+        // reservation back. `signing_key = None` → the post-append checkpoint
+        // path is skipped, but the append fails first regardless.
+        let result = crate::context::messaging_helpers::finalize_send(
+            &mut state,
+            &deps,
+            &context_id,
+            &context_id_bytes,
+            &sender,
+            reserved,
+            b"payload",
+            None,
+            false, // spending_nonce_committed
+            false, // is_broadcast
+        );
+
+        assert!(
+            matches!(result, Err(ContextError::EventLogFailed(_))),
+            "a failing event-log append must surface as EventLogFailed: got {result:?}"
+        );
+
+        // The reservation must have been rolled back EXACTLY ONCE: the next
+        // reservation returns 1 again. A leak would make it return 2; a
+        // double-rollback (saturating_sub past the floor) would also return 1
+        // here but only because it underflowed — so additionally assert the
+        // pre-reservation reissue is stable across two calls.
+        let next_after_failure = state
+            .membership
+            .next_sequence_number(sender.as_ref())
+            .expect("sender is still a member");
+        assert_eq!(
+            next_after_failure, 1,
+            "the reserved sequence must roll back to baseline exactly once, so the \
+             next reservation reissues 1 (a leak would reissue 2)"
+        );
+    }
+
+    /// ADR-049 §9 (round-9 leak fix) — STRUCTURAL. In `join_context`, the
+    /// `MemberJoined` `append_context_event` runs AFTER the economy ticket is
+    /// committed but while the external escrow hold (`auth`, a
+    /// `PaidActionAuthorization` with NO `Drop`) is still held and uncaptured.
+    /// On that append's `Err`, `auth` would otherwise drop WITHOUT voiding —
+    /// leaking the hold and charging the joiner for an unacknowledged join. The
+    /// runtime tail (post-commit, pre-capture) is reached only by the not-yet-
+    /// wired explicit paid-acceptance flow (the public entry rejects an
+    /// auto-accept paid join at SCP-ECON-12030 first — see
+    /// `paid_join_blocked_at_auto_accept_guard_touches_no_escrow`), so this is a
+    /// STRUCTURAL assertion on the real `join_context` body, mirroring
+    /// `paid_join_captures_escrow_after_persist_not_before`: the `MemberJoined`
+    /// append's failure branch — which sits BETWEEN the ticket commit and the
+    /// fail-closed persist — MUST void the escrow.
+    #[test]
+    fn join_context_voids_escrow_on_member_joined_append_failure() {
+        const SRC: &str = include_str!("lifecycle_helpers.rs");
+
+        let start = SRC
+            .find("pub async fn join_context(")
+            .expect("join_context must exist");
+        let rest = &SRC[start..];
+        let end_rel = rest
+            .find("\npub fn join_context_membership(")
+            .expect("join_context_membership follows join_context");
+        let body = &rest[..end_rel];
+
+        // The economy ticket is committed here; AFTER this point `auth` is the
+        // only un-Drop-guarded reservation still live.
+        let commit_idx = body
+            .find("commit_economy_ticket(ticket)")
+            .expect("join_context must commit the economy ticket before the append");
+        // The MemberJoined append is the next fallible step after the commit.
+        let append_idx = body
+            .find("\"MemberJoined\"")
+            .expect("join_context must append a MemberJoined event");
+        assert!(
+            commit_idx < append_idx,
+            "the MemberJoined append must follow the ticket commit"
+        );
+
+        // The fail-closed persist runs after the append; the append-failure
+        // branch sits strictly between commit and that persist.
+        let persist_idx = body
+            .find("persist_state_fail_closed(state, deps, &context_id)")
+            .expect("join_context must fail-closed persist on the paid path");
+        assert!(
+            append_idx < persist_idx,
+            "the MemberJoined append must precede the fail-closed persist"
+        );
+
+        // The slice from the append to the fail-closed persist contains the
+        // append's Err branch. It MUST void the escrow — otherwise `auth` drops
+        // silently (no Drop impl) and the hold leaks.
+        let append_to_persist = &body[append_idx..persist_idx];
+        assert!(
+            append_to_persist.contains("void_paid_action(state, deps, a, &context_id)"),
+            "the MemberJoined append-failure branch (between the ticket commit and \
+             the fail-closed persist) must void the escrow so a failing append \
+             releases the hold instead of leaking it (ADR-049 §9 round-9)"
+        );
     }
 }

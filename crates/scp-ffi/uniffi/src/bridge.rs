@@ -1126,6 +1126,20 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
+            // ADR-049 §10: actor poisoned (exceeded the respawn budget).
+            // Dedicated SCP-CTX-2134 instead of the CTX_2001 catch-all so a
+            // Swift / Kotlin caller can detect "dormant, needs operator
+            // recovery".
+            CE::ContextPoisoned(_) => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2134.to_owned(),
+            },
+            // ADR-049 §10: actor crashed and could not be respawned (lost /
+            // corrupt snapshot). Dedicated SCP-CTX-2135 instead of CTX_2001.
+            CE::ActorCrashed(_) => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2135.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
@@ -1437,6 +1451,9 @@ pub enum ContextState {
     MigratingOut,
     /// Context permanently tombstoned after migration (§5.11A.5). Terminal state.
     Tombstoned,
+    /// Context actor exceeded its respawn budget (ADR-049 §10) — dormant
+    /// until operator intervention. No actor is serving the context.
+    Poisoned,
 }
 
 /// Memory scope for a context — governs key destruction and data retention on close.
@@ -2590,7 +2607,13 @@ impl ContextHandle {
     /// Returns the context's current lifecycle state as a string.
     ///
     /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
-    /// `"migrating_out"`, `"tombstoned"`.
+    /// `"migrating_out"`, `"tombstoned"`, `"poisoned"`.
+    ///
+    /// `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
+    /// path wrote `Poisoned` into this cached state; the watchdog poison path
+    /// does NOT push into this cache (it is a best-effort cached getter, not a
+    /// live supervisor read). The authoritative poison signal is the
+    /// `SCP-CTX-2134` error code on the next per-context operation.
     ///
     /// # Errors
     ///
@@ -2608,6 +2631,7 @@ impl ContextHandle {
             ContextState::Expired => "expired".to_owned(),
             ContextState::MigratingOut => "migrating_out".to_owned(),
             ContextState::Tombstoned => "tombstoned".to_owned(),
+            ContextState::Poisoned => "poisoned".to_owned(),
         })
     }
 
@@ -18144,6 +18168,41 @@ mod tests {
     fn non_pre_rotation_identity_errors_keep_generic_envelope() {
         let err: ScpError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
         assert_eq!(pre_rotation_code_of(err), codes::IDENT_1001);
+    }
+
+    /// Extracts the code from a `ScpError::Context` (or panics).
+    fn context_code_of(e: ScpError) -> String {
+        match e {
+            ScpError::Context { code, .. } => code,
+            other => panic!("expected ScpError::Context, got {other:?}"),
+        }
+    }
+
+    /// ADR-049 §10: a poisoned context must surface the dedicated
+    /// SCP-CTX-2134 code, NOT the catch-all SCP-CTX-2001.
+    #[test]
+    fn context_poisoned_surfaces_ctx_2134() {
+        let err: ScpError =
+            scp_core::context::ContextError::ContextPoisoned("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2134);
+    }
+
+    /// ADR-049 §10: an unrecoverable actor crash must surface the dedicated
+    /// SCP-CTX-2135 code, distinct from the poison code and the catch-all.
+    #[test]
+    fn actor_crashed_surfaces_ctx_2135() {
+        let err: ScpError =
+            scp_core::context::ContextError::ActorCrashed("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2135);
+    }
+
+    /// Regression guard: an unrelated `ContextError` still falls through to
+    /// the catch-all SCP-CTX-2001 — the poison/crash arms are narrow.
+    #[test]
+    fn generic_context_error_keeps_ctx_2001() {
+        let err: ScpError =
+            scp_core::context::ContextError::MembershipFailed("nope".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2001);
     }
 
     // -----------------------------------------------------------------------

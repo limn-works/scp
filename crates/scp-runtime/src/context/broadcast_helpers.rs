@@ -782,6 +782,7 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         hard_rate_limit_config: Some(state.governance.hard_rate_limit.config().clone()),
         hard_rate_limit_state: state.governance.hard_rate_limit.snapshot_entries(),
         spending_nonce_tracker_state: state.governance.spending_nonce_tracker.snapshot_entries(),
+        revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
         pending_commits: state.pending_commits.clone(),
         commit_fault: state.commit_fault.clone(),
         checkpoint_events_since: state.checkpoint_events_since,

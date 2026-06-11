@@ -237,6 +237,19 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
+            // ADR-049 §10: actor poisoned (exceeded the respawn budget).
+            // Dedicated SCP-CTX-2134 instead of the CTX_2001 catch-all so a
+            // caller can detect "dormant, needs operator recovery".
+            CE::ContextPoisoned(_) => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2134.to_owned(),
+            },
+            // ADR-049 §10: actor crashed and could not be respawned (lost /
+            // corrupt snapshot). Dedicated SCP-CTX-2135 instead of CTX_2001.
+            CE::ActorCrashed(_) => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2135.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
@@ -629,5 +642,40 @@ mod tests {
     fn non_pre_rotation_identity_errors_keep_generic_envelope() {
         let err: ScpNapiError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
         assert_eq!(code_of(err), codes::IDENT_1001);
+    }
+
+    /// Extracts the code from a `ScpNapiError::Context` (or panics).
+    fn context_code_of(e: ScpNapiError) -> String {
+        match e {
+            ScpNapiError::Context { code, .. } => code,
+            other => panic!("expected ScpNapiError::Context, got {other:?}"),
+        }
+    }
+
+    /// ADR-049 §10: a poisoned context must surface the dedicated
+    /// SCP-CTX-2134 code, NOT the catch-all SCP-CTX-2001.
+    #[test]
+    fn context_poisoned_surfaces_ctx_2134() {
+        let err: ScpNapiError =
+            scp_core::context::ContextError::ContextPoisoned("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2134);
+    }
+
+    /// ADR-049 §10: an unrecoverable actor crash must surface the dedicated
+    /// SCP-CTX-2135 code, distinct from the poison code and the catch-all.
+    #[test]
+    fn actor_crashed_surfaces_ctx_2135() {
+        let err: ScpNapiError =
+            scp_core::context::ContextError::ActorCrashed("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2135);
+    }
+
+    /// Regression guard: an unrelated `ContextError` still falls through to
+    /// the catch-all SCP-CTX-2001 — the poison/crash arms are narrow.
+    #[test]
+    fn generic_context_error_keeps_ctx_2001() {
+        let err: ScpNapiError =
+            scp_core::context::ContextError::MembershipFailed("nope".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2001);
     }
 }

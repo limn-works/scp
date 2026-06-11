@@ -282,7 +282,10 @@ pub async fn tombstone_migrated_context(
     // M7: Participation decay on tombstone (#1530).
     state.governance.decay_participation();
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: tombstoning is a terminal lifecycle transition (the
+    // context is migrated out and must not silently re-open) — persist
+    // fail-closed.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
 
     deps.event_log.append_context_event(
         &context_id_bytes,
@@ -398,7 +401,10 @@ pub async fn apply_pending_ceiling_modification(
     state.role_state.ceiling = CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
     state.governance.pending_ceiling_modification = None;
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: applying a ceiling modification is a downward-
+    // authorization transition (the effective capability ceiling lowers) —
+    // persist fail-closed so a crash cannot restore the prior, broader ceiling.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
@@ -661,7 +667,10 @@ pub fn execute_suspend_member(
         deps,
     );
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: member suspension is a downward-authorization
+    // transition — persist fail-closed so a crash cannot un-suspend a member
+    // the caller was told was suspended.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
@@ -766,7 +775,10 @@ pub fn execute_revoke(
     let needs_sender_key_rotation = matches!(access, AccessScope::Write | AccessScope::Both)
         && state.broadcast_context.is_none();
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: revocation (capability / access / write) is a
+    // downward-authorization transition — persist fail-closed so a crash cannot
+    // re-grant authority the caller was told was revoked.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     if let Some(ref bc) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, bc);
     }
@@ -1078,7 +1090,10 @@ pub fn execute_remove_member(
         );
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: member removal is a downward-authorization
+    // transition — persist fail-closed so a crash cannot re-admit a removed
+    // member.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
         .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
     state.checkpoint_events_since += 1;
@@ -1114,7 +1129,10 @@ pub fn execute_change_role(
         info.tokens = tokens;
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: a role change can be a demotion (downward
+    // authorization) — persist fail-closed so a crash cannot restore authority
+    // a demotion removed.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
         .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
     state.checkpoint_events_since += 1;
@@ -1178,7 +1196,12 @@ pub fn execute_remove_tool(
         .registered_tools
         .retain(|t| t.tool_id != tool_id);
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: removing a registered tool revokes the authority to
+    // invoke it — a downward-authorization transition (the inverse of
+    // `execute_register_tool`'s upward grant). Persist fail-closed so an actor
+    // crash in the ≤50ms coalesce window cannot roll the removal back and
+    // re-grant invocation of a tool the caller was told was removed.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
         .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
     state.checkpoint_events_since += 1;
@@ -1237,7 +1260,10 @@ pub fn execute_modify_ceiling(
         deps,
     );
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: the pending ceiling modification is part of a
+    // ceiling-lowering decision chain (downward authorization) — persist
+    // fail-closed so the pending record cannot be lost on a crash.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         "CeilingModificationPending",
@@ -1276,7 +1302,10 @@ pub async fn execute_close_context(
     state.broadcast_context = None;
     state.governance.decay_participation();
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: the lifecycle close transition is security-critical
+    // (a closed context must not silently re-open on a crash) — persist
+    // fail-closed.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
         .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
     state.checkpoint_events_since += 1;
@@ -1418,7 +1447,11 @@ pub fn execute_transfer_admin(
         info.tokens = tokens;
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: admin transfer is an authorization transition (the
+    // prior admin loses admin authority) — persist fail-closed so a crash
+    // cannot restore the prior admin's authority after the transfer was
+    // acknowledged.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
         .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
     state.checkpoint_events_since += 1;
@@ -1629,7 +1662,10 @@ pub fn execute_remove_signer(
         });
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: removing a threshold signer tightens governance
+    // authorization — persist fail-closed so a crash cannot re-admit a removed
+    // signer.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
         .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
     state.checkpoint_events_since += 1;
@@ -1660,7 +1696,10 @@ pub fn execute_modify_threshold(
     }
     state.governance.threshold_value = new_threshold;
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: changing the governance threshold is an
+    // authorization-control transition — persist fail-closed so a crash cannot
+    // revert to a weaker threshold the caller was told had changed.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
         .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
     state.checkpoint_events_since += 1;
@@ -1899,7 +1938,13 @@ pub fn execute_resolve_conflict(
 
     state.governance.freeze = None;
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: `executed_proposals` is security-critical replay-
+    // protection state that does NOT survive an actor crash (it lives in the
+    // actor-owned `GovernanceState`). Persist fail-closed BEFORE acknowledging
+    // the resolution — if the persist fails, return an error rather than
+    // reporting success on a mutation an actor crash could roll back (which
+    // would let an already-resolved/superseded proposal be re-executed).
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         "GovernanceConflictResolved",
@@ -2031,7 +2076,11 @@ pub fn execute_rotate_content_keys(
         )?;
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: content-key rotation is a forward-secrecy transition
+    // (the prior wrapping/content keys are superseded) — persist fail-closed so
+    // a crash cannot revert to the pre-rotation key state after the rotation
+    // was acknowledged.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     if let Some(ref snap) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, snap);
     }
@@ -2117,7 +2166,11 @@ pub fn execute_reconfigure_governance(
         return Err(e);
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: governance reconfiguration (signer/threshold changes)
+    // is an authorization-control transition — persist fail-closed so a crash
+    // cannot revert to the prior governance configuration after the
+    // reconfiguration was acknowledged.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
         .append_context_event(&context_id_bytes, "GovernanceReconfigured", actor_did)?;
     state.checkpoint_events_since += 1;
@@ -3174,10 +3227,19 @@ pub fn dispatch_content_governance_action(
         | GovernanceAction::ProposeContextMigration { .. }
         | GovernanceAction::CancelContextMigration
         | GovernanceAction::ModifyHardRateLimit { .. } => {
-            unreachable!(
-                "action variant handled by dispatch_governance_action \
-                 or dispatch_context_governance_action"
-            )
+            // ADR-049 §10 (round-9): these variants are routed by
+            // `dispatch_governance_action` / `dispatch_context_governance_action`
+            // and never reach this content-level leaf. A future routing change
+            // that mis-delivers one here must surface as a recoverable typed
+            // error — NOT a panic. A panic inside a per-context actor handler
+            // unwinds the task; the watchdog catches it but discards the payload
+            // (it may interpolate key material) and burns respawn budget toward
+            // poison (a self-DoS). Return a typed `GovernanceFailed` instead.
+            Err(ContextError::GovernanceFailed(format!(
+                "governance action {} is not a content-level leaf — it is routed by \
+                 dispatch_governance_action / dispatch_context_governance_action",
+                action.variant_name()
+            )))
         }
     }
 }
@@ -3288,7 +3350,16 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::ApproveSpend { .. }
         | GovernanceAction::LockEconomicPolicy
         | GovernanceAction::ModifyHardRateLimit { .. } => {
-            unreachable!("handled in dispatch_governance_action")
+            // ADR-049 §10 (round-9): these variants are handled by the top-level
+            // `dispatch_governance_action` and never reach this context-level
+            // dispatcher. A future routing change that delivers one here must
+            // surface as a recoverable typed error, never an actor-killing panic
+            // (see the matching arm in `dispatch_content_governance_action`).
+            Err(ContextError::GovernanceFailed(format!(
+                "governance action {} is not a context-level leaf — it is handled by \
+                 dispatch_governance_action",
+                action.variant_name()
+            )))
         }
     }
 }
@@ -3342,7 +3413,13 @@ pub async fn dispatch_governance_action(
                 deps,
             );
 
-            crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+            // ADR-049 §9 Class S: `suspend_all` strips a member's ENTIRE
+            // capability set — a downward-authorization transition, identical
+            // in shape to `execute_suspend_member`'s `suspend_capabilities`.
+            // Persist fail-closed so an actor crash in the ≤50ms coalesce
+            // window cannot roll the ban back and re-grant the suspended
+            // member's capabilities after the caller was told the ban applied.
+            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log
                 .append_context_event(&context_id_bytes, "MemberSuspendedAll", actor)?;

@@ -112,9 +112,6 @@ pub enum ContextLifecycleState {
     /// Terminal. The actor's `run()` loop has exited; the handle in the
     /// supervisor's `actors` map is stale and should be removed.
     Closed,
-    /// Crash-count budget exhausted (3 panics in 60s per ADR-049 §10).
-    /// The supervisor will NOT respawn; operator intervention required.
-    Poisoned,
 }
 
 // ---------------------------------------------------------------------------

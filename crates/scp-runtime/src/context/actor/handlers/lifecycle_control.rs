@@ -61,6 +61,14 @@ pub async fn dispatch(
         LifecycleControlCommand::PrepareForReplace { mls_state, reply } => {
             handle_prepare_for_replace(state, deps, &mls_state, reply)
         }
+        // The test-only fault-injection variant is intercepted by the
+        // actor's `dispatch_state` (in `actor/mod.rs`) BEFORE it reaches
+        // this handler, so it never actually arrives here. The arm exists
+        // only to keep the match exhaustive when the `testing` feature adds
+        // the variant — it must NOT panic (the handler panic-ban gate), so
+        // it is a typed no-op.
+        #[cfg(feature = "testing")]
+        LifecycleControlCommand::TestInducePanic { .. } => Outcome::ok(()),
     }
 }
 
@@ -97,7 +105,11 @@ fn handle_prepare_for_replace(
         return Outcome::ok(());
     }
 
-    // Security invariant: never overwrite a LIVE context.
+    // Security invariant: never overwrite a LIVE context. A `Poisoned`
+    // context (ADR-049 §10) is dead — its actor exhausted the respawn budget
+    // and is no longer serving the context — so it is replaceable, exactly
+    // like the terminal states. Including it here lets an import / replace
+    // recover a poisoned id without first requiring an operator `clear_poison`.
     let replaceable = state.handle.try_read_state().is_some_and(|s| {
         matches!(
             s,
@@ -105,6 +117,7 @@ fn handle_prepare_for_replace(
                 | ContextState::Closed
                 | ContextState::Expired
                 | ContextState::Tombstoned
+                | ContextState::Poisoned
         )
     });
     if !replaceable {
@@ -121,10 +134,13 @@ fn handle_prepare_for_replace(
     // `SnapshotFloorRegression` replay rejection) the helper has already rolled
     // back the crypto; surface the error and leave the actor live (NO terminal
     // claim) so a rejected/replayed import cannot terminate a live context.
+    // `PrepareForReplace` is driven by `import_context` — an UNTRUSTED peer
+    // snapshot. Use Invariant 3 (reject-on-regression): `trusted_local = false`.
     if let Err(e) = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
         deps,
         &ctx_id_bytes,
         mls_state,
+        false,
     ) {
         let _ = reply.send(Err(e));
         return Outcome::ok(());

@@ -343,6 +343,7 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         hard_rate_limit_config: Some(ctx.governance.hard_rate_limit.config().clone()),
         hard_rate_limit_state: ctx.governance.hard_rate_limit.snapshot_entries(),
         spending_nonce_tracker_state: ctx.governance.spending_nonce_tracker.snapshot_entries(),
+        revoked_spending_ucan_cids: ctx.governance.revoked_spending_ucan_cids.clone(),
         pending_commits: ctx.pending_commits.clone(),
         commit_fault: ctx.commit_fault.clone(),
         checkpoint_events_since: ctx.checkpoint_events_since,
