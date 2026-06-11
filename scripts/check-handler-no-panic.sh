@@ -341,22 +341,143 @@ if [[ ! -f "$DISPATCH_HUB" ]]; then
     exit 2
 fi
 
+# The per-context dispatch helper layer (`*_helpers.rs`) — the `execute_*`
+# governance leaves and dispatch transitives the handlers call synchronously.
+# A reachable panic here unwinds the same actor task as a handler panic.
+HELPER_DIR="crates/scp-runtime/src/context"
+
+if [[ ! -d "$HELPER_DIR" ]]; then
+    printf '%serror:%s helper dir %s does not exist\n' \
+        "$C_RED" "$C_RESET" "$HELPER_DIR" >&2
+    exit 2
+fi
+
 # ---------------------------------------------------------------------------
-# run_scan — scan a handlers dir + dispatch hub, evaluate the results, print a
-# verdict. Returns 0 on PASS, 1 on a banned-macro / MULTITEST / vacuous-scan
-# failure. Factored out so the self-test below can drive it against synthetic
-# fixtures (planted production panic, planted handler panic) and assert the
-# gate actually catches them.
+# scan_helper_file — scan one per-context dispatch HELPER file
+# (`crates/scp-runtime/src/context/*_helpers.rs`) for the REACHABLE-panic
+# family only. ADR-049 §10 (round-9): the helper layer holds the `execute_*`
+# governance leaves and the per-context dispatch transitives that the actor
+# handlers call synchronously. A `panic!`/`unreachable!`/`unimplemented!`/`todo!`
+# reached there unwinds the SAME actor task as a panic in a handler — the
+# watchdog respawns and, on a deterministic re-trip, poisons the context (a
+# self-DoS, see §10 BLACK-002). So a reachable panic in a helper is exactly as
+# dangerous as one in a handler and is banned here.
+#
+# DIFFERENCES FROM `scan_file` (handlers), each deliberate:
+#
+#   1. BANNED SET = reachable panics ONLY: panic unreachable unimplemented todo.
+#      The `assert*!` / `debug_assert*!` family is NOT banned in the helper
+#      layer. A `debug_assert!` is compiled OUT of release builds, so it can
+#      never unwind a production actor; the helpers legitimately use it as a
+#      release-stripped invariant tripwire (e.g. a `Drop`-guard "ticket dropped
+#      without commit" tripwire that ALSO logs + recovers in release). Banning
+#      the always-compiled reachable-panic macros catches the real hazard the
+#      round-9 `unreachable!→Err` conversion targets without forcing the removal
+#      of legitimate debug tripwires. (Handlers stay assert-free via `scan_file`;
+#      this carve-out is scoped to the helper layer only.)
+#
+#   2. TEST-REGION EXCLUSION by brace-depth, not a single `#[cfg(test)]` cutoff.
+#      Helper files gate test/test-only code several ways — `#[cfg(test)]`,
+#      `#[cfg(all(test, feature = "testing"))]`, `#[cfg(any(test, feature =
+#      "testing"))]`, and bare `#[cfg(feature = "testing")]` test accessors that
+#      are INTERSPERSED in production (not a single trailing module). The
+#      "scan everything before the first #[cfg(test)]" model would mis-handle
+#      these. Instead, any `#[cfg(...)]` attribute whose predicate mentions
+#      `test` or `feature = "testing"` marks the NEXT item as a gated region,
+#      tracked by brace depth exactly like the dispatch hub's testing-seam
+#      exclusion; banned macros inside such a region are skipped. This both
+#      ignores the trailing test module and the interspersed testing-only items.
+#
+# Emits, per offending line: HIT<TAB>file<TAB>line<TAB>text, plus a trailing
+# SCANNED<TAB>file<TAB>count of live production lines inspected.
+# ---------------------------------------------------------------------------
+scan_helper_file() {
+    local file="$1"
+    awk -v FILE="$file" '
+    BEGIN {
+        in_block = 0
+        depth = 0
+        gated_pending = 0   # saw a test/testing #[cfg(...)], awaiting item open
+        in_gated = 0        # currently inside a test/testing-gated region
+        gated_floor = 0     # brace depth the gated region returns to
+        # Reachable-panic family ONLY (assert/debug_assert intentionally absent).
+        split("panic unreachable unimplemented todo", names, " ")
+    }
+    {
+        raw = $0
+
+        # Detect a test/testing cfg gate on the RAW line BEFORE string/comment
+        # stripping (the `"testing"` literal would otherwise be stripped). Match
+        # any #[cfg(...)] whose predicate references `test` (covers `test`,
+        # `all(test, ..)`, `any(test, ..)`) OR `feature = "testing"`.
+        if (raw ~ /#\[cfg\([^]]*\btest\b/ || \
+            raw ~ /#\[cfg\([^]]*feature[[:space:]]*=[[:space:]]*"testing"/) {
+            gated_pending = 1
+        }
+
+        line = raw
+        if (!in_block) gsub(/"[^"]*"/, "", line)
+        if (!in_block) sub(/\/\/.*$/, "", line)
+        while (match(line, /\/\*.*\*\//)) {
+            line = substr(line, 1, RSTART - 1) substr(line, RSTART + RLENGTH)
+        }
+        if (match(line, /\/\*/)) { line = substr(line, 1, RSTART - 1); in_block = 1 }
+        if (in_block && match(line, /\*\//)) { line = substr(line, RSTART + RLENGTH); in_block = 0 }
+        if (in_block) next
+
+        opens = gsub(/{/, "{", line)
+        closes = gsub(/}/, "}", line)
+
+        # A pending test/testing gate opens its region at the first net-positive
+        # brace line; the floor is the depth BEFORE this item opened.
+        if (gated_pending && opens > 0) {
+            in_gated = 1
+            gated_floor = depth
+            gated_pending = 0
+        }
+
+        if (!in_gated) {
+            if (line ~ /[^[:space:]]/) scanned++
+            for (i in names) {
+                pat = "(^|[^A-Za-z0-9_])" names[i] "!"
+                if (match(line, pat)) {
+                    trimmed = line
+                    sub(/^[[:space:]]+/, "", trimmed)
+                    sub(/[[:space:]]+$/, "", trimmed)
+                    printf("HIT\t%s\t%d\t%s\n", FILE, NR, trimmed)
+                    break
+                }
+            }
+        }
+
+        depth += opens - closes
+        if (in_gated && depth <= gated_floor) in_gated = 0
+    }
+    END {
+        printf("SCANNED\t%s\t%d\n", FILE, scanned)
+    }
+    ' "$file"
+}
+
+# ---------------------------------------------------------------------------
+# run_scan — scan a handlers dir + dispatch hub + the per-context helper layer,
+# evaluate the results, print a verdict. Returns 0 on PASS, 1 on a banned-macro
+# / MULTITEST / vacuous-scan failure. Factored out so the self-test below can
+# drive it against synthetic fixtures (planted production panic, planted handler
+# panic) and assert the gate actually catches them.
 #
 # Args:
 #   $1 — handlers scan dir
 #   $2 — dispatch hub file
 #   $3 — verb for messages ("scan" for the real run, "self-test" otherwise)
+#   $4 — (optional) helper-layer dir scanned for the reachable-panic family.
+#        When empty (the self-test fixtures), the helper scan is skipped.
 # ---------------------------------------------------------------------------
 run_scan() {
     local scan_dir="$1"
     local dispatch_hub="$2"
     local label="${3:-scan}"
+    local helper_dir="${4:-}"
 
     local tmp_out
     tmp_out=$(mktemp)
@@ -374,6 +495,22 @@ run_scan() {
     printf '%shandler panic-ban %s:%s %s\n' \
         "$C_DIM" "$label" "$C_RESET" "$dispatch_hub"
     scan_dispatch_hub "$dispatch_hub" >> "$tmp_out"
+
+    # Scan the per-context dispatch helper layer for reachable panics.
+    local helper_scanned=0 helper_min=0
+    if [[ -n "$helper_dir" ]]; then
+        printf '%shelper panic-ban %s:%s %s/*_helpers.rs\n' \
+            "$C_DIM" "$label" "$C_RESET" "$helper_dir"
+        find "$helper_dir" -maxdepth 1 -type f -name '*_helpers.rs' -print0 \
+            | while IFS= read -r -d '' file; do
+                scan_helper_file "$file"
+            done >> "$tmp_out"
+        helper_scanned=$(awk -F'\t' -v D="$helper_dir" \
+            '$1=="SCANNED" && index($2, D)==1 {s+=$3} END{print s+0}' "$tmp_out")
+        # The helper layer is several thousand production lines; a near-zero
+        # count means the scanner wedged (and the gate would vacuously pass).
+        helper_min=500
+    fi
 
     local hits multi
     hits=$(grep -c $'^HIT\t' "$tmp_out" 2>/dev/null || true)
@@ -398,6 +535,12 @@ run_scan() {
     if [[ "$hub_scanned" -lt "$hub_min" ]]; then
         vacuous=1
     fi
+    # Helper-layer vacuity: if a helper dir was scanned, it must contribute a
+    # non-trivial line count (the helper layer is thousands of lines). A wedged
+    # helper scanner would otherwise let a reachable panic slip through.
+    if [[ -n "$helper_dir" && "$helper_scanned" -lt "$helper_min" ]]; then
+        vacuous=1
+    fi
 
     if [[ "$multi" -ne 0 ]]; then
         printf '\n%sFAILED%s: %d handler file(s) contain more than one `#[cfg(test)]`,\n' \
@@ -412,12 +555,14 @@ run_scan() {
     fi
 
     if [[ "$vacuous" -ne 0 ]]; then
-        printf '\n%sFAILED%s: dispatch hub scan is vacuous — only %d production\n' \
+        printf '\n%sFAILED%s: a scan is vacuous — dispatch hub scanned %d production\n' \
             "$C_RED" "$C_RESET" "$hub_scanned" >&2
-        printf 'line(s) scanned in %s (expected >= %d). The scanner has been\n' \
-            "$dispatch_hub" "$hub_min" >&2
-        printf 'wedged (likely a comment-stripping regression), so the panic ban is\n' >&2
-        printf 'no longer enforced. Fix the scanner — do not lower the threshold.\n' >&2
+        printf 'line(s) (expected >= %d), helper layer scanned %d line(s) (expected\n' \
+            "$hub_min" "$helper_scanned" >&2
+        printf '>= %d). A scanner has been wedged (likely a comment-stripping\n' \
+            "$helper_min" >&2
+        printf 'regression), so the panic ban is no longer enforced. Fix the scanner —\n' >&2
+        printf 'do not lower the threshold.\n' >&2
     fi
 
     if [[ "$hits" -ne 0 ]]; then
@@ -550,17 +695,103 @@ self_test() {
     return "$rc"
 }
 
+# ---------------------------------------------------------------------------
+# self_test_helpers — prove the helper-layer scanner (`scan_helper_file`) is
+# alive and correctly scoped. Drives synthetic `*_helpers.rs` fixtures and
+# asserts it:
+#   (1) CATCHES a production reachable panic (`unreachable!`),
+#   (2) does NOT flag a production `debug_assert!` (release-stripped tripwire —
+#       the deliberate helper-layer carve-out),
+#   (3) does NOT flag a panic inside a `#[cfg(all(test, feature = "testing"))]`
+#       module (the form lifecycle_helpers.rs uses),
+#   (4) does NOT flag a panic inside a bare `#[cfg(feature = "testing")]` item
+#       (the interspersed testing accessors in queries_helpers.rs).
+# Set NO_PANIC_GATE_SELFTEST=1 to skip (not recommended).
+# ---------------------------------------------------------------------------
+self_test_helpers() {
+    local fixt
+    fixt=$(mktemp -d)
+    local rc=0
+
+    # (1)+(2): a production reachable panic AND a production debug_assert.
+    {
+        printf 'pub fn execute_thing() {\n'
+        printf '    debug_assert!(false, "release-stripped tripwire");\n'
+        printf '    unreachable!("planted helper reachable panic");\n'
+        printf '}\n'
+    } > "$fixt/a_helpers.rs"
+    local out
+    out=$(scan_helper_file "$fixt/a_helpers.rs")
+    if ! grep -q $'^HIT\t.*unreachable' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner did NOT catch a production reachable\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'panic (`unreachable!`) — the helper panic-ban is dead.\n' >&2
+        rc=1
+    fi
+    if grep -q $'^HIT\t.*debug_assert' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner flagged a `debug_assert!` — the\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'release-stripped-tripwire carve-out is broken (it must NOT be banned).\n' >&2
+        rc=1
+    fi
+
+    # (3): a panic inside `#[cfg(all(test, feature = "testing"))]` — excluded.
+    {
+        printf 'pub fn prod_clean() { let _ = 1; }\n'
+        printf '#[cfg(all(test, feature = "testing"))]\n'
+        printf 'mod tests {\n'
+        printf '    #[test]\n'
+        printf '    fn t() { panic!("test panic ok"); }\n'
+        printf '}\n'
+    } > "$fixt/b_helpers.rs"
+    out=$(scan_helper_file "$fixt/b_helpers.rs")
+    if grep -q $'^HIT\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner flagged a panic inside a\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`#[cfg(all(test, feature = "testing"))]` test module (must be excluded).\n' >&2
+        rc=1
+    fi
+
+    # (4): a panic inside a bare `#[cfg(feature = "testing")]` accessor — excluded.
+    {
+        printf 'pub fn prod_clean2() { let _ = 2; }\n'
+        printf '#[cfg(feature = "testing")]\n'
+        printf 'pub fn test_accessor() { todo!("testing-only accessor"); }\n'
+    } > "$fixt/c_helpers.rs"
+    out=$(scan_helper_file "$fixt/c_helpers.rs")
+    if grep -q $'^HIT\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner flagged a panic inside a bare\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`#[cfg(feature = "testing")]` accessor (must be excluded).\n' >&2
+        rc=1
+    fi
+
+    rm -rf "$fixt"
+    return "$rc"
+}
+
 if [[ -z "${NO_PANIC_GATE_SELFTEST:-}" ]]; then
     if ! self_test; then
         exit 1
     fi
-    printf '%sself-test:%s gate catches planted panics and excludes the testing seam.\n' \
+    if ! self_test_helpers; then
+        printf '%sThe helper-layer panic-ban scanner is dead or mis-scoped — fix it.%s\n' \
+            "$C_RED" "$C_RESET" >&2
+        exit 1
+    fi
+    printf '%sself-test:%s gate catches planted panics, excludes the testing seam,\n' \
+        "$C_DIM" "$C_RESET"
+    printf '%s          %s and the helper scanner catches reachable panics while\n' \
+        "$C_DIM" "$C_RESET"
+    printf '%s          %s excluding debug_assert + test/testing-gated code.\n' \
         "$C_DIM" "$C_RESET"
 fi
 
-if run_scan "$SCAN_DIR" "$DISPATCH_HUB" "scan"; then
-    printf '%sPASSED%s: no banned panic-family macros in handler production code.\n' \
+if run_scan "$SCAN_DIR" "$DISPATCH_HUB" "scan" "$HELPER_DIR"; then
+    printf '%sPASSED%s: no banned panic-family macros in handler production code,\n' \
         "$C_GREEN" "$C_RESET"
+    printf '%s        %s and no reachable panics in the per-context helper layer.\n' \
+        "$C_DIM" "$C_RESET"
     exit 0
 fi
 exit 1

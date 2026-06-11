@@ -3227,10 +3227,19 @@ pub fn dispatch_content_governance_action(
         | GovernanceAction::ProposeContextMigration { .. }
         | GovernanceAction::CancelContextMigration
         | GovernanceAction::ModifyHardRateLimit { .. } => {
-            unreachable!(
-                "action variant handled by dispatch_governance_action \
-                 or dispatch_context_governance_action"
-            )
+            // ADR-049 §10 (round-9): these variants are routed by
+            // `dispatch_governance_action` / `dispatch_context_governance_action`
+            // and never reach this content-level leaf. A future routing change
+            // that mis-delivers one here must surface as a recoverable typed
+            // error — NOT a panic. A panic inside a per-context actor handler
+            // unwinds the task; the watchdog catches it but discards the payload
+            // (it may interpolate key material) and burns respawn budget toward
+            // poison (a self-DoS). Return a typed `GovernanceFailed` instead.
+            Err(ContextError::GovernanceFailed(format!(
+                "governance action {} is not a content-level leaf — it is routed by \
+                 dispatch_governance_action / dispatch_context_governance_action",
+                action.variant_name()
+            )))
         }
     }
 }
@@ -3341,7 +3350,16 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::ApproveSpend { .. }
         | GovernanceAction::LockEconomicPolicy
         | GovernanceAction::ModifyHardRateLimit { .. } => {
-            unreachable!("handled in dispatch_governance_action")
+            // ADR-049 §10 (round-9): these variants are handled by the top-level
+            // `dispatch_governance_action` and never reach this context-level
+            // dispatcher. A future routing change that delivers one here must
+            // surface as a recoverable typed error, never an actor-killing panic
+            // (see the matching arm in `dispatch_content_governance_action`).
+            Err(ContextError::GovernanceFailed(format!(
+                "governance action {} is not a context-level leaf — it is handled by \
+                 dispatch_governance_action",
+                action.variant_name()
+            )))
         }
     }
 }
