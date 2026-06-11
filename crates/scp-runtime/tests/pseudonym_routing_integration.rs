@@ -461,7 +461,7 @@ async fn local_pseudonym_query_on_broadcast_is_not_pseudonymous() {
 
 // §9.10.4 (FIX 1 runtime defense): the broadcast-import-rejection test moved
 // in-crate to `supervisor::tests::import_rejects_broadcast_export`, because the
-// post-#1774 export/import flow signs at the FFI boundary — building a
+// signed export/import flow signs at the FFI boundary — building a
 // validation-passing signed `ContextExport` requires the crate-private
 // `export_import::create_export`, which is not reachable from this external
 // integration crate.

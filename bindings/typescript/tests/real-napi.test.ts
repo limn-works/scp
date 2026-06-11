@@ -1149,7 +1149,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
       // Seed Bob's per-member pseudonym so the multi-member fan-out is
       // registered; otherwise the send fails closed with SCP-CTX-2095
-      // ("pseudonym registry empty") per PR #1744 §9.10.4.
+      // ("pseudonym registry empty") per §9.10.4.
       await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
 
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("hello bob"));

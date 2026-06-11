@@ -387,7 +387,7 @@ pub struct NapiMessage {
 /// same `.code` across bridges: missing key material → SCP-IDENT-1054,
 /// derivation failure → SCP-IDENT-1055, wrong key length → SCP-IDENT-1057.
 ///
-/// Un-gated for production (#1780): pseudonym derivation runs through retained
+/// Un-gated for production: pseudonym derivation runs through retained
 /// callback custody (OS-keychain/HSM), exactly like the rest of the signing
 /// chain. The fail-closed boundary is the ABSENCE of retained custody
 /// (SCP-IDENT-1054), not a build feature.
@@ -468,6 +468,51 @@ async fn derive_member_pseudonym_required(
     })?;
     let (custody, identity_key) = custody_and_key;
     derive_pseudonym_bytes(&custody, &identity_key, context_id).await
+}
+
+/// Best-effort §9.10.4 pseudonym announcement (NAPI).
+///
+/// The caller decides WHETHER to announce — a pseudonym is present on join, or
+/// the imported context is non-broadcast — and this helper owns the HOW so the
+/// join and import paths cannot drift apart. It runs over the retained callback
+/// custody (OS-keychain/HSM, production) exactly like the `PyO3` import reference.
+/// Best-effort: a sign-only custody that cannot export raw signing bytes simply
+/// skips, and peers recover on the announcer's next explicit announcement. Never
+/// panics — a missing key or a dropped reply is swallowed.
+async fn announce_pseudonym_best_effort(
+    bi: &NapiBridgeInstance,
+    sup: &scp_core::context::supervisor::Supervisor,
+    did: &str,
+    context_id: &str,
+    params: scp_core::context::ContextParams,
+) {
+    // Extract custody + key handle from the registry (sync), then export the
+    // signing key asynchronously — avoids block_on inside an async fn.
+    let Some((custody, key_handle)) = crate::runtime::with_identity(bi, did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
+    })
+    .ok() else {
+        return;
+    };
+    let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await else {
+        return;
+    };
+    use scp_core::context::actor::commands::{
+        MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = MessagingCommand::SendPseudonymAnnouncement {
+        payload: Box::new(SendPseudonymAnnouncementPayload {
+            context_id: context_id.to_owned(),
+            params,
+            sender_did: DID(did.to_owned()),
+            signing_key: SigningKeyBytes::from_signing_key(&sk),
+        }),
+        reply: tx,
+    };
+    if sup.dispatch_command(context_id, cmd).await.is_ok() {
+        let _ = rx.await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -823,38 +868,16 @@ pub(crate) async fn context_join_on(
     }
 
     // §9.10.4: Send pseudonym announcement to inform existing members.
-    // Best-effort: if signing key is not available, skip silently. Routes
-    // through the ADR-049 commit-8 messaging shim.
+    // Best-effort: if the signing key is not available, skip silently.
     if local_pseudonym.is_some() {
-        // Extract custody + key handle from registry (sync), then export
-        // the signing key asynchronously — avoids block_on inside async fn.
-        let custody_and_key = crate::runtime::with_identity(bi, &identity_did, |e| {
-            Ok((e.custody.clone(), e.identity.active_signing_key))
-        })
-        .ok();
-        if let Some((custody, key_handle)) = custody_and_key
-            && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
-        {
-            use scp_core::context::actor::commands::{
-                MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-            };
-            let sender_did = DID(identity_did.clone());
-            let ann_ctx_id = context_id.clone();
-            let ann_params = core_handle.params().clone();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let cmd = MessagingCommand::SendPseudonymAnnouncement {
-                payload: Box::new(SendPseudonymAnnouncementPayload {
-                    context_id: ann_ctx_id.clone(),
-                    params: ann_params,
-                    sender_did,
-                    signing_key: SigningKeyBytes::from_signing_key(&sk),
-                }),
-                reply: tx,
-            };
-            if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
-                let _ = rx.await;
-            }
-        }
+        announce_pseudonym_best_effort(
+            bi,
+            sup,
+            &identity_did,
+            &context_id,
+            core_handle.params().clone(),
+        )
+        .await;
     }
 
     Ok(())
@@ -3873,34 +3896,13 @@ pub(crate) async fn context_import_on(
     // NOT auto-announce — only a `PseudonymAnnouncement` payload reaches the
     // shared routing ID).
     if !imported_is_broadcast {
-        #[cfg(feature = "allow_in_memory_custody")]
-        {
-            let custody_and_key = crate::runtime::with_identity(bi, &importer_did, |entry| {
-                Ok((entry.custody.clone(), entry.identity.active_signing_key))
-            })
-            .ok();
-            if let Some((custody, key_handle)) = custody_and_key
-                && let Ok(sk) = custody.export_ed25519_signing_key(&key_handle).await
-            {
-                use scp_core::context::actor::commands::{
-                    MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-                };
-                let sender_did = DID(importer_did);
-                let (atx, arx) = tokio::sync::oneshot::channel();
-                let ann_cmd = MessagingCommand::SendPseudonymAnnouncement {
-                    payload: Box::new(SendPseudonymAnnouncementPayload {
-                        context_id: context_id.clone(),
-                        params: imported_core_params,
-                        sender_did,
-                        signing_key: SigningKeyBytes::from_signing_key(&sk),
-                    }),
-                    reply: atx,
-                };
-                if sup.dispatch_command(&context_id, ann_cmd).await.is_ok() {
-                    let _ = arx.await;
-                }
-            }
-        }
+        // Un-gated for production: runs over retained callback custody
+        // (OS-keychain/HSM), matching the NAPI join path and the PyO3 import
+        // reference. Without it, a production node that imports a context derives
+        // its routing pseudonym but never announces it, so peers' registries
+        // stay stale and app-data fan-out silently misses it.
+        announce_pseudonym_best_effort(bi, sup, &importer_did, &context_id, imported_core_params)
+            .await;
     }
 
     Ok(context_id)

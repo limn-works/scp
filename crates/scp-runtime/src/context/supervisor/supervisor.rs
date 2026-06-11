@@ -6767,7 +6767,7 @@ mod tests {
     /// §9.10.4 (FIX 1 runtime defense): a validly-signed BROADCAST-mode export
     /// is rejected with `ImportRejected` (the import path is encrypted-only) —
     /// NOT silently re-homed as an encrypted context with the reserved zero
-    /// pseudonym. Post-#1774 the signature must VERIFY first, so the export is
+    /// pseudonym. With verify-before-init, the signature must VERIFY first, so the export is
     /// signed by the creator key and presented with the matching verifying key;
     /// rejection then comes from the broadcast guard inside `import_context`.
     #[tokio::test]
