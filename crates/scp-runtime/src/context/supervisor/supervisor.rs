@@ -9939,6 +9939,210 @@ mod tests {
         );
     }
 
+    /// A persistence double whose `persist_context` ALWAYS fails. Used to
+    /// prove the send path's fail-closed gating: a paid send must surface the
+    /// persist error (not silently `Ok`) when a spending nonce was committed.
+    #[derive(Default)]
+    struct FailingPersistence;
+    impl ContextPersistence for FailingPersistence {
+        fn persist_context(
+            &self,
+            _id: &str,
+            _snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("induced persist failure".into())
+        }
+        fn load_context(
+            &self,
+            _id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// ADR-049 §9 Class S (BLACK-001) — the MESSAGE-SEND path's spending-nonce
+    /// persist GATING is fail-closed, structurally identical to the tool-invoke
+    /// path. Asserted against the PRODUCTION `finalize_send`: with a persistence
+    /// backend that always fails, `finalize_send(spending_nonce_committed = true)`
+    /// returns an error (the paid send is NOT acknowledged while its
+    /// nonce-consume is unpersisted), whereas `spending_nonce_committed = false`
+    /// (a free / non-spending send) swallows the same failure and returns `Ok`
+    /// (the common path stays best-effort, un-regressed).
+    ///
+    /// Before this fix, the send path persisted via `persist_state_best_effort`
+    /// regardless of whether a spending nonce was committed: a crash in the
+    /// ≤50ms coalesce window rolled the consume back, freshening the nonce after
+    /// the caller already saw the send succeed (replay / double-spend).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_path_spending_nonce_persist_is_fail_closed() {
+        let sup = supervisor_with_providers();
+        let mut deps = test_actor_deps(&sup).await;
+        // Swap in a persistence double that always fails.
+        deps.persistence = Arc::new(FailingPersistence);
+
+        let ctx_id_bytes = [0xDAu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let sender = DID("did:example:send-fail-closed".to_owned());
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            sender.clone(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+
+        // A paid send (spending nonce committed) MUST surface the persist
+        // failure — fail-closed.
+        let paid = crate::context::messaging_helpers::finalize_send(
+            &mut state,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            0,
+            b"paid",
+            Some(&signing_key),
+            /* spending_nonce_committed = */ true,
+        );
+        assert!(
+            matches!(paid, Err(ContextError::PersistenceFailed(_))),
+            "a paid send whose spending-nonce consume cannot be persisted MUST \
+             fail-closed, not return Ok: got {paid:?}"
+        );
+
+        // A free send (no spending nonce) swallows the same failure — the
+        // common path stays best-effort, un-regressed.
+        let free = crate::context::messaging_helpers::finalize_send(
+            &mut state,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            1,
+            b"free",
+            Some(&signing_key),
+            /* spending_nonce_committed = */ false,
+        );
+        assert!(
+            free.is_ok(),
+            "a free (non-spending) send must keep best-effort persist and \
+             not be regressed to fail-closed: got {free:?}"
+        );
+    }
+
+    /// ADR-049 §9 Class S (BLACK-001) — the MESSAGE-SEND path's spending-nonce
+    /// consume survives a crash before coalesce. With a working backend, a
+    /// consumed nonce persisted via the PRODUCTION `finalize_send(.. = true)` is
+    /// still present in the snapshot the respawn rehydrates from — so a replayed
+    /// spending UCAN would be rejected post-crash.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_path_spending_nonce_consume_survives_crash_before_coalesce() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xDBu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let sender = DID("did:example:send-nonce-sender".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            sender.clone(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        // Seed the post-`commit_spending_ucan_nonce` tracker state (the same
+        // shape `snapshot_entries` persists), then run the PRODUCTION send-path
+        // finalize with `spending_nonce_committed = true` — the exact gating the
+        // metered send path uses. This drives the real fail-closed persist.
+        let consumed_nonce = "1700000000000-aabbccddeeff00112233445566778899".to_owned();
+        let mut seed_entries = std::collections::HashMap::new();
+        seed_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
+        let nonce_clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        state.governance.spending_nonce_tracker =
+            scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                ctx_key.clone(),
+                nonce_clock,
+                seed_entries,
+            );
+        let deps = test_actor_deps(&sup).await;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]);
+        crate::context::messaging_helpers::finalize_send(
+            &mut state,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            0,
+            b"paid-send",
+            Some(&signing_key),
+            /* spending_nonce_committed = */ true,
+        )
+        .expect("fail-closed finalize of the send-path consumed nonce must succeed");
+
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+        induce_panic(&handle, "SECRET_SENTINEL_send_nonce").await;
+
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "the context must respawn to a responsive Active actor"
+        );
+
+        let snap = persistence
+            .load_context(&ctx_key)
+            .expect("load")
+            .expect("snapshot present after respawn");
+        assert!(
+            snap.spending_nonce_tracker_state
+                .contains_key(&consumed_nonce),
+            "crash+respawn must NOT drop the send-path consumed spending-UCAN nonce"
+        );
+    }
+
     /// ADR-049 §9 Class S: an executed-proposal id MUST survive a crash before
     /// any coalesce. The conflict-resolution handler that records it
     /// (`execute_resolve_conflict`) sync-persists fail-closed before its reply;

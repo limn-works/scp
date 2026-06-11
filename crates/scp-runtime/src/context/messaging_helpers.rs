@@ -925,11 +925,29 @@ pub async fn send_message(
         return Err(e);
     }
 
-    // Phase 3: capture escrow + finalize.
-    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
-    capture_send_payment(state, deps, auth, sender_did, &context_id, deducted_cost).await;
-
-    finalize_send(
+    // Phase 3: finalize, then capture escrow + commit ticket.
+    //
+    // ADR-049 §9 Class S (BLACK-001): the spending-nonce consume that
+    // `enforce_send_economy` performed in Phase 1 mutated the actor-owned
+    // `spending_nonce_tracker` — security-critical monotonic state that does
+    // NOT survive an actor crash. It MUST be durably persisted (fail-closed)
+    // BEFORE this paid send is acknowledged to the caller, exactly as the
+    // structurally-identical TOOL-INVOKE path does in `reserve_tool_economy`.
+    // A best-effort (coalesced) persist would let an actor crash in the ≤50ms
+    // coalesce window roll the consume back, freshening the spending UCAN's
+    // nonce after the caller already saw the send succeed — a replay /
+    // double-spend window. `finalize_send` therefore persists fail-closed when
+    // a spending nonce was committed for THIS send (mirroring the exact gating
+    // `reserve_tool_economy` uses: `deducted_cost.is_some() &&
+    // spending_ucan.is_some()`); on persist failure it returns an error and we
+    // REVERSE the economy reservation (budget / velocity / rate-limit) and void
+    // the escrow hold below — leaving the consumed nonce CONSUMED (the
+    // fail-closed direction; un-consuming would re-open the replay window) and
+    // surfacing the error so the caller does not observe a phantom success.
+    // Non-spending / free sends keep the best-effort persist inside
+    // `finalize_send` (the common path is not regressed).
+    let spending_nonce_committed = deducted_cost.is_some() && spending_ucan.is_some();
+    if let Err(e) = finalize_send(
         state,
         deps,
         &context_id,
@@ -938,7 +956,29 @@ pub async fn send_message(
         sequence,
         payload,
         signing_key,
-    )
+        spending_nonce_committed,
+    ) {
+        // Fail-closed persist of the Class-S nonce consume failed. Reverse the
+        // economy reservation (the ticket is still alive — it is NOT committed
+        // until finalize succeeds), void the escrow hold, and roll back the
+        // sequence reservation. The consumed nonce is intentionally left
+        // consumed.
+        if let Some(a) = auth {
+            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
+        }
+        crate::context::economy_logic::rollback_economy_ticket_inline(
+            &mut state.governance,
+            ticket,
+        );
+        if !is_broadcast {
+            state.membership.rollback_sequence_number(sender_did);
+        }
+        return Err(e);
+    }
+
+    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
+    capture_send_payment(state, deps, auth, sender_did, &context_id, deducted_cost).await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,6 +1300,16 @@ fn record_payment_capture_failure(
 /// Sync — no await points in the actor body. The caller (`send_message`)
 /// stays `async` because it threads through escrow / transport awaits
 /// before `finalize_send`.
+///
+/// `spending_nonce_committed` selects the ADR-049 §9 persistence class for the
+/// final snapshot (BLACK-001): when `true` (a paid send committed a spending-
+/// UCAN nonce in Phase 1 — `enforce_send_economy` mutated the actor-owned
+/// `spending_nonce_tracker`, Class S monotonic state that does NOT survive an
+/// actor crash), the persist is FAIL-CLOSED: a persist failure returns
+/// [`ContextError::PersistenceFailed`] so the paid send is NOT acknowledged
+/// while its nonce-consume is unpersisted, exactly mirroring the tool-invoke
+/// path in `reserve_tool_economy`. When `false` (a free / non-spending send),
+/// the persist stays best-effort (Class C) — the common path is not regressed.
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_send(
     state: &mut PerContextState,
@@ -1270,6 +1320,7 @@ pub fn finalize_send(
     sequence: u64,
     payload: &[u8],
     signing_key: Option<&ed25519_dalek::SigningKey>,
+    spending_nonce_committed: bool,
 ) -> Result<(), ContextError> {
     // M12: append event log BEFORE consequence evaluation.
     deps.event_log
@@ -1283,6 +1334,14 @@ pub fn finalize_send(
     // the legacy contract: rollback the sequence number and exit.
     if state::require_active(&state.handle).is_err() {
         state.membership.rollback_sequence_number(sender_did);
+        // The sequence reservation is rolled back, but a spending-UCAN nonce
+        // committed in Phase 1 stays CONSUMED (the fail-closed direction: a
+        // late TTL expiry must not freshen a nonce the economy gate already
+        // burned). Persist it fail-closed so a crash before coalesce cannot
+        // roll the consume back (ADR-049 §9 Class S).
+        if spending_nonce_committed {
+            persist_state_fail_closed(state, deps, context_id)?;
+        }
         return Ok(());
     }
 
@@ -1372,7 +1431,20 @@ pub fn finalize_send(
         );
     }
 
-    persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S vs Class C persist selection (BLACK-001). A paid send
+    // that committed a spending-UCAN nonce in Phase 1 MUST persist fail-closed
+    // here — a swallowed (best-effort) persist would let an actor crash in the
+    // ≤50ms coalesce window roll the nonce-consume back, re-opening a replay /
+    // double-spend window after the caller already saw the send succeed. The
+    // common (free / non-spending) path keeps the best-effort persist so it is
+    // not regressed. On the metered path this is NOT a new write: the
+    // best-effort persist already ran synchronously per send — only the error
+    // handling changes (and the caller reverses + voids on failure).
+    if spending_nonce_committed {
+        persist_state_fail_closed(state, deps, context_id)?;
+    } else {
+        persist_state_best_effort(state, deps, context_id);
+    }
     Ok(())
 }
 
