@@ -78,6 +78,40 @@
 # author to add the fail-closed persist (or justify one of the allowlists).
 #
 # ---------------------------------------------------------------------------
+# ROUND-9 KEYSTONE — FAIL-CLOSED-BY-DEFAULT FOR GOVERNANCE LEAVES
+# ---------------------------------------------------------------------------
+# The MUTATORS-marker rule closes the class along the spending-nonce / explicit
+# downward-mutator axis, but a governance leaf can transition authorization
+# DOWNWARD without tripping any marker. `execute_change_role` demoting a member
+# writes role state directly; it carries no `suspend_*` / `remove_member` /
+# `executed_proposals` token, so reverting it to a best-effort persist used to
+# slip past the gate entirely (the white-hat round-7 hole). And a NEW
+# downward-auth handler could be silenced just by adding it to a Class-C
+# allowlist that the gate did not couple to anything.
+#
+# This gate therefore ALSO enforces a fail-closed-by-DEFAULT rule for the
+# governance-leaf class: every `execute_*` governance leaf (the arms of
+# dispatch_governance_action / dispatch_context_governance_action /
+# dispatch_content_governance_action and the `execute_*` leaves they call) that
+# persists BEST-EFFORT and does NOT also fail-close MUST be listed in
+# CLASS_C_GOVERNANCE_LEAVES — the explicit allowlist of the genuinely UPWARD /
+# NEUTRAL / PUBLIC leaves. A best-effort governance leaf that is NOT allowlisted
+# FAILS (GOVHIT). So a downward-auth leaf either fail-closes or becomes a
+# CONSCIOUS, reviewable allowlist add — it can never silently ride the coalesced
+# path again.
+#
+# ALLOWLIST COUPLING (closes the uncoupled-allowlist hole): every entry in
+# CLASS_C_GOVERNANCE_LEAVES (and CLASS_C_EXCEPTIONS) MUST name a function that
+# actually exists in the scanned tree — a stale or mistyped entry FAILS the gate
+# instead of silently exempting nothing (or, worse, a future fn that reuses the
+# name). Governance-leaf allowlist entries must additionally be real `execute_*`
+# leaves, so a non-leaf cannot be parked in the governance allowlist.
+#
+# The combined gate = (governance leaves fail-closed-or-allowlisted)
+#                   + (every non-governance Class-S consume site fail-closed)
+#                   + (both allowlists coupled to real functions).
+#
+# ---------------------------------------------------------------------------
 # P1-A — THE ALLOWLIST/DETECTION COUPLING (no silent helper holes)
 # ---------------------------------------------------------------------------
 # Every MUTATION_HELPERS / CLASS_C_EXCEPTIONS entry that names a CALL-style
@@ -230,44 +264,69 @@ execute_governance_action:dispatch_governance_action"
 # is benign. Each MUST be justified in the header. Space-separated fn names.
 CLASS_C_EXCEPTIONS="unsubscribe_broadcast"
 
+# ---------------------------------------------------------------------------
+# CLASS_C_GOVERNANCE_LEAVES — the FAIL-CLOSED-BY-DEFAULT governance allowlist
+# (round-9 keystone, ADR-049 §9). The MUTATORS-marker rule above closes the
+# class along the *spending-nonce / explicit downward-mutator* axis, but a
+# governance leaf can transition authorization downward WITHOUT tripping any
+# marker — e.g. `execute_change_role` demoting a member writes role state
+# directly, contains no `suspend_*` / `remove_member` / `executed_proposals`
+# token, and so reverting it to a best-effort persist slipped past the gate
+# (the white-hat round-7 hole). Worse, a NEW downward-auth leaf could be
+# silenced by adding it to `CLASS_C_EXCEPTIONS`, an allowlist the gate did not
+# couple to anything.
+#
+# This allowlist inverts the default for the GOVERNANCE-LEAF class: any
+# `execute_*` governance leaf (the arms of dispatch_governance_action /
+# dispatch_context_governance_action / dispatch_content_governance_action and
+# the `execute_*` leaves they call) whose body uses `persist_state_best_effort`
+# MUST be listed here as a genuinely UPWARD / NEUTRAL / PUBLIC leaf, or the gate
+# FAILS. A downward-auth leaf therefore either fail-closes (persist_state_
+# fail_closed) or is a CONSCIOUS, reviewable allowlist add — it can no longer
+# regress to best-effort silently, and a new downward handler cannot be hidden
+# by an uncoupled exception entry.
+#
+# Each entry below is a real `execute_*` fn that legitimately rides best-effort
+# (Class C) because its effect is upward (grants/adds authority), neutral
+# (policy/config that does not lower anyone's authority), or public (no MLS
+# key secrecy). The proposal-executed marker it co-persists is coalesced-ATOMIC
+# with the effect (same snapshot, rolls back together, re-execution reproduces
+# the single effect — no replay divergence; see ADR-049 §9). The list is
+# verified against the actual dispatch arms; a stale/typo entry that names a
+# non-existent fn is caught by the coupling check below.
+#
+#   Upward (grant/add authority — rollback re-removes, never re-grants):
+#     execute_add_member           — adds a member
+#     execute_restore_access       — restores previously-revoked access
+#     execute_approve_spend        — approves a spend allowance
+#     execute_promote_context      — promotes a probationary context
+#     execute_add_signer           — ADDS a threshold signer (the DOWNWARD
+#                                    counterparts execute_remove_signer /
+#                                    execute_modify_threshold are fail-closed)
+#     execute_extend_ttl           — extends lifetime (never shortens)
+#   Neutral (policy/config/registration — no member authority lowered):
+#     execute_register_tool        — registers a tool
+#     execute_establish_tool_interface — establishes a tool interface
+#     execute_set_economic_policy  — sets economic policy
+#     execute_lock_economic_policy — locks economic policy (one-way latch)
+#     execute_modify_hard_rate_limit   — adjusts the anti-spam rate cap
+#     execute_modify_pruning_policy    — adjusts pruning policy
+#     execute_propose_context_migration — opens a migration proposal
+#     execute_cancel_context_migration  — cancels a pending migration proposal
+CLASS_C_GOVERNANCE_LEAVES="execute_add_member execute_restore_access \
+execute_approve_spend execute_promote_context execute_add_signer \
+execute_extend_ttl execute_register_tool execute_establish_tool_interface \
+execute_set_economic_policy execute_lock_economic_policy \
+execute_modify_hard_rate_limit execute_modify_pruning_policy \
+execute_propose_context_migration execute_cancel_context_migration"
+
 SCAN_DIR="crates/scp-runtime/src/context"
 
-# ---------------------------------------------------------------------------
-# collect_failclosed — emit `FC<TAB>fnname` for every PRODUCTION function whose
-# body contains `persist_state_fail_closed(`. Used to verify persist delegates.
-# ---------------------------------------------------------------------------
-collect_failclosed() {
-    local file="$1"
-    awk '
-    BEGIN { in_block=0; seen_test=0; depth=0; in_fn=0; pending=0 }
-    {
-        raw=$0
-        if (raw ~ /#\[cfg\(test\)\]/) seen_test=1
-        if (seen_test) next
-        line=raw
-        if (!in_block) gsub(/"[^"]*"/, "", line)
-        if (!in_block) sub(/\/\/.*$/, "", line)
-        while (match(line, /\/\*.*\*\//)) line = substr(line,1,RSTART-1) substr(line,RSTART+RLENGTH)
-        if (match(line, /\/\*/)) { line=substr(line,1,RSTART-1); in_block=1 }
-        if (in_block && match(line, /\*\//)) { line=substr(line,RSTART+RLENGTH); in_block=0 }
-        if (in_block) next
-        if (!in_fn && line ~ /^[[:space:]]*(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
-            tmp=line
-            sub(/^[[:space:]]*(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+/, "", tmp)
-            sub(/[^A-Za-z0-9_].*$/, "", tmp)
-            pending_fn=tmp; pending=1
-        }
-        opens=gsub(/{/,"{",line); closes=gsub(/}/,"}",line)
-        if (pending && opens>0) { in_fn=1; fn_name=pending_fn; fn_floor=depth; fn_fc=0; pending=0 }
-        if (in_fn && line ~ /persist_state_fail_closed[[:space:]]*\(/) fn_fc=1
-        depth += opens - closes
-        if (in_fn && depth <= fn_floor) {
-            if (fn_fc) printf("FC\t%s\n", fn_name)
-            in_fn=0
-        }
-    }
-    ' "$file"
-}
+# The fail-closed set used to be collected by a SEPARATE `collect_failclosed`
+# awk parser (a near-duplicate of the function tracker in `scan_file`). It has
+# been removed: `scan_file` now emits an `FC<TAB>fn` line per fail-closed
+# function, so the first pass in `run_scan` drives the SAME scanner with an
+# empty `FC_FUNCS` and harvests the `FC` lines — one parser, no twin to drift.
 
 # ---------------------------------------------------------------------------
 # scan_file — emit, per offending function, a line:
@@ -292,7 +351,8 @@ scan_file() {
     local file="$1"
     awk -v FILE="$file" -v HELPERS="$MUTATION_HELPERS" \
         -v DELEGATES="$PERSIST_DELEGATES" -v FC_FUNCS="${FC_FUNCS:-}" \
-        -v MUTATORS="$MUTATORS" -v CLASSC="$CLASS_C_EXCEPTIONS" '
+        -v MUTATORS="$MUTATORS" -v CLASSC="$CLASS_C_EXCEPTIONS" \
+        -v GOVLEAVES="$CLASS_C_GOVERNANCE_LEAVES" '
     BEGIN {
         in_block = 0
         seen_test = 0
@@ -302,11 +362,15 @@ scan_file() {
         fn_line = 0
         fn_mutates = 0
         fn_failclosed = 0
+        fn_besteffort = 0
         scanned = 0
         n = split(HELPERS, harr, " ")
         for (i = 1; i <= n; i++) if (harr[i] != "") helper[harr[i]] = 1
         c = split(CLASSC, carr, " ")
         for (i = 1; i <= c; i++) if (carr[i] != "") classc[carr[i]] = 1
+        # Fail-closed-by-default governance-leaf allowlist (round-9 keystone).
+        g = split(GOVLEAVES, garr, " ")
+        for (i = 1; i <= g; i++) if (garr[i] != "") govleaf[garr[i]] = 1
         # Persist-delegate map: handler -> delegate.
         m = split(DELEGATES, darr, " ")
         for (i = 1; i <= m; i++) {
@@ -368,17 +432,21 @@ scan_file() {
             fn_floor = depth
             fn_mutates = 0
             fn_failclosed = 0
+            fn_besteffort = 0
             pending = 0
             scanned++
         }
 
-        # Within a function body, look for Class-S mutation markers + the
-        # fail-closed persist. Markers are matched as literal substrings.
+        # Within a function body, look for Class-S mutation markers, the
+        # fail-closed persist, AND the best-effort persist (round-9 keystone:
+        # a governance leaf that best-effort-persists must be allowlisted).
+        # Markers are matched as literal substrings.
         if (in_fn) {
             for (mi = 1; mi <= nm; mi++) {
                 if (marr[mi] != "" && index(line, marr[mi]) > 0) { fn_mutates = 1; break }
             }
             if (line ~ /persist_state_fail_closed[[:space:]]*\(/) fn_failclosed = 1
+            if (line ~ /persist_state_best_effort[[:space:]]*\(/) fn_besteffort = 1
         }
 
         depth += opens - closes
@@ -397,6 +465,34 @@ scan_file() {
             if (fn_mutates && !satisfied) {
                 printf("HIT\t%s\t%d\t%s\n", FILE, fn_line, fn_name)
             }
+
+            # Round-9 keystone — fail-closed-by-default for GOVERNANCE leaves.
+            # An `execute_*` leaf (a dispatch arm / leaf the governance
+            # dispatchers call) that persists best-effort and is NOT a
+            # fail-closed leaf MUST be in CLASS_C_GOVERNANCE_LEAVES, else it is
+            # a downward-auth leaf silently riding the coalesced path (the
+            # round-7 hole). A leaf that ALSO fail-closes somewhere in its body
+            # (e.g. a mixed FC+BE body) is not flagged — it already persists
+            # fail-closed for its downward effect.
+            if (fn_name ~ /^execute_/ && fn_besteffort && !fn_failclosed \
+                && !(fn_name in govleaf)) {
+                printf("GOVHIT\t%s\t%d\t%s\n", FILE, fn_line, fn_name)
+            }
+
+            # Emit every governance-leaf fn definition seen, so the allowlist
+            # coupling check can verify each CLASS_C_GOVERNANCE_LEAVES entry
+            # names a REAL function (catching a typo / stale entry).
+            if (fn_name ~ /^execute_/) {
+                printf("GOVFN\t%s\n", fn_name)
+            }
+            # Emit EVERY production fn definition seen, so the coupling check can
+            # verify each CLASS_C_EXCEPTIONS entry names a real function too.
+            printf("FNDEF\t%s\n", fn_name)
+            # Emit the fail-closed set so the first pass can be driven by this
+            # same scanner (no separate collect_failclosed parser needed): a
+            # function that persists fail-closed in its own body is an `FC`.
+            if (fn_failclosed) printf("FC\t%s\n", fn_name)
+
             in_fn = 0
             fn_name = ""
         }
@@ -435,15 +531,71 @@ check_passthrough_coupling() {
 }
 
 # ---------------------------------------------------------------------------
+# check_allowlist_coupling — round-9 keystone. Every entry in
+# CLASS_C_GOVERNANCE_LEAVES and CLASS_C_EXCEPTIONS MUST name a function that
+# actually exists in the scanned tree (collected as the FNDEF / GOVFN sets in
+# `$1`). A typo or a stale entry (a fn that was renamed/removed) therefore FAILS
+# the gate instead of silently disabling enforcement for the real fn it was
+# meant to cover — closing the white-hat "uncoupled allowlist" hole. Governance
+# leaves are additionally required to be real `execute_*` defs (the GOVFN set),
+# so a non-leaf cannot be parked in the governance allowlist.
+#
+# Args:
+#   $1 — file holding the scan output (FNDEF / GOVFN lines)
+# ---------------------------------------------------------------------------
+check_allowlist_coupling() {
+    local out_file="$1"
+    local all_fns gov_fns
+    all_fns=" $(awk -F'\t' '$1=="FNDEF"{print $2}' "$out_file" | sort -u | tr '\n' ' ') "
+    gov_fns=" $(awk -F'\t' '$1=="GOVFN"{print $2}' "$out_file" | sort -u | tr '\n' ' ') "
+
+    local missing_gov="" missing_exc="" e
+    for e in $CLASS_C_GOVERNANCE_LEAVES; do
+        case "$gov_fns" in
+            *" $e "*) : ;;
+            *) missing_gov="$missing_gov $e" ;;
+        esac
+    done
+    for e in $CLASS_C_EXCEPTIONS; do
+        case "$all_fns" in
+            *" $e "*) : ;;
+            *) missing_exc="$missing_exc $e" ;;
+        esac
+    done
+
+    local rc=0
+    if [[ -n "$missing_gov" ]]; then
+        printf '\n%sFAILED%s (allowlist coupling): CLASS_C_GOVERNANCE_LEAVES entr(ies)\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'name no real `execute_*` governance leaf:%s\n' "$missing_gov" >&2
+        printf 'A stale or mistyped allowlist entry silently disables fail-closed-by-\n' >&2
+        printf 'default for the leaf it was meant to cover. Fix the name or remove it.\n' >&2
+        rc=1
+    fi
+    if [[ -n "$missing_exc" ]]; then
+        printf '\n%sFAILED%s (allowlist coupling): CLASS_C_EXCEPTIONS entr(ies) name no\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'real function:%s\n' "$missing_exc" >&2
+        printf 'A stale Class-C carve-out would silently exempt nothing (or, worse, a\n' >&2
+        printf 'future fn that reuses the name). Fix the name or remove it.\n' >&2
+        rc=1
+    fi
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
 # run_scan — scan a directory of *.rs files, evaluate, print verdict.
 # Returns 0 PASS / 1 FAIL. Factored out so the self-test can drive it against
 # synthetic fixtures.
 #   $1 — scan dir
 #   $2 — label
+#   $3 — (optional) "skip-coupling" to suppress the allowlist-coupling check
+#        (the self-test fixtures use partial trees that lack the real leaves).
 # ---------------------------------------------------------------------------
 run_scan() {
     local scan_dir="$1"
     local label="${2:-scan}"
+    local coupling="${3:-check-coupling}"
 
     local tmp_out
     tmp_out=$(mktemp)
@@ -452,11 +604,15 @@ run_scan() {
         "$C_DIM" "$label" "$C_RESET" "$scan_dir"
 
     # First pass: collect every production function that persists fail-closed,
-    # so persist-delegates can be verified in the second pass.
+    # so persist-delegates can be verified in the second pass. Driven by the
+    # SAME `scan_file` scanner (it emits an `FC<TAB>fn` line per fail-closed
+    # function), so there is a single function-tracking parser, not a twin.
+    # `FC_FUNCS` is empty for this pass (delegate resolution is irrelevant when
+    # we only want the FC set; the FC emission does not depend on it).
     FC_FUNCS=$(
         find "$scan_dir" -type f -name '*.rs' -print0 \
             | while IFS= read -r -d '' file; do
-                collect_failclosed "$file"
+                FC_FUNCS="" scan_file "$file"
             done | awk -F'\t' '$1=="FC"{print $2}' | sort -u | tr '\n' ' '
     )
     export FC_FUNCS
@@ -467,9 +623,11 @@ run_scan() {
             scan_file "$file"
         done > "$tmp_out"
 
-    local hits scanned_total
+    local hits govhits scanned_total
     hits=$(grep -c $'^HIT\t' "$tmp_out" 2>/dev/null || true)
     hits=${hits:-0}
+    govhits=$(grep -c $'^GOVHIT\t' "$tmp_out" 2>/dev/null || true)
+    govhits=${govhits:-0}
     scanned_total=$(awk -F'\t' '$1=="SCANNED"{s+=$3} END{print s+0}' "$tmp_out")
 
     if [[ "$hits" -ne 0 ]]; then
@@ -492,6 +650,39 @@ run_scan() {
         printf 'secrecy), add a justified CLASS_C_EXCEPTIONS entry. See ADR-049 §9.\n' >&2
     fi
 
+    # Round-9 keystone — governance leaves that best-effort-persist but are not
+    # allowlisted as upward/neutral/public.
+    if [[ "$govhits" -ne 0 ]]; then
+        printf '\n%sFAILED%s: %d governance leaf/leaves (ADR-049 §9) persist BEST-EFFORT\n' \
+            "$C_RED" "$C_RESET" "$govhits" >&2
+        printf 'but are NOT in CLASS_C_GOVERNANCE_LEAVES — a downward-authorization\n' >&2
+        printf 'transition silently riding the coalesced (Class-C) path can roll back in\n' >&2
+        printf 'the ≤50ms window AFTER the caller saw success, re-granting removed\n' >&2
+        printf 'authority:\n' >&2
+        while IFS=$'\t' read -r tag file line fn; do
+            [[ "$tag" == "GOVHIT" ]] || continue
+            printf '      %s%s:%s%s  fn %s%s%s\n' \
+                "$C_DIM" "$file" "$line" "$C_RESET" \
+                "$C_YELLOW" "$fn" "$C_RESET" >&2
+        done < "$tmp_out"
+        printf '\n' >&2
+        printf 'If this leaf transitions authorization DOWNWARD, replace\n' >&2
+        printf '`persist_state_best_effort` with `persist_state_fail_closed` (mirroring\n' >&2
+        printf 'execute_change_role / execute_remove_signer / execute_modify_threshold).\n' >&2
+        printf 'If it is genuinely UPWARD/NEUTRAL/PUBLIC, add it to\n' >&2
+        printf 'CLASS_C_GOVERNANCE_LEAVES with a one-line justification — a CONSCIOUS,\n' >&2
+        printf 'reviewable allowlist add. See ADR-049 §9 (round-9 keystone).\n' >&2
+    fi
+
+    # Round-9 keystone — allowlist coupling: every CLASS_C_GOVERNANCE_LEAVES /
+    # CLASS_C_EXCEPTIONS entry must name a real function.
+    local coupling_failed=0
+    if [[ "$coupling" != "skip-coupling" ]]; then
+        if ! check_allowlist_coupling "$tmp_out"; then
+            coupling_failed=1
+        fi
+    fi
+
     rm -f "$tmp_out"
 
     # Vacuity guard: the runtime context module has many functions; a near-zero
@@ -503,7 +694,9 @@ run_scan() {
         return 1
     fi
 
-    [[ "$hits" -eq 0 ]] && return 0
+    if [[ "$hits" -eq 0 && "$govhits" -eq 0 && "$coupling_failed" -eq 0 ]]; then
+        return 0
+    fi
     return 1
 }
 
@@ -569,6 +762,28 @@ self_test() {
         printf '}\n'
     } > "$fdir/bypass.rs"
 
+    # (8) Round-9 keystone — a governance leaf that persists BEST-EFFORT and is
+    # NOT in CLASS_C_GOVERNANCE_LEAVES MUST be caught (GOVHIT). This models a
+    # downward-auth leaf (e.g. execute_change_role) reverted to best-effort: it
+    # carries NO MUTATORS marker, so ONLY the fail-closed-by-default rule sees
+    # it. `execute_demote_fixture` is not in the allowlist.
+    {
+        printf 'pub fn execute_demote_fixture() {\n'
+        printf '    state.role_state.assign_role(did, lower_role);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/govleaf_bad.rs"
+
+    # (9) Round-9 keystone — an allowlisted governance leaf that persists
+    # best-effort MUST NOT be flagged. `execute_add_member` is a real
+    # CLASS_C_GOVERNANCE_LEAVES entry (upward — adds authority).
+    {
+        printf 'pub fn execute_add_member() {\n'
+        printf '    state.membership.add_member(did, role, tokens);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/govleaf_ok.rs"
+
     local rc=0
     local out
     out=$(
@@ -601,6 +816,24 @@ self_test() {
         printf '%sSELF-TEST FAILED%s: a direct spending_nonce_tracker.record() bypass was\n' \
             "$C_RED" "$C_RESET" >&2
         printf 'NOT caught — the P1-B chokepoint-bypass marker is not wired.\n' >&2
+        rc=1
+    fi
+    # (8) Round-9 keystone: a best-effort governance leaf NOT in the allowlist
+    # MUST be caught via GOVHIT (the fail-closed-by-default rule). This is the
+    # axis that the round-7 `execute_change_role` revert slipped past.
+    if ! grep -q $'^GOVHIT\t.*\texecute_demote_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a best-effort governance leaf NOT in\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'CLASS_C_GOVERNANCE_LEAVES was NOT caught — the fail-closed-by-default\n' >&2
+        printf 'rule is not wired (a downward-auth leaf could ride best-effort silently).\n' >&2
+        rc=1
+    fi
+    # (9) Round-9 keystone: an allowlisted (upward) governance leaf that persists
+    # best-effort MUST NOT be flagged.
+    if grep -q $'^GOVHIT\t.*\texecute_add_member$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: an allowlisted upward governance leaf\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '(execute_add_member) was wrongly flagged by the fail-closed-by-default rule.\n' >&2
         rc=1
     fi
 
@@ -660,6 +893,46 @@ self_test() {
         rc=1
     fi
 
+    # (10) Round-9 keystone — allowlist coupling. Build a synthetic scan output
+    # naming ONE real governance leaf + one ordinary fn, then assert:
+    #   - a ghost CLASS_C_GOVERNANCE_LEAVES entry (no matching GOVFN) FAILS;
+    #   - a ghost CLASS_C_EXCEPTIONS entry (no matching FNDEF) FAILS;
+    #   - the present names PASS.
+    local cpl="$fixt/coupling_out.txt"
+    {
+        printf 'GOVFN\texecute_add_member\n'
+        printf 'FNDEF\texecute_add_member\n'
+        printf 'FNDEF\tunsubscribe_broadcast\n'
+    } > "$cpl"
+    if (
+        CLASS_C_GOVERNANCE_LEAVES="execute_add_member execute_ghost_leaf" \
+            check_allowlist_coupling "$cpl" 2>/dev/null
+    ); then
+        printf '%sSELF-TEST FAILED%s: a ghost CLASS_C_GOVERNANCE_LEAVES entry\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '(naming no real execute_* leaf) was NOT caught by the coupling check.\n' >&2
+        rc=1
+    fi
+    if (
+        CLASS_C_EXCEPTIONS="unsubscribe_broadcast ghost_exception_fn" \
+            check_allowlist_coupling "$cpl" 2>/dev/null
+    ); then
+        printf '%sSELF-TEST FAILED%s: a ghost CLASS_C_EXCEPTIONS entry (naming no real\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'function) was NOT caught by the coupling check.\n' >&2
+        rc=1
+    fi
+    if ! (
+        CLASS_C_GOVERNANCE_LEAVES="execute_add_member" \
+            CLASS_C_EXCEPTIONS="unsubscribe_broadcast" \
+            check_allowlist_coupling "$cpl" 2>/dev/null
+    ); then
+        printf '%sSELF-TEST FAILED%s: a fully-coupled allowlist (every entry a real fn)\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'was wrongly flagged by the coupling check.\n' >&2
+        rc=1
+    fi
+
     rm -rf "$fixt"
     return "$rc"
 }
@@ -678,7 +951,9 @@ if [[ -z "${NO_CLASS_S_SELFTEST:-}" ]]; then
     fi
     printf '%sself-test:%s gate catches missed consume / suspend_all / .record() bypass\n' \
         "$C_DIM" "$C_RESET"
-    printf '%s          %s sites, clears fixed/helper/delegate sites, and enforces P1-A.\n' \
+    printf '%s          %s + best-effort governance-leaf sites, clears fixed/helper/\n' \
+        "$C_DIM" "$C_RESET"
+    printf '%s          %s delegate/allowlisted sites, and enforces P1-A + allowlist coupling.\n' \
         "$C_DIM" "$C_RESET"
 fi
 
