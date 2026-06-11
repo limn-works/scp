@@ -1896,8 +1896,20 @@ pub async fn restore_context(
 
     if !ctx_snapshot.mls_crypto_state.is_empty() {
         let ctx_id_bytes = context_id_to_bytes(context_id);
-        deps.crypto
-            .restore_crypto_state(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)?;
+        // §23.17 Invariant 3/4 (replay guard): route the crypto restore through
+        // the floor-regression guard, NOT bare `restore_crypto_state`. This
+        // path is shared by process-restart restore AND the watchdog respawn
+        // (`Supervisor::respawn_from_snapshot`). A respawn rehydrates from the
+        // last COALESCED snapshot, which may lag the live per-sender epoch
+        // floors by up to one coalesce interval (ADR-049 §9). Restoring such a
+        // snapshot with a bare `restore_crypto_state` would silently lower a
+        // per-sender replay floor — re-opening a replay window for any sender
+        // whose epoch advanced after the snapshot was written. The guard
+        // captures the LIVE floors (still held by the crypto provider, which a
+        // mailbox despawn does not tear down) before teardown, restores the
+        // snapshot crypto, then rejects any regression and max-merges the live
+        // floors back, so a stale snapshot cannot regress the floor.
+        restore_crypto_state_with_floor_guard(deps, &ctx_id_bytes, &ctx_snapshot.mls_crypto_state)?;
     }
 
     let last_members: HashSet<scp_identity::DID> = ctx_snapshot

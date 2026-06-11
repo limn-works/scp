@@ -3542,6 +3542,106 @@ mod tests {
     }
 
     #[test]
+    fn validate_and_merge_epoch_floors_rejects_regression() {
+        // §23.17 Invariant 3 (replay guard): a restore whose per-sender epoch
+        // floor is BELOW the live floor must be rejected. This is the guard
+        // `restore_crypto_state_with_floor_guard` applies — and which
+        // `lifecycle_helpers::restore_context` now routes through on the
+        // watchdog respawn / process-restart path (ADR-049 §10 + §9): a
+        // coalesced snapshot that lags the live floor must not silently lower
+        // it (re-opening a replay window).
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Live floor for Dave is epoch 12.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .sender_key_store
+                .restore_epoch_high_water(&ctx_id_hex, dave_did, 12);
+        }
+        let live_floors = provider.export_sender_key_epochs(&ctx_id);
+        assert!(
+            live_floors.iter().any(|(d, e)| d == dave_did && *e == 12),
+            "live floor for Dave must be epoch 12 before the regression check"
+        );
+
+        // The "restored" crypto now carries a LOWER floor (epoch 5) for Dave —
+        // simulate a stale snapshot by lowering the store directly. (In the
+        // real flow `restore_crypto_state` writes these from snapshot bytes;
+        // here we exercise the validate/merge guard in isolation, passing the
+        // captured live floors exactly as `restore_crypto_state_with_floor_guard`
+        // does.)
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .sender_key_store
+                .restore_epoch_high_water(&ctx_id_hex, dave_did, 5);
+        }
+
+        let err = provider
+            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE)
+            .expect_err("a floor regression (5 < live 12) must be rejected");
+        assert!(
+            matches!(err, ContextError::SnapshotFloorRegression { .. }),
+            "expected SnapshotFloorRegression, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_and_merge_epoch_floors_max_merges_non_regressing() {
+        // The guard is not over-eager: when the restored floor is at or above
+        // the live floor, it accepts and max-merges. A local-only sender
+        // (absent from the restored set) retains its floor (Invariant 4).
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let erin_did = "did:dht:z6MkErinErinErinErinErinErinErinErinErinEr";
+        let frank_did = "did:dht:z6MkFrankFrankFrankFrankFrankFrankFrankFr";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Live floors: Erin=4, Frank=7.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let store = &mut entry.value_mut().sender_key_store;
+            store.restore_epoch_high_water(&ctx_id_hex, erin_did, 4);
+            store.restore_epoch_high_water(&ctx_id_hex, frank_did, 7);
+        }
+        let live_floors = provider.export_sender_key_epochs(&ctx_id);
+
+        // Restored set advances Erin to 9 and omits Frank entirely.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let store = &mut entry.value_mut().sender_key_store;
+            store.restore_epoch_high_water(&ctx_id_hex, erin_did, 9);
+            // Frank dropped from the restored snapshot.
+        }
+
+        provider
+            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE)
+            .expect("a non-regressing restore must be accepted and max-merged");
+
+        let merged = provider.export_sender_key_epochs(&ctx_id);
+        assert!(
+            merged.iter().any(|(d, e)| d == erin_did && *e == 9),
+            "Erin's floor must advance to the higher restored value (9)"
+        );
+        assert!(
+            merged.iter().any(|(d, e)| d == frank_did && *e == 7),
+            "Frank's local-only floor (7) must be retained (Invariant 4)"
+        );
+    }
+
+    #[test]
     fn restore_tolerates_legacy_snapshot_with_seeded_floor() {
         // Back-compat: a snapshot serialized before `sender_key_epochs`
         // was persisted must still deserialize cleanly AND must close
