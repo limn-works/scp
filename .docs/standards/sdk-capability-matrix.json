@@ -110,17 +110,27 @@
         },
         {
           "name": "attest_device",
-          "python": true,
-          "typescript": true,
+          "python": false,
+          "typescript": false,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "notes": "Only wired DeviceAttestation backend is the software InMemoryDeviceAttestation; production hardware attestation (Apple App Attest / Android Key Attestation) is unimplemented (ADR-025 stub). PyO3 and NAPI gate identity_attest_device out of production builds entirely; the UniFFI bridge exports it but its impl fails closed (SCP-IDENT-1010) in bare/production builds. Present in the Swift/Kotlin surface but always denies until ADR-025 hardware attestation lands.",
+          "exemptions": {
+            "python": "identity_attest_device #[cfg(allow_in_memory_custody)]-gated out of production PyO3 builds; only wired backend is software InMemoryDeviceAttestation (ADR-025 hardware attestation unimplemented)",
+            "typescript": "lives in an #[cfg(allow_in_memory_custody)]-gated #[napi] impl block, absent from production NAPI builds (ADR-025)"
+          }
         },
         {
           "name": "verify_device_attestation",
-          "python": true,
-          "typescript": true,
+          "python": false,
+          "typescript": false,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "notes": "Companion verify for device attestation; same gating as attest_device. Only wired backend is software InMemoryDeviceAttestation (ADR-025 hardware attestation unimplemented). PyO3/NAPI gate it out of production builds; UniFFI exports it but fails closed in bare builds.",
+          "exemptions": {
+            "python": "identity_verify_device_attestation #[cfg(allow_in_memory_custody)]-gated out of production PyO3 builds; only wired backend is software InMemoryDeviceAttestation (ADR-025 hardware attestation unimplemented)",
+            "typescript": "lives in an #[cfg(allow_in_memory_custody)]-gated #[napi] impl block, absent from production NAPI builds (ADR-025)"
+          }
         },
         {
           "name": "execute_recovery",
