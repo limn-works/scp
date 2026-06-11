@@ -1428,7 +1428,12 @@ impl Supervisor {
     /// method only when no actor is registered for the target context.
     #[allow(clippy::too_many_lines)] // flat match over every lifecycle variant
     async fn dispatch_lifecycle_direct(self: &Arc<Self>, cmd: LifecycleCommand) -> Outcome<()> {
-        const LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        // Single source of truth: derive from the associated `Self::
+        // LIFECYCLE_TIMEOUT` (shared with the respawn path) rather than
+        // re-declaring the `from_secs(30)` magic number. The local alias keeps
+        // the `{LIFECYCLE_TIMEOUT:?}` diagnostics below working without a
+        // duplicate literal.
+        const LIFECYCLE_TIMEOUT: std::time::Duration = Supervisor::LIFECYCLE_TIMEOUT;
 
         match cmd {
             LifecycleCommand::Placeholder { reply } => {
@@ -1685,6 +1690,7 @@ impl Supervisor {
                     &deps,
                     &p.context_id,
                     &handle,
+                    None, // process-restart / dispatch arm: load the snapshot here
                 ));
                 let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
                     .await
@@ -3141,8 +3147,20 @@ impl Supervisor {
         // respawn failure (so a reliably-hanging snapshot consumes the budget
         // and eventually poisons rather than wedging forever) and surface a
         // typed timeout error, mirroring the dispatch arm exactly.
+        // Dedup the double snapshot load: `respawn_from_snapshot` already
+        // loaded this snapshot for the Active-state precondition check. Thread
+        // it in (clone — cheap relative to a second disk read) so the snapshot
+        // is read from persistence exactly ONCE per respawn, and so the
+        // redundant load no longer runs INSIDE the timed `restore_context`
+        // region. (`load_context` is a synchronous trait call: a
+        // `tokio::time::timeout` cannot interrupt a blocking sync read, so the
+        // genuine mitigation is removing the second read, not wrapping it. The
+        // storage layer's `load_context` is contracted not to block unbounded.)
         let restore_fut = Box::pin(crate::context::lifecycle_helpers::restore_context(
-            &deps, ctx_id, &handle,
+            &deps,
+            ctx_id,
+            &handle,
+            Some(snapshot.clone()),
         ));
         match tokio::time::timeout(Self::LIFECYCLE_TIMEOUT, restore_fut).await {
             Ok(Ok(())) => {

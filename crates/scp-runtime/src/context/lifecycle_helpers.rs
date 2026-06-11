@@ -1821,6 +1821,7 @@ pub async fn import_context(
 pub fn load_persisted_context_state(
     deps: &ActorDeps,
     context_id: &str,
+    preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
 ) -> Result<
     (
         crate::context::state::ContextSnapshot,
@@ -1828,17 +1829,28 @@ pub fn load_persisted_context_state(
     ),
     ContextError,
 > {
-    let ctx_snapshot = deps
-        .persistence
-        .load_context(context_id)
-        .map_err(|e| {
-            ContextError::PersistenceFailed(format!(
-                "failed to load context state for {context_id}: {e}"
-            ))
-        })?
-        .ok_or_else(|| {
-            ContextError::PersistenceFailed(format!("no persisted context state for {context_id}"))
-        })?;
+    // Dedup: the watchdog respawn path (`Supervisor::respawn_from_snapshot`)
+    // already loaded the context snapshot for its Active-state precondition
+    // check; it threads that snapshot through here so the context snapshot is
+    // loaded exactly once per respawn. Other callers (process-restart, the
+    // RestoreContext dispatch arm) pass `None` and load it here. The broadcast
+    // snapshot is always loaded here (the respawn pre-load does not fetch it).
+    let ctx_snapshot = match preloaded_snapshot {
+        Some(snapshot) => snapshot,
+        None => deps
+            .persistence
+            .load_context(context_id)
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "failed to load context state for {context_id}: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "no persisted context state for {context_id}"
+                ))
+            })?,
+    };
 
     let broadcast_ctx = deps
         .persistence
@@ -1882,6 +1894,12 @@ fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
 /// its handle in the supervisor registry (no legacy contexts `DashMap`
 /// write). Re-spawns the TTL timer if `ttl_remaining_secs` is `Some`.
 ///
+/// `preloaded_snapshot` lets the watchdog respawn path
+/// (`Supervisor::respawn_from_snapshot`) hand in the `ContextSnapshot` it
+/// already loaded for its `Active`-state precondition check, so the context
+/// snapshot is read from persistence exactly ONCE per respawn instead of twice.
+/// Process-restart and the `RestoreContext` dispatch arm pass `None`.
+///
 /// # Errors
 ///
 /// Returns [`ContextError::PersistenceFailed`] if no persisted state
@@ -1894,6 +1912,7 @@ pub async fn restore_context(
     deps: &ActorDeps,
     context_id: &str,
     handle: &ContextHandle,
+    preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
 ) -> Result<(), ContextError> {
     use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
     use crate::context::lifecycle_logic::{
@@ -1906,7 +1925,8 @@ pub async fn restore_context(
     use scp_protocol::context::governance::mls_integration::EpochCoordinator;
     use scp_protocol::context::membership::ReceiveBuffer;
 
-    let (mut ctx_snapshot, broadcast_ctx) = load_persisted_context_state(deps, context_id)?;
+    let (mut ctx_snapshot, broadcast_ctx) =
+        load_persisted_context_state(deps, context_id, preloaded_snapshot)?;
     restore_event_log_best_effort(deps, context_id);
 
     validate_consequence_rules_for_import(
@@ -2747,7 +2767,7 @@ mod restore_reconcile_tests {
             .await
             .expect("build_actor_deps");
         let handle = ContextHandle::new(restore_ctx_id.to_owned(), ContextParams::default());
-        lifecycle_helpers::restore_context(&deps, restore_ctx_id, &handle).await
+        lifecycle_helpers::restore_context(&deps, restore_ctx_id, &handle, None).await
     }
 
     /// Case 1: reconstructed mode ENCRYPTED (no broadcast state) but the
