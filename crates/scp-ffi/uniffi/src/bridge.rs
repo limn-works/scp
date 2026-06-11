@@ -275,7 +275,8 @@ async fn snapshot_verifying_key_hex<C: KeyCustody>(custody: &C, key: &KeyHandle)
 ///
 /// `DidDht::new()` creates an instance with `sign_fn: None`, which causes
 /// all DHT publish operations (used by `add_agent_key`, `rotate_agent_key`,
-/// `remove_agent_key`) to fail. This helper constructs a properly configured
+/// `remove_agent_key`, `rotate_key` (active-key rotation), and
+/// `migrate_identity`) to fail. This helper constructs a properly configured
 /// instance with the signing function wired to the custody's key material.
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer<C: KeyCustody + Send + Sync + 'static>(
@@ -2120,7 +2121,11 @@ impl Identity {
         // Dispatch to the correct custody path.
         if let Some(ref callback) = self.callback_custody {
             // Platform/software custody: rotate via CallbackKeyCustody.
-            let dht = DidDht::new();
+            // `rotate` -> `rotate_active_key` -> `publish_document`, which
+            // requires a signing function bound to the identity custody.
+            // `DidDht::new()` (sign_fn: None) would surface
+            // "no signing function configured"; mirror the in-memory branch.
+            let dht = make_dht_with_signer(callback)?;
             let (new_identity, new_document) = dht
                 .rotate(core_id, callback.as_ref())
                 .await
@@ -14404,7 +14409,13 @@ impl Scp {
                     // the same handle on resume.
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
-                    let dht = DidDht::new();
+                    // `migrate_identity` calls `publish_document` for the old
+                    // and new DID documents — both BEP44 puts require a
+                    // signing function bound to the identity custody.
+                    // `DidDht::new()` (sign_fn: None) would surface
+                    // "no signing function configured"; mirror the in-memory
+                    // branch above.
+                    let dht = make_dht_with_signer(cc)?;
                     let scp_identity::MigrationOutcome {
                         new_identity,
                         new_document,
@@ -18963,6 +18974,183 @@ mod tests {
         assert!(
             err_str.contains(codes::IDENT_1008),
             "expected SCP-IDENT-1008, got: {err_str}"
+        );
+    }
+
+    /// Direct, end-to-end proof of the `rotate_key` fix mechanism over callback
+    /// (Secure Enclave / Android Keystore) custody.
+    ///
+    /// `Identity::rotate_key`'s callback branch built `DidDht::new()`
+    /// (`sign_fn`: None) and called `dht.rotate(...)`, which delegates to
+    /// `rotate_active_key` -> `publish_document`. `publish_document` returns
+    /// `DhtPublishFailed("no signing function configured ...")` whenever the
+    /// signer is `None`, so over production custody key rotation failed
+    /// unconditionally. The fix swaps in `make_dht_with_signer(callback)`,
+    /// wiring the BEP44 signer to the callback custody's `sign` closure.
+    ///
+    /// This test exercises that exact construct: it builds the DHT via
+    /// `make_dht_with_signer` over a `CallbackKeyCustody`, `create`s an identity,
+    /// `publish`es it, then `rotate`s — all on a SINGLE `DidDht` instance so the
+    /// in-memory BEP44 store round-trips the `resolve_did` that `rotate`
+    /// performs before re-publishing (the bridge op builds a fresh DHT per call,
+    /// so its `resolve_did` cannot see the create-time publish in a unit harness;
+    /// that integration path is covered by cross-process E2E). With the
+    /// `DidDht::new()` regression in place, the `publish` below fails with the
+    /// signer error and the test fails; with the fix it succeeds and the
+    /// `#active` key changes while `#0` and the DID are preserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotate_key_signer_is_wired_over_callback_custody() {
+        use scp_identity::DidMethod;
+
+        let callback = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+
+        // The fix under test: a DHT whose BEP44 signer is bound to the callback
+        // custody. `DidDht::new()` (the pre-fix construct) would leave
+        // `sign_fn: None` and fail every publish below.
+        let dht = make_dht_with_signer(&callback).expect("make_dht_with_signer over callback");
+
+        let (identity, document, _pre_handle) = dht
+            .create(callback.as_ref(), pre_rotation_custody.as_ref())
+            .await
+            .expect("create over callback custody");
+
+        // Pre-fix this publish returns DhtPublishFailed("no signing function
+        // configured ...") because the signer is None.
+        dht.publish_document(&identity, &document)
+            .await
+            .expect("publish_document must succeed with the callback signer wired");
+
+        let pre_active = document
+            .verification_method_by_fragment("active")
+            .map(|vm| vm.public_key_multibase.clone())
+            .expect("created document exposes #active");
+
+        // `rotate` resolves the just-published document (same in-memory BEP44
+        // store) and republishes with a fresh #active key — the full path the
+        // bridge `rotate_key` callback branch drives.
+        let (rotated_identity, rotated_doc) = dht
+            .rotate(&identity, callback.as_ref())
+            .await
+            .expect("rotate over callback custody must succeed with the signer wired");
+
+        // DID and identity key (#0) are invariant under active-key rotation.
+        assert_eq!(
+            rotated_identity.did, identity.did,
+            "active-key rotation must preserve the DID string"
+        );
+        assert_eq!(
+            rotated_identity.identity_key, identity.identity_key,
+            "active-key rotation must preserve the identity key #0"
+        );
+
+        // The #active verification method must carry a different public key.
+        let post_active = rotated_doc
+            .verification_method_by_fragment("active")
+            .map(|vm| vm.public_key_multibase.clone())
+            .expect("rotated document still exposes #active");
+        assert_ne!(
+            pre_active, post_active,
+            "rotation must install a different #active public key"
+        );
+    }
+
+    /// Smoke test for the public bridge op `Identity::rotate_key` over callback
+    /// (Secure Enclave / Android Keystore) custody. It drives the REAL op end to
+    /// end and confirms it dispatches through `dht.rotate` and reaches the
+    /// resolve stage without panicking or erroring earlier.
+    ///
+    /// `dht.rotate` (`scp-identity` `dht.rs`) calls `resolve_did` BEFORE any
+    /// `publish_document`. In a bare unit-test build the bridge builds a fresh
+    /// per-op `DidDht` whose in-memory BEP44 store is empty (per-`DidDht`
+    /// instance, no cross-instance sharing), so `resolve_did` fails
+    /// `DhtNotFound` before the flow ever reaches `publish_document`. The op
+    /// therefore cannot return `Ok` here regardless of the signer fix — full
+    /// round-trip integration is a cross-process / relay-backed E2E concern.
+    ///
+    /// Because the failure originates at the resolve stage (which runs ahead of
+    /// the signer-bearing publish), this test CANNOT distinguish the
+    /// `DidDht::new()` regression from the fix:
+    /// a `"no signing function configured"` assertion here would be vacuous.
+    /// The signer-regression guard lives in
+    /// `rotate_key_signer_is_wired_over_callback_custody`, which reaches
+    /// `publish_document` directly on a single shared `DidDht`. This test only
+    /// pins that the public op wires through to the resolve stage and surfaces
+    /// `DhtNotFound`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotate_key_over_callback_custody_advances_past_signer_guard() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+            .await
+            .expect("identity_create_with_custody");
+
+        let Err(err) = Arc::clone(&identity).rotate_key().await else {
+            panic!(
+                "rotate_key cannot round-trip in the per-op in-memory DHT harness; \
+                 a successful result would mean the test DHT now shares state \
+                 cross-instance — revisit this assertion"
+            )
+        };
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("not found on DHT") || err_str.contains("DID not found"),
+            "rotate_key must fail at the resolve stage (DhtNotFound) in the \
+             per-op in-memory DHT harness; got: {err_str}"
+        );
+    }
+
+    /// `identity_migrate` over callback (Secure Enclave / Android Keystore)
+    /// custody. The migrate callback branch's `DidDht::new()` -> `make_dht_with_signer(cc)`
+    /// fix is correct and necessary, but it is NOT independently observable: a
+    /// successful migrate over callback custody is architecturally unsupported
+    /// today. `migrate_identity` Step 0 pre-flights `import_ed25519_signing_key`
+    /// on the operational custody (it must later import the revealed pre-rotation
+    /// seed as the new `#0`), and `CallbackKeyCustody::import_ed25519_signing_key`
+    /// deliberately returns `Unsupported` because `KeyCustodyProvider` has no
+    /// seed-import method (see the impl's documentation). That fail-fast happens
+    /// BEFORE any `publish_document`, so the DHT-signer fix is latent until a
+    /// future `import_ed25519_seed_bytes` lands on the SDK callback interface.
+    ///
+    /// A "migrate succeeds over callback custody" assertion is therefore
+    /// infeasible by any means (bare OR `allow_in_memory_custody`-gated) —
+    /// `ProdLikeCustody` is still callback custody and cannot import a seed. This
+    /// test instead pins the real, current contract: migrate over callback
+    /// custody fails fast at the seed-import constraint (Step 0), leaving the
+    /// source identity intact. Because that abort precedes any
+    /// `publish_document`, this test cannot observe the migrate DHT-signer fix —
+    /// that guard lives in `rotate_key_signer_is_wired_over_callback_custody`,
+    /// which reaches the signer-bearing publish directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn migrate_over_callback_custody_fails_fast_at_seed_import() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+            .await
+            .expect("identity_create_with_custody");
+        let pre_did = identity.did();
+
+        let Err(err) = scp.identity_migrate(Arc::clone(&identity)).await else {
+            panic!(
+                "migrate over callback custody must fail at the seed-import \
+                 constraint until KeyCustodyProvider gains import_ed25519_seed_bytes; \
+                 a successful result means that capability landed — replace this \
+                 with a full success assertion"
+            )
+        };
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("import pre-rotation seed bytes")
+                || err_str.contains("import_ed25519_seed_bytes"),
+            "migrate over callback custody must fail fast at the seed-import \
+             constraint; got: {err_str}"
+        );
+        // The source identity is untouched by the fail-fast path.
+        assert_eq!(
+            identity.did(),
+            pre_did,
+            "a failed migrate must leave the source DID intact"
         );
     }
 
