@@ -1376,9 +1376,17 @@ pub fn finalize_send(
     Ok(())
 }
 
-/// Best-effort persist of the current actor state. Mirrors the legacy
-/// Phase 3 snapshot persistence path, but reads from actor-owned state.
-pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+/// Build the snapshot for `context_id` from owned actor state, threading in
+/// the supervisor-owned MLS crypto state. Shared by the best-effort and
+/// fail-closed persist paths. A crypto-export failure marks the snapshot
+/// `needs_reconnect` (so restore fires the §23.11 reconnection pipeline)
+/// rather than failing — the crypto state is Class M (crash-surviving), so a
+/// transient export failure does not lose security state.
+fn build_snapshot_for_persist(
+    state: &PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+) -> crate::context::state::ContextSnapshot {
     let mut snapshot = build_snapshot_from_state(state);
     let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
     match deps.crypto.export_crypto_state(&ctx_id_bytes) {
@@ -1395,6 +1403,21 @@ pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, cont
             );
         }
     }
+    snapshot
+}
+
+/// Best-effort persist of the current actor state. Mirrors the legacy
+/// Phase 3 snapshot persistence path, but reads from actor-owned state.
+///
+/// **Persistence class.** Use this ONLY for state whose ≤50ms coalesce-window
+/// rollback is acceptable (ADR-049 §9 Class C — liveness/structural state and
+/// the accepted soft anti-spam residual: velocity / earned-capacity). For
+/// security-critical monotonic state that does NOT survive an actor crash
+/// (Class S — spending-nonce consume, executed-proposals, downward-authorization
+/// transitions), use [`persist_state_fail_closed`] so a persist failure returns
+/// an error instead of silently acknowledging an unpersisted mutation.
+pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+    let snapshot = build_snapshot_for_persist(state, deps, context_id);
     if let Err(e) = deps.persistence.persist_context(context_id, &snapshot) {
         crate::metrics::record_persistence_failure();
         tracing::warn!(
@@ -1403,6 +1426,46 @@ pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, cont
             "failed to persist context snapshot"
         );
     }
+}
+
+/// Fail-closed sync persist of the current actor state (ADR-049 §9 Class S).
+///
+/// Persists synchronously and, on failure, returns
+/// [`ContextError::PersistenceFailed`] instead of swallowing the error — so a
+/// security-critical mutation (spending-nonce consume, executed-proposals,
+/// downward-authorization transition) is NEVER acknowledged to a caller unless
+/// it is durable. The respawn crash-safety invariant (ADR-049 §9) forbids
+/// returning `Ok` for such a mutation when the persist did not land: a coalesced
+/// (best-effort) acknowledgment would let an actor crash roll the mutation back,
+/// re-opening a replay / re-spend / re-grant window after the caller already
+/// observed success.
+///
+/// The failure metric is still recorded for observability.
+///
+/// # Errors
+///
+/// Returns [`ContextError::PersistenceFailed`] if the underlying
+/// `persist_context` write fails.
+pub fn persist_state_fail_closed(
+    state: &PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+) -> Result<(), ContextError> {
+    let snapshot = build_snapshot_for_persist(state, deps, context_id);
+    deps.persistence
+        .persist_context(context_id, &snapshot)
+        .map_err(|e| {
+            crate::metrics::record_persistence_failure();
+            tracing::error!(
+                context_id = %context_id,
+                error = %e,
+                "fail-closed persist of security-critical state failed; \
+                 operation rejected (ADR-049 §9 Class S)"
+            );
+            ContextError::PersistenceFailed(format!(
+                "fail-closed persist failed for context '{context_id}': {e}"
+            ))
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1467,6 +1530,7 @@ pub fn build_snapshot_from_state(
         hard_rate_limit_config: Some(state.governance.hard_rate_limit.config().clone()),
         hard_rate_limit_state: state.governance.hard_rate_limit.snapshot_entries(),
         spending_nonce_tracker_state: state.governance.spending_nonce_tracker.snapshot_entries(),
+        revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
         pending_commits: state.pending_commits.clone(),
         commit_fault: state.commit_fault.clone(),
         checkpoint_events_since: state.checkpoint_events_since,

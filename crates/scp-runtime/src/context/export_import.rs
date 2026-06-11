@@ -794,6 +794,10 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // to a joiner and could leak activity patterns. Always empty
         // in public scope.
         spending_nonce_tracker_state: HashMap::new(),
+        // Revoked spending-UCAN CIDs are internal governance state with no
+        // meaning to a public observer (and could leak activity). Always empty
+        // in public scope, like the nonce tracker.
+        revoked_spending_ucan_cids: HashSet::new(),
         // PR #1606 C6: pending commits and the fail-close marker are
         // strictly local node state. They reference the local MLS group
         // and have no meaning to a public observer. Always empty in
@@ -993,6 +997,7 @@ mod tests {
             hard_rate_limit_config: None,
             hard_rate_limit_state: std::collections::HashMap::new(),
             spending_nonce_tracker_state: std::collections::HashMap::new(),
+            revoked_spending_ucan_cids: std::collections::HashSet::new(),
             pending_commits: std::collections::VecDeque::new(),
             commit_fault: None,
             checkpoint_events_since: 0,

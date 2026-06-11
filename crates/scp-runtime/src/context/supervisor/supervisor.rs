@@ -7734,6 +7734,7 @@ mod tests {
             hard_rate_limit_config: None,
             hard_rate_limit_state: HashMap::new(),
             spending_nonce_tracker_state: HashMap::new(),
+            revoked_spending_ucan_cids: HashSet::new(),
             pending_commits: std::collections::VecDeque::new(),
             commit_fault: None,
             checkpoint_events_since: 0,
@@ -9601,6 +9602,209 @@ mod tests {
             is_member.ok(),
             Some(false),
             "crash+respawn must NOT re-admit the removed member"
+        );
+    }
+
+    /// ADR-049 §9 Class S: a consumed spending-UCAN nonce MUST survive a crash
+    /// before any coalesce. The nonce-consume is sync-persisted (fail-closed)
+    /// inside `reserve_tool_economy` BEFORE the reservation is acknowledged; a
+    /// respawn that re-opened the consumed nonce would let the spending UCAN be
+    /// replayed. Asserted through the persisted snapshot the respawn rehydrates
+    /// from (the nonce-tracker entry must be present post-crash).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spending_nonce_consume_survives_crash_before_coalesce() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xD8u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:nonce-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            admin,
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        // Seed a consumed nonce into the tracker via the snapshot path (the
+        // same `(first_seen, token_expiry)` shape `snapshot_entries` persists),
+        // with a far-future expiry so the restore-time prune keeps it. This is
+        // the post-`commit_spending_ucan_nonce` state. Then sync-persist via the
+        // SAME fail-closed primitive `reserve_tool_economy` calls before reply.
+        // Nonce format is `{unix_millis}-{16_byte_hex}` (see `generate_nonce`).
+        let consumed_nonce = "1700000000000-0123456789abcdef0123456789abcdef".to_owned();
+        let mut seed_entries = std::collections::HashMap::new();
+        seed_entries.insert(consumed_nonce.clone(), (1_700_000_000_u64, u64::MAX));
+        let nonce_clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        state.governance.spending_nonce_tracker =
+            scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                ctx_key.clone(),
+                nonce_clock,
+                seed_entries,
+            );
+        let deps = test_actor_deps(&sup).await;
+        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .expect("fail-closed persist of the consumed nonce must succeed");
+
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+        induce_panic(&handle, "SECRET_SENTINEL_nonce").await;
+
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "the context must respawn to a responsive Active actor"
+        );
+
+        // The respawn rehydrates from the persisted snapshot — assert the
+        // consumed nonce is still recorded there, so the replayed token would
+        // be rejected by the rehydrated tracker.
+        let snap = persistence
+            .load_context(&ctx_key)
+            .expect("load")
+            .expect("snapshot present after respawn");
+        assert!(
+            snap.spending_nonce_tracker_state
+                .contains_key(&consumed_nonce),
+            "crash+respawn must NOT drop the consumed spending-UCAN nonce"
+        );
+    }
+
+    /// ADR-049 §9 Class S: an executed-proposal id MUST survive a crash before
+    /// any coalesce. The conflict-resolution handler that records it
+    /// (`execute_resolve_conflict`) sync-persists fail-closed before its reply;
+    /// a respawn that dropped it would let an already-resolved proposal be
+    /// re-executed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executed_proposal_survives_crash_before_coalesce() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xD9u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:proposal-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            admin,
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        // Mark a proposal executed (the mutation the conflict-resolution
+        // handler performs), then sync-persist fail-closed.
+        let executed_id = [0x42u8; 32];
+        state
+            .governance
+            .executed_proposals
+            .insert(executed_id, 1_700_000_000);
+        let deps = test_actor_deps(&sup).await;
+        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .expect("fail-closed persist of executed proposal must succeed");
+
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+        induce_panic(&handle, "SECRET_SENTINEL_proposal").await;
+
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "the context must respawn to a responsive Active actor"
+        );
+
+        let snap = persistence
+            .load_context(&ctx_key)
+            .expect("load")
+            .expect("snapshot present after respawn");
+        assert!(
+            snap.executed_proposals.contains(&executed_id),
+            "crash+respawn must NOT drop the executed-proposal id (replay protection)"
+        );
+    }
+
+    /// ADR-049 §9 Class S: a spending-UCAN revocation MUST survive a crash
+    /// before any coalesce. The revocation set is now a persisted snapshot
+    /// field (it was previously reset to empty on every restore — a silent
+    /// downward-authorization rollback the instant a writer existed). A respawn
+    /// that dropped it would re-admit a revoked token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spending_ucan_revocation_survives_crash_before_coalesce() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xDAu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:revoke-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            admin,
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        // Add a revoked CID (the mutation a future revocation handler will
+        // perform), then sync-persist fail-closed.
+        let revoked_cid = "bafyRevokedSpendingUcanCid".to_owned();
+        state
+            .governance
+            .revoked_spending_ucan_cids
+            .insert(revoked_cid.clone());
+        let deps = test_actor_deps(&sup).await;
+        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .expect("fail-closed persist of revocation must succeed");
+
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+        induce_panic(&handle, "SECRET_SENTINEL_revoke").await;
+
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "the context must respawn to a responsive Active actor"
+        );
+
+        let snap = persistence
+            .load_context(&ctx_key)
+            .expect("load")
+            .expect("snapshot present after respawn");
+        assert!(
+            snap.revoked_spending_ucan_cids.contains(&revoked_cid),
+            "crash+respawn must NOT drop the spending-UCAN revocation"
         );
     }
 

@@ -491,6 +491,37 @@ pub async fn reserve_tool_economy(
         )));
     }
 
+    // ADR-049 §9 Class S: the spending-nonce consume is security-critical
+    // monotonic state that does NOT survive an actor crash (it lives in the
+    // actor-owned `spending_nonce_tracker`). It MUST be durably persisted
+    // BEFORE this reservation is acknowledged to the caller — otherwise an
+    // actor crash in the ≤50ms coalesce window would roll the consume back,
+    // letting the same spending UCAN nonce be replayed after the caller already
+    // saw the spend succeed. Persist fail-closed: on a persist failure, reverse
+    // the budget/velocity/rate-limit reservation and return an error so the
+    // operation is NOT acknowledged. (The consumed nonce is intentionally NOT
+    // un-consumed — leaving it consumed is the conservative/fail-closed
+    // direction for replay protection; un-consuming would re-open the replay
+    // window, the exact failure this guard prevents.)
+    if deducted_cost.is_some()
+        && spending_ucan.is_some()
+        && let Err(persist_err) =
+            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)
+    {
+        if let Some(cost) = deducted_cost {
+            state
+                .governance
+                .budget_tracker
+                .reverse_spend(invoker_did, cost);
+        }
+        state
+            .governance
+            .velocity_tracker
+            .rollback(invoker_did, velocity_token);
+        state.governance.hard_rate_limit.refund(invoker_did);
+        return Err(persist_err);
+    }
+
     let escrow = match (economic_policy.as_ref(), payment_adapter.as_ref()) {
         (Some(policy), Some(adapter)) => {
             match invoke::authorize_tool_payment(

@@ -340,8 +340,10 @@ pub async fn leave_context(
         .append_context_event(&context_id_bytes, "MemberLeft", member_did.as_ref())?;
     state.checkpoint_events_since += 1;
 
-    // Persist context state after leave (best-effort).
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
+    // ADR-049 §9 Class S: a member leaving removes their own membership (a
+    // downward-authorization transition for that member) — persist fail-closed
+    // so a crash cannot re-admit a member who was told their leave succeeded.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
 
     // If member count reaches zero, transition to Closing.
     if should_close {
@@ -564,8 +566,10 @@ pub async fn close_context_with_key(
         supervisor.update_context_gauges().await;
     });
 
-    // Persist context state after close (best-effort).
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
+    // ADR-049 §9 Class S: the lifecycle close transition is security-critical
+    // (a closed context must not silently re-open on a crash) — persist
+    // fail-closed.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
 
     Ok(result)
 }
@@ -1698,7 +1702,13 @@ pub async fn import_context(
                 context_id.clone(),
                 Arc::clone(&deps.clock),
             ),
-            revoked_spending_ucan_cids: HashSet::new(),
+            // Carry the revocation set through import: it is a downward-
+            // authorization decision (a revoked spending UCAN must STAY revoked)
+            // and it is bound into the SIGNED export preimage, so dropping it
+            // would re-admit a token whose revocation the export attests. Unlike
+            // the nonce tracker / proposal timestamps (local-instance C3 wipe),
+            // a revocation is authorization state that must not regress.
+            revoked_spending_ucan_cids: export.snapshot.revoked_spending_ucan_cids,
             // C3: Wipe `proposal_timestamps`.
             proposal_timestamps: HashMap::new(),
         },
@@ -2099,7 +2109,12 @@ pub async fn restore_context(
                 Arc::clone(&deps.clock),
                 ctx_snapshot.spending_nonce_tracker_state,
             ),
-            revoked_spending_ucan_cids: HashSet::new(),
+            // ADR-049 §9 Class S: restore the revocation set FROM the snapshot.
+            // Resetting it to empty here (the prior behaviour) silently dropped
+            // every revocation on actor respawn / process restart — a
+            // downward-authorization rollback the crash-safety invariant
+            // forbids. The snapshot is authoritative.
+            revoked_spending_ucan_cids: ctx_snapshot.revoked_spending_ucan_cids,
             proposal_timestamps: ctx_snapshot.proposal_timestamps,
         },
         role_state: ctx_snapshot.role_state,
