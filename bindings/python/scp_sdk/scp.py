@@ -148,8 +148,13 @@ class KeyCustodyProvider(Protocol):
     def export_signing_key_bytes(self, key_id: str) -> bytes:
         """Return the 32 raw Ed25519 private-seed bytes for ``key_id``.
 
-        Required for governance vote signing. Hardware-bound custody that
-        cannot export key material should raise an exception.
+        Hardware-bound / sign-only custody that cannot export raw bytes should
+        raise an exception. The exception is handled per call site: best-effort
+        callers (the §9.10.4 pseudonym announcement emitted on context
+        join/import) catch it and skip the announcement — peers recover on the
+        next explicit announcement — whereas callers that strictly require the
+        raw key (governance vote signing via ``identity_create_with_custody``)
+        surface a hard error.
         """
         ...
 
@@ -956,7 +961,14 @@ class SCP:
         payload: bytes | str,
         spending_ucan_jwt: str | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.context_send``."""
+        """Delegate to ``_scp_core.SCP.context_send``.
+
+        Raises a ``ContextError`` with code ``SCP-CTX-2095`` when this is a
+        multi-member encrypted context and no peer has announced its routing ID
+        yet (§9.10.4): the send fails closed and is rolled back (no charge, no
+        event); retry once peers' pseudonym-announcement messages have arrived.
+        A lone-member send is a no-op; broadcast contexts are unaffected.
+        """
         return await asyncio.to_thread(
             self._native.context_send, handle, identity_did, payload, spending_ucan_jwt
         )

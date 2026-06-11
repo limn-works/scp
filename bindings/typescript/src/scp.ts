@@ -373,8 +373,14 @@ export interface KeyCustodyProvider {
     pseudonymEpoch: bigint,
   ): Uint8Array;
   /**
-   * Return the 32 raw Ed25519 private-seed bytes for `keyId`. Required for
-   * governance vote signing; hardware-bound custody should throw.
+   * Return the 32 raw Ed25519 private-seed bytes for `keyId`.
+   *
+   * Hardware-bound / sign-only custody that cannot surface raw bytes should
+   * throw. The throw is handled differently per call site: best-effort callers
+   * (the §9.10.4 pseudonym announcement emitted on context join/import) catch it
+   * and silently skip the announcement — peers recover on the next explicit
+   * announcement — whereas callers that strictly require the raw key (governance
+   * vote signing via {@link SCP.identityCreateWithCustody}) surface a hard error.
    */
   exportSigningKeyBytes(keyId: string): Uint8Array;
   /** Return `"hardware"`, `"software"`, or `"in_memory"`. */
@@ -962,6 +968,15 @@ export class SCP {
     );
   }
 
+  /**
+   * Send an encrypted message to a context.
+   *
+   * @throws A typed `ContextError` with code `SCP-CTX-2095` when this is a
+   * multi-member encrypted context and no peer has announced its routing ID
+   * yet (§9.10.4): the send fails closed and is rolled back (no charge, no
+   * event); retry once peers' pseudonym-announcement messages have been
+   * delivered. A lone-member send is a no-op; broadcast contexts are unaffected.
+   */
   async contextSend(
     handle: unknown,
     identityDid: string,

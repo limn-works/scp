@@ -2839,7 +2839,7 @@ impl crate::scp::PyScp {
         );
         // Resolve the importer's signing key for the post-import announcement
         // (best-effort — a missing key just skips the announcement, which peers
-        // recover on the importer's first send via lazy re-announcement).
+        // recover on the importer's next explicit announcement).
         let announce_signing_key = resolve_signing_key(bi, importer_did).ok();
         let context_id_for_announce = context_id.clone();
 

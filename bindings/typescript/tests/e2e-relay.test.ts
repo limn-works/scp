@@ -209,7 +209,7 @@ if (bridge === null || scp === null) {
 
       // Seed Bob's per-member pseudonym so the multi-member fan-out is
       // registered; otherwise the send fails closed with SCP-CTX-2095
-      // ("pseudonym registry empty") per PR #1744 §9.10.4.
+      // ("pseudonym registry empty") per §9.10.4.
       await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
 
       // Alice sends a message -- full pipeline:
@@ -238,7 +238,7 @@ if (bridge === null || scp === null) {
 
       // Both Alice and Bob send, so each sender needs the other party's
       // per-member pseudonym registered; otherwise the send fails closed with
-      // SCP-CTX-2095 ("pseudonym registry empty") per PR #1744 §9.10.4.
+      // SCP-CTX-2095 ("pseudonym registry empty") per §9.10.4.
       await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
       await napi.contextSeedPeerPseudonym(ctx, alice.did, new Uint8Array(32).fill(0x41));
 
@@ -275,7 +275,7 @@ if (bridge === null || scp === null) {
 
       // All three members send, so every sender needs the other parties'
       // per-member pseudonyms registered; otherwise the send fails closed with
-      // SCP-CTX-2095 ("pseudonym registry empty") per PR #1744 §9.10.4.
+      // SCP-CTX-2095 ("pseudonym registry empty") per §9.10.4.
       await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
       await napi.contextSeedPeerPseudonym(ctx, carol.did, new Uint8Array(32).fill(0x43));
       await napi.contextSeedPeerPseudonym(ctx, alice.did, new Uint8Array(32).fill(0x41));
@@ -309,7 +309,7 @@ if (bridge === null || scp === null) {
 
       // Seed Bob's per-member pseudonym so the fan-out is registered before the
       // loop; otherwise each send fails closed with SCP-CTX-2095 ("pseudonym
-      // registry empty") per PR #1744 §9.10.4.
+      // registry empty") per §9.10.4.
       await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
 
       // Send 5 messages -- all should succeed through the relay.
@@ -539,7 +539,7 @@ if (bridge === null || scp === null) {
 
       // Seed Bob's per-member pseudonym so the fan-out is registered before the
       // send; otherwise it fails closed with SCP-CTX-2095 ("pseudonym registry
-      // empty") per PR #1744 §9.10.4.
+      // empty") per §9.10.4.
       await napi.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
 
       // Send through relay

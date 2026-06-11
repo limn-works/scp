@@ -645,7 +645,15 @@ class SCP internal constructor(
         newSeconds = newSeconds,
     )
 
-    /** Forwards to [NativeScp.contextSend] on [inner]. */
+    /**
+     * Forwards to [NativeScp.contextSend] on [inner].
+     *
+     * Throws a `ContextError` with code `SCP-CTX-2095` when this is a
+     * multi-member encrypted context and no peer has announced its routing ID
+     * yet (§9.10.4): the send fails closed and is rolled back (no charge, no
+     * event); retry once peers' pseudonym-announcement messages have arrived.
+     * A lone-member send is a no-op; broadcast contexts are unaffected.
+     */
     suspend fun contextSend(
         handle: ContextHandle,
         identity: Identity,

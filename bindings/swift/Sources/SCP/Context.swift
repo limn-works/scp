@@ -307,8 +307,14 @@ public actor Context {
     /// actor's ``scp``.
     ///
     /// - Parameter payload: The raw message data to send.
-    /// - Throws: ``ScpError/Context(msg:code:)`` with code `"SCP-CTX-2001"`
-    ///   if the context is not active, or if the bridge send operation fails.
+    /// - Throws: ``ScpError/Context(msg:code:)``:
+    ///   - `"SCP-CTX-2001"` if the context is not active.
+    ///   - `"SCP-CTX-2095"` if this is a multi-member encrypted context and no
+    ///     peer has announced its routing ID yet (§9.10.4). The send fails
+    ///     closed and is rolled back — no charge, no event — and should be
+    ///     retried once peers' pseudonym announcements have been delivered. A
+    ///     lone-member send is a no-op; broadcast contexts are unaffected.
+    ///   - or if the bridge send operation otherwise fails.
     public func send(_ payload: Data, spendingUcanJwt: String? = nil) async throws {
         guard state == .active else {
             throw ScpError.Context(

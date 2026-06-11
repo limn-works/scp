@@ -295,6 +295,70 @@ async fn derive_member_pseudonym_required(
         })
 }
 
+/// Best-effort §9.10.4 pseudonym announcement (`UniFFI`).
+///
+/// The caller decides WHETHER to announce — a pseudonym is present on
+/// create/join, or the imported context is non-broadcast — and this helper owns
+/// the HOW so the create, join, and import paths cannot drift apart (matching
+/// the NAPI bridge's `announce_pseudonym_best_effort`). It runs over the
+/// retained callback custody (OS-keychain/HSM, production), falling back to the
+/// `allow_in_memory_custody`-gated in-memory custody only in test builds. Best
+/// effort: a sign-only custody that cannot export raw signing bytes simply
+/// skips, and peers recover on the announcer's next explicit announcement. Never
+/// panics — a missing key or a dropped reply is swallowed.
+async fn announce_pseudonym_best_effort(
+    sup: &scp_core::context::supervisor::Supervisor,
+    identity: &Identity,
+    context_id: &str,
+    params: scp_core::context::ContextParams,
+) {
+    let sk_opt: Option<ed25519_dalek::SigningKey> = if let Some(ref ik) = identity.core_id {
+        if let Some(ref cb) = identity.callback_custody {
+            cb.export_ed25519_signing_key(&ik.active_signing_key)
+                .await
+                .ok()
+        } else {
+            #[cfg(feature = "allow_in_memory_custody")]
+            {
+                if let Some(ref custody) = identity.in_memory_custody {
+                    custody
+                        .0
+                        .export_ed25519_signing_key(&ik.active_signing_key)
+                        .await
+                        .ok()
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(feature = "allow_in_memory_custody"))]
+            {
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let Some(sk) = sk_opt else {
+        return;
+    };
+    use scp_core::context::actor::commands::{
+        MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = MessagingCommand::SendPseudonymAnnouncement {
+        payload: Box::new(SendPseudonymAnnouncementPayload {
+            context_id: context_id.to_owned(),
+            params,
+            sender_did: scp_identity::DID(identity.did.clone()),
+            signing_key: SigningKeyBytes::from_signing_key(&sk),
+        }),
+        reply: tx,
+    };
+    if sup.dispatch_command(context_id, cmd).await.is_ok() {
+        let _ = rx.await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CallbackKeyCustody — concrete adapter wrapping KeyCustodyProvider callback
 //
@@ -8336,61 +8400,13 @@ impl Scp {
                 // restored/imported contexts with existing members the announcement
                 // is needed. Best-effort: if signing key is not available, skip.
                 if local_pseudonym.is_some() {
-                    let sender_did = scp_identity::DID(identity.did.clone());
-                    let core_handle = scp_core::context::ContextHandle::new(
-                        context_id.clone(),
+                    announce_pseudonym_best_effort(
+                        sup,
+                        &identity,
+                        &context_id,
                         retained_core_params.clone(),
-                    );
-                    let _ = core_handle
-                        .transition_to(&scp_core::context::ContextState::Active)
-                        .await;
-                    let sk_opt: Option<ed25519_dalek::SigningKey> =
-                        if let Some(ref ik) = identity.core_id {
-                            if let Some(ref cb) = identity.callback_custody {
-                                cb.export_ed25519_signing_key(&ik.active_signing_key)
-                                    .await
-                                    .ok()
-                            } else {
-                                #[cfg(feature = "allow_in_memory_custody")]
-                                {
-                                    if let Some(ref custody) = identity.in_memory_custody {
-                                        custody
-                                            .0
-                                            .export_ed25519_signing_key(&ik.active_signing_key)
-                                            .await
-                                            .ok()
-                                    } else {
-                                        None
-                                    }
-                                }
-                                #[cfg(not(feature = "allow_in_memory_custody"))]
-                                {
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                    if let Some(sk) = sk_opt {
-                        use scp_core::context::actor::commands::{
-                            MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-                        };
-                        let ann_ctx_id = core_handle.context_id().to_owned();
-                        let ann_params = core_handle.params().clone();
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let cmd = MessagingCommand::SendPseudonymAnnouncement {
-                            payload: Box::new(SendPseudonymAnnouncementPayload {
-                                context_id: ann_ctx_id.clone(),
-                                params: ann_params,
-                                sender_did,
-                                signing_key: SigningKeyBytes::from_signing_key(&sk),
-                            }),
-                            reply: tx,
-                        };
-                        if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
-                            let _ = rx.await;
-                        }
-                    }
+                    )
+                    .await;
                 }
 
                 let handle = Arc::new(ContextHandle {
@@ -8574,54 +8590,13 @@ impl Scp {
                 // §9.10.4: Send pseudonym announcement to inform existing members.
                 // Best-effort: if signing key is not available, skip silently.
                 if local_pseudonym.is_some() {
-                    let sender_did = scp_identity::DID(identity.did.clone());
-                    let sk_opt: Option<ed25519_dalek::SigningKey> =
-                        if let Some(ref ik) = identity.core_id {
-                            if let Some(ref cb) = identity.callback_custody {
-                                cb.export_ed25519_signing_key(&ik.active_signing_key)
-                                    .await
-                                    .ok()
-                            } else {
-                                #[cfg(feature = "allow_in_memory_custody")]
-                                {
-                                    if let Some(ref custody) = identity.in_memory_custody {
-                                        custody
-                                            .0
-                                            .export_ed25519_signing_key(&ik.active_signing_key)
-                                            .await
-                                            .ok()
-                                    } else {
-                                        None
-                                    }
-                                }
-                                #[cfg(not(feature = "allow_in_memory_custody"))]
-                                {
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                    if let Some(sk) = sk_opt {
-                        use scp_core::context::actor::commands::{
-                            MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-                        };
-                        let ann_ctx_id = core_handle.context_id().to_owned();
-                        let ann_params = core_handle.params().clone();
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let cmd = MessagingCommand::SendPseudonymAnnouncement {
-                            payload: Box::new(SendPseudonymAnnouncementPayload {
-                                context_id: ann_ctx_id.clone(),
-                                params: ann_params,
-                                sender_did,
-                                signing_key: SigningKeyBytes::from_signing_key(&sk),
-                            }),
-                            reply: tx,
-                        };
-                        if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
-                            let _ = rx.await;
-                        }
-                    }
+                    announce_pseudonym_best_effort(
+                        sup,
+                        &identity,
+                        core_handle.context_id(),
+                        core_handle.params().clone(),
+                    )
+                    .await;
                 }
 
                 Ok(())
@@ -15760,55 +15735,16 @@ impl Scp {
                 // contexts only — broadcast contexts use the shared
                 // `broadcast_routing_id` and carry no pseudonym registry.
                 // Best-effort: a missing signing key just skips the
-                // announcement, which peers recover on the importer's first
-                // send via lazy re-announcement.
+                // announcement, which peers recover on the importer's next
+                // explicit announcement (a plain send does NOT auto-announce).
                 if !imported_is_broadcast {
-                    let sk_opt: Option<ed25519_dalek::SigningKey> =
-                        if let Some(ref ik) = identity.core_id {
-                            if let Some(ref cb) = identity.callback_custody {
-                                cb.export_ed25519_signing_key(&ik.active_signing_key)
-                                    .await
-                                    .ok()
-                            } else {
-                                #[cfg(feature = "allow_in_memory_custody")]
-                                {
-                                    if let Some(ref custody) = identity.in_memory_custody {
-                                        custody
-                                            .0
-                                            .export_ed25519_signing_key(&ik.active_signing_key)
-                                            .await
-                                            .ok()
-                                    } else {
-                                        None
-                                    }
-                                }
-                                #[cfg(not(feature = "allow_in_memory_custody"))]
-                                {
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                    if let Some(sk) = sk_opt {
-                        use scp_core::context::actor::commands::{
-                            MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-                        };
-                        let sender_did = scp_identity::DID(identity.did.clone());
-                        let (atx, arx) = tokio::sync::oneshot::channel();
-                        let ann_cmd = MessagingCommand::SendPseudonymAnnouncement {
-                            payload: Box::new(SendPseudonymAnnouncementPayload {
-                                context_id: context_id.clone(),
-                                params: imported_core_params,
-                                sender_did,
-                                signing_key: SigningKeyBytes::from_signing_key(&sk),
-                            }),
-                            reply: atx,
-                        };
-                        if sup.dispatch_command(&context_id, ann_cmd).await.is_ok() {
-                            let _ = arx.await;
-                        }
-                    }
+                    announce_pseudonym_best_effort(
+                        sup,
+                        &identity,
+                        &context_id,
+                        imported_core_params,
+                    )
+                    .await;
                 }
 
                 Ok(context_id)

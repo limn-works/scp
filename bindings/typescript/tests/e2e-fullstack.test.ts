@@ -115,7 +115,7 @@ if (addon === null) {
 
       // Seed Bob's per-member pseudonym into the sender's node so the
       // multi-member fan-out is registered; otherwise the send fails closed
-      // with SCP-CTX-2095 ("pseudonym registry empty") per PR #1744 §9.10.4.
+      // with SCP-CTX-2095 ("pseudonym registry empty") per §9.10.4.
       scp.fullstackSeedPeerPseudonym(alice, ctxId, bob.did, new Uint8Array(32).fill(0x42));
 
       const plaintext = Buffer.from("Hello from Alice!");
@@ -198,7 +198,7 @@ if (addon === null) {
 
       // Register both peers' per-member pseudonyms into the sender's node so
       // the fan-out covers Bob and Carol; otherwise the send fails closed with
-      // SCP-CTX-2095 ("pseudonym registry empty") per PR #1744 §9.10.4.
+      // SCP-CTX-2095 ("pseudonym registry empty") per §9.10.4.
       scp.fullstackSeedPeerPseudonym(alice, ctxId, bob.did, new Uint8Array(32).fill(0x42));
       scp.fullstackSeedPeerPseudonym(alice, ctxId, carol.did, new Uint8Array(32).fill(0x43));
 
@@ -230,7 +230,7 @@ if (addon === null) {
 
       // Seed Bob's per-member pseudonym into the sender's node before the loop;
       // otherwise each send fails closed with SCP-CTX-2095 ("pseudonym registry
-      // empty") per PR #1744 §9.10.4.
+      // empty") per §9.10.4.
       scp.fullstackSeedPeerPseudonym(alice, ctxId, bob.did, new Uint8Array(32).fill(0x42));
 
       // Send 5 messages and verify each roundtrips correctly.
@@ -266,7 +266,7 @@ if (addon === null) {
       // Seed Bob's per-member pseudonym for the pre-removal send only; after
       // removal Bob's leaf is gone from the group, so MLS forward secrecy (not
       // the pseudonym registry) is what blocks decryption. Without this the
-      // pre-removal send would fail closed with SCP-CTX-2095 per PR #1744 §9.10.4.
+      // pre-removal send would fail closed with SCP-CTX-2095 per §9.10.4.
       scp.fullstackSeedPeerPseudonym(alice, ctxId, bob.did, new Uint8Array(32).fill(0x42));
 
       // Bob can decrypt a pre-removal message.
@@ -307,7 +307,7 @@ if (addon === null) {
 
       // Seed Bob's per-member pseudonym into the sender's node before the sends;
       // otherwise the sends fail closed with SCP-CTX-2095 ("pseudonym registry
-      // empty") per PR #1744 §9.10.4.
+      // empty") per §9.10.4.
       scp.fullstackSeedPeerPseudonym(alice, ctxId, bob.did, new Uint8Array(32).fill(0x42));
 
       const msg = Buffer.from("same message twice");
