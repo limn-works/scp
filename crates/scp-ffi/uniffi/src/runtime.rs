@@ -230,7 +230,7 @@ pub struct UniffiBridgeInstance {
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
 
-    /// Retained identity state for in-memory custody DIDs.
+    /// Retained identity custody for the production identity ops, keyed by DID.
     ///
     /// Previously stored type-erased in `CoreFields::identity_registry` AND
     /// as a bridge-local `OnceLock` in `bridge.rs::identity_custody_registry`.
@@ -238,16 +238,24 @@ pub struct UniffiBridgeInstance {
     /// now returns a reference to this field on the caller's own
     /// `UniffiBridgeInstance` (Phase D, #1695, deleted the process-wide
     /// default that the earlier `OnceLock` path backed).
-    /// Feature-gated because only the `allow_in_memory_custody` build flag
-    /// pulls in [`OpaqueInMemoryKeyCustody`](crate::bridge::OpaqueInMemoryKeyCustody).
-    /// Cleared on shutdown — drops the `Arc<OpaqueInMemoryKeyCustody>` values
-    /// which zeroize their underlying key material via `Drop`.
-    #[cfg(feature = "allow_in_memory_custody")]
+    ///
+    /// Typed to [`UniffiKeyCustody`](crate::bridge::UniffiKeyCustody) — an
+    /// enum over the callback (production) and in-memory (`allow_in_memory_custody`,
+    /// dev/desktop) backends — so the registry, the accessor, and the
+    /// `scpid_sign` / `identity_create_link_attestation` / `identity_remove*`
+    /// ops that read it exist in BARE production builds (matching the `PyO3` and
+    /// napi bridges, whose registries are likewise custody-enum-typed). The
+    /// previous in-memory-typed field forced those production ops behind the
+    /// `allow_in_memory_custody` gate, silently dropping them from the released
+    /// Swift/Kotlin SDKs.
+    ///
+    /// Cleared on shutdown — dropping the `Arc<UniffiKeyCustody>` values
+    /// zeroizes any underlying key material via the custody provider's `Drop`.
     pub(crate) identity_custody_registry: Arc<
         DashMap<
             String,
             (
-                Arc<crate::bridge::OpaqueInMemoryKeyCustody>,
+                Arc<crate::bridge::UniffiKeyCustody>,
                 scp_platform::KeyHandle,
             ),
         >,
@@ -353,7 +361,6 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -384,7 +391,6 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -524,7 +530,6 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -581,15 +586,15 @@ impl UniffiBridgeInstance {
 
     /// Returns a reference to the typed identity custody registry.
     ///
-    /// `pub(crate)` because `OpaqueInMemoryKeyCustody` is itself `pub(crate)`
-    /// and would leak through the public signature otherwise.
+    /// `pub(crate)` because [`UniffiKeyCustody`](crate::bridge::UniffiKeyCustody)
+    /// is itself `pub(crate)` and would leak through the public signature
+    /// otherwise.
     ///
     /// Marked `#[allow(dead_code)]` because bridge callers currently reach
     /// the registry via the free helper `bridge::identity_custody_registry()`
     /// which dereferences this field directly. The typed accessor is kept
     /// for any future per-instance callers that prefer the typed path; it
     /// is not gated on any pending work.
-    #[cfg(feature = "allow_in_memory_custody")]
     #[must_use]
     #[allow(dead_code)]
     pub(crate) const fn identity_custody_registry(
@@ -598,7 +603,7 @@ impl UniffiBridgeInstance {
         DashMap<
             String,
             (
-                Arc<crate::bridge::OpaqueInMemoryKeyCustody>,
+                Arc<crate::bridge::UniffiKeyCustody>,
                 scp_platform::KeyHandle,
             ),
         >,
@@ -1028,11 +1033,10 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
     // gate `scripts/check-bridge-instance-lifecycle.py`.
 
     fn bridge_specific_shutdown(&self) {
-        // Clear typed registries. Dropping `Arc<OpaqueInMemoryKeyCustody>`
-        // values zeroizes any key material they hold via the custody
-        // provider's `Drop` impl.
+        // Clear typed registries. Dropping `Arc<UniffiKeyCustody>` values
+        // zeroizes any key material they hold via the custody provider's
+        // `Drop` impl.
         self.ucan_registry.clear();
-        #[cfg(feature = "allow_in_memory_custody")]
         self.identity_custody_registry.clear();
         // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
         // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
@@ -1383,7 +1387,6 @@ mod tests {
         // typed interface (DashMap, Arc).
         let bi = UniffiBridgeInstance::new_uniffi();
         assert!(bi.ucan_registry().is_empty());
-        #[cfg(feature = "allow_in_memory_custody")]
         assert!(bi.identity_custody_registry().is_empty());
 
         // ucan_registry is `Arc<DashMap<...>>` — typed, not Box<dyn Any>.

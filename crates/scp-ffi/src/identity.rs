@@ -1568,8 +1568,8 @@ impl crate::scp::PyScp {
     ///
     /// Use this as a cleanup mechanism for long-running processes that
     /// create many ephemeral identities. The DID document published to the
-    /// DHT is unaffected; this only releases the bridge's in-memory state.
-    #[cfg(feature = "allow_in_memory_custody")]
+    /// DHT is unaffected; this only releases the bridge's retained registry
+    /// state. Custody-agnostic registry teardown — available in production.
     #[pyo3(name = "identity_remove")]
     pub fn identity_remove(&self, did: &str) -> PyResult<()> {
         validate::validate_did(did)?;
@@ -1583,8 +1583,8 @@ impl crate::scp::PyScp {
     /// Returns `true` if the identity was found and removed, `false` if the
     /// DID was not in the registry. Companion to
     /// [`PyScp::identity_remove`] (which is unconditional), matching the
-    /// NAPI bridge's `identity_remove_if_present` semantics.
-    #[cfg(feature = "allow_in_memory_custody")]
+    /// NAPI bridge's `identity_remove_if_present` semantics. Custody-agnostic
+    /// registry teardown — available in production.
     #[pyo3(name = "identity_remove_if_present")]
     pub fn identity_remove_if_present(&self, did: &str) -> PyResult<bool> {
         validate::validate_did(did)?;
