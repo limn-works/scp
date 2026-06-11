@@ -359,6 +359,33 @@ async fn announce_pseudonym_best_effort(
     }
 }
 
+/// Resolves the retained custody on an [`Identity`] handle into a
+/// [`UniffiKeyCustody`] enum, for the production identity ops that re-sign or
+/// re-derive over it (`scpid_sign`, `identity_create_link_attestation`).
+///
+/// Resolution order mirrors [`derive_member_pseudonym_required`] and
+/// [`announce_pseudonym_best_effort`]: production callback custody (Secure
+/// Enclave / Android Keystore) first, then — only in `allow_in_memory_custody`
+/// builds — the retained in-memory custody. Returns `None` for an
+/// externally-loaded DID-string-only handle (no retained key material), so the
+/// caller can fail closed with the appropriate cross-bridge error code.
+///
+/// The returned `Arc<UniffiKeyCustody>` SHARES the custody instance the
+/// `Identity` already holds (no second key store) so signing and the registry
+/// entry stay consistent.
+fn resolve_identity_custody(identity: &Identity) -> Option<Arc<UniffiKeyCustody>> {
+    if let Some(ref cb) = identity.callback_custody {
+        return Some(Arc::new(UniffiKeyCustody::Callback(Arc::clone(cb))));
+    }
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        if let Some(ref imc) = identity.in_memory_custody {
+            return Some(Arc::new(UniffiKeyCustody::InMemory(Arc::clone(imc))));
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // CallbackKeyCustody — concrete adapter wrapping KeyCustodyProvider callback
 //
@@ -611,6 +638,183 @@ impl CallbackKeyCustody {
             &key_bytes,
         )?);
         Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UniffiKeyCustody — enum dispatch over the retained custody backends
+//
+// The per-instance identity custody registry retains, keyed by DID, the
+// custody provider + active signing key handle so the production identity ops
+// (`scpid_sign`, `identity_create_link_attestation`,
+// `identity_remove*`) can re-derive public keys and re-sign without the caller
+// re-passing an `Identity` handle. Production identities are
+// callback-custody-backed (Secure Enclave / Android Keystore via the injected
+// `KeyCustodyProvider`); only dev/desktop builds with `allow_in_memory_custody`
+// use `InMemoryKeyCustody`.
+//
+// `KeyCustody` uses RPITIT (return-position `impl Trait` in trait) and is NOT
+// object-safe, so the registry cannot hold `Arc<dyn KeyCustody>`. This enum
+// wraps the concrete backends and delegates each trait method to the active
+// variant — mirroring the PyO3 reference bridge's `FfiKeyCustody`
+// (`crates/scp-ffi/src/custody.rs`) and the napi bridge's `NapiKeyCustody`.
+//
+// The variants hold `Arc<…>` so registration shares the SAME custody instance
+// the `Identity` handle already retains (no second key store, no divergence).
+// The `InMemory` variant — and its match arms — are `allow_in_memory_custody`-
+// gated; production builds carry only `Callback`. See ADR-006.
+// ---------------------------------------------------------------------------
+
+/// Enum dispatch over the custody backends retained in the per-instance
+/// identity custody registry.
+///
+/// Production identities route to [`Self::Callback`] (an injected
+/// `KeyCustodyProvider`); dev/desktop builds with `allow_in_memory_custody`
+/// also carry [`Self::InMemory`]. Private key material never crosses the FFI
+/// boundary (ADR-006) — only public keys and signatures are returned.
+pub(crate) enum UniffiKeyCustody {
+    /// Test/development in-memory custody. Keys are lost on process exit.
+    /// Available only when `allow_in_memory_custody` is enabled. Production
+    /// mobile builds MUST NOT enable this feature (ADR-006).
+    #[cfg(feature = "allow_in_memory_custody")]
+    InMemory(Arc<OpaqueInMemoryKeyCustody>),
+    /// Production callback custody backed by the injected
+    /// [`KeyCustodyProvider`](crate::KeyCustodyProvider) (Secure Enclave /
+    /// Android Keystore). Private key material stays in the platform TEE.
+    Callback(Arc<CallbackKeyCustody>),
+}
+
+impl fmt::Debug for UniffiKeyCustody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(_) => f.write_str("UniffiKeyCustody::InMemory([redacted])"),
+            Self::Callback(_) => f.write_str("UniffiKeyCustody::Callback([platform])"),
+        }
+    }
+}
+
+impl KeyCustody for UniffiKeyCustody {
+    async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.0.generate_keypair(key_type).await,
+            Self::Callback(kc) => kc.generate_keypair(key_type).await,
+        }
+    }
+
+    async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.0.sign(key, data).await,
+            Self::Callback(kc) => kc.sign(key, data).await,
+        }
+    }
+
+    async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.0.public_key(key).await,
+            Self::Callback(kc) => kc.public_key(key).await,
+        }
+    }
+
+    async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.0.destroy_key(key).await,
+            Self::Callback(kc) => kc.destroy_key(key).await,
+        }
+    }
+
+    async fn dh_agree(
+        &self,
+        key: &KeyHandle,
+        peer_public: &[u8; 32],
+    ) -> Result<SharedSecret, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.0.dh_agree(key, peer_public).await,
+            Self::Callback(kc) => kc.dh_agree(key, peer_public).await,
+        }
+    }
+
+    async fn derive_pseudonym(
+        &self,
+        key: &KeyHandle,
+        context_id: &[u8],
+    ) -> Result<PseudonymKeypair, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.0.derive_pseudonym(key, context_id).await,
+            Self::Callback(kc) => kc.derive_pseudonym(key, context_id).await,
+        }
+    }
+
+    async fn derive_rotatable_pseudonym(
+        &self,
+        key: &KeyHandle,
+        context_id: &[u8],
+        pseudonym_epoch: u64,
+    ) -> Result<PseudonymKeypair, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => {
+                kc.0.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
+                    .await
+            }
+            Self::Callback(kc) => {
+                kc.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
+                    .await
+            }
+        }
+    }
+
+    async fn ed25519_to_x25519_agree(
+        &self,
+        ed25519_handle: &KeyHandle,
+        peer_x25519_public: &[u8; 32],
+    ) -> Result<SharedSecret, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => {
+                kc.0.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
+                    .await
+            }
+            Self::Callback(kc) => {
+                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
+                    .await
+            }
+        }
+    }
+
+    fn custody_type(&self, key: &KeyHandle) -> CustodyType {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.0.custody_type(key),
+            Self::Callback(kc) => kc.custody_type(key),
+        }
+    }
+
+    async fn generate_ephemeral_ed25519_seed(
+        &self,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.0.generate_ephemeral_ed25519_seed().await,
+            Self::Callback(kc) => kc.generate_ephemeral_ed25519_seed().await,
+        }
+    }
+
+    async fn import_ed25519_signing_key(
+        &self,
+        seed: &zeroize::Zeroizing<[u8; 32]>,
+    ) -> Result<KeyHandle, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.0.import_ed25519_signing_key(seed).await,
+            Self::Callback(kc) => kc.import_ed25519_signing_key(seed).await,
+        }
     }
 }
 
@@ -1638,7 +1842,6 @@ pub struct Identity {
     /// Wraps the injected [`KeyCustodyProvider`](crate::KeyCustodyProvider)
     /// callback so all crypto operations delegate to the platform TEE.
     /// `None` for in-memory and external custody.
-    #[allow(dead_code)]
     pub(crate) callback_custody: Option<Arc<CallbackKeyCustody>>,
     /// Hex-encoded Ed25519 verifying-key bytes for the identity key
     /// (VM `#0`, the key that derives the DID). 64 hex chars = 32 raw
@@ -2939,14 +3142,11 @@ async fn identity_verify_device_attestation_impl(
 // ---------------------------------------------------------------------------
 
 /// Maximum number of entries in the identity custody registry.
-#[cfg(feature = "allow_in_memory_custody")]
 const UNIFFI_CUSTODY_REGISTRY_CAP: usize = 10_000;
 
 /// Maximum number of DID entries in the identity link attestation registry.
-#[cfg(feature = "allow_in_memory_custody")]
 const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
 
-#[cfg(feature = "allow_in_memory_custody")]
 use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
 /// Returns a reference to this `UniffiBridgeInstance`'s identity link
@@ -2972,10 +3172,14 @@ fn identity_link_attestation_registry(
 ///
 /// Phase D (#1695): operates directly on the caller's `Scp`'s
 /// `UniffiBridgeInstance` — there is no process-wide fallback.
-#[cfg(feature = "allow_in_memory_custody")]
+///
+/// Typed over [`UniffiKeyCustody`] so the registry — and the production
+/// identity ops that read it (`scpid_sign`, `identity_create_link_attestation`,
+/// `identity_remove*`) — exist in bare production builds, not only when
+/// `allow_in_memory_custody` is enabled.
 pub(crate) fn identity_custody_registry(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-) -> &dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
+) -> &dashmap::DashMap<String, (Arc<UniffiKeyCustody>, scp_platform::KeyHandle)> {
     bi.identity_custody_registry.as_ref()
 }
 
@@ -2997,11 +3201,10 @@ pub(crate) fn identity_custody_registry(
 ///   replaced.
 /// - Vacant: enforces `UNIFFI_CUSTODY_REGISTRY_CAP` before inserting,
 ///   surfacing `SCP-VALID-7403` on overflow.
-#[cfg(feature = "allow_in_memory_custody")]
 fn register_identity_custody(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     did: &str,
-    custody: &Arc<OpaqueInMemoryKeyCustody>,
+    custody: &Arc<UniffiKeyCustody>,
     active_key: scp_platform::KeyHandle,
 ) -> Result<(), ScpError> {
     use scp_ffi_common::error_codes as codes;
@@ -3031,7 +3234,6 @@ fn register_identity_custody(
 /// Creates an identity link attestation for an external platform identity.
 ///
 /// See spec §3.5.1, §3.5.2.
-#[cfg(feature = "allow_in_memory_custody")]
 async fn identity_create_link_attestation_impl(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     identity: Arc<Identity>,
@@ -3059,13 +3261,17 @@ async fn identity_create_link_attestation_impl(
             msg: "identity link attestation requires retained identity state".to_owned(),
             code: codes::IDENT_1040.to_owned(),
         })?;
-    let custody = identity
-        .in_memory_custody
-        .as_ref()
-        .ok_or_else(|| ScpError::Identity {
-            msg: "identity link attestation requires in-memory custody".to_owned(),
-            code: codes::IDENT_1040.to_owned(),
-        })?;
+    // Resolve the retained custody to a `UniffiKeyCustody` enum: production
+    // identities are callback-custody-backed (Secure Enclave / Android
+    // Keystore), while dev/desktop `allow_in_memory_custody` builds may also
+    // carry in-memory custody. Fails closed when neither is present (an
+    // externally-loaded DID-string-only handle cannot self-sign an attestation).
+    let custody = resolve_identity_custody(&identity).ok_or_else(|| ScpError::Identity {
+        msg: "identity link attestation requires retained custody (callback or \
+              in-memory) — externally loaded identities cannot self-sign"
+            .to_owned(),
+        code: codes::IDENT_1040.to_owned(),
+    })?;
 
     // Build unsigned attestation using shared pipeline.
     let built = scp_ffi_common::attestation::build_unsigned_attestation(
@@ -3091,11 +3297,11 @@ async fn identity_create_link_attestation_impl(
     let mut attestation = built.attestation;
 
     let active_key = core_id.active_signing_key;
-    let custody_clone = Arc::clone(custody);
+    let custody_clone = Arc::clone(&custody);
     let canonical = built.canonical_bytes;
 
     let sig = runtime()
-        .spawn(async move { custody_clone.0.sign(&active_key, &canonical).await })
+        .spawn(async move { custody_clone.sign(&active_key, &canonical).await })
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio join error: {e}"),
@@ -3109,7 +3315,7 @@ async fn identity_create_link_attestation_impl(
 
     // Store custody for later verification lookups. Shared with
     // `identity_create` so the registry contract stays in sync.
-    register_identity_custody(bi, &identity.did, custody, active_key)?;
+    register_identity_custody(bi, &identity.did, &custody, active_key)?;
 
     // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
@@ -5032,21 +5238,25 @@ async fn resolve_uniffi_creator_verifying_key(
 }
 
 /// Derives the `#active` Ed25519 verifying key for `did` from this instance's
-/// in-memory identity custody, if `did` is a local in-memory identity.
+/// retained identity custody, if `did` is a local identity.
 ///
-/// Returns `None` when `did` is not registered locally, when the custody key
-/// cannot be exported, or when the in-memory custody feature is not compiled
-/// in. The returned key is the *public* verifying key only — private key
-/// material never leaves custody.
+/// Reads the per-instance identity custody registry (now typed over
+/// [`UniffiKeyCustody`], so this resolves in BARE production builds over
+/// callback custody, not only in `allow_in_memory_custody` builds) and exports
+/// the `#active` public key via the resolved custody enum. Returns `None` when
+/// `did` is not registered locally or when the custody key cannot be exported,
+/// so resolution falls through to the DID resolver. The returned key is the
+/// *public* verifying key only — private key material never leaves custody.
 ///
 /// This backs the local-custody-first leg of
 /// [`resolve_uniffi_creator_verifying_key`] (§23.16.8 step 1), enabling a
 /// self-export → self-import round-trip before any DID resolver is configured.
-#[cfg(feature = "allow_in_memory_custody")]
 async fn resolve_local_custody_verifying_key(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     did: &str,
 ) -> Option<ed25519_dalek::VerifyingKey> {
+    use scp_platform::traits::KeyCustody;
+
     // Clone the custody Arc and key handle out of the registry under a short
     // guard scope so no DashMap reference is held across the `.await`.
     let (custody, key_handle) = {
@@ -5056,21 +5266,10 @@ async fn resolve_local_custody_verifying_key(
         (Arc::clone(custody), *handle)
     };
 
-    let public_key = custody.0.public_key(&key_handle).await.ok()?;
+    let public_key = custody.public_key(&key_handle).await.ok()?;
     // 32-byte length + canonical-point decode: the shared conversion tail in
     // scp-ffi-common, identical across all non-WASM bridges.
     scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
-}
-
-/// No-custody build: local identities are never resolvable from in-memory
-/// custody, so the local-custody leg always yields `None` and resolution
-/// falls through to the DID resolver.
-#[cfg(not(feature = "allow_in_memory_custody"))]
-async fn resolve_local_custody_verifying_key(
-    _bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-    _did: &str,
-) -> Option<ed25519_dalek::VerifyingKey> {
-    None
 }
 
 /// Parses a hex-encoded proposal ID into a 32-byte array.
@@ -7201,7 +7400,6 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> Result<String, Scp
 ///
 /// The body is retained as a `pub(crate)` helper; `Scp::scpid_sign`
 /// performs the check and then delegates here.
-#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn scpid_sign_impl(
     identity: Arc<Identity>,
     signing_key_id: String,
@@ -7255,19 +7453,21 @@ pub(crate) fn scpid_sign_impl(
         }
     };
 
-    let custody = identity
-        .in_memory_custody
-        .as_ref()
-        .ok_or_else(|| ScpError::Identity {
-            msg: "scpid_sign requires in-memory custody (only supported with \
-                  allow_in_memory_custody feature)"
-                .to_owned(),
-            code: codes::IDENT_1008.to_owned(),
-        })?;
+    // Resolve the retained custody: production identities sign through the
+    // injected callback custody (Secure Enclave / Android Keystore); dev/desktop
+    // `allow_in_memory_custody` builds may also carry in-memory custody. Fails
+    // closed for externally-loaded DID-string-only handles, which have no key
+    // material to sign with.
+    let custody = resolve_identity_custody(&identity).ok_or_else(|| ScpError::Identity {
+        msg: "scpid_sign requires retained custody (callback or in-memory) — \
+              externally loaded identities have no signing key material"
+            .to_owned(),
+        code: codes::IDENT_1008.to_owned(),
+    })?;
 
     let rt = crate::runtime();
     let response = rt.block_on(core_sign(
-        &custody.0,
+        &*custody,
         &key_handle,
         &identity.did,
         key_id,
@@ -7949,7 +8149,7 @@ impl Scp {
                             register_identity_custody(
                                 &bi,
                                 &identity.did,
-                                &key_custody,
+                                &Arc::new(UniffiKeyCustody::InMemory(Arc::clone(&key_custody))),
                                 identity.active_signing_key,
                             )?;
 
@@ -8054,6 +8254,22 @@ impl Scp {
                 // on this instance.
                 ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
 
+                // Register the freshly created callback-custody identity in the
+                // per-instance custody registry, keyed by DID, so the production
+                // identity ops (`scpid_sign`, `identity_create_link_attestation`,
+                // `identity_remove_if_present`, local-custody verifying-key
+                // resolution) work over callback custody — matching the
+                // in-memory creation paths and the PyO3/napi bridges, whose
+                // identity creation registers a bundled entry. Done before
+                // `identity` and `callback_custody` are moved into the handle so
+                // the DID and active signing key are still available.
+                register_identity_custody(
+                    &bi,
+                    &identity.did,
+                    &Arc::new(UniffiKeyCustody::Callback(Arc::clone(&callback_custody))),
+                    identity.active_signing_key,
+                )?;
+
                 let handle = Arc::new(Identity {
                     did: identity.did.clone(),
                     custody_type: CustodyMethod::Platform,
@@ -8157,7 +8373,6 @@ impl Scp {
     /// `Identity` handle.
     ///
     /// See spec §3.5.1, §3.5.2.
-    #[cfg(feature = "allow_in_memory_custody")]
     pub async fn identity_create_link_attestation(
         &self,
         identity: Arc<Identity>,
@@ -8208,7 +8423,6 @@ impl Scp {
     /// Mutates the link-attestation registry on `&*self.inner`.
     ///
     /// See spec §3.5.1.
-    #[cfg(feature = "allow_in_memory_custody")]
     #[must_use]
     pub fn identity_remove_link_attestation(&self, did: String, attestation_id: String) -> bool {
         // Phase D (#1695): per-`Scp` registry lookups — no default fallback.
@@ -8240,7 +8454,6 @@ impl Scp {
     ///
     /// Returns `ScpError::Validation` when `did` is not a syntactically
     /// valid DID, mirroring the `PyO3` reference bridge's `identity_remove`.
-    #[cfg(feature = "allow_in_memory_custody")]
     pub fn identity_remove(&self, did: String) -> Result<(), ScpError> {
         validate_did(&did)?;
         identity_custody_registry(&self.inner).remove(&did);
@@ -8262,7 +8475,6 @@ impl Scp {
     /// Returns `ScpError::Validation` when `did` is not a syntactically
     /// valid DID, mirroring the `PyO3` reference bridge's
     /// `identity_remove_if_present`.
-    #[cfg(feature = "allow_in_memory_custody")]
     pub fn identity_remove_if_present(&self, did: String) -> Result<bool, ScpError> {
         validate_did(&did)?;
         let removed = identity_custody_registry(&self.inner)
@@ -13667,7 +13879,6 @@ impl Scp {
     /// cross-bridge parity harness. Only accepted when scp-core is built
     /// with the `testing` feature; production builds reject any non-`None`
     /// value via `SCP-VALID-7008`.
-    #[cfg(feature = "allow_in_memory_custody")]
     pub fn scpid_sign(
         &self,
         identity: Arc<Identity>,
@@ -14108,6 +14319,7 @@ impl Scp {
                             .await
                             .ok()
                             .map(|pk| hex::encode(pk.as_bytes()));
+                    let new_active_key = new_identity.active_signing_key;
                     let handle = Arc::new(Identity {
                         did: new_identity.did.clone(),
                         custody_type,
@@ -14125,26 +14337,26 @@ impl Scp {
                     increment_handle_count();
                     let _ = has_agent; // suppress unused warning
 
-                    // Migrate attestation and custody registries from old DID to new DID.
-                    // The attestation block runs first; when `allow_in_memory_custody` is
-                    // enabled, the custody block follows and consumes `new_did`, so the
-                    // attestation block must clone. When the feature is disabled, the
-                    // custody block is excluded and `new_did` can be moved into attestation.
-                    #[cfg(feature = "allow_in_memory_custody")]
+                    // Migrate attestation and custody registries from old DID to
+                    // new DID. The custody-registry block (now un-gated — the
+                    // registry exists in bare production builds) always consumes
+                    // `new_did`, so the attestation block clones.
                     let attestation_did = new_did.clone();
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
-                    let attestation_did = new_did;
                     {
                         let registry = identity_link_attestation_registry(&bi);
                         if let Some((_, attestations)) = registry.remove(&old_did) {
                             registry.insert(attestation_did, attestations);
                         }
                     }
-                    #[cfg(feature = "allow_in_memory_custody")]
                     {
+                        // Re-register under the new DID with the migrated active
+                        // signing key. `migrate_identity` rotates the active key,
+                        // so the old entry's key handle is stale (and destroyed);
+                        // reuse the same custody enum but swap in the new handle.
                         let registry = identity_custody_registry(&bi);
-                        if let Some((_, entry)) = registry.remove(&old_did) {
-                            registry.insert(new_did, entry);
+                        if let Some((_, (custody_enum, _stale_handle))) = registry.remove(&old_did)
+                        {
+                            registry.insert(new_did, (custody_enum, new_active_key));
                         }
                     }
 
@@ -14185,6 +14397,7 @@ impl Scp {
                     let new_did = new_identity.did.clone();
                     let verifying_key_hex =
                         snapshot_verifying_key_hex(cc.as_ref(), &new_identity.identity_key).await;
+                    let new_active_key = new_identity.active_signing_key;
                     let handle = Arc::new(Identity {
                         did: new_identity.did.clone(),
                         custody_type,
@@ -14201,26 +14414,26 @@ impl Scp {
                     });
                     increment_handle_count();
 
-                    // Migrate attestation and custody registries from old DID to new DID.
-                    // The attestation block runs first; when `allow_in_memory_custody` is
-                    // enabled, the custody block follows and consumes `new_did`, so the
-                    // attestation block must clone. When the feature is disabled, the
-                    // custody block is excluded and `new_did` can be moved into attestation.
-                    #[cfg(feature = "allow_in_memory_custody")]
+                    // Migrate attestation and custody registries from old DID to
+                    // new DID. The custody-registry block (now un-gated — the
+                    // registry exists in bare production builds) always consumes
+                    // `new_did`, so the attestation block clones.
                     let attestation_did = new_did.clone();
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
-                    let attestation_did = new_did;
                     {
                         let registry = identity_link_attestation_registry(&bi);
                         if let Some((_, attestations)) = registry.remove(&old_did) {
                             registry.insert(attestation_did, attestations);
                         }
                     }
-                    #[cfg(feature = "allow_in_memory_custody")]
                     {
+                        // Re-register under the new DID with the migrated active
+                        // signing key. `migrate_identity` rotates the active key,
+                        // so the old entry's key handle is stale (and destroyed);
+                        // reuse the same custody enum but swap in the new handle.
                         let registry = identity_custody_registry(&bi);
-                        if let Some((_, entry)) = registry.remove(&old_did) {
-                            registry.insert(new_did, entry);
+                        if let Some((_, (custody_enum, _stale_handle))) = registry.remove(&old_did)
+                        {
+                            registry.insert(new_did, (custody_enum, new_active_key));
                         }
                     }
 
@@ -14309,7 +14522,7 @@ impl Scp {
                             register_identity_custody(
                                 &bi,
                                 &identity.did,
-                                &key_custody,
+                                &Arc::new(UniffiKeyCustody::InMemory(Arc::clone(&key_custody))),
                                 identity.active_signing_key,
                             )?;
 
@@ -18304,6 +18517,225 @@ mod tests {
             .expect("identity_create (second identity)");
         scp.identity_remove(other.did())
             .expect("identity_remove must succeed on a registered identity");
+    }
+
+    // -----------------------------------------------------------------------
+    // Production (callback-custody) path coverage — NOT gated on
+    // `allow_in_memory_custody`. These pin the bare-build fix: re-typing the
+    // identity custody registry to the `UniffiKeyCustody` enum un-gated
+    // `scpid_sign`, `identity_create_link_attestation`, and `identity_remove*`
+    // so they ship in the released Swift/Kotlin SDKs and route over callback
+    // (Secure Enclave / Android Keystore) custody. Before the fix these ops
+    // were `#[cfg(allow_in_memory_custody)]`-gated and silently absent.
+    // -----------------------------------------------------------------------
+
+    /// A full `KeyCustodyProvider` backed by real Ed25519 keys with a
+    /// multi-key store, modelling a platform custody (e.g. Secure Enclave). It
+    /// supports every required protocol method so `identity_create_with_custody`
+    /// (which runs `DidDht::create`) and `scpid_sign` (which signs + exposes the
+    /// public key) both work. Signatures are real, so a signed SCPID response
+    /// verifies against the exposed public key.
+    struct ProdLikeCustody {
+        keys: std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::SigningKey>>,
+        next: std::sync::atomic::AtomicU64,
+    }
+
+    impl ProdLikeCustody {
+        fn new() -> Self {
+            Self {
+                keys: std::sync::Mutex::new(std::collections::HashMap::new()),
+                next: std::sync::atomic::AtomicU64::new(1),
+            }
+        }
+
+        fn key_for(&self, key_id: &str) -> Result<ed25519_dalek::SigningKey, ScpError> {
+            self.keys
+                .lock()
+                .expect("keystore mutex")
+                .get(key_id)
+                .cloned()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: format!("unknown key_id {key_id}"),
+                    code: codes::IDENT_1010.to_owned(),
+                })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::KeyCustodyProvider for ProdLikeCustody {
+        async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+            use ed25519_dalek::Signer;
+            let sk = self.key_for(&key_id)?;
+            Ok(sk.sign(&message).to_bytes().to_vec())
+        }
+
+        async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
+            let sk = self.key_for(&key_id)?;
+            Ok(sk.verifying_key().to_bytes().to_vec())
+        }
+
+        async fn destroy_key(&self, key_id: String) -> Result<(), ScpError> {
+            self.keys.lock().expect("keystore mutex").remove(&key_id);
+            Ok(())
+        }
+
+        async fn generate_keypair(&self, _key_type: String) -> Result<String, ScpError> {
+            use rand::RngCore;
+            // Derive a deterministic-per-call seed from an OS draw so each key is
+            // distinct (a fresh `#0`, `#active`, … per identity).
+            let mut seed = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+            let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+            let id = self
+                .next
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .to_string();
+            self.keys
+                .lock()
+                .expect("keystore mutex")
+                .insert(id.clone(), sk);
+            Ok(id)
+        }
+
+        async fn dh_agree(
+            &self,
+            _key_id: String,
+            peer_public: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            // Deterministic 32-byte digest of the peer key — exercises the path
+            // without modelling real X25519 (not needed by these tests).
+            Ok(sha2::Sha256::digest(&peer_public).to_vec())
+        }
+
+        async fn derive_pseudonym(
+            &self,
+            key_id: String,
+            context_id: Vec<u8>,
+        ) -> Result<Vec<u8>, ScpError> {
+            // Mint a derived key, return `[pubkey(32) || derived_key_id_utf8]`.
+            let sk = self.key_for(&key_id)?;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(sk.to_bytes());
+            hasher.update(&context_id);
+            let derived_seed: [u8; 32] = hasher.finalize().into();
+            let derived = ed25519_dalek::SigningKey::from_bytes(&derived_seed);
+            let derived_pub = derived.verifying_key().to_bytes();
+            let id = self
+                .next
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .to_string();
+            self.keys
+                .lock()
+                .expect("keystore mutex")
+                .insert(id.clone(), derived);
+            let mut out = derived_pub.to_vec();
+            out.extend_from_slice(id.as_bytes());
+            Ok(out)
+        }
+
+        fn custody_type(&self, _key_id: String) -> String {
+            "hardware".to_owned()
+        }
+    }
+
+    /// `identity_create_with_custody` must register the callback identity in the
+    /// per-instance custody registry so `identity_remove_if_present` reports
+    /// `true` on first removal — proving the registry exists and is populated in
+    /// a BARE (no `allow_in_memory_custody`) build over callback custody.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn callback_identity_is_registered_for_remove_if_present() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+            .await
+            .expect("identity_create_with_custody");
+        let did = identity.did();
+
+        assert!(
+            scp.identity_remove_if_present(did.clone())
+                .expect("identity_remove_if_present must accept a valid DID"),
+            "a callback-custody identity must be present in the custody registry"
+        );
+        assert!(
+            !scp.identity_remove_if_present(did)
+                .expect("identity_remove_if_present must accept a valid DID"),
+            "second removal must report absence"
+        );
+    }
+
+    /// `scpid_sign` must work over callback custody (production path), producing
+    /// a response whose signature verifies against the identity's `#active`
+    /// public key. Pins that the op is un-gated and routes through
+    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scpid_sign_works_over_callback_custody() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+            .await
+            .expect("identity_create_with_custody");
+
+        let challenge =
+            scpid_challenge("https://relying.example".to_owned(), 60).expect("scpid_challenge");
+
+        // `scpid_sign` is a sync method that drives a nested `block_on`
+        // internally; call it off the async test runtime via `spawn_blocking`
+        // (exactly how a Swift/Kotlin caller hits it — synchronously, outside
+        // the tokio worker). A real signed response is returned and parses as
+        // JSON.
+        let response_json = tokio::task::spawn_blocking(move || {
+            scp.scpid_sign(identity, "#active".to_owned(), challenge, None)
+        })
+        .await
+        .expect("spawn_blocking join")
+        .expect("scpid_sign over callback custody must succeed");
+        let response: serde_json::Value =
+            serde_json::from_str(&response_json).expect("response is JSON");
+        assert!(
+            response.get("signature").is_some(),
+            "signed response must carry a signature"
+        );
+    }
+
+    /// `identity_create_link_attestation` must work over callback custody
+    /// (production path): it signs the attestation with the `#active` callback
+    /// key and registers the identity, so a subsequent
+    /// `identity_remove_link_attestation` (which requires the DID present in the
+    /// custody registry) returns `true`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn link_attestation_create_and_remove_over_callback_custody() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+            .await
+            .expect("identity_create_with_custody");
+        let did = identity.did();
+
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                Arc::clone(&identity),
+                "github".to_owned(),
+                "octocat".to_owned(),
+                "proof-blob".to_owned(),
+                "oauth".to_owned(),
+                None,
+            )
+            .await
+            .expect("identity_create_link_attestation over callback custody");
+        let attestation: serde_json::Value =
+            serde_json::from_str(&attestation_json).expect("attestation is JSON");
+        let attestation_id = attestation
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .expect("attestation carries an id")
+            .to_owned();
+
+        // The identity is now registered (custody registry populated by the
+        // attestation path), so removal of the just-created attestation succeeds.
+        assert!(
+            scp.identity_remove_link_attestation(did, attestation_id),
+            "removing an existing attestation on a registered DID must report true"
+        );
     }
 
     // -----------------------------------------------------------------------

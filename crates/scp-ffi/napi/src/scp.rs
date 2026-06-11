@@ -3894,6 +3894,45 @@ impl Scp {
     ) -> napi::Result<String> {
         crate::scpid::scpid_verify_on(&self.inner, response_json, challenge_json)
     }
+
+    /// Per-instance equivalent of `identity_remove`.
+    ///
+    /// Drops retained key material for the DID. Idempotent — succeeds
+    /// silently when the DID is a syntactically valid DID not present in
+    /// the registry. Custody-agnostic registry teardown — available in
+    /// production over callback custody, mirroring the `PyO3` bridge.
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error when `did` is not a syntactically valid
+    /// DID, mirroring the `PyO3` reference bridge's `identity_remove`.
+    #[napi(js_name = "identityRemove")]
+    pub fn identity_remove(&self, did: String) -> napi::Result<()> {
+        scp_ffi_common::validate::validate_did(&did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        crate::runtime::remove_identity(&self.inner, &did);
+        Ok(())
+    }
+
+    /// Per-instance equivalent of `identity_remove_if_present`.
+    ///
+    /// Returns `true` if the identity was present and removed. Custody-agnostic
+    /// registry teardown — available in production over callback custody.
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error when `did` is not a syntactically valid
+    /// DID, mirroring the `PyO3` reference bridge's
+    /// `identity_remove_if_present`.
+    #[napi(js_name = "identityRemoveIfPresent")]
+    pub fn identity_remove_if_present(&self, did: String) -> napi::Result<bool> {
+        scp_ffi_common::validate::validate_did(&did)
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        Ok(crate::runtime::remove_identity_if_present(
+            &self.inner,
+            &did,
+        ))
+    }
 }
 
 // Non-`#[napi]` impl block — Rust-only test affordance. Not exported to
@@ -3964,58 +4003,21 @@ impl Scp {
 // In-memory-custody-only `Scp` methods.
 //
 // These methods are gated behind `allow_in_memory_custody` because they
-// depend on an in-memory *backend* (the in-memory identity registry teardown
-// helpers and the `InMemoryDeviceAttestation` software attestation backend),
-// or on the full-stack in-memory test network. They live in a SEPARATE
+// depend on an in-memory *backend* — the `InMemoryDeviceAttestation` software
+// attestation backend (production hardware attestation per ADR-025 is not yet
+// wired) or the full-stack in-memory test network. They live in a SEPARATE
 // `#[napi] impl Scp` block so napi-rs emits their `_c_callback` registration
 // only when the feature is enabled — a single gated method inside the main
 // `#[napi] impl` block would leave a dangling registration reference in
 // production builds.
 //
-// Production callback-custody parity (registry retention, SCPID signing, link
-// attestations) lives in the main `impl Scp` block above and is NOT gated,
-// mirroring the PyO3 reference bridge.
+// Production callback-custody parity (registry retention + teardown, SCPID
+// signing, link attestations) lives in the main `impl Scp` block above and is
+// NOT gated, mirroring the PyO3 reference bridge.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "allow_in_memory_custody")]
 #[napi]
 impl Scp {
-    /// Per-instance equivalent of `identity_remove`.
-    ///
-    /// Drops retained key material for the DID. Idempotent — succeeds
-    /// silently when the DID is a syntactically valid DID not present in
-    /// the registry.
-    ///
-    /// # Errors
-    ///
-    /// Throws a validation error when `did` is not a syntactically valid
-    /// DID, mirroring the `PyO3` reference bridge's `identity_remove`.
-    #[napi(js_name = "identityRemove")]
-    pub fn identity_remove(&self, did: String) -> napi::Result<()> {
-        scp_ffi_common::validate::validate_did(&did)
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-        crate::runtime::remove_identity(&self.inner, &did);
-        Ok(())
-    }
-
-    /// Per-instance equivalent of `identity_remove_if_present`.
-    ///
-    /// Returns `true` if the identity was present and removed.
-    ///
-    /// # Errors
-    ///
-    /// Throws a validation error when `did` is not a syntactically valid
-    /// DID, mirroring the `PyO3` reference bridge's
-    /// `identity_remove_if_present`.
-    #[napi(js_name = "identityRemoveIfPresent")]
-    pub fn identity_remove_if_present(&self, did: String) -> napi::Result<bool> {
-        scp_ffi_common::validate::validate_did(&did)
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-        Ok(crate::runtime::remove_identity_if_present(
-            &self.inner,
-            &did,
-        ))
-    }
-
     /// Per-instance equivalent of `identity_attest_device`.
     ///
     /// The attestation is device-local; the DID argument is retained for

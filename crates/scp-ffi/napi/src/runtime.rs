@@ -1335,11 +1335,8 @@ pub(crate) fn remove_identity(bi: &NapiBridgeInstance, did: &str) {
 /// Provided as a cleanup mechanism for long-running processes alongside
 /// [`remove_identity`] which is unconditional.
 ///
-/// Gated to match its sole consumer, the `Scp::identity_remove_if_present`
-/// method, which is itself gated behind `allow_in_memory_custody` (the
-/// in-memory-custody registry-teardown API surface, mirroring the `PyO3`
-/// bridge).
-#[cfg(feature = "allow_in_memory_custody")]
+/// Custody-agnostic registry teardown (only touches the identity registry, no
+/// custody backend) — available in production, mirroring the `PyO3` bridge.
 #[must_use]
 pub(crate) fn remove_identity_if_present(bi: &NapiBridgeInstance, did: &str) -> bool {
     identity_registry(bi).remove(did).is_some()
