@@ -1295,44 +1295,11 @@ fn record_payment_capture_failure(
 // 12. finalize_send
 // ---------------------------------------------------------------------------
 
-/// Pushes a `MessageSent` event, appends to the event log, runs
-/// consequence enforcement, and persists. Actor-shape: no relock
-/// dance — `state` is borrowed throughout.
-///
-/// Sync — no await points in the actor body. The caller (`send_message`)
-/// stays `async` because it threads through escrow / transport awaits
-/// before `finalize_send`.
-///
-/// `spending_nonce_committed` selects the ADR-049 §9 persistence class for the
-/// final snapshot (BLACK-001): when `true` (a paid send committed a spending-
-/// UCAN nonce in Phase 1 — `enforce_send_economy` mutated the actor-owned
-/// `spending_nonce_tracker`, Class S monotonic state that does NOT survive an
-/// actor crash), the persist is FAIL-CLOSED: a persist failure returns
-/// [`ContextError::PersistenceFailed`] so the paid send is NOT acknowledged
-/// while its nonce-consume is unpersisted, exactly mirroring the tool-invoke
-/// path in `reserve_tool_economy`. When `false` (a free / non-spending send),
-/// the persist stays best-effort (Class C) — the common path is not regressed.
-// `is_broadcast`: ADR-049 §9 — `finalize_send` OWNS the sequence rollback on its
-// error exits (the persist-failure path below). A broadcast publish reserves NO
-// per-sender sequence (`sequence` is 0 and `next_sequence_number` was never
-// called), so rolling back would spuriously decrement the publisher's counter —
-// every rollback is gated on `!is_broadcast`.
-/// Appends the `MessageSent` event log entry and, on failure, rolls the
-/// reserved per-sender sequence back before surfacing the error.
-///
-/// ADR-049 §9 (round-9 leak fix): [`finalize_send`] OWNS the per-sender
-/// sequence rollback on ALL of its error exits — the `send_message` caller
-/// deliberately does NOT roll the sequence back when [`finalize_send`] returns
-/// `Err` (doing so would double-revert: a `+1` reservation undone by a `−2` via
-/// `saturating_sub`). This FIRST `append_context_event` sits BETWEEN the
-/// caller's `next_sequence_number` reservation and the relocated rollbacks in
-/// [`finalize_send`], so on its `Err` it must perform the rollback itself, or
-/// the reserved sequence leaks → a per-sender gap → a receiver
-/// `SequenceGapForceClose`. Broadcast publishes reserved no sequence
-/// (`sequence` is 0, `next_sequence_number` was never called), so the rollback
-/// is gated on `!is_broadcast`. The escrow hold + economy ticket are voided by
-/// the caller (they are still alive — finalize did not commit them); only the
-/// sequence is the caller's deferred responsibility.
+/// Appends the `MessageSent` event log entry and, on a log-append failure,
+/// rolls the reserved per-sender sequence back (gated `!is_broadcast`) before
+/// surfacing the error. This is the FIRST of [`finalize_send`]'s rollback
+/// sites; it shares the single sequence-rollback ownership invariant documented
+/// on [`finalize_send`] (the caller must not double-revert).
 fn append_message_sent_or_rollback_sequence(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -1386,6 +1353,40 @@ fn record_send_participation(
     }
 }
 
+/// Pushes a `MessageSent` event, appends to the event log, runs
+/// consequence enforcement, and persists. Actor-shape: no relock
+/// dance — `state` is borrowed throughout.
+///
+/// Sync — no await points in the actor body. The caller (`send_message`)
+/// stays `async` because it threads through escrow / transport awaits
+/// before `finalize_send`.
+///
+/// `spending_nonce_committed` selects the ADR-049 §9 persistence class for the
+/// final snapshot (BLACK-001): when `true` (a paid send committed a spending-
+/// UCAN nonce in Phase 1 — `enforce_send_economy` mutated the actor-owned
+/// `spending_nonce_tracker`, Class S monotonic state that does NOT survive an
+/// actor crash), the persist is FAIL-CLOSED: a persist failure returns
+/// [`ContextError::PersistenceFailed`] so the paid send is NOT acknowledged
+/// while its nonce-consume is unpersisted, exactly mirroring the tool-invoke
+/// path in `reserve_tool_economy`. When `false` (a free / non-spending send),
+/// the persist stays best-effort (Class C) — the common path is not regressed.
+///
+/// # Sequence-rollback ownership (ADR-049 §9, round-9 leak fix)
+///
+/// `finalize_send` OWNS the per-sender sequence rollback on ALL of its error
+/// exits — the FIRST `append_context_event` (delegated to
+/// [`append_message_sent_or_rollback_sequence`]), the TTL early-return below,
+/// and the final persist failure (in [`persist_finalized_send`]). The
+/// `send_message` caller deliberately does NOT roll the sequence back when
+/// `finalize_send` returns `Err`: doing so would double-revert, a `+1`
+/// reservation undone by a `−2` via `saturating_sub`, leaving a per-sender gap
+/// that a receiver reads as a `SequenceGapForceClose`. A broadcast publish
+/// reserves NO per-sender sequence (`sequence` is 0 and `next_sequence_number`
+/// was never called), so rolling back would spuriously decrement the
+/// publisher's counter — every rollback is therefore gated on `!is_broadcast`.
+/// The escrow hold + economy ticket are voided by the caller (they are still
+/// alive — finalize did not commit them); only the sequence is the caller's
+/// deferred responsibility, discharged here.
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_send(
     state: &mut PerContextState,
@@ -1523,12 +1524,9 @@ pub fn finalize_send(
 /// after the caller saw success — replay / double-spend); the free path keeps
 /// best-effort (not regressed).
 ///
-/// `finalize_send` OWNS the sequence rollback on ALL its error exits (this
-/// persist-failure path + the TTL early-return). The `send_message` caller MUST
-/// NOT also roll it back, or the reservation is reverted twice (a +1 undone by
-/// −2 via `saturating_sub`). Broadcast publishes reserved no sequence, so the
-/// rollback is gated on `!is_broadcast`. The nonce stays consumed; the caller
-/// voids only the escrow + economy ticket.
+/// This is the LAST of [`finalize_send`]'s rollback sites (the persist-failure
+/// path); it shares the single sequence-rollback ownership invariant documented
+/// on [`finalize_send`] (gated `!is_broadcast`, no caller double-revert).
 fn persist_finalized_send(
     state: &mut PerContextState,
     deps: &ActorDeps,
