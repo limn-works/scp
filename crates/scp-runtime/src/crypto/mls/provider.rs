@@ -2281,6 +2281,21 @@ impl MlsCryptoProvider {
         max_advance_per_sender: u64,
         trusted_local: bool,
     ) -> Result<(), ContextError> {
+        // Cold-restart no-op (ADR-049 §9 / spec §23.17.2). This merge + its
+        // overshoot ceiling are a WARM-PATH protection: they bound the snapshot
+        // floors against the LIVE pre-crash floors. On a COLD process restart
+        // (`restore_all_contexts` into a fresh provider) there are no live
+        // floors — `local_floors` is empty — so there is nothing to merge
+        // against and nothing to ceiling against; the snapshot's floors load
+        // verbatim. This is NOT a security regression: a cold restart trusts the
+        // at-rest snapshot exactly as much as it already must (same
+        // at-rest-storage trust boundary; an attacker who can rewrite epoch
+        // floors in the snapshot can rewrite anything else in it too). Class M
+        // monotonicity (Invariant 2 max-merge, Invariant 4 append-only) still
+        // holds on every WARM respawn, where this function runs with non-empty
+        // live floors. The ceiling protects against a peer-influenced epoch
+        // advance racing a warm respawn; it does not police the at-rest snapshot
+        // a cold restart loads, and is not claimed to.
         if local_floors.is_empty() {
             return Ok(());
         }
