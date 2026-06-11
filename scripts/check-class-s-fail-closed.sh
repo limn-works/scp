@@ -391,18 +391,24 @@ scan_file() {
         -v GOVLEAVES="$CLASS_C_GOVERNANCE_LEAVES" '
     # normalize_assign — collapse whitespace around a bare assignment `=` so a
     # space-free ASSIGNMENT marker (`threshold_value=`, `role_state.ceiling=`)
-    # matches the downward-auth write `x = y` but NOT a read or a comparison.
-    # The relational / equality operators are protected first (mapped to control
-    # bytes) so `==`, `!=`, `>=`, `<=` are never seen as a bare `=` — an
-    # assignment marker therefore cannot false-match a comparison such as
-    # `threshold_value == n`. (The protected bytes need not be restored: no
-    # marker contains them.)
+    # matches the downward-auth write `x = y` but NOT a read, a comparison, or a
+    # match arm. The relational / equality operators AND the match-arm fat arrow
+    # are protected first (mapped to control bytes) so `==`, `!=`, `>=`, `<=`,
+    # and `=>` are never seen as a bare `=` — an assignment marker therefore
+    # cannot false-match a comparison such as `threshold_value == n` NOR a match
+    # arm such as `threshold_value => ...` (which, without the `=>` guard, would
+    # collapse to `threshold_value=>` and spuriously match `threshold_value=`).
+    # No such match arm exists today, and this is the fail-closed direction (it
+    # would only ever over-alert, never hide a write), but the guard keeps the
+    # marker precise. (The protected bytes need not be restored: no marker
+    # contains them.)
     function normalize_assign(s,   t) {
         t = s
         gsub(/==/, "\x01", t)
         gsub(/!=/, "\x02", t)
         gsub(/>=/, "\x03", t)
         gsub(/<=/, "\x04", t)
+        gsub(/=>/, "\x05", t)
         gsub(/[[:space:]]*=[[:space:]]*/, "=", t)
         return t
     }
@@ -896,6 +902,24 @@ self_test() {
         printf '}\n'
     } > "$fdir/remove_signer.rs"
 
+    # (15) `=>` GUARD — a match arm that BINDS the marker identifier as the arm
+    # pattern (`threshold_value => ...`) is NOT an assignment and MUST NOT be
+    # flagged. Without the `=>` protection in normalize_assign, the fat arrow
+    # would collapse to `threshold_value=>`, spuriously matching the
+    # `threshold_value=` assignment marker. The fixture only READS via a match
+    # arm and persists best-effort; named non-`execute_` so the GOVHIT rule can
+    # not mask the result. No such arm exists in the tree today, but the guard
+    # keeps the marker precise (fail-closed: it would only ever over-alert).
+    {
+        printf 'pub fn match_arm_guard_fixture() {\n'
+        printf '    let label = match policy {\n'
+        printf '        threshold_value => "t",\n'
+        printf '        role_state.ceiling => "c",\n'
+        printf '    };\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/match_arm_guard.rs"
+
     # (8) Round-9 keystone — a governance leaf that persists BEST-EFFORT and is
     # NOT in CLASS_C_GOVERNANCE_LEAVES MUST be caught (GOVHIT). This models a
     # downward-auth leaf (e.g. execute_change_role) reverted to best-effort: it
@@ -981,6 +1005,17 @@ self_test() {
         printf '%sSELF-TEST FAILED%s: a fail-closed signer removal was wrongly flagged\n' \
             "$C_RED" "$C_RESET" >&2
         printf 'despite persisting fail-closed (the `.retain` marker ignored the persist).\n' >&2
+        rc=1
+    fi
+    # (15) `=>` guard: a match arm binding a marker identifier (`threshold_value
+    # => ..`, `role_state.ceiling => ..`) is NOT an assignment and MUST NOT be
+    # flagged. A regression that drops the `=>` protection in normalize_assign
+    # would collapse the fat arrow to `threshold_value=>` and spuriously HIT.
+    if grep -q $'^HIT\t.*\tmatch_arm_guard_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a match arm binding a marker identifier was wrongly\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'flagged — the `=>` guard in normalize_assign is missing (a fat-arrow arm\n' >&2
+        printf 'collapsed to a bare `=` and false-matched an assignment marker).\n' >&2
         rc=1
     fi
     # (8) Round-9 keystone: a best-effort governance leaf NOT in the allowlist

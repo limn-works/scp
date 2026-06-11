@@ -13,19 +13,42 @@
 # burns respawn budget AND loses its error context. Handlers must return a
 # typed `ContextError` instead — never panic.
 #
-# This gate fails if any of the following macros appear (as a macro CALL,
-# i.e. followed by `!`) in PRODUCTION code under
-# `crates/scp-runtime/src/context/actor/handlers/` OR in the dispatch hub
-# `crates/scp-runtime/src/context/actor/mod.rs`:
+# This gate enforces the panic ban across the FULL set of code reachable
+# SYNCHRONOUSLY on the per-context actor task, in three concentric scopes:
+#
+#   1. The actor HANDLERS (`crates/scp-runtime/src/context/actor/handlers/`)
+#      and the dispatch HUB (`crates/scp-runtime/src/context/actor/mod.rs`):
+#      the FULL banned set below, including the `assert*!` family. A panic
+#      here unwinds the actor task directly.
+#
+#   2. The PER-CONTEXT dispatch layer — EVERY `.rs` file under
+#      `crates/scp-runtime/src/context/` RECURSIVELY (the `*_helpers.rs` /
+#      `*_logic.rs` dispatch transitives, the `governance/`, `tools/`,
+#      `actor/`, `supervisor/`, `providers/` submodules, and the bare
+#      `ttl.rs` / `manager_methods.rs` / etc. leaves): the REACHABLE-panic
+#      family only (panic! unreachable! unimplemented! todo!). The governance
+#      timeout tick (`governance/timeout.rs`), the tool invoke/session leaves
+#      (`tools/invoke.rs`, `tools/session.rs`), and the TTL leaf (`ttl.rs`)
+#      are all called synchronously from a handler; a reachable panic in any
+#      of them unwinds the SAME actor task as a handler panic (ADR-049 §10,
+#      Seam-3). The `assert*!`/`debug_assert*!` family is NOT banned in this
+#      layer — a `debug_assert!` is release-stripped and is legitimately used
+#      as a tripwire (see `scan_helper_file`).
+#
+# The FULL banned set (scope 1 — handlers + hub):
 #
 #   panic!  unreachable!  unimplemented!  todo!
 #   assert!  assert_eq!  assert_ne!
 #   debug_assert!  debug_assert_eq!  debug_assert_ne!
 #
-# "Production code" = everything BEFORE the file's `#[cfg(test)]` line. Test
-# modules (which legitimately use `assert*!`) live below that marker and are
-# NOT scanned. The check asserts at most ONE `#[cfg(test)]` per file so the
-# "scan everything before the first one" rule is unambiguous.
+# In the handlers + hub, "production code" = everything BEFORE the file's
+# `#[cfg(test)]` line. Test modules (which legitimately use `assert*!`) live
+# below that marker and are NOT scanned. The check asserts at most ONE
+# `#[cfg(test)]` per handler file so the "scan everything before the first
+# one" rule is unambiguous. In the recursive per-context layer (scope 2),
+# test/testing code is excluded by brace-depth region instead (it covers
+# `#[cfg(test)]`, `#[cfg(all(test, ..))]`, `#[cfg(any(test, ..))]`, and
+# `#[cfg(feature = "testing")]` gates, whether trailing or interspersed).
 #
 # DISPATCH HUB EXCEPTION (actor/mod.rs only): the dispatch hub carries the
 # `#[cfg(feature = "testing")]`-gated `TestInducePanic` fault-injection seam
@@ -341,11 +364,27 @@ if [[ ! -f "$DISPATCH_HUB" ]]; then
     exit 2
 fi
 
-# The per-context dispatch helper layer (`*_helpers.rs` AND `*_logic.rs`) — the
-# `execute_*` governance leaves, dispatch transitives, and the Class-S mutators
-# (enforce_suspend / enforce_economy / dispatch_enforcement_action) the handlers
-# call synchronously. A reachable panic in EITHER family unwinds the same actor
-# task as a handler panic (ADR-049 §10, Seam-3).
+# The per-context dispatch layer — EVERY `.rs` file under `context/`,
+# RECURSIVELY. This is the closure of all code reachable SYNCHRONOUSLY on the
+# actor task: the `*_helpers.rs` / `*_logic.rs` dispatch transitives, the
+# `execute_*` governance leaves, the Class-S mutators (enforce_suspend /
+# enforce_economy / dispatch_enforcement_action), AND the submodule leaves a
+# handler calls synchronously but that the old maxdepth-1 `*_{helpers,logic}.rs`
+# glob MISSED: `governance/timeout.rs` (the governance timeout tick, called from
+# `actor/handlers/governance.rs`), `tools/invoke.rs` + `tools/session.rs` (from
+# `actor/handlers/tools.rs`), and `ttl.rs` (from `actor/handlers/lifecycle.rs`).
+# A reachable panic in ANY of them unwinds the SAME actor task as a handler
+# panic (ADR-049 §10, Seam-3), so the whole tree is scanned for the
+# reachable-panic family. The `actor/` subtree (handlers + hub) is also covered
+# here for the reachable family; the handlers + hub additionally get the FULL
+# banned set (incl. assert*!) via `scan_file` / `scan_dispatch_hub` above.
+#
+# The whole `context/` tree is verified to contain ZERO production
+# reachable-panic-family macros today — the only panic-family uses are inside
+# `#[cfg(test)]` modules and the single `#[cfg(feature = "testing")]`-gated
+# `TestInducePanic` seam in `actor/mod.rs`, all excluded by the test/testing
+# brace-depth carve-out in `scan_helper_file`. Scanning the whole tree therefore
+# passes clean; no file needs a documented per-file exclusion.
 HELPER_DIR="crates/scp-runtime/src/context"
 
 if [[ ! -d "$HELPER_DIR" ]]; then
@@ -355,11 +394,13 @@ if [[ ! -d "$HELPER_DIR" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# scan_helper_file — scan one per-context dispatch HELPER file
-# (`crates/scp-runtime/src/context/*_helpers.rs` and `*_logic.rs`) for the
-# REACHABLE-panic family only. ADR-049 §10 (round-9): the helper/logic layer
-# holds the `execute_*` governance leaves, the per-context dispatch transitives,
-# and the Class-S mutators that the actor handlers call synchronously. A
+# scan_helper_file — scan one per-context dispatch-layer file (ANY `.rs` under
+# `crates/scp-runtime/src/context/`, recursively) for the REACHABLE-panic family
+# only. ADR-049 §10: the per-context dispatch layer holds the `execute_*`
+# governance leaves, the per-context dispatch transitives, the Class-S mutators,
+# AND the synchronously-called submodule leaves (`governance/timeout.rs`,
+# `tools/invoke.rs`, `tools/session.rs`, `ttl.rs`) that the actor handlers reach
+# on the actor task. A
 # `panic!`/`unreachable!`/`unimplemented!`/`todo!`
 # reached there unwinds the SAME actor task as a panic in a handler — the
 # watchdog respawns and, on a deterministic re-trip, poisons the context (a
@@ -411,9 +452,21 @@ scan_helper_file() {
 
         # Detect a test/testing cfg gate on the RAW line BEFORE string/comment
         # stripping (the `"testing"` literal would otherwise be stripped). Match
-        # any #[cfg(...)] whose predicate references `test` (covers `test`,
-        # `all(test, ..)`, `any(test, ..)`) OR `feature = "testing"`.
-        if (raw ~ /#\[cfg\([^]]*\btest\b/ || \
+        # any #[cfg(...)] whose predicate gates on `test` (covers the bare
+        # `#[cfg(test)]`, `#[cfg(all(test, ..))]`, and `#[cfg(any(test, ..))]`
+        # forms) OR `feature = "testing"`.
+        #
+        # PORTABILITY (BSD vs GNU awk): the `test` token is anchored as a
+        # standalone cfg predicate atom — it must follow `cfg(`, `all(`, or
+        # `any(` and be terminated by `,`, `)`, or a space. This is the
+        # POSIX-portable substitute for a `\b...\b` word boundary, which BSD
+        # (macOS) awk does NOT support — a prior `/\btest\b/` form silently
+        # NEVER matched on macOS, so the bare `#[cfg(test)]` trailing-module
+        # exclusion was dead (it only worked for the `feature = "testing"`
+        # branch). The anchor also rejects look-alikes (`detest`, `test_util`,
+        # `my_test`, `fastest`) and deliberately does NOT fire on `not(test)` —
+        # a `#[cfg(not(test))]` item is PRODUCTION code and must stay scanned.
+        if (raw ~ /#\[cfg\((all\(|any\()?test[,) ]/ || \
             raw ~ /#\[cfg\([^]]*feature[[:space:]]*=[[:space:]]*"testing"/) {
             gated_pending = 1
         }
@@ -499,29 +552,37 @@ run_scan() {
         "$C_DIM" "$label" "$C_RESET" "$dispatch_hub"
     scan_dispatch_hub "$dispatch_hub" >> "$tmp_out"
 
-    # Scan the per-context dispatch helper layer for reachable panics. This
-    # covers BOTH the `*_helpers.rs` files AND the `*_logic.rs` dispatch
-    # transitives (governance_logic / economy_logic / lifecycle_logic), which
-    # hold synchronously-called Class-S mutators (enforce_suspend,
-    # enforce_economy, enforce_join_economy, dispatch_enforcement_action) whose
-    # reachable panic would unwind the SAME actor task as a handler panic. The
-    # `*_logic.rs` files obey the identical reachable-panic-family rules and
-    # test/testing carve-outs, so they reuse `scan_helper_file` unchanged — no
-    # separate scanner (ADR-049 §10, Seam-3).
+    # Scan the per-context dispatch layer for reachable panics — EVERY `.rs`
+    # file under `context/`, RECURSIVELY. This is the closure of all code
+    # reachable synchronously on the actor task: the `*_helpers.rs` /
+    # `*_logic.rs` dispatch transitives (governance_logic / economy_logic /
+    # lifecycle_logic) holding the Class-S mutators (enforce_suspend,
+    # enforce_economy, enforce_join_economy, dispatch_enforcement_action), PLUS
+    # the submodule leaves the old maxdepth-1 `*_{helpers,logic}.rs` glob missed
+    # — `governance/timeout.rs` (governance timeout tick), `tools/invoke.rs` +
+    # `tools/session.rs` (tool dispatch), and `ttl.rs` (TTL leaf) — each called
+    # synchronously from a handler. A reachable panic in ANY of them unwinds the
+    # SAME actor task as a handler panic (ADR-049 §10, Seam-3). Every file obeys
+    # the identical reachable-panic-family rules and test/testing brace-depth
+    # carve-outs, so they all reuse `scan_helper_file` unchanged — no separate
+    # scanner. (The `actor/` handlers + hub are re-covered here for the reachable
+    # family; they additionally get the FULL banned set via `scan_file` /
+    # `scan_dispatch_hub` above — the overlap is harmless.)
     local helper_scanned=0 helper_min=0
     if [[ -n "$helper_dir" ]]; then
-        printf '%shelper panic-ban %s:%s %s/*_{helpers,logic}.rs\n' \
+        printf '%sdispatch-layer panic-ban %s:%s %s/**/*.rs (recursive)\n' \
             "$C_DIM" "$label" "$C_RESET" "$helper_dir"
-        find "$helper_dir" -maxdepth 1 -type f \
-            \( -name '*_helpers.rs' -o -name '*_logic.rs' \) -print0 \
+        find "$helper_dir" -type f -name '*.rs' -print0 \
             | while IFS= read -r -d '' file; do
                 scan_helper_file "$file"
             done >> "$tmp_out"
         helper_scanned=$(awk -F'\t' -v D="$helper_dir" \
             '$1=="SCANNED" && index($2, D)==1 {s+=$3} END{print s+0}' "$tmp_out")
-        # The helper layer is several thousand production lines; a near-zero
-        # count means the scanner wedged (and the gate would vacuously pass).
-        helper_min=500
+        # The per-context tree is tens of thousands of production lines; a
+        # near-zero count means the scanner wedged (and the gate would vacuously
+        # pass). The real count is ~24k; this floor is well below that but far
+        # above any plausible "wedged scanner" residue.
+        helper_min=5000
     fi
 
     local hits multi
@@ -537,8 +598,12 @@ run_scan() {
     # fixes) would drop the hub's scanned count toward zero, making the gate
     # vacuously PASS. Treat a near-empty hub scan as a failure.
     local hub_scanned vacuous=0
+    # The hub path now appears TWICE in SCANNED: once from `scan_dispatch_hub`
+    # (run first) and once from the recursive `scan_helper_file` pass (which
+    # also visits `actor/mod.rs`). Take only the FIRST — the dispatch-hub scan —
+    # so `hub_scanned` stays a single integer for the `-lt` comparison below.
     hub_scanned=$(awk -F'\t' -v F="$dispatch_hub" \
-        '$1=="SCANNED" && $2==F {print $3}' "$tmp_out")
+        '$1=="SCANNED" && $2==F && !seen {print $3; seen=1}' "$tmp_out")
     hub_scanned=${hub_scanned:-0}
     # The dispatch hub is a large file; its production region is hundreds of
     # lines. A threshold well below the real count (which is in the hundreds)
@@ -717,7 +782,18 @@ self_test() {
 #   (3) does NOT flag a panic inside a `#[cfg(all(test, feature = "testing"))]`
 #       module (the form lifecycle_helpers.rs uses),
 #   (4) does NOT flag a panic inside a bare `#[cfg(feature = "testing")]` item
-#       (the interspersed testing accessors in queries_helpers.rs).
+#       (the interspersed testing accessors in queries_helpers.rs),
+#   (5) does NOT flag a panic inside a bare `#[cfg(test)]` trailing module — the
+#       FORM that the bulk of the now-recursively-scanned tree uses (export_
+#       import.rs / supervisor.rs / actor/state.rs all gate tests this way). This
+#       case is the regression guard for the BSD-awk `\b`-word-boundary bug: the
+#       prior `/\btest\b/` gate-detect NEVER matched on macOS, so a bare
+#       `#[cfg(test)]` module was NOT excluded and its `panic!`s were false HITs.
+#   (6) does NOT flag a panic inside a `#[cfg(any(test, feature = "testing"))]`
+#       module (the form tools_helpers.rs / context/mod.rs use),
+#   (7) DOES flag a production reachable panic inside a `#[cfg(not(test))]` item
+#       — `not(test)` is PRODUCTION code and must stay scanned; the gate-detect
+#       must NOT mistake it for a test gate.
 # Set NO_PANIC_GATE_SELFTEST=1 to skip (not recommended).
 # ---------------------------------------------------------------------------
 self_test_helpers() {
@@ -778,6 +854,67 @@ self_test_helpers() {
         rc=1
     fi
 
+    # (5): a panic inside a bare `#[cfg(test)]` TRAILING module — excluded.
+    # This is the regression guard for the BSD-awk `\b` bug: with a `/\btest\b/`
+    # gate-detect this case would FAIL (the module would not be excluded and its
+    # panic would be a false HIT). Production padding precedes the module so the
+    # fixture mirrors a real file (production code, then a trailing test mod).
+    {
+        printf 'pub fn prod_clean3() { let _ = 3; }\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod tests {\n'
+        printf '    #[test]\n'
+        printf '    fn t() {\n'
+        printf '        match v {\n'
+        printf '            other => panic!("expected X, got {other:?}"),\n'
+        printf '        }\n'
+        printf '    }\n'
+        printf '}\n'
+    } > "$fixt/d_helpers.rs"
+    out=$(scan_helper_file "$fixt/d_helpers.rs")
+    if grep -q $'^HIT\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner flagged a panic inside a bare\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`#[cfg(test)]` trailing module — the test-region exclusion is broken\n' >&2
+        printf '(likely a non-portable `\\btest\\b` gate-detect that fails on BSD awk).\n' >&2
+        rc=1
+    fi
+
+    # (6): a panic inside `#[cfg(any(test, feature = "testing"))]` — excluded.
+    {
+        printf 'pub fn prod_clean4() { let _ = 4; }\n'
+        printf '#[cfg(any(test, feature = "testing"))]\n'
+        printf 'mod tests {\n'
+        printf '    fn t() { unreachable!("test panic ok"); }\n'
+        printf '}\n'
+    } > "$fixt/e_helpers.rs"
+    out=$(scan_helper_file "$fixt/e_helpers.rs")
+    if grep -q $'^HIT\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner flagged a panic inside a\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`#[cfg(any(test, feature = "testing"))]` module (must be excluded).\n' >&2
+        rc=1
+    fi
+
+    # (7): a production reachable panic inside a `#[cfg(not(test))]` item MUST be
+    # CAUGHT — `not(test)` is production-only code, NOT a test gate, so the
+    # gate-detect must not exclude it. (Guards against an over-broad `test`
+    # match that would wrongly silence production panics behind `cfg(not(test))`.)
+    {
+        printf '#[cfg(not(test))]\n'
+        printf 'pub fn prod_only() {\n'
+        printf '    panic!("production-only panic must be caught");\n'
+        printf '}\n'
+    } > "$fixt/f_helpers.rs"
+    out=$(scan_helper_file "$fixt/f_helpers.rs")
+    if ! grep -q $'^HIT\t.*panic' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner did NOT catch a production reachable\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'panic inside a `#[cfg(not(test))]` item — the gate-detect wrongly treats\n' >&2
+        printf '`not(test)` as a test gate and excludes production code.\n' >&2
+        rc=1
+    fi
+
     rm -rf "$fixt"
     return "$rc"
 }
@@ -802,7 +939,9 @@ fi
 if run_scan "$SCAN_DIR" "$DISPATCH_HUB" "scan" "$HELPER_DIR"; then
     printf '%sPASSED%s: no banned panic-family macros in handler production code,\n' \
         "$C_GREEN" "$C_RESET"
-    printf '%s        %s and no reachable panics in the per-context helper layer.\n' \
+    printf '%s        %s and no reachable panics anywhere in the per-context tree\n' \
+        "$C_DIM" "$C_RESET"
+    printf '%s        %s (context/**/*.rs, scanned recursively).\n' \
         "$C_DIM" "$C_RESET"
     exit 0
 fi
