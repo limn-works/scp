@@ -2864,6 +2864,24 @@ impl Supervisor {
         //    `restore_context` respawn primitive.
         let handle =
             crate::context::ContextHandle::new(ctx_id.to_owned(), snapshot.context_params.clone());
+        // Drive the handle to `Active` BEFORE restore — `restore_context`
+        // assumes a live handle and never transitions it itself, so a fresh
+        // `ContextHandle` (which starts `Creating`) would otherwise leave the
+        // respawned context stuck in `Creating`. This mirrors the
+        // `RestoreContext` direct dispatch arm, which transitions to `Active`
+        // before calling `restore_context`. On a transition failure, count it
+        // as a failed respawn.
+        if let Err(e) = handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .await
+        {
+            if record_failure(self) {
+                self.despawn_actor(ctx_id).await;
+            }
+            return Err(ContextError::ActorCrashed(format!(
+                "{ctx_id} (could not activate respawned context handle: {e})"
+            )));
+        }
         let deps = match self.build_actor_deps(owning_did).await {
             Ok(deps) => deps,
             Err(e) => {
@@ -6354,11 +6372,120 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    // The watchdog tests' tracing-capture buffer uses `std::sync::Mutex`,
+    // which is only locked synchronously inside `tracing::Subscriber::event`
+    // (never across an `.await`), so the async-deadlock rationale behind the
+    // workspace `disallowed_types` ban does not apply here.
+    clippy::disallowed_types,
+    // `clock` / `clock_dyn` and similar paired test bindings trip the
+    // pedantic similar-names lint without any real ambiguity.
+    clippy::similar_names
+)]
 mod tests {
     use super::*;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::testing::InMemoryStorage;
+
+    // -----------------------------------------------------------------
+    // CrashWindow pure-method unit tests (ADR-049 §10).
+    //
+    // These exercise the respawn-budget logic with explicit `now_ms`
+    // values — no clock, no actor, no async. They prove eviction,
+    // the exactly-3-in-window poison threshold, the
+    // 2-then-gap-then-1 non-poison case, sticky poison, and clear().
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn crash_window_three_in_window_poisons() {
+        let mut w = CrashWindow::default();
+        assert!(!w.record(0), "1st crash does not poison");
+        assert!(!w.record(100), "2nd crash does not poison");
+        assert!(w.record(200), "3rd crash within 60s poisons");
+        assert!(w.is_poisoned());
+        assert_eq!(w.crash_count(), CRASH_POISON_THRESHOLD);
+    }
+
+    #[test]
+    fn crash_window_two_then_gap_then_one_does_not_poison() {
+        let mut w = CrashWindow::default();
+        // Two crashes near t=0.
+        assert!(!w.record(0));
+        assert!(!w.record(1_000));
+        // A third crash AFTER the window has slid past the first two: at
+        // t = 1_000 + 60_001, the entries at 0 and 1_000 are both strictly
+        // older than 60s relative to `now_ms` and get evicted, leaving only
+        // the newest. Count is 1, so no poison.
+        let now = 1_000 + CRASH_WINDOW_MS + 1;
+        assert!(
+            !w.record(now),
+            "the two early crashes evicted; only 1 remains"
+        );
+        assert!(!w.is_poisoned());
+        assert_eq!(w.crash_count(), 1);
+    }
+
+    #[test]
+    fn crash_window_evicts_only_strictly_older_than_window() {
+        let mut w = CrashWindow::default();
+        // Crash at the exact window edge is RETAINED (eviction is strict
+        // `> CRASH_WINDOW_MS`).
+        assert!(!w.record(0));
+        assert!(!w.record(CRASH_WINDOW_MS)); // exactly 60s later: front kept
+        assert_eq!(w.crash_count(), 2, "edge-of-window crash is not evicted");
+        // A third within the same window poisons (all three within 60s of
+        // the newest).
+        assert!(w.record(CRASH_WINDOW_MS), "3rd within window poisons");
+    }
+
+    #[test]
+    fn crash_window_poison_is_sticky_across_later_eviction() {
+        let mut w = CrashWindow::default();
+        w.record(0);
+        w.record(100);
+        assert!(w.record(200), "poisoned at 3 crashes");
+        // A much-later record evicts the old crashes (count drops) but the
+        // sticky flag must stay set — an in-window eviction must NOT
+        // silently un-poison.
+        let later = 200 + CRASH_WINDOW_MS * 10;
+        assert!(
+            w.record(later),
+            "poison persists even after the window slides past the old crashes"
+        );
+        assert!(w.is_poisoned());
+    }
+
+    #[test]
+    fn crash_window_clear_unpoison_and_resets() {
+        let mut w = CrashWindow::default();
+        w.record(0);
+        w.record(100);
+        w.record(200);
+        assert!(w.is_poisoned());
+        w.clear();
+        assert!(!w.is_poisoned(), "clear() un-poisons");
+        assert_eq!(w.crash_count(), 0, "clear() empties the deque");
+        // After clear the budget starts fresh: one crash does not re-poison.
+        assert!(!w.record(300));
+    }
+
+    #[test]
+    fn crash_window_deque_is_length_capped() {
+        // Under a pathological non-monotonic clock that never advances past
+        // the window, the deque must stay bounded by the defensive cap.
+        let mut w = CrashWindow::default();
+        for _ in 0..100 {
+            w.record(0);
+        }
+        assert!(
+            w.crash_count() <= CRASH_DEQUE_CAP,
+            "deque length is defensively capped at {CRASH_DEQUE_CAP}"
+        );
+        assert!(w.is_poisoned(), "many same-instant crashes poison");
+    }
 
     /// In-memory `ContextPersistence` stub for tests only. Returns an
     /// empty snapshot for every load and silently accepts every persist.
@@ -7746,5 +7873,644 @@ mod tests {
         // `concurrent_reservations_get_distinct_sequences` test that pins
         // the sequence values themselves.
         handle.send_shutdown().await.expect("handle is live");
+    }
+
+    // =================================================================
+    // Watchdog / respawn / poison integration tests (ADR-049 §10).
+    //
+    // These spawn real state-bearing actors, induce panics via the
+    // testing-only `TestInducePanic` seam, and assert the watchdog's
+    // crash-budget, poison, respawn, and payload-redaction behaviour.
+    // They run on a multi-thread runtime so the watchdog task (spawned
+    // separately from the actor) makes progress, and inject a
+    // `TestClock` so the 60s crash window is driven deterministically.
+    // =================================================================
+
+    use scp_primitives::TestClock;
+
+    // -----------------------------------------------------------------
+    // Global tracing capture (test-only) for the payload-redaction test.
+    //
+    // The watchdog's `tracing::error!` runs on a tokio worker thread, so a
+    // thread-local subscriber on the test thread would miss it. We install
+    // a process-global capturing subscriber exactly once (`std::sync::Once`)
+    // and let every watchdog test read its own lines out of the shared
+    // buffer (filtered by the test's unique `context_id`). The static lives
+    // inside `mod tests`, so the no-mutable-globals gate ignores it.
+    // -----------------------------------------------------------------
+    static CAPTURED_LOG: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<String>>>> =
+        std::sync::OnceLock::new();
+    static CAPTURE_INIT: std::sync::Once = std::sync::Once::new();
+
+    fn capture_buffer() -> Arc<std::sync::Mutex<Vec<String>>> {
+        Arc::clone(CAPTURED_LOG.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new()))))
+    }
+
+    /// Install the process-global capturing subscriber (idempotent).
+    fn install_capture_subscriber() {
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Metadata};
+
+        struct CaptureSub;
+        struct LineVisitor<'a>(&'a mut String);
+        impl Visit for LineVisitor<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {}={value:?}", field.name());
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {}={value}", field.name());
+            }
+        }
+        impl tracing::Subscriber for CaptureSub {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut line = String::new();
+                let mut v = LineVisitor(&mut line);
+                event.record(&mut v);
+                if let Some(buf) = CAPTURED_LOG.get() {
+                    buf.lock().unwrap().push(line);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        CAPTURE_INIT.call_once(|| {
+            let _ = capture_buffer(); // ensure the buffer OnceLock is set.
+            // Best-effort: if another test already set a global default this
+            // is a no-op (returns Err), but no other test installs one.
+            let _ = tracing::subscriber::set_global_default(CaptureSub);
+        });
+    }
+
+    /// Captured watchdog log lines that mention `ctx_key`.
+    fn captured_log_lines_for(ctx_key: &str) -> Vec<String> {
+        capture_buffer()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(ctx_key))
+            .cloned()
+            .collect()
+    }
+
+    /// `ContextPersistence` backed by a shared `DashMap` so a snapshot
+    /// persisted in a test is actually returned by `load_context` — unlike
+    /// `TestPersistence`, which always returns `None`. Used by the respawn
+    /// tests, which need `restore_context` to find a real snapshot.
+    #[derive(Clone, Default)]
+    struct MapPersistence {
+        contexts: Arc<DashMap<String, crate::context::state::ContextSnapshot>>,
+    }
+    impl ContextPersistence for MapPersistence {
+        fn persist_context(
+            &self,
+            id: &str,
+            snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.contexts.insert(id.to_owned(), snap.clone());
+            Ok(())
+        }
+        fn load_context(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(self.contexts.get(id).map(|s| s.value().clone()))
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.contexts.iter().map(|e| e.key().clone()).collect())
+        }
+    }
+
+    /// Build a providers-populated supervisor with an injected clock and
+    /// persistence backend so the watchdog/respawn tests can drive the
+    /// crash window deterministically and rehydrate real snapshots.
+    fn supervisor_with_clock_and_persistence(
+        clock: Arc<dyn Clock>,
+        persistence: Box<dyn ContextPersistence>,
+    ) -> Arc<Supervisor> {
+        // Install the global capture subscriber so the payload-redaction
+        // test can observe the watchdog's log (emitted on a worker thread).
+        install_capture_subscriber();
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestDoNotRely".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(TestEventLog);
+        let key_resolver: KeyResolver = Arc::new(|_: &DID| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            Some(clock),
+            mls_storage,
+        )
+    }
+
+    /// Drive a panic into the actor via the testing-only seam and wait for
+    /// the watchdog to observe it. Sending `TestInducePanic` returns an
+    /// `Err` (the reply channel drops when the actor task unwinds) — that
+    /// is the signal the actor has crashed. We then poll until the
+    /// supervisor's registry/budget reflects the watchdog's reaction.
+    async fn induce_panic(handle: &ContextActorHandle, sentinel: &str) {
+        // Fire-and-forget: `TestInducePanic` carries no reply channel and the
+        // actor unwinds on dispatch, so use the pre-built-command send path.
+        let cmd = ContextCommand::LifecycleControl(
+            crate::context::actor::commands::LifecycleControlCommand::TestInducePanic {
+                sentinel: sentinel.to_owned(),
+            },
+        );
+        let _ = handle
+            .send_with_timeout(cmd, std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    /// Spawn-and-panic helper: registers a fresh encrypted actor for
+    /// `ctx_key`, drives it Active, persists a snapshot, then returns the
+    /// handle so the test can panic it. Returns `(handle, ctx_key)`.
+    async fn spawn_active_with_snapshot(
+        sup: &Arc<Supervisor>,
+        ctx_id_bytes: [u8; 32],
+    ) -> (ContextActorHandle, String) {
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+        // Persist a snapshot so a respawn can rehydrate the context.
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        sup.persistence_ref()
+            .expect("test supervisor has persistence")
+            .persist_context(&ctx_key, &snap)
+            .unwrap();
+        let deps = test_actor_deps(sup).await;
+        // `Box::pin` keeps the large (state-carrying) spawn future off the
+        // test's stack frame, mirroring the production call sites.
+        let handle = Box::pin(sup.spawn_actor_with_state(state, deps, None))
+            .await
+            .expect("spawn registers");
+        (handle, ctx_key)
+    }
+
+    /// Poll until `cond` holds or the timeout elapses. Returns whether the
+    /// condition became true. Used to wait on the watchdog (which runs on a
+    /// separate task) without a fixed sleep.
+    async fn wait_until<F>(timeout: std::time::Duration, mut cond: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Async variant of [`wait_until`]: polls an async predicate (e.g. a
+    /// mailbox query) until it holds or the timeout elapses. Used to wait on
+    /// a RESPONSIVE respawned actor — a bare registry `lookup` is not enough
+    /// because a just-crashed actor's handle lingers in the registry until
+    /// the watchdog despawns it.
+    async fn wait_until_async<F, Fut>(timeout: std::time::Duration, mut cond: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond().await {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// 3 panics within 60s poison the context: `is_context_poisoned` becomes
+    /// true, `lookup` returns None (the dead handle is despawned), a
+    /// subsequent dispatch surfaces `ContextPoisoned`, and no respawn
+    /// happens after the poison.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn three_crashes_poison_and_stop_respawning() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        let ctx_id_bytes = [0xC1u8; 32];
+        let (handle, ctx_key) = spawn_active_with_snapshot(&sup, ctx_id_bytes).await;
+
+        // Crash 1 and 2: each below the threshold, so the watchdog respawns.
+        // After each crash we wait for a RESPONSIVE respawned actor before
+        // capturing the next handle — a bare `lookup` would return the
+        // lingering dead handle (despawned only by the watchdog), and the
+        // next panic would land on a closed mailbox and never crash.
+        let mut handle = handle;
+        for i in 0..2u32 {
+            induce_panic(&handle, "SECRET_SENTINEL_abc123").await;
+            let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+                sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                    && !sup.is_context_poisoned(&ctx_key)
+            })
+            .await;
+            assert!(
+                respawned,
+                "watchdog must respawn a responsive actor below the poison threshold (crash {i})"
+            );
+            clock.advance_millis(100);
+            handle = sup
+                .lookup(&ctx_key)
+                .expect("respawned responsive actor is registered");
+        }
+
+        // Crash 3: reaches the threshold (3 within 60s) → poison.
+        induce_panic(&handle, "SECRET_SENTINEL_abc123").await;
+        let poisoned = wait_until(std::time::Duration::from_secs(5), || {
+            sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(poisoned, "the 3rd crash within 60s must poison the context");
+
+        // The poisoned context's dead handle is despawned (lookup None).
+        let despawned = wait_until(std::time::Duration::from_secs(5), || {
+            sup.lookup(&ctx_key).is_none()
+        })
+        .await;
+        assert!(despawned, "a poisoned context's actor must be despawned");
+
+        // A subsequent per-context dispatch surfaces ContextPoisoned (not
+        // the generic ContextNotRegistered). `dispatch_command` returns
+        // `Result<Outcome<()>, _>` (Outcome is not Debug), so inspect the
+        // error arm directly.
+        let result = sup
+            .dispatch_command(
+                &ctx_key,
+                crate::context::actor::commands::MessagingCommand::Placeholder {
+                    reply: tokio::sync::oneshot::channel().0,
+                },
+            )
+            .await;
+        match result {
+            Err(ContextError::ContextPoisoned(id)) => {
+                assert_eq!(id, ctx_key, "ContextPoisoned must carry the context id");
+            }
+            Err(other) => {
+                panic!("dispatch to a poisoned context must surface ContextPoisoned, got {other:?}")
+            }
+            Ok(_) => panic!("dispatch to a poisoned context must fail, but it succeeded"),
+        }
+
+        // No respawn after poison: even after time passes, lookup stays None.
+        clock.advance_millis(1_000);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            sup.lookup(&ctx_key).is_none(),
+            "a poisoned context must NOT be respawned"
+        );
+    }
+
+    /// A single crash (below the threshold) respawns the actor from its
+    /// persisted snapshot, and the rehydrated context preserves the
+    /// persisted state — including the §9.10.4 routing axis.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_crash_respawns_and_preserves_state() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        // Build an encrypted state with a non-default member, persist it,
+        // and spawn.
+        let ctx_id_bytes = [0xC2u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        // Mutate membership so the snapshot carries an observable field.
+        // `is_member` reads `state.membership` (a `MembershipState`), and
+        // restore derives the actor's member set from the snapshot's
+        // `membership`, so add through the membership API (NOT the `members`
+        // HashSet, which the snapshot does not persist).
+        let member = DID("did:example:preserved-member".to_owned());
+        state
+            .membership
+            .add_member(member.clone(), "member".to_owned(), Vec::new());
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        // The snapshot's routing axis must be encrypted (not broadcast) —
+        // the §9.10.4 axis carried through restore.
+        assert!(
+            !snap.routing.is_broadcast(),
+            "encrypted context snapshot must carry a non-broadcast routing axis"
+        );
+        persistence.persist_context(&ctx_key, &snap).unwrap();
+
+        let deps = test_actor_deps(&sup).await;
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+
+        // Crash once (below threshold).
+        induce_panic(&handle, "SECRET_SENTINEL_abc123").await;
+
+        // Wait for a RESPONSIVE respawned actor. A bare `lookup().is_some()`
+        // is not sufficient: between the crash and the watchdog's
+        // despawn-then-respawn, the dead actor's handle still lingers in the
+        // registry, so we must wait until a live query actually succeeds —
+        // i.e. the respawned actor answers `read_context_state`.
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "a single crash must respawn a RESPONSIVE actor from the snapshot"
+        );
+
+        // Query membership through the supervisor's mailbox dispatch (the
+        // production read path, which re-resolves the live actor each call)
+        // — the persisted member is present, proving the snapshot was
+        // rehydrated.
+        let is_member = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sup.dispatch_query(crate::context::actor::commands::QueriesCommand::IsMember {
+                context_id: ctx_key.clone(),
+                did: member.to_string(),
+                reply: tx,
+            })
+            .await
+            .expect("dispatch_query routes to the respawned actor");
+            rx.await.expect("respawned actor replies")
+        };
+        assert_eq!(
+            is_member.ok(),
+            Some(true),
+            "respawned context must preserve the persisted membership"
+        );
+
+        // §9.10.4 routing-axis assertion: an encrypted context that
+        // rehydrated as broadcast would have failed the restore-time
+        // routing-agreement check (`restore_context` fails closed when the
+        // snapshot's routing variant disagrees with the reconstructed mode),
+        // so reaching a responsive Active state at all proves the encrypted
+        // routing axis survived the snapshot round-trip.
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "respawned encrypted context must be Active with its routing axis intact"
+        );
+    }
+
+    /// The watchdog logs the crash WITHOUT the panic payload: the captured
+    /// tracing output contains the diagnostic message and `crash_count` but
+    /// NEVER the panic sentinel (which could be plaintext or key material).
+    ///
+    /// Capture mechanism: a hand-rolled `tracing::Subscriber` (no
+    /// `tracing-subscriber` dependency) installed as the PROCESS-GLOBAL
+    /// default exactly once (the watchdog runs on a separate tokio worker
+    /// thread, so a thread-local `set_default` on the test thread would not
+    /// see its events). Every test using a distinct `context_id` reads only
+    /// its own lines out of the shared global buffer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panic_payload_is_not_logged() {
+        const SENTINEL: &str = "SECRET_SENTINEL_abc123";
+
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        // Distinct context id → the global capture buffer can be filtered to
+        // this test's watchdog lines only.
+        let ctx_id_bytes = [0xC3u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let (handle, _k) = spawn_active_with_snapshot(&sup, ctx_id_bytes).await;
+
+        induce_panic(&handle, SENTINEL).await;
+
+        // Wait until the watchdog's crash line for THIS context appears.
+        let logged = wait_until(std::time::Duration::from_secs(5), || {
+            captured_log_lines_for(&ctx_key)
+                .iter()
+                .any(|l| l.contains("context actor panicked") && l.contains("crash_count"))
+        })
+        .await;
+        assert!(
+            logged,
+            "the watchdog must log a payload-free crash diagnostic"
+        );
+
+        let lines = captured_log_lines_for(&ctx_key);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("payload intentionally not logged"),
+            "the diagnostic must state the payload was withheld; got: {joined}"
+        );
+        assert!(
+            !joined.contains(SENTINEL),
+            "SECURITY: the panic payload sentinel MUST NOT appear in the log; got: {joined}"
+        );
+    }
+
+    /// A clean shutdown is NOT a crash: the watchdog sees `Ok(())`, records
+    /// no crash, and does not respawn. Same for an inbox-closed exit (all
+    /// handles dropped).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_shutdown_is_not_a_crash() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        // --- Case 1: explicit shutdown ---
+        let ctx_id_bytes = [0xC4u8; 32];
+        let (handle, ctx_key) = spawn_active_with_snapshot(&sup, ctx_id_bytes).await;
+        handle.send_shutdown().await.expect("shutdown acks");
+        // Give the watchdog time to observe the clean Ok exit.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !sup.is_context_poisoned(&ctx_key),
+            "a clean shutdown must not record a crash or poison the context"
+        );
+        // The watchdog must NOT respawn on a clean exit — but `despawn_actor`
+        // was not called by the watchdog either; the handle's mailbox closed
+        // on shutdown, so the actor exited and no respawn re-registered it.
+        let no_respawn = wait_until(std::time::Duration::from_secs(2), || {
+            // Confirm the crash window has no entry (never recorded a crash).
+            !sup.crash_windows.contains_key(&ctx_key)
+        })
+        .await;
+        assert!(
+            no_respawn,
+            "a clean shutdown must not create a crash-window entry"
+        );
+
+        // --- Case 2: inbox closed (all handles dropped) ---
+        let ctx2_bytes = [0xC5u8; 32];
+        let (handle2, ctx2_key) = spawn_active_with_snapshot(&sup, ctx2_bytes).await;
+        drop(handle2); // close the inbox; the run loop exits via `None`.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !sup.is_context_poisoned(&ctx2_key),
+            "an inbox-closed exit is clean — no crash, no poison"
+        );
+        assert!(
+            !sup.crash_windows.contains_key(&ctx2_key),
+            "an inbox-closed exit must not record a crash"
+        );
+    }
+
+    /// A respawn that reliably fails (no persisted snapshot — the lost-state
+    /// case) is counted as a crash. One induced panic therefore records TWO
+    /// crashes (the panic itself + the failed respawn), proving failed
+    /// respawns consume the budget rather than looping forever. The context
+    /// is left dormant (lookup None) — it was not resurrected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_respawn_counts_as_crash() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        // Empty persistence: load_context always returns None, so the
+        // watchdog's respawn fails (the lost-state case).
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        // Spawn WITHOUT persisting a snapshot — the crash's respawn will
+        // fail (no snapshot), counting as an additional crash.
+        let ctx_id_bytes = [0xC6u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+        let deps = test_actor_deps(&sup).await;
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+
+        // One induced panic: the watchdog records crash #1, then the respawn
+        // loads no snapshot and `record_failure` records crash #2.
+        induce_panic(&handle, "SECRET_SENTINEL_abc123").await;
+
+        let recorded = wait_until(std::time::Duration::from_secs(5), || {
+            sup.crash_windows
+                .get(&ctx_key)
+                .is_some_and(|w| w.crash_count() >= 2)
+        })
+        .await;
+        assert!(
+            recorded,
+            "a failed respawn must be counted as an additional crash \
+             (1 panic + 1 failed respawn = 2 crashes)"
+        );
+        assert!(
+            sup.lookup(&ctx_key).is_none(),
+            "a context with no recoverable snapshot must not be resurrected"
+        );
+    }
+
+    /// Repeated failed respawns within the window cross the threshold and
+    /// poison the context — proving the failed-respawn crash accounting
+    /// feeds the budget. Driven directly via `respawn_from_snapshot` (the
+    /// watchdog's respawn primitive) against an empty persistence so each
+    /// call is a guaranteed failed respawn that records one crash.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_failed_respawns_poison() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        let ctx_key = "ctx-no-snapshot".to_owned();
+        let owning = DID("did:example:admin".to_owned());
+
+        // Each respawn fails (no snapshot) and records exactly one crash.
+        // After CRASH_POISON_THRESHOLD failed respawns within the window the
+        // context must be poisoned.
+        for i in 0..CRASH_POISON_THRESHOLD {
+            let result = sup.respawn_from_snapshot(&ctx_key, &owning).await;
+            assert!(
+                matches!(result, Err(ContextError::ActorCrashed(_))),
+                "respawn #{i} with no snapshot must surface ActorCrashed, got {result:?}"
+            );
+            clock.advance_millis(100);
+        }
+
+        assert!(
+            sup.is_context_poisoned(&ctx_key),
+            "{CRASH_POISON_THRESHOLD} failed respawns within the window must poison the context"
+        );
     }
 }
