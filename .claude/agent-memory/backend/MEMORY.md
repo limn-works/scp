@@ -1,7 +1,5 @@
 # Backend Agent Memory (scoped)
 
-- [project-adr049-phase2b-watchdog](project_adr049_phase2b_watchdog.md) — Phase 2B per-actor watchdog/respawn/poison (ADR-049 §10): design as built + 2 gotchas (respawn must transition handle→Active before restore_context; dead-handle lingers in registry so tests wait on read_context_state==Active not bare lookup). Free-fn watchdog spawn breaks async opaque-type cycle.
-
 - [project-adr049-main-merge-pyo3](project_adr049_main_merge_pyo3.md) — origin/main→actor MERGE, conflict-resolution recipe + 19-op dispatch MAP. PyO3 GREEN + NAPI GREEN (cargo check -p scp-ffi-napi = 0 err/warn; context.rs 77 hunks + runtime.rs:563 + bridge_runtime.rs variant fix, git-add'd, mid-merge). NAPI gotchas: HEAD free-fn → main `_on(bi,...)` shape (public #[napi] live in scp.rs); custody.as_ref() not &custody.0; ProtocolRepoVariant::InMemory→Arc<BridgeInMemoryRepo> (UniFFI needs same fix). Remaining: UniFFI bridge. SOLE upstream gate blocker = scp-platform/src/sqlite/mod.rs (passphrase-vs-fs2 union).
 
 - [project-adr-049-commit-4](project_adr_049_commit_4.md) — active work: ADR-049 actor-per-context, commit 4 (new traits + prod impls)

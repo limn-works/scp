@@ -1,8 +1,5 @@
 # API Design Reviewer Memory
 
-- [ADR-049 §10 poison observability review](adr049_poison_observability_review.md) — ContextState ordinal 8, 2134/2135 taxonomy, honesty docs; APPROVED w/ 2 doc nits
-- [Bash cwd lands in MAIN worktree](feedback_bash_cwd_main_worktree.md) — pin every git cmd with `git -C <worktree>`; bare HEAD reads main and gives false findings
-
 ## SCP SDK Standards Review (2026-02-22)
 - Reviewed all 10 files in `.docs/standards/` (sdk-common.md + 8 language files + conventions.md)
 - Key blocking issues found:
