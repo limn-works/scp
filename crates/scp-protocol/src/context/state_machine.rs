@@ -26,15 +26,18 @@ use super::{ContextError, ContextState};
 /// | `Active` | `Closing` | Close initiated by admin/governance |
 /// | `Active` | `Expired` | TTL elapsed (automatic) |
 /// | `Active` | `MigratingOut` | Migration approved (§5.11A) |
+/// | `Active` | `Poisoned` | Actor exceeded respawn budget (ADR-049 §10) |
 /// | `Closing` | `Closed` | All members processed final events |
 /// | `MigratingOut` | `Tombstoned` | Grace period expired (§5.11A.5) |
 /// | `MigratingOut` | `Active` | Migration cancelled (§5.11A) |
+/// | `Poisoned` | `Active` | Operator cleared poison; fresh respawn (ADR-049 §10) |
 ///
 /// # Invalid transitions
 ///
 /// - `Closed -> *` (terminal state)
 /// - `Expired -> *` (terminal state)
 /// - `Tombstoned -> *` (terminal state)
+/// - `Poisoned -> *` except `Active` (only operator-driven recovery re-activates)
 /// - `Creating -> Closing` (never active, just drop)
 /// - `Closing -> Active` (no re-opening)
 /// - Any self-transition (e.g., `Active -> Active`)
@@ -57,10 +60,16 @@ pub fn transition(
 
     match (current, target) {
         // Valid transitions per ADR-008 + §5.11A migration.
-        (ContextState::Creating, ContextState::Active)
+        // `Creating -> Active` (MLS group formed) and `Poisoned -> Active`
+        // (operator-driven respawn after the budget was cleared, ADR-049
+        // §10) share the same target.
+        (ContextState::Creating | ContextState::Poisoned, ContextState::Active)
         | (
             ContextState::Active,
-            ContextState::Closing | ContextState::Expired | ContextState::MigratingOut,
+            ContextState::Closing
+            | ContextState::Expired
+            | ContextState::MigratingOut
+            | ContextState::Poisoned,
         )
         | (ContextState::Closing, ContextState::Closed)
         | (ContextState::MigratingOut, ContextState::Tombstoned | ContextState::Active) => {
@@ -352,6 +361,49 @@ mod tests {
     #[test]
     fn transition_closing_to_migrating_out_returns_error() {
         let result = transition(&ContextState::Closing, &ContextState::MigratingOut);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Poisoned (ADR-049 §10 — actor respawn budget)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transition_active_to_poisoned_succeeds() {
+        // The actor exceeded its respawn budget; the supervisor poisons the
+        // live context rather than respawning it again.
+        let result = transition(&ContextState::Active, &ContextState::Poisoned);
+        assert_eq!(result.ok(), Some(ContextState::Poisoned));
+    }
+
+    #[test]
+    fn transition_poisoned_to_active_succeeds() {
+        // Operator-driven recovery: clearing the poison and respawning the
+        // actor from its snapshot returns the context to Active.
+        let result = transition(&ContextState::Poisoned, &ContextState::Active);
+        assert_eq!(result.ok(), Some(ContextState::Active));
+    }
+
+    #[test]
+    fn transition_poisoned_to_self_returns_error() {
+        let result = transition(&ContextState::Poisoned, &ContextState::Poisoned);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn transition_poisoned_to_closed_returns_error() {
+        // Poisoned recovers only via Active — never directly to a terminal
+        // state. A poisoned context that should be closed must first be
+        // respawned (Active), then closed through the normal path.
+        let result = transition(&ContextState::Poisoned, &ContextState::Closed);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn transition_creating_to_poisoned_returns_error() {
+        // Only a live (Active) context can be poisoned — a context still
+        // Creating has no spawned actor to crash past budget.
+        let result = transition(&ContextState::Creating, &ContextState::Poisoned);
         assert!(result.is_err());
     }
 }

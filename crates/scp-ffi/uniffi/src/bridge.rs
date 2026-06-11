@@ -1437,6 +1437,9 @@ pub enum ContextState {
     MigratingOut,
     /// Context permanently tombstoned after migration (§5.11A.5). Terminal state.
     Tombstoned,
+    /// Context actor exceeded its respawn budget (ADR-049 §10) — dormant
+    /// until operator intervention. No actor is serving the context.
+    Poisoned,
 }
 
 /// Memory scope for a context — governs key destruction and data retention on close.
@@ -2608,6 +2611,7 @@ impl ContextHandle {
             ContextState::Expired => "expired".to_owned(),
             ContextState::MigratingOut => "migrating_out".to_owned(),
             ContextState::Tombstoned => "tombstoned".to_owned(),
+            ContextState::Poisoned => "poisoned".to_owned(),
         })
     }
 

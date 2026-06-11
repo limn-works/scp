@@ -168,6 +168,15 @@ pub enum ContextState {
     /// Context has been permanently tombstoned after migration (§5.11A.5).
     /// Carries a pointer to the destination context. Terminal state.
     Tombstoned,
+    /// The context's actor exhausted its respawn budget (ADR-049 §10): it
+    /// crashed more than the permitted number of times inside the sliding
+    /// crash window, so the supervisor stopped respawning it to avoid an
+    /// infinite crash-respawn loop. The context is dormant — no actor is
+    /// serving it — and operator intervention (clearing the poison and
+    /// triggering a fresh respawn, or a process restart that re-runs the
+    /// restore-all-contexts path) is required to recover. Reachable from
+    /// `Active`; recovers to `Active` only via the operator-driven respawn.
+    Poisoned,
 }
 
 impl std::fmt::Display for ContextState {
@@ -180,6 +189,7 @@ impl std::fmt::Display for ContextState {
             Self::Expired => write!(f, "Expired"),
             Self::MigratingOut => write!(f, "MigratingOut"),
             Self::Tombstoned => write!(f, "Tombstoned"),
+            Self::Poisoned => write!(f, "Poisoned"),
         }
     }
 }
@@ -586,6 +596,41 @@ pub enum ContextError {
         /// The affected context ID.
         context_id: String,
     },
+
+    /// The context's actor exceeded its respawn budget (ADR-049 §10): it
+    /// crashed more than the permitted number of times inside the sliding
+    /// crash window, so the supervisor poisoned the context rather than
+    /// respawning it again. No actor is serving the context; every
+    /// subsequent per-context dispatch surfaces this error until an
+    /// operator clears the poison (which triggers a single fresh respawn)
+    /// or the process restarts and re-runs the restore-all-contexts path.
+    ///
+    /// The payload is the affected context id — never a panic payload (the
+    /// supervisor watchdog deliberately discards the panic message, which
+    /// could otherwise carry plaintext or key material).
+    ///
+    /// Mapped to canonical code `SCP-CTX-2134` through every FFI bridge
+    /// translator's generic context-error fallthrough.
+    #[error(
+        "SCP-CTX-2134: context is poisoned (exceeded respawn budget); \
+         operator intervention required: {0}"
+    )]
+    ContextPoisoned(String),
+
+    /// The context's actor crashed and the supervisor could not respawn it
+    /// from the persisted snapshot (ADR-049 §10) — typically because no
+    /// snapshot was found (the actor crashed before its first coalesced
+    /// persist, so its in-memory state is unrecoverable), or because the
+    /// snapshot failed to rehydrate. Distinct from
+    /// [`Self::ContextPoisoned`]: the crash budget was not necessarily
+    /// exhausted; the respawn itself was impossible this time.
+    ///
+    /// The payload is the affected context id — never a panic payload.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2135` through every FFI bridge
+    /// translator's generic context-error fallthrough.
+    #[error("SCP-CTX-2135: context actor crashed and could not be respawned: {0}")]
+    ActorCrashed(String),
 }
 
 // ---------------------------------------------------------------------------

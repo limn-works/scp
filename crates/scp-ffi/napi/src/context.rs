@@ -160,6 +160,7 @@ const fn state_str(state: &ContextState) -> &'static str {
         ContextState::Expired => "expired",
         ContextState::MigratingOut => "migrating_out",
         ContextState::Tombstoned => "tombstoned",
+        ContextState::Poisoned => "poisoned",
     }
 }
 
