@@ -2372,6 +2372,20 @@ pub enum LifecycleControlCommand {
         /// final persist completes.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+    /// Test-only fault-injection seam (ADR-049 §10 watchdog tests). The
+    /// actor's dispatch loop turns this into a `panic!(sentinel)` so the
+    /// supervisor watchdog's crash/poison/respawn + payload-redaction paths
+    /// can be exercised deterministically. Gated behind the `testing`
+    /// feature so it never exists in a production build, and handled in the
+    /// actor's `dispatch_state` (in `actor/mod.rs`) — NOT in any
+    /// `handlers/*.rs` module, so the handler panic-ban gate stays green.
+    #[cfg(feature = "testing")]
+    TestInducePanic {
+        /// Sentinel string interpolated into the induced panic message. A
+        /// security test asserts this sentinel NEVER appears in the
+        /// watchdog's log output (the payload is intentionally discarded).
+        sentinel: String,
+    },
     /// Terminal command — the supervisor asks this actor to make way for
     /// an imported context with the same id. Running on its own owned
     /// `PerContextState`, the actor checks it is replaceable (lifecycle

@@ -61,6 +61,14 @@ pub async fn dispatch(
         LifecycleControlCommand::PrepareForReplace { mls_state, reply } => {
             handle_prepare_for_replace(state, deps, &mls_state, reply)
         }
+        // The test-only fault-injection variant is intercepted by the
+        // actor's `dispatch_state` (in `actor/mod.rs`) BEFORE it reaches
+        // this handler, so it never actually arrives here. The arm exists
+        // only to keep the match exhaustive when the `testing` feature adds
+        // the variant — it must NOT panic (the handler panic-ban gate), so
+        // it is a typed no-op.
+        #[cfg(feature = "testing")]
+        LifecycleControlCommand::TestInducePanic { .. } => Outcome::ok(()),
     }
 }
 

@@ -584,6 +584,23 @@ impl ContextActor {
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
             ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(state, deps, msg).await,
+            // Test-only fault injection (ADR-049 §10 watchdog tests). The
+            // `panic!` lives here in `actor/mod.rs` — deliberately NOT in
+            // any `handlers/*.rs` module — so the production handler
+            // panic-ban gate (`scripts/check-handler-no-panic.sh`) stays
+            // green while still letting the watchdog crash/poison/respawn
+            // and payload-redaction paths be exercised deterministically.
+            // Gated behind the `testing` feature so it cannot exist in a
+            // production build.
+            #[cfg(feature = "testing")]
+            ContextCommand::LifecycleControl(LifecycleControlCommand::TestInducePanic {
+                sentinel,
+            }) => {
+                #[allow(clippy::panic)]
+                {
+                    panic!("{sentinel}");
+                }
+            }
             ContextCommand::LifecycleControl(sub) => {
                 handlers::lifecycle_control::dispatch(state, deps, sub).await
             }
@@ -767,6 +784,13 @@ impl ContextActor {
                 // success; ack Ok and let `run()` exit (`is_terminal`).
                 ack_ok(reply);
             }
+            // The test-only fault-injection variant carries no reply and is
+            // only meaningful for a state-bearing actor (the watchdog tests
+            // spawn one). A skeleton actor owns no state — make it a no-op.
+            #[cfg(feature = "testing")]
+            ContextCommand::LifecycleControl(LifecycleControlCommand::TestInducePanic {
+                ..
+            }) => {}
         }
     }
 
