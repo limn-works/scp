@@ -271,6 +271,34 @@ pub struct SenderKeyStore {
     epochs: HashMap<String, HashMap<String, u64>>,
 }
 
+/// Lower-bound policy for [`SenderKeyStore::merge_incoming_epochs`].
+///
+/// Encodes the spec §23.17.2 distinction between trusting an UNTRUSTED peer
+/// snapshot and restoring the node's OWN snapshot. The two policies differ ONLY
+/// in the lower-bound (regression) check; the upper-bound epoch-poisoning
+/// overshoot ceiling and the max-merge apply step are identical. A NAMED policy
+/// (not a bare `bool`) keeps the security distinction legible at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePolicy {
+    /// Spec §23.17.2 **Invariant 3** — UNTRUSTED peer import.
+    ///
+    /// Cross-node replication / import that retains prior crypto state. REJECT
+    /// the entire merge if ANY incoming floor is strictly below its local floor:
+    /// a snapshot-mediated downgrade is a replay vector, so a regressing peer
+    /// snapshot must not be incorporated. The merge is atomic — on any
+    /// regression OR overshoot, no state is mutated.
+    RejectRegression,
+    /// Spec §23.17.2 **Invariant 2** — TRUSTED-LOCAL restore.
+    ///
+    /// Crash recovery / actor respawn / process restart / same-node device
+    /// migration. NEVER reject a regression: a snapshot floor that lags the live
+    /// floor is the expected ≤50ms coalesce-lag case (an epoch advanced in the
+    /// window before the crash, ADR-049 §9), silently dominated by the live
+    /// floor in the max-merge. Rejecting here would fail a respawn and poison a
+    /// healthy context for a benign lag. Only the overshoot ceiling is enforced.
+    MaxMergeTrustedLocal,
+}
+
 impl SenderKeyStore {
     /// Creates a new, empty sender key store.
     #[must_use]
@@ -388,183 +416,97 @@ impl SenderKeyStore {
             .insert(sender_did.to_owned(), epoch);
     }
 
-    /// Merge an incoming per-sender epoch map into the local store
-    /// with spec §23.17 invariants 3 + 4 enforcement:
+    /// Merge an incoming per-sender epoch map into the local store under a
+    /// spec §23.17.2 lower-bound [`MergePolicy`], enforcing invariants 2/3 + 4.
     ///
-    /// - **Invariant 3 (atomic reject on regression):** if ANY
-    ///   incoming floor is strictly less than the local floor for
-    ///   the same `(context_id, sender_did)`, the entire merge is
-    ///   rejected and no state is modified.
-    /// - **Invariant 4 (append-only dominance):** accepted merges
-    ///   produce `local = max(local, incoming)` per sender, never
-    ///   lowering the floor.
+    /// The two policies share everything EXCEPT the lower-bound (regression)
+    /// check — this single function is the merge logic; the `policy` parameter
+    /// selects whether a regressing incoming floor is rejected:
     ///
-    /// # Epoch advance bounds
+    /// - [`MergePolicy::RejectRegression`] — **Invariant 3**, UNTRUSTED peer
+    ///   import. If ANY incoming floor is strictly less than its local floor for
+    ///   the same `(context_id, sender_did)`, the entire merge is rejected and
+    ///   no state is modified (a snapshot-mediated downgrade is a replay vector).
+    /// - [`MergePolicy::MaxMergeTrustedLocal`] — **Invariant 2**, TRUSTED-LOCAL
+    ///   restore (crash recovery / respawn / restart / same-node migration). A
+    ///   regression is NOT rejected — a snapshot floor that lags the live floor
+    ///   is the expected ≤50ms coalesce-lag case (ADR-049 §9) and is silently
+    ///   dominated by the live floor in the max-merge. Rejecting would fail a
+    ///   respawn and poison a healthy context for a benign lag.
     ///
-    /// `max_advance_per_sender` bounds how far an incoming epoch may
-    /// exceed the local floor for a given sender. This mirrors the
-    /// `set_checked` receive-path guard (`MAX_EPOCH_ADVANCE = 1000`
-    /// in the MLS crypto provider) which prevents epoch-poisoning
-    /// attacks where a malicious peer sets `epoch = u64::MAX`,
-    /// permanently blocking that sender's future legitimate
-    /// rotations against `set_checked`'s monotonicity guard.
-    ///
-    /// The bound is applied to BOTH:
-    /// - Senders the local store already knows: `incoming > local + max_advance` → reject
-    /// - Senders not in the local store (first-merge case): `incoming > max_advance` → reject
-    ///   (the first-merge ceiling is the same bound, treating "no local entry" as "local floor = 0")
-    ///
-    /// Pass `max_advance_per_sender = u64::MAX` to disable the bound
-    /// for trusted-source merges (e.g., cross-node replication where
-    /// the source is cryptographically authenticated).
-    ///
-    /// Returns `Ok(())` on successful max-merge. Returns
-    /// `Err(Vec<(String, u64, u64)>)` carrying
-    /// `(sender_did, local_floor, incoming_floor)` tuples for every
-    /// regression OR out-of-bounds advance found. The caller wraps
-    /// this in `ContextError::SnapshotFloorRegression`.
+    /// BOTH policies enforce, identically:
+    /// - **Invariant 4 (append-only dominance):** accepted merges produce
+    ///   `local = max(local, incoming)` per sender, never lowering a floor;
+    ///   local-only senders (absent from `incoming`) are retained.
+    /// - **Epoch-poisoning overshoot ceiling:** an incoming floor exceeding
+    ///   `local + max_advance_per_sender` is rejected (atomically, no mutation)
+    ///   so a corrupt/garbage snapshot cannot set `epoch = u64::MAX` and
+    ///   permanently wedge a sender's `set_checked` monotonicity guard. The
+    ///   bound mirrors the provider's `MAX_EPOCH_ADVANCE` and applies to both
+    ///   known senders (`incoming > local + max_advance`) and first-merge
+    ///   senders (`incoming > max_advance`, treating "no local entry" as floor
+    ///   0). Pass `max_advance_per_sender = u64::MAX` to disable the ceiling for
+    ///   a cryptographically-authenticated trusted source.
     ///
     /// # When to use this vs [`Self::restore_epoch_high_water`]
     ///
-    /// - Use `restore_epoch_high_water` on the LOCAL RESTORE path
-    ///   (fresh in-memory state being rehydrated from a local
-    ///   snapshot). The snapshot IS the authoritative source of truth
-    ///   for the local node — no regression check is needed because
-    ///   there is no prior state to regress against.
-    /// - Use `merge_incoming_epochs_with_atomic_reject` on any path
-    ///   that INCORPORATES external state (snapshot received from a
-    ///   peer, cross-node replication, import that retains prior
-    ///   crypto state) into ALREADY-POPULATED or fresh local state.
-    ///   Today's `import_context` destroys prior crypto state before
-    ///   reimport, so this helper is defense-in-depth — but the
-    ///   invariant is enforceable from this single point so any
-    ///   future code path that adds a merge case is forced through
-    ///   the check, satisfying spec §23.17 structurally.
-    ///
-    /// **WARNING**: Callers MUST pass a realistic `max_advance_per_sender`
-    /// bound (typically matching the provider's `MAX_EPOCH_ADVANCE`)
-    /// unless the merge source is cryptographically authenticated as
-    /// trusted. The first-merge branch (empty local state) has no
-    /// regression to check against, so the bound is the only defense
-    /// against epoch-poisoning by a malicious incoming snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns the per-sender regression/overshoot deltas via `Err`.
-    /// The store is NOT mutated if any entry fails validation — the
-    /// merge is strictly atomic (invariant 3).
-    pub fn merge_incoming_epochs_with_atomic_reject(
-        &mut self,
-        context_id: &str,
-        incoming: impl IntoIterator<Item = (String, u64)>,
-        max_advance_per_sender: u64,
-    ) -> Result<(), Vec<(String, u64, u64)>> {
-        // First pass: materialize the incoming iterator and detect
-        // any regression OR out-of-bounds advance against the current
-        // local state. We scan twice (detect, apply); the caller may
-        // have passed a one-shot iterator.
-        let incoming: Vec<(String, u64)> = incoming.into_iter().collect();
-        let mut regressions: Vec<(String, u64, u64)> = Vec::new();
-        let local_map = self.epochs.get(context_id);
-        for (did, incoming_epoch) in &incoming {
-            let local_epoch = local_map.and_then(|m| m.get(did)).copied().unwrap_or(0);
-
-            // Invariant 3: strict regression.
-            if *incoming_epoch < local_epoch {
-                regressions.push((did.clone(), local_epoch, *incoming_epoch));
-                continue;
-            }
-
-            // Epoch-poisoning guard: reject if the incoming value
-            // overshoots the local floor by more than
-            // `max_advance_per_sender`. `saturating_add` clamps the
-            // comparison at u64::MAX so passing u64::MAX disables
-            // the bound entirely.
-            let max_allowed = local_epoch.saturating_add(max_advance_per_sender);
-            if *incoming_epoch > max_allowed {
-                regressions.push((did.clone(), local_epoch, *incoming_epoch));
-            }
-        }
-        if !regressions.is_empty() {
-            return Err(regressions);
-        }
-
-        // Second pass: apply max-merge. Local entries not present in
-        // `incoming` are retained (invariant 4 append-only dominance
-        // for sender DIDs the incoming snapshot doesn't mention).
-        // Incoming entries strictly higher than local replace the
-        // local value; equal entries are no-ops (strictly-lower
-        // entries were already rejected above).
-        let local = self.epochs.entry(context_id.to_owned()).or_default();
-        for (did, incoming_epoch) in incoming {
-            let entry = local.entry(did).or_insert(0);
-            if incoming_epoch > *entry {
-                *entry = incoming_epoch;
-            }
-        }
-        Ok(())
-    }
-
-    /// Merge an incoming per-sender epoch map into the local store on the
-    /// TRUSTED-LOCAL restore path (spec §23.17.2 **Invariant 2** — restoring
-    /// the node's OWN prior snapshot: crash recovery / actor respawn / process
-    /// restart / same-node device migration).
-    ///
-    /// Unlike [`Self::merge_incoming_epochs_with_atomic_reject`] (which enforces
-    /// Invariant 3, *reject* on any regression, for an UNTRUSTED peer import),
-    /// this method **never rejects a regression**. Restoring a node's own
-    /// coalesced snapshot whose floor lags the live floor is the normal case:
-    /// an epoch may have advanced in the ≤50ms coalesce window before a crash
-    /// (ADR-049 §9), so the persisted snapshot legitimately trails the live
-    /// in-memory floor. Invariant 2 prescribes restoring each floor to
-    /// `max(snapshot_floor, retained_floor)` and PROCEEDING — never lowering,
-    /// never failing. Rejecting here would fail a respawn and poison a healthy
-    /// context for a benign, expected lag.
-    ///
-    /// The result is `local = max(local, incoming)` per sender, with
-    /// local-only senders (absent from `incoming`) retained (Invariant 4).
-    ///
-    /// The ONLY rejection is the epoch-poisoning overshoot guard: an incoming
-    /// floor that exceeds the local floor by more than `max_advance_per_sender`
-    /// is rejected (a corrupt/garbage snapshot must not be able to set
-    /// `epoch = u64::MAX` and permanently wedge a sender's monotonicity guard).
-    /// This is the same upper bound `merge_incoming_epochs_with_atomic_reject`
-    /// applies; only the lower-bound (regression) check differs between the two
-    /// paths. Pass `max_advance_per_sender = u64::MAX` to disable the bound.
+    /// Use `restore_epoch_high_water` on the LOCAL RESTORE path that rehydrates
+    /// fresh in-memory state from a local snapshot (the snapshot IS the
+    /// authoritative source — no prior state to regress against). Use
+    /// `merge_incoming_epochs` on any path that INCORPORATES state into
+    /// already-populated or fresh local state; the single chokepoint makes the
+    /// §23.17 invariant enforceable structurally for any future merge case.
     ///
     /// # Errors
     ///
     /// Returns `Err(Vec<(sender_did, local_floor, incoming_floor)>)` for every
-    /// sender whose incoming floor OVERSHOOTS `local + max_advance_per_sender`.
-    /// On any overshoot the store is NOT mutated (atomic, like the sibling).
-    pub fn merge_incoming_epochs_trusted_local(
+    /// sender that fails validation: a regression (under
+    /// [`MergePolicy::RejectRegression`] only) OR an overshoot (both policies).
+    /// The store is NOT mutated if any entry fails — the merge is atomic. The
+    /// caller wraps the `Err` in `ContextError::SnapshotFloorRegression`.
+    pub fn merge_incoming_epochs(
         &mut self,
         context_id: &str,
         incoming: impl IntoIterator<Item = (String, u64)>,
         max_advance_per_sender: u64,
+        policy: MergePolicy,
     ) -> Result<(), Vec<(String, u64, u64)>> {
+        // First pass: materialize the incoming iterator (the caller may have
+        // passed a one-shot iterator) and detect, against the current local
+        // state, every entry that fails validation under `policy`.
         let incoming: Vec<(String, u64)> = incoming.into_iter().collect();
-        let mut overshoots: Vec<(String, u64, u64)> = Vec::new();
+        let mut rejected: Vec<(String, u64, u64)> = Vec::new();
         let local_map = self.epochs.get(context_id);
         for (did, incoming_epoch) in &incoming {
             let local_epoch = local_map.and_then(|m| m.get(did)).copied().unwrap_or(0);
-            // Invariant 2: NO regression check — a lower snapshot floor is the
-            // expected coalesce-lag case and is silently dominated by the live
-            // floor in the max-merge below. Only the overshoot (epoch-poisoning)
-            // ceiling is enforced.
+
+            // Lower-bound check — policy-specific. RejectRegression (Invariant 3)
+            // rejects a strictly-lower incoming floor; MaxMergeTrustedLocal
+            // (Invariant 2) tolerates it (the live floor dominates in the
+            // max-merge below). The overshoot ceiling below is policy-agnostic.
+            if policy == MergePolicy::RejectRegression && *incoming_epoch < local_epoch {
+                rejected.push((did.clone(), local_epoch, *incoming_epoch));
+                continue;
+            }
+
+            // Epoch-poisoning guard (both policies): reject if the incoming value
+            // overshoots the local floor by more than `max_advance_per_sender`.
+            // `saturating_add` clamps the comparison at u64::MAX so passing
+            // u64::MAX disables the bound entirely.
             let max_allowed = local_epoch.saturating_add(max_advance_per_sender);
             if *incoming_epoch > max_allowed {
-                overshoots.push((did.clone(), local_epoch, *incoming_epoch));
+                rejected.push((did.clone(), local_epoch, *incoming_epoch));
             }
         }
-        if !overshoots.is_empty() {
-            return Err(overshoots);
+        if !rejected.is_empty() {
+            return Err(rejected);
         }
 
-        // Apply max-merge: local = max(local, incoming) per sender. Local-only
-        // senders are retained (Invariant 4). A lower incoming floor is a no-op
-        // (the live floor dominates) — this is exactly Invariant 2's
-        // `max(snapshot_floor, retained_floor)`.
+        // Second pass: apply max-merge (Invariant 4). Local entries not present
+        // in `incoming` are retained; incoming entries strictly higher than
+        // local replace the local value; equal/lower entries are no-ops (lower
+        // entries were either rejected above or, under MaxMergeTrustedLocal,
+        // dominated by the live floor here).
         let local = self.epochs.entry(context_id.to_owned()).or_default();
         for (did, incoming_epoch) in incoming {
             let entry = local.entry(did).or_insert(0);
@@ -891,7 +833,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // merge_incoming_epochs_with_atomic_reject — §23.17 invariants 3 + 4
+    // merge_incoming_epochs (MergePolicy::RejectRegression) — §23.17 inv 3 + 4
     // -----------------------------------------------------------------------
 
     /// Default bound for merge tests — matches the production
@@ -905,8 +847,12 @@ mod tests {
             .set_checked("ctx", "did:a", generate_sender_key(), 5)
             .unwrap();
         let incoming: Vec<(String, u64)> = vec![];
-        let result =
-            store.merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE);
+        let result = store.merge_incoming_epochs(
+            "ctx",
+            incoming,
+            TEST_MAX_ADVANCE,
+            MergePolicy::RejectRegression,
+        );
         assert!(result.is_ok());
         assert_eq!(store.epoch("ctx", "did:a"), 5, "local floor unchanged");
     }
@@ -920,8 +866,12 @@ mod tests {
 
         // Incoming floor is strictly higher → accepted, local advances.
         let incoming = vec![("did:a".to_owned(), 10)];
-        let result =
-            store.merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE);
+        let result = store.merge_incoming_epochs(
+            "ctx",
+            incoming,
+            TEST_MAX_ADVANCE,
+            MergePolicy::RejectRegression,
+        );
         assert!(result.is_ok());
         assert_eq!(
             store.epoch("ctx", "did:a"),
@@ -938,8 +888,12 @@ mod tests {
             .unwrap();
 
         let incoming = vec![("did:a".to_owned(), 5)];
-        let result =
-            store.merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE);
+        let result = store.merge_incoming_epochs(
+            "ctx",
+            incoming,
+            TEST_MAX_ADVANCE,
+            MergePolicy::RejectRegression,
+        );
         assert!(result.is_ok(), "equal epoch is not a regression");
         assert_eq!(store.epoch("ctx", "did:a"), 5, "floor unchanged");
     }
@@ -964,7 +918,12 @@ mod tests {
             ("did:b".to_owned(), 15),
         ];
         let err = store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .merge_incoming_epochs(
+                "ctx",
+                incoming,
+                TEST_MAX_ADVANCE,
+                MergePolicy::RejectRegression,
+            )
             .expect_err("regression must reject the entire merge");
         assert_eq!(err.len(), 1, "exactly one regression reported");
         assert_eq!(err[0], ("did:a".to_owned(), 10, 5));
@@ -1001,7 +960,12 @@ mod tests {
         // retained.
         let incoming = vec![("did:c".to_owned(), 3)];
         store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .merge_incoming_epochs(
+                "ctx",
+                incoming,
+                TEST_MAX_ADVANCE,
+                MergePolicy::RejectRegression,
+            )
             .unwrap();
 
         assert_eq!(store.epoch("ctx", "did:a"), 10);
@@ -1017,7 +981,12 @@ mod tests {
         let mut store = SenderKeyStore::new();
         let incoming = vec![("did:a".to_owned(), 5), ("did:b".to_owned(), 12)];
         store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .merge_incoming_epochs(
+                "ctx",
+                incoming,
+                TEST_MAX_ADVANCE,
+                MergePolicy::RejectRegression,
+            )
             .unwrap();
         assert_eq!(store.epoch("ctx", "did:a"), 5);
         assert_eq!(store.epoch("ctx", "did:b"), 12);
@@ -1037,7 +1006,12 @@ mod tests {
 
         let incoming = vec![("did:a".to_owned(), 5), ("did:b".to_owned(), 15)];
         let err = store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .merge_incoming_epochs(
+                "ctx",
+                incoming,
+                TEST_MAX_ADVANCE,
+                MergePolicy::RejectRegression,
+            )
             .unwrap_err();
         assert_eq!(err.len(), 2, "both regressions must be reported");
         // Order is insertion-order of the incoming iterator, which
@@ -1056,7 +1030,12 @@ mod tests {
         let mut store = SenderKeyStore::new();
         let incoming = vec![("did:malicious".to_owned(), u64::MAX - 1)];
         let err = store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .merge_incoming_epochs(
+                "ctx",
+                incoming,
+                TEST_MAX_ADVANCE,
+                MergePolicy::RejectRegression,
+            )
             .expect_err("epoch above max_advance must be rejected");
         assert_eq!(err.len(), 1);
         assert_eq!(err[0].0, "did:malicious");
@@ -1080,7 +1059,12 @@ mod tests {
         let overshoot = 10 + TEST_MAX_ADVANCE + 1;
         let incoming = vec![("did:a".to_owned(), overshoot)];
         let err = store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .merge_incoming_epochs(
+                "ctx",
+                incoming,
+                TEST_MAX_ADVANCE,
+                MergePolicy::RejectRegression,
+            )
             .expect_err("epoch overshoot must be rejected");
         assert_eq!(err[0], ("did:a".to_owned(), 10, overshoot));
         assert_eq!(
@@ -1093,7 +1077,12 @@ mod tests {
         let at_bound = 10 + TEST_MAX_ADVANCE;
         let incoming = vec![("did:a".to_owned(), at_bound)];
         store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .merge_incoming_epochs(
+                "ctx",
+                incoming,
+                TEST_MAX_ADVANCE,
+                MergePolicy::RejectRegression,
+            )
             .expect("epoch exactly at local + max_advance must be accepted");
         assert_eq!(store.epoch("ctx", "did:a"), at_bound);
     }
@@ -1106,7 +1095,7 @@ mod tests {
         let mut store = SenderKeyStore::new();
         let incoming = vec![("did:trusted".to_owned(), u64::MAX - 1)];
         store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, u64::MAX)
+            .merge_incoming_epochs("ctx", incoming, u64::MAX, MergePolicy::RejectRegression)
             .expect("u64::MAX bound must disable the guard entirely");
         assert_eq!(store.epoch("ctx", "did:trusted"), u64::MAX - 1);
     }
@@ -1132,7 +1121,12 @@ mod tests {
             ("did:poison".to_owned(), u64::MAX), // first-merge overshoot
         ];
         let err = store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .merge_incoming_epochs(
+                "ctx",
+                incoming,
+                TEST_MAX_ADVANCE,
+                MergePolicy::RejectRegression,
+            )
             .expect_err("mixed failures must reject the entire merge");
         assert_eq!(err.len(), 2, "regression + overshoot both reported");
         assert!(err.iter().any(|(d, _, _)| d == "did:reg"));

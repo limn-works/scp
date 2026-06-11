@@ -2321,19 +2321,17 @@ impl MlsCryptoProvider {
         for (did, floor) in &local_floors {
             temp_store.restore_epoch_high_water(&ctx_id_hex, did, *floor);
         }
-        let merge_result = if trusted_local {
-            temp_store.merge_incoming_epochs_trusted_local(
-                &ctx_id_hex,
-                import_floors,
-                max_advance_per_sender,
-            )
+        let policy = if trusted_local {
+            scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal
         } else {
-            temp_store.merge_incoming_epochs_with_atomic_reject(
-                &ctx_id_hex,
-                import_floors,
-                max_advance_per_sender,
-            )
+            scp_protocol::crypto::sender_keys::MergePolicy::RejectRegression
         };
+        let merge_result = temp_store.merge_incoming_epochs(
+            &ctx_id_hex,
+            import_floors,
+            max_advance_per_sender,
+            policy,
+        );
         merge_result.map_err(|per_sender_deltas| ContextError::SnapshotFloorRegression {
             resource: "sender_key_epoch".to_owned(),
             per_sender_deltas,
