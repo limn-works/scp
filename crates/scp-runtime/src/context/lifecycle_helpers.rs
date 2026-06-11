@@ -815,8 +815,28 @@ pub async fn join_context(
     let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
 
     // Append MemberJoined event to event log.
-    deps.event_log
-        .append_context_event(&context_id_bytes, "MemberJoined", member_did.as_ref())?;
+    //
+    // ADR-049 §9 (round-9 leak fix): the economy ticket was just committed
+    // (line above), so its `Drop` guard no longer rolls anything back — but the
+    // external escrow hold (`auth`, a `PaidActionAuthorization` that has NO
+    // `Drop` impl) is still HELD and uncaptured. The fail-closed persist + the
+    // success-path `capture_join_payment` both run AFTER this append. On this
+    // append's `Err`, the membership / MLS state already applied above is NOT
+    // reversed (it is Class-S security state that, like the consumed nonce, must
+    // persist — the joiner re-drives the idempotent join), but `auth` would
+    // otherwise drop silently WITHOUT voiding, leaking the hold and charging the
+    // joiner for an unacknowledged join. VOID the escrow here (gated on
+    // `auth.is_some()`) before returning — mirroring the money-ordering rule the
+    // persist-failure branch below already follows.
+    if let Err(e) =
+        deps.event_log
+            .append_context_event(&context_id_bytes, "MemberJoined", member_did.as_ref())
+    {
+        if let Some(a) = auth {
+            crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
+        }
+        return Err(e);
+    }
     state.checkpoint_events_since += 1;
 
     // ADR-049 §9 Class S (BLACK-001): a PAID join consumed a spending-UCAN
@@ -2615,6 +2635,32 @@ mod restore_reconcile_tests {
         }
     }
 
+    /// Event log whose `init`/`destroy` succeed but whose `append_event` ALWAYS
+    /// fails. Models the ADR-049 §9 round-9 leak scenario: a WORKING persistence
+    /// backend with a FAILING event-log append, so `finalize_send`'s very first
+    /// `append_context_event("MessageSent")` returns `Err` AFTER the caller has
+    /// reserved a per-sender sequence — exercising the rollback this gate fixes.
+    struct FailingAppendEventLog;
+    impl ContextEventLogProvider for FailingAppendEventLog {
+        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: &str,
+            _actor: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), ContextCreationError> {
+            Err(ContextCreationError::EventLogFailed(
+                "fixture: event-log append deliberately fails".to_owned(),
+            ))
+        }
+        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
     /// Captures every snapshot/broadcast write so a real `create_context` can be
     /// used to harvest a fully-formed, validation-passing `ContextSnapshot`.
     #[derive(Default)]
@@ -3318,6 +3364,167 @@ mod restore_reconcile_tests {
             "the persist-failure branch must void the escrow (between the \
              fail-closed persist and the success-path capture) so a durability \
              failure releases the hold instead of charging the joiner"
+        );
+    }
+
+    /// ADR-049 §9 (round-9 leak fix) — BEHAVIORAL. `finalize_send` reserves a
+    /// per-sender sequence in its caller (`send_message`), and OWNS the sequence
+    /// rollback on every error exit. Its FIRST statement is the `MessageSent`
+    /// `append_context_event`; before this fix that `?` returned BEFORE the
+    /// relocated rollbacks, so an event-log append failure leaked the reserved
+    /// sequence → a per-sender gap → a receiver `SequenceGapForceClose`. This
+    /// test drives a WORKING persistence + a FAILING event-log append directly
+    /// through `finalize_send` and asserts the reserved sequence returns to its
+    /// pre-reservation baseline EXACTLY ONCE (no leak, no double-rollback).
+    #[tokio::test]
+    async fn finalize_send_rolls_back_sequence_on_event_log_append_failure() {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkFinalizeSendSeq".to_owned(),
+        ));
+        let key_resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(|_q: &DID| None);
+
+        // Working persistence (CapturingPersistence) + FAILING event-log append.
+        let sup = Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(FailingAppendEventLog),
+            key_resolver,
+            Some(Box::new(CapturingPersistence::default())),
+            None,
+            None,
+            None,
+            mls_storage(),
+        );
+
+        let admin = DID("did:dht:z6MkFinalizeSendAdmin".to_owned());
+        let deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-finalize-send-seq".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+
+        let sender = DID("did:dht:z6MkFinalizeSendSender".to_owned());
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+            admin.clone(),
+        );
+        state
+            .membership
+            .add_member(sender.clone(), "member".to_owned(), Vec::new());
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        // Reserve a sequence exactly as `send_message` does, capturing it.
+        let reserved = state
+            .membership
+            .next_sequence_number(sender.as_ref())
+            .expect("sender is a member");
+        assert_eq!(reserved, 1, "first reservation yields sequence 1");
+
+        // Encrypted (non-broadcast) send: the failing append must roll the
+        // reservation back. `signing_key = None` → the post-append checkpoint
+        // path is skipped, but the append fails first regardless.
+        let result = crate::context::messaging_helpers::finalize_send(
+            &mut state,
+            &deps,
+            &context_id,
+            &context_id_bytes,
+            &sender,
+            reserved,
+            b"payload",
+            None,
+            false, // spending_nonce_committed
+            false, // is_broadcast
+        );
+
+        assert!(
+            matches!(result, Err(ContextError::EventLogFailed(_))),
+            "a failing event-log append must surface as EventLogFailed: got {result:?}"
+        );
+
+        // The reservation must have been rolled back EXACTLY ONCE: the next
+        // reservation returns 1 again. A leak would make it return 2; a
+        // double-rollback (saturating_sub past the floor) would also return 1
+        // here but only because it underflowed — so additionally assert the
+        // pre-reservation reissue is stable across two calls.
+        let next_after_failure = state
+            .membership
+            .next_sequence_number(sender.as_ref())
+            .expect("sender is still a member");
+        assert_eq!(
+            next_after_failure, 1,
+            "the reserved sequence must roll back to baseline exactly once, so the \
+             next reservation reissues 1 (a leak would reissue 2)"
+        );
+    }
+
+    /// ADR-049 §9 (round-9 leak fix) — STRUCTURAL. In `join_context`, the
+    /// `MemberJoined` `append_context_event` runs AFTER the economy ticket is
+    /// committed but while the external escrow hold (`auth`, a
+    /// `PaidActionAuthorization` with NO `Drop`) is still held and uncaptured.
+    /// On that append's `Err`, `auth` would otherwise drop WITHOUT voiding —
+    /// leaking the hold and charging the joiner for an unacknowledged join. The
+    /// runtime tail (post-commit, pre-capture) is reached only by the not-yet-
+    /// wired explicit paid-acceptance flow (the public entry rejects an
+    /// auto-accept paid join at SCP-ECON-12030 first — see
+    /// `paid_join_blocked_at_auto_accept_guard_touches_no_escrow`), so this is a
+    /// STRUCTURAL assertion on the real `join_context` body, mirroring
+    /// `paid_join_captures_escrow_after_persist_not_before`: the `MemberJoined`
+    /// append's failure branch — which sits BETWEEN the ticket commit and the
+    /// fail-closed persist — MUST void the escrow.
+    #[test]
+    fn join_context_voids_escrow_on_member_joined_append_failure() {
+        const SRC: &str = include_str!("lifecycle_helpers.rs");
+
+        let start = SRC
+            .find("pub async fn join_context(")
+            .expect("join_context must exist");
+        let rest = &SRC[start..];
+        let end_rel = rest
+            .find("\npub fn join_context_membership(")
+            .expect("join_context_membership follows join_context");
+        let body = &rest[..end_rel];
+
+        // The economy ticket is committed here; AFTER this point `auth` is the
+        // only un-Drop-guarded reservation still live.
+        let commit_idx = body
+            .find("commit_economy_ticket(ticket)")
+            .expect("join_context must commit the economy ticket before the append");
+        // The MemberJoined append is the next fallible step after the commit.
+        let append_idx = body
+            .find("\"MemberJoined\"")
+            .expect("join_context must append a MemberJoined event");
+        assert!(
+            commit_idx < append_idx,
+            "the MemberJoined append must follow the ticket commit"
+        );
+
+        // The fail-closed persist runs after the append; the append-failure
+        // branch sits strictly between commit and that persist.
+        let persist_idx = body
+            .find("persist_state_fail_closed(state, deps, &context_id)")
+            .expect("join_context must fail-closed persist on the paid path");
+        assert!(
+            append_idx < persist_idx,
+            "the MemberJoined append must precede the fail-closed persist"
+        );
+
+        // The slice from the append to the fail-closed persist contains the
+        // append's Err branch. It MUST void the escrow — otherwise `auth` drops
+        // silently (no Drop impl) and the hold leaks.
+        let append_to_persist = &body[append_idx..persist_idx];
+        assert!(
+            append_to_persist.contains("void_paid_action(state, deps, a, &context_id)"),
+            "the MemberJoined append-failure branch (between the ticket commit and \
+             the fail-closed persist) must void the escrow so a failing append \
+             releases the hold instead of leaking it (ADR-049 §9 round-9)"
         );
     }
 }

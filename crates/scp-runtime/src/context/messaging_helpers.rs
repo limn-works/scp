@@ -1317,6 +1317,75 @@ fn record_payment_capture_failure(
 // per-sender sequence (`sequence` is 0 and `next_sequence_number` was never
 // called), so rolling back would spuriously decrement the publisher's counter —
 // every rollback is gated on `!is_broadcast`.
+/// Appends the `MessageSent` event log entry and, on failure, rolls the
+/// reserved per-sender sequence back before surfacing the error.
+///
+/// ADR-049 §9 (round-9 leak fix): [`finalize_send`] OWNS the per-sender
+/// sequence rollback on ALL of its error exits — the `send_message` caller
+/// deliberately does NOT roll the sequence back when [`finalize_send`] returns
+/// `Err` (doing so would double-revert: a `+1` reservation undone by a `−2` via
+/// `saturating_sub`). This FIRST `append_context_event` sits BETWEEN the
+/// caller's `next_sequence_number` reservation and the relocated rollbacks in
+/// [`finalize_send`], so on its `Err` it must perform the rollback itself, or
+/// the reserved sequence leaks → a per-sender gap → a receiver
+/// `SequenceGapForceClose`. Broadcast publishes reserved no sequence
+/// (`sequence` is 0, `next_sequence_number` was never called), so the rollback
+/// is gated on `!is_broadcast`. The escrow hold + economy ticket are voided by
+/// the caller (they are still alive — finalize did not commit them); only the
+/// sequence is the caller's deferred responsibility.
+fn append_message_sent_or_rollback_sequence(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id_bytes: &[u8; 32],
+    sender_did: &DID,
+    is_broadcast: bool,
+) -> Result<(), ContextError> {
+    if let Err(e) =
+        deps.event_log
+            .append_context_event(context_id_bytes, "MessageSent", sender_did.as_ref())
+    {
+        if !is_broadcast {
+            state.membership.rollback_sequence_number(sender_did);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Computes and caches the sender's participation record after a send (#1530).
+/// Factored out of [`finalize_send`] to keep that function within the line
+/// budget; pure bookkeeping with no error path (a missing Merkle root or a
+/// zero-count record is simply not cached).
+fn record_send_participation(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    sender_did: &DID,
+    send_events: &[scp_event_log::Event],
+    now: u64,
+) {
+    let send_merkle = deps
+        .event_log
+        .event_log_merkle_root(context_id_bytes)
+        .unwrap_or([0u8; 32]);
+    if !send_events.is_empty()
+        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
+            send_events,
+            sender_did.as_ref(),
+            context_id,
+            send_merkle,
+            now,
+        )
+        && record.participation_count > 0
+    {
+        state
+            .governance
+            .participation_cache
+            .insert(sender_did.to_string(), record);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_send(
     state: &mut PerContextState,
@@ -1330,9 +1399,15 @@ pub fn finalize_send(
     spending_nonce_committed: bool,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
-    // M12: append event log BEFORE consequence evaluation.
-    deps.event_log
-        .append_context_event(context_id_bytes, "MessageSent", sender_did.as_ref())?;
+    // M12: append event log BEFORE consequence evaluation; on failure roll the
+    // reserved sequence back (round-9 leak fix — see the helper doc).
+    append_message_sent_or_rollback_sequence(
+        state,
+        deps,
+        context_id_bytes,
+        sender_did,
+        is_broadcast,
+    )?;
 
     // Phase 3 reacquire-and-mutate is unnecessary in the actor model;
     // the actor owns state for the duration of the command. We DO
@@ -1402,25 +1477,15 @@ pub fn finalize_send(
     }
 
     // Participation record (#1530).
-    let send_merkle = deps
-        .event_log
-        .event_log_merkle_root(context_id_bytes)
-        .unwrap_or([0u8; 32]);
-    if !send_events.is_empty()
-        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
-            &send_events,
-            sender_did.as_ref(),
-            context_id,
-            send_merkle,
-            now,
-        )
-        && record.participation_count > 0
-    {
-        state
-            .governance
-            .participation_cache
-            .insert(sender_did.to_string(), record);
-    }
+    record_send_participation(
+        state,
+        deps,
+        context_id,
+        context_id_bytes,
+        sender_did,
+        &send_events,
+        now,
+    );
 
     // Checkpoint tracking (§9.9.3).
     state.checkpoint_events_since += 1;
