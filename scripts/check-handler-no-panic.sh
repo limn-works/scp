@@ -15,7 +15,8 @@
 #
 # This gate fails if any of the following macros appear (as a macro CALL,
 # i.e. followed by `!`) in PRODUCTION code under
-# `crates/scp-runtime/src/context/actor/handlers/`:
+# `crates/scp-runtime/src/context/actor/handlers/` OR in the dispatch hub
+# `crates/scp-runtime/src/context/actor/mod.rs`:
 #
 #   panic!  unreachable!  unimplemented!  todo!
 #   assert!  assert_eq!  assert_ne!
@@ -25,6 +26,15 @@
 # modules (which legitimately use `assert*!`) live below that marker and are
 # NOT scanned. The check asserts at most ONE `#[cfg(test)]` per file so the
 # "scan everything before the first one" rule is unambiguous.
+#
+# DISPATCH HUB EXCEPTION (actor/mod.rs only): the dispatch hub carries the
+# `#[cfg(feature = "testing")]`-gated `TestInducePanic` fault-injection seam
+# — a `panic!` that exists solely to exercise the supervisor watchdog
+# deterministically and CANNOT exist in a production build. Banned macros
+# inside a `#[cfg(feature = "testing")]`-gated item are therefore NOT flagged
+# in `actor/mod.rs`; a banned macro OUTSIDE such a gate (e.g. a new
+# production `panic!` in `dispatch_state`) IS flagged. The handlers/*.rs
+# files have NO such exception — they must never panic at all.
 #
 # ---------------------------------------------------------------------------
 # WHEN THIS RUNS
@@ -166,6 +176,111 @@ scan_file() {
     ' "$file"
 }
 
+# ---------------------------------------------------------------------------
+# Scan the dispatch hub (`actor/mod.rs`). Identical banned-macro detection as
+# `scan_file`, with ONE additional exclusion: a banned macro inside a
+# `#[cfg(feature = "testing")]`-gated item is skipped (the `TestInducePanic`
+# fault-injection seam). Testing-gated regions are tracked by brace depth: a
+# `#[cfg(feature = "testing")]` attribute marks the NEXT item as the start of
+# a testing region; the region floor is the brace depth just before the item
+# opens, and the region ends when the brace depth returns to that floor.
+# Everything else is scanned exactly as production code, so a NEW production
+# panic in `dispatch_state` (outside any testing gate) is still flagged.
+# ---------------------------------------------------------------------------
+scan_dispatch_hub() {
+    local file="$1"
+    awk -v FILE="$file" '
+    BEGIN {
+        in_block = 0
+        seen_test = 0
+        test_count = 0
+        depth = 0            # running brace depth
+        testing_pending = 0  # saw #[cfg(feature="testing")], awaiting item open
+        in_testing = 0       # currently inside a testing-gated region
+        testing_floor = 0    # brace depth to which the testing region returns
+        split("panic unreachable unimplemented todo assert assert_eq assert_ne debug_assert debug_assert_eq debug_assert_ne", names, " ")
+    }
+    {
+        raw = $0
+
+        if (raw ~ /#\[cfg\(test\)\]/) {
+            test_count++
+            seen_test = 1
+        }
+        if (seen_test) next
+
+        line = raw
+        # Strip /* .. */ on a single line.
+        while (match(line, /\/\*.*\*\//)) {
+            line = substr(line, 1, RSTART - 1) substr(line, RSTART + RLENGTH)
+        }
+        if (match(line, /\/\*/)) {
+            line = substr(line, 1, RSTART - 1)
+            in_block = 1
+        }
+        if (in_block && match(line, /\*\//)) {
+            line = substr(line, RSTART + RLENGTH)
+            in_block = 0
+        }
+        if (in_block) next
+        sub(/\/\/.*$/, "", line)
+
+        # Detect the testing-feature gate. The gated item opens on a later
+        # line; remember the depth at which it opens so we can find its end.
+        if (line ~ /#\[cfg\(feature[[:space:]]*=[[:space:]]*"testing"\)\]/) {
+            testing_pending = 1
+        }
+
+        # Count braces on this (comment-stripped) line to track depth.
+        opens = gsub(/{/, "{", line)
+        closes = gsub(/}/, "}", line)
+
+        # If a testing gate is pending and this line opens the gated item
+        # (net positive braces), enter the testing region. The floor is the
+        # depth BEFORE this item opened.
+        if (testing_pending && opens > 0) {
+            in_testing = 1
+            testing_floor = depth
+            testing_pending = 0
+        }
+
+        # Scan for banned macros UNLESS inside a testing-gated region.
+        if (!in_testing) {
+            for (i in names) {
+                pat = "(^|[^A-Za-z0-9_])" names[i] "!"
+                if (match(line, pat)) {
+                    trimmed = line
+                    sub(/^[[:space:]]+/, "", trimmed)
+                    sub(/[[:space:]]+$/, "", trimmed)
+                    printf("HIT\t%s\t%d\t%s\n", FILE, NR, trimmed)
+                    break
+                }
+            }
+        }
+
+        # Update running depth; close the testing region when we return to
+        # the floor.
+        depth += opens - closes
+        if (in_testing && depth <= testing_floor) {
+            in_testing = 0
+        }
+    }
+    END {
+        if (test_count > 1) {
+            printf("MULTITEST\t%s\t%d\n", FILE, test_count)
+        }
+    }
+    ' "$file"
+}
+
+DISPATCH_HUB="crates/scp-runtime/src/context/actor/mod.rs"
+
+if [[ ! -f "$DISPATCH_HUB" ]]; then
+    printf '%serror:%s dispatch hub %s does not exist\n' \
+        "$C_RED" "$C_RESET" "$DISPATCH_HUB" >&2
+    exit 2
+fi
+
 TMP_OUT=$(mktemp)
 trap 'rm -f "$TMP_OUT"' EXIT
 
@@ -176,6 +291,10 @@ find "$SCAN_DIR" -maxdepth 1 -type f -name '*.rs' -print0 \
     | while IFS= read -r -d '' file; do
         scan_file "$file"
     done > "$TMP_OUT"
+
+# Scan the dispatch hub with the testing-seam exclusion.
+printf '%shandler panic-ban scan:%s %s\n' "$C_DIM" "$C_RESET" "$DISPATCH_HUB"
+scan_dispatch_hub "$DISPATCH_HUB" >> "$TMP_OUT"
 
 HITS=$(grep -c $'^HIT\t' "$TMP_OUT" 2>/dev/null || true)
 HITS=${HITS:-0}
