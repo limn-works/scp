@@ -341,9 +341,11 @@ if [[ ! -f "$DISPATCH_HUB" ]]; then
     exit 2
 fi
 
-# The per-context dispatch helper layer (`*_helpers.rs`) — the `execute_*`
-# governance leaves and dispatch transitives the handlers call synchronously.
-# A reachable panic here unwinds the same actor task as a handler panic.
+# The per-context dispatch helper layer (`*_helpers.rs` AND `*_logic.rs`) — the
+# `execute_*` governance leaves, dispatch transitives, and the Class-S mutators
+# (enforce_suspend / enforce_economy / dispatch_enforcement_action) the handlers
+# call synchronously. A reachable panic in EITHER family unwinds the same actor
+# task as a handler panic (ADR-049 §10, Seam-3).
 HELPER_DIR="crates/scp-runtime/src/context"
 
 if [[ ! -d "$HELPER_DIR" ]]; then
@@ -354,10 +356,11 @@ fi
 
 # ---------------------------------------------------------------------------
 # scan_helper_file — scan one per-context dispatch HELPER file
-# (`crates/scp-runtime/src/context/*_helpers.rs`) for the REACHABLE-panic
-# family only. ADR-049 §10 (round-9): the helper layer holds the `execute_*`
-# governance leaves and the per-context dispatch transitives that the actor
-# handlers call synchronously. A `panic!`/`unreachable!`/`unimplemented!`/`todo!`
+# (`crates/scp-runtime/src/context/*_helpers.rs` and `*_logic.rs`) for the
+# REACHABLE-panic family only. ADR-049 §10 (round-9): the helper/logic layer
+# holds the `execute_*` governance leaves, the per-context dispatch transitives,
+# and the Class-S mutators that the actor handlers call synchronously. A
+# `panic!`/`unreachable!`/`unimplemented!`/`todo!`
 # reached there unwinds the SAME actor task as a panic in a handler — the
 # watchdog respawns and, on a deterministic re-trip, poisons the context (a
 # self-DoS, see §10 BLACK-002). So a reachable panic in a helper is exactly as
@@ -496,12 +499,21 @@ run_scan() {
         "$C_DIM" "$label" "$C_RESET" "$dispatch_hub"
     scan_dispatch_hub "$dispatch_hub" >> "$tmp_out"
 
-    # Scan the per-context dispatch helper layer for reachable panics.
+    # Scan the per-context dispatch helper layer for reachable panics. This
+    # covers BOTH the `*_helpers.rs` files AND the `*_logic.rs` dispatch
+    # transitives (governance_logic / economy_logic / lifecycle_logic), which
+    # hold synchronously-called Class-S mutators (enforce_suspend,
+    # enforce_economy, enforce_join_economy, dispatch_enforcement_action) whose
+    # reachable panic would unwind the SAME actor task as a handler panic. The
+    # `*_logic.rs` files obey the identical reachable-panic-family rules and
+    # test/testing carve-outs, so they reuse `scan_helper_file` unchanged — no
+    # separate scanner (ADR-049 §10, Seam-3).
     local helper_scanned=0 helper_min=0
     if [[ -n "$helper_dir" ]]; then
-        printf '%shelper panic-ban %s:%s %s/*_helpers.rs\n' \
+        printf '%shelper panic-ban %s:%s %s/*_{helpers,logic}.rs\n' \
             "$C_DIM" "$label" "$C_RESET" "$helper_dir"
-        find "$helper_dir" -maxdepth 1 -type f -name '*_helpers.rs' -print0 \
+        find "$helper_dir" -maxdepth 1 -type f \
+            \( -name '*_helpers.rs' -o -name '*_logic.rs' \) -print0 \
             | while IFS= read -r -d '' file; do
                 scan_helper_file "$file"
             done >> "$tmp_out"
