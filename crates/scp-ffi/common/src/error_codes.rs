@@ -378,6 +378,21 @@ pub const CTX_2095: &str = "SCP-CTX-2095";
 ///
 /// Maps from `ContextError::NotPseudonymousContext`.
 pub const CTX_2096: &str = "SCP-CTX-2096";
+/// Context poisoned: its actor exceeded the respawn budget (ADR-049 §10).
+///
+/// No longer respawned; the context is dormant until an operator clears the
+/// poison (triggering a fresh respawn) or the process restarts.
+///
+/// Maps from `ContextError::ContextPoisoned`.
+pub const CTX_2134: &str = "SCP-CTX-2134";
+/// Context actor crashed and could not be respawned (ADR-049 §10).
+///
+/// Typically a lost or corrupt persisted snapshot. Distinct from `CTX_2134`:
+/// the crash budget was not necessarily exhausted; the respawn itself was
+/// impossible.
+///
+/// Maps from `ContextError::ActorCrashed`.
+pub const CTX_2135: &str = "SCP-CTX-2135";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.

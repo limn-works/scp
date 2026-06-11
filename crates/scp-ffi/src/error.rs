@@ -395,6 +395,19 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
+            // ADR-049 §10: actor poisoned (exceeded the respawn budget).
+            // Dedicated SCP-CTX-2134 instead of the CTX_2001 catch-all so a
+            // caller can detect "dormant, needs operator recovery".
+            CE::ContextPoisoned(_) => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2134.to_owned(),
+            },
+            // ADR-049 §10: actor crashed and could not be respawned (lost /
+            // corrupt snapshot). Dedicated SCP-CTX-2135 instead of CTX_2001.
+            CE::ActorCrashed(_) => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2135.to_owned(),
+            },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for tool-economy and tool-invocation failures
             // (economy 12xxx, tool-invocation 6xxx). Recover the embedded
@@ -856,5 +869,24 @@ mod tests {
         let err: ScpPyError =
             scp_core::context::ContextError::MembershipFailed("nope".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2001);
+    }
+
+    /// ADR-049 §10: a poisoned context must surface the dedicated
+    /// SCP-CTX-2134 code via the translator's dedicated arm, NOT the catch-all
+    /// SCP-CTX-2001.
+    #[test]
+    fn context_poisoned_surfaces_ctx_2134() {
+        let err: ScpPyError =
+            scp_core::context::ContextError::ContextPoisoned("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2134);
+    }
+
+    /// ADR-049 §10: an unrecoverable actor crash must surface the dedicated
+    /// SCP-CTX-2135 code, distinct from the poison code and the catch-all.
+    #[test]
+    fn actor_crashed_surfaces_ctx_2135() {
+        let err: ScpPyError =
+            scp_core::context::ContextError::ActorCrashed("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2135);
     }
 }

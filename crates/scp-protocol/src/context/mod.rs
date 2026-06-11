@@ -609,8 +609,11 @@ pub enum ContextError {
     /// supervisor watchdog deliberately discards the panic message, which
     /// could otherwise carry plaintext or key material).
     ///
-    /// Mapped to canonical code `SCP-CTX-2134` through every FFI bridge
-    /// translator's generic context-error fallthrough.
+    /// Mapped to canonical code `SCP-CTX-2134` through a dedicated
+    /// translator arm in each non-WASM FFI bridge (`PyO3`, NAPI, `UniFFI`) — not
+    /// the generic `SCP-CTX-2001` fallthrough — so a caller can detect a
+    /// poisoned context. (WASM has no actor model per ADR-034, so it never
+    /// produces this variant.)
     #[error(
         "SCP-CTX-2134: context is poisoned (exceeded respawn budget); \
          operator intervention required: {0}"
@@ -627,8 +630,12 @@ pub enum ContextError {
     ///
     /// The payload is the affected context id — never a panic payload.
     ///
-    /// Mapped to canonical code `SCP-CTX-2135` through every FFI bridge
-    /// translator's generic context-error fallthrough.
+    /// Mapped to canonical code `SCP-CTX-2135` through a dedicated translator
+    /// arm in each non-WASM FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
+    /// `SCP-CTX-2001` fallthrough — so a caller can distinguish an
+    /// unrecoverable crash from a poisoned context (`SCP-CTX-2134`) and from a
+    /// generic context error. (WASM has no actor model per ADR-034, so it
+    /// never produces this variant.)
     #[error("SCP-CTX-2135: context actor crashed and could not be respawned: {0}")]
     ActorCrashed(String),
 }
