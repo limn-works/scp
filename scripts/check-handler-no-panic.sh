@@ -137,12 +137,23 @@ scan_file() {
         if (seen_test) next
 
         line = raw
-        # Strip the //-comment tail FIRST. A `//` line comment may contain a
-        # literal `/*` (e.g. a doc reference to `handlers/*.rs`); if the block-
-        # comment scanner ran first it would mistake that for an unterminated
-        # block comment and wrongly suppress every following line. Stripping
-        # the line-comment tail up front makes the block-comment scan see only
-        # real (code-region) `/*`/`*/` tokens.
+        # Strip whole double-quoted string literals FIRST (only outside an open
+        # block comment, where string syntax is inactive). A string literal may
+        # contain a literal `/*` or `*/` or `//` (e.g. `let s = "/* not a
+        # comment";`); without removing strings the block-comment scanner would
+        # mistake the in-string `/*` for a real block-comment open and wedge the
+        # scanner (flip `in_block` permanently), silently swallowing every
+        # following line and making the gate vacuously pass. Removing string
+        # bodies up front is a lexer-lite step: banned macro CALLS are never
+        # inside a string literal, so dropping string contents cannot hide a
+        # real violation, and it cannot be abused to wedge the scanner.
+        if (!in_block) {
+            gsub(/"[^"]*"/, "", line)
+        }
+        # Strip the //-comment tail. A `//` line comment may still contain a
+        # literal `/*` (e.g. a doc reference to `handlers/*.rs`); stripping the
+        # line-comment tail before block-comment detection makes the block scan
+        # see only real (code-region) `/*`/`*/` tokens.
         #
         # NOTE: this does not strip a `//` that itself sits inside an open
         # block comment — but `in_block` short-circuits below before the strip
@@ -229,8 +240,25 @@ scan_dispatch_hub() {
         }
         if (seen_test) next
 
+        # Detect the testing-feature gate on the RAW line, BEFORE any string /
+        # comment stripping. The `"testing"` literal inside the attribute would
+        # otherwise be removed by the string-literal strip below, breaking the
+        # exclusion (the gated `TestInducePanic` panic would then be flagged).
+        # The gate attribute is never inside a comment or string, so reading it
+        # from `raw` is correct.
+        if (raw ~ /#\[cfg\(feature[[:space:]]*=[[:space:]]*"testing"\)\]/) {
+            testing_pending = 1
+        }
+
         line = raw
-        # Strip the //-comment tail FIRST (see scan_file for the rationale: a
+        # Strip whole double-quoted string literals FIRST (see scan_file for the
+        # rationale: a string-literal `/*` must not wedge the block-comment
+        # scanner). Doing this before the brace count below also makes depth
+        # tracking ignore braces that live inside string literals.
+        if (!in_block) {
+            gsub(/"[^"]*"/, "", line)
+        }
+        # Strip the //-comment tail (see scan_file for the rationale: a
         # `//` line comment containing a literal `/*` — e.g. the
         # `handlers/*.rs` doc reference at the TestInducePanic seam in this file —
         # must not be mistaken for an unterminated block comment, which would
@@ -253,11 +281,9 @@ scan_dispatch_hub() {
         }
         if (in_block) next
 
-        # Detect the testing-feature gate. The gated item opens on a later
-        # line; remember the depth at which it opens so we can find its end.
-        if (line ~ /#\[cfg\(feature[[:space:]]*=[[:space:]]*"testing"\)\]/) {
-            testing_pending = 1
-        }
+        # (Testing-feature gate already detected from `raw` above, before
+        # string/comment stripping.) The gated item opens on a later line; the
+        # brace count below finds the depth at which it opens.
 
         # Count braces on this (comment-stripped) line to track depth.
         opens = gsub(/{/, "{", line)
@@ -440,23 +466,36 @@ self_test() {
     # A hub fixture that reproduces the real-code shape: a `//` comment that
     # contains a literal `/*` (the `handlers/*.rs` reference), a testing-gated
     # panic that MUST be excluded, and padding so the production scan is
-    # non-trivial. The planted production `unreachable!()` sits AFTER the
-    # `/*`-bearing comment so the old (buggy) scanner would have swallowed it.
+    # non-trivial.
+    #
+    # CRITICAL ORDERING: the `/*`-bearing `//` wedge comment is placed FIRST,
+    # BEFORE the padding. If a comment-stripping regression reappears (block-
+    # comment detection runs before the `//`-tail strip, so the literal `/*`
+    # flips `in_block` permanently), the wedge swallows EVERYTHING after it —
+    # the padding AND the planted panic. The scanned-line count then collapses
+    # toward zero, BELOW `hub_min`, so the vacuity guard fires and the self-test
+    # FAILS. Were the padding placed first (the previous fixture), the regressed
+    # scanner would still count the 150 padding lines (scanned >= hub_min),
+    # masking the regression and letting the swallowed panic pass vacuously.
+    # Ordering the wedge first makes the vacuity guard the independent safety
+    # net for the wedge regression — even if the planted-panic HIT is missed.
     {
         printf 'fn dispatch_state() {\n'
-        # >= hub_min production lines of padding so vacuity guard is satisfied.
+        # The `//` comment carrying a literal `/*` (mirrors mod.rs:589) FIRST.
+        printf '    // any `handlers/*.rs` module reference\n'
+        # >= hub_min production lines of padding so a CORRECT scanner clears the
+        # vacuity guard; a wedged scanner swallows all of this and drops below it.
         local i
         for ((i = 0; i < 150; i++)); do
             printf '    let _x%d = %d;\n' "$i" "$i"
         done
-        # The `//` comment carrying a literal `/*` (mirrors mod.rs:589).
-        printf '    // any `handlers/*.rs` module reference\n'
         # Testing-gated panic — MUST be excluded.
         printf '    #[cfg(feature = "testing")]\n'
         printf '    fn induce() {\n'
         printf '        panic!("testing seam");\n'
         printf '    }\n'
-        # Production panic AFTER the `/*` comment — MUST be caught.
+        # Production panic AFTER the `/*` comment + padding — MUST be caught by a
+        # correct scanner, and swallowed (→ vacuity fail) by a wedged one.
         printf '    unreachable!("planted production panic");\n'
         printf '}\n'
     } > "$fhub"
@@ -483,11 +522,12 @@ self_test() {
     local fhub_clean="$fixt/mod_clean.rs"
     {
         printf 'fn dispatch_state() {\n'
+        # Wedge comment first (same ordering as the catching fixture).
+        printf '    // any `handlers/*.rs` module reference\n'
         local j
         for ((j = 0; j < 150; j++)); do
             printf '    let _y%d = %d;\n' "$j" "$j"
         done
-        printf '    // any `handlers/*.rs` module reference\n'
         printf '    #[cfg(feature = "testing")]\n'
         printf '    fn induce() {\n'
         printf '        panic!("testing seam");\n'
