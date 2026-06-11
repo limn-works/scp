@@ -1319,7 +1319,7 @@ fn append_message_sent_or_rollback_sequence(
     Ok(())
 }
 
-/// Computes and caches the sender's participation record after a send (#1530).
+/// Computes and caches the sender's participation record after a send.
 /// Factored out of [`finalize_send`] to keep that function within the line
 /// budget; pure bookkeeping with no error path (a missing Merkle root or a
 /// zero-count record is simply not cached).
