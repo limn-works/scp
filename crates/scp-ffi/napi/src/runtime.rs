@@ -1369,8 +1369,7 @@ where
         .ok_or_else(|| ScpNapiError::Identity {
             message: format!(
                 "identity '{did}' is not registered on this bridge instance — \
-                 create it via identityCreate / identityCreateWithCustody, or it \
-                 was loaded externally without retained custody"
+                 create it via identityCreate / identityCreateWithCustody"
             ),
             code: codes::IDENT_1001.to_owned(),
         })?;
@@ -1400,8 +1399,7 @@ where
         .ok_or_else(|| ScpNapiError::Identity {
             message: format!(
                 "identity '{did}' is not registered on this bridge instance — \
-                 create it via identityCreate / identityCreateWithCustody, or it \
-                 was loaded externally without retained custody"
+                 create it via identityCreate / identityCreateWithCustody"
             ),
             code: codes::IDENT_1001.to_owned(),
         })?;

@@ -426,11 +426,11 @@ pub(crate) fn event_log_checkpoint_on(
         crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
         let custody = identity.inner.in_memory_custody.as_ref().ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Permission {
-                message: "event log checkpoint requires key custody — this identity has no \
-                      retained custody (it was externally loaded)"
+            napi::Error::from(ScpNapiError::Identity {
+                message: "event log checkpoint requires retained signing custody — this identity \
+                      has no retained custody (it was externally loaded)"
                     .to_owned(),
-                code: codes::PERM_3023.to_owned(),
+                code: codes::IDENT_1017.to_owned(),
             })
         })?;
         let scp_id = identity.inner.scp_identity.as_ref().ok_or_else(|| {
@@ -589,7 +589,7 @@ pub(crate) fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use scp_ffi_common::error_codes as codes;
@@ -616,6 +616,49 @@ mod tests {
         let hex = format!("abcd{}ef", "00".repeat(29));
         let result = decode_hex_hash(&hex).unwrap();
         assert_eq!(result, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Missing-signing-custody → SCP-IDENT-1017
+    //
+    // An identity that retains no custody (externally loaded: `in_memory_custody`
+    // is `None`) must reject an event-log checkpoint with the canonical
+    // missing-signing-custody code.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn event_log_checkpoint_without_retained_custody_returns_ident_1017() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let instance_id = bi.instance_id();
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-no-custody-checkpoint".to_owned(),
+            "did:dht:z6MkCreatorNoCustody".to_owned(),
+        );
+
+        // Externally-loaded identity: no retained custody, no signing key state.
+        let identity = crate::identity::NapiIdentity {
+            inner: std::sync::Arc::new(crate::identity::NapiIdentityInner {
+                did: "did:dht:z6MkCreatorNoCustody".to_owned(),
+                custody_type: "external".to_owned(),
+                scp_identity: None,
+                in_memory_custody: None,
+                document: None,
+                bi: std::sync::Arc::clone(&bi),
+                verifying_key_hex: None,
+                instance_id,
+                rotation_event_json: None,
+            }),
+        };
+
+        let Err(err) = event_log_checkpoint_on(&bi, &handle, &identity, 1.0) else {
+            panic!("checkpoint without retained custody must fail")
+        };
+        let reason = err.reason.clone();
+        assert!(
+            reason.contains("SCP-IDENT-1017"),
+            "expected SCP-IDENT-1017, got: {reason}"
+        );
     }
 
     #[test]

@@ -2025,19 +2025,19 @@ pub(crate) async fn broadcast_publish_on(
 
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastPayload};
     let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish requires key custody — this identity has no retained \
-                      custody (it was externally loaded)"
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish requires retained signing custody — this identity has no \
+                      retained custody (it was externally loaded)"
                 .to_owned(),
-            code: codes::PERM_3020.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish requires a signing key — identity has no active \
-                      signing key handle"
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish requires retained signing custody — identity has no \
+                      active signing key"
                 .to_owned(),
-            code: codes::PERM_3021.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
 
@@ -2174,19 +2174,19 @@ pub(crate) async fn broadcast_publish_asset_on(
 
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
     let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish asset requires key custody — this identity has no \
-                      retained custody (it was externally loaded)"
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish asset requires retained signing custody — this identity \
+                      has no retained custody (it was externally loaded)"
                 .to_owned(),
-            code: codes::PERM_3020.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish asset requires a signing key — identity has no active \
-                      signing key handle"
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish asset requires retained signing custody — identity has \
+                      no active signing key"
                 .to_owned(),
-            code: codes::PERM_3021.to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
 
@@ -2279,15 +2279,19 @@ pub(crate) async fn broadcast_publish_assets_on(
 
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
     let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish assets requires key custody".to_owned(),
-            code: codes::PERM_3020.to_owned(),
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish assets requires retained signing custody — this identity \
+                      has no retained custody (it was externally loaded)"
+                .to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
-        NapiError::from(ScpNapiError::Permission {
-            message: "broadcast publish assets requires a signing key".to_owned(),
-            code: codes::PERM_3021.to_owned(),
+        NapiError::from(ScpNapiError::Identity {
+            message: "broadcast publish assets requires retained signing custody — identity has \
+                      no active signing key"
+                .to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
     })?;
 
@@ -5651,6 +5655,36 @@ mod tests {
             msg.contains(codes::IDENT_1054),
             "expected missing-key-material code {}, got: {msg}",
             codes::IDENT_1054
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_publish_without_retained_custody_returns_ident_1017() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        // `test_active_on` leaves `in_memory_custody`/`signing_key` as `None`
+        // (an externally-loaded identity), so broadcast publish trips the
+        // missing signing-custody gate before reaching the relay.
+        let handle = super::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-no-custody-broadcast".to_owned(),
+            "did:dht:z6MkCreatorNoCustodyBroadcast".to_owned(),
+        );
+
+        let result = super::broadcast_publish_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkAuthor".to_owned(),
+            b"hi".to_vec(),
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("broadcast publish without retained custody must fail")
+        };
+        let reason = err.reason.clone();
+        assert!(
+            reason.contains("SCP-IDENT-1017"),
+            "expected SCP-IDENT-1017, got: {reason}"
         );
     }
 }

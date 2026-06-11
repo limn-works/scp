@@ -158,6 +158,20 @@ describe("mapBridgeError", () => {
     expect(err.code).toBe("SCP-IDENT-1001");
   });
 
+  it("maps the missing-signing-custody code to IdentityError", () => {
+    // SCP-IDENT-1017 is surfaced by the NAPI-backed mint /
+    // event-log-checkpoint paths (and the UniFFI-only delegate path) when the
+    // creator/identity retains no signing custody (externally loaded). The
+    // NAPI delegate path is registry-based and surfaces SCP-IDENT-1001 instead.
+    // It must route to IdentityError, not the permission/nonce family it was
+    // formerly overloaded onto.
+    const err = mapBridgeError(
+      new Error("[SCP-IDENT-1017] identity error: UCAN minting requires retained signing custody"),
+    );
+    expect(err).toBeInstanceOf(IdentityError);
+    expect(err.code).toBe("SCP-IDENT-1017");
+  });
+
   it("maps context error codes to ContextError", () => {
     const err = mapBridgeError(new Error("[SCP-CTX-2001] context error: failed"));
     expect(err).toBeInstanceOf(ContextError);
@@ -171,9 +185,9 @@ describe("mapBridgeError", () => {
   });
 
   it("maps PERM error codes in correct range to UcanPermissionError", () => {
-    const err = mapBridgeError(new Error("[SCP-PERM-3023] permission error: denied"));
+    const err = mapBridgeError(new Error("[SCP-PERM-3021] permission error: denied"));
     expect(err).toBeInstanceOf(UcanPermissionError);
-    expect(err.code).toBe("SCP-PERM-3023");
+    expect(err.code).toBe("SCP-PERM-3021");
   });
 
   it("maps crypto error codes to CryptoError", () => {

@@ -951,6 +951,23 @@ OP_UNREGISTERED_DID_REJECTED = OpSpec(
 
 
 # ---------------------------------------------------------------------------
+# Why there is NO missing-signing-custody parity op here.
+#
+# The missing-signing-custody condition (a sign operation invoked for an
+# identity/handle that retains no custody) is deliberately NOT a cross-bridge
+# equality op: (a) the expected code diverges by bridge BY DESIGN, so an
+# equality comparator would force a false match; and (b) the no-custody handle
+# is not reachable through the public JSON-RPC flow the parity runners drive —
+# a normal `context_create` always stamps the creator's retained custody onto
+# the returned handle, and the runner exposes no synthetic-handle construction
+# to bypass that. The condition is instead covered by per-bridge inline tests.
+#
+# For the canonical code and its full per-bridge cross-bridge contract, see the
+# "SCP-IDENT-1017 and its cross-bridge contract" section in
+# `.docs/standards/sdk-common.md`.
+
+
+# ---------------------------------------------------------------------------
 # Library
 # ---------------------------------------------------------------------------
 

@@ -31,7 +31,14 @@
 
 /// Generic identity error.
 pub const IDENT_1000: &str = "SCP-IDENT-1000";
-/// Identity operation failed.
+/// Identity operation failed (generic identity error category).
+///
+/// Also the code surfaced when an identity is not registered / has no retained
+/// state on the bridge instance: the registry-miss path that the NAPI and
+/// `PyO3` bridges take in `with_identity` / `with_identity_mut` when the DID was
+/// never created on this bridge. For registry-based key resolution this is where
+/// missing signing custody manifests, in contrast to the handle-borne
+/// `IDENT_1017` (see sdk-common.md).
 pub const IDENT_1001: &str = "SCP-IDENT-1001";
 /// Identity not found.
 pub const IDENT_1002: &str = "SCP-IDENT-1002";
@@ -79,6 +86,17 @@ pub const IDENT_1015: &str = "SCP-IDENT-1015";
 /// `identity_verify_device_attestation` method is not exposed on the
 /// native bridge.
 pub const IDENT_1016: &str = "SCP-IDENT-1016";
+/// Operation requires retained signing custody, which this identity/handle
+/// lacks.
+///
+/// Surfaced by operations that must sign with the creator/identity key (UCAN
+/// mint, UCAN delegate, event-log checkpoint, broadcast publish) when the
+/// identity was loaded externally with no retained custody, or the
+/// custody/handle is sign-only without the needed key material. Distinct from
+/// `IDENT_1001` (identity not registered). (UCAN delegate surfaces this on
+/// `UniFFI` only; the registry-based NAPI/PyO3 delegate paths surface
+/// `IDENT_1001` instead — see sdk-common.md.)
+pub const IDENT_1017: &str = "SCP-IDENT-1017";
 /// Identity agent key creation.
 pub const IDENT_1020: &str = "SCP-IDENT-1020";
 /// Identity DID document error.
@@ -408,6 +426,11 @@ pub const PERM_3002: &str = "SCP-PERM-3002";
 /// Capability delegation error.
 pub const PERM_3003: &str = "SCP-PERM-3003";
 /// Capability ceiling exceeded.
+///
+/// Reserved; no active producer. The bridge sites that emitted it for the
+/// missing-signing-custody condition now use `IDENT_1017`. The semantic name is
+/// retained for the capability-ceiling-exceeded condition should producers be
+/// reintroduced.
 pub const PERM_3004: &str = "SCP-PERM-3004";
 /// Role assignment error.
 pub const PERM_3005: &str = "SCP-PERM-3005";
@@ -424,12 +447,34 @@ pub const PERM_3011: &str = "SCP-PERM-3011";
 /// Provenance permission: capability check failed.
 pub const PERM_3012: &str = "SCP-PERM-3012";
 /// UCAN permission: issuer not authorized.
+///
+/// Reserved; no active producer. The bridge sites that emitted it for the
+/// missing-signing-custody condition now use `IDENT_1017`. The semantic name is
+/// retained for the issuer-not-authorized condition should producers be
+/// reintroduced.
 pub const PERM_3020: &str = "SCP-PERM-3020";
 /// UCAN permission: audience mismatch.
+///
+/// Reserved; no active producer. UCAN audience-mismatch
+/// (`UcanError::AudienceMismatch`) is currently classified as `PERM_3001` by
+/// `ucan_errors::ucan_error_code`. The semantic name is retained for the
+/// audience-mismatch condition should producers be reintroduced.
 pub const PERM_3021: &str = "SCP-PERM-3021";
 /// UCAN permission: delegation chain invalid.
+///
+/// Reserved; no active producer. The bridge sites that emitted it for the
+/// missing-signing-custody condition now use `IDENT_1017`. UCAN
+/// delegation-chain failures (`UcanError::DelegationChainBroken`) are currently
+/// classified as `PERM_3001` by `ucan_errors::ucan_error_code`. The semantic
+/// name is retained for the delegation-chain-invalid condition should producers
+/// be reintroduced.
 pub const PERM_3022: &str = "SCP-PERM-3022";
-/// UCAN permission: nonce replay detected.
+/// Reserved; no active producer.
+///
+/// Formerly overloaded by the NAPI bridge for the missing-signing-custody
+/// condition (now `IDENT_1017`). Genuine UCAN nonce replay
+/// (`UcanError::NonceReused`) is classified as `PERM_3001` by
+/// `ucan_errors::ucan_error_code`.
 pub const PERM_3023: &str = "SCP-PERM-3023";
 /// Handle affinity violation — handle from a different SCP instance.
 pub const PERM_3030: &str = "SCP-PERM-3030";

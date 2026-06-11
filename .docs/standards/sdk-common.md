@@ -59,6 +59,26 @@ ScpError (root)
 | `SCP-ATTEST-9017` | Failed to re-serialize attestation to UTF-8 JSON |
 | `SCP-ATTEST-9018` | Cryptographic-class verification method not verifiable via browser fetch |
 
+### SCP-IDENT-1017 and its cross-bridge contract
+
+This section documents `SCP-IDENT-1017` (missing signing custody) and the
+per-bridge contract for how that one condition surfaces across the bridges. It
+is **not** the full registry of `SCP-IDENT-` codes — other `SCP-IDENT-` codes
+exist (for example, the pseudonym-derivation family `SCP-IDENT-1054`..`1057`)
+and are documented with their own features.
+
+| Code | Description |
+|------|-------------|
+| `SCP-IDENT-1017` | Operation requires retained signing custody (identity loaded externally with no retained custody, or handle is sign-only). Surfaced by handle-borne bridges for UCAN **mint** (NAPI + UniFFI), event-log **checkpoint** (NAPI + UniFFI), and **broadcast publish** (NAPI + UniFFI). UCAN **delegate** surfaces `SCP-IDENT-1017` on **UniFFI only**: NAPI resolves the delegator key from the identity registry and surfaces `SCP-IDENT-1001` on a registry miss (same structural reason as PyO3), so NAPI delegate does **not** surface `SCP-IDENT-1017`. |
+
+**Cross-bridge note (native bridges).** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise); NAPI's UCAN **delegate** path is registry-based for the same structural reason and surfaces `SCP-IDENT-1001` as well (see the table above). On the native bridges (PyO3, NAPI, and UniFFI → Swift / Kotlin / TS-via-NAPI), consumers that catch the `IdentityError` category are safe for the missing-custody condition; only code that switches on the exact code string must account for the per-bridge code splits described above.
+
+**WASM note (per signing path).** WASM cannot sign in-Rust (ADR-034) and has no DID-keyed identity registry, so the three signing paths diverge by *path*, not as one uniform code:
+
+- **UCAN mint / delegate** → `SCP-PERM-3000` (`UcanPermissionError`, capability-absent per ADR-034). The Rust side returns this immediately and defers signing to JS-side key custody (`WebCrypto`/`SubtleCrypto`). This is the **only** path where the `SCP-PERM-3000` claim holds — and it is a distinct condition from the native bridges' missing-custody `IdentityError`, so a WASM consumer must handle `UcanPermissionError` / `SCP-PERM-3000` separately; catching `IdentityError` alone does **not** cover it.
+- **Event-log checkpoint** → **no missing-custody error**. WASM returns a *successful unsigned* checkpoint carrying a `signing_payload_hash`, deferring Ed25519 signing to JS `WebCrypto` (ADR-048 §7b semantic divergence). There is no `SCP-PERM-3000` (or any custody) error on this path.
+- **Broadcast publish** → **no in-Rust custody gate**. The `SCP-PERM-3000` errors WASM raises on this path are suspended-write and non-author authorization checks, a different condition entirely — not a missing-custody signal.
+
 ## Stub and Placeholder Policy
 
 Code that does not fully implement its documented contract (acceptance criterion, ADR spec, or trait method) is a **stub**. Stubs are tolerated during phased implementation but must be traceable to the planning system.

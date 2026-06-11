@@ -156,7 +156,8 @@ public nonisolated struct EventLog: Sendable {
 ///   - epoch: The current MLS epoch (pass 0 for broadcast contexts).
 /// - Returns: A ``Checkpoint`` containing the signed checkpoint data.
 /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not found.
-///   ``ScpError/Permission(msg:code:)`` if key custody is not available.
+///   ``ScpError/Identity(msg:code:)`` (`SCP-IDENT-1017`) if the identity
+///   retains no signing custody (externally loaded).
 ///
 /// ## Provenance
 ///
@@ -189,7 +190,8 @@ public func generateEventLogCheckpoint(
 ///   - epoch: The current MLS epoch (pass 0 for broadcast contexts).
 /// - Returns: A ``Checkpoint`` containing the signed checkpoint data.
 /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not found.
-///   ``ScpError/Permission(msg:code:)`` if key custody is not available.
+///   ``ScpError/Identity(msg:code:)`` (`SCP-IDENT-1017`) if the identity
+///   retains no signing custody (externally loaded).
 ///
 /// ## Provenance
 ///
