@@ -85,7 +85,18 @@ impl PyContextHandle {
     /// Returns the context's current lifecycle state as a string.
     ///
     /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
-    /// `"migrating_out"`, `"tombstoned"`.
+    /// `"migrating_out"`, `"tombstoned"`, `"poisoned"`.
+    ///
+    /// This is a **best-effort, cached** snapshot taken at the last observed
+    /// transition — it is intentionally NOT a live supervisor read (that would
+    /// add a mailbox round-trip to every call). Per ADR-049 §10, an actor
+    /// crash or poison detected by the supervisor watchdog is surfaced
+    /// authoritatively via a typed **error code on the next per-context
+    /// operation** (`SCP-CTX-2134` `ContextPoisoned` once the respawn budget is
+    /// exceeded, `SCP-CTX-2135` `ActorCrashed` for the crashed/mid-respawn
+    /// window) — NOT by polling this getter, which may still report the
+    /// last-known non-terminal state. Operator recovery from a poisoned context
+    /// is `clear_poison` / process restart, not an SDK call.
     #[getter]
     fn state(&self) -> PyResult<String> {
         let guard = self

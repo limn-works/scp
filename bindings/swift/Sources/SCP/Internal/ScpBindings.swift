@@ -10757,6 +10757,11 @@ public enum ContextState {
      * Context permanently tombstoned after migration (§5.11A.5). Terminal state.
      */
     case tombstoned
+    /**
+     * Context actor exceeded the ADR-049 §10 respawn budget and is poisoned —
+     * dormant pending operator recovery (`clear_poison` / process restart).
+     */
+    case poisoned
 }
 
 
@@ -10787,7 +10792,9 @@ public struct FfiConverterTypeContextState: FfiConverterRustBuffer {
         case 6: return .migratingOut
         
         case 7: return .tombstoned
-        
+
+        case 8: return .poisoned
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -10822,7 +10829,11 @@ public struct FfiConverterTypeContextState: FfiConverterRustBuffer {
         
         case .tombstoned:
             writeInt(&buf, Int32(7))
-        
+
+
+        case .poisoned:
+            writeInt(&buf, Int32(8))
+
         }
     }
 }
