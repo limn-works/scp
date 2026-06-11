@@ -479,6 +479,36 @@ fn resolve_identity_custody(identity: &Identity) -> Option<Arc<UniffiKeyCustody>
     None
 }
 
+/// Resolves the retained custody on a [`ContextHandle`] into a
+/// [`UniffiKeyCustody`] enum, for the production context ops that sign over it
+/// (`ucan_mint`, `ucan_delegate`).
+///
+/// Resolution order mirrors [`resolve_identity_custody`] (and the handle's own
+/// `resolve_uniffi_signing_key` / `sign_export_snapshot_via_custody`): the
+/// `ContextHandle`'s production callback custody (Secure Enclave / Android
+/// Keystore) first, then — only in `allow_in_memory_custody` builds — the
+/// retained in-memory custody. Returns `None` for an externally-loaded handle
+/// that retains no custody (all custody fields `None`), so the caller fails
+/// closed with [`codes::IDENT_1017`].
+///
+/// The returned `Arc<UniffiKeyCustody>` SHARES the custody instance the
+/// `ContextHandle` already holds (no second key store), keeping the handle's
+/// signing key and the resolved custody consistent. [`UniffiKeyCustody`]
+/// implements [`KeyCustody`], so the result is directly usable as
+/// `&impl KeyCustody` by `mint_ucan` / `delegate_ucan`.
+fn resolve_context_custody(handle: &ContextHandle) -> Option<Arc<UniffiKeyCustody>> {
+    if let Some(ref cc) = handle.callback_custody {
+        return Some(Arc::new(UniffiKeyCustody::Callback(Arc::clone(cc))));
+    }
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        if let Some(ref imc) = handle.in_memory_custody {
+            return Some(Arc::new(UniffiKeyCustody::InMemory(Arc::clone(imc))));
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // CallbackKeyCustody — concrete adapter wrapping KeyCustodyProvider callback
 //
@@ -4611,8 +4641,7 @@ fn mcp_allowlist_lock_poisoned() -> ScpError {
 // See ADR-021 acceptance criterion 6.
 // ---------------------------------------------------------------------------
 
-/// Inner implementation of [`ucan_mint`], split out for cfg-gating clarity.
-#[cfg(feature = "allow_in_memory_custody")]
+/// Inner implementation of [`ucan_mint`].
 async fn ucan_mint_impl(
     handle: Arc<ContextHandle>,
     member_did: String,
@@ -4621,16 +4650,16 @@ async fn ucan_mint_impl(
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
-            // Extract key custody and signing key from the context handle.
-            let custody = handle
-                .in_memory_custody
-                .as_ref()
-                .ok_or_else(|| ScpError::Identity {
-                    msg: "UCAN minting requires retained signing custody — the context \
-                              creator identity has no retained custody (it was externally loaded)"
-                        .to_owned(),
-                    code: codes::IDENT_1017.to_owned(),
-                })?;
+            // Resolve the retained key custody (callback first, then in-memory
+            // in allow_in_memory_custody builds) and the signing key from the
+            // context handle. Externally-loaded handles retain no custody and
+            // fail closed with SCP-IDENT-1017.
+            let custody = resolve_context_custody(&handle).ok_or_else(|| ScpError::Identity {
+                msg: "UCAN minting requires retained signing custody — the context \
+                          creator identity has no retained custody (it was externally loaded)"
+                    .to_owned(),
+                code: codes::IDENT_1017.to_owned(),
+            })?;
             let signing_key = handle.signing_key.ok_or_else(|| ScpError::Identity {
                 msg: "UCAN minting requires retained signing custody — the context creator \
                           identity has no active signing key"
@@ -4661,7 +4690,7 @@ async fn ucan_mint_impl(
 
             let token = scp_core::crypto::ucan::mint::mint_ucan(
                 &params,
-                &custody.0,
+                &*custody,
                 &scp_primitives::SystemClock,
             )
             .await
@@ -4689,26 +4718,7 @@ async fn ucan_mint_impl(
         })?
 }
 
-#[cfg(not(feature = "allow_in_memory_custody"))]
-#[allow(clippy::unused_async)] // Must be async to match the cfg(feature) variant's signature.
-async fn ucan_mint_impl(
-    _handle: Arc<ContextHandle>,
-    _member_did: String,
-    _capabilities: Vec<String>,
-    _proofs: Option<Vec<String>>,
-) -> Result<Arc<UcanToken>, ScpError> {
-    Err(ScpError::Identity {
-        msg: "UCAN minting requires retained signing custody — the in_memory custody path \
-                  is not available in this build. Enable the \
-                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
-                  a KeyCustodyProvider for production."
-            .to_owned(),
-        code: codes::IDENT_1017.to_owned(),
-    })
-}
-
-/// Inner implementation of [`ucan_delegate`], split out for cfg-gating clarity.
-#[cfg(feature = "allow_in_memory_custody")]
+/// Inner implementation of [`ucan_delegate`].
 async fn ucan_delegate_impl(
     handle: Arc<ContextHandle>,
     delegator_did: String,
@@ -4722,16 +4732,16 @@ async fn ucan_delegate_impl(
             use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
             use scp_core::crypto::ucan::validate::parse_ucan;
 
-            // Extract key custody and signing key from the context handle.
-            let custody = handle
-                .in_memory_custody
-                .as_ref()
-                .ok_or_else(|| ScpError::Identity {
-                    msg: "UCAN delegation requires retained signing custody — the context \
-                              creator identity has no retained custody (it was externally loaded)"
-                        .to_owned(),
-                    code: codes::IDENT_1017.to_owned(),
-                })?;
+            // Resolve the retained key custody (callback first, then in-memory
+            // in allow_in_memory_custody builds) and the signing key from the
+            // context handle. Externally-loaded handles retain no custody and
+            // fail closed with SCP-IDENT-1017.
+            let custody = resolve_context_custody(&handle).ok_or_else(|| ScpError::Identity {
+                msg: "UCAN delegation requires retained signing custody — the context \
+                          creator identity has no retained custody (it was externally loaded)"
+                    .to_owned(),
+                code: codes::IDENT_1017.to_owned(),
+            })?;
             let signing_key = handle.signing_key.ok_or_else(|| ScpError::Identity {
                 msg: "UCAN delegation requires retained signing custody — the context creator \
                           identity has no active signing key"
@@ -4791,7 +4801,7 @@ async fn ucan_delegate_impl(
                 ceiling,
             };
 
-            let token = delegate_ucan(&params, &custody.0, &scp_primitives::SystemClock)
+            let token = delegate_ucan(&params, &*custody, &scp_primitives::SystemClock)
                 .await
                 .map_err(ScpError::from)?;
 
@@ -4817,32 +4827,12 @@ async fn ucan_delegate_impl(
         })?
 }
 
-#[cfg(not(feature = "allow_in_memory_custody"))]
-#[allow(clippy::unused_async)] // Must be async to match the cfg(feature) variant's signature.
-async fn ucan_delegate_impl(
-    _handle: Arc<ContextHandle>,
-    _delegator_did: String,
-    _delegatee_did: String,
-    _parent_token: String,
-    _capabilities: Vec<String>,
-) -> Result<Arc<UcanToken>, ScpError> {
-    Err(ScpError::Identity {
-        msg: "UCAN delegation requires retained signing custody — the in_memory custody path \
-                  is not available in this build. Enable the \
-                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
-                  a KeyCustodyProvider for production."
-            .to_owned(),
-        code: codes::IDENT_1017.to_owned(),
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Free functions — event log operations
 //
 // See ADR-021 acceptance criterion 7.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "allow_in_memory_custody")]
 async fn event_log_checkpoint_impl(
     bi: Arc<crate::runtime::UniffiBridgeInstance>,
     handle: Arc<ContextHandle>,
@@ -4851,16 +4841,17 @@ async fn event_log_checkpoint_impl(
 ) -> Result<Checkpoint, ScpError> {
     runtime()
         .spawn(async move {
+            // Resolve the retained key custody (callback first, then in-memory in
+            // allow_in_memory_custody builds) from the signing identity.
+            // Externally-loaded identities retain no custody and fail closed with
+            // SCP-IDENT-1017.
             let custody =
-                identity
-                    .in_memory_custody
-                    .as_ref()
-                    .ok_or_else(|| ScpError::Identity {
-                        msg: "event log checkpoint requires retained signing custody — this \
-                              identity has no retained custody (it was externally loaded)"
-                            .to_owned(),
-                        code: codes::IDENT_1017.to_owned(),
-                    })?;
+                resolve_identity_custody(&identity).ok_or_else(|| ScpError::Identity {
+                    msg: "event log checkpoint requires retained signing custody — this \
+                          identity has no retained custody (it was externally loaded)"
+                        .to_owned(),
+                    code: codes::IDENT_1017.to_owned(),
+                })?;
             let core_id = identity
                 .core_id
                 .as_ref()
@@ -4885,7 +4876,7 @@ async fn event_log_checkpoint_impl(
             let checkpoint = bi
                 .with_ucan_state(&context_id, |ucan_state| {
                     let signer = scp_core::event_log::KeyCustodySigner {
-                        custody: &custody.0,
+                        custody: &*custody,
                         key: &core_id.active_signing_key,
                     };
                     // generate_checkpoint is async — use block_in_place to allow
@@ -4930,24 +4921,6 @@ async fn event_log_checkpoint_impl(
         })?
 }
 
-#[cfg(not(feature = "allow_in_memory_custody"))]
-#[allow(clippy::unused_async)]
-async fn event_log_checkpoint_impl(
-    _bi: Arc<crate::runtime::UniffiBridgeInstance>,
-    _handle: Arc<ContextHandle>,
-    _identity: Arc<Identity>,
-    _epoch: u64,
-) -> Result<Checkpoint, ScpError> {
-    Err(ScpError::Identity {
-        msg: "event log checkpoint requires retained signing custody — the in_memory custody \
-                  path is not available in this build. Enable the \
-                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
-                  a KeyCustodyProvider for production."
-            .to_owned(),
-        code: codes::IDENT_1017.to_owned(),
-    })
-}
-
 /// Generates a signed consistency checkpoint scoped to a member DID.
 ///
 /// The `UniFFI` bridge holds no DID-keyed identity registry — identities are
@@ -4968,7 +4941,6 @@ async fn event_log_checkpoint_impl(
 /// unrelated identity's key — a provenance forgery. The argument is retained
 /// (rather than dropped in favour of `identity.did`) so the call site reads
 /// symmetrically with the other bridges' `*_by_did` signatures.
-#[cfg(feature = "allow_in_memory_custody")]
 async fn event_log_checkpoint_by_did_impl(
     bi: Arc<crate::runtime::UniffiBridgeInstance>,
     handle: Arc<ContextHandle>,
@@ -4994,16 +4966,17 @@ async fn event_log_checkpoint_by_did_impl(
     }
     runtime()
         .spawn(async move {
+            // Resolve the retained key custody (callback first, then in-memory in
+            // allow_in_memory_custody builds) from the signing identity.
+            // Externally-loaded identities retain no custody and fail closed with
+            // SCP-IDENT-1017.
             let custody =
-                identity
-                    .in_memory_custody
-                    .as_ref()
-                    .ok_or_else(|| ScpError::Identity {
-                        msg: "event log checkpoint requires retained signing custody — this \
-                              identity has no retained custody (it was externally loaded)"
-                            .to_owned(),
-                        code: codes::IDENT_1017.to_owned(),
-                    })?;
+                resolve_identity_custody(&identity).ok_or_else(|| ScpError::Identity {
+                    msg: "event log checkpoint requires retained signing custody — this \
+                          identity has no retained custody (it was externally loaded)"
+                        .to_owned(),
+                    code: codes::IDENT_1017.to_owned(),
+                })?;
             let core_id = identity
                 .core_id
                 .as_ref()
@@ -5028,7 +5001,7 @@ async fn event_log_checkpoint_by_did_impl(
             let checkpoint = bi
                 .with_ucan_state(&context_id, |ucan_state| {
                     let signer = scp_core::event_log::KeyCustodySigner {
-                        custody: &custody.0,
+                        custody: &*custody,
                         key: &core_id.active_signing_key,
                     };
                     // generate_checkpoint is async — use block_in_place to allow
@@ -5071,25 +5044,6 @@ async fn event_log_checkpoint_by_did_impl(
             msg: format!("tokio task join error during event log checkpoint: {e}"),
             code: codes::CTX_2028.to_owned(),
         })?
-}
-
-#[cfg(not(feature = "allow_in_memory_custody"))]
-#[allow(clippy::unused_async)]
-async fn event_log_checkpoint_by_did_impl(
-    _bi: Arc<crate::runtime::UniffiBridgeInstance>,
-    _handle: Arc<ContextHandle>,
-    _identity: Arc<Identity>,
-    _did: String,
-    _epoch: u64,
-) -> Result<Checkpoint, ScpError> {
-    Err(ScpError::Identity {
-        msg: "event log checkpoint requires retained signing custody — the in_memory custody \
-                  path is not available in this build. Enable the \
-                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
-                  a KeyCustodyProvider for production."
-            .to_owned(),
-        code: codes::IDENT_1017.to_owned(),
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -18950,6 +18904,222 @@ mod tests {
         assert!(
             err_str.contains(codes::IDENT_1008),
             "expected SCP-IDENT-1008, got: {err_str}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Context-level custody ops over CALLBACK custody (production path)
+    //
+    // `ucan_mint`, `ucan_delegate`, and `event_log_checkpoint` previously read
+    // the `allow_in_memory_custody`-only custody and fail-closed
+    // (SCP-IDENT-1017) in a bare production build — even when the context
+    // creator used platform/callback (OS-keychain / HSM) custody. These tests
+    // pin the production path: in a BARE build (no `allow_in_memory_custody`),
+    // a callback-custody context handle / identity must sign UCANs and event-log
+    // checkpoints, and the produced UCAN signature must verify against the
+    // custody's `#active` public key. They are NOT cfg-gated, so they run on the
+    // release canary.
+    // -----------------------------------------------------------------------
+
+    /// Builds a `ContextHandle` carrying a real-Ed25519 [`ProdLikeCustody`]
+    /// (modelling Secure Enclave / Android Keystore) and a freshly generated
+    /// `#active` signing-key handle that lives in that custody's store — exactly
+    /// the shape `context_create` produces for a platform-custody identity. The
+    /// returned tuple yields the verifying key so signatures can be checked.
+    async fn callback_context_handle(
+        scp: &Arc<crate::scp::Scp>,
+    ) -> (Arc<ContextHandle>, ed25519_dalek::VerifyingKey) {
+        let callback_custody = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        // Generate the `#active` key inside the callback store and capture its
+        // public key for signature verification.
+        let signing_key = callback_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("callback custody generates an Ed25519 #active key");
+        let public_key = callback_custody
+            .public_key(&signing_key)
+            .await
+            .expect("callback custody exposes the #active public key");
+        let pk_bytes: [u8; 32] = public_key
+            .into_bytes()
+            .try_into()
+            .expect("Ed25519 public key is 32 bytes");
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
+            .expect("custody public key is a valid Ed25519 verifying key");
+
+        let handle = Arc::new(ContextHandle {
+            context_id: "ctx-callback".to_owned(),
+            state: tokio::sync::Mutex::new(ContextState::Active),
+            creator_did: "did:dht:z6MkCallbackCreator".to_owned(),
+            #[cfg(feature = "allow_in_memory_custody")]
+            in_memory_custody: None,
+            callback_custody: Some(callback_custody),
+            signing_key: Some(signing_key),
+            ceiling_strings: Vec::new(),
+            tool_registry: tokio::sync::Mutex::new(scp_core::context::tools::ToolRegistry::new()),
+            tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
+            economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
+            instance_id: scp.instance_id(),
+        });
+        (handle, verifying_key)
+    }
+
+    /// `ucan_mint` must work over callback custody (production path): the minted
+    /// token's detached Ed25519 signature verifies against the custody's
+    /// `#active` public key. Pins that `ucan_mint_impl` is un-gated and resolves
+    /// custody via `resolve_context_custody` → `UniffiKeyCustody::Callback`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_works_over_callback_custody() {
+        let scp = scp_test();
+        let (handle, verifying_key) = callback_context_handle(&scp).await;
+
+        let token = ucan_mint_impl(
+            handle,
+            "did:dht:z6MkCallbackMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("ucan_mint over callback custody must succeed");
+
+        // The encoded token's signature must verify against the callback
+        // custody's #active public key — proving a real signature was produced
+        // on the production path (not a fail-closed stub).
+        assert_encoded_ucan_signature_verifies(&token.encoded, &verifying_key);
+    }
+
+    /// Verifies that a JWT-encoded UCAN's detached Ed25519 signature (the final
+    /// base64url segment) verifies against `verifying_key` over the signing
+    /// input (everything before the last `.`) — mirroring the verification step
+    /// of the scp-core validation pipeline.
+    fn assert_encoded_ucan_signature_verifies(
+        encoded: &str,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) {
+        use base64::Engine;
+        use ed25519_dalek::Verifier;
+
+        assert!(!encoded.is_empty(), "token must be encoded");
+        let (signing_input, sig_b64) = encoded
+            .rsplit_once('.')
+            .expect("encoded UCAN has a signature segment");
+        let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(sig_b64)
+            .expect("signature segment is base64url");
+        let sig =
+            ed25519_dalek::Signature::from_slice(&sig_bytes).expect("token signature is 64 bytes");
+        verifying_key
+            .verify(signing_input.as_bytes(), &sig)
+            .expect("UCAN signature must verify against the callback #active key");
+    }
+
+    /// `ucan_delegate` must work over callback custody (production path): a child
+    /// token delegated from a callback-minted parent verifies against the same
+    /// `#active` public key. Pins that `ucan_delegate_impl` is un-gated and
+    /// resolves custody via `resolve_context_custody`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_delegate_works_over_callback_custody() {
+        let scp = scp_test();
+        let (handle, verifying_key) = callback_context_handle(&scp).await;
+
+        // Mint a parent token first (callback custody), then delegate from it —
+        // both must route through the callback signing path.
+        let parent = ucan_mint_impl(
+            Arc::clone(&handle),
+            "did:dht:z6MkCallbackDelegator".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("parent ucan_mint over callback custody must succeed");
+
+        let child = ucan_delegate_impl(
+            handle,
+            "did:dht:z6MkCallbackDelegator".to_owned(),
+            "did:dht:z6MkCallbackDelegatee".to_owned(),
+            parent.encoded.clone(),
+            vec!["messages:write".to_owned()],
+        )
+        .await
+        .expect("ucan_delegate over callback custody must succeed");
+
+        assert_encoded_ucan_signature_verifies(&child.encoded, &verifying_key);
+    }
+
+    /// `event_log_checkpoint` must work over callback custody (production path):
+    /// a real callback-custody identity (created via `identity_create_with_custody`,
+    /// carrying `core_id.active_signing_key` in its callback store) signs a
+    /// checkpoint, producing a non-empty signature. Pins that
+    /// `event_log_checkpoint_impl` is un-gated and resolves custody via
+    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_log_checkpoint_works_over_callback_custody() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+            .await
+            .expect("identity_create_with_custody");
+
+        // A synthetic handle stamped with this instance's id; the checkpoint
+        // impl registers fresh UCAN state (event log) for the context, so no
+        // full `context_create` is required. Custody comes from `identity`, not
+        // the handle.
+        let handle = test_handle_for(&scp);
+
+        let checkpoint = event_log_checkpoint_impl(Arc::clone(&scp.inner), handle, identity, 0u64)
+            .await
+            .expect("event_log_checkpoint over callback custody must succeed");
+
+        assert!(
+            !checkpoint.signature.is_empty(),
+            "a successful callback-custody checkpoint must carry a signature"
+        );
+    }
+
+    /// `event_log_checkpoint_by_did` must work over callback custody
+    /// (production path): a real callback-custody identity (created via
+    /// `identity_create_with_custody`, carrying `core_id.active_signing_key` in
+    /// its callback store) signs a checkpoint attributed to its own DID,
+    /// producing a non-empty signature attributed to that same DID. Pins that
+    /// `event_log_checkpoint_by_did_impl` is un-gated and resolves custody via
+    /// `resolve_identity_custody` → `UniffiKeyCustody::Callback` on the bare
+    /// canary, with the `did == identity.did` `VALID_7000` binding satisfied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_log_checkpoint_by_did_works_over_callback_custody() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+            .await
+            .expect("identity_create_with_custody");
+
+        // A synthetic handle stamped with this instance's id; the checkpoint
+        // impl registers fresh UCAN state (event log) for the context, so no
+        // full `context_create` is required. Custody comes from `identity`, not
+        // the handle.
+        let handle = test_handle_for(&scp);
+
+        // Pass the identity's own DID so the `did == identity.did` binding
+        // (VALID_7000) is satisfied — the production happy path.
+        let own_did = identity.did();
+        let checkpoint = event_log_checkpoint_by_did_impl(
+            Arc::clone(&scp.inner),
+            handle,
+            identity,
+            own_did.clone(),
+            0u64,
+        )
+        .await
+        .expect("event_log_checkpoint_by_did over callback custody must succeed");
+
+        assert_eq!(
+            checkpoint.sender_did, own_did,
+            "the checkpoint must be attributed to the signing identity's DID"
+        );
+        assert!(
+            !checkpoint.signature.is_empty(),
+            "a successful callback-custody checkpoint must carry a signature"
         );
     }
 
