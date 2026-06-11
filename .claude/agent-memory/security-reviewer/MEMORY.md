@@ -197,6 +197,14 @@
 - RUSTSEC-2026-0044/0048/0049 (aws-lc-sys): suppressed as transitive, awaiting upstream. Appropriate.
 - MEDIUM REMAINING: BootstrapConfig bootstrap resolver doesn't enforce expected_creator_did -- intentional but documentation-only guarantee. If callers skip post-join verification, Sybil attack vector remains.
 
+### ADR-049 §10 Phase 2B Watchdog/Respawn/Poison R2 (2026-06-11, HEAD 2490db0c5)
+- See `adr049-phase2b-watchdog-respawn.md`. PASS w/ 1 MEDIUM residual (pre-existing) + 2 LOW.
+- Replay-floor CLOSED: respawn → restore_context → restore_crypto_state_with_floor_guard (capture-live → restore-snapshot → validate+max-merge → rollback-on-reject; fail-closed before spawn).
+- MEDIUM: persist_state_best_effort SWALLOWS persist failures; all 4 security mutations (member-remove/ceiling/access-revoke/close) return Ok() even on persist fail → crash can roll back membership/cap. Floor guard armors ONLY per-sender epoch floors, NOT membership. Pre-existing; matches ADR "50ms rollback".
+- CI gate check-handler-no-panic.sh LIVE: mutation-tested (planted prod panic → exit 1); vacuity guard hub_min=100 defends scanner-wedge the prior pass found DEAD; awk strips //-tail before block-comment scan.
+- Payload-free PASS: watchdog is_panic() bool only; WASM hook dropped info.to_string(), emits only static file:line.
+- LOW: standing-poison auto-revives unconditionally (logged; deterministic id → not injection; rate-limit is documented follow-up); PrepareForReplace now Poisoned-replaceable (import re-verifies sig, safe).
+
 ### PR #1628 -- BridgeInstance Extraction (2026-04-14)
 - HIGH: context_manager() bypasses check_ready() -- 52 NAPI + 42 UniFFI operations skip shutdown/suspend guard
 - MEDIUM: known_contexts eviction TOCTOU; rate limiter ephemeral bypass at capacity; STORAGE_PROVIDER not clearable; shutdown hook panic payload leaks; hook silent drop on mutex poison

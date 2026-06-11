@@ -134,10 +134,13 @@ fn handle_prepare_for_replace(
     // `SnapshotFloorRegression` replay rejection) the helper has already rolled
     // back the crypto; surface the error and leave the actor live (NO terminal
     // claim) so a rejected/replayed import cannot terminate a live context.
+    // `PrepareForReplace` is driven by `import_context` — an UNTRUSTED peer
+    // snapshot. Use Invariant 3 (reject-on-regression): `trusted_local = false`.
     if let Err(e) = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
         deps,
         &ctx_id_bytes,
         mls_state,
+        false,
     ) {
         let _ = reply.send(Err(e));
         return Outcome::ok(());

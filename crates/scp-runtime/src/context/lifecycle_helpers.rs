@@ -1298,16 +1298,32 @@ fn generate_initial_access_key_store(
 ///
 /// # Errors
 ///
+/// `trusted_local` selects the spec §23.17.2 merge semantics:
+///
+/// - `true` — restoring the node's OWN snapshot (Invariant 2): crash recovery,
+///   actor respawn (`Supervisor::respawn_from_snapshot`), process restart
+///   (`restore_all_contexts`). A lower restored floor is the expected
+///   coalesce-lag case and is MAX-merged with the live floor; the restore
+///   PROCEEDS (never rejected for a regression). Only an overshoot beyond
+///   `MAX_EPOCH_ADVANCE` (corrupt/garbage snapshot) is rejected.
+/// - `false` — importing an UNTRUSTED peer snapshot (Invariant 3): any
+///   per-sender floor regression is rejected (snapshot-mediated replay guard).
+///
 /// Returns `ContextError::PersistenceFailed` if `restore_crypto_state` fails,
 /// or `ContextError::SnapshotFloorRegression` (the §23.17 replay-protection
 /// rejection — whatever `validate_and_merge_epoch_floors` returns) if a
-/// per-sender floor regresses; the restored crypto is rolled back first.
+/// per-sender floor regresses (import path) or overshoots (both paths); the
+/// restored crypto is rolled back first.
 pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     deps: &ActorDeps,
     ctx_id_bytes: &[u8; 32],
     mls_state: &[u8],
+    trusted_local: bool,
 ) -> Result<(), ContextError> {
-    // §23.17 Inv 3: capture floors BEFORE destroying crypto state.
+    // §23.17 Inv 2/3: capture the LIVE floors BEFORE destroying crypto state.
+    // A mailbox/handle despawn does NOT tear down the supervisor-owned crypto
+    // provider, so these live pre-crash floors are still authoritative and are
+    // the max-merge input (Class M, ADR-049 §9).
     let local_epoch_floors = deps.crypto.export_sender_key_epochs(ctx_id_bytes);
 
     let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
@@ -1321,12 +1337,15 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
             })?;
     }
 
-    // §23.17 Inv 3/4: reject any per-sender floor regression (replay guard) and
-    // max-merge local floors back. Roll back the restored crypto on failure.
+    // §23.17 Inv 2/3/4: merge the live floors back. `trusted_local=true` max-
+    // merges and proceeds (Inv 2 — respawn of own snapshot); `false` rejects
+    // any regression (Inv 3 — untrusted peer import). Either way the merged
+    // floor is never below the live floor (Inv 4). Roll back on failure.
     if let Err(e) = deps.crypto.validate_and_merge_epoch_floors(
         ctx_id_bytes,
         local_epoch_floors,
         crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
+        trusted_local,
     ) {
         let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
         let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
@@ -1471,10 +1490,13 @@ pub async fn import_context(
                 // path the actor handler uses, so the replay guard still runs.
                 // Read from the SIGNED snapshot field, never an unsigned
                 // envelope blob (ADR-050).
+                // IMPORT path: untrusted peer snapshot → Invariant 3
+                // (reject-on-regression). `trusted_local = false`.
                 restore_crypto_state_with_floor_guard(
                     deps,
                     &ctx_id_bytes,
                     &export.snapshot.mls_crypto_state,
+                    false,
                 )?;
             }
             Err(other) => return Err(other),
@@ -1482,11 +1504,13 @@ pub async fn import_context(
     } else {
         // Fresh import (no existing actor): floor-guarded crypto restore (the
         // empty-crypto-state case is a no-op restore + floor merge inside the
-        // helper). Read from the SIGNED snapshot field (ADR-050).
+        // helper). Read from the SIGNED snapshot field (ADR-050). IMPORT path:
+        // untrusted peer snapshot → Invariant 3 (reject-on-regression).
         restore_crypto_state_with_floor_guard(
             deps,
             &ctx_id_bytes,
             &export.snapshot.mls_crypto_state,
+            false,
         )?;
     }
 
@@ -1907,9 +1931,21 @@ pub async fn restore_context(
         // whose epoch advanced after the snapshot was written. The guard
         // captures the LIVE floors (still held by the crypto provider, which a
         // mailbox despawn does not tear down) before teardown, restores the
-        // snapshot crypto, then rejects any regression and max-merges the live
-        // floors back, so a stale snapshot cannot regress the floor.
-        restore_crypto_state_with_floor_guard(deps, &ctx_id_bytes, &ctx_snapshot.mls_crypto_state)?;
+        // snapshot crypto, then MAX-merges the live floors back. This is the
+        // node restoring its OWN snapshot (Invariant 2, `trusted_local = true`):
+        // a coalesce-lagged snapshot whose floor trails the live floor is the
+        // NORMAL case (an epoch advanced in the ≤50ms pre-crash window), so the
+        // restore MUST max-merge and PROCEED — rejecting it (Invariant 3, the
+        // untrusted-import policy) would fail the respawn and poison a healthy
+        // context. Only an overshoot beyond `MAX_EPOCH_ADVANCE` (corrupt
+        // snapshot) is rejected. The merged floor is never below the live
+        // floor, so a stale snapshot still cannot regress the replay floor.
+        restore_crypto_state_with_floor_guard(
+            deps,
+            &ctx_id_bytes,
+            &ctx_snapshot.mls_crypto_state,
+            true,
+        )?;
     }
 
     let last_members: HashSet<scp_identity::DID> = ctx_snapshot

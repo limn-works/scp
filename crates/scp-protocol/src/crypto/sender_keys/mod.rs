@@ -505,6 +505,76 @@ impl SenderKeyStore {
         Ok(())
     }
 
+    /// Merge an incoming per-sender epoch map into the local store on the
+    /// TRUSTED-LOCAL restore path (spec §23.17.2 **Invariant 2** — restoring
+    /// the node's OWN prior snapshot: crash recovery / actor respawn / process
+    /// restart / same-node device migration).
+    ///
+    /// Unlike [`Self::merge_incoming_epochs_with_atomic_reject`] (which enforces
+    /// Invariant 3, *reject* on any regression, for an UNTRUSTED peer import),
+    /// this method **never rejects a regression**. Restoring a node's own
+    /// coalesced snapshot whose floor lags the live floor is the normal case:
+    /// an epoch may have advanced in the ≤50ms coalesce window before a crash
+    /// (ADR-049 §9), so the persisted snapshot legitimately trails the live
+    /// in-memory floor. Invariant 2 prescribes restoring each floor to
+    /// `max(snapshot_floor, retained_floor)` and PROCEEDING — never lowering,
+    /// never failing. Rejecting here would fail a respawn and poison a healthy
+    /// context for a benign, expected lag.
+    ///
+    /// The result is `local = max(local, incoming)` per sender, with
+    /// local-only senders (absent from `incoming`) retained (Invariant 4).
+    ///
+    /// The ONLY rejection is the epoch-poisoning overshoot guard: an incoming
+    /// floor that exceeds the local floor by more than `max_advance_per_sender`
+    /// is rejected (a corrupt/garbage snapshot must not be able to set
+    /// `epoch = u64::MAX` and permanently wedge a sender's monotonicity guard).
+    /// This is the same upper bound `merge_incoming_epochs_with_atomic_reject`
+    /// applies; only the lower-bound (regression) check differs between the two
+    /// paths. Pass `max_advance_per_sender = u64::MAX` to disable the bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Vec<(sender_did, local_floor, incoming_floor)>)` for every
+    /// sender whose incoming floor OVERSHOOTS `local + max_advance_per_sender`.
+    /// On any overshoot the store is NOT mutated (atomic, like the sibling).
+    pub fn merge_incoming_epochs_trusted_local(
+        &mut self,
+        context_id: &str,
+        incoming: impl IntoIterator<Item = (String, u64)>,
+        max_advance_per_sender: u64,
+    ) -> Result<(), Vec<(String, u64, u64)>> {
+        let incoming: Vec<(String, u64)> = incoming.into_iter().collect();
+        let mut overshoots: Vec<(String, u64, u64)> = Vec::new();
+        let local_map = self.epochs.get(context_id);
+        for (did, incoming_epoch) in &incoming {
+            let local_epoch = local_map.and_then(|m| m.get(did)).copied().unwrap_or(0);
+            // Invariant 2: NO regression check — a lower snapshot floor is the
+            // expected coalesce-lag case and is silently dominated by the live
+            // floor in the max-merge below. Only the overshoot (epoch-poisoning)
+            // ceiling is enforced.
+            let max_allowed = local_epoch.saturating_add(max_advance_per_sender);
+            if *incoming_epoch > max_allowed {
+                overshoots.push((did.clone(), local_epoch, *incoming_epoch));
+            }
+        }
+        if !overshoots.is_empty() {
+            return Err(overshoots);
+        }
+
+        // Apply max-merge: local = max(local, incoming) per sender. Local-only
+        // senders are retained (Invariant 4). A lower incoming floor is a no-op
+        // (the live floor dominates) — this is exactly Invariant 2's
+        // `max(snapshot_floor, retained_floor)`.
+        let local = self.epochs.entry(context_id.to_owned()).or_default();
+        for (did, incoming_epoch) in incoming {
+            let entry = local.entry(did).or_insert(0);
+            if incoming_epoch > *entry {
+                *entry = incoming_epoch;
+            }
+        }
+        Ok(())
+    }
+
     /// Removes the sender key for a given context and sender DID.
     ///
     /// Returns the removed key if it existed, or `None` otherwise.

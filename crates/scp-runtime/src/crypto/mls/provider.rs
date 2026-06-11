@@ -2222,26 +2222,53 @@ impl MlsCryptoProvider {
             .epochs_for_context(&ctx_id_hex)
     }
 
-    /// Validates that the per-sender epoch floors in the just-restored crypto
-    /// state do not regress any entry in `local_floors`, then applies a
-    /// max-merge so `max(local, imported)` is the effective floor for every
-    /// sender (spec §23.17 Invariant 3 + Invariant 4).
+    /// Test-only: seed a per-sender epoch high-water floor directly into the
+    /// live sender-key store, simulating a floor that advanced AFTER the last
+    /// coalesced snapshot was persisted (the exact §23.17.2 Invariant 2
+    /// scenario the respawn floor-guard must tolerate). `cfg(test)`-gated so it
+    /// never compiles into any non-test build.
+    #[cfg(test)]
+    pub(crate) fn seed_sender_key_epoch_for_test(
+        &self,
+        context_id: &[u8; 32],
+        sender_did: &str,
+        epoch: u64,
+    ) {
+        let ctx_id_hex = hex::encode(context_id);
+        if let Some(mut entry) = self.contexts.get_mut(context_id) {
+            entry.value_mut().sender_key_store.restore_epoch_high_water(
+                &ctx_id_hex,
+                sender_did,
+                epoch,
+            );
+        }
+    }
+
+    /// Merges the per-sender epoch floors of the just-restored crypto state
+    /// against the captured live `local_floors`, applying a max-merge so
+    /// `max(local, restored)` is the effective floor for every sender (spec
+    /// §23.17 Invariant 4, append-only dominance).
     ///
-    /// Call this AFTER `restore_crypto_state` during `import_context`, passing
-    /// the floors captured via `export_sender_key_epochs` **before** the
-    /// destroy+restore cycle.
+    /// Call this AFTER `restore_crypto_state`, passing the floors captured via
+    /// `export_sender_key_epochs` **before** the destroy+restore cycle.
     ///
-    /// Rejects (returns `Err`) if any imported epoch is below its local floor
-    /// (regression) **or** exceeds `local_floor + max_advance_per_sender`
-    /// (epoch-poisoning guard). No state is mutated on failure.
+    /// `trusted_local` selects the spec §23.17.2 lower-bound policy:
+    /// - `true` (Invariant 2 — restoring the node's OWN snapshot: crash
+    ///   recovery / actor respawn / process restart): a restored floor BELOW
+    ///   the live floor is the expected coalesce-lag case; max-merge and
+    ///   PROCEED, never reject. Only an overshoot beyond `max_advance_per_sender`
+    ///   is rejected.
+    /// - `false` (Invariant 3 — importing an UNTRUSTED peer snapshot): reject
+    ///   the entire merge if ANY restored floor regresses below its live floor
+    ///   (snapshot-mediated replay guard), or overshoots
+    ///   `local_floor + max_advance_per_sender` (epoch-poisoning guard).
     ///
-    /// The default implementation is a no-op (`Ok`). Production providers MUST
-    /// override this.
+    /// No state is mutated on failure (atomic, both paths).
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::SnapshotFloorRegression`] on regression or
-    /// ceiling violation.
+    /// Returns [`ContextError::SnapshotFloorRegression`] on a regression
+    /// (import path only) or a ceiling overshoot (both paths).
     // Parameter type `Vec<(String, u64)>` is fixed by the `ContextCryptoProvider`
     // trait signature (the forwarder impl below passes ownership through from a
     // trait-object call). Switching to `&[(String, u64)]` is a signature change
@@ -2252,6 +2279,7 @@ impl MlsCryptoProvider {
         context_id: &[u8; 32],
         local_floors: Vec<(String, u64)>,
         max_advance_per_sender: u64,
+        trusted_local: bool,
     ) -> Result<(), ContextError> {
         if local_floors.is_empty() {
             return Ok(());
@@ -2271,24 +2299,45 @@ impl MlsCryptoProvider {
                         .epochs_for_context(&ctx_id_hex)
                 });
 
-        // Step 2: build a temporary store seeded with local floors, then
-        // validate the import floors against them via the atomic-reject helper.
-        // Rejects if any import floor regresses below a local floor, or
-        // overshoots local + max_advance (epoch-poisoning guard).
+        // Step 2: build a temporary store seeded with the captured LIVE floors,
+        // then merge the restored/imported floors against them. The merge
+        // semantics depend on the trust origin of the snapshot (spec §23.17.2):
+        //
+        // - `trusted_local = true` (Invariant 2 — restoring the node's OWN
+        //   snapshot: crash recovery / actor respawn / process restart): a
+        //   lower restored floor is the expected coalesce-lag case (an epoch
+        //   advanced in the ≤50ms window before the crash, ADR-049 §9). MAX-
+        //   merge and PROCEED — never reject a regression (rejecting would fail
+        //   the respawn and poison a healthy context). Only the overshoot
+        //   (epoch-poisoning) ceiling is enforced.
+        // - `trusted_local = false` (Invariant 3 — importing an UNTRUSTED peer
+        //   snapshot): reject the entire merge if ANY restored floor regresses
+        //   below the live floor (snapshot-mediated replay guard), or overshoots
+        //   local + max_advance.
+        //
+        // Either way the merged floor is `max(live, restored)` per sender and is
+        // NEVER below the live floor (Invariant 4 append-only dominance).
         let mut temp_store = SenderKeyStore::new();
         for (did, floor) in &local_floors {
             temp_store.restore_epoch_high_water(&ctx_id_hex, did, *floor);
         }
-        temp_store
-            .merge_incoming_epochs_with_atomic_reject(
+        let merge_result = if trusted_local {
+            temp_store.merge_incoming_epochs_trusted_local(
                 &ctx_id_hex,
                 import_floors,
                 max_advance_per_sender,
             )
-            .map_err(|per_sender_deltas| ContextError::SnapshotFloorRegression {
-                resource: "sender_key_epoch".to_owned(),
-                per_sender_deltas,
-            })?;
+        } else {
+            temp_store.merge_incoming_epochs_with_atomic_reject(
+                &ctx_id_hex,
+                import_floors,
+                max_advance_per_sender,
+            )
+        };
+        merge_result.map_err(|per_sender_deltas| ContextError::SnapshotFloorRegression {
+            resource: "sender_key_epoch".to_owned(),
+            per_sender_deltas,
+        })?;
 
         // Step 3: apply the merged floors (max of local and import) back into
         // the real store. Ensures local-only senders (absent from the import
@@ -3542,14 +3591,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_and_merge_epoch_floors_rejects_regression() {
-        // §23.17 Invariant 3 (replay guard): a restore whose per-sender epoch
-        // floor is BELOW the live floor must be rejected. This is the guard
-        // `restore_crypto_state_with_floor_guard` applies — and which
-        // `lifecycle_helpers::restore_context` now routes through on the
-        // watchdog respawn / process-restart path (ADR-049 §10 + §9): a
-        // coalesced snapshot that lags the live floor must not silently lower
-        // it (re-opening a replay window).
+    fn validate_and_merge_epoch_floors_rejects_regression_on_import() {
+        // §23.17 Invariant 3 (replay guard) — the UNTRUSTED IMPORT path
+        // (`trusted_local = false`): an imported peer snapshot whose per-sender
+        // epoch floor is BELOW the live floor must be rejected entirely, because
+        // a peer-supplied stale floor is a snapshot-mediated replay vector. This
+        // is the policy `import_context` / `PrepareForReplace` apply. NOTE: the
+        // RESPAWN/restore path (`trusted_local = true`, Invariant 2) does NOT
+        // reject here — see `validate_and_merge_epoch_floors_max_merges_on_restore`.
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
@@ -3586,9 +3635,10 @@ mod tests {
                 .restore_epoch_high_water(&ctx_id_hex, dave_did, 5);
         }
 
+        // IMPORT path (`trusted_local = false`): a regression is rejected.
         let err = provider
-            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE)
-            .expect_err("a floor regression (5 < live 12) must be rejected");
+            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE, false)
+            .expect_err("an import floor regression (5 < live 12) must be rejected");
         assert!(
             matches!(err, ContextError::SnapshotFloorRegression { .. }),
             "expected SnapshotFloorRegression, got {err:?}"
@@ -3596,10 +3646,134 @@ mod tests {
     }
 
     #[test]
+    fn validate_and_merge_epoch_floors_max_merges_on_restore() {
+        // §23.17 Invariant 2 (own-snapshot restore) — the TRUSTED-LOCAL RESPAWN
+        // path (`trusted_local = true`): a restored floor BELOW the live floor
+        // is the EXPECTED coalesce-lag case (an epoch advanced in the ≤50ms
+        // window before the crash, ADR-049 §9). It MUST max-merge and PROCEED —
+        // NOT reject (rejecting would fail the respawn and poison a healthy
+        // context: the round-2 HIGH bug this corrects). The merged floor is the
+        // higher LIVE value (12), and no error is returned.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Live floor for Dave is epoch 12 (advanced just before the crash).
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .sender_key_store
+                .restore_epoch_high_water(&ctx_id_hex, dave_did, 12);
+        }
+        let live_floors = provider.export_sender_key_epochs(&ctx_id);
+
+        // The restored (coalesced) snapshot carries a LOWER floor (epoch 5) for
+        // Dave — it predates the live epoch-12 advance.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .sender_key_store
+                .restore_epoch_high_water(&ctx_id_hex, dave_did, 5);
+        }
+
+        // RESPAWN path (`trusted_local = true`): max-merge and proceed.
+        provider
+            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE, true)
+            .expect(
+                "a respawn from a coalesce-lagged snapshot must max-merge and proceed, not fail",
+            );
+
+        let merged = provider.export_sender_key_epochs(&ctx_id);
+        assert!(
+            merged.iter().any(|(d, e)| d == dave_did && *e == 12),
+            "Dave's floor must be the higher LIVE value (12), never lowered to the stale snapshot's 5"
+        );
+    }
+
+    #[test]
+    fn validate_and_merge_epoch_floors_restore_rejects_overshoot() {
+        // §23.17 Invariant 2 still enforces the epoch-poisoning overshoot
+        // ceiling on the trusted-local path: a corrupt snapshot floor that
+        // exceeds the live floor by more than `MAX_EPOCH_ADVANCE` is rejected
+        // even on respawn, so a garbage snapshot cannot wedge a sender's
+        // monotonicity guard at `epoch = u64::MAX`.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let gina_did = "did:dht:z6MkGinaGinaGinaGinaGinaGinaGinaGinaGinaGi";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Live floor for Gina is epoch 1.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .sender_key_store
+                .restore_epoch_high_water(&ctx_id_hex, gina_did, 1);
+        }
+        let live_floors = provider.export_sender_key_epochs(&ctx_id);
+
+        // Corrupt snapshot floor overshoots live (1) + MAX_EPOCH_ADVANCE.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry.value_mut().sender_key_store.restore_epoch_high_water(
+                &ctx_id_hex,
+                gina_did,
+                1 + MAX_EPOCH_ADVANCE + 1,
+            );
+        }
+
+        let err = provider
+            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE, true)
+            .expect_err("an overshoot beyond MAX_EPOCH_ADVANCE must be rejected even on restore");
+        assert!(
+            matches!(err, ContextError::SnapshotFloorRegression { .. }),
+            "expected SnapshotFloorRegression on overshoot, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_and_merge_epoch_floors_empty_live_floors_is_noop_both_paths() {
+        // Cryptographer Residual 1 (empty-floors bypass): when the captured
+        // LIVE floors are empty — e.g. the crypto was destroyed on close /
+        // migrate before the snapshot loaded — there is nothing to regress
+        // against, so the guard is a no-op `Ok(())` on BOTH paths. This is NOT
+        // a resurrection hazard: a closed/migrated context's snapshot.state is
+        // terminal (close sync-persists the transition, ADR-049 §9), so the
+        // respawn Active-only gate rejects it BEFORE the crypto restore runs
+        // (`respawn_skips_terminal_snapshot`). The floor guard never has to be
+        // the thing that stops a stale-Active resurrection; the lifecycle gate
+        // does. This test pins the benign no-op so a future change that makes
+        // empty-live-floors reject (and thus break legitimate first-restore of
+        // a context with no prior live state) is caught.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        // Empty captured live floors → early Ok, regardless of trust origin.
+        provider
+            .validate_and_merge_epoch_floors(&ctx_id, Vec::new(), MAX_EPOCH_ADVANCE, true)
+            .expect("empty live floors must be a no-op on the trusted-local restore path");
+        provider
+            .validate_and_merge_epoch_floors(&ctx_id, Vec::new(), MAX_EPOCH_ADVANCE, false)
+            .expect("empty live floors must be a no-op on the untrusted import path");
+    }
+
+    #[test]
     fn validate_and_merge_epoch_floors_max_merges_non_regressing() {
         // The guard is not over-eager: when the restored floor is at or above
         // the live floor, it accepts and max-merges. A local-only sender
         // (absent from the restored set) retains its floor (Invariant 4).
+        // Holds on BOTH paths; exercised here on the import path.
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
@@ -3627,7 +3801,7 @@ mod tests {
         }
 
         provider
-            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE)
+            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE, false)
             .expect("a non-regressing restore must be accepted and max-merged");
 
         let merged = provider.export_sender_key_epochs(&ctx_id);

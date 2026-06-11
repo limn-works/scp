@@ -8766,6 +8766,97 @@ mod tests {
         );
     }
 
+    /// §23.17.2 Invariant 2 (the round-2 HIGH-bug regression test): a respawn
+    /// from a COALESCE-LAGGED snapshot — one whose per-sender epoch floor is
+    /// BELOW the live floor because the epoch advanced in the ≤50ms window
+    /// before the crash — must SUCCEED, max-merging the live floor, NOT fail
+    /// (which would poison a healthy context). The crash-surviving live floor
+    /// (Class M, supervisor-owned crypto provider) is authoritative.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn respawn_from_coalesce_lagged_snapshot_max_merges_floor() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xC7u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let sender_did = "did:dht:z6MkLaggedSenderLaggedSenderLaggedSenderXX";
+
+        // Stand up live MLS + sender-key crypto so the snapshot carries a
+        // non-empty `mls_crypto_state` (otherwise the floor guard is skipped).
+        let crypto = sup
+            .crypto_ref()
+            .expect("test supervisor has crypto")
+            .clone();
+        crypto.create_mls_group(&ctx_id_bytes).unwrap();
+        crypto.generate_sender_key(&ctx_id_bytes).unwrap();
+
+        // The PERSISTED snapshot captures the floor at epoch 5 (the coalesced
+        // state at snapshot time).
+        crypto.seed_sender_key_epoch_for_test(&ctx_id_bytes, sender_did, 5);
+
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+        let mut snap = crate::context::manager_methods::snapshot_context(&state);
+        // Capture the live crypto state (floor=5) into the persisted snapshot,
+        // exactly as `persist_state_best_effort` does.
+        snap.mls_crypto_state = crypto.export_crypto_state(&ctx_id_bytes).unwrap();
+        assert!(
+            !snap.mls_crypto_state.is_empty(),
+            "snapshot must carry crypto state so the floor guard runs on respawn"
+        );
+        persistence.persist_context(&ctx_key, &snap).unwrap();
+
+        let deps = test_actor_deps(&sup).await;
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+
+        // The LIVE floor advances to epoch 12 AFTER the snapshot was persisted
+        // — the snapshot now lags the live floor by 7 epochs. This live floor
+        // survives the crash (it lives in the supervisor-owned crypto provider,
+        // which a mailbox/handle despawn does not tear down).
+        crypto.seed_sender_key_epoch_for_test(&ctx_id_bytes, sender_did, 12);
+
+        // Crash before any re-persist of the advanced floor.
+        induce_panic(&handle, "SECRET_SENTINEL_lagged").await;
+
+        // The respawn MUST succeed (round-2 bug: it failed with
+        // SnapshotFloorRegression and poisoned the context).
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "a respawn from a coalesce-lagged snapshot (floor 5 < live 12) must SUCCEED \
+             and max-merge — not reject and poison the context"
+        );
+        assert!(
+            !sup.is_context_poisoned(&ctx_key),
+            "a healthy context must not be poisoned by a benign coalesce-lag floor regression"
+        );
+
+        // The merged floor is the higher LIVE value (12), never lowered to the
+        // stale snapshot's 5.
+        let merged = crypto.export_sender_key_epochs(&ctx_id_bytes);
+        assert!(
+            merged.iter().any(|(d, e)| d == sender_did && *e == 12),
+            "merged floor must be the higher live value (12), got {merged:?}"
+        );
+    }
+
     /// The watchdog logs the crash WITHOUT the panic payload: the captured
     /// tracing output contains the diagnostic message and `crash_count` but
     /// NEVER the panic sentinel (which could be plaintext or key material).
