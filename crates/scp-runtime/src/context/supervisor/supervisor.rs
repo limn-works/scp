@@ -31,7 +31,7 @@
 //! stub — saga orchestration migrates with `handlers/standing.rs` and
 //! the related cross-context paths in commit 11.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
@@ -140,15 +140,131 @@ pub struct SupervisorConfig {
     reserved: (),
 }
 
-/// Per-context crash-count window. Plan §"Actor panic recovery" defines
-/// a 60-second sliding window with a 3-crash respawn budget; commit 6
-/// lands the struct layout, the watchdog that feeds it arrives with the
-/// handler migrations.
+/// Sliding-window length for the actor respawn budget (ADR-049 §10).
+/// Crashes older than this (relative to the newest crash) are evicted
+/// before the budget is evaluated.
+const CRASH_WINDOW_MS: u64 = 60_000;
+
+/// Number of crashes within [`CRASH_WINDOW_MS`] that poisons a context
+/// (ADR-049 §10): "3 crashes in 60s poisons the context."
+const CRASH_POISON_THRESHOLD: usize = 3;
+
+/// Defensive upper bound on the retained crash-timestamp deque. The
+/// sliding-window eviction already bounds the deque to crashes within
+/// [`CRASH_WINDOW_MS`], but a pathological clock (non-monotonic, or stuck)
+/// could otherwise let it grow without bound. Capping at the poison
+/// threshold is sufficient: once the threshold is reached the context is
+/// poisoned and never respawned, so no further timestamps accrue. The cap
+/// keeps the structure O(1) in space regardless of clock behaviour.
+const CRASH_DEQUE_CAP: usize = CRASH_POISON_THRESHOLD;
+
+/// Per-context crash-count window (ADR-049 §10 — actor respawn budget).
+///
+/// Tracks the wall-clock-millisecond timestamps of recent actor crashes
+/// in a sliding [`CRASH_WINDOW_MS`] window. When [`CRASH_POISON_THRESHOLD`]
+/// crashes land inside the window the context is *poisoned*: the
+/// supervisor stops respawning its actor (no infinite crash-respawn loop)
+/// until an operator clears the poison.
+///
+/// # Purity
+///
+/// Every method that observes time takes the current time as an explicit
+/// `now_ms` parameter — the struct never reads a clock itself. This keeps
+/// the budget logic deterministic and unit-testable without a clock, and
+/// confines the (only) clock read to the supervisor watchdog.
 #[derive(Debug, Default)]
 pub struct CrashWindow {
-    /// Reserved; real fields land with the watchdog in commit 11.
-    #[allow(dead_code)]
-    reserved: (),
+    /// Crash timestamps in `now_millis()` units, ordered oldest → newest.
+    /// Front-evicted as the window slides; capped at [`CRASH_DEQUE_CAP`].
+    crashes: VecDeque<u64>,
+    /// Sticky poison flag. Once set (the budget was exceeded) it stays set
+    /// until [`Self::clear`] is called by an explicit operator action — a
+    /// later in-window eviction must NOT silently un-poison the context.
+    poisoned: bool,
+}
+
+impl CrashWindow {
+    /// Record a crash at `now_ms` and return whether the context is now
+    /// poisoned.
+    ///
+    /// Steps, in order:
+    /// 1. Push `now_ms` as the newest crash.
+    /// 2. Front-evict every crash strictly older than `CRASH_WINDOW_MS`
+    ///    relative to `now_ms` (`now_ms - front > CRASH_WINDOW_MS`).
+    ///    `saturating_sub` keeps a non-monotonic clock (an earlier reading
+    ///    than the stored front) from underflowing — such a reading simply
+    ///    evicts nothing.
+    /// 3. Defensively cap the deque length (see [`CRASH_DEQUE_CAP`]).
+    /// 4. Set `poisoned` if the in-window crash count reached the
+    ///    threshold. The flag is sticky (never cleared here).
+    ///
+    /// Returns the (post-update) value of [`Self::is_poisoned`].
+    fn record(&mut self, now_ms: u64) -> bool {
+        self.crashes.push_back(now_ms);
+        while let Some(&front) = self.crashes.front() {
+            if now_ms.saturating_sub(front) > CRASH_WINDOW_MS {
+                self.crashes.pop_front();
+            } else {
+                break;
+            }
+        }
+        // Defensive cap: drop the oldest entries if the deque somehow
+        // exceeded the bound (only reachable under a misbehaving clock).
+        while self.crashes.len() > CRASH_DEQUE_CAP {
+            self.crashes.pop_front();
+        }
+        if self.crashes.len() >= CRASH_POISON_THRESHOLD {
+            self.poisoned = true;
+        }
+        self.poisoned
+    }
+
+    /// Whether the context is poisoned (the respawn budget was exceeded).
+    const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Current number of crashes retained in the window. Used by the
+    /// watchdog log line so operators can see how close a context is to
+    /// the poison threshold.
+    fn crash_count(&self) -> usize {
+        self.crashes.len()
+    }
+
+    /// Operator un-poison: clear the recorded crashes and the sticky
+    /// poison flag so the context can be respawned again. Distinct from
+    /// the automatic window eviction in [`Self::record`], which never
+    /// touches `poisoned`.
+    fn clear(&mut self) {
+        self.crashes.clear();
+        self.poisoned = false;
+    }
+}
+
+/// Spawn a context actor's watchdog task (ADR-049 §10).
+///
+/// This is a free function — deliberately NOT an inline `tokio::spawn`
+/// inside [`Supervisor::spawn_actor_with_watchdog`] — so the watchdog
+/// future's `Send` proof is resolved here, OUTSIDE the opaque `impl
+/// Future` scope of the spawn method. The watchdog reaches
+/// `Supervisor::respawn_from_snapshot` → `restore_context` →
+/// `Supervisor::spawn_actor_with_state` → `spawn_actor_with_watchdog`,
+/// forming a self-referential async cycle. Spawning inline makes the
+/// compiler try to fetch an opaque type's hidden type within its own
+/// defining scope (unsupported); moving the spawn into this free fn —
+/// whose only relationship to the cycle is a plain `tokio::spawn` call —
+/// breaks that self-reference. The actor task is NOT placed on the
+/// supervisor's timer `task_set`; the watchdog owns its `JoinHandle`
+/// directly.
+fn spawn_actor_watchdog_task(
+    supervisor: Arc<Supervisor>,
+    ctx_id: String,
+    owning_did: DID,
+    join: tokio::task::JoinHandle<()>,
+) {
+    tokio::spawn(async move {
+        supervisor.actor_watchdog(ctx_id, owning_did, join).await;
+    });
 }
 
 /// Placeholder saga state stored in `pending_sagas` between Prepare and
@@ -236,10 +352,10 @@ pub struct Supervisor {
     // configuration plumbed through ActorDeps).
     #[allow(dead_code)]
     pub(in crate::context::supervisor) health_config: SupervisorConfig,
-    /// Per-context crash-count windows (respawn budget state).
-    // Operational in Phase 2 of post-review-round-1 plan (watchdog respawn
-    // budget per ADR-049 §10).
-    #[allow(dead_code)]
+    /// Per-context crash-count windows (respawn budget state, ADR-049 §10).
+    /// Keyed by context id; populated lazily by [`Self::actor_watchdog`] the
+    /// first time an actor for that context crashes. Lock-free reads via
+    /// `DashMap` per ADR-049 §Decision 12.
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
 
     // -----------------------------------------------------------------
@@ -1088,9 +1204,10 @@ impl Supervisor {
         // tracker dance have been deleted; the actor owns
         // `state.send_tracker` and serializes by construction.
         let actor = self.lookup(ctx_id).ok_or_else(|| {
-            ContextError::ContextNotRegistered(format!(
-                "dispatch_command — no actor registered for context_id `{ctx_id}`"
-            ))
+            self.lookup_miss_error(
+                ctx_id,
+                format!("dispatch_command — no actor registered for context_id `{ctx_id}`"),
+            )
         })?;
         Self::dispatch_via_mailbox(&actor, ContextCommand::Messaging(cmd)).await
     }
@@ -1478,19 +1595,19 @@ impl Supervisor {
             // and return a matching error `Outcome` (mirrors the
             // `FlushSnapshot`/`ShutdownSelf` never-should-reach arms).
             LifecycleCommand::JoinContext { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let err = self.lookup_miss_error(&payload.context_id, payload.context_id.clone());
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
             LifecycleCommand::LeaveContext { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let err = self.lookup_miss_error(&payload.context_id, payload.context_id.clone());
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
             LifecycleCommand::CloseContext { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
+                let err = self.lookup_miss_error(&payload.context_id, payload.context_id.clone());
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
@@ -1498,7 +1615,7 @@ impl Supervisor {
             LifecycleCommand::ExportContext {
                 context_id, reply, ..
             } => {
-                let err = ContextError::ContextNotRegistered(context_id);
+                let err = self.lookup_miss_error(&context_id, context_id.clone());
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
@@ -1515,7 +1632,7 @@ impl Supervisor {
             | LifecycleCommand::RestoreContextAccessKey {
                 context_id, reply, ..
             } => {
-                let err = ContextError::ContextNotRegistered(context_id);
+                let err = self.lookup_miss_error(&context_id, context_id.clone());
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
@@ -1605,9 +1722,12 @@ impl Supervisor {
             ));
         };
         let actor = self.lookup(ctx_id).ok_or_else(|| {
-            ContextError::ContextNotRegistered(format!(
-                "dispatch_ttl_close_command — no actor registered for context_id `{ctx_id}`"
-            ))
+            self.lookup_miss_error(
+                ctx_id,
+                format!(
+                    "dispatch_ttl_close_command — no actor registered for context_id `{ctx_id}`"
+                ),
+            )
         })?;
         Self::dispatch_via_mailbox(&actor, ContextCommand::TtlClose(cmd)).await
     }
@@ -1660,9 +1780,12 @@ impl Supervisor {
             ));
         };
         let actor = self.lookup(ctx_id).ok_or_else(|| {
-            ContextError::ContextNotRegistered(format!(
-                "dispatch_governance_command — no actor registered for context_id `{ctx_id}`"
-            ))
+            self.lookup_miss_error(
+                ctx_id,
+                format!(
+                    "dispatch_governance_command — no actor registered for context_id `{ctx_id}`"
+                ),
+            )
         })?;
         Self::dispatch_via_mailbox(&actor, ContextCommand::Governance(cmd)).await
     }
@@ -2433,9 +2556,56 @@ impl Supervisor {
     /// import replace path despawns the prior actor before respawning,
     /// so the slot is vacant by the time it reaches here.
     pub(in crate::context) async fn spawn_actor_with_state(
-        &self,
+        self: &Arc<Self>,
+        state: crate::context::actor::state::PerContextState,
+        deps: crate::context::actor::deps::ActorDeps,
+        mailbox_capacity: Option<usize>,
+    ) -> Result<ContextActorHandle, ContextError> {
+        // Derive the DID this context's deps were scoped to so the watchdog
+        // can rebuild deps if the actor crashes and must be respawned. This
+        // mirrors the `RestoreContext` direct arm: prefer a registered local
+        // DID (the node performing the work), falling back to a context-id-
+        // derived seed so respawn-deps construction stays deterministic and
+        // never fabricates a foreign participant. Restore/respawn do not key
+        // crypto on this DID (they rehydrate the persisted snapshot's MLS
+        // state), so the seed fallback is sound.
+        let owning_did = self
+            .local_dids_ref()
+            .load()
+            .iter()
+            .min()
+            .cloned()
+            .unwrap_or_else(|| DID(state.handle.context_id().to_owned()));
+        // `Box::pin` keeps the (large, state-carrying) spawn future off the
+        // caller's stack frame — `PerContextState` + `ActorDeps` are ~20KB.
+        Box::pin(self.spawn_actor_with_watchdog(state, deps, owning_did, mailbox_capacity)).await
+    }
+
+    /// Spawn a state-owning [`ContextActor`], register its handle, and
+    /// attach a per-actor *watchdog* task that observes the actor's
+    /// `JoinHandle` (ADR-049 §10).
+    ///
+    /// Unlike the pre-watchdog spawn, this KEEPS the actor's `JoinHandle`
+    /// (rather than dropping it) and hands it to [`Self::actor_watchdog`],
+    /// which: detects panics, logs them **without the panic payload**
+    /// (security-critical — the payload may carry plaintext or key
+    /// material), enforces the respawn budget ([`CrashWindow`]), and
+    /// respawns from the persisted snapshot when the budget is not yet
+    /// exhausted.
+    ///
+    /// `owning_did` is the DID the actor's [`ActorDeps`] were scoped to;
+    /// the watchdog reuses it to rebuild deps on respawn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CreationFailed`] if an actor is already
+    /// registered for this context id (first-writer-wins — same contract
+    /// the pre-watchdog spawn enforced).
+    pub(in crate::context) async fn spawn_actor_with_watchdog(
+        self: &Arc<Self>,
         mut state: crate::context::actor::state::PerContextState,
         deps: crate::context::actor::deps::ActorDeps,
+        owning_did: DID,
         mailbox_capacity: Option<usize>,
     ) -> Result<ContextActorHandle, ContextError> {
         // Stamp a fresh monotonic spawn-generation onto the owned state
@@ -2483,15 +2653,303 @@ impl Supervisor {
             self.actors.insert(ctx_id_str.clone(), handle.clone());
         }
 
-        // Hand the owned state + deps into the actor task. The
-        // spawned future captures both by move; neither escapes the
-        // actor's scope.
+        // Hand the owned state + deps into the actor task. The spawned
+        // future captures both by move; neither escapes the actor's scope.
+        // KEEP the JoinHandle (the pre-watchdog spawn dropped it, silently
+        // swallowing panics and wedging the context). Actor tasks are NOT
+        // added to `task_set` — that JoinSet drives TTL / governance
+        // timers; the watchdog owns this handle directly.
         let inbox = rx;
-        tokio::spawn(async move {
+        let join = tokio::spawn(async move {
             Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox).run()).await;
         });
 
+        // Spawn the watchdog: it awaits the actor's completion and, on a
+        // panic, records the crash + (poison-or-respawn). A clone of the
+        // supervisor `Arc` keeps it alive for the watchdog's lifetime.
+        // Spawn the watchdog through a free helper (not inline) so its
+        // future's `Send` proof is resolved OUTSIDE this method's opaque
+        // `impl Future` scope. Spawning inline would form a self-referential
+        // opaque-type cycle (`spawn_actor_with_watchdog` ↔ `actor_watchdog`
+        // ↔ `respawn_from_snapshot` ↔ `restore_context` ↔
+        // `spawn_actor_with_state`) that the compiler refuses to resolve
+        // ("fetching the hidden types of an opaque inside of the defining
+        // scope is not supported").
+        spawn_actor_watchdog_task(Arc::clone(self), ctx_id_str, owning_did, join);
+
         Ok(handle)
+    }
+
+    /// Per-actor watchdog (ADR-049 §10).
+    ///
+    /// Awaits the actor task's [`JoinHandle`] and reacts to how it
+    /// finished:
+    ///
+    /// - **Clean exit** (`Ok(())`) — the actor's `run()` loop returned
+    ///   normally (shutdown ack, inbox closed). No crash is recorded and no
+    ///   respawn happens; any pre-existing poison record is left intact.
+    /// - **Panic** (`Err(e)` with `e.is_panic()`) — record the crash in the
+    ///   context's [`CrashWindow`], log a payload-free diagnostic, then
+    ///   either poison-and-despawn (budget exhausted) or respawn from the
+    ///   persisted snapshot.
+    /// - **Cancellation / abort** (`Err(e)` with `!e.is_panic()`) — treated
+    ///   as a clean exit: the task was deliberately stopped, not a fault.
+    ///
+    /// # Security invariant
+    ///
+    /// The [`tokio::task::JoinError`] is inspected ONLY via
+    /// [`JoinError::is_panic`](tokio::task::JoinError::is_panic) (a bool).
+    /// Its panic payload is NEVER read or formatted — a panic inside an
+    /// MLS-encrypt or key-derivation path could otherwise interpolate
+    /// plaintext or secret-key bytes into the log.
+    ///
+    /// # Panic location
+    ///
+    /// The diagnostic logs `panic_location = "unknown"`. ADR-049 §10
+    /// permits capturing the file:line location via a `std::panic::Location`
+    /// hook, but a *process-global* "last panic location" store is
+    /// inherently racy: with multiple `Supervisor`s and concurrent actor
+    /// panics across threads, the stored location cannot be reliably
+    /// correlated to the specific [`JoinError`] observed here, and would
+    /// also be a mutable global (forbidden by the workspace
+    /// `check-no-mutable-globals` gate). The plan's stated floor —
+    /// "payload-free logging with `panic_location=\"unknown\"`" — is chosen
+    /// deliberately over a racy, possibly-wrong location.
+    async fn actor_watchdog(
+        self: Arc<Self>,
+        ctx_id: String,
+        owning_did: DID,
+        join: tokio::task::JoinHandle<()>,
+    ) {
+        let outcome = join.await;
+        let join_err = match outcome {
+            // Clean return: the run loop exited normally. No crash, no
+            // respawn. Leave any existing poison record untouched.
+            Ok(()) => return,
+            Err(e) => e,
+        };
+
+        // A cancellation / shutdown-abort is not a fault. Only a genuine
+        // panic counts against the respawn budget.
+        if !join_err.is_panic() {
+            return;
+        }
+
+        // Record the crash and copy the budget state OUT of the DashMap
+        // entry, then DROP the guard before any `.await` (the workspace
+        // denies `await_holding_lock`).
+        let now_ms = self
+            .clock_ref()
+            .map_or(0, |c| scp_primitives::Clock::now_millis(c.as_ref()));
+        let (poisoned, count) = {
+            let mut entry = self.crash_windows.entry(ctx_id.clone()).or_default();
+            let poisoned = entry.record(now_ms);
+            (poisoned, entry.crash_count())
+        };
+
+        // Payload-free diagnostic (ADR-049 §10). The panic payload is
+        // intentionally absent — see the security invariant above.
+        tracing::error!(
+            actor_kind = "context_actor",
+            context_id = %ctx_id,
+            crash_count = count,
+            poisoned = poisoned,
+            panic_location = "unknown",
+            "context actor panicked; payload intentionally not logged (may contain key material)"
+        );
+
+        if poisoned {
+            // Budget exhausted: stop the crash-respawn loop. Despawn the
+            // (already-dead) handle so per-context dispatch resolves the
+            // poison instead of mailboxing a closed channel. No respawn.
+            self.despawn_actor(&ctx_id).await;
+            return;
+        }
+
+        // Budget intact: respawn from the persisted snapshot. A failed
+        // respawn is itself counted as a crash (inside `respawn_from_snapshot`)
+        // so a snapshot that reliably panics the loader poisons after the
+        // budget rather than looping forever.
+        if let Err(e) = self.respawn_from_snapshot(&ctx_id, &owning_did).await {
+            tracing::error!(
+                actor_kind = "context_actor",
+                context_id = %ctx_id,
+                error = %e,
+                "context actor respawn failed"
+            );
+        }
+    }
+
+    /// Respawn a context's actor from its persisted snapshot (ADR-049 §10).
+    ///
+    /// Order matters:
+    /// 1. **Despawn first** — remove the stale (dead) handle under the
+    ///    write lock. Otherwise the first-writer-wins duplicate-key check in
+    ///    [`Self::spawn_actor_with_watchdog`] would reject the re-insert.
+    /// 2. **Load the snapshot.** A missing snapshot is the lost-state case
+    ///    (the actor crashed before its first coalesced persist): log and
+    ///    surface [`ContextError::ActorCrashed`] — there is nothing to
+    ///    rehydrate.
+    /// 3. **Rebuild deps + `ContextHandle`** and delegate to
+    ///    [`crate::context::lifecycle_helpers::restore_context`] — the
+    ///    single respawn primitive that reconstructs the FULL
+    ///    `PerContextState` (governance, MLS crypto, §9.10.4 routing /
+    ///    pseudonym registry, rate-limit) and spawns the new watched actor.
+    ///    Reusing it keeps the §9.10.4 routing-state restore in ONE place.
+    ///
+    /// A failed respawn is recorded as a crash so repeated failures consume
+    /// the budget and eventually poison the context.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorCrashed`] when no snapshot exists.
+    /// - Any error surfaced by [`Self::persistence_ref`] /
+    ///   `restore_context` (persistence failure, validation failure, etc.).
+    async fn respawn_from_snapshot(
+        self: &Arc<Self>,
+        ctx_id: &str,
+        owning_did: &DID,
+    ) -> Result<(), ContextError> {
+        // 1. Despawn the stale handle so the re-insert is not rejected.
+        self.despawn_actor(ctx_id).await;
+
+        // Helper that records a failed respawn as a crash (budget pressure)
+        // and may poison the context. Returns the budget state so callers
+        // can despawn-on-poison. Drops the DashMap guard before returning.
+        let record_failure = |sup: &Arc<Self>| {
+            let now_ms = sup
+                .clock_ref()
+                .map_or(0, |c| scp_primitives::Clock::now_millis(c.as_ref()));
+            let mut entry = sup.crash_windows.entry(ctx_id.to_owned()).or_default();
+            entry.record(now_ms)
+        };
+
+        // 2. Load the snapshot. None ⇒ lost state (crashed pre-persist).
+        let Some(persistence) = self.persistence_ref() else {
+            // No persistence backend configured — cannot respawn. Count it
+            // as a failed respawn so the budget applies.
+            if record_failure(self) {
+                self.despawn_actor(ctx_id).await;
+            }
+            return Err(ContextError::ActorCrashed(format!(
+                "{ctx_id} (no persistence backend configured for respawn)"
+            )));
+        };
+        let snapshot = match persistence.load_context(ctx_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                if record_failure(self) {
+                    self.despawn_actor(ctx_id).await;
+                }
+                tracing::error!(
+                    actor_kind = "context_actor",
+                    context_id = %ctx_id,
+                    "context actor crashed with no persisted snapshot; state is lost"
+                );
+                return Err(ContextError::ActorCrashed(format!(
+                    "{ctx_id} (no persisted snapshot — state lost)"
+                )));
+            }
+            Err(e) => {
+                if record_failure(self) {
+                    self.despawn_actor(ctx_id).await;
+                }
+                return Err(ContextError::ActorCrashed(format!(
+                    "{ctx_id} (snapshot load failed: {e})"
+                )));
+            }
+        };
+
+        // 3. Rebuild deps + handle, then delegate to the shared
+        //    `restore_context` respawn primitive.
+        let handle =
+            crate::context::ContextHandle::new(ctx_id.to_owned(), snapshot.context_params.clone());
+        let deps = match self.build_actor_deps(owning_did).await {
+            Ok(deps) => deps,
+            Err(e) => {
+                if record_failure(self) {
+                    self.despawn_actor(ctx_id).await;
+                }
+                return Err(e);
+            }
+        };
+        // The recursive async cycle through `restore_context` →
+        // `spawn_actor_with_state` is broken by `spawn_actor_watchdog_task`
+        // (a free fn that resolves the watchdog future's `Send` proof
+        // outside any opaque-type defining scope). `Box::pin` keeps this
+        // (large) restore future off the stack, mirroring the existing
+        // `restore_context` call sites in `lifecycle_helpers`.
+        match Box::pin(crate::context::lifecycle_helpers::restore_context(
+            &deps, ctx_id, &handle,
+        ))
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if record_failure(self) {
+                    self.despawn_actor(ctx_id).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether the context has been poisoned (ADR-049 §10) — its actor
+    /// exceeded the respawn budget and is no longer being respawned.
+    /// Lock-free read of the `crash_windows` `DashMap`.
+    #[must_use]
+    pub(in crate::context) fn is_context_poisoned(&self, ctx_id: &str) -> bool {
+        self.crash_windows
+            .get(ctx_id)
+            .is_some_and(|w| w.is_poisoned())
+    }
+
+    /// Map a per-context `lookup` miss to the right typed error (ADR-049
+    /// §10): if the context was poisoned (its actor exceeded the respawn
+    /// budget and is no longer being respawned), surface
+    /// [`ContextError::ContextPoisoned`] so callers can distinguish "dormant,
+    /// needs operator recovery" from a generic "never registered". Otherwise
+    /// fall back to [`ContextError::ContextNotRegistered`] with the caller's
+    /// diagnostic message.
+    fn lookup_miss_error(&self, ctx_id: &str, not_registered_msg: String) -> ContextError {
+        if self.is_context_poisoned(ctx_id) {
+            ContextError::ContextPoisoned(ctx_id.to_owned())
+        } else {
+            ContextError::ContextNotRegistered(not_registered_msg)
+        }
+    }
+
+    /// Operator action (ADR-049 §10): clear a context's poison record and
+    /// attempt ONE respawn from the persisted snapshot.
+    ///
+    /// This is the explicit recovery path for a poisoned context — it is
+    /// surfaced only on [`SupervisorHandle::clear_poison`] for operator use,
+    /// NOT reachable by ordinary per-context callers. The alternative
+    /// recovery path is a process restart, which re-runs
+    /// [`crate::context::lifecycle_helpers::restore_all_contexts`] and
+    /// rebuilds every actor from persistence (the poison record lives only
+    /// in memory, so it does not survive a restart).
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any error from [`Self::respawn_from_snapshot`] (e.g.
+    /// [`ContextError::ActorCrashed`] when no snapshot exists). On a failed
+    /// respawn the freshly-cleared window records the failure as a crash —
+    /// a context that cannot be respawned does not silently re-poison from
+    /// stale history, but also does not loop.
+    pub(in crate::context) async fn clear_poison(
+        self: &Arc<Self>,
+        ctx_id: &str,
+        owning_did: &DID,
+    ) -> Result<(), ContextError> {
+        // Clear the window first so the single retry starts from a clean
+        // budget. `entry().or_default()` then `clear()` resets both the
+        // deque and the sticky flag.
+        {
+            let mut entry = self.crash_windows.entry(ctx_id.to_owned()).or_default();
+            entry.clear();
+        }
+        self.respawn_from_snapshot(ctx_id, owning_did).await
     }
 
     /// Despawn the actor registered for `context_id`, removing the
@@ -4191,8 +4649,16 @@ impl Supervisor {
                         }
                     }
                     // Standing contexts in terminal states are eviction
-                    // candidates (Phase 3) to bound the index.
-                    ContextState::Closed | ContextState::Expired | ContextState::Tombstoned => {
+                    // candidates (Phase 3) to bound the index. A `Poisoned`
+                    // standing context has no live actor and will not be
+                    // auto-respawned (ADR-049 §10), so it is likewise an
+                    // eviction candidate — leaving it in the index would
+                    // make every reconnect sweep re-probe a dormant context
+                    // that only an operator action can revive.
+                    ContextState::Closed
+                    | ContextState::Expired
+                    | ContextState::Tombstoned
+                    | ContextState::Poisoned => {
                         terminal_context_ids.push(context_id.clone());
                     }
                     // Creating / Closing / MigratingOut — transient, keep.

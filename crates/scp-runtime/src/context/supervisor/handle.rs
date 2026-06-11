@@ -503,6 +503,39 @@ impl SupervisorHandle {
         self.supervisor.despawn_actor(context_id).await
     }
 
+    /// Whether the context is poisoned (ADR-049 §10) — its actor exceeded
+    /// the respawn budget and is no longer being respawned. Lock-free read.
+    #[must_use]
+    pub fn is_context_poisoned(&self, context_id: &str) -> bool {
+        self.supervisor.is_context_poisoned(context_id)
+    }
+
+    /// Operator recovery action (ADR-049 §10): clear a poisoned context's
+    /// crash window and attempt ONE respawn from the persisted snapshot.
+    ///
+    /// This is the explicit, operator-driven recovery path for a poisoned
+    /// context. It is deliberately surfaced on the `SupervisorHandle` (the
+    /// operator-facing capability) rather than on any per-context dispatch
+    /// path, so ordinary context callers cannot un-poison a context — only
+    /// an operator action (or a process restart that re-runs
+    /// [`crate::context::lifecycle_helpers::restore_all_contexts`]) can.
+    ///
+    /// `owning_did` scopes the rebuilt [`ActorDeps`](crate::context::actor::deps::ActorDeps);
+    /// callers pass the local DID performing the recovery.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any error from the respawn (e.g.
+    /// [`ContextError::ActorCrashed`](scp_protocol::context::ContextError::ActorCrashed)
+    /// when no snapshot exists to rehydrate).
+    pub async fn clear_poison(
+        &self,
+        context_id: &str,
+        owning_did: &DID,
+    ) -> Result<(), ContextError> {
+        self.supervisor.clear_poison(context_id, owning_did).await
+    }
+
     // -----------------------------------------------------------------
     // Timer-task surface (ADR-049 Phase 2A finalization — TTL +
     // governance timer → actor registry + mailbox tick).
