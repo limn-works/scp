@@ -820,8 +820,29 @@ pub async fn join_context(
         .append_context_event(&context_id_bytes, "MemberJoined", member_did.as_ref())?;
     state.checkpoint_events_since += 1;
 
-    // Persist context state after join (best-effort).
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
+    // ADR-049 §9 Class S (BLACK-001): a PAID join consumed a spending-UCAN
+    // nonce in Phase 1 (`enforce_join_economy` → `enforce_economy` →
+    // `commit_spending_ucan_nonce`, mutating the actor-owned
+    // `spending_nonce_tracker`) — the same Class-S monotonic state the
+    // message-send and tool-invoke paths persist fail-closed. A best-effort
+    // persist here would let an actor crash in the ≤50ms coalesce window roll
+    // the nonce-consume back, freshening the spending UCAN's nonce after the
+    // joiner already saw the join succeed (replay / double-spend). Persist
+    // fail-closed when a spending nonce was committed (the same gating the
+    // send path uses: `deducted_cost.is_some() && spending_ucan.is_some()`):
+    // a persist failure returns an error so the join is NOT acknowledged. The
+    // membership / MLS state already applied above is NOT reversed — it is
+    // Class-S security state that, like the consumed nonce, must persist; the
+    // joiner re-drives the (now nonce-consumed, idempotent) join, and the
+    // surviving in-memory actor already holds the member. The consumed nonce
+    // stays CONSUMED (the fail-closed direction; un-consuming re-opens the
+    // replay window). A free / non-spending join keeps the best-effort persist
+    // — the common path is not regressed.
+    if deducted_cost.is_some() && spending_ucan.is_some() {
+        crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
+    } else {
+        crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
+    }
 
     Ok(())
 }

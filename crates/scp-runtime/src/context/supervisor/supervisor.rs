@@ -9657,7 +9657,8 @@ mod tests {
         );
     }
 
-    /// ADR-049 §9 crash-safety invariant — STRUCTURAL ENFORCEMENT.
+    /// ADR-049 §9 crash-safety invariant — STRUCTURAL ENFORCEMENT (FIELD
+    /// ROUND-TRIP HALF).
     ///
     /// Every security-critical, monotonic piece of per-context state must be
     /// either Class S (sync-persisted — therefore present in the persisted
@@ -9666,12 +9667,22 @@ mod tests {
     /// silently rides only the coalesced (Class C) path is a respawn rollback
     /// vulnerability and is FORBIDDEN.
     ///
-    /// This test catches the regression structurally: it populates EVERY
+    /// SCOPE — what THIS test catches, and what it does NOT. This test catches
+    /// a security FIELD dropped from the snapshot builder: it populates EVERY
     /// Class-S `GovernanceState` field with a non-default sentinel, runs the
-    /// real snapshot build (`snapshot_context`) + the real persistence
+    /// real snapshot build (`build_snapshot_from_state`) + the real persistence
     /// serialization round-trip (`serde_json` is the on-disk format), and
-    /// asserts each sentinel survives. The mechanism that catches a NEW
-    /// coalesced-only security field:
+    /// asserts each sentinel survives. It does NOT catch a missed CONSUME SITE
+    /// — a code path that mutates a Class-S field and then acknowledges the
+    /// operation WITHOUT a fail-closed persist (e.g. the message-send / paid-
+    /// join nonce-consume sites that earlier rounds missed while the tool-invoke
+    /// site was fixed). That complementary half is enforced by
+    /// `scripts/check-class-s-fail-closed.sh`, which scans every consume site
+    /// and requires a fail-closed persist before acknowledgment. The two
+    /// together — field round-trip HERE, consume-site fail-closed THERE — are
+    /// what the §9 enforcement actually guarantees.
+    ///
+    /// The mechanism that catches a NEW coalesced-only security FIELD:
     ///
     /// - To add it to `GovernanceState` and have it tested here, the author
     ///   must populate it below — and the round-trip assertion then FAILS unless
