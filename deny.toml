@@ -80,6 +80,22 @@ ignore = [
     # libcrux/openmls dependency chain). No runtime exposure; no upstream
     # fix available. Awaiting hax-lib migration off proc-macro-error2.
     "RUSTSEC-2026-0173",
+    # pyo3: out-of-bounds read in `nth` / `nth_back` for `PyList` and
+    # `PyTuple` iterators. Direct dependency, but patched only in pyo3
+    # >= 0.29 (a five-minor-version breaking migration from our 0.24).
+    # The vulnerable path is unreachable in SCP: the PyO3 bridge never
+    # applies `nth`/`nth_back` (nor `skip`/`step_by`/`rev`) to a
+    # `PyList`/`PyTuple` iterator. The sole `.nth()` in the codebase
+    # (scp-ffi/src/mcp.rs) is on a Rust `SplitWhitespace` string iterator
+    # (HTTP status-line parse), and there are zero `.nth_back()` sites.
+    # Inbound `PyList` values are only constructed (`PyList::new`/`empty`)
+    # or forward-iterated via `.iter()` (`next()`); `PyTuple` is never
+    # Rust-iterated. The one Rust-tuple extraction (`(u8, u8)` for
+    # min_protocol_version in scp-ffi/src/context.rs) is safe because
+    # pyo3's tuple/array `FromPyObject` uses indexed `get_borrowed_item`,
+    # not the iterator's `nth`/`nth_back`. Awaiting a feasible pyo3 0.29
+    # migration.
+    "RUSTSEC-2026-0176",
 ]
 
 # ── Bans ────────────────────────────────────────────────────────────────────
