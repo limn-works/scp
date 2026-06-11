@@ -146,13 +146,28 @@ use wasm_bindgen::prelude::*;
 /// ```
 #[wasm_bindgen]
 pub fn scp_init() {
-    // Route Rust panics to the browser console as readable error messages.
-    // std::panic::set_hook replaces any previously installed hook, so this
+    // Route Rust panics to the browser console — REDACTED. The WASM bridge
+    // runs the full MLS / sender-key crypto path (ADR-034), so a panic on a
+    // crypto codepath could interpolate plaintext, key material, or DIDs into
+    // its message via `format!`. `PanicHookInfo::to_string()` (and the
+    // payload it embeds) is therefore NEVER read or logged — we emit only a
+    // CONSTANT redacted message plus the panic's source `file:line` (which is
+    // a static code location, not runtime data). This mirrors the native
+    // supervisor watchdog's payload-free redaction (ADR-049 §10).
+    //
+    // `std::panic::set_hook` replaces any previously installed hook, so this
     // is idempotent in the sense that calling it again simply replaces the
     // hook with an identical implementation.
     std::panic::set_hook(Box::new(|info| {
-        let msg = info.to_string();
-        web_sys::console::error_1(&JsValue::from_str(&msg));
+        let location = info.location().map_or_else(
+            || "unknown".to_owned(),
+            |l| format!("{}:{}", l.file(), l.line()),
+        );
+        // Constant message — never the panic payload (may contain key
+        // material). Location is a static code position, safe to emit.
+        let redacted =
+            format!("scp panic at {location}; payload withheld (may contain key material)");
+        web_sys::console::error_1(&JsValue::from_str(&redacted));
     }));
 }
 
