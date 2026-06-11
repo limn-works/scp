@@ -1581,6 +1581,9 @@ fn build_snapshot_for_persist(
 /// Best-effort persist of the current actor state. Mirrors the legacy
 /// Phase 3 snapshot persistence path, but reads from actor-owned state.
 ///
+/// Internal cross-module persistence helper — `pub` only so the sibling
+/// `crate::context` dispatch modules can call it; not part of the SDK surface.
+///
 /// **Persistence class.** Use this ONLY for state whose ≤50ms coalesce-window
 /// rollback is acceptable (ADR-049 §9 Class C — liveness/structural state and
 /// the accepted soft anti-spam residual: velocity / earned-capacity). For
@@ -1613,6 +1616,9 @@ pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, cont
 /// observed success.
 ///
 /// The failure metric is still recorded for observability.
+///
+/// Internal cross-module persistence helper — `pub` only so the sibling
+/// `crate::context` dispatch modules can call it; not part of the SDK surface.
 ///
 /// # Errors
 ///
