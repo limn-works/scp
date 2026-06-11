@@ -10045,6 +10045,7 @@ mod tests {
             b"paid",
             Some(&signing_key),
             /* spending_nonce_committed = */ true,
+            /* is_broadcast = */ false,
         );
         assert!(
             matches!(paid, Err(ContextError::PersistenceFailed(_))),
@@ -10064,6 +10065,7 @@ mod tests {
             b"free",
             Some(&signing_key),
             /* spending_nonce_committed = */ false,
+            /* is_broadcast = */ false,
         );
         assert!(
             free.is_ok(),
@@ -10124,6 +10126,7 @@ mod tests {
             b"paid-send",
             Some(&signing_key),
             /* spending_nonce_committed = */ true,
+            /* is_broadcast = */ false,
         )
         .expect("fail-closed finalize of the send-path consumed nonce must succeed");
 
@@ -10355,6 +10358,240 @@ mod tests {
         assert!(
             sup.lookup(&ctx_key).is_none(),
             "a closed context must NOT be resurrected into a live actor"
+        );
+    }
+
+    /// ADR-049 §9 Class S: `SuspendAccess` (`suspend_all`) strips a member's
+    /// ENTIRE capability set — a downward-authorization transition that MUST
+    /// survive a crash before any coalesce. `SuspendAccess` now sync-persists
+    /// (fail-closed) BEFORE acknowledging, mirroring `execute_suspend_member`.
+    /// A respawn that re-granted the banned member's capabilities would be a
+    /// security rollback. Asserted through the persisted snapshot the respawn
+    /// rehydrates from (the suspended-capabilities entry must be present).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_all_survives_crash_before_coalesce() {
+        use scp_protocol::context::roles::Capability;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xE1u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:suspendall-admin".to_owned());
+        let target = DID("did:example:suspendall-target".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            admin,
+        );
+        state
+            .membership
+            .add_member(target.clone(), "member".to_owned(), Vec::new());
+        state
+            .role_state
+            .member_capabilities
+            .entry(target.0.clone())
+            .or_default()
+            .extend([Capability::MessagesWrite, Capability::MessagesRead]);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let deps = test_actor_deps(&sup).await;
+
+        // Apply the `SuspendAccess` mutation (the same `suspend_all` the
+        // production arm performs) and sync-persist via the SAME fail-closed
+        // primitive that arm now calls before its reply.
+        state.role_state.suspend_all(target.as_ref());
+        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .expect("fail-closed persist of the suspend_all transition must succeed");
+
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+        induce_panic(&handle, "SECRET_SENTINEL_suspendall").await;
+
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "the context must respawn to a responsive Active actor"
+        );
+
+        // The respawn rehydrates from the persisted snapshot — the suspended
+        // capability set for the banned member must still be present, so the
+        // ban is NOT rolled back by the crash.
+        let snap = persistence
+            .load_context(&ctx_key)
+            .expect("load")
+            .expect("snapshot present after respawn");
+        let suspended = snap
+            .role_state
+            .suspended_capabilities
+            .get(target.as_ref())
+            .expect("the banned member's suspension must survive the crash");
+        assert!(
+            suspended.contains(&Capability::MessagesWrite)
+                && suspended.contains(&Capability::MessagesRead),
+            "crash+respawn must NOT re-grant the SuspendAccess-banned member's capabilities"
+        );
+    }
+
+    /// ADR-049 §9 Class S: the `executed_proposals` anti-replay marker MUST
+    /// survive a crash before any coalesce. A downward-authorization governance
+    /// arm sync-persists (fail-closed) after the entry point inserts the marker,
+    /// so the marker is durably captured in the same snapshot. A respawn that
+    /// dropped the marker would let an already-executed governance proposal be
+    /// replayed. Asserted through the persisted snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executed_proposals_marker_survives_crash_before_coalesce() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xE2u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:execprop-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            admin,
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let deps = test_actor_deps(&sup).await;
+
+        // Insert the executed-proposal marker (the same anti-replay state
+        // `execute_governance_action` records before dispatching a downward-auth
+        // arm) and sync-persist via the SAME fail-closed primitive the downward
+        // arm calls — the marker rides the downward arm's durable persist.
+        let proposal_id: scp_protocol::context::governance::ProposalId = [0xABu8; 32];
+        state
+            .governance
+            .executed_proposals
+            .insert(proposal_id, 1_700_000_000);
+        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .expect("fail-closed persist of the executed-proposals marker must succeed");
+
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+        induce_panic(&handle, "SECRET_SENTINEL_execprop").await;
+
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "the context must respawn to a responsive Active actor"
+        );
+
+        let snap = persistence
+            .load_context(&ctx_key)
+            .expect("load")
+            .expect("snapshot present after respawn");
+        assert!(
+            snap.executed_proposals.contains(&proposal_id),
+            "crash+respawn must NOT drop the executed-proposals anti-replay marker"
+        );
+    }
+
+    /// ADR-049 §9 (round-5 regression): `finalize_send` owns the sequence-number
+    /// rollback on its error exits, and rolls it back EXACTLY ONCE per error
+    /// path. The prior code double-rolled (the TTL early-return rolled back AND
+    /// the `send_message` caller rolled back again on the same `Err`), leaving
+    /// the counter one BELOW correct via `saturating_sub`. Here we reserve a
+    /// sequence, drive a paid `finalize_send` against an always-failing
+    /// persistence backend (the bottom persist-failure path), and assert the
+    /// counter is rolled back to EXACTLY the pre-reservation baseline — neither
+    /// short (no rollback) nor over (double rollback).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_send_rolls_back_sequence_exactly_once_on_persist_failure() {
+        let sup = supervisor_with_providers();
+        let mut deps = test_actor_deps(&sup).await;
+        deps.persistence = Arc::new(FailingPersistence);
+
+        let ctx_id_bytes = [0xE3u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let sender = DID("did:example:seq-rollback-sender".to_owned());
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            sender.clone(),
+        );
+        // The sender must be a member to reserve a sequence (membership starts
+        // empty in the test constructor).
+        state
+            .membership
+            .add_member(sender.clone(), "member".to_owned(), Vec::new());
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
+
+        // Baseline: the sender's sequence counter before any reservation.
+        let baseline = state
+            .membership
+            .get(sender.as_ref())
+            .expect("sender is a member")
+            .sequence_number;
+
+        // Reserve a sequence (Phase 1 of a real send), then drive the paid
+        // finalize whose fail-closed persist will fail.
+        let reserved = state
+            .membership
+            .next_sequence_number(sender.as_ref())
+            .expect("sender is a member");
+        assert_eq!(
+            reserved,
+            baseline + 1,
+            "reservation must advance the counter by exactly 1"
+        );
+
+        let result = crate::context::messaging_helpers::finalize_send(
+            &mut state,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            reserved,
+            b"paid",
+            Some(&signing_key),
+            /* spending_nonce_committed = */ true,
+            /* is_broadcast = */ false,
+        );
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "a paid send whose fail-closed persist fails must surface the error: got {result:?}"
+        );
+
+        let after = state
+            .membership
+            .get(sender.as_ref())
+            .expect("sender is a member")
+            .sequence_number;
+        assert_eq!(
+            after, baseline,
+            "finalize_send must roll the reserved sequence back to the baseline \
+             EXACTLY ONCE (not double-rolled below it)"
         );
     }
 }

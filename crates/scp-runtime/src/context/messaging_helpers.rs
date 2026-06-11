@@ -957,12 +957,17 @@ pub async fn send_message(
         payload,
         signing_key,
         spending_nonce_committed,
+        is_broadcast,
     ) {
         // Fail-closed persist of the Class-S nonce consume failed. Reverse the
         // economy reservation (the ticket is still alive — it is NOT committed
-        // until finalize succeeds), void the escrow hold, and roll back the
-        // sequence reservation. The consumed nonce is intentionally left
-        // consumed.
+        // until finalize succeeds) and void the escrow hold. The sequence
+        // rollback is INTENTIONALLY NOT performed here: `finalize_send` owns the
+        // sequence rollback on all of its error exits (ADR-049 §9 round-5
+        // regression fix). Rolling it back here too would revert the reserved
+        // sequence twice (a +1 undone by −2 via `saturating_sub`), leaving the
+        // counter one below correct. The consumed nonce is intentionally left
+        // consumed (the fail-closed direction).
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
@@ -970,9 +975,6 @@ pub async fn send_message(
             &mut state.governance,
             ticket,
         );
-        if !is_broadcast {
-            state.membership.rollback_sequence_number(sender_did);
-        }
         return Err(e);
     }
 
@@ -1310,6 +1312,11 @@ fn record_payment_capture_failure(
 /// while its nonce-consume is unpersisted, exactly mirroring the tool-invoke
 /// path in `reserve_tool_economy`. When `false` (a free / non-spending send),
 /// the persist stays best-effort (Class C) — the common path is not regressed.
+// `is_broadcast`: ADR-049 §9 — `finalize_send` OWNS the sequence rollback on its
+// error exits (the persist-failure path below). A broadcast publish reserves NO
+// per-sender sequence (`sequence` is 0 and `next_sequence_number` was never
+// called), so rolling back would spuriously decrement the publisher's counter —
+// every rollback is gated on `!is_broadcast`.
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_send(
     state: &mut PerContextState,
@@ -1321,6 +1328,7 @@ pub fn finalize_send(
     payload: &[u8],
     signing_key: Option<&ed25519_dalek::SigningKey>,
     spending_nonce_committed: bool,
+    is_broadcast: bool,
 ) -> Result<(), ContextError> {
     // M12: append event log BEFORE consequence evaluation.
     deps.event_log
@@ -1333,12 +1341,14 @@ pub fn finalize_send(
     // arm fires (Phase 2A.9 wires this). For Phase 2A.7 this matches
     // the legacy contract: rollback the sequence number and exit.
     if state::require_active(&state.handle).is_err() {
-        state.membership.rollback_sequence_number(sender_did);
-        // The sequence reservation is rolled back, but a spending-UCAN nonce
-        // committed in Phase 1 stays CONSUMED (the fail-closed direction: a
-        // late TTL expiry must not freshen a nonce the economy gate already
-        // burned). Persist it fail-closed so a crash before coalesce cannot
-        // roll the consume back (ADR-049 §9 Class S).
+        // Only encrypted sends reserved a sequence (broadcast publishes carry 0
+        // and never call `next_sequence_number`) — broadcast must not roll back.
+        if !is_broadcast {
+            state.membership.rollback_sequence_number(sender_did);
+        }
+        // A spending-UCAN nonce committed in Phase 1 stays CONSUMED (a late TTL
+        // expiry must not freshen it); persist it fail-closed so a crash before
+        // coalesce cannot roll the consume back (ADR-049 §9 Class S).
         if spending_nonce_committed {
             persist_state_fail_closed(state, deps, context_id)?;
         }
@@ -1431,17 +1441,44 @@ pub fn finalize_send(
         );
     }
 
-    // ADR-049 §9 Class S vs Class C persist selection (BLACK-001). A paid send
-    // that committed a spending-UCAN nonce in Phase 1 MUST persist fail-closed
-    // here — a swallowed (best-effort) persist would let an actor crash in the
-    // ≤50ms coalesce window roll the nonce-consume back, re-opening a replay /
-    // double-spend window after the caller already saw the send succeed. The
-    // common (free / non-spending) path keeps the best-effort persist so it is
-    // not regressed. On the metered path this is NOT a new write: the
-    // best-effort persist already ran synchronously per send — only the error
-    // handling changes (and the caller reverses + voids on failure).
+    persist_finalized_send(
+        state,
+        deps,
+        context_id,
+        sender_did,
+        spending_nonce_committed,
+        is_broadcast,
+    )
+}
+
+/// Final persist step of [`finalize_send`], factored out so the success body
+/// stays within the line budget. ADR-049 §9 Class S vs Class C: a paid send
+/// that committed a spending-UCAN nonce MUST persist fail-closed (a best-effort
+/// persist would let a crash in the ≤50ms coalesce window roll the consume back
+/// after the caller saw success — replay / double-spend); the free path keeps
+/// best-effort (not regressed).
+///
+/// `finalize_send` OWNS the sequence rollback on ALL its error exits (this
+/// persist-failure path + the TTL early-return). The `send_message` caller MUST
+/// NOT also roll it back, or the reservation is reverted twice (a +1 undone by
+/// −2 via `saturating_sub`). Broadcast publishes reserved no sequence, so the
+/// rollback is gated on `!is_broadcast`. The nonce stays consumed; the caller
+/// voids only the escrow + economy ticket.
+fn persist_finalized_send(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    sender_did: &DID,
+    spending_nonce_committed: bool,
+    is_broadcast: bool,
+) -> Result<(), ContextError> {
     if spending_nonce_committed {
-        persist_state_fail_closed(state, deps, context_id)?;
+        if let Err(e) = persist_state_fail_closed(state, deps, context_id) {
+            if !is_broadcast {
+                state.membership.rollback_sequence_number(sender_did);
+            }
+            return Err(e);
+        }
     } else {
         persist_state_best_effort(state, deps, context_id);
     }
@@ -1544,8 +1581,57 @@ pub fn persist_state_fail_closed(
 pub fn build_snapshot_from_state(
     state: &PerContextState,
 ) -> crate::context::state::ContextSnapshot {
-    use crate::context::state::VelocityTrackerSnapshot;
+    use crate::context::state::{GovernanceState, VelocityTrackerSnapshot};
     use scp_protocol::context::ContextState;
+
+    // ADR-049 §9 (white-hat P2): exhaustively destructure `GovernanceState` so a
+    // NEW governance field forces a conscious persist decision AT COMPILE TIME.
+    // Without this bind, a freshly-added field is invisible to both this builder
+    // and the field-round-trip test — silently dropped from the snapshot and
+    // lost across an actor crash. Every field is bound below: persisted fields
+    // are threaded into the snapshot; genuinely-transient fields are `_`-prefixed
+    // WITH a justification. Adding a field to `GovernanceState` will fail to
+    // compile here until the author decides which bucket it belongs to.
+    let GovernanceState {
+        // --- Persisted: threaded into ContextSnapshot below. ---
+        // `engine` is persisted via `governance_model_config: Some(engine.model_config())`.
+        engine: _engine_persisted_as_model_config,
+        executed_proposals: _executed_proposals,
+        approved_proposals: _approved_proposals,
+        next_proposal_seq: _next_proposal_seq,
+        freeze: _freeze,
+        threshold_signers: _threshold_signers,
+        threshold_value: _threshold_value,
+        pending_ceiling_modification: _pending_ceiling_modification,
+        pending_economic_policy_change: _pending_economic_policy_change,
+        registered_tools: _registered_tools,
+        tool_interfaces: _tool_interfaces,
+        pruning_policy: _pruning_policy,
+        economic_policy: _economic_policy,
+        budget_tracker: _budget_tracker,
+        consequence_rules: _consequence_rules,
+        velocity_tracker: _velocity_tracker,
+        participation_cache: _participation_cache,
+        cooldown_until: _cooldown_until,
+        message_pricing: _message_pricing,
+        hard_rate_limit: _hard_rate_limit,
+        spending_nonce_tracker: _spending_nonce_tracker,
+        revoked_spending_ucan_cids: _revoked_spending_ucan_cids,
+        proposal_timestamps: _proposal_timestamps,
+        // --- Transient: deliberately NOT persisted (rebuilt at restore). ---
+        // `timeout_task`: governance-timer handle, re-installed by the actor
+        // registry on respawn (no durable identity to preserve).
+        timeout_task: _timeout_task_transient,
+        // `deadlock`: per-context deadlock-detection scratch state, recomputed
+        // from the live proposal set after restore.
+        deadlock: _deadlock_transient,
+        // `last_known_members`: departure-detection cache for the timeout loop;
+        // re-seeded from `membership` on the next tick.
+        last_known_members: _last_known_members_transient,
+        // `pending_epoch_resets`: drained each timeout tick; an in-flight reset
+        // is re-driven by the member, not replayed from a snapshot.
+        pending_epoch_resets: _pending_epoch_resets_transient,
+    } = &state.governance;
 
     let context_state_value = state
         .handle

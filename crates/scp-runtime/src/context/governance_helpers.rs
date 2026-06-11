@@ -1196,7 +1196,12 @@ pub fn execute_remove_tool(
         .registered_tools
         .retain(|t| t.tool_id != tool_id);
 
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+    // ADR-049 §9 Class S: removing a registered tool revokes the authority to
+    // invoke it — a downward-authorization transition (the inverse of
+    // `execute_register_tool`'s upward grant). Persist fail-closed so an actor
+    // crash in the ≤50ms coalesce window cannot roll the removal back and
+    // re-grant invocation of a tool the caller was told was removed.
+    crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
         .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
     state.checkpoint_events_since += 1;
@@ -3390,7 +3395,13 @@ pub async fn dispatch_governance_action(
                 deps,
             );
 
-            crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+            // ADR-049 §9 Class S: `suspend_all` strips a member's ENTIRE
+            // capability set — a downward-authorization transition, identical
+            // in shape to `execute_suspend_member`'s `suspend_capabilities`.
+            // Persist fail-closed so an actor crash in the ≤50ms coalesce
+            // window cannot roll the ban back and re-grant the suspended
+            // member's capabilities after the caller was told the ban applied.
+            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log
                 .append_context_event(&context_id_bytes, "MemberSuspendedAll", actor)?;

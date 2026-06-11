@@ -808,12 +808,11 @@ pub async fn join_context(
         state.routing.set_local_pseudonym(pseudonym);
     }
 
-    // Phase 5: Capture the escrow hold after all mutations succeeded.
-    // Consume the ticket — commit returns the deducted cost for the
-    // capture step and marks the ticket as committed so the Drop
-    // guard stays quiet.
+    // Phase 5: commit the economy ticket (in-memory budget debit) and append
+    // the join event, THEN durably persist, THEN settle the external escrow.
+    // Consume the ticket — commit returns the deducted cost and marks the
+    // ticket committed so the Drop guard stays quiet.
     let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
-    capture_join_payment(state, deps, auth, &member_did, &context_id, deducted_cost).await;
 
     // Append MemberJoined event to event log.
     deps.event_log
@@ -838,11 +837,33 @@ pub async fn join_context(
     // stays CONSUMED (the fail-closed direction; un-consuming re-opens the
     // replay window). A free / non-spending join keeps the best-effort persist
     // — the common path is not regressed.
+    //
+    // MONEY-ORDERING (round-7, mirrors the send path): the external escrow is
+    // CAPTURED only AFTER the fail-closed persist succeeds. Capturing before
+    // would charge the joiner (irreversible escrow settlement) and then hand
+    // them an `Err` if the persist failed — a double-charge on retry. On
+    // persist failure we VOID the escrow hold instead (releasing the funds) so
+    // the charge is atomic with durability; the consumed nonce stays consumed,
+    // so the joiner's retry is idempotent and they are charged at most once.
     if deducted_cost.is_some() && spending_ucan.is_some() {
-        crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)?;
+        if let Err(e) =
+            crate::context::messaging_helpers::persist_state_fail_closed(state, deps, &context_id)
+        {
+            // Durability failed before the charge was captured — release the
+            // escrow hold so the joiner is not charged for an unacknowledged
+            // join, and surface the error. The consumed nonce stays consumed.
+            if let Some(a) = auth {
+                crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id)
+                    .await;
+            }
+            return Err(e);
+        }
     } else {
         crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
     }
+
+    // Durability has succeeded (or this is a free join): now settle the escrow.
+    capture_join_payment(state, deps, auth, &member_did, &context_id, deducted_cost).await;
 
     Ok(())
 }
@@ -2521,6 +2542,13 @@ mod restore_reconcile_tests {
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::large_futures,
+        // Test fixtures only: `captured`/`voided` counters read naturally
+        // despite the shared prefix; the recording adapter's trait methods
+        // return string literals tied to `&self` by the trait signature; and
+        // the end-to-end paid-join fixture is necessarily long.
+        clippy::similar_names,
+        clippy::unnecessary_literal_bound,
+        clippy::too_many_lines,
         // Test-only capturing persistence: the `Mutex<HashMap>` is never held
         // across `.await` (writes/reads are synchronous trait methods), so a
         // plain `std::sync::Mutex` is the right tool. The runtime's actor path
@@ -2845,5 +2873,451 @@ mod restore_reconcile_tests {
         )
         .await
         .expect("routing agreeing with mode must restore Ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-049 §9 (round-7): paid-join money-ordering parity with the send path.
+    // capture_join_payment (external escrow settlement) runs AFTER the
+    // fail-closed persist. On persist failure the escrow is VOIDED (not
+    // captured), so the joiner is not charged for an unacknowledged join.
+    // -----------------------------------------------------------------------
+
+    /// A persistence double whose `persist_context` ALWAYS fails — drives the
+    /// paid-join fail-closed persist into its error path.
+    #[derive(Default)]
+    struct FailingJoinPersistence;
+    impl ContextPersistence for FailingJoinPersistence {
+        fn persist_context(&self, _id: &str, _snap: &ContextSnapshot) -> Result<(), PersistErr> {
+            Err("forced persist failure".into())
+        }
+        fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _id: &str,
+            _snap: &BroadcastContextSnapshot,
+        ) -> Result<(), PersistErr> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _id: &str,
+        ) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
+            Ok(None)
+        }
+        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
+            Ok(())
+        }
+        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A `PaymentAdapter` that records whether `capture` or `void` was invoked,
+    /// so the money-ordering test can assert the escrow was VOIDED (not
+    /// captured) when the fail-closed persist fails. (Implementing the
+    /// non-dyn `PaymentAdapter` trait yields `PaymentAdapterDyn` via the
+    /// blanket impl.)
+    struct RecordingPaymentAdapter {
+        captured: Arc<std::sync::atomic::AtomicUsize>,
+        voided: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::economy::adapter::PaymentAdapter for RecordingPaymentAdapter {
+        fn adapter_id(&self) -> &str {
+            "recording"
+        }
+        fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
+            crate::economy::adapter::AdapterCapabilities {
+                supported_currencies: vec![scp_protocol::economy::types::CurrencyCode::from("USD")],
+                supports_streaming: false,
+                supports_batch_auth: false,
+                supports_single_step: false,
+                min_amount: None,
+                max_amount: None,
+                typical_settlement_ms: 0,
+                requires_facilitator: false,
+            }
+        }
+        async fn authorize(
+            &self,
+            payer: &DID,
+            payee: &DID,
+            amount: scp_protocol::economy::types::Amount,
+            currency: scp_protocol::economy::types::CurrencyCode,
+            _metadata: crate::economy::adapter::PaymentMetadata,
+        ) -> Result<
+            crate::economy::adapter::PaymentAuthorization,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::PaymentAuthorization {
+                auth_id: [7u8; 32],
+                payer: payer.clone(),
+                payee: payee.clone(),
+                amount,
+                currency,
+                adapter_id: "recording".to_owned(),
+                created_at: 1_000_000,
+                expires_at: 2_000_000,
+                adapter_state: vec![],
+            })
+        }
+        async fn capture(
+            &self,
+            auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
+        {
+            self.captured
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::economy::adapter::PaymentReceipt {
+                receipt_id: [9u8; 32],
+                payer: auth.payer.clone(),
+                payee: auth.payee.clone(),
+                amount: auth.amount,
+                currency: auth.currency,
+                action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
+                context_id: None,
+                adapter_id: "recording".to_owned(),
+                adapter_proof: vec![],
+                timestamp: 1_000_001,
+                signature: vec![],
+            })
+        }
+        async fn void(
+            &self,
+            _auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<(), crate::economy::adapter::PaymentError> {
+            self.voided
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn verify_authorization(
+            &self,
+            _auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<(), crate::economy::adapter::PaymentError> {
+            Ok(())
+        }
+        async fn verify(
+            &self,
+            _receipt: &crate::economy::adapter::PaymentReceipt,
+        ) -> Result<
+            crate::economy::adapter::VerificationResult,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::VerificationResult {
+                valid: true,
+                adapter_id: "recording".to_owned(),
+                verified_amount: scp_protocol::economy::types::Amount(0),
+                verified_currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                verification_timestamp: 1_000_002,
+            })
+        }
+        async fn refund(
+            &self,
+            _receipt: &crate::economy::adapter::PaymentReceipt,
+            _amount: Option<scp_protocol::economy::types::Amount>,
+        ) -> Result<
+            crate::economy::adapter::RefundConfirmation,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::RefundConfirmation {
+                refund_id: [0u8; 32],
+                original_receipt_id: [9u8; 32],
+                refunded_amount: scp_protocol::economy::types::Amount(0),
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                adapter_proof: vec![],
+            })
+        }
+    }
+
+    /// Derive a `did:key` DID + matching signing key (the same convention the
+    /// FFI tool-economy harness uses), so a `key_resolver` can resolve the
+    /// issuer's verifying key for spending-UCAN signature verification.
+    fn join_keypair() -> (DID, ed25519_dalek::SigningKey) {
+        use std::fmt::Write;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32]);
+        let vk = signing_key.verifying_key();
+        let hex = vk.as_bytes().iter().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        (DID::from(format!("did:key:{hex}").as_str()), signing_key)
+    }
+
+    /// Build a fully-signed spending UCAN bound to `joiner` (iss == aud ==
+    /// joiner), signed by `signing_key`, valid for a `ContextJoin`.
+    fn signed_join_ucan(
+        joiner: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> scp_protocol::crypto::ucan::UcanToken {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_protocol::crypto::ucan::nonce::generate_nonce;
+        use scp_protocol::crypto::ucan::spending::{
+            Amount as SpendAmount, CurrencyCode as SpendCurrency, SpendingCapability,
+        };
+        use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
+
+        let cap = SpendingCapability {
+            max_per_action: SpendAmount(u64::MAX),
+            max_total: SpendAmount(u64::MAX),
+            currency: SpendCurrency::from_code("USD").unwrap_or(SpendCurrency(*b"USD\0")),
+            time_window: std::time::Duration::from_hours(1),
+            allowed_adapters: vec![],
+        };
+        let mut fct = serde_json::Map::new();
+        fct.insert(
+            "spending_capability".to_owned(),
+            cap.to_fact_value().unwrap_or(serde_json::Value::Null),
+        );
+        fct.insert(
+            "scp_key_scope".to_owned(),
+            serde_json::Value::String("#agent".to_owned()),
+        );
+
+        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let header = UcanHeader::with_kid("#agent".to_owned());
+        let payload = UcanPayload {
+            iss: joiner.as_ref().to_owned(),
+            aud: joiner.as_ref().to_owned(),
+            exp: now + 3600,
+            nbf: Some(now.saturating_sub(60)),
+            nnc: generate_nonce(&scp_primitives::SystemClock),
+            att: vec![Attenuation {
+                with: "scp:spending:*".to_owned(),
+                can: "spend".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::Value::Object(fct)),
+        };
+
+        let header_json = serde_json::to_vec(&header).expect("header serializes");
+        let payload_json = serde_json::to_vec(&payload).expect("payload serializes");
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature = ed25519_dalek::Signer::sign(signing_key, signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        let encoded = format!("{signing_input}.{sig_b64}");
+
+        UcanToken {
+            header,
+            payload,
+            signature: signature.to_bytes().to_vec(),
+            encoded,
+        }
+    }
+
+    /// ADR-049 §9 (round-7 money-ordering): the escrow side of a PAID join is
+    /// settled atomically with durability — `capture_join_payment` runs only
+    /// AFTER the fail-closed persist succeeds, and the escrow is VOIDED (never
+    /// captured) when the persist fails, so the joiner is never charged for an
+    /// unacknowledged join. The ordering invariant itself is mechanically
+    /// enforced by `paid_join_captures_escrow_after_persist_not_before` below.
+    ///
+    /// This runtime test locks in the CURRENTLY-REACHABLE behavior of the public
+    /// `join_context` path: a paid (`per_join`) context blocks AUTO-accept joins
+    /// at the `auto_accept_blocked_by_economics` guard (SCP-ECON-12030) BEFORE
+    /// any escrow is authorized — so neither capture nor void runs, and no
+    /// double-charge is possible through this path. (Surfaced residual: the
+    /// escrow/persist tail of `join_context` — and thus the round-7 reorder — is
+    /// reached only once an explicit paid-acceptance join flow is wired past the
+    /// auto-accept guard; until then it is forward-looking defensive code. The
+    /// FFI bridges already thread a `spending_ucan` into this path expecting it
+    /// to settle, so the acceptance-flow gap is worth tracking upstream.)
+    #[tokio::test]
+    async fn paid_join_blocked_at_auto_accept_guard_touches_no_escrow() {
+        use scp_protocol::context::roles::Capability;
+
+        let (joiner, joiner_key) = join_keypair();
+        let joiner_for_resolver = joiner.clone();
+        let joiner_vk = joiner_key.verifying_key();
+
+        // Real MLS crypto provider so `add_member` succeeds, plus a key_resolver
+        // that resolves the joiner's verifying key for the spending-UCAN sig.
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkJoinMoneyOrder".to_owned(),
+        ));
+        let key_resolver: scp_protocol::context::governance::KeyResolver = {
+            let did = joiner_for_resolver;
+            let vk = joiner_vk;
+            Arc::new(move |q: &DID| if *q == did { Some(vk) } else { None })
+        };
+        let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
+            Arc::new(RecordingPaymentAdapter {
+                captured: Arc::clone(&captured),
+                voided: Arc::clone(&voided),
+            });
+
+        let sup = Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(OkEventLog),
+            key_resolver,
+            Some(Box::new(FailingJoinPersistence)),
+            Some(payment_adapter),
+            None,
+            None,
+            mls_storage(),
+        );
+
+        let admin = DID("did:dht:z6MkJoinMoneyAdmin".to_owned());
+        let mut deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-paid-join-money-order".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+
+        // Create the MLS group so the joiner's `add_member` can succeed.
+        deps.crypto
+            .create_mls_group(&context_id_bytes)
+            .expect("create_mls_group");
+
+        // Build per-context state with a per_join cost so a spending UCAN is
+        // required and the escrow path runs.
+        let now_secs = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            now_secs,
+            admin.clone(),
+        );
+        state.role_state.ceiling = scp_protocol::context::roles::CapabilityCeiling::new([
+            Capability::MemberInvite,
+            Capability::MessagesWrite,
+            Capability::MessagesRead,
+        ]);
+        state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
+            locked: false,
+            cost_schedule: scp_protocol::economy::types::CostSchedule {
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                per_message: None,
+                per_tool_invoke: None,
+                per_join: Some(scp_protocol::economy::types::Amount(10)),
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["recording".to_owned()],
+            pricing_formula: None,
+            payee: admin.clone(),
+        });
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        // Generate a real MLS KeyPackage for the joiner.
+        let joiner_cred = crate::crypto::mls::credential::ScpCredential::new(
+            joiner.as_ref().to_owned(),
+            None,
+            scp_protocol::identity::SigningKeyId::Active,
+        )
+        .expect("joiner credential");
+        let (kp_bundle, _signer, _provider) =
+            crate::crypto::mls::group::generate_key_package(&joiner_cred)
+                .expect("generate joiner key package");
+        let kp_bytes =
+            openmls::prelude::tls_codec::Serialize::tls_serialize_detached(kp_bundle.key_package())
+                .expect("serialize key package");
+        let key_package =
+            scp_protocol::context::membership::KeyPackage::new(joiner.clone(), kp_bytes);
+
+        let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
+        handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let spending_ucan = signed_join_ucan(&joiner, &joiner_key);
+
+        // Even with a failing persistence backend, the paid (`per_join`) policy
+        // is rejected at the auto-accept guard BEFORE escrow authorization, so
+        // the persist failure is never reached and no escrow side effect runs.
+        deps.persistence = Arc::new(FailingJoinPersistence);
+
+        let result = lifecycle_helpers::join_context(
+            &mut state,
+            &deps,
+            &handle,
+            key_package,
+            Some(&spending_ucan),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("SCP-ECON-12030")),
+            "an auto-accept join of a paid context must be rejected at the \
+             economics guard (SCP-ECON-12030) before any escrow side effect: got {result:?}"
+        );
+        assert_eq!(
+            captured.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no escrow may be captured when the join is rejected at the guard"
+        );
+        assert_eq!(
+            voided.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no escrow may be voided when the join is rejected before authorization"
+        );
+    }
+
+    /// ADR-049 §9 (round-7 money-ordering) — STRUCTURAL enforcement of the
+    /// reorder. In `join_context`, the external escrow settlement
+    /// (`capture_join_payment`) MUST appear AFTER the fail-closed persist
+    /// (`persist_state_fail_closed`), and the persist-failure branch MUST void
+    /// the escrow (`void_paid_action`) — mirroring the send path. This guards
+    /// the ordering at compile/test time because the runtime tail is currently
+    /// gated behind the not-yet-wired explicit paid-acceptance flow (see
+    /// `paid_join_blocked_at_auto_accept_guard_touches_no_escrow`). A non-gamed
+    /// assertion: it checks the actual byte ORDER of the two calls in the real
+    /// `join_context` body, so reverting the reorder fails this test.
+    #[test]
+    fn paid_join_captures_escrow_after_persist_not_before() {
+        const SRC: &str = include_str!("lifecycle_helpers.rs");
+
+        // Isolate the `join_context` fn body (from its signature to the next
+        // top-level `pub fn`/`pub async fn` boundary) so the assertion is about
+        // THIS function, not incidental matches elsewhere in the file.
+        let start = SRC
+            .find("pub async fn join_context(")
+            .expect("join_context must exist");
+        let rest = &SRC[start..];
+        // The function ends before the next item that starts a new helper.
+        let end_rel = rest
+            .find("\npub fn join_context_membership(")
+            .expect("join_context_membership follows join_context");
+        let body = &rest[..end_rel];
+
+        let persist_idx = body
+            .find("persist_state_fail_closed(state, deps, &context_id)")
+            .expect("join_context must fail-closed persist on the paid path");
+        let capture_idx = body
+            .find("capture_join_payment(")
+            .expect("join_context must capture the escrow");
+
+        assert!(
+            persist_idx < capture_idx,
+            "capture_join_payment (escrow settlement) must run AFTER \
+             persist_state_fail_closed — capturing before durability double-charges \
+             the joiner on the idempotent retry (ADR-049 §9 round-7)"
+        );
+
+        // The persist-failure branch (between the fail-closed persist and the
+        // success-path capture) MUST void the escrow. `void_paid_action` also
+        // appears in the earlier MLS-rollback branches, so search the slice
+        // AFTER the persist call for the failure escape hatch specifically.
+        let post_persist = &body[persist_idx..capture_idx];
+        assert!(
+            post_persist.contains("void_paid_action(state, deps, a, &context_id)"),
+            "the persist-failure branch must void the escrow (between the \
+             fail-closed persist and the success-path capture) so a durability \
+             failure releases the hold instead of charging the joiner"
+        );
     }
 }
