@@ -2607,7 +2607,13 @@ impl ContextHandle {
     /// Returns the context's current lifecycle state as a string.
     ///
     /// One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
-    /// `"migrating_out"`, `"tombstoned"`.
+    /// `"migrating_out"`, `"tombstoned"`, `"poisoned"`.
+    ///
+    /// `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
+    /// path wrote `Poisoned` into this cached state; the watchdog poison path
+    /// does NOT push into this cache (it is a best-effort cached getter, not a
+    /// live supervisor read). The authoritative poison signal is the
+    /// `SCP-CTX-2134` error code on the next per-context operation.
     ///
     /// # Errors
     ///

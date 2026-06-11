@@ -8685,6 +8685,115 @@ mod tests {
         );
     }
 
+    /// Operator recovery (ADR-049 §10): `clear_poison` clears a poisoned
+    /// context's crash window and attempts ONE respawn from the snapshot,
+    /// returning it to a usable Active state. The poison flag is cleared and
+    /// per-context dispatch resolves to the live actor again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_poison_recovers_a_poisoned_context() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        let ctx_id_bytes = [0xDBu8; 32];
+        let (handle, ctx_key) = spawn_active_with_snapshot(&sup, ctx_id_bytes).await;
+
+        // Poison: 3 crashes within 60s.
+        let mut handle = handle;
+        for _ in 0..2u32 {
+            induce_panic(&handle, "SECRET_SENTINEL_clear").await;
+            let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+                sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                    && !sup.is_context_poisoned(&ctx_key)
+            })
+            .await;
+            assert!(respawned, "watchdog must respawn below the threshold");
+            clock.advance_millis(100);
+            handle = sup.lookup(&ctx_key).expect("respawned actor registered");
+        }
+        induce_panic(&handle, "SECRET_SENTINEL_clear").await;
+        let poisoned = wait_until(std::time::Duration::from_secs(5), || {
+            sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(poisoned, "3 crashes within 60s must poison");
+
+        // Operator recovery: clear_poison clears the window + respawns once.
+        let owning = DID(format!("did:scp:{ctx_key}"));
+        sup.clear_poison(&ctx_key, &owning)
+            .await
+            .expect("clear_poison must succeed: snapshot is present and Active");
+
+        assert!(
+            !sup.is_context_poisoned(&ctx_key),
+            "clear_poison must clear the sticky poison flag"
+        );
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "clear_poison must respawn the context back to a usable Active state"
+        );
+
+        // Per-context dispatch resolves to the live actor again (no longer
+        // ContextPoisoned).
+        let result = sup
+            .dispatch_command(
+                &ctx_key,
+                crate::context::actor::commands::MessagingCommand::Placeholder {
+                    reply: tokio::sync::oneshot::channel().0,
+                },
+            )
+            .await;
+        assert!(
+            !matches!(result, Err(ContextError::ContextPoisoned(_))),
+            "after clear_poison, dispatch must NOT surface ContextPoisoned"
+        );
+    }
+
+    /// `clear_poison` on a context with NO persisted snapshot records a FRESH
+    /// respawn failure (the single retry fails) and returns an error WITHOUT
+    /// looping: the budget is reset to one fresh failure, not re-poisoned in a
+    /// tight loop. The caller (operator) sees the failure and can decide.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_poison_without_snapshot_records_one_failure_no_loop() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        // Empty persistence: a respawn finds no snapshot and fails.
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+
+        let ctx_key = hex::encode([0xDCu8; 32]);
+        let owning = DID(format!("did:scp:{ctx_key}"));
+
+        // Pre-mark the context poisoned (no actor, no snapshot).
+        {
+            let mut entry = sup.crash_windows.entry(ctx_key.clone()).or_default();
+            // Drive it to poisoned by recording the budget's worth of crashes.
+            entry.mark_respawn_failed();
+        }
+
+        // clear_poison clears the window and attempts ONE respawn, which fails
+        // (no snapshot) and is recorded as a single fresh failure.
+        let result = sup.clear_poison(&ctx_key, &owning).await;
+        assert!(
+            matches!(result, Err(ContextError::ActorCrashed(_))),
+            "clear_poison with no snapshot must surface the failed single retry, got {result:?}"
+        );
+
+        // The single retry recorded ONE crash, not a poison loop: the window
+        // exists with a fresh (non-poisoned) failure, and the context is NOT
+        // re-poisoned by a tight loop.
+        assert!(
+            !sup.is_context_poisoned(&ctx_key),
+            "a single failed retry must NOT immediately re-poison (no loop)"
+        );
+        assert!(
+            sup.lookup(&ctx_key).is_none(),
+            "no actor is registered after a failed no-snapshot respawn"
+        );
+    }
+
     /// A single crash (below the threshold) respawns the actor from its
     /// persisted snapshot, and the rehydrated context preserves the
     /// persisted state — including the §9.10.4 routing axis.

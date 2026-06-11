@@ -2,7 +2,10 @@ import Foundation
 
 // ContextState and ContextHandleProtocol are now defined by UniFFI in ScpBindings.swift.
 //
-// UniFFI ContextState: .creating, .active, .closing, .closed, .expired
+// UniFFI ContextState: .creating, .active, .closing, .closed, .expired,
+//   .migratingOut, .tombstoned, .poisoned (all 8 states — see ADR-049 §10 for
+//   .poisoned; `mapStateString` below maps every one, defaulting fail-safe to
+//   .poisoned for an unreadable/unrecognized state).
 // UniFFI ContextHandleProtocol: contextId() -> String, creatorDid() -> String, state() throws -> String
 // UniFFI MessageListener: onMessage(message:), onError(error:), onComplete()
 
