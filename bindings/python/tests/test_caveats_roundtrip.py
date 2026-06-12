@@ -64,6 +64,9 @@ async def test_caveats_round_trip_through_jwt_nb_field() -> None:
     )
 
     audience = "did:dht:zMember"
+    # Marshalling parity test — exercises the SDK-caveats -> wire-JSON ->
+    # PyO3 bridge -> Rust mint_ucan -> JWT `nb` chain through ucan.mint.
+    # SCP-DEFAULT-INSTANCE-OK: bridge-level mint; no per-instance SCP equivalent yet
     token = await scp_sdk.ucan.mint(
         audience=audience,
         capabilities=["messages:write"],
@@ -114,6 +117,8 @@ async def test_mint_limit_violation_surfaces_slug() -> None:
     )
 
     with pytest.raises(UcanPermissionError) as exc_info:
+        # Verifies the mint-limit (SCP-TOOL-6114) slug surfaces through ucan.mint.
+        # SCP-DEFAULT-INSTANCE-OK: bridge-level mint; no per-instance SCP equivalent yet
         await scp_sdk.ucan.mint(
             audience="did:dht:zMember",
             capabilities=["messages:write"],

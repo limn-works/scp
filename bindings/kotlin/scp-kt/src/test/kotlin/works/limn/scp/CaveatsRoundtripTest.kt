@@ -58,6 +58,7 @@ class CaveatsRoundtripTest {
                 kotlinx.coroutines.runBlocking {
                     val handle = uniffi.scp.relayStartInMemory()
                     relayHandle = handle
+                    // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                     val bootstrap = uniffi.scp.identityCreate("in_memory")
                     uniffi.scp.configureRelayTransport(
                         relayUrl = handle.relayUrl(),
