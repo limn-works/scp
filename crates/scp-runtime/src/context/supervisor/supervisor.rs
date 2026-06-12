@@ -351,6 +351,24 @@ fn spawn_actor_watchdog_task(
     });
 }
 
+/// Spawn a `KeyPackageStoreActor`'s watchdog task (ADR-049 §10).
+///
+/// The per-identity twin of [`spawn_actor_watchdog_task`]. A free function for
+/// the same reason: the watchdog reaches `Supervisor::kp_actor_watchdog` →
+/// `Supervisor::respawn_kp_actor` → `Supervisor::key_package_store_for` →
+/// (spawn), which forms a self-referential async cycle the compiler refuses to
+/// resolve when spawned inline. The KP actor task is NOT placed on the
+/// supervisor's timer `task_set`; the watchdog owns its `JoinHandle` directly.
+fn spawn_kp_actor_watchdog_task(
+    supervisor: Arc<Supervisor>,
+    identity: DID,
+    join: tokio::task::JoinHandle<()>,
+) {
+    tokio::spawn(async move {
+        supervisor.kp_actor_watchdog(identity, join).await;
+    });
+}
+
 /// Placeholder saga state stored in `pending_sagas` between Prepare and
 /// Commit/Abort. Commit 6 keeps this opaque; the real state shape lives
 /// in the per-saga-type `SagaPreparedState` variants.
@@ -737,9 +755,22 @@ impl Supervisor {
         let _ = supervisor.task_set.set(Arc::new(tokio::sync::Mutex::new(
             tokio::task::JoinSet::new(),
         )));
+        // A2 — attach the durable consumed-init-key set to the shared MLS
+        // backend so `join_from_welcome` enforces the crypto-layer single-use
+        // backstop on EVERY join path (independent of the KeyPackage actor's
+        // reservation bookkeeping). The backend is the single instance shared
+        // via `crypto.mls_backend()`; wiring the supervisor's own
+        // `mls_storage` here gives the two anchors one durable home.
+        if let Some(crypto) = supervisor.crypto.get() {
+            crypto
+                .mls_backend()
+                .set_consumed_init_key_store(Arc::clone(&mls_storage));
+        }
+
         // Required, non-Option — the runtime never defaults storage. The
         // freshly-constructed supervisor's slot is always empty here, so
-        // `set` cannot fail; `let _ =` discards the `Result` for clippy.
+        // `set` cannot fail; `let _ =` discards the `Result` for clippy. This
+        // is the last use of `mls_storage`, so it is moved (not cloned) in.
         let _ = supervisor.mls_storage.set(mls_storage);
 
         supervisor
@@ -1087,22 +1118,140 @@ impl Supervisor {
     // only from `build_actor_deps`' test fixtures.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::context) async fn key_package_store_for(
-        &self,
+        self: &Arc<Self>,
         identity: &DID,
-    ) -> crate::context::supervisor::key_package_actor::KeyPackageStoreHandle {
+    ) -> Result<crate::context::supervisor::key_package_actor::KeyPackageStoreHandle, ContextError>
+    {
+        // Per-identity poison consult (ADR-049 §10). A KP actor that exceeded
+        // its respawn budget surfaces a sticky typed error on the next
+        // resolution instead of returning a dead handle. The crash window is
+        // keyed by `kp::{did}` so it shares the `crash_windows` map with the
+        // per-context budgets without colliding on a context id.
+        let poison_key = Self::kp_crash_key(identity);
+        if self.is_context_poisoned(&poison_key) {
+            return Err(Self::kp_poison_err(identity));
+        }
+
         if let Some(handle) = self.key_package_stores.get(identity) {
-            return handle.value().clone();
+            return Ok(handle.value().clone());
         }
         let _guard = self.write_lock.lock().await;
-        if let Some(handle) = self.key_package_stores.get(identity) {
-            return handle.value().clone();
+        // Re-check the poison flag under the lock — a concurrent watchdog could
+        // have poisoned the identity between the probe and the lock.
+        if self.is_context_poisoned(&poison_key) {
+            return Err(Self::kp_poison_err(identity));
         }
-        let handle = crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn(
-            identity.clone(),
-        );
+        if let Some(handle) = self.key_package_stores.get(identity) {
+            return Ok(handle.value().clone());
+        }
+        let deps = self.build_kp_store_deps(identity)?;
+        let (handle, join) =
+            crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn(
+                identity.clone(),
+                deps,
+            );
         self.key_package_stores
             .insert(identity.clone(), handle.clone());
-        handle
+        // Attach the watchdog (ADR-049 §10) — mirrors the per-context actor
+        // watchdog. Keeps the JoinHandle and respawns from durable storage on
+        // panic; poisons the identity after the 3-crash/60s budget.
+        spawn_kp_actor_watchdog_task(Arc::clone(self), identity.clone(), join);
+        Ok(handle)
+    }
+
+    /// The `crash_windows` key for a per-identity KeyPackage actor. Namespaced
+    /// with a `kp::` prefix so it never collides with a per-context budget
+    /// (context keys are hex context-ids / original id strings, neither of
+    /// which start with `kp::`).
+    fn kp_crash_key(identity: &DID) -> String {
+        format!("kp::{}", identity.0)
+    }
+
+    /// The sticky typed error a poisoned KeyPackage actor surfaces on the next
+    /// resolution. Shared by the pre-lock probe and the under-lock re-check in
+    /// [`Self::key_package_store_for`] (the double-check is load-bearing — a
+    /// concurrent watchdog can poison the identity between the two consults) so
+    /// the two sites cannot drift in wording.
+    fn kp_poison_err(identity: &DID) -> ContextError {
+        ContextError::ContextPoisoned(format!(
+            "key-package actor for '{}' is poisoned; operator recovery required",
+            identity.0
+        ))
+    }
+
+    /// Read the crash instant for a watchdog crash record (ADR-049 §10).
+    ///
+    /// # Clock requirement for the poison budget
+    ///
+    /// The poison budget (3 crashes / 60s) is a SLIDING window only when a clock
+    /// is wired. With a clock the sliding 60s window is exact; WITHOUT one
+    /// (`clock_ref() == None`) every crash stamps `now_ms = 0`, collapsing the
+    /// sliding window into a LIFETIME budget ("3-crashes-EVER" rather than
+    /// "3-in-60s") — the actor is poisoned permanently after the third crash no
+    /// matter how far apart they are. Production always wires a clock
+    /// (`with_providers` defaults to `SystemClock`, and storage is mandatory per
+    /// the storage-foundation ladder), so an absent clock is a test/misconfig
+    /// path only — emit a loud, payload-free warning so the degraded window is
+    /// never silent, and degrade rather than panic. A future configuration that
+    /// drops the clock therefore must not silently lose the sliding behavior:
+    /// the warning makes the lifetime-budget degradation observable.
+    ///
+    /// Shared by the per-context [`Self::actor_watchdog`] and the per-identity
+    /// [`Self::kp_actor_watchdog`] (the clock-read + degraded-window `warn!`
+    /// was byte-for-byte duplicated). `actor_kind` / `subject` tag the warning.
+    fn crash_now_ms(&self, actor_kind: &'static str, subject: &str) -> u64 {
+        self.clock_ref().map_or_else(
+            || {
+                tracing::warn!(
+                    actor_kind,
+                    subject = %subject,
+                    "no clock configured: crash window degraded to crashes-ever (3-crash budget \
+                     without the 60s slide); wire a clock via with_providers in production"
+                );
+                0
+            },
+            |c| scp_primitives::Clock::now_millis(c.as_ref()),
+        )
+    }
+
+    /// Assemble a [`KeyPackageStoreDeps`](crate::context::supervisor::key_package_actor::KeyPackageStoreDeps)
+    /// from the supervisor's own provider slots, scoped to `identity`'s
+    /// wrapping key (if any).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if any required provider slot
+    /// is empty (i.e. [`Self::with_providers`] was not used).
+    fn build_kp_store_deps(
+        &self,
+        identity: &DID,
+    ) -> Result<crate::context::supervisor::key_package_actor::KeyPackageStoreDeps, ContextError>
+    {
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
+
+        let crypto = self.crypto_ref().ok_or_else(not_init)?;
+        let mls = Arc::clone(crypto.mls_backend());
+        let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
+        let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
+        let mls_storage = Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?);
+        // The identity's published wrapping pubkey (§9.16.1) is embedded in each
+        // generated KP leaf node when present. Absent → KPs carry no wrapping
+        // extension, which is valid (the extension is optional).
+        let wrapping_pubkey = self
+            .wrapping_keys
+            .get(identity)
+            .map(|entry| entry.value().load_full().public);
+
+        Ok(
+            crate::context::supervisor::key_package_actor::KeyPackageStoreDeps {
+                mls,
+                mls_storage,
+                transport,
+                clock,
+                wrapping_pubkey,
+            },
+        )
     }
 
     /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
@@ -1184,7 +1333,7 @@ impl Supervisor {
             },
             Arc::clone,
         );
-        let key_package_store = self.key_package_store_for(owning_did).await;
+        let key_package_store = self.key_package_store_for(owning_did).await?;
         let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(Arc::clone(self));
 
         Ok(crate::context::actor::deps::ActorDeps {
@@ -2867,26 +3016,9 @@ impl Supervisor {
             return;
         }
 
-        // Read the crash instant. With a clock the sliding 60s window is
-        // exact; WITHOUT one (`clock_ref() == None`) every crash stamps
-        // `now_ms = 0`, collapsing the window to "3-crashes-EVER" rather than
-        // "3-in-60s". Production always wires a clock (`with_providers`
-        // defaults to `SystemClock`, and storage is mandatory per the
-        // storage-foundation ladder), so an absent clock is a test/misconfig
-        // path only — emit a loud, payload-free warning so the degraded
-        // window is never silent, and degrade rather than panic.
-        let now_ms = self.clock_ref().map_or_else(
-            || {
-                tracing::warn!(
-                    actor_kind = "context_actor",
-                    context_id = %ctx_id,
-                    "no clock configured: crash window degraded to crashes-ever (3-crash budget \
-                     without the 60s slide); wire a clock via with_providers in production"
-                );
-                0
-            },
-            |c| scp_primitives::Clock::now_millis(c.as_ref()),
-        );
+        // Read the crash instant (degraded-window `warn!` factored into
+        // `crash_now_ms`).
+        let now_ms = self.crash_now_ms("context_actor", &ctx_id);
         // Record the crash and copy the budget state OUT of the DashMap
         // entry, then DROP the guard before any `.await` (the workspace
         // denies `await_holding_lock`).
@@ -2954,6 +3086,88 @@ impl Supervisor {
                     "context actor respawn failed"
                 );
             }
+        }
+    }
+
+    /// Per-identity KeyPackage-actor watchdog (ADR-049 §10).
+    ///
+    /// The twin of [`Self::actor_watchdog`] for `KeyPackageStoreActor`s. Awaits
+    /// the actor task's [`JoinHandle`](tokio::task::JoinHandle) and reacts:
+    ///
+    /// - **Clean exit / cancellation** — no crash recorded, no respawn.
+    /// - **Panic** — record the crash in the per-identity [`CrashWindow`]
+    ///   (keyed `kp::{did}`), log a payload-free diagnostic, then either
+    ///   poison-and-despawn (budget exhausted) or respawn the actor, which
+    ///   re-runs the §9 reconciliation from `mls_storage` on its next spawn.
+    ///
+    /// # Security invariant
+    ///
+    /// The [`JoinError`](tokio::task::JoinError) is inspected ONLY via
+    /// [`is_panic`](tokio::task::JoinError::is_panic). The panic payload is
+    /// NEVER read or formatted — a KP actor panic could carry private
+    /// signer-state bytes.
+    async fn kp_actor_watchdog(self: Arc<Self>, identity: DID, join: tokio::task::JoinHandle<()>) {
+        let outcome = join.await;
+        let join_err = match outcome {
+            Ok(()) => return,
+            Err(e) => e,
+        };
+        if !join_err.is_panic() {
+            return;
+        }
+
+        let poison_key = Self::kp_crash_key(&identity);
+        let now_ms = self.crash_now_ms("key_package_store", &identity.0);
+        let (poisoned, count) = {
+            let mut entry = self.crash_windows.entry(poison_key.clone()).or_default();
+            let poisoned = entry.record(now_ms);
+            (poisoned, entry.crash_count())
+        };
+
+        // Payload-free diagnostic (ADR-049 §10) — the panic payload may carry
+        // private signer-state bytes, so it is intentionally absent.
+        tracing::error!(
+            actor_kind = "key_package_store",
+            identity = %identity.0,
+            crash_count = count,
+            poisoned = poisoned,
+            panic_location = "unknown",
+            "key-package actor panicked; payload intentionally not logged (may contain key material)"
+        );
+
+        // Remove the dead handle so the next `key_package_store_for` resolves
+        // the poison (poisoned) or get-or-spawns a fresh actor (respawn).
+        {
+            let _guard = self.write_lock.lock().await;
+            self.key_package_stores.remove(&identity);
+        }
+
+        if poisoned {
+            tracing::error!(
+                actor_kind = "key_package_store",
+                identity = %identity.0,
+                crash_count = count,
+                "key-package actor poisoned; exceeded respawn budget, operator intervention required"
+            );
+            return;
+        }
+
+        // Budget intact: respawn. The fresh actor re-runs the §9 reconciliation
+        // from `mls_storage` in its `run()` startup, rebuilding `pool` /
+        // `reserved` from the durable journal — NOT a coalesced snapshot.
+        if let Err(e) = self.key_package_store_for(&identity).await {
+            tracing::error!(
+                actor_kind = "key_package_store",
+                identity = %identity.0,
+                error = %e,
+                "key-package actor respawn failed"
+            );
+        } else {
+            tracing::info!(
+                actor_kind = "key_package_store",
+                identity = %identity.0,
+                "key-package actor respawned; reconciling from durable storage"
+            );
         }
     }
 
@@ -3316,6 +3530,45 @@ impl Supervisor {
             entry.clear();
         }
         self.respawn_from_snapshot(ctx_id, owning_did).await
+    }
+
+    /// Operator action (ADR-049 §10): clear a per-identity KeyPackage actor's
+    /// poison record and re-resolve the actor.
+    ///
+    /// Unlike [`Self::clear_poison`] (per-context), this does NOT route through
+    /// [`Self::respawn_from_snapshot`]: there is no KP context-snapshot to
+    /// rehydrate (the KP actor reconciles from the durable `mls_storage`
+    /// journal on spawn, not from a coalesced `PerContextState` snapshot), so
+    /// the snapshot path would fail and re-dirty the crash window. Instead we
+    /// clear the sticky `kp::{did}` window and call
+    /// [`Self::key_package_store_for`], which get-or-spawns a fresh actor that
+    /// re-runs the §9 reconciliation. The dead handle (if any) was already
+    /// removed by the watchdog on poison; if a stale handle somehow remains we
+    /// remove it first so the get-or-spawn creates a live one.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any error from [`Self::key_package_store_for`] (e.g.
+    /// `NotInitialized` if providers are absent).
+    pub(in crate::context) async fn clear_kp_poison(
+        self: &Arc<Self>,
+        identity: &DID,
+    ) -> Result<(), ContextError> {
+        let poison_key = Self::kp_crash_key(identity);
+        {
+            // Clear the sticky window AND drop any stale (dead) handle so the
+            // re-resolve get-or-spawns a fresh actor rather than returning the
+            // dead one.
+            let _guard = self.write_lock.lock().await;
+            if let Some(mut entry) = self.crash_windows.get_mut(&poison_key) {
+                entry.clear();
+            }
+            self.key_package_stores.remove(identity);
+        }
+        // Re-resolve: get-or-spawn a fresh actor that reconciles from the
+        // durable journal. Discard the handle — the side effect (a live,
+        // watched actor registered for `identity`) is the recovery.
+        self.key_package_store_for(identity).await.map(|_| ())
     }
 
     /// Despawn the actor registered for `context_id`, removing the
@@ -7219,6 +7472,95 @@ mod tests {
         )
     }
 
+    /// Poll `cond` every 5ms until it returns `true` or a generous deadline
+    /// (~8s) elapses; returns whether it settled. Replaces fixed
+    /// `sleep(20ms)×50` (~1s) poison-respawn poll loops, which are flaky on
+    /// loaded CI: a short fixed budget can expire before the watchdog task is
+    /// scheduled. The CrashWindow budget math stays deterministic; only the
+    /// WALL-CLOCK wait for the watchdog to be scheduled is widened. The tighter
+    /// 5ms interval keeps the common (fast) case responsive while the long
+    /// deadline removes the false-timeout tail.
+    async fn poll_until<F: Fn() -> bool>(cond: F) -> bool {
+        // ~8s ceiling = 1600 iterations × 5ms. Far above any realistic watchdog
+        // scheduling delay, but still bounded so a genuinely stuck test fails
+        // rather than hangs.
+        for _ in 0..1600 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        cond()
+    }
+
+    /// Structural: a supervisor built through the production
+    /// `Supervisor::with_providers` factory ALWAYS attaches the consumed-init-key
+    /// store to the shared MLS backend. Proven behaviorally: a join through the
+    /// supervisor's own backend must NOT fail closed (it would
+    /// `MlsError::StorageError` if the store were unattached). A future
+    /// `with_providers` that forgets the `set_consumed_init_key_store` wiring
+    /// would make this join fail closed and the test would fail.
+    #[tokio::test]
+    async fn with_providers_attaches_consumed_init_key_store() {
+        use crate::crypto::mls::credential::ScpCredential;
+
+        let supervisor = supervisor_with_providers();
+        let crypto = supervisor
+            .crypto_ref()
+            .expect("with_providers populates crypto");
+        let backend = crypto.mls_backend();
+
+        let joiner = ScpCredential::new(
+            "did:dht:z6MkWithProvidersStoreCheck".to_owned(),
+            None,
+            scp_identity::SigningKeyId::Active,
+        )
+        .expect("valid credential");
+        let generated = backend
+            .generate_key_package(&joiner, None)
+            .await
+            .expect("generate kp");
+
+        // Build a real Welcome for the generated KP.
+        let inviter = ScpCredential::new(
+            "did:dht:z6MkWithProvidersInviter".to_owned(),
+            None,
+            scp_identity::SigningKeyId::Active,
+        )
+        .expect("valid inviter credential");
+        let mut group = backend
+            .create_group(&inviter, None)
+            .await
+            .expect("create group");
+        let added = backend
+            .add_member_raw(&mut group, &generated.key_package_bytes)
+            .await
+            .expect("add member");
+
+        // The join must succeed — i.e. NOT fail closed with StorageError, which
+        // is the symptom of a missing consumed-init-key store. (ScpMlsGroup is
+        // not Debug, so assert on the error shape, not the Ok value.)
+        let result = backend
+            .join_from_welcome(
+                &added.welcome,
+                generated.signer_state,
+                &generated.key_package_bytes,
+            )
+            .await;
+        assert!(
+            !matches!(
+                result,
+                Err(crate::crypto::mls::error::MlsError::StorageError(_))
+            ),
+            "with_providers must attach the consumed-init-key store \
+             (a store-less backend fails the join closed with StorageError)"
+        );
+        assert!(
+            result.is_ok(),
+            "the join through the supervisor backend must succeed once the store is attached"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_actor_with_state_registers_handle_and_accepts_commands() {
         let supervisor_arc = supervisor_with_providers();
@@ -8010,7 +8352,10 @@ mod tests {
         // Pre-seed the owning member's key-package store, simulating a
         // store already in use by another context/import. The rejected
         // import below must NOT evict it.
-        let preexisting = supervisor.key_package_store_for(&owning_did).await;
+        let preexisting = supervisor
+            .key_package_store_for(&owning_did)
+            .await
+            .expect("kp store resolves with providers");
         assert!(
             supervisor.key_package_stores.contains_key(&owning_did),
             "pre-seeded store registered"
@@ -8216,9 +8561,15 @@ mod tests {
     #[tokio::test]
     async fn key_package_store_for_is_idempotent() {
         let supervisor = supervisor_with_providers();
-        let did = DID("did:example:kp-idem".to_owned());
-        let first = supervisor.key_package_store_for(&did).await;
-        let second = supervisor.key_package_store_for(&did).await;
+        let did = DID("did:dht:z6MkKpIdem".to_owned());
+        let first = supervisor
+            .key_package_store_for(&did)
+            .await
+            .expect("kp store resolves with providers");
+        let second = supervisor
+            .key_package_store_for(&did)
+            .await
+            .expect("kp store resolves with providers");
         // The registry holds exactly one entry for this DID.
         assert_eq!(
             supervisor.key_package_stores.len(),
@@ -8227,14 +8578,149 @@ mod tests {
         );
         // A different DID spawns a distinct actor.
         let other = supervisor
-            .key_package_store_for(&DID("did:example:kp-other".to_owned()))
-            .await;
+            .key_package_store_for(&DID("did:dht:z6MkKpOther".to_owned()))
+            .await
+            .expect("kp store resolves with providers");
         assert_eq!(supervisor.key_package_stores.len(), 2);
         first.send_shutdown().await.expect("first handle is live");
         // `second` targets the same actor as `first`; the actor may have
         // already shut down, so a failed send is acceptable here.
         let _ = second.send_shutdown().await;
         other.send_shutdown().await.expect("other handle is live");
+    }
+
+    /// A KP-actor panic is caught by the watchdog, recorded payload-free in the
+    /// per-identity crash window, and the actor is respawned — a subsequent
+    /// `key_package_store_for` resolves a fresh, live handle.
+    #[tokio::test]
+    async fn kp_actor_watchdog_records_panic_and_respawns() {
+        let supervisor = supervisor_with_providers();
+        let did = DID("did:dht:z6MkKpWatchdog".to_owned());
+        let poison_key = format!("kp::{}", did.0);
+
+        let handle = supervisor
+            .key_package_store_for(&did)
+            .await
+            .expect("kp store resolves");
+
+        // Induce a panic through the testing-only seam. The watchdog catches
+        // it, records a crash, removes the dead handle, and respawns.
+        handle
+            .send_induce_panic("kp-panic-sentinel")
+            .await
+            .expect("induce-panic command is accepted");
+
+        // Wait for the watchdog to record the crash + respawn. Use `poll_until`
+        // (5ms interval, generous ~8s ceiling) rather than a fixed
+        // `sleep(20ms)×50` loop, which is flaky on loaded CI when the watchdog
+        // task is scheduled late — matching the sibling poison tests.
+        let recorded = poll_until(|| {
+            supervisor
+                .crash_windows
+                .get(&poison_key)
+                .is_some_and(|w| w.crash_count() >= 1)
+        })
+        .await;
+        assert!(recorded, "watchdog must record the KP-actor panic");
+        assert!(
+            !supervisor.is_context_poisoned(&poison_key),
+            "a single crash must not poison the identity"
+        );
+
+        // The respawned actor resolves a live handle (the dead one was removed).
+        let fresh = supervisor
+            .key_package_store_for(&did)
+            .await
+            .expect("respawned kp store resolves");
+        fresh
+            .send_shutdown()
+            .await
+            .expect("respawned handle is live");
+    }
+
+    /// Three KP-actor panics within the budget window poison the identity; the
+    /// next `key_package_store_for` surfaces a typed `ContextPoisoned` error.
+    #[tokio::test]
+    async fn kp_actor_poisons_after_budget() {
+        let supervisor = supervisor_with_providers();
+        let did = DID("did:dht:z6MkKpPoison".to_owned());
+        let poison_key = format!("kp::{}", did.0);
+
+        for _ in 0..CRASH_POISON_THRESHOLD {
+            // Resolve (get-or-respawn) and induce a panic.
+            match supervisor.key_package_store_for(&did).await {
+                Ok(handle) => {
+                    let _ = handle.send_induce_panic("kp-poison-sentinel").await;
+                }
+                Err(ContextError::ContextPoisoned(_)) => break,
+                Err(e) => panic!("unexpected error before poison: {e:?}"),
+            }
+            // Let the watchdog process this crash before inducing the next.
+            poll_until(|| {
+                supervisor.crash_windows.get(&poison_key).is_some_and(|w| {
+                    w.is_poisoned() || !supervisor.key_package_stores.contains_key(&did)
+                })
+            })
+            .await;
+        }
+
+        // Wait for the poison flag to settle.
+        let poisoned = poll_until(|| supervisor.is_context_poisoned(&poison_key)).await;
+        assert!(poisoned, "identity must poison after the crash budget");
+
+        // The next resolution surfaces a typed poison error.
+        match supervisor.key_package_store_for(&did).await {
+            Err(ContextError::ContextPoisoned(_)) => {}
+            Ok(_) => panic!("poisoned identity must not resolve a live handle"),
+            Err(e) => panic!("expected ContextPoisoned, got {e:?}"),
+        }
+    }
+
+    /// `clear_kp_poison` is the operator recovery surface for a poisoned
+    /// per-identity KeyPackage actor (E1): it clears the sticky `kp::{did}`
+    /// window and re-resolves the actor via `key_package_store_for` (which
+    /// reconciles from the journal), WITHOUT routing through the per-context
+    /// snapshot respawn (there is no KP context-snapshot). After recovery the
+    /// identity resolves a live handle again.
+    #[tokio::test]
+    async fn clear_kp_poison_recovers_poisoned_actor() {
+        let supervisor = supervisor_with_providers();
+        let did = DID("did:dht:z6MkKpClearPoison".to_owned());
+        let poison_key = format!("kp::{}", did.0);
+
+        // Drive the actor to the poison threshold.
+        for _ in 0..CRASH_POISON_THRESHOLD {
+            match supervisor.key_package_store_for(&did).await {
+                Ok(handle) => {
+                    let _ = handle.send_induce_panic("kp-clear-sentinel").await;
+                }
+                Err(ContextError::ContextPoisoned(_)) => break,
+                Err(e) => panic!("unexpected error before poison: {e:?}"),
+            }
+            poll_until(|| {
+                supervisor.crash_windows.get(&poison_key).is_some_and(|w| {
+                    w.is_poisoned() || !supervisor.key_package_stores.contains_key(&did)
+                })
+            })
+            .await;
+        }
+        let poisoned = poll_until(|| supervisor.is_context_poisoned(&poison_key)).await;
+        assert!(poisoned, "precondition: identity poisoned after the budget");
+
+        // Operator recovery: clear the KP poison and re-resolve.
+        supervisor
+            .clear_kp_poison(&did)
+            .await
+            .expect("clear_kp_poison recovers a poisoned KP actor");
+
+        assert!(
+            !supervisor.is_context_poisoned(&poison_key),
+            "clear_kp_poison clears the sticky poison flag"
+        );
+        supervisor
+            .key_package_store_for(&did)
+            .await
+            .expect("a recovered identity resolves a live handle");
     }
 
     /// Two concurrent broadcast publishes reserve DISTINCT sequences

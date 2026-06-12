@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use scp_core::context::builder::{ContextCreationError, ContextTransportProvider};
 use scp_core::context::{ContextError, ContextParams};
+use scp_core::crypto::envelope_seal::derive_key_package_routing_id;
 use scp_core::envelope::OuterEnvelope;
 
 use crate::traits::{BlobId, TransportAdapter};
@@ -95,6 +96,78 @@ impl<A: TransportAdapter + Send + Sync + 'static> RelayTransportProvider<A> {
     pub fn mark_connected(&self) {
         self.connected.store(true, Ordering::Release);
     }
+
+    /// Build an [`OuterEnvelope`] for `routing_id` carrying `blob`.
+    ///
+    /// Centralizes the envelope-construction boilerplate the four publish /
+    /// send paths share (version, default TTL, empty extensions, no
+    /// recipient-hint / version-compatibility).
+    fn build_envelope(routing_id: Vec<u8>, blob: Vec<u8>) -> OuterEnvelope {
+        OuterEnvelope {
+            version: scp_core::envelope::SCP_PROTOCOL_VERSION,
+            routing_id,
+            recipient_hint: None,
+            blob_ttl: DEFAULT_BLOB_TTL,
+            encrypted_blob: blob,
+            extensions: std::collections::HashMap::new(),
+            version_compatibility: None,
+        }
+    }
+
+    /// Bridge the async adapter `send` to the synchronous
+    /// [`ContextTransportProvider`] surface WITHOUT panicking on a
+    /// `current_thread` runtime.
+    ///
+    /// `tokio::task::block_in_place` requires a multi-thread runtime: on a
+    /// `current_thread` runtime it PANICS (`can call blocking only when
+    /// running on the multi-threaded runtime`), and that panic is reachable
+    /// from production (any node driven by a `current_thread` runtime), so it
+    /// must be turned into a typed error rather than an unwind. We probe the
+    /// current runtime's flavor first and return
+    /// [`ContextError::TransportFailed`] on `current_thread`, only entering
+    /// `block_in_place` when the multi-thread flavor makes it safe.
+    fn send_blocking(&self, envelope: &OuterEnvelope) -> Result<BlobId, ContextError> {
+        // Shared runtime-flavor probe: `block_in_place` panics on a
+        // `current_thread` runtime (a reachable production crash), so guard it
+        // and surface a typed error. `op` is the description for the typed
+        // error messages.
+        require_multi_thread_runtime("send").map_err(ContextError::TransportFailed)?;
+        let adapter = Arc::clone(&self.adapter);
+        // ci-allow: block-on: multi-thread runtime only — flavor is checked
+        // above; current_thread returns a typed error instead of panicking.
+        // Sync ContextTransportProvider surface bridges to the async adapter
+        // here.
+        tokio::task::block_in_place(|| {
+            let guard = adapter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tokio::runtime::Handle::current().block_on(guard.send(envelope))
+        })
+        .map_err(|e| ContextError::TransportFailed(e.to_string()))
+    }
+}
+
+/// Probe the current tokio runtime and require the multi-thread flavor.
+///
+/// `tokio::task::block_in_place` PANICS on a `current_thread` runtime (a
+/// reachable production crash from any node driven by a `current_thread`
+/// runtime), so every sync→async bridge in this provider must check the flavor
+/// FIRST and return a typed error instead of unwinding. `op` names the
+/// operation for the error text (e.g. `"send"`, `"delete"`).
+///
+/// Returns `Ok(())` only on a multi-thread runtime; otherwise an `Err(String)`
+/// the caller maps into its own transport-error type.
+fn require_multi_thread_runtime(op: &str) -> Result<(), String> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            Ok(())
+        }
+        Ok(_) => Err(format!(
+            "transport {op} requires a multi-thread tokio runtime; \
+             a current_thread runtime cannot bridge the sync→async boundary"
+        )),
+        Err(_) => Err(format!("transport {op} called outside a tokio runtime")),
+    }
 }
 
 // Nursery lint — false-positives on lock guards across block boundaries.
@@ -111,49 +184,32 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         context_id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
-        // Build an OuterEnvelope representing the context announcement.
-        // The routing_id is the context_id itself (used by relays for routing).
-        //
         // Context announcements carry a minimal 1-byte placeholder blob because
         // the relay rejects empty blobs. The actual context parameters are not
-        // published (they are exchanged via the invite/join flow).
-        let envelope = OuterEnvelope {
-            version: scp_core::envelope::SCP_PROTOCOL_VERSION,
-            routing_id: context_id.to_vec(),
-            recipient_hint: None,
-            blob_ttl: DEFAULT_BLOB_TTL,
-            encrypted_blob: vec![0x00], // Placeholder: relay rejects empty blobs.
-            extensions: std::collections::HashMap::new(),
-            version_compatibility: None,
-        };
-
-        // Clone the Arc so the mutex lock is acquired inside block_in_place,
-        // avoiding holding a std::sync::Mutex guard across async I/O which
-        // would block tokio worker threads on concurrent calls.
-        let adapter = Arc::clone(&self.adapter);
-
-        let result = tokio::task::block_in_place(|| {
-            let guard = adapter
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tokio::runtime::Handle::current().block_on(guard.send(&envelope))
-        });
-
-        match result {
-            Ok(_blob_id) => Ok(()),
-            Err(e) => Err(ContextCreationError::TransportFailed(e.to_string())),
-        }
+        // published (they are exchanged via the invite/join flow). The
+        // routing_id is the context_id itself (used by relays for routing).
+        let envelope = Self::build_envelope(context_id.to_vec(), vec![0x00]);
+        self.send_blocking(&envelope)
+            .map(|_blob_id| ())
+            .map_err(|e| ContextCreationError::TransportFailed(e.to_string()))
     }
 
     fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let blob_id = BlobId::from_sha256(context_id);
 
-        let adapter = Arc::clone(&self.adapter);
+        // Shared runtime-flavor probe (see `require_multi_thread_runtime`):
+        // block_in_place panics on a current_thread runtime, so guard it and
+        // surface a typed error instead.
+        require_multi_thread_runtime("delete").map_err(ContextCreationError::TransportFailed)?;
 
+        let adapter = Arc::clone(&self.adapter);
         let result = tokio::task::block_in_place(|| {
             let guard = adapter
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // ci-allow: block-on: multi-thread runtime only (flavor checked
+            // above); sync ContextTransportProvider surface bridges to the
+            // async adapter delete here.
             tokio::runtime::Handle::current().block_on(guard.delete(&blob_id))
         });
 
@@ -168,29 +224,21 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
     ) -> Result<(), ContextError> {
-        let envelope = OuterEnvelope {
-            version: scp_core::envelope::SCP_PROTOCOL_VERSION,
-            routing_id: context_id.to_vec(),
-            recipient_hint: None,
-            blob_ttl: DEFAULT_BLOB_TTL,
-            encrypted_blob: encrypted_payload.to_vec(),
-            extensions: std::collections::HashMap::new(),
-            version_compatibility: None,
-        };
+        let envelope = Self::build_envelope(context_id.to_vec(), encrypted_payload.to_vec());
+        self.send_blocking(&envelope).map(|_blob_id| ())
+    }
 
-        let adapter = Arc::clone(&self.adapter);
-
-        let result = tokio::task::block_in_place(|| {
-            let guard = adapter
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tokio::runtime::Handle::current().block_on(guard.send(&envelope))
-        });
-
-        match result {
-            Ok(_blob_id) => Ok(()),
-            Err(e) => Err(ContextError::TransportFailed(e.to_string())),
-        }
+    fn publish_key_package(&self, owner_did: &str, kp_bytes: &[u8]) -> Result<(), ContextError> {
+        // Route the published KeyPackage under the CANONICAL per-DID routing id
+        // `derive_key_package_routing_id(owner_did)` (spec §5.12.3), so a peer
+        // fetches this identity's KeyPackages with the SAME id the canonical
+        // fetcher computes from the owner DID. The bytes land on this adapter's
+        // own connection — there is no per-relay-URL fan-out. The
+        // content-addressed blob keeps a re-publish of identical bytes
+        // idempotent at the relay.
+        let routing_id = derive_key_package_routing_id(owner_did);
+        let envelope = Self::build_envelope(routing_id.to_vec(), kp_bytes.to_vec());
+        self.send_blocking(&envelope).map(|_blob_id| ())
     }
 }
 

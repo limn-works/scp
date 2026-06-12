@@ -393,6 +393,16 @@ pub const CTX_2134: &str = "SCP-CTX-2134";
 ///
 /// Maps from `ContextError::ActorCrashed`.
 pub const CTX_2135: &str = "SCP-CTX-2135";
+/// Key package single-use replay rejected by the crypto-layer consumed-init-key
+/// backstop (ADR-049 §9 two-anchor single-use model).
+///
+/// Distinct from the generic `CTX_2001` catch-all and from `InvalidState`: a
+/// caller can detect a security-relevant single-use replay (a Welcome addressed
+/// to an already-consumed `KeyPackage` init key) rather than a transient state
+/// mismatch.
+///
+/// Maps from `ContextError::KeyPackageReplay`.
+pub const CTX_2136: &str = "SCP-CTX-2136";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.
