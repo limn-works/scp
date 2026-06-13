@@ -54,6 +54,13 @@ rmp-serde = { workspace = true }
 proptest = "1"
 scp-primitives = { path = "../scp-primitives" }
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }
+# RFC 9180 reference implementation — used ONLY as a cross-validation oracle
+# for the hand-implemented `crypto::hpke` core. Already present in Cargo.lock
+# via openmls; dev-deps never ship in production or wasm32 builds. MPL-2.0
+# (allowed in deny.toml). Gated #[cfg(not(target_arch = "wasm32"))] in the
+# oracle test so `cargo check --target wasm32` is unaffected.
+hpke-rs = "0.6"
+hpke-rs-rust-crypto = "0.6"
 
 [lints]
 workspace = true
