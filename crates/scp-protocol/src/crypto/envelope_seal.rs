@@ -77,7 +77,7 @@ pub fn ed25519_pubkey_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], Enve
     Ok(verifying_key.to_montgomery().to_bytes())
 }
 
-/// Builds the HKDF info string for invitation ECIES.
+/// Builds the HPKE `info` string for invitation HPKE (§5.12.3.1).
 /// Format: `"scp-invitation-v1" || len(context_id) || context_id || len(creator_did) || creator_did`
 fn build_invitation_info(context_id: &str, creator_did: &str) -> Vec<u8> {
     let mut info = Vec::new();

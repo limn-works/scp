@@ -1193,15 +1193,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         let mut new_psk = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut new_psk);
 
-        // For each eligible device, wrap the PSK using X25519 ECDH:
-        // 1. Generate ephemeral X25519 keypair
-        // 2. ECDH with device's public key to get shared secret
-        // 3. HKDF-SHA256 to derive AES-256-GCM wrapping key
-        // 4. AES-256-GCM encrypt the PSK (random nonce)
-        // 5. Output: ephemeral_pubkey || nonce || ciphertext || tag
-        //
-        // This ensures only the holder of the device's X25519 private key
-        // can recover the shared secret and unwrap the PSK.
+        // For each eligible device, wrap the new PSK via RFC 9180 HPKE Base
+        // mode (§3.7.2): DHKEM(X25519, HKDF-SHA256) Encap to the device key,
+        // AES-128-GCM seal under info "scp-private-state-v1" || len(did) ||
+        // did || "psk-rotate". Output is enc(32) || ct(48) = 80 bytes; the
+        // AEAD nonce is internal per RFC 9180. Only the holder of the device's
+        // X25519 private key can complete Decap and unwrap the PSK.
         let mut wrapped_psks: Vec<Vec<u8>> = Vec::with_capacity(eligible_devices.len());
         for device_pk in &eligible_devices {
             // Device public key must be exactly 32 bytes (X25519).
