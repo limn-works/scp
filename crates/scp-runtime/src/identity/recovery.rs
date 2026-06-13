@@ -1172,7 +1172,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // The wrapped PSKs are distributed as a recovery notification.
 
         use rand::RngCore as _;
-        use zeroize::Zeroize as _;
+        use zeroize::Zeroizing;
 
         // Filter out the compromised device, if any.
         let eligible_devices: Vec<&[u8]> = params
@@ -1192,9 +1192,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             return false;
         }
 
-        // Generate a fresh PSK (32 bytes of random data).
-        let mut new_psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut new_psk);
+        // Generate a fresh PSK (32 bytes of random data). Held in `Zeroizing`
+        // so the plaintext PSK is wiped on drop regardless of which return
+        // path is taken (including the early `device_pk.len() != 32` reject
+        // below), preserving forward secrecy of the rotated key.
+        let mut new_psk = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(new_psk.as_mut());
 
         // For each eligible device, wrap the new PSK via RFC 9180 HPKE Base
         // mode (§3.7.2): DHKEM(X25519, HKDF-SHA256) Encap to the device key,
@@ -1211,13 +1214,15 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             let mut pk_bytes = [0u8; 32];
             pk_bytes.copy_from_slice(device_pk);
             match wrap_psk_for_device(&new_psk, &pk_bytes, &params.did) {
+                // `&new_psk` deref-coerces `&Zeroizing<[u8; 32]>` to `&[u8; 32]`.
                 Some(wrapped) => wrapped_psks.push(wrapped),
                 None => return false,
             }
         }
 
-        // Zeroize the plaintext PSK now that all devices have wrapped copies.
-        new_psk.zeroize();
+        // The plaintext PSK is wiped automatically when `new_psk` (a
+        // `Zeroizing<[u8; 32]>`) is dropped at end of scope — no explicit
+        // call needed, and every early return is now covered too.
 
         // Distribute the wrapped PSKs as a recovery notification via the
         // context manager. Each entry in the serialized payload corresponds
