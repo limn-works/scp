@@ -552,12 +552,12 @@ pub enum ContextEvent {
     },
     /// An MLS Welcome was generated for a newly added member.
     ///
-    /// The application layer must ECIES-encrypt and deliver it to the
-    /// joiner's personal routing ID (spec §5.12.3, issue #1311).
+    /// The application layer must HPKE-encrypt (RFC 9180, §5.12.3.1) and
+    /// deliver it to the joiner's personal routing ID (spec §5.12.3).
     WelcomeGenerated {
-        /// Context ID for ECIES domain binding.
+        /// Context ID for HPKE `info`/`aad` domain binding.
         context_id: String,
-        /// DID of the context creator (for ECIES domain binding).
+        /// DID of the context creator (for HPKE `info`/`aad` domain binding).
         creator_did: DID,
         /// DID of the member being invited.
         member_did: DID,

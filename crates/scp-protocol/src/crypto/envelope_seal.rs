@@ -1,25 +1,23 @@
-//! Generalized ECIES envelope seal/open for arbitrary-length payloads.
+//! RFC 9180 HPKE envelope seal/open for arbitrary-length payloads.
 //!
-//! Reuses the HKDF-SHA256 + AES-128-GCM construction from `sender_keys/key_protocol.rs`
-//! but with variable-length plaintext and invitation-specific domain separators.
-//! Used for invitation bundle and join response encryption (spec §5.12.3).
+//! Used for invitation bundle and join response encryption (spec §5.12.3.1),
+//! over the shared [`crate::crypto::hpke`] core (RFC 9180 Base mode, §9.5).
+//! The invitation-specific `info`/`aad` domain separators distinguish these
+//! ciphertexts from sender-key, access-key, broadcast-key, and private-state
+//! HPKE.
 
 use sha2::{Digest, Sha256};
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
-use zeroize::Zeroizing;
 
-use super::sender_keys::key_protocol_verify::{
-    aes128gcm_decrypt, aes128gcm_encrypt, hkdf_derive_key,
-};
+use crate::crypto::hpke;
 
 /// Errors from envelope seal/open operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeSealError {
-    /// ECIES encryption failed.
-    #[error("ECIES encryption failed: {0}")]
+    /// HPKE encryption failed.
+    #[error("HPKE encryption failed: {0}")]
     SealFailed(String),
-    /// ECIES decryption failed.
-    #[error("ECIES decryption failed: {0}")]
+    /// HPKE decryption failed.
+    #[error("HPKE decryption failed: {0}")]
     OpenFailed(String),
 }
 
@@ -79,7 +77,7 @@ pub fn ed25519_pubkey_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], Enve
     Ok(verifying_key.to_montgomery().to_bytes())
 }
 
-/// Builds the HKDF info string for invitation ECIES.
+/// Builds the HPKE `info` string for invitation HPKE (§5.12.3.1).
 /// Format: `"scp-invitation-v1" || len(context_id) || context_id || len(creator_did) || creator_did`
 fn build_invitation_info(context_id: &str, creator_did: &str) -> Vec<u8> {
     let mut info = Vec::new();
@@ -89,96 +87,75 @@ fn build_invitation_info(context_id: &str, creator_did: &str) -> Vec<u8> {
     info
 }
 
-/// Builds the AES-GCM AAD for invitation ECIES (distinct from HKDF info).
-/// Format: `"scp-invitation-aad-v1" || len(context_id) || context_id || len(creator_did) || creator_did || ephemeral_pubkey[32]`
+/// Builds the AEAD AAD for invitation HPKE (distinct from the HPKE `info`).
+/// Format: `"scp-invitation-aad-v1" || len(context_id) || context_id || len(creator_did) || creator_did`
 ///
-/// Including the ephemeral public key in the AAD binds the ciphertext to
-/// the specific DH exchange, preventing ephemeral key substitution attacks.
-fn build_invitation_aad(context_id: &str, creator_did: &str, ephemeral_pub: &[u8; 32]) -> Vec<u8> {
+/// The ephemeral public key (`enc`) is NOT carried in the AAD: RFC 9180 binds
+/// `enc` into the key schedule via `kem_context = enc || pkRm` (§4.1), so an
+/// ephemeral-key substitution already produces a different derived key and
+/// fails AEAD verification. Including `enc` in the AAD would be redundant (and
+/// caused a build-AAD-before-enc-exists ordering wart). See spec §5.12.3.1.
+fn build_invitation_aad(context_id: &str, creator_did: &str) -> Vec<u8> {
     let mut aad = Vec::new();
     aad.extend_from_slice(b"scp-invitation-aad-v1");
     append_length_prefixed(&mut aad, context_id.as_bytes());
     append_length_prefixed(&mut aad, creator_did.as_bytes());
-    aad.extend_from_slice(ephemeral_pub);
     aad
 }
 
-/// ECIES-seals an arbitrary-length payload to a recipient's X25519 public key.
+/// HPKE-seals an arbitrary-length payload to a recipient's X25519 public key
+/// (RFC 9180 Base mode, §5.12.3.1).
 ///
-/// Returns `(sealed_bytes, ephemeral_pubkey)` where `sealed_bytes` = `nonce || ciphertext || tag`.
-/// Uses HKDF-SHA256 + AES-128-GCM, matching the sender key ECIES construction.
+/// Returns `(sealed, enc)` where `sealed` is the HPKE ciphertext
+/// (`ciphertext || tag`) and `enc` is the 32-byte HPKE encapsulated key. There
+/// is no external nonce — the AEAD nonce is derived internally by RFC 9180.
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeSealError::SealFailed`] if encryption fails.
-pub fn ecies_seal(
+/// Returns [`EnvelopeSealError::SealFailed`] if HPKE sealing fails.
+pub fn hpke_seal_invitation(
     plaintext: &[u8],
     recipient_x25519_pub: &[u8; 32],
     context_id: &str,
     creator_did: &str,
 ) -> Result<(Vec<u8>, [u8; 32]), EnvelopeSealError> {
-    let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
-    let ephemeral_public = X25519Pub::from(&ephemeral_secret);
-    let ephemeral_pub_bytes = ephemeral_public.to_bytes();
-
-    let recipient_key = X25519Pub::from(*recipient_x25519_pub);
-    let shared_secret = ephemeral_secret.diffie_hellman(&recipient_key);
-
     let info = build_invitation_info(context_id, creator_did);
-    let aad = build_invitation_aad(context_id, creator_did, &ephemeral_pub_bytes);
+    let aad = build_invitation_aad(context_id, creator_did);
 
-    // x25519-dalek v2 SharedSecret implements Zeroize + zeroize(drop) when the
-    // zeroize feature is enabled (which it is). Wrapping in Zeroizing is
-    // defense-in-depth — ensures zeroing even if the feature is ever removed.
-    let shared_bytes = Zeroizing::new(*shared_secret.as_bytes());
-    let aes_key = hkdf_derive_key(shared_bytes.as_ref(), &info)
+    let (enc, ct) = hpke::seal(recipient_x25519_pub, &info, &aad, plaintext)
         .map_err(|e| EnvelopeSealError::SealFailed(e.to_string()))?;
 
-    let sealed = aes128gcm_encrypt(&aes_key, plaintext, &aad)
-        .map_err(|e| EnvelopeSealError::SealFailed(e.to_string()))?;
-
-    Ok((sealed, ephemeral_pub_bytes))
+    Ok((ct, enc))
 }
 
-/// ECIES-opens a sealed payload using a local X25519 secret key.
+/// HPKE-opens a sealed payload using a local (software-held) X25519 secret key.
 ///
-/// The `ephemeral_pub` is the sender's ephemeral X25519 public key from the seal operation.
+/// The `ephemeral_pub` is the HPKE encapsulated key (`enc`) from the seal
+/// operation.
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeSealError::OpenFailed`] if decryption fails (wrong key, tampered
-/// ciphertext, wrong context/DID binding).
-pub fn ecies_open(
+/// Returns [`EnvelopeSealError::OpenFailed`] if HPKE open fails (wrong key,
+/// tampered ciphertext/enc, wrong context/DID binding).
+pub fn hpke_open_invitation(
     sealed: &[u8],
     ephemeral_pub: &[u8; 32],
     local_x25519_secret: &[u8; 32],
     context_id: &str,
     creator_did: &str,
 ) -> Result<Vec<u8>, EnvelopeSealError> {
-    let ephemeral_key = X25519Pub::from(*ephemeral_pub);
-    // Wrap the dereferenced secret in Zeroizing so the stack copy is zeroed
-    // on drop (StaticSecret::from consumes by value, creating a second copy).
-    let secret_copy = Zeroizing::new(*local_x25519_secret);
-    let local_secret = x25519_dalek::StaticSecret::from(*secret_copy);
-    let shared_secret = local_secret.diffie_hellman(&ephemeral_key);
-
     let info = build_invitation_info(context_id, creator_did);
-    let aad = build_invitation_aad(context_id, creator_did, ephemeral_pub);
+    let aad = build_invitation_aad(context_id, creator_did);
 
-    // x25519-dalek v2 SharedSecret implements Zeroize + zeroize(drop) when the
-    // zeroize feature is enabled (which it is). Wrapping in Zeroizing is
-    // defense-in-depth — ensures zeroing even if the feature is ever removed.
-    let shared_bytes = Zeroizing::new(*shared_secret.as_bytes());
-    let aes_key = hkdf_derive_key(shared_bytes.as_ref(), &info)
-        .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))?;
-
-    aes128gcm_decrypt(&aes_key, sealed, &aad)
+    hpke::open(local_x25519_secret, ephemeral_pub, &info, &aad, sealed)
         .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use x25519_dalek::PublicKey as X25519Pub;
+
     use super::*;
 
     #[test]
@@ -188,9 +165,10 @@ mod tests {
 
         let plaintext = b"hello world, this is an invitation bundle";
         let (sealed, eph_pub) =
-            ecies_seal(plaintext, public.as_bytes(), "ctx-123", "did:dht:z6MkAlice").unwrap();
+            hpke_seal_invitation(plaintext, public.as_bytes(), "ctx-123", "did:dht:z6MkAlice")
+                .unwrap();
 
-        let recovered = ecies_open(
+        let recovered = hpke_open_invitation(
             &sealed,
             &eph_pub,
             &secret.to_bytes(),
@@ -207,7 +185,7 @@ mod tests {
         let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let public = X25519Pub::from(&secret);
 
-        let (sealed, eph_pub) = ecies_seal(
+        let (sealed, eph_pub) = hpke_seal_invitation(
             b"payload",
             public.as_bytes(),
             "ctx-123",
@@ -215,7 +193,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = ecies_open(
+        let result = hpke_open_invitation(
             &sealed,
             &eph_pub,
             &secret.to_bytes(),
@@ -230,7 +208,7 @@ mod tests {
         let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let public = X25519Pub::from(&secret);
 
-        let (sealed, eph_pub) = ecies_seal(
+        let (sealed, eph_pub) = hpke_seal_invitation(
             b"payload",
             public.as_bytes(),
             "ctx-123",
@@ -238,7 +216,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = ecies_open(
+        let result = hpke_open_invitation(
             &sealed,
             &eph_pub,
             &secret.to_bytes(),
@@ -269,7 +247,7 @@ mod tests {
         let bob_x25519_pub = ed25519_pubkey_to_x25519(&bob_verifying.to_bytes()).unwrap();
 
         // Alice seals
-        let (sealed, eph_pub) = ecies_seal(
+        let (sealed, eph_pub) = hpke_seal_invitation(
             b"welcome message",
             &bob_x25519_pub,
             "ctx-abc",
@@ -282,7 +260,7 @@ mod tests {
         let bob_x25519_secret = x25519_dalek::StaticSecret::from(bob_scalar_bytes);
 
         // Bob opens
-        let recovered = ecies_open(
+        let recovered = hpke_open_invitation(
             &sealed,
             &eph_pub,
             &bob_x25519_secret.to_bytes(),
@@ -311,7 +289,7 @@ mod tests {
 
         // 10KB payload (larger than Welcome messages typically)
         let plaintext = vec![0x42u8; 10_000];
-        let (sealed, eph_pub) = ecies_seal(
+        let (sealed, eph_pub) = hpke_seal_invitation(
             &plaintext,
             public.as_bytes(),
             "ctx-large",
@@ -319,7 +297,7 @@ mod tests {
         )
         .unwrap();
 
-        let recovered = ecies_open(
+        let recovered = hpke_open_invitation(
             &sealed,
             &eph_pub,
             &secret.to_bytes(),

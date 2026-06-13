@@ -154,6 +154,7 @@ async fn compromise_tier_active_signing() {
     let kr = active_key_rotation_outcome(&alice, 2000);
     let contacts = HashSet::from([did("did:dht:bob")]);
     let psk_params = PskRotationParams {
+        did: "did:dht:zRecoveryTestIdentity".to_owned(),
         enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
         compromised_device_pubkey: None,
     };
@@ -196,6 +197,7 @@ async fn compromise_tier_identity_key() {
     let kr = identity_key_rotation_outcome(&alice, alice_new.clone(), 3000);
     let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
     let psk_params = PskRotationParams {
+        did: "did:dht:zRecoveryTestIdentity".to_owned(),
         enrolled_device_pubkeys: vec![vec![1u8; 32]],
         compromised_device_pubkey: None,
     };
@@ -509,6 +511,7 @@ async fn recovery_result_with_rejoin_context() {
 async fn psk_rotation_params() {
     // Without compromised device.
     let params_clean = PskRotationParams {
+        did: "did:dht:zRecoveryTestIdentity".to_owned(),
         enrolled_device_pubkeys: vec![vec![0xAA; 32], vec![0xBB; 32], vec![0xCC; 32]],
         compromised_device_pubkey: None,
     };
@@ -517,6 +520,7 @@ async fn psk_rotation_params() {
 
     // With compromised device excluded.
     let params_compromised = PskRotationParams {
+        did: "did:dht:zRecoveryTestIdentity".to_owned(),
         enrolled_device_pubkeys: vec![vec![0xAA; 32], vec![0xBB; 32], vec![0xCC; 32]],
         compromised_device_pubkey: Some(vec![0xBB; 32]),
     };
@@ -662,6 +666,7 @@ async fn recovery_with_psk_rotation_failure() {
     let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![]);
     let kr = active_key_rotation_outcome(&alice, 9000);
     let psk_params = PskRotationParams {
+        did: "did:dht:zRecoveryTestIdentity".to_owned(),
         enrolled_device_pubkeys: vec![vec![1u8; 32]],
         compromised_device_pubkey: Some(vec![1u8; 32]),
     };

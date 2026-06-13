@@ -16,6 +16,7 @@ use std::hash::BuildHasher;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
+use zeroize::Zeroizing;
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 
@@ -207,11 +208,12 @@ pub async fn request_sender_key(
 ///
 /// # HPKE Assembly
 ///
-/// 1. Generate ephemeral X25519 keypair (software-generated).
-/// 2. ECDH between ephemeral secret and requester's wrapping pubkey.
-/// 3. HKDF-SHA256 to derive a 16-byte AES-128-GCM encryption key.
-/// 4. AES-128-GCM encrypt the sender key bytes.
-/// 5. Include the ephemeral public key in the response.
+/// Seals via RFC 9180 HPKE Base mode (§9.16.2) through the shared
+/// `scp_protocol::crypto::hpke` core: a fresh ephemeral keypair performs
+/// DHKEM Encap to the requester's wrapping pubkey, `KeySchedule_base` derives
+/// the AEAD key/nonce, and a single seq-0 `Seal` produces the 48-byte
+/// ciphertext. The `ephemeral_pubkey` (HPKE `enc`) is returned in the
+/// response; there is no external nonce.
 ///
 /// # Errors
 ///
@@ -278,11 +280,12 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
         params.epoch,
     )?;
 
-    // Convert to fixed-size array. hpke_seal always returns exactly 60 bytes
-    // (nonce 12 + ciphertext 32 + tag 16) for a 32-byte plaintext input.
-    let sealed: [u8; 60] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+    // Convert to fixed-size array. The HPKE seal always returns exactly 48
+    // bytes (ciphertext 32 + AES-128-GCM tag 16) for a 32-byte plaintext;
+    // the AEAD nonce is internal per RFC 9180.
+    let sealed: [u8; 48] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
         SenderKeyError::HpkeEncryptionFailed(format!(
-            "HPKE seal produced {} bytes, expected 60",
+            "HPKE seal produced {} bytes, expected 48",
             v.len()
         ))
     })?;
@@ -310,52 +313,74 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
 // Open sender key response (requester side) — async custody variant
 // ---------------------------------------------------------------------------
 
-/// Decrypts a [`SenderKeyResponse`] using the requester's wrapping key handle
-/// inside the [`KeyCustody`] boundary.
+/// Opens a [`SenderKeyResponse`] using the requester's wrapping key handle
+/// inside the [`KeyCustody`] boundary (RFC 9180 HPKE Base mode, §9.16.2).
 ///
-/// The shared secret is computed via `key_custody.dh_agree(wrapping_key_handle,
-/// ephemeral_pk)` so the wrapping private key never leaves custody. KDF + AEAD
-/// decryption then recovers the sender key in software.
+/// The KEM Diffie-Hellman output is computed inside custody via
+/// `key_custody.dh_agree(wrapping_key_handle, enc)`, so the wrapping private
+/// key never leaves the boundary. The recipient public key `pkRm` is fetched
+/// via `key_custody.public_key(wrapping_key_handle)`. RFC 9180 DHKEM Decap
+/// (`ExtractAndExpand(dh, enc || pkRm)`), `KeySchedule_base`, and the AEAD open
+/// then complete in software via
+/// [`scp_protocol::crypto::hpke::custody::open_with_external_dh`].
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::KeyCustodyError`] if the DH agreement fails.
-/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if AEAD decryption fails.
+/// Returns [`SenderKeyError::KeyCustodyError`] if the DH agreement or
+/// public-key lookup fails. Returns [`SenderKeyError::HpkeDecryptionFailed`]
+/// if HPKE open fails (wrong key/`info`/`aad`, tampered `enc`/`ct`) or the
+/// recovered plaintext is not exactly 32 bytes.
 pub async fn open_sender_key_response(
     key_custody: &impl KeyCustody,
     wrapping_key_handle: &KeyHandle,
     context_id: &str,
     response: &SenderKeyResponse,
 ) -> Result<SenderKey, SenderKeyError> {
-    // hpke_sealed_key is [u8; 60] — length is enforced at the type level
-    // (nonce 12 + ciphertext 32 + AES-128-GCM tag 16 = 60 bytes).
-    // The ephemeral public key is already validated as [u8; 32] by serde.
-    let ephemeral_bytes: [u8; 32] = response.ephemeral_pubkey;
+    // The ephemeral public key (HPKE `enc`) is validated as [u8; 32] by serde.
+    let enc: [u8; 32] = response.ephemeral_pubkey;
 
-    // Compute shared secret inside custody boundary.
-    let shared_secret = key_custody
-        .dh_agree(wrapping_key_handle, &ephemeral_bytes)
+    // Compute the KEM DH output inside the custody boundary (same handle,
+    // same enc — the only sound inputs to open_with_external_dh).
+    let dh = key_custody
+        .dh_agree(wrapping_key_handle, &enc)
         .await
         .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
+    let dh_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*dh.as_bytes());
+
+    // Fetch pkRm for the same handle, needed for kem_context = enc || pkRm.
+    let pk_rm = key_custody
+        .public_key(wrapping_key_handle)
+        .await
+        .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
+    let pk_rm_bytes: [u8; 32] = pk_rm.as_bytes().try_into().map_err(|_| {
+        SenderKeyError::KeyCustodyError("wrapping public key must be 32 bytes".to_owned())
+    })?;
 
     // Build context-bound info and AAD (§9.16.2) using response fields.
     let info = build_hpke_info(context_id, &response.sender_did, response.epoch);
     let aad = build_hpke_aad(context_id, &response.sender_did, response.epoch);
 
-    // Derive AES-128-GCM key from shared secret (zeroized on drop).
-    let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info)?;
+    let plaintext = Zeroizing::new(
+        scp_protocol::crypto::hpke::custody::open_with_external_dh(
+            &dh_bytes,
+            &pk_rm_bytes,
+            &enc,
+            &info,
+            &aad,
+            &response.hpke_sealed_key,
+        )
+        .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?,
+    );
 
-    // Decrypt the sealed sender key with AAD verification.
-    let plaintext = aes128gcm_decrypt(&aes_key, &response.hpke_sealed_key, &aad)?;
+    let key_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(plaintext.as_slice().try_into().map_err(|_| {
+            SenderKeyError::HpkeDecryptionFailed(format!(
+                "decrypted key must be 32 bytes, got {}",
+                plaintext.len()
+            ))
+        })?);
 
-    let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
-        SenderKeyError::HpkeDecryptionFailed(format!(
-            "decrypted key must be 32 bytes, got {}",
-            plaintext.len()
-        ))
-    })?;
-
-    Ok(SenderKey::from_bytes(key_bytes))
+    Ok(SenderKey::from_bytes(*key_bytes))
 }
 
 // ---------------------------------------------------------------------------

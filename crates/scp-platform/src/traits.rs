@@ -459,7 +459,7 @@ pub trait KeyCustody: Send + Sync {
     /// then performs X25519 DH with the peer's X25519 public key. The private key never
     /// leaves the custody boundary.
     ///
-    /// Used for ECIES decryption of invitation bundles (spec §5.12.3).
+    /// Used for RFC 9180 HPKE decryption of invitation bundles (spec §5.12.3.1).
     ///
     /// # Errors
     ///

@@ -1285,8 +1285,8 @@ This suite matches the MLS ciphersuite (§9.5) and the DID-to-DID HPKE suite, mi
 
 **Open (recipient-side):**
 
-1. Call `SetupBaseR(enc, wrapping_secret_key, info)` (RFC 9180 §5.1.1) to obtain `recipient_context`, where `enc` is the `ephemeral_pubkey` from the response. The wrapping secret key is computed inside the `KeyCustody` boundary via `dh_agree(wrapping_key_handle, enc)`.
-2. Call `recipient_context.Open(aad, ct)` to recover `sender_key_bytes`, where `ct` is the `hpke_sealed_key` from the response.
+1. Compute the KEM Diffie-Hellman output `dh = DH(wrapping_secret_key, enc)` inside the `KeyCustody` boundary via `dh_agree(wrapping_key_handle, enc)`, where `enc` is the `ephemeral_pubkey` from the response. The wrapping private key never leaves custody — only the raw `dh` output (and the recipient's own public key `pkRm`, obtained via `KeyCustody::public_key(wrapping_key_handle)`) cross the boundary. RFC 9180 DHKEM Decap then completes outside custody: `shared_secret = ExtractAndExpand(dh, enc || pkRm)` (RFC 9180 §4.1), binding both `enc` and `pkRm` into the KEM shared secret. This is equivalent to `SetupBaseR(enc, wrapping_secret_key, info)` (RFC 9180 §5.1.1) for software-held keys, but splits the single non-extractable scalar multiplication into custody while keeping the rest of Decap + KeySchedule in software.
+2. Run `KeySchedule_base` over `shared_secret` and `info` to derive the AEAD `key`/`base_nonce`, then `Open(aad, ct)` to recover `sender_key_bytes`, where `ct` is the `hpke_sealed_key` from the response.
 
 **`info` parameter (domain separation):**
 
@@ -1618,6 +1618,11 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 |-------------|----------|-------------|----------------|
 | `"scp-sender-key-v1"` | Sender key HPKE encapsulation | `"scp-sender-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(sender_did)) \|\| sender_did \|\| epoch_BE` | §9.16.2 |
 | `"scp-access-key-v1"` | Access key HPKE encapsulation | `"scp-access-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(member_did)) \|\| member_did \|\| epoch_bytes` | §9.17.1 |
+| `"scp-broadcast-key-v1"` | Broadcast key HPKE encapsulation | `"scp-broadcast-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(author_did)) \|\| author_did \|\| epoch_bytes` | §5.14.2 |
+| `"scp-invitation-v1"` | Invitation/join HPKE encapsulation | `"scp-invitation-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(creator_did)) \|\| creator_did` | §5.12.3.1 |
+| `"scp-private-state-v1"` | PSK distribution HPKE encapsulation | `"scp-private-state-v1" \|\| BE32(len(did)) \|\| did \|\| purpose` where `purpose` ∈ {`"device-enroll"`, `"psk-rotate"`} | §3.7.2 |
+
+`"scp-invitation-aad-v1"` is an AEAD-AAD domain string (not an HPKE `info` prefix): `aad = "scp-invitation-aad-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(creator_did)) \|\| creator_did` (§5.12.3.1). The broadcast-key and access-key `aad` strings reuse the `info` field encoding without the domain-separator prefix (§5.14.2, §9.17.1).
 
 **HKDF labels** — used in HKDF-SHA-256 `salt` or `info` parameters:
 

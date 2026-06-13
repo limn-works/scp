@@ -32,9 +32,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use broadcast::{
     BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, BroadcastReplayDetector,
-    SealBroadcastParams, SigningPayloadFields, build_broadcast_signing_payload,
-    compute_provenance_hash, generate_broadcast_key, generate_broadcast_nonce, open_broadcast,
-    open_broadcast_trusted, rotate_broadcast_key, seal_broadcast, validate_broadcast_version,
+    SealBroadcastParams, SigningPayloadFields, build_broadcast_key_hpke_aad,
+    build_broadcast_key_hpke_info, build_broadcast_signing_payload, compute_provenance_hash,
+    generate_broadcast_key, generate_broadcast_nonce, open_broadcast, open_broadcast_key,
+    open_broadcast_trusted, rotate_broadcast_key, seal_broadcast, seal_broadcast_key_to_subscriber,
+    validate_broadcast_version,
 };
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 // build_sender_header, parse_sender_header, and SENDER_HEADER_SIZE are wire-format

@@ -2,6 +2,8 @@
 
 ## Project: SCP Protocol Core
 
+- [HPKE RFC 9180 conformance](hpke-rfc9180-conformance.md) — FIXED the custom-ECIES finding: one hand-impl RFC 9180 core in scp-protocol/src/crypto/hpke.rs (A.1 KAT + hpke-rs oracle), custody Decap variant, 60->48 wire, all 5 paths conformed; C5 platform custody verified OK
+
 ### Merkle Tree (event_log/)
 - RFC 6962 domain separation: leaf=SHA-256(0x00||data), interior=SHA-256(0x01||left||right)
 - Consistent across tree.rs, proof.rs, checkpoint.rs, metrics.rs, phase2_integration.rs

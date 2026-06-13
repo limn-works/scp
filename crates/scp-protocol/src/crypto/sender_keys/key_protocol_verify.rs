@@ -2,8 +2,13 @@
 //! key distribution protocol.
 //!
 //! This module contains all **sync, platform-independent** items from the
-//! sender key protocol: constants, wire types, HPKE helpers, hash helpers,
-//! signature verification, nonce deduplication, and block list expansion.
+//! sender key protocol: constants, wire types, HPKE context-binding helpers,
+//! hash helpers, signature verification, nonce deduplication, and block list
+//! expansion.
+//!
+//! Sender key distribution is sealed/opened with RFC 9180 HPKE via the shared
+//! [`crate::crypto::hpke`] core; the `build_hpke_info`/`build_hpke_aad`
+//! helpers below supply the §9.16.2 domain-separated `info`/`aad`.
 //!
 //! Async signing operations that depend on `KeyCustody` remain in
 //! `key_protocol` (in `scp-runtime`).
@@ -11,21 +16,16 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
-use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
-use hkdf::Hkdf;
-use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
-use zeroize::Zeroizing;
+use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
 #[cfg(test)]
 use super::generate_sender_key;
 use super::{SenderKey, SenderKeyError};
+use crate::crypto::hpke;
 use crate::identity::SigningKeyId;
-use crate::serde_util::{serde_hpke_sealed_60, serde_pubkey_32, serde_signature_64};
+use crate::serde_util::{serde_hpke_sealed_48, serde_pubkey_32, serde_signature_64};
 
 // ---------------------------------------------------------------------------
 // Wrapping keypair generation (§9.16.1)
@@ -46,7 +46,6 @@ use crate::serde_util::{serde_hpke_sealed_60, serde_pubkey_32, serde_signature_6
 /// See spec §9.16.1.
 #[must_use]
 pub fn generate_wrapping_keypair() -> ([u8; 32], [u8; 32]) {
-    use x25519_dalek::StaticSecret;
     let secret = StaticSecret::random_from_rng(OsRng);
     let public = X25519Pub::from(&secret);
     (public.to_bytes(), secret.to_bytes())
@@ -56,16 +55,15 @@ pub fn generate_wrapping_keypair() -> ([u8; 32], [u8; 32]) {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// AES-128-GCM nonce size in bytes.
-pub const HPKE_NONCE_SIZE: usize = 12;
-
 /// Maximum size of a serialized [`SenderKeyDistributionMessage`] in bytes (64 KiB).
 ///
 /// Pre-deserialization guard against allocation bombs from malformed input.
 pub const MAX_SENDER_KEY_MESSAGE_SIZE: usize = 65_536;
 
 /// HKDF info domain separator for sender key HPKE encryption (§9.16.2).
-/// The full info string is `"scp-sender-key-v1" || context_id || sender_did || epoch_BE`.
+/// The full info string is length-prefixed (see [`build_hpke_info`]):
+/// `"scp-sender-key-v1" || BE32(len(context_id)) || context_id ||
+/// BE32(len(sender_did)) || sender_did || BE64(epoch)`.
 const HPKE_INFO_PREFIX: &[u8] = b"scp-sender-key-v1";
 
 /// Grace period in seconds during which the old key should still be accepted
@@ -154,7 +152,11 @@ pub struct SenderKeyRequest {
 /// Response containing HPKE-encrypted sender key material.
 ///
 /// Sent as an MLS application message back to the requester. The sender
-/// key is encrypted using HPKE: ephemeral X25519 ECDH + HKDF + AES-128-GCM.
+/// key is sealed with RFC 9180 HPKE Base mode (§9.5, §9.16.2): the
+/// `ephemeral_pubkey` carries the HPKE encapsulated key (`enc`) and
+/// `hpke_sealed_key` carries the AEAD ciphertext (`ct = ciphertext || tag`).
+/// The AEAD nonce is derived internally by RFC 9180 (`base_nonce` at
+/// sequence 0) — there is NO external nonce on the wire.
 ///
 /// The [`request_nonce`][SenderKeyResponse::request_nonce] field echoes the
 /// nonce from the corresponding [`SenderKeyRequest`] to bind the response to
@@ -165,11 +167,12 @@ pub struct SenderKeyResponse {
     pub sender_did: String,
     /// The epoch of the distributed key.
     pub epoch: u64,
-    /// HPKE-sealed sender key bytes (AES-128-GCM nonce || ciphertext || tag).
-    /// Exactly 60 bytes: nonce (12) + encrypted key (32) + tag (16).
-    #[serde(with = "serde_hpke_sealed_60")]
-    pub hpke_sealed_key: [u8; 60],
-    /// The ephemeral X25519 public key used in the HPKE encapsulation.
+    /// HPKE ciphertext (`ct = ciphertext || tag`), 48 bytes: encrypted key
+    /// (32) + AES-128-GCM tag (16). The AEAD nonce is internal per RFC 9180.
+    #[serde(with = "serde_hpke_sealed_48")]
+    pub hpke_sealed_key: [u8; 48],
+    /// The HPKE encapsulated key (`enc`, a 32-byte ephemeral X25519 public
+    /// key) used to derive the KEM shared secret.
     #[serde(with = "serde_pubkey_32")]
     pub ephemeral_pubkey: [u8; 32],
     /// Echo of the request nonce from [`SenderKeyRequest::nonce`], binding
@@ -598,19 +601,20 @@ where
 // HPKE open (non-custody variant)
 // ---------------------------------------------------------------------------
 
-/// Decrypts an HPKE-sealed sender key using the raw X25519 wrapping secret
-/// key bytes.
+/// Opens an HPKE-sealed sender key using the raw X25519 wrapping secret key
+/// bytes (RFC 9180 Base mode, §9.16.2).
 ///
-/// This is the non-custody variant of
-/// `key_protocol::open_sender_key_response` (in `scp-runtime`) for use when the
-/// wrapping secret key is held in software (e.g., in
-/// `MlsCryptoProvider`) rather
-/// than inside a `KeyCustody` boundary.
+/// This is the non-custody (software-key) variant of
+/// `key_protocol::open_sender_key_response` (in `scp-runtime`), for use when
+/// the wrapping secret key is held in software (e.g. in `MlsCryptoProvider`)
+/// rather than inside a `KeyCustody` boundary. Custody-held keys must use
+/// [`crate::crypto::hpke::custody::open_with_external_dh`].
 ///
 /// # Arguments
 ///
-/// * `sealed` - The HPKE-sealed key bytes (`nonce || ciphertext || tag`).
-/// * `ephemeral_pubkey` - The sender's ephemeral X25519 public key.
+/// * `sealed` - The HPKE ciphertext `ct` (`ciphertext || tag`).
+/// * `ephemeral_pubkey` - The HPKE encapsulated key `enc` (sender's ephemeral
+///   X25519 public key).
 /// * `wrapping_secret` - The recipient's X25519 wrapping secret key (32 bytes).
 /// * `context_id` - The SCP context identifier (hex string).
 /// * `sender_did` - The DID of the sender.
@@ -618,8 +622,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if ECDH, KDF, or AEAD
-/// decryption fails.
+/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if HPKE open fails (wrong
+/// key, wrong `info`/`aad`, or tampered `enc`/`ct`), or if the recovered
+/// plaintext is not exactly 32 bytes.
 pub fn hpke_open_sender_key(
     sealed: &[u8],
     ephemeral_pubkey: &[u8; 32],
@@ -628,17 +633,11 @@ pub fn hpke_open_sender_key(
     sender_did: &str,
     epoch: u64,
 ) -> Result<SenderKey, SenderKeyError> {
-    use x25519_dalek::StaticSecret;
-
-    let secret = StaticSecret::from(*wrapping_secret);
-    let ephemeral_pub = X25519Pub::from(*ephemeral_pubkey);
-    let shared_secret = secret.diffie_hellman(&ephemeral_pub);
-
     let info = build_hpke_info(context_id, sender_did, epoch);
     let aad = build_hpke_aad(context_id, sender_did, epoch);
 
-    let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info)?;
-    let plaintext = aes128gcm_decrypt(&aes_key, sealed, &aad)?;
+    let plaintext = hpke::open(wrapping_secret, ephemeral_pubkey, &info, &aad, sealed)
+        .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?;
 
     let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
         SenderKeyError::HpkeDecryptionFailed(format!(
@@ -705,7 +704,7 @@ impl NonceDedup {
 // HPKE context binding helpers (§9.16.2)
 // ---------------------------------------------------------------------------
 
-/// Builds the HPKE `info` parameter for sender-key ECIES encryption (spec §9.16.2).
+/// Builds the HPKE `info` parameter for sender-key HPKE encryption (spec §9.16.2).
 ///
 /// Contains a fixed prefix, context ID, sender DID, and epoch — length-prefixed to
 /// prevent boundary-shift collisions.
@@ -729,7 +728,7 @@ pub fn build_hpke_info(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8
     info
 }
 
-/// Builds the HPKE `aad` (additional authenticated data) for sender-key ECIES encryption (spec §9.16.2).
+/// Builds the HPKE `aad` (additional authenticated data) for sender-key HPKE encryption (spec §9.16.2).
 ///
 /// Contains context ID, sender DID, and epoch — length-prefixed to prevent
 /// boundary-shift collisions.
@@ -752,22 +751,23 @@ pub fn build_hpke_aad(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8>
 }
 
 // ---------------------------------------------------------------------------
-// HPKE helpers
+// HPKE seal (RFC 9180 Base mode, §9.16.2)
 // ---------------------------------------------------------------------------
 
-/// HPKE-seals a 32-byte sender key to a recipient's X25519 wrapping pubkey.
+/// HPKE-seals a 32-byte sender key to a recipient's X25519 wrapping pubkey
+/// (RFC 9180 Base mode via [`crate::crypto::hpke`]).
 ///
-/// Returns `(sealed_bytes, ephemeral_pubkey)` where `sealed_bytes` is
-/// `nonce || ciphertext || tag` (60 bytes for 32-byte plaintext) and
-/// `ephemeral_pubkey` is the 32-byte X25519 public key used for ECDH.
+/// Returns `(sealed_ct, enc)` where `sealed_ct` is the HPKE ciphertext
+/// (`ciphertext || tag`, 48 bytes for a 32-byte plaintext) and `enc` is the
+/// 32-byte HPKE encapsulated key (the ephemeral X25519 public key). There is
+/// NO external nonce — the AEAD nonce is derived internally by RFC 9180.
 ///
-/// Context binding: both info and AAD include `context_id`, `sender_did`,
+/// Context binding: both `info` and `aad` include `context_id`, `sender_did`,
 /// and `epoch` to prevent cross-context/cross-epoch replay (§9.16.2).
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if HKDF or AES-128-GCM
-/// encryption fails.
+/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if HPKE sealing fails.
 pub fn hpke_seal_sender_key(
     plaintext: &[u8; 32],
     recipient_pub: &[u8; 32],
@@ -775,114 +775,13 @@ pub fn hpke_seal_sender_key(
     sender_did: &str,
     epoch: u64,
 ) -> Result<(Vec<u8>, [u8; 32]), SenderKeyError> {
-    // 1. Generate ephemeral X25519 keypair.
-    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-    let ephemeral_public = X25519Pub::from(&ephemeral_secret);
-
-    // 2. ECDH between ephemeral secret and recipient's wrapping pubkey.
-    let recipient_key = X25519Pub::from(*recipient_pub);
-    let shared_secret = ephemeral_secret.diffie_hellman(&recipient_key);
-
-    // 3. Build context-bound info and AAD (§9.16.2).
     let info = build_hpke_info(context_id, sender_did, epoch);
     let aad = build_hpke_aad(context_id, sender_did, epoch);
 
-    // 4. HKDF to derive 16-byte AES-128-GCM key (zeroized on drop).
-    let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info)?;
-
-    // 5. AES-128-GCM encrypt with AAD.
-    let sealed = aes128gcm_encrypt(&aes_key, plaintext, &aad)?;
-
-    Ok((sealed, ephemeral_public.to_bytes()))
-}
-
-/// Derives a 16-byte AES-128-GCM key from a 32-byte shared secret using
-/// HKDF-SHA256.
-///
-/// The returned key is wrapped in [`Zeroizing`] so the derived key material
-/// is zeroed on drop (defense-in-depth, see issue #82).
-///
-/// # Errors
-///
-/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if HKDF expansion fails.
-pub fn hkdf_derive_key(
-    shared_secret: &[u8],
-    info: &[u8],
-) -> Result<Zeroizing<[u8; 16]>, SenderKeyError> {
-    let hk = Hkdf::<Sha256>::new(None, shared_secret);
-    let mut okm = Zeroizing::new([0u8; 16]);
-    hk.expand(info, okm.as_mut())
-        .map_err(|e| SenderKeyError::HpkeEncryptionFailed(e.to_string()))?;
-    Ok(okm)
-}
-
-/// Encrypts `plaintext` with AES-128-GCM. Returns `nonce || ciphertext || tag`.
-///
-/// # Errors
-///
-/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if AES-128-GCM encryption fails.
-pub fn aes128gcm_encrypt(
-    key: &[u8; 16],
-    plaintext: &[u8],
-    aad: &[u8],
-) -> Result<Vec<u8>, SenderKeyError> {
-    let cipher = Aes128Gcm::new_from_slice(key)
+    let (enc, ct) = hpke::seal(recipient_pub, &info, &aad, plaintext)
         .map_err(|e| SenderKeyError::HpkeEncryptionFailed(e.to_string()))?;
 
-    let mut nonce_bytes = [0u8; HPKE_NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .map_err(|e| SenderKeyError::HpkeEncryptionFailed(e.to_string()))?;
-
-    let mut output = Vec::with_capacity(HPKE_NONCE_SIZE + ciphertext.len());
-    output.extend_from_slice(&nonce_bytes);
-    output.extend_from_slice(&ciphertext);
-    Ok(output)
-}
-
-/// Decrypts AES-128-GCM ciphertext of the form `nonce || ciphertext || tag`.
-///
-/// # Errors
-///
-/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if the sealed data is too
-/// short or AES-128-GCM authentication fails.
-pub fn aes128gcm_decrypt(
-    key: &[u8; 16],
-    sealed: &[u8],
-    aad: &[u8],
-) -> Result<Vec<u8>, SenderKeyError> {
-    if sealed.len() < HPKE_NONCE_SIZE {
-        return Err(SenderKeyError::HpkeDecryptionFailed(format!(
-            "sealed data too short: {} bytes, minimum {}",
-            sealed.len(),
-            HPKE_NONCE_SIZE
-        )));
-    }
-
-    let (nonce_bytes, encrypted) = sealed.split_at(HPKE_NONCE_SIZE);
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    let cipher = Aes128Gcm::new_from_slice(key)
-        .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?;
-
-    cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: encrypted,
-                aad,
-            },
-        )
-        .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))
+    Ok((ct, enc))
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,8 +965,9 @@ pub struct BridgeShadowKeyParams<'a> {
 ///
 /// # Returns
 ///
-/// `(hpke_sealed_key, ephemeral_public_key)` -- The HPKE-wrapped sender
-/// key and the ephemeral public key for ECDH reconstruction.
+/// `(hpke_sealed_key, enc)` -- The HPKE ciphertext (`ct = ciphertext || tag`,
+/// 48 bytes) and the HPKE encapsulated key (`enc`, 32-byte ephemeral X25519
+/// public key). The AEAD nonce is internal per RFC 9180.
 ///
 /// # Errors
 ///
@@ -1075,7 +975,7 @@ pub struct BridgeShadowKeyParams<'a> {
 pub fn handle_bridge_shadow_key_request(
     requester_wrapping_pubkey: &[u8; 32],
     params: &BridgeShadowKeyParams<'_>,
-) -> Result<([u8; 60], [u8; 32]), SenderKeyError> {
+) -> Result<([u8; 48], [u8; 32]), SenderKeyError> {
     let (sealed_vec, ephemeral_pub) = hpke_seal_sender_key(
         params.shadow_sender_key.as_bytes(),
         requester_wrapping_pubkey,
@@ -1084,15 +984,13 @@ pub fn handle_bridge_shadow_key_request(
         0, // Shadow keys are initial distribution (epoch 0)
     )?;
 
-    // Convert to fixed-size array.
-    let mut sealed_arr = [0u8; 60];
-    if sealed_vec.len() != 60 {
-        return Err(SenderKeyError::HpkeEncryptionFailed(format!(
-            "expected 60 bytes from HPKE seal, got {}",
+    // Convert to fixed-size array (32-byte key + 16-byte AEAD tag = 48 bytes).
+    let sealed_arr: [u8; 48] = sealed_vec.as_slice().try_into().map_err(|_| {
+        SenderKeyError::HpkeEncryptionFailed(format!(
+            "expected 48 bytes from HPKE seal, got {}",
             sealed_vec.len()
-        )));
-    }
-    sealed_arr.copy_from_slice(&sealed_vec);
+        ))
+    })?;
 
     Ok((sealed_arr, ephemeral_pub))
 }
@@ -1150,21 +1048,27 @@ mod tests {
         let sender = "did:dht:alice";
         let epoch = 1u64;
 
-        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let recipient_secret = StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
         let (sealed, ephemeral_pub) =
             hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
                 .unwrap();
 
-        let ephemeral_key = X25519Pub::from(ephemeral_pub);
-        let shared = recipient_secret.diffie_hellman(&ephemeral_key);
-        let info = build_hpke_info(ctx, sender, epoch);
-        let aad = build_hpke_aad(ctx, sender, epoch);
-        let aes_key = hkdf_derive_key(shared.as_bytes(), &info).unwrap();
-        let recovered = aes128gcm_decrypt(&aes_key, &sealed, &aad).unwrap();
+        // ct is exactly 48 bytes: 32-byte key + 16-byte AEAD tag.
+        assert_eq!(sealed.len(), 48);
 
-        assert_eq!(recovered.as_slice(), &plaintext);
+        let recovered = hpke_open_sender_key(
+            &sealed,
+            &ephemeral_pub,
+            &recipient_secret.to_bytes(),
+            ctx,
+            sender,
+            epoch,
+        )
+        .unwrap();
+
+        assert_eq!(recovered.as_bytes(), &plaintext);
     }
 
     #[test]
@@ -1174,25 +1078,82 @@ mod tests {
         let sender = "did:dht:alice";
         let epoch = 1u64;
 
-        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let recipient_secret = StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
-        let wrong_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let wrong_secret = StaticSecret::random_from_rng(OsRng);
 
         let (sealed, ephemeral_pub) =
             hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
                 .unwrap();
 
-        let ephemeral_key = X25519Pub::from(ephemeral_pub);
-        let shared = wrong_secret.diffie_hellman(&ephemeral_key);
-        let info = build_hpke_info(ctx, sender, epoch);
-        let aad = build_hpke_aad(ctx, sender, epoch);
-        let aes_key = hkdf_derive_key(shared.as_bytes(), &info).unwrap();
-        let result = aes128gcm_decrypt(&aes_key, &sealed, &aad);
+        let result = hpke_open_sender_key(
+            &sealed,
+            &ephemeral_pub,
+            &wrong_secret.to_bytes(),
+            ctx,
+            sender,
+            epoch,
+        );
+
+        assert!(result.is_err(), "wrong recipient should fail HPKE open");
+    }
+
+    #[test]
+    fn hpke_rejects_tampered_ciphertext() {
+        let plaintext = [0x11u8; 32];
+        let ctx = "ctx-test";
+        let sender = "did:dht:alice";
+        let epoch = 7u64;
+
+        let recipient_secret = StaticSecret::random_from_rng(OsRng);
+        let recipient_public = X25519Pub::from(&recipient_secret);
+
+        let (mut sealed, ephemeral_pub) =
+            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
+                .unwrap();
+        sealed[0] ^= 0x01;
 
         assert!(
-            result.is_err(),
-            "wrong recipient should fail AEAD decryption"
+            hpke_open_sender_key(
+                &sealed,
+                &ephemeral_pub,
+                &recipient_secret.to_bytes(),
+                ctx,
+                sender,
+                epoch,
+            )
+            .is_err(),
+            "tampered ciphertext should fail AEAD verification"
+        );
+    }
+
+    #[test]
+    fn hpke_rejects_tampered_enc() {
+        let plaintext = [0x22u8; 32];
+        let ctx = "ctx-test";
+        let sender = "did:dht:alice";
+        let epoch = 9u64;
+
+        let recipient_secret = StaticSecret::random_from_rng(OsRng);
+        let recipient_public = X25519Pub::from(&recipient_secret);
+
+        let (sealed, mut ephemeral_pub) =
+            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
+                .unwrap();
+        ephemeral_pub[0] ^= 0x01;
+
+        assert!(
+            hpke_open_sender_key(
+                &sealed,
+                &ephemeral_pub,
+                &recipient_secret.to_bytes(),
+                ctx,
+                sender,
+                epoch,
+            )
+            .is_err(),
+            "tampered enc should fail HPKE open"
         );
     }
 
@@ -1217,7 +1178,7 @@ mod tests {
         let plaintext = [0xEFu8; 32];
         let sender = "did:dht:alice";
         let epoch = 1u64;
-        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let recipient_secret = StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
         let (sealed, ephemeral_pub) = hpke_seal_sender_key(
@@ -1229,16 +1190,16 @@ mod tests {
         )
         .unwrap();
 
-        let ephemeral_key = X25519Pub::from(ephemeral_pub);
-        let shared = recipient_secret.diffie_hellman(&ephemeral_key);
-        let wrong_info = build_hpke_info("ctx-B", sender, epoch);
-        let wrong_aad = build_hpke_aad("ctx-B", sender, epoch);
-        let aes_key = hkdf_derive_key(shared.as_bytes(), &wrong_info).unwrap();
-        let result = aes128gcm_decrypt(&aes_key, &sealed, &wrong_aad);
-        assert!(
-            result.is_err(),
-            "wrong context_id should fail AEAD decryption"
+        // Open with a different context_id — wrong info/aad → AEAD failure.
+        let result = hpke_open_sender_key(
+            &sealed,
+            &ephemeral_pub,
+            &recipient_secret.to_bytes(),
+            "ctx-B",
+            sender,
+            epoch,
         );
+        assert!(result.is_err(), "wrong context_id should fail HPKE open");
     }
 
     #[test]
@@ -1246,7 +1207,7 @@ mod tests {
         let plaintext = [0xDDu8; 32];
         let ctx = "ctx-test";
         let epoch = 1u64;
-        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let recipient_secret = StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
         let (sealed, ephemeral_pub) = hpke_seal_sender_key(
@@ -1258,16 +1219,15 @@ mod tests {
         )
         .unwrap();
 
-        let ephemeral_key = X25519Pub::from(ephemeral_pub);
-        let shared = recipient_secret.diffie_hellman(&ephemeral_key);
-        let wrong_info = build_hpke_info(ctx, "did:dht:bob", epoch);
-        let wrong_aad = build_hpke_aad(ctx, "did:dht:bob", epoch);
-        let aes_key = hkdf_derive_key(shared.as_bytes(), &wrong_info).unwrap();
-        let result = aes128gcm_decrypt(&aes_key, &sealed, &wrong_aad);
-        assert!(
-            result.is_err(),
-            "wrong sender_did should fail AEAD decryption"
+        let result = hpke_open_sender_key(
+            &sealed,
+            &ephemeral_pub,
+            &recipient_secret.to_bytes(),
+            ctx,
+            "did:dht:bob",
+            epoch,
         );
+        assert!(result.is_err(), "wrong sender_did should fail HPKE open");
     }
 
     #[test]
@@ -1275,19 +1235,21 @@ mod tests {
         let plaintext = [0xBBu8; 32];
         let ctx = "ctx-test";
         let sender = "did:dht:alice";
-        let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let recipient_secret = StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
         let (sealed, ephemeral_pub) =
             hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, 1).unwrap();
 
-        let ephemeral_key = X25519Pub::from(ephemeral_pub);
-        let shared = recipient_secret.diffie_hellman(&ephemeral_key);
-        let wrong_info = build_hpke_info(ctx, sender, 2);
-        let wrong_aad = build_hpke_aad(ctx, sender, 2);
-        let aes_key = hkdf_derive_key(shared.as_bytes(), &wrong_info).unwrap();
-        let result = aes128gcm_decrypt(&aes_key, &sealed, &wrong_aad);
-        assert!(result.is_err(), "wrong epoch should fail AEAD decryption");
+        let result = hpke_open_sender_key(
+            &sealed,
+            &ephemeral_pub,
+            &recipient_secret.to_bytes(),
+            ctx,
+            sender,
+            2,
+        );
+        assert!(result.is_err(), "wrong epoch should fail HPKE open");
     }
 
     // -------------------------------------------------------------------
@@ -1643,9 +1605,9 @@ mod tests {
 
     #[test]
     fn hpke_sealed_key_wrong_length_rejected_on_deser() {
-        // hpke_sealed_key is now [u8; 60] — length is enforced at the type
-        // level by serde_hpke_sealed_60. Verify deserialization rejects wrong
-        // sizes (#347).
+        // hpke_sealed_key is [u8; 48] (RFC 9180 ct = 32-byte key + 16-byte
+        // tag) — length is enforced at the type level by serde_hpke_sealed_48.
+        // Verify deserialization rejects wrong sizes (#347).
         #[derive(serde::Serialize)]
         struct FakeResponse {
             sender_did: String,
@@ -1658,34 +1620,34 @@ mod tests {
             request_nonce: [u8; REQUEST_NONCE_SIZE],
         }
 
-        // 59 bytes — too short.
+        // 47 bytes — too short.
         let fake_short = FakeResponse {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            hpke_sealed_key: vec![0u8; 59],
+            hpke_sealed_key: vec![0u8; 47],
             ephemeral_pubkey: [0u8; 32],
             request_nonce: [0u8; REQUEST_NONCE_SIZE],
         };
         let serialized = rmp_serde::to_vec_named(&fake_short).unwrap();
         let result = rmp_serde::from_slice::<SenderKeyResponse>(&serialized);
-        assert!(result.is_err(), "should reject 59-byte sealed key");
+        assert!(result.is_err(), "should reject 47-byte sealed key");
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("60-byte HPKE sealed key"),
-            "error should mention 60-byte: {err}"
+            err.contains("48-byte HPKE sealed key"),
+            "error should mention 48-byte: {err}"
         );
 
-        // 61 bytes — too long.
+        // 49 bytes — too long.
         let fake_long = FakeResponse {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            hpke_sealed_key: vec![0u8; 61],
+            hpke_sealed_key: vec![0u8; 49],
             ephemeral_pubkey: [0u8; 32],
             request_nonce: [0u8; REQUEST_NONCE_SIZE],
         };
         let serialized_long = rmp_serde::to_vec_named(&fake_long).unwrap();
         let result_long = rmp_serde::from_slice::<SenderKeyResponse>(&serialized_long);
-        assert!(result_long.is_err(), "should reject 61-byte sealed key");
+        assert!(result_long.is_err(), "should reject 49-byte sealed key");
     }
 
     #[test]
@@ -1780,7 +1742,7 @@ mod tests {
         let response = SenderKeyResponse {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 3,
-            hpke_sealed_key: [0x44; 60],
+            hpke_sealed_key: [0x44; 48],
             ephemeral_pubkey: [0x55; 32],
             request_nonce: [0x66; REQUEST_NONCE_SIZE],
         };
@@ -1869,7 +1831,7 @@ mod tests {
         let response = SenderKeyResponse {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 2,
-            hpke_sealed_key: [0xEE; 60],
+            hpke_sealed_key: [0xEE; 48],
             ephemeral_pubkey: [0xFF; 32],
             request_nonce: [0x11; REQUEST_NONCE_SIZE],
         };
@@ -1880,7 +1842,7 @@ mod tests {
             SenderKeyDistributionMessage::KeyResponse(r) => {
                 assert_eq!(r.sender_did, "did:dht:alice");
                 assert_eq!(r.epoch, 2);
-                assert_eq!(r.hpke_sealed_key, [0xEE; 60]);
+                assert_eq!(r.hpke_sealed_key, [0xEE; 48]);
             }
             other => panic!("expected KeyResponse, got {other:?}"),
         }
@@ -1929,7 +1891,7 @@ mod tests {
         let response = SenderKeyDistributionMessage::KeyResponse(SenderKeyResponse {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            hpke_sealed_key: [0; 60],
+            hpke_sealed_key: [0; 48],
             ephemeral_pubkey: [0; 32],
             request_nonce: [0; REQUEST_NONCE_SIZE],
         });
@@ -1978,17 +1940,20 @@ mod tests {
         let (sealed, ephemeral_pub) =
             handle_bridge_shadow_key_request(&recipient_pub, &params).unwrap();
 
-        // Unwrap: ECDH with recipient secret and ephemeral public.
-        let recipient_static = x25519_dalek::StaticSecret::from(recipient_secret);
-        let eph_pub = x25519_dalek::PublicKey::from(ephemeral_pub);
-        let shared = recipient_static.diffie_hellman(&eph_pub);
-        let info = build_hpke_info("ctx-bridge-test", "shadow:bridge-001:user-alice", 0);
-        let aad = build_hpke_aad("ctx-bridge-test", "shadow:bridge-001:user-alice", 0);
-        let aes_key = hkdf_derive_key(shared.as_bytes(), &info).unwrap();
+        // ct is exactly 48 bytes: 32-byte key + 16-byte AEAD tag.
+        assert_eq!(sealed.len(), 48);
 
-        let decrypted = aes128gcm_decrypt(&aes_key, &sealed, &aad).unwrap();
-        assert_eq!(decrypted.len(), 32);
-        assert_eq!(&decrypted[..], shadow_key.as_bytes());
+        // Unwrap via the HPKE open path (epoch 0 for shadow keys).
+        let recovered = hpke_open_sender_key(
+            &sealed,
+            &ephemeral_pub,
+            &recipient_secret,
+            "ctx-bridge-test",
+            "shadow:bridge-001:user-alice",
+            0,
+        )
+        .unwrap();
+        assert_eq!(recovered.as_bytes(), shadow_key.as_bytes());
     }
 
     #[test]
@@ -2096,7 +2061,7 @@ mod tests {
         let response = SenderKeyResponse {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 3,
-            hpke_sealed_key: [0x44; 60],
+            hpke_sealed_key: [0x44; 48],
             ephemeral_pubkey: [0x55; 32],
             request_nonce: [0x66; REQUEST_NONCE_SIZE],
         };

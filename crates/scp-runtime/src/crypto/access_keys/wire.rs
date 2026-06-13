@@ -1,40 +1,34 @@
 //! Wire types and HPKE distribution protocol for access keys.
 //!
-//! Access keys are distributed via the same pull-based HPKE protocol as
-//! sender keys (§9.16.2), but with a distinct domain separator
-//! (`"scp-access-key-v1"`) to prevent cross-protocol key confusion.
+//! Access keys are distributed via the same pull-based RFC 9180 HPKE protocol
+//! as sender keys (§9.16.2), but with a distinct domain separator
+//! (`"scp-access-key-v1"`) to prevent cross-protocol key confusion. Sealing and
+//! opening go through the shared [`scp_protocol::crypto::hpke`] core.
 //!
 //! Protocol flow:
 //! 1. New member sends [`AccessKeyRequest`] with ephemeral X25519 wrapping
 //!    pubkey, signature, nonce, and timestamp for replay protection.
-//! 2. Key holder verifies the request and HPKE-encrypts the access key.
+//! 2. Key holder verifies the request and HPKE-seals the access key.
 //! 3. Key holder responds with [`AccessKeyResponse`] containing the sealed
-//!    key and ephemeral pubkey.
-//! 4. Requester decrypts via [`open_access_key_response`].
+//!    ciphertext (`ct`) and the HPKE encapsulated key (`enc`).
+//! 4. Requester opens via [`open_access_key_response`].
 //!
 //! See ADR-038 §2 and spec §9.17.1.
 
-use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
-use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
 use zeroize::Zeroizing;
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 use scp_primitives::Clock;
 
 use scp_protocol::crypto::access_keys::{AccessKey, AccessKeyError};
+use scp_protocol::crypto::hpke;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// AES-128-GCM nonce size in bytes.
-const HPKE_NONCE_SIZE: usize = 12;
 
 /// Size of the cryptographic nonce in access key requests (bytes).
 const ACCESS_KEY_NONCE_SIZE: usize = 16;
@@ -101,9 +95,10 @@ pub struct AccessKeyRequest {
 
 /// Response containing HPKE-encrypted access key material.
 ///
-/// Sent back to the requester. The access key is encrypted using HPKE:
-/// ephemeral X25519 ECDH + HKDF-SHA256 + AES-128-GCM, with the
-/// `"scp-access-key-v1"` domain separator.
+/// Sent back to the requester. The access key is sealed with RFC 9180 HPKE
+/// Base mode (DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM) under
+/// the `"scp-access-key-v1"` domain separator. The AEAD nonce is internal per
+/// RFC 9180 — there is no external nonce on the wire.
 ///
 /// See spec §9.17.1 and ADR-038 §2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,10 +109,12 @@ pub struct AccessKeyResponse {
     pub member_did: String,
     /// The epoch of the distributed access key.
     pub epoch: u64,
-    /// HPKE-sealed access key bytes (AES-128-GCM nonce || ciphertext || tag).
-    #[serde(with = "serde_bytes")]
-    pub hpke_sealed_key: Vec<u8>,
-    /// The ephemeral X25519 public key used in the HPKE encapsulation.
+    /// HPKE ciphertext (`ct = ciphertext || tag`, exactly 48 bytes: a 32-byte
+    /// access key plus the 16-byte AES-128-GCM tag). Fixed-size so deserialize
+    /// cannot allocate an arbitrarily large buffer from malicious input.
+    #[serde(with = "scp_protocol::serde_util::serde_hpke_sealed_48")]
+    pub hpke_sealed_key: [u8; 48],
+    /// HPKE encapsulated key (`enc`, the 32-byte ephemeral X25519 public key).
     #[serde(with = "serde_bytes")]
     pub ephemeral_pubkey: Vec<u8>,
 }
@@ -311,7 +308,8 @@ pub fn handle_access_key_request(
         ))
     })?;
 
-    // HPKE seal with access-key-specific info string and AAD binding.
+    // HPKE seal with access-key-specific info string and AAD binding
+    // (RFC 9180 Base mode via the shared hpke core).
     let info = build_hpke_info(
         access_key.context_id(),
         access_key.member_did(),
@@ -322,14 +320,25 @@ pub fn handle_access_key_request(
         access_key.member_did(),
         access_key.epoch(),
     );
-    let (sealed, ephemeral_pub) = hpke_seal(access_key.as_bytes(), &wrapping_bytes, &info, &aad)?;
+    let (enc, sealed_vec) = hpke::seal(&wrapping_bytes, &info, &aad, access_key.as_bytes())
+        .map_err(|e| AccessKeyError::HpkeEncryptionFailed(e.to_string()))?;
+
+    // Convert to fixed-size array. The HPKE seal always returns exactly 48
+    // bytes (ciphertext 32 + AES-128-GCM tag 16) for a 32-byte access key;
+    // the AEAD nonce is internal per RFC 9180.
+    let sealed: [u8; 48] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+        AccessKeyError::HpkeEncryptionFailed(format!(
+            "HPKE seal produced {} bytes, expected 48",
+            v.len()
+        ))
+    })?;
 
     let response = AccessKeyResponse {
         context_id: access_key.context_id().to_owned(),
         member_did: access_key.member_did().to_owned(),
         epoch: access_key.epoch(),
         hpke_sealed_key: sealed,
-        ephemeral_pubkey: ephemeral_pub.to_vec(),
+        ephemeral_pubkey: enc.to_vec(),
     };
 
     // Record the nonce only after the request has been fully validated and
@@ -344,61 +353,81 @@ pub fn handle_access_key_request(
 // Response handling (requester side)
 // ---------------------------------------------------------------------------
 
-/// Decrypts an [`AccessKeyResponse`] using the requester's wrapping key
-/// handle inside the [`KeyCustody`] boundary.
+/// Opens an [`AccessKeyResponse`] using the requester's wrapping key handle
+/// inside the [`KeyCustody`] boundary (RFC 9180 HPKE Base mode, §9.17.1).
 ///
-/// The shared secret is computed via `key_custody.dh_agree(wrapping_key_handle,
-/// ephemeral_pk)` so the wrapping private key never leaves custody. KDF +
-/// AEAD decryption then recovers the access key in software.
+/// The KEM Diffie-Hellman output is computed inside custody via
+/// `key_custody.dh_agree(wrapping_key_handle, enc)` so the wrapping private key
+/// never leaves the boundary; `pkRm` is fetched via
+/// `key_custody.public_key(wrapping_key_handle)`. DHKEM Decap
+/// (`ExtractAndExpand(dh, enc || pkRm)`), `KeySchedule_base`, and the AEAD open
+/// then complete in software via
+/// [`scp_protocol::crypto::hpke::custody::open_with_external_dh`].
 ///
 /// # Errors
 ///
-/// Returns [`AccessKeyError::KeyCustodyError`] if the DH agreement fails.
-/// Returns [`AccessKeyError::HpkeDecryptionFailed`] if AEAD decryption fails.
+/// Returns [`AccessKeyError::KeyCustodyError`] if the DH agreement or
+/// public-key lookup fails. Returns [`AccessKeyError::HpkeDecryptionFailed`]
+/// if HPKE open fails or the recovered plaintext is not exactly 32 bytes.
 pub async fn open_access_key_response(
     key_custody: &impl KeyCustody,
     wrapping_key_handle: &KeyHandle,
     response: &AccessKeyResponse,
 ) -> Result<AccessKey, AccessKeyError> {
-    let ephemeral_bytes: [u8; 32] =
-        response
-            .ephemeral_pubkey
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                AccessKeyError::HpkeDecryptionFailed(format!(
-                    "ephemeral pubkey must be 32 bytes, got {}",
-                    response.ephemeral_pubkey.len()
-                ))
-            })?;
+    let enc: [u8; 32] = response
+        .ephemeral_pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            AccessKeyError::HpkeDecryptionFailed(format!(
+                "ephemeral pubkey must be 32 bytes, got {}",
+                response.ephemeral_pubkey.len()
+            ))
+        })?;
 
-    // Compute shared secret inside custody boundary.
-    let shared_secret = key_custody
-        .dh_agree(wrapping_key_handle, &ephemeral_bytes)
+    // Compute the KEM DH output inside the custody boundary (same handle,
+    // same enc — the only sound inputs to open_with_external_dh).
+    let dh = key_custody
+        .dh_agree(wrapping_key_handle, &enc)
         .await
         .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+    let dh_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*dh.as_bytes());
 
-    // Build info string with access-key-specific domain separator.
-    let info = build_hpke_info(&response.context_id, &response.member_did, response.epoch);
-
-    // Derive AES-128-GCM key from shared secret (zeroized on drop).
-    let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info)?;
-
-    // Build AAD to verify context binding during decryption.
-    let aad = build_hpke_aad(&response.context_id, &response.member_did, response.epoch);
-
-    // Decrypt the sealed access key.
-    let plaintext = aes128gcm_decrypt(&aes_key, &response.hpke_sealed_key, &aad)?;
-
-    let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
-        AccessKeyError::HpkeDecryptionFailed(format!(
-            "decrypted key must be 32 bytes, got {}",
-            plaintext.len()
-        ))
+    // Fetch pkRm for the same handle (kem_context = enc || pkRm).
+    let pk_rm = key_custody
+        .public_key(wrapping_key_handle)
+        .await
+        .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
+    let pk_rm_bytes: [u8; 32] = pk_rm.as_bytes().try_into().map_err(|_| {
+        AccessKeyError::KeyCustodyError("wrapping public key must be 32 bytes".to_owned())
     })?;
 
+    // Build context-bound info and AAD (§9.17.1).
+    let info = build_hpke_info(&response.context_id, &response.member_did, response.epoch);
+    let aad = build_hpke_aad(&response.context_id, &response.member_did, response.epoch);
+
+    let plaintext = Zeroizing::new(
+        hpke::custody::open_with_external_dh(
+            &dh_bytes,
+            &pk_rm_bytes,
+            &enc,
+            &info,
+            &aad,
+            &response.hpke_sealed_key,
+        )
+        .map_err(|e| AccessKeyError::HpkeDecryptionFailed(e.to_string()))?,
+    );
+
+    let key_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(plaintext.as_slice().try_into().map_err(|_| {
+            AccessKeyError::HpkeDecryptionFailed(format!(
+                "decrypted key must be 32 bytes, got {}",
+                plaintext.len()
+            ))
+        })?);
+
     Ok(AccessKey::from_parts(
-        key_bytes,
+        *key_bytes,
         response.context_id.clone(),
         response.member_did.clone(),
         response.epoch,
@@ -434,109 +463,6 @@ fn build_hpke_info(context_id: &str, member_did: &str, epoch: u64) -> Vec<u8> {
     info.extend_from_slice(member_did.as_bytes());
     info.extend_from_slice(&epoch.to_be_bytes());
     info
-}
-
-/// HPKE seal: encrypts `plaintext` to `recipient_pub` using ephemeral X25519
-/// ECDH + HKDF-SHA256 + AES-128-GCM with access-key-specific info string.
-///
-/// `aad` is bound to the AEAD tag as Additional Authenticated Data,
-/// preventing ciphertext relocation across contexts or members.
-///
-/// Returns `(sealed_bytes, ephemeral_public_key)`.
-fn hpke_seal(
-    plaintext: &[u8; 32],
-    recipient_pub: &[u8; 32],
-    info: &[u8],
-    aad: &[u8],
-) -> Result<(Vec<u8>, [u8; 32]), AccessKeyError> {
-    // 1. Generate ephemeral X25519 keypair.
-    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-    let ephemeral_public = X25519Pub::from(&ephemeral_secret);
-
-    // 2. ECDH between ephemeral secret and recipient's wrapping pubkey.
-    let recipient_key = X25519Pub::from(*recipient_pub);
-    let shared_secret = ephemeral_secret.diffie_hellman(&recipient_key);
-
-    // 3. HKDF to derive 16-byte AES-128-GCM key (zeroized on drop).
-    let aes_key = hkdf_derive_key(shared_secret.as_bytes(), info)?;
-
-    // 4. AES-128-GCM encrypt with AAD binding.
-    let sealed = aes128gcm_encrypt(&aes_key, plaintext, aad)?;
-
-    Ok((sealed, ephemeral_public.to_bytes()))
-}
-
-/// Derives a 16-byte AES-128-GCM key from a 32-byte shared secret using
-/// HKDF-SHA256 with the access-key-specific info string.
-///
-/// The returned key is wrapped in [`Zeroizing`] so the derived key material
-/// is zeroed on drop (defense-in-depth).
-fn hkdf_derive_key(
-    shared_secret: &[u8],
-    info: &[u8],
-) -> Result<Zeroizing<[u8; 16]>, AccessKeyError> {
-    let hk = Hkdf::<Sha256>::new(None, shared_secret);
-    let mut okm = Zeroizing::new([0u8; 16]);
-    hk.expand(info, okm.as_mut())
-        .map_err(|e| AccessKeyError::HpkeEncryptionFailed(e.to_string()))?;
-    Ok(okm)
-}
-
-/// Encrypts `plaintext` with AES-128-GCM using `aad` as Additional
-/// Authenticated Data. Returns `nonce || ciphertext || tag`.
-fn aes128gcm_encrypt(
-    key: &[u8; 16],
-    plaintext: &[u8],
-    aad: &[u8],
-) -> Result<Vec<u8>, AccessKeyError> {
-    let cipher = Aes128Gcm::new_from_slice(key)
-        .map_err(|e| AccessKeyError::HpkeEncryptionFailed(e.to_string()))?;
-
-    let mut nonce_bytes = [0u8; HPKE_NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .map_err(|e| AccessKeyError::HpkeEncryptionFailed(e.to_string()))?;
-
-    let mut output = Vec::with_capacity(HPKE_NONCE_SIZE + ciphertext.len());
-    output.extend_from_slice(&nonce_bytes);
-    output.extend_from_slice(&ciphertext);
-    Ok(output)
-}
-
-/// Decrypts AES-128-GCM ciphertext of the form `nonce || ciphertext || tag`,
-/// verifying `aad` as Additional Authenticated Data.
-fn aes128gcm_decrypt(key: &[u8; 16], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, AccessKeyError> {
-    if sealed.len() < HPKE_NONCE_SIZE {
-        return Err(AccessKeyError::HpkeDecryptionFailed(format!(
-            "sealed data too short: {} bytes, minimum {HPKE_NONCE_SIZE}",
-            sealed.len(),
-        )));
-    }
-
-    let (nonce_bytes, encrypted) = sealed.split_at(HPKE_NONCE_SIZE);
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    let cipher = Aes128Gcm::new_from_slice(key)
-        .map_err(|e| AccessKeyError::HpkeDecryptionFailed(e.to_string()))?;
-
-    cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: encrypted,
-                aad,
-            },
-        )
-        .map_err(|e| AccessKeyError::HpkeDecryptionFailed(e.to_string()))
 }
 
 /// Builds Additional Authenticated Data (AAD) for access key HPKE
@@ -623,6 +549,8 @@ fn verify_ed25519_signature(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
     use super::*;
     use scp_protocol::crypto::access_keys::generate_access_key;
     use scp_protocol::crypto::sender_keys::NonceDedup;
@@ -655,7 +583,7 @@ mod tests {
             context_id: "ctx-1".to_owned(),
             member_did: "did:dht:alice".to_owned(),
             epoch: 5,
-            hpke_sealed_key: vec![1, 2, 3, 4],
+            hpke_sealed_key: [0x11; 48],
             ephemeral_pubkey: vec![0u8; 32],
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -688,7 +616,7 @@ mod tests {
             context_id: "ctx-2".to_owned(),
             member_did: "did:dht:bob".to_owned(),
             epoch: 10,
-            hpke_sealed_key: vec![5, 6, 7, 8],
+            hpke_sealed_key: [0x55; 48],
             ephemeral_pubkey: vec![99u8; 32],
         };
         let bytes = rmp_serde::to_vec(&response).unwrap();
@@ -779,61 +707,68 @@ mod tests {
 
     #[test]
     fn hpke_seal_open_roundtrip() {
-        // Generate a simulated wrapping keypair.
-        let wrapping_secret = EphemeralSecret::random_from_rng(OsRng);
+        // Generate a simulated wrapping keypair (software-held).
+        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
         let wrapping_public = X25519Pub::from(&wrapping_secret);
 
         let access_key = generate_access_key("ctx-1", "did:dht:alice");
         let info = build_hpke_info("ctx-1", "did:dht:alice", 0);
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
 
-        // Seal.
-        let (sealed, ephemeral_pub) = hpke_seal(
-            access_key.as_bytes(),
+        // Seal via the shared RFC 9180 HPKE core.
+        let (enc, sealed) = hpke::seal(
             &wrapping_public.to_bytes(),
             &info,
             &aad,
+            access_key.as_bytes(),
         )
         .unwrap();
 
-        // Derive shared secret on the requester side.
-        let ephemeral_key = X25519Pub::from(ephemeral_pub);
-        let shared_secret = wrapping_secret.diffie_hellman(&ephemeral_key);
+        // ct is exactly 48 bytes: 32-byte key + 16-byte AEAD tag.
+        assert_eq!(sealed.len(), 48);
 
-        // Derive AES key and decrypt.
-        let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info).unwrap();
-        let plaintext = aes128gcm_decrypt(&aes_key, &sealed, &aad).unwrap();
+        // Open with the software-held secret.
+        let plaintext =
+            hpke::open(&wrapping_secret.to_bytes(), &enc, &info, &aad, &sealed).unwrap();
 
         assert_eq!(plaintext.len(), 32);
         assert_eq!(plaintext.as_slice(), access_key.as_bytes());
     }
 
     #[test]
-    fn hpke_seal_produces_nonce_plus_ciphertext_plus_tag() {
-        let wrapping_secret = EphemeralSecret::random_from_rng(OsRng);
+    fn hpke_seal_produces_ciphertext_plus_tag() {
+        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
         let wrapping_public = X25519Pub::from(&wrapping_secret);
         let info = build_hpke_info("ctx-1", "did:dht:alice", 0);
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
 
         let key_bytes = [42u8; 32];
-        let (sealed, _) = hpke_seal(&key_bytes, &wrapping_public.to_bytes(), &info, &aad).unwrap();
+        let (_enc, sealed) =
+            hpke::seal(&wrapping_public.to_bytes(), &info, &aad, &key_bytes).unwrap();
 
-        // nonce (12) + plaintext (32) + tag (16) = 60
-        assert_eq!(sealed.len(), HPKE_NONCE_SIZE + 32 + 16);
+        // RFC 9180: ct = plaintext (32) + AEAD tag (16) = 48. No external nonce.
+        assert_eq!(sealed.len(), 32 + 16);
     }
 
     #[test]
-    fn hpke_different_info_produces_different_keys() {
-        // Same shared secret but different info strings should produce
-        // different derived keys.
-        let shared_secret = [42u8; 32];
+    fn hpke_different_info_produces_different_ciphertext() {
+        // Sealing the same key under different info strings (different context)
+        // must not cross-open: a ciphertext sealed with info_a fails to open
+        // with info_b.
+        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
+        let wrapping_public = X25519Pub::from(&wrapping_secret);
         let info_a = build_hpke_info("ctx-a", "did:dht:alice", 0);
+        let aad_a = build_hpke_aad("ctx-a", "did:dht:alice", 0);
         let info_b = build_hpke_info("ctx-b", "did:dht:alice", 0);
+        let aad_b = build_hpke_aad("ctx-b", "did:dht:alice", 0);
 
-        let key_a = hkdf_derive_key(&shared_secret, &info_a).unwrap();
-        let key_b = hkdf_derive_key(&shared_secret, &info_b).unwrap();
+        let (enc, sealed) =
+            hpke::seal(&wrapping_public.to_bytes(), &info_a, &aad_a, &[42u8; 32]).unwrap();
 
-        assert_ne!(*key_a, *key_b);
+        assert!(
+            hpke::open(&wrapping_secret.to_bytes(), &enc, &info_b, &aad_b, &sealed).is_err(),
+            "different info/aad must fail to open"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1029,8 +964,9 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
 
-        // 2. Generate X25519 wrapping keypair for the requester.
-        let wrapping_secret = EphemeralSecret::random_from_rng(OsRng);
+        // 2. Generate X25519 wrapping keypair for the requester (software-held
+        //    StaticSecret so the test can run the software `hpke::open` path).
+        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
         let wrapping_public = X25519Pub::from(&wrapping_secret);
 
         let timestamp = 1_700_000_000_u64;
@@ -1078,15 +1014,18 @@ mod tests {
         assert_eq!(response.member_did, "did:dht:alice");
         assert_eq!(response.epoch, 0);
 
-        // 7. Decrypt the response (requester side) -- manual HPKE open.
-        let ephemeral_bytes: [u8; 32] = response.ephemeral_pubkey.as_slice().try_into().unwrap();
-        let ephemeral_key = X25519Pub::from(ephemeral_bytes);
-        let shared_secret = wrapping_secret.diffie_hellman(&ephemeral_key);
-
+        // 7. Open the response (requester side) via the software HPKE path.
+        let enc: [u8; 32] = response.ephemeral_pubkey.as_slice().try_into().unwrap();
         let info = build_hpke_info("ctx-1", "did:dht:alice", 0);
-        let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info).unwrap();
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
-        let plaintext = aes128gcm_decrypt(&aes_key, &response.hpke_sealed_key, &aad).unwrap();
+        let plaintext = hpke::open(
+            &wrapping_secret.to_bytes(),
+            &enc,
+            &info,
+            &aad,
+            &response.hpke_sealed_key,
+        )
+        .unwrap();
 
         let recovered_bytes: [u8; 32] = plaintext.as_slice().try_into().unwrap();
         assert_eq!(recovered_bytes, original_key_bytes);
@@ -1114,7 +1053,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
 
-        let wrapping_secret = EphemeralSecret::random_from_rng(OsRng);
+        let wrapping_secret = StaticSecret::random_from_rng(OsRng);
         let wrapping_public = X25519Pub::from(&wrapping_secret);
 
         let timestamp = 1_700_000_000_u64;
