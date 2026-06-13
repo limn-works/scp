@@ -471,6 +471,66 @@ jobs:
           # must compile and pass without the testing affordances.
           cargo test -p scp-ffi-napi --features server
 
+  # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
+  # features (`server` on) but WITHOUT `allow_in_memory_custody`. This is the
+  # config `build-matrix.yml` only exercises at release/tag time, so a PR could
+  # re-gate a production identity/SCPID/custody op behind the test-only
+  # `allow_in_memory_custody` feature — making it vanish from the production lib —
+  # and the regression would go unnoticed until release. This is the per-PR guard
+  # against that over-gating regression class. Build-only (lib + bins): the pyo3
+  # test suite assumes in-memory custody and does not compile in prod config, so
+  # a full prod-config test lane is a separate follow-up. The lib build still
+  # catches the bug class — a production op gated out of the lib won't compile.
+  rust-build-pyo3-production:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    name: Rust / build (pyo3 production config)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build pyo3 bridge in production config (no in-memory custody)
+        run: |
+          # pyo3 links libpython, so LD_LIBRARY_PATH must point at LIBDIR.
+          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          # Default features = production: `server` on, no `allow_in_memory_custody`.
+          cargo build -p scp-ffi --features server
+
+  # Builds the uniffi bridge (`scp-ffi-uniffi`) in its PRODUCTION configuration:
+  # default features (`server` on) but WITHOUT `allow_in_memory_custody`. Same
+  # guardrail rationale as the pyo3 lane above: `build-matrix.yml` only builds
+  # the mobile (iOS XCFramework / Android .aar) production libs at release time,
+  # so a PR could re-gate a production op behind the test-only feature and break
+  # the production lib unnoticed until release. This is the per-PR guard against
+  # that over-gating regression class. Build-only (lib + bins): the uniffi test
+  # suite assumes in-memory custody and does not compile in prod config, so a
+  # full prod-config test lane is a separate follow-up.
+  rust-build-uniffi-production:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    name: Rust / build (uniffi production config)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build uniffi bridge in production config (no in-memory custody)
+        run: |
+          # Default features = production: `server` on, no `allow_in_memory_custody`.
+          cargo build -p scp-ffi-uniffi --features server
+
   rust-doc:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -1045,6 +1105,8 @@ jobs:
       - rust-clippy
       - rust-test
       - rust-test-napi-production
+      - rust-build-pyo3-production
+      - rust-build-uniffi-production
       - rust-doc
       - rust-deny
       - python-lint
@@ -1082,6 +1144,8 @@ jobs:
             "${{ needs.rust-clippy.result }}" \
             "${{ needs.rust-test.result }}" \
             "${{ needs.rust-test-napi-production.result }}" \
+            "${{ needs.rust-build-pyo3-production.result }}" \
+            "${{ needs.rust-build-uniffi-production.result }}" \
             "${{ needs.rust-doc.result }}" \
             "${{ needs.rust-deny.result }}" \
             "${{ needs.python-lint.result }}" \
