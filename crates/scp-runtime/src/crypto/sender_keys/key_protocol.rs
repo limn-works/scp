@@ -372,14 +372,15 @@ pub async fn open_sender_key_response(
         .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?,
     );
 
-    let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
-        SenderKeyError::HpkeDecryptionFailed(format!(
-            "decrypted key must be 32 bytes, got {}",
-            plaintext.len()
-        ))
-    })?;
+    let key_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(plaintext.as_slice().try_into().map_err(|_| {
+            SenderKeyError::HpkeDecryptionFailed(format!(
+                "decrypted key must be 32 bytes, got {}",
+                plaintext.len()
+            ))
+        })?);
 
-    Ok(SenderKey::from_bytes(key_bytes))
+    Ok(SenderKey::from_bytes(*key_bytes))
 }
 
 // ---------------------------------------------------------------------------

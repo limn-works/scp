@@ -418,15 +418,16 @@ pub async fn open_access_key_response(
         .map_err(|e| AccessKeyError::HpkeDecryptionFailed(e.to_string()))?,
     );
 
-    let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
-        AccessKeyError::HpkeDecryptionFailed(format!(
-            "decrypted key must be 32 bytes, got {}",
-            plaintext.len()
-        ))
-    })?;
+    let key_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(plaintext.as_slice().try_into().map_err(|_| {
+            AccessKeyError::HpkeDecryptionFailed(format!(
+                "decrypted key must be 32 bytes, got {}",
+                plaintext.len()
+            ))
+        })?);
 
     Ok(AccessKey::from_parts(
-        key_bytes,
+        *key_bytes,
         response.context_id.clone(),
         response.member_did.clone(),
         response.epoch,
