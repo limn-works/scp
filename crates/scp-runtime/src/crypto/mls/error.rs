@@ -103,4 +103,11 @@ pub enum MlsError {
     /// A member with the given leaf index was not found in the group.
     #[error("member not found at leaf index {0}")]
     MemberNotFound(u32),
+
+    /// A join was attempted with a `KeyPackage` whose HPKE init key is already
+    /// in the durable consumed-init-key set — a replay of a single-use
+    /// `KeyPackage`, rejected at the crypto layer (ADR-049 §9 two-anchor
+    /// single-use model).
+    #[error("key package replay: init key already consumed")]
+    KeyPackageReplay,
 }

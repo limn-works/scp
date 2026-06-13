@@ -125,10 +125,17 @@ pub enum ContextLifecycleState {
 /// dissolution": the `StagedWelcome` lives here (per-context), the KP
 /// reservation lives on the `KeyPackageStoreActor`.
 ///
-/// The field set is placeholder for commit 6 — the actual `StagedWelcome`
-/// bytes plus the `KpRef` land when `handlers/lifecycle.rs` migrates in
-/// commit 9. Keeping the type as a marker now lets the actor state shape
-/// compile.
+/// # Supersession of the single-slot provider path
+///
+/// The [`Self::kp_reservation`] handle pairs with the per-identity
+/// [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor)
+/// `reserved` map, which **supersedes** the legacy single-slot
+/// `MlsCryptoProvider::pending_joins` (`ArcSwapOption`): a Welcome flow
+/// reserves a KP (recording the `ReservationId` here), joins from the returned
+/// signer-state, then confirms (success) or cancels (failure) the reservation.
+/// Because reservations are keyed by id, concurrent Welcomes for distinct
+/// contexts never clobber one another — the single-slot provider could hold
+/// only one outstanding KP-for-join at a time.
 #[derive(Debug, Default)]
 pub struct WelcomeProcessing {
     /// Opaque bytes of the OpenMLS `StagedWelcome`. Zeroized on drop
@@ -136,10 +143,13 @@ pub struct WelcomeProcessing {
     /// material (plan §"MlsCryptoProvider dissolution" row
     /// `pending_joins`).
     pub staged_welcome: Zeroizing<Vec<u8>>,
-    /// The `KpRef` reservation ID held by the `KeyPackageStoreActor`.
+    /// The reservation ID held by the `KeyPackageStoreActor`.
     /// Populated at Welcome-Reserve time; consumed at ConfirmConsume
-    /// (success) or CancelReservation (failure).
-    pub kp_reservation: Option<String>,
+    /// (success) or CancelReservation (failure). A
+    /// [`ReservationId`](crate::context::supervisor::key_package_actor::ReservationId)
+    /// newtype (not a bare `String`) so it cannot be transposed with a
+    /// `KpRef`.
+    pub kp_reservation: Option<crate::context::supervisor::key_package_actor::ReservationId>,
 }
 
 // ---------------------------------------------------------------------------

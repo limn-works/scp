@@ -536,6 +536,26 @@ impl SupervisorHandle {
         self.supervisor.clear_poison(context_id, owning_did).await
     }
 
+    /// Operator recovery action (ADR-049 §10) for a poisoned per-identity
+    /// `KeyPackageStoreActor`: clear its `kp::{did}` crash window and
+    /// re-resolve the actor, which reconciles its pool from the durable
+    /// `mls_storage` journal on spawn.
+    ///
+    /// This is the KeyPackage-actor twin of [`Self::clear_poison`]. It is a
+    /// SEPARATE surface because a KP actor has no context-snapshot to
+    /// rehydrate — routing it through the per-context snapshot respawn would
+    /// fail and re-dirty the crash window. Surfaced on the operator-facing
+    /// `SupervisorHandle` so ordinary callers cannot un-poison a KP actor.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any error from the re-resolve (e.g.
+    /// [`ContextError::NotInitialized`](scp_protocol::context::ContextError::NotInitialized)
+    /// when providers are absent).
+    pub async fn clear_kp_poison(&self, identity: &DID) -> Result<(), ContextError> {
+        self.supervisor.clear_kp_poison(identity).await
+    }
+
     // -----------------------------------------------------------------
     // Timer-task surface (ADR-049 Phase 2A finalization — TTL +
     // governance timer → actor registry + mailbox tick).
@@ -830,9 +850,28 @@ mod tests {
 
     #[tokio::test]
     async fn my_key_package_store_returns_registered_handle() {
+        use crate::context::supervisor::key_package_actor::KeyPackageStoreDeps;
+        use crate::crypto::mls::provider::MlsCryptoProvider;
+        use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
+
         let (sup, handle) = test_handle();
-        let did = DID("did:example:alice".to_owned());
-        let kp_handle = KeyPackageStoreActor::spawn(did.clone());
+        let did = DID("did:dht:z6MkAliceKpStore".to_owned());
+        let crypto = Arc::new(MlsCryptoProvider::new(did.0.clone()));
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+                InMemoryStorage::new(),
+            )));
+        let transport: Arc<dyn crate::context::builder::ContextTransportProvider> =
+            Arc::new(crate::context::builder::NotConfiguredTransportProvider);
+        let clock: Arc<dyn scp_primitives::Clock> = Arc::new(scp_primitives::SystemClock);
+        let deps = KeyPackageStoreDeps {
+            mls: Arc::clone(crypto.mls_backend()),
+            mls_storage,
+            transport,
+            clock,
+            wrapping_pubkey: None,
+        };
+        let (kp_handle, _join) = KeyPackageStoreActor::spawn(did.clone(), deps);
         sup.key_package_stores.insert(did.clone(), kp_handle);
         let token = OwnedIdentityDid::issue_for_actor(did);
         let got = handle.my_key_package_store(&token);

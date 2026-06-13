@@ -9,12 +9,12 @@
     "crates/scp-runtime/src/store/context.rs": 20,
     "crates/scp-runtime/src/store/trust.rs": 6,
     "crates/scp-transport/src/native/relay_persistence.rs": 12,
-    "crates/scp-transport/src/provider.rs": 6
+    "crates/scp-transport/src/provider.rs": 4
   },
   "crates": {
     "scp-node": 1,
     "scp-runtime": 36,
-    "scp-transport": 18
+    "scp-transport": 16
   },
   "_breakdown": {
     "scp-node": [
@@ -28,7 +28,7 @@
       "crates/scp-runtime/src/store/trust.rs:273-336 (6 block_on via stored Handle)"
     ],
     "scp-transport": [
-      "crates/scp-transport/src/provider.rs:135-187 (3 block_in_place + 3 block_on)",
+      "crates/scp-transport/src/provider.rs:141-214 (2 block_in_place + 2 block_on — send_blocking + delete_published sync→async bridges; the shared runtime-flavor probe is hoisted into require_multi_thread_runtime, dropping the prior count from 6)",
       "crates/scp-transport/src/native/relay_persistence.rs:141-251 (6 block_in_place + 6 block_on)"
     ]
   }

@@ -84,6 +84,39 @@ pub trait ContextTransportProvider: Send + Sync {
             "send_to_routing_id not supported".into(),
         ))
     }
+
+    /// Publishes a public `KeyPackage`'s TLS-serialized bytes so other members
+    /// can fetch it for offline member addition (§9.16.1). The
+    /// `KeyPackageStoreActor` calls this for each pooled KP not yet published.
+    ///
+    /// `owner_did` is the DID that owns the `KeyPackage`. The relay routing id
+    /// is the canonical `derive_key_package_routing_id(owner_did)` (spec
+    /// §5.12.3) so a peer can fetch this identity's published `KeyPackage`s with
+    /// the SAME id the canonical fetcher computes from the owner's DID. The id
+    /// MUST be per-DID: a relay-URL-only id collides every identity onto one
+    /// bucket and makes published KPs unfetchable by the canonical path.
+    ///
+    /// There is no `relay_url` parameter: routing is fully determined by
+    /// `owner_did`, and the relay the bytes land on is the adapter's OWN
+    /// connection (the production impl publishes through its single configured
+    /// adapter). Each `KeyPackage` is therefore published exactly once, not
+    /// fanned out per relay URL — a `relay_url` argument would be silently
+    /// discarded and imply a fan-out that does not happen.
+    ///
+    /// Publication is idempotent at the relay: the same `kp_bytes` published
+    /// twice resolves to the same content-addressed blob, so a re-publish
+    /// (e.g. after an actor respawn) is harmless.
+    ///
+    /// Default: not supported (returns error). Production transports override.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if publication fails.
+    fn publish_key_package(&self, _owner_did: &str, _kp_bytes: &[u8]) -> Result<(), ContextError> {
+        Err(ContextError::TransportFailed(
+            "publish_key_package not supported".into(),
+        ))
+    }
 }
 
 /// Provides event log operations needed during context creation.

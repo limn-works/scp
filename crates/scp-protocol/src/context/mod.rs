@@ -638,6 +638,26 @@ pub enum ContextError {
     /// never produces this variant.)
     #[error("SCP-CTX-2135: context actor crashed and could not be respawned: {0}")]
     ActorCrashed(String),
+
+    /// A join was attempted with a `KeyPackage` whose single-use HPKE init key
+    /// was already consumed by a prior completed join (ADR-049 §9 two-anchor
+    /// single-use model). The crypto-layer consumed-init-key backstop rejected
+    /// the replay durably.
+    ///
+    /// Distinct from the generic [`Self::InvalidState`] (which also means
+    /// "unknown reservation" and other transient state mismatches): a caller
+    /// can tell a *security-relevant single-use replay* apart from an ordinary
+    /// invalid-state error. The `KeyPackageStoreActor` also uses this variant
+    /// to recognize its OWN prior already-completed join when a post-join
+    /// tombstone write failed and the confirm is retried — turning the retry
+    /// into an idempotent success rather than a permanent replay failure.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2136` through a dedicated translator
+    /// arm in each non-WASM FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
+    /// `SCP-CTX-2001` fallthrough — so a caller can detect a single-use replay.
+    /// (WASM has no actor model per ADR-034, so it never produces this variant.)
+    #[error("SCP-CTX-2136: key package already consumed (init-key replay rejected): {0}")]
+    KeyPackageReplay(String),
 }
 
 // ---------------------------------------------------------------------------

@@ -250,6 +250,14 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2135.to_owned(),
             },
+            // ADR-049 §9: key package single-use replay rejected by the
+            // crypto-layer consumed-init-key backstop. Dedicated SCP-CTX-2136
+            // instead of CTX_2001 so a caller can detect a security-relevant
+            // single-use replay.
+            CE::KeyPackageReplay(_) => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2136.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
@@ -668,6 +676,15 @@ mod tests {
         let err: ScpNapiError =
             scp_core::context::ContextError::ActorCrashed("ctx-1".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2135);
+    }
+
+    /// ADR-049 §9: a key package single-use replay must surface the dedicated
+    /// SCP-CTX-2136 code, distinct from the catch-all and from `InvalidState`.
+    #[test]
+    fn key_package_replay_surfaces_ctx_2136() {
+        let err: ScpNapiError =
+            scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2136);
     }
 
     /// Regression guard: an unrelated `ContextError` still falls through to

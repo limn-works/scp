@@ -21,11 +21,14 @@
 //! [`SerializedSigner`] — the byte layout is private to this module and is
 //! not a stable interoperability surface. Callers MUST NOT parse the bytes.
 
+use std::sync::{Arc, OnceLock};
+
 use async_trait::async_trait;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 use zeroize::Zeroizing;
 
@@ -38,6 +41,13 @@ use super::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use super::error::MlsError;
 use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use super::storage::{InMemoryMlsProvider, new_provider};
+use super::storage_adapter::OpenMlsStorageAdapter;
+
+/// Durable-store key namespace for the consumed-init-key set (A2 crypto-layer
+/// single-use backstop). Value at `scp-kp-consumed-initkey/{hex(SHA-256(init_key))}`
+/// is a 1-byte marker; its presence means that KP's init key was already
+/// consumed by a completed join.
+const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 
 // ---------------------------------------------------------------------------
 // ProductionMlsBackend
@@ -45,18 +55,128 @@ use super::storage::{InMemoryMlsProvider, new_provider};
 
 /// Production `MlsBackend` backed by `OpenMLS`.
 ///
-/// Stateless; safe to share via `Arc` across every actor in the process.
-/// Every primitive delegates to the same free-function family the
-/// pre-refactor `MlsCryptoProvider` uses — this preserves byte-identical
-/// wire output through the trait split.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ProductionMlsBackend;
+/// Stateless on the wire-primitive surface — every MLS primitive delegates to
+/// the same free-function family the pre-refactor `MlsCryptoProvider` uses,
+/// preserving byte-identical output through the trait split. The owned state is
+/// the durable consumed-init-key set (`consumed_init_key_store`), a crypto-layer
+/// single-use backstop attached once after construction via
+/// [`MlsBackend::set_consumed_init_key_store`], plus a `join_gate` mutex that
+/// serializes the retrieve→join→store consumed-init-key sequence.
+///
+/// # Why the store is attached after construction (not a constructor arg)
+///
+/// The backend is built inside `MlsCryptoProvider::new` / `with_backends`,
+/// which run BEFORE the supervisor exists and therefore before the
+/// supervisor-owned `mls_storage` is available — the provider (carrying this
+/// backend) is passed INTO `Supervisor::with_providers`, which only then has
+/// the storage to wire. A construction-time required parameter is thus
+/// impossible without inverting that ordering across all four FFI bridges.
+/// Instead the store is a [`OnceLock`] set once after construction, and
+/// `join_from_welcome` **fails CLOSED** when it is still unset (deny-by-default)
+/// — the single-use backstop never silently vanishes.
+///
+/// The store is a [`OnceLock`] so reads stay lock-free (ADR-049 §12) and the
+/// store is set at most once. Safe to share via `Arc` across every actor in the
+/// process.
+///
+/// # Anchor independence vs. shared durable substrate (ADR-049 §9)
+///
+/// This crypto-layer consumed-init-key set (A2) is independent of the actor's
+/// reservation journal (A1) in KEYING (HPKE init key vs. reservation-id /
+/// consumed-`kp_ref`) and in ENFORCEMENT LOCATION (this backend vs. the
+/// `KeyPackageStoreActor`): a LOGIC bug in either cannot defeat the other. The
+/// two anchors are NOT independent in their durable substrate — the attached
+/// `consumed_init_key_store` is the SAME injected `mls_storage` `Arc` the
+/// reservation journal writes to (a different key prefix on one backend).
+/// Single-use DURABILITY is therefore contingent on that backend's
+/// crash-and-rollback consistency: an operator or faulty/adversarial `Storage`
+/// backend that can roll `mls_storage` back to a pre-consume state — a partial
+/// restore, a rollback, or a correlated loss spanning both key prefixes —
+/// un-consumes a `KeyPackage` at BOTH layers at once, re-enabling re-pool +
+/// re-join. This is consistent with the protocol treating durable storage as
+/// the trust anchor; it is not a logic gap the backend can close in code.
+/// Giving A2 a SEPARATE failure domain from A1 is a possible FUTURE hardening,
+/// out of scope until the consume path is production-wired (the
+/// spawn-from-Welcome entrypoint) and deliberately NOT implemented now.
+#[derive(Default)]
+pub struct ProductionMlsBackend {
+    /// Durable consumed-init-key set. `None` until
+    /// [`MlsBackend::set_consumed_init_key_store`] wires the supervisor's
+    /// shared `mls_storage`. When unset, `join_from_welcome` FAILS CLOSED (it
+    /// does NOT skip the crypto-layer replay check).
+    consumed_init_key_store: OnceLock<Arc<dyn OpenMlsStorageAdapter>>,
+    /// Serializes the consumed-init-key `retrieve → join → store` sequence in
+    /// [`MlsBackend::join_from_welcome`] so two concurrent joins of the same
+    /// init key cannot both pass the retrieve before either stores (a
+    /// check-then-act TOCTOU on the shared backend instance).
+    ///
+    /// This is NOT a per-context read-path lock — joins are rare and off the
+    /// hot per-context dispatch path, so ADR-049 §12's "no `Mutex` on read
+    /// paths" rule is not implicated (the gate is acquired only on a join,
+    /// which is not a per-command-dispatch read).
+    join_gate: tokio::sync::Mutex<()>,
+}
+
+impl std::fmt::Debug for ProductionMlsBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProductionMlsBackend")
+            .field(
+                "consumed_init_key_store",
+                &self.consumed_init_key_store.get().is_some(),
+            )
+            .field("join_gate", &"<tokio::sync::Mutex>")
+            .finish()
+    }
+}
 
 impl ProductionMlsBackend {
-    /// Creates a new production backend.
+    /// Creates a new production backend with no consumed-init-key store
+    /// attached yet. Production wires the store via
+    /// [`MlsBackend::set_consumed_init_key_store`] (called from the
+    /// supervisor's `with_providers`) BEFORE any join is attempted; until the
+    /// store is attached, [`MlsBackend::join_from_welcome`] fails closed.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self {
+            consumed_init_key_store: OnceLock::new(),
+            join_gate: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Derive the durable consumed-init-key set key for a KP's TLS-serialized
+    /// public bytes: `scp-kp-consumed-initkey/{hex(SHA-256(hpke_init_key))}`.
+    ///
+    /// The HPKE init key is the cryptographically-unique single-use element of
+    /// a `KeyPackage` (RFC 9420 §10): each KP carries a fresh init key, and a
+    /// Welcome is HPKE-sealed to it. Keying the consumed set by the init key
+    /// (not the whole KP bytes) binds the marker to the exact one-time secret
+    /// `OpenMLS` consumes on join.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::WelcomeProcessingFailed`] if the public bytes do
+    /// not deserialize / validate as an SCP `KeyPackage`.
+    fn consumed_init_key_key(key_package_public_bytes: &[u8]) -> Result<String, MlsError> {
+        let kp_in =
+            KeyPackageIn::tls_deserialize(&mut &*key_package_public_bytes).map_err(|e| {
+                MlsError::WelcomeProcessingFailed(format!(
+                    "deserializing key package for init-key: {e}"
+                ))
+            })?;
+        let provider = new_provider();
+        let validated = kp_in
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| {
+                MlsError::WelcomeProcessingFailed(format!(
+                    "validating key package for init-key: {e}"
+                ))
+            })?;
+        let init_key = validated.hpke_init_key().as_slice();
+        let digest = Sha256::digest(init_key);
+        Ok(format!(
+            "{CONSUMED_INIT_KEY_PREFIX}/{}",
+            hex::encode(digest)
+        ))
     }
 }
 
@@ -65,20 +185,48 @@ impl ProductionMlsBackend {
 // ---------------------------------------------------------------------------
 
 /// Opaque byte layout behind [`SignerState`]. Private to this module.
+///
+/// `signer_bytes` and `mls_storage_entries` hold private signing key and HPKE
+/// decryption-key material. A transient `SerializedSigner` (the wrapper built to
+/// serialize a signer-state in `serialize_signer_state`, or parsed back out of
+/// one via `parse_signer_state` during a join) would otherwise drop those
+/// private `Vec`s un-zeroed. The hand-written [`Drop`] zeroes them on every drop
+/// while leaving the on-disk serde format (plain `Vec<u8>` / tuple-vec fields)
+/// unchanged. `key_package_public_bytes` is the publishable KP and is not zeroed.
 #[derive(Serialize, Deserialize)]
 struct SerializedSigner {
-    /// MessagePack-serialized [`SignatureKeyPair`] bytes.
+    /// MessagePack-serialized [`SignatureKeyPair`] bytes. Zeroed on drop.
     signer_bytes: Vec<u8>,
     /// Raw MLS storage entries from the `InMemoryMlsProvider` generated
     /// alongside the `KeyPackage`. Needed to process a Welcome addressed to
     /// the KP (`OpenMLS` reads the private HPKE decryption key out of
-    /// storage when decrypting the Welcome).
+    /// storage when decrypting the Welcome). Zeroed on drop.
     mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// TLS-serialized PUBLIC `KeyPackage` bytes this signer-state was
+    /// generated for. Carried so [`MlsBackend::join_from_welcome`] can derive
+    /// the consumed-init-key marker from the signer-state's OWN KP and bind it
+    /// to the `key_package_public_bytes` argument — defeating a mismatched
+    /// `(public_bytes, signer_state)` pair at the bare API boundary. Publishable
+    /// (not zeroed).
+    key_package_public_bytes: Vec<u8>,
+}
+
+impl Drop for SerializedSigner {
+    fn drop(&mut self) {
+        // Zero the private signing-key + HPKE-key material on drop;
+        // `key_package_public_bytes` is publishable.
+        zeroize::Zeroize::zeroize(&mut self.signer_bytes);
+        for (k, v) in &mut self.mls_storage_entries {
+            zeroize::Zeroize::zeroize(k);
+            zeroize::Zeroize::zeroize(v);
+        }
+    }
 }
 
 fn serialize_signer_state(
     signer: &SignatureKeyPair,
     provider: &InMemoryMlsProvider,
+    key_package_public_bytes: &[u8],
 ) -> Result<SignerState, MlsError> {
     let signer_bytes = Zeroizing::new(
         rmp_serde::to_vec_named(signer)
@@ -97,20 +245,32 @@ fn serialize_signer_state(
     let wrapper = SerializedSigner {
         signer_bytes: signer_bytes.to_vec(),
         mls_storage_entries,
+        key_package_public_bytes: key_package_public_bytes.to_vec(),
     };
 
-    let bytes = rmp_serde::to_vec_named(&wrapper)
-        .map_err(|e| MlsError::StorageError(format!("signer-state serialization: {e}")))?;
+    let bytes = Zeroizing::new(
+        rmp_serde::to_vec_named(&wrapper)
+            .map_err(|e| MlsError::StorageError(format!("signer-state serialization: {e}")))?,
+    );
 
     Ok(SignerState { bytes })
 }
 
-fn deserialize_signer_state(
-    state: &SignerState,
-) -> Result<(SignatureKeyPair, InMemoryMlsProvider), MlsError> {
-    let wrapper: SerializedSigner = rmp_serde::from_slice(&state.bytes)
-        .map_err(|e| MlsError::StorageError(format!("signer-state deserialization: {e}")))?;
+/// Parse the opaque [`SignerState`] blob into its [`SerializedSigner`] wrapper
+/// ONCE. Both the bound-init-key derivation and the signer/provider
+/// reconstruction in [`MlsBackend::join_from_welcome`] consume the SAME parsed
+/// wrapper, so the blob is deserialized exactly once per join (not 2-3×).
+fn parse_signer_state(state: &SignerState) -> Result<SerializedSigner, MlsError> {
+    rmp_serde::from_slice(&state.bytes)
+        .map_err(|e| MlsError::StorageError(format!("signer-state deserialization: {e}")))
+}
 
+/// Rebuild the `OpenMLS` signer + provider from an already-parsed
+/// [`SerializedSigner`] wrapper. Consumes the wrapper so the private
+/// `mls_storage_entries` move into the provider without a copy.
+fn signer_and_provider_from_wrapper(
+    mut wrapper: SerializedSigner,
+) -> Result<(SignatureKeyPair, InMemoryMlsProvider), MlsError> {
     let signer: SignatureKeyPair = rmp_serde::from_slice(&wrapper.signer_bytes)
         .map_err(|e| MlsError::StorageError(format!("signer deserialization: {e}")))?;
 
@@ -121,7 +281,11 @@ fn deserialize_signer_state(
             .values
             .write()
             .map_err(|e| MlsError::StorageError(format!("provider lock poisoned: {e}")))?;
-        for (k, v) in wrapper.mls_storage_entries {
+        // `SerializedSigner` has a `Drop` that zeroes its private fields, so
+        // the entries cannot be moved out by value; take them out via
+        // `mem::take` (leaving an empty Vec the Drop harmlessly zeroes) so the
+        // private bytes move into the provider without an extra copy.
+        for (k, v) in std::mem::take(&mut wrapper.mls_storage_entries) {
             values.insert(k, v);
         }
     }
@@ -314,7 +478,7 @@ impl MlsBackend for ProductionMlsBackend {
             MlsError::KeyPackageGenerationFailed(format!("serializing key package: {e}"))
         })?;
 
-        let signer_state = serialize_signer_state(&signer, &provider)?;
+        let signer_state = serialize_signer_state(&signer, &provider, &kp_bytes)?;
 
         Ok(GeneratedKeyPackage {
             key_package_bytes: kp_bytes,
@@ -326,9 +490,104 @@ impl MlsBackend for ProductionMlsBackend {
         &self,
         welcome_bytes: &[u8],
         signer_state: SignerState,
+        key_package_public_bytes: &[u8],
     ) -> Result<ScpMlsGroup, MlsError> {
-        let (signer, provider) = deserialize_signer_state(&signer_state)?;
-        group::join_group_from_bytes(welcome_bytes, provider, signer)
+        // A2 — crypto-layer single-use backstop. Independent of the actor's
+        // reservation bookkeeping in KEYING and ENFORCEMENT LOCATION (so a LOGIC
+        // bug in the reservation journal cannot defeat it), this rejects a SECOND
+        // join with the same KP init key durably, protecting every join that
+        // flows through `MlsBackend::join_from_welcome`. Both anchors share the
+        // same durable `mls_storage` substrate, so a storage rollback can still
+        // un-consume at both layers — see the struct doc's "Anchor independence
+        // vs. shared durable substrate" note.
+        //
+        // Deny-by-default: when no consumed-init-key store has been attached
+        // (it is wired post-construction by the supervisor's `with_providers`),
+        // FAIL CLOSED rather than skip the check — a single-use security
+        // backstop that silently vanishes when unconfigured is the wrong
+        // default. The store is always attached before any production join.
+        let Some(store) = self.consumed_init_key_store.get() else {
+            return Err(MlsError::StorageError(
+                "consumed-init-key store not attached: refusing to join without the \
+                 single-use backstop (call set_consumed_init_key_store first)"
+                    .to_owned(),
+            ));
+        };
+
+        // Parse the opaque signer-state wrapper ONCE; both the bound-init-key
+        // derivation below and the signer/provider rebuild later reuse it.
+        let wrapper = parse_signer_state(&signer_state)?;
+
+        // Derive the init-key set key from the caller-supplied
+        // `key_package_public_bytes`. This also validates the KP, so a malformed
+        // KP is rejected before any group state is built.
+        let consumed_key = Self::consumed_init_key_key(key_package_public_bytes)?;
+
+        // Init-key / Welcome binding (checked BEFORE the join consumes anything).
+        // `key_package_public_bytes` is the marker key source; the
+        // `signer_state` carries its OWN KP public bytes. A successful join over
+        // a provider built SOLELY from `signer_state` necessarily uses THAT KP's
+        // init private key (OpenMLS has no other init key in scope). If a caller
+        // passed a `key_package_public_bytes` whose init key does not match the
+        // one in `signer_state`, the marker would key the WRONG init key.
+        //
+        // Fast path: when the caller-supplied bytes are byte-identical to the
+        // bytes carried in `signer_state` (the actor's normal path — it passes
+        // the reserved KP's OWN bytes), they trivially share an init key, so the
+        // second KeyPackageIn validation is skipped. Only when the bytes DIFFER
+        // (a bare-API misuse) do we re-derive the marker from the signer-state's
+        // own KP and require it to equal `consumed_key`; a mismatch means the
+        // caller violated the `(public_bytes, signer_state)` pairing contract —
+        // reject before consuming any crypto. Behaviour-preserving: the mismatch
+        // rejection still fires for every genuinely-mismatched pair.
+        if wrapper.key_package_public_bytes != key_package_public_bytes {
+            let bound_key = Self::consumed_init_key_key(&wrapper.key_package_public_bytes)?;
+            if bound_key != consumed_key {
+                return Err(MlsError::WelcomeProcessingFailed(
+                    "key_package_public_bytes init key does not match the signer-state's \
+                     key package (mismatched (public_bytes, signer_state) pair)"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        // Serialize the retrieve→join→store sequence so two concurrent joins of
+        // the same init key cannot both pass the retrieve before either stores
+        // (check-then-act TOCTOU on this shared backend instance). The gate is
+        // acquired only on a join (rare, off the per-context read path) — see
+        // the `join_gate` field doc for the ADR-049 §12 lock-free-read note.
+        let _join_guard = self.join_gate.lock().await;
+
+        // Consult the durable consumed set FIRST. An init key already present
+        // means this KP was already consumed → reject the replay.
+        let already = store
+            .retrieve(&consumed_key)
+            .await
+            .map_err(|e| MlsError::StorageError(format!("consumed-init-key retrieve: {e}")))?;
+        if already.is_some() {
+            return Err(MlsError::KeyPackageReplay);
+        }
+
+        let (signer, provider) = signer_and_provider_from_wrapper(wrapper)?;
+        let group = group::join_group_from_bytes(welcome_bytes, provider, signer)?;
+
+        // Join succeeded and the marker key is bound to the consumed init key —
+        // durably record it BEFORE returning, so a replay (even on a different
+        // code path or after a crash) is rejected by the check above. A write
+        // failure fails the join closed: returning Ok here would acknowledge a
+        // join whose single-use marker was not durably recorded.
+        store
+            .store(&consumed_key, &[0x01])
+            .await
+            .map_err(|e| MlsError::StorageError(format!("consumed-init-key store: {e}")))?;
+
+        Ok(group)
+    }
+
+    fn set_consumed_init_key_store(&self, store: Arc<dyn OpenMlsStorageAdapter>) {
+        // Idempotent single set; a second attach is ignored (the first store
+        // wins). Production attaches exactly once via `with_providers`.
+        let _ = self.consumed_init_key_store.set(store);
     }
 }
 
@@ -407,10 +666,103 @@ fn assert_groups_equivalent(left: &ScpMlsGroup, right: &ScpMlsGroup) -> Result<(
 mod tests {
     use super::*;
     use crate::crypto::mls::credential::ScpCredential;
+    use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
     use scp_identity::SigningKeyId;
+    use scp_platform::testing::InMemoryStorage;
 
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(format!("did:dht:z6Mk{name}"), None, SigningKeyId::Active).unwrap()
+    }
+
+    /// A `ProductionMlsBackend` with the durable consumed-init-key store
+    /// attached over a fresh in-memory `Storage`, so `join_from_welcome` is
+    /// JOINABLE (it fails closed without a store). Use for any test that drives
+    /// a real join.
+    fn joinable_backend() -> ProductionMlsBackend {
+        let backend = ProductionMlsBackend::new();
+        let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ));
+        backend.set_consumed_init_key_store(store);
+        backend
+    }
+
+    /// Security-critical: two concurrent `join_from_welcome` calls for ONE
+    /// generated KP (same init key) on a store-wired backend must resolve to
+    /// EXACTLY one `Ok` and one `Err(MlsError::KeyPackageReplay)`. This
+    /// exercises the `join_gate` mutex that serializes the
+    /// retrieve→join→store consumed-init-key sequence: without it, both joins
+    /// could pass the durable `retrieve` (seeing the init key absent) before
+    /// either `store`d the marker — a check-then-act TOCTOU that would let the
+    /// single-use KP join two groups. A Welcome is single-use cryptographically,
+    /// so we build TWO distinct Welcomes addressed to the SAME KP (two inviter
+    /// groups each add the same `key_package_bytes`); the init-key backstop —
+    /// not Welcome uniqueness — is what must reject the second join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_join_of_one_kp_yields_exactly_one_replay_rejection() {
+        let backend = Arc::new(joinable_backend());
+
+        // Two inviter groups each add the SAME KeyPackage, producing two
+        // distinct (cryptographically single-use) Welcomes for one init key.
+        let kp_cred = test_credential("bob-race");
+        let kp_gen = backend.generate_key_package(&kp_cred, None).await.unwrap();
+
+        let inviter_a = test_credential("alice-race-a");
+        let mut grp_a = backend.create_group(&inviter_a, None).await.unwrap();
+        let added_a = backend
+            .add_member_raw(&mut grp_a, &kp_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        let inviter_b = test_credential("alice-race-b");
+        let mut grp_b = backend.create_group(&inviter_b, None).await.unwrap();
+        let added_b = backend
+            .add_member_raw(&mut grp_b, &kp_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        // Race the two joins of the SAME KP (same init key) through the shared
+        // backend (shared `join_gate` + consumed-init-key store).
+        let b1 = Arc::clone(&backend);
+        let b2 = Arc::clone(&backend);
+        let kp_bytes_1 = kp_gen.key_package_bytes.clone();
+        let kp_bytes_2 = kp_gen.key_package_bytes.clone();
+        let signer_1 = kp_gen.signer_state.clone();
+        let signer_2 = kp_gen.signer_state.clone();
+        let welcome_1 = added_a.welcome.clone();
+        let welcome_2 = added_b.welcome.clone();
+
+        let (res1, res2) = tokio::join!(
+            async move {
+                b1.join_from_welcome(&welcome_1, signer_1, &kp_bytes_1)
+                    .await
+            },
+            async move {
+                b2.join_from_welcome(&welcome_2, signer_2, &kp_bytes_2)
+                    .await
+            },
+        );
+
+        // `ScpMlsGroup` is not `Debug`; project each result to a Debug-able tag
+        // for the assertion messages.
+        let tag = |r: &Result<ScpMlsGroup, MlsError>| match r {
+            Ok(_) => "Ok".to_owned(),
+            Err(e) => format!("Err({e:?})"),
+        };
+        let (t1, t2) = (tag(&res1), tag(&res2));
+
+        let ok_count = usize::from(res1.is_ok()) + usize::from(res2.is_ok());
+        let replay_count = usize::from(matches!(res1, Err(MlsError::KeyPackageReplay)))
+            + usize::from(matches!(res2, Err(MlsError::KeyPackageReplay)));
+        assert_eq!(
+            ok_count, 1,
+            "exactly one concurrent join must succeed (res1={t1}, res2={t2})"
+        );
+        assert_eq!(
+            replay_count, 1,
+            "exactly one concurrent join must be rejected as a single-use replay \
+             (res1={t1}, res2={t2})"
+        );
     }
 
     #[tokio::test]
@@ -447,7 +799,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_member_raw_bytes_drive_join() {
-        let backend = ProductionMlsBackend::new();
+        let backend = joinable_backend();
 
         let alice_cred = test_credential("alice-add");
         let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
@@ -468,7 +820,11 @@ mod tests {
 
         // Bob joins from the returned Welcome bytes.
         let bob_grp = backend
-            .join_from_welcome(&added.welcome, bob_gen.signer_state)
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
             .await
             .unwrap();
         assert_eq!(bob_grp.epoch().unwrap(), 1);
@@ -480,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn encrypt_decrypt_roundtrip() {
-        let backend = ProductionMlsBackend::new();
+        let backend = joinable_backend();
 
         // Alice + Bob setup.
         let alice_cred = test_credential("alice-enc");
@@ -492,7 +848,11 @@ mod tests {
             .await
             .unwrap();
         let mut bob_grp = backend
-            .join_from_welcome(&added.welcome, bob_gen.signer_state)
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
             .await
             .unwrap();
 
@@ -581,7 +941,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_commit_applies_epoch_advance() {
-        let backend = ProductionMlsBackend::new();
+        let backend = joinable_backend();
 
         // `advance_epoch` always proposes a wrapping-extension update on
         // the leaf (mirrors `MlsCryptoProvider::advance_epoch`). For Bob
@@ -606,7 +966,11 @@ mod tests {
             .await
             .unwrap();
         let mut bob_grp = backend
-            .join_from_welcome(&added.welcome, bob_gen.signer_state)
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
             .await
             .unwrap();
 
@@ -629,7 +993,7 @@ mod tests {
     /// bytes are interoperable in both directions.
     #[tokio::test]
     async fn wire_bytes_interop_between_backend_and_primitive() {
-        let backend = ProductionMlsBackend::new();
+        let backend = joinable_backend();
 
         let alice_cred = test_credential("alice-wire");
         let bob_cred = test_credential("bob-wire");
@@ -640,7 +1004,11 @@ mod tests {
             .await
             .unwrap();
         let mut bob_grp = backend
-            .join_from_welcome(&added.welcome, bob_gen.signer_state)
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
             .await
             .unwrap();
 

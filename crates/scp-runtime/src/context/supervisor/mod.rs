@@ -40,8 +40,8 @@ pub mod supervisor;
 
 pub use handle::SupervisorHandle;
 pub use key_package_actor::{
-    KP_MAILBOX_CAPACITY, KP_SEND_TIMEOUT, KeyPackageCommand, KeyPackagePrivateStub,
-    KeyPackageStoreActor, KeyPackageStoreHandle, KpRef, RelayUrl, ReservationId,
+    KP_MAILBOX_CAPACITY, KP_SEND_TIMEOUT, KeyPackageCommand, KeyPackageStoreActor,
+    KeyPackageStoreHandle, KpRef, PooledKeyPackages, ReservationId,
 };
 pub use saga_journal::{
     JournalEntry, JournalError, ProtocolRepositorySagaJournal, SAGA_JOURNAL_KEY_PREFIX, SagaId,

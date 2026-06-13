@@ -38,6 +38,8 @@
 //! to both the backend and a bare `MlsCryptoProvider` and asserts equality on
 //! the produced ciphertext / Welcome / Commit bytes.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use openmls::prelude::LeafNodeIndex;
 
@@ -45,6 +47,7 @@ use super::credential::ScpCredential;
 use super::encrypt::DecryptedContent;
 use super::error::MlsError;
 use super::group::ScpMlsGroup;
+use super::storage_adapter::OpenMlsStorageAdapter;
 
 // ---------------------------------------------------------------------------
 // Wrapper output types
@@ -120,10 +123,32 @@ pub struct GeneratedKeyPackage {
 ///
 /// The enclosed Ed25519 signing key bytes are wrapped in
 /// [`zeroize::Zeroizing`] via the implementation's serialization format.
-#[derive(Debug, Clone)]
+///
+/// The [`std::fmt::Debug`] impl is hand-written to REDACT the private bytes:
+/// it prints only the byte length, never the contents, so an accidental
+/// `{:?}` of a `SignerState` (or any struct that embeds it) can never leak
+/// the private signing / HPKE material into a log or panic payload.
+#[derive(Clone)]
 pub struct SignerState {
     /// Implementation-defined serialization of the signer + provider state.
-    pub bytes: Vec<u8>,
+    ///
+    /// Wrapped in [`zeroize::Zeroizing`] so the private signing / HPKE
+    /// material it carries is zeroed when the `SignerState` is dropped —
+    /// including the transient copy made when handing a reserved KP's
+    /// signer-state to `join_from_welcome`.
+    pub bytes: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for SignerState {
+    /// Redacted: prints the byte length, never the raw private bytes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignerState")
+            .field(
+                "bytes",
+                &format_args!("<redacted, {} bytes>", self.bytes.len()),
+            )
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,12 +297,54 @@ pub trait MlsBackend: Send + Sync {
     /// Joins a group from a TLS-serialized MLS Welcome message using the
     /// opaque `signer_state` previously returned by `generate_key_package`.
     ///
+    /// `key_package_public_bytes` is the TLS-serialized public `KeyPackage`
+    /// this signer-state was generated for. It is the single-use anchor's
+    /// crypto-layer key: the implementation derives the KP's HPKE init key
+    /// (the cryptographically-unique single-use element, RFC 9420 §10) from
+    /// these bytes and consults the durable consumed-init-key set (see
+    /// [`Self::set_consumed_init_key_store`]) BEFORE completing the join. An
+    /// init key already in the set means this KP was already consumed by some
+    /// join — the call is rejected with a typed error, defeating a replay at
+    /// the crypto layer independent of any higher-level reservation
+    /// bookkeeping. On a successful join the init key is durably added to the
+    /// set. The backstop covers every join that flows through THIS method
+    /// (`MlsBackend::join_from_welcome`); the legacy
+    /// `MlsCryptoProvider::join_from_welcome` path calls
+    /// `group::join_group_from_bytes` directly and is production-unreachable
+    /// (test/feature-gated, `#[cfg(any(test, feature = "testing"))]`), slated for
+    /// deletion when the spawn-from-Welcome entrypoint lands — so there is no
+    /// LIVE production gap, only a test/feature-gated path that will be removed.
+    /// The production implementation FAILS CLOSED when no store has been
+    /// attached — it never silently skips the check.
+    ///
+    /// The implementation MUST also bind `key_package_public_bytes` to the
+    /// init key the Welcome actually consumes, so a mismatched
+    /// `(key_package_public_bytes, signer_state)` pair cannot key the marker
+    /// against an unrelated init key.
+    ///
     /// # Errors
     ///
     /// See [`MlsError`]. Cancel-hostile on the caller's key material.
+    /// Returns [`MlsError::KeyPackageReplay`] if the KP's init key is already
+    /// in the durable consumed-init-key set.
     async fn join_from_welcome(
         &self,
         welcome_bytes: &[u8],
         signer_state: SignerState,
+        key_package_public_bytes: &[u8],
     ) -> Result<ScpMlsGroup, MlsError>;
+
+    /// Attach the durable consumed-init-key set used by
+    /// [`Self::join_from_welcome`] as a crypto-layer single-use backstop.
+    ///
+    /// Production wires the supervisor's shared `mls_storage` here so that a
+    /// second join with the same KP init key is rejected durably even if the
+    /// `KeyPackageStoreActor`'s reservation bookkeeping has a bug. The
+    /// production implementation requires the store to be attached before any
+    /// join: with no store attached its `join_from_welcome` fails closed
+    /// (deny-by-default). The default trait implementation is a no-op so a
+    /// backend that does not maintain the set (a test mock) can opt out of the
+    /// crypto-layer set entirely; such a backend's own `join_from_welcome`
+    /// defines its single-use policy.
+    fn set_consumed_init_key_store(&self, _store: Arc<dyn OpenMlsStorageAdapter>) {}
 }

@@ -28,7 +28,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
+// `ArcSwapOption` backs the test/feature-gated `pending_joins` single-slot join
+// state only; importing it in the production build would be an unused import.
+#[cfg(any(test, feature = "testing"))]
+use arc_swap::ArcSwapOption;
 use dashmap::{DashMap, DashSet};
 
 use openmls::prelude::*;
@@ -342,6 +346,11 @@ impl std::fmt::Debug for OwnedMlsCryptoState {
 /// When [`MlsCryptoProvider::prepare_key_package_for_join`] generates a key
 /// package, the signer and provider are retained here so that a subsequent
 /// [`MlsCryptoProvider::join_from_welcome`] call can reconstruct the group.
+///
+/// Test/feature-gated alongside those two legacy methods (the only readers /
+/// writers of this state), so the production build does not carry the
+/// unbackstopped single-slot join state.
+#[cfg(any(test, feature = "testing"))]
 struct PendingJoinState {
     /// The signing key pair for the generated key package, wrapped in
     /// [`EagerDropSigner`] for best-effort zeroization (consistent with
@@ -429,6 +438,11 @@ pub struct MlsCryptoProvider {
     /// provider is the sole writer of this slot — `swap` returns an
     /// `Arc` whose strong count is 1 in the absence of concurrent
     /// `load`s, so `try_unwrap` succeeds in the steady state.
+    ///
+    /// Test/feature-gated alongside the legacy `prepare_key_package_for_join` /
+    /// `join_from_welcome` methods that are its sole writer / reader, so the
+    /// production build carries no unbackstopped single-slot join state.
+    #[cfg(any(test, feature = "testing"))]
     pending_joins: ArcSwapOption<PendingJoinState>,
     /// Contexts whose crypto state has been destructively moved into a
     /// [`crate::context::actor::ContextActor`] via
@@ -509,6 +523,7 @@ impl MlsCryptoProvider {
             broadcast_keys: DashMap::new(),
             wrapping_public_key: ArcSwap::from_pointee(wrapping_public_key),
             wrapping_secret_key: ArcSwap::from_pointee(Zeroizing::new(wrapping_secret_key)),
+            #[cfg(any(test, feature = "testing"))]
             pending_joins: ArcSwapOption::empty(),
             taken_context_ids: DashSet::new(),
         }
@@ -2375,9 +2390,32 @@ impl MlsCryptoProvider {
     ///
     /// Default: not supported (returns error).
     ///
+    /// # Superseded by the actor reserve→confirm protocol
+    ///
+    /// This single-slot path (one outstanding `pending_joins` entry at a time)
+    /// is superseded by the per-identity
+    /// [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor)
+    /// reserve→confirm/cancel protocol, which tracks an arbitrary number of
+    /// concurrent reservations keyed by `ReservationId`. It is retained only
+    /// until the join-from-welcome spawn entrypoint lands; it will be removed
+    /// then. No new call sites should use it.
+    ///
+    /// # Test/feature-gated (single-use backstop bypass)
+    ///
+    /// This legacy path generates the KP in the provider's in-memory single
+    /// slot and joins via `group::join_group_from_bytes` directly, BYPASSING the
+    /// crypto-layer consumed-init-key backstop ([`MlsBackend::join_from_welcome`]
+    /// in `ProductionMlsBackend`). Its only callers are feature-gated test seams
+    /// (the `scp-testing` fullstack harness, pulled into `scp-ffi` solely via
+    /// `allow_in_memory_custody`, which transitively enables `scp-runtime/testing`).
+    /// Gating it behind `#[cfg(any(test, feature = "testing"))]` makes the
+    /// PRODUCTION build unable to wire the unbackstopped path — production joins
+    /// MUST flow through `MlsBackend::join_from_welcome`.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if key package generation fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
         use tls_codec::Serialize as TlsSerializeTrait;
 
@@ -2415,9 +2453,29 @@ impl MlsCryptoProvider {
     ///
     /// Default: not supported (returns error).
     ///
+    /// # Superseded by the actor reserve→confirm protocol
+    ///
+    /// Paired with the superseded
+    /// [`Self::prepare_key_package_for_join`]: the actor-native flow reserves a
+    /// KP from the
+    /// [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor),
+    /// joins from the returned signer-state, then confirms/cancels the
+    /// reservation. This provider path is retained only until the
+    /// join-from-welcome spawn entrypoint lands.
+    ///
+    /// # Test/feature-gated (single-use backstop bypass)
+    ///
+    /// This legacy path calls `group::join_group_from_bytes` directly, BYPASSING
+    /// the crypto-layer consumed-init-key backstop ([`MlsBackend::join_from_welcome`]
+    /// in `ProductionMlsBackend`). Its only callers are feature-gated test seams,
+    /// so it is gated behind `#[cfg(any(test, feature = "testing"))]` to keep the
+    /// PRODUCTION build from wiring the unbackstopped path — production joins MUST
+    /// flow through `MlsBackend::join_from_welcome`.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if Welcome processing fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn join_from_welcome(
         &self,
         context_id: &[u8; 32],

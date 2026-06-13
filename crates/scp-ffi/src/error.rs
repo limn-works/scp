@@ -408,6 +408,14 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: codes::CTX_2135.to_owned(),
             },
+            // ADR-049 §9: key package single-use replay rejected by the
+            // crypto-layer consumed-init-key backstop. Dedicated SCP-CTX-2136
+            // instead of CTX_2001 so a caller can detect a security-relevant
+            // single-use replay.
+            CE::KeyPackageReplay(_) => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2136.to_owned(),
+            },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for tool-economy and tool-invocation failures
             // (economy 12xxx, tool-invocation 6xxx). Recover the embedded
@@ -888,5 +896,14 @@ mod tests {
         let err: ScpPyError =
             scp_core::context::ContextError::ActorCrashed("ctx-1".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2135);
+    }
+
+    /// ADR-049 §9: a key package single-use replay must surface the dedicated
+    /// SCP-CTX-2136 code, distinct from the catch-all and from `InvalidState`.
+    #[test]
+    fn key_package_replay_surfaces_ctx_2136() {
+        let err: ScpPyError =
+            scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2136);
     }
 }
