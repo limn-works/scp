@@ -2133,11 +2133,14 @@ pub async fn restore_context(
     // already proved `ctx_snapshot.routing.is_broadcast()` matches the
     // reconstructed mode, so no rebuild is needed — move the snapshot's variant
     // through verbatim. For encrypted contexts this carries the persisted local
-    // pseudonym and peer registry; an empty / zero pseudonym is acceptable here
-    // (the local member re-announces its real pseudonym after restore, and peers
-    // re-announce theirs, exactly as a cold restore starts). `ContextRouting`'s
-    // `Pseudonymous` fields are private, which is precisely why a destructure-
-    // and-rebuild is no longer possible here — and why it is no longer needed.
+    // pseudonym and peer registry forward, so a warm restore is NOT bootstrap-
+    // empty (it can address known peers immediately; see §9.10.4). An empty /
+    // zero pseudonym is acceptable here: that snapshot behaves like a cold start,
+    // and the member becomes addressable only once it explicitly re-announces —
+    // `restore_context` itself emits no announcement — and peers re-announce
+    // theirs. `ContextRouting`'s `Pseudonymous` fields are private, which is
+    // precisely why a destructure-and-rebuild is no longer possible here — and
+    // why it is no longer needed.
     let restored_routing = ctx_snapshot.routing;
     let per_context = PerContextState {
         context_id: context_id_bytes,

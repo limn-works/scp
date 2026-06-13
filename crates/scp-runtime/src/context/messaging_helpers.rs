@@ -2285,7 +2285,7 @@ pub async fn send_pseudonym_announcement(
         tracing::warn!(
             context_id = %context_id,
             error = %e,
-            "failed to send pseudonym announcement — other members will use shared routing"
+            "failed to send pseudonym announcement — peers cannot address this member until it re-announces (no shared-RID fallback for application data)"
         );
     }
 }
