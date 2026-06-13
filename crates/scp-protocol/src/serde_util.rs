@@ -9,7 +9,7 @@
 //! - [`serde_signature_64`] — Ed25519 signatures (exactly 64 bytes)
 //! - [`serde_hash_32`] — SHA-256 hashes (exactly 32 bytes)
 //! - [`serde_pubkey_32`] — X25519 / Ed25519 public keys (exactly 32 bytes)
-//! - [`serde_hpke_sealed_60`] — HPKE-sealed sender key (exactly 60 bytes)
+//! - [`serde_hpke_sealed_48`] — HPKE-sealed sender key (exactly 48 bytes)
 //!
 //! # Bounded variable-size
 //!
@@ -149,32 +149,33 @@ pub mod serde_pubkey_32 {
     }
 }
 
-/// Serde module for `[u8; 60]` fields (HPKE-sealed sender keys).
+/// Serde module for `[u8; 48]` fields (HPKE-sealed sender keys).
 ///
-/// The HPKE-sealed sender key is exactly 60 bytes: AES-128-GCM nonce (12) +
-/// encrypted sender key (32) + authentication tag (16). Using a fixed-size
-/// array prevents allocation of arbitrarily large buffers from malicious input.
+/// The HPKE ciphertext is exactly 48 bytes: encrypted sender key (32) +
+/// AES-128-GCM authentication tag (16). The AEAD nonce is internal per RFC
+/// 9180 — it is NOT carried on the wire. Using a fixed-size array prevents
+/// allocation of arbitrarily large buffers from malicious input.
 #[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
-pub mod serde_hpke_sealed_60 {
+pub mod serde_hpke_sealed_48 {
     use serde::{self, Deserializer, Serializer};
 
-    /// Serializes a 60-byte HPKE-sealed sender key as compact binary.
-    pub fn serialize<S>(bytes: &[u8; 60], serializer: S) -> Result<S::Ok, S::Error>
+    /// Serializes a 48-byte HPKE-sealed sender key as compact binary.
+    pub fn serialize<S>(bytes: &[u8; 48], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serde_bytes::serialize(bytes.as_slice(), serializer)
     }
 
-    /// Deserializes exactly 60 bytes as an HPKE-sealed sender key.
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 60], D::Error>
+    /// Deserializes exactly 48 bytes as an HPKE-sealed sender key.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 48], D::Error>
     where
         D: Deserializer<'de>,
     {
         let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
         v.try_into().map_err(|v: Vec<u8>| {
             serde::de::Error::custom(format!(
-                "expected 60-byte HPKE sealed key, got {} bytes",
+                "expected 48-byte HPKE sealed key, got {} bytes",
                 v.len()
             ))
         })
@@ -767,12 +768,12 @@ mod tests {
         );
     }
 
-    // --- hpke_sealed_60 tests ---
+    // --- hpke_sealed_48 tests ---
 
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
-    struct HpkeSealed60Wrapper {
-        #[serde(with = "serde_hpke_sealed_60")]
-        sealed: [u8; 60],
+    struct HpkeSealed48Wrapper {
+        #[serde(with = "serde_hpke_sealed_48")]
+        sealed: [u8; 48],
     }
 
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -782,33 +783,33 @@ mod tests {
     }
 
     #[test]
-    fn hpke_sealed_60_roundtrip() {
-        let wrapper = HpkeSealed60Wrapper { sealed: [0xAB; 60] };
+    fn hpke_sealed_48_roundtrip() {
+        let wrapper = HpkeSealed48Wrapper { sealed: [0xAB; 48] };
         let serialized = rmp_serde::to_vec_named(&wrapper).unwrap();
-        let deserialized: HpkeSealed60Wrapper = rmp_serde::from_slice(&serialized).unwrap();
-        assert_eq!(deserialized.sealed, [0xAB; 60]);
+        let deserialized: HpkeSealed48Wrapper = rmp_serde::from_slice(&serialized).unwrap();
+        assert_eq!(deserialized.sealed, [0xAB; 48]);
     }
 
     #[test]
-    fn hpke_sealed_60_rejects_wrong_size() {
+    fn hpke_sealed_48_rejects_wrong_size() {
         let bad = BadHpkeSealedWrapper {
-            sealed: vec![0u8; 59],
+            sealed: vec![0u8; 47],
         };
         let serialized = rmp_serde::to_vec_named(&bad).unwrap();
-        let result = rmp_serde::from_slice::<HpkeSealed60Wrapper>(&serialized);
+        let result = rmp_serde::from_slice::<HpkeSealed48Wrapper>(&serialized);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("60-byte HPKE sealed key"),
-            "error should mention 60-byte: {err}"
+            err.contains("48-byte HPKE sealed key"),
+            "error should mention 48-byte: {err}"
         );
 
-        // 61 bytes — too long
+        // 49 bytes — too long
         let bad_long = BadHpkeSealedWrapper {
-            sealed: vec![0u8; 61],
+            sealed: vec![0u8; 49],
         };
         let serialized_long = rmp_serde::to_vec_named(&bad_long).unwrap();
-        let result = rmp_serde::from_slice::<HpkeSealed60Wrapper>(&serialized_long);
+        let result = rmp_serde::from_slice::<HpkeSealed48Wrapper>(&serialized_long);
         assert!(result.is_err());
     }
 

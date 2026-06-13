@@ -810,6 +810,127 @@ impl BroadcastReplayDetector {
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast key distribution (RFC 9180 HPKE, §5.14.2)
+// ---------------------------------------------------------------------------
+
+/// HPKE `info` domain separator for broadcast-key distribution (§5.14.2).
+const BROADCAST_KEY_HPKE_INFO_PREFIX: &[u8] = b"scp-broadcast-key-v1";
+
+/// Builds the HPKE `info` for broadcast-key distribution (spec §5.14.2).
+///
+/// Format: `"scp-broadcast-key-v1" || BE32(len(context_id)) || context_id || BE32(len(author_did)) || author_did || epoch_BE`.
+/// Variable-length fields carry 4-byte big-endian length prefixes (§9.5.1) to
+/// prevent boundary-shift ambiguity, matching the sender-key (§9.16.2) and
+/// access-key (§9.17.1) `info` constructions. Distinct from those domain
+/// separators to prevent cross-protocol key confusion.
+#[must_use]
+pub fn build_broadcast_key_hpke_info(context_id: &str, author_did: &str, epoch: u64) -> Vec<u8> {
+    let ctx = context_id.as_bytes();
+    let did = author_did.as_bytes();
+    let mut info =
+        Vec::with_capacity(BROADCAST_KEY_HPKE_INFO_PREFIX.len() + 4 + ctx.len() + 4 + did.len() + 8);
+    info.extend_from_slice(BROADCAST_KEY_HPKE_INFO_PREFIX);
+    #[allow(clippy::cast_possible_truncation)] // context_id/DID lengths << u32::MAX
+    let ctx_len = ctx.len() as u32;
+    info.extend_from_slice(&ctx_len.to_be_bytes());
+    info.extend_from_slice(ctx);
+    #[allow(clippy::cast_possible_truncation)]
+    let did_len = did.len() as u32;
+    info.extend_from_slice(&did_len.to_be_bytes());
+    info.extend_from_slice(did);
+    info.extend_from_slice(&epoch.to_be_bytes());
+    info
+}
+
+/// Builds the HPKE `aad` for broadcast-key distribution (spec §5.14.2).
+///
+/// Format: `BE32(len(context_id)) || context_id || BE32(len(author_did)) || author_did || epoch_BE`
+/// — the same encoding as the `info`, without the domain-separator prefix.
+#[must_use]
+pub fn build_broadcast_key_hpke_aad(context_id: &str, author_did: &str, epoch: u64) -> Vec<u8> {
+    let ctx = context_id.as_bytes();
+    let did = author_did.as_bytes();
+    let mut aad = Vec::with_capacity(4 + ctx.len() + 4 + did.len() + 8);
+    #[allow(clippy::cast_possible_truncation)] // context_id/DID lengths << u32::MAX
+    let ctx_len = ctx.len() as u32;
+    aad.extend_from_slice(&ctx_len.to_be_bytes());
+    aad.extend_from_slice(ctx);
+    #[allow(clippy::cast_possible_truncation)]
+    let did_len = did.len() as u32;
+    aad.extend_from_slice(&did_len.to_be_bytes());
+    aad.extend_from_slice(did);
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad
+}
+
+/// HPKE-seals a 32-byte broadcast key to a subscriber's X25519 wrapping pubkey
+/// (RFC 9180 Base mode, §5.14.2).
+///
+/// Returns `(ct, enc)` where `ct` is the HPKE ciphertext (`ciphertext || tag`,
+/// 48 bytes) and `enc` is the 32-byte HPKE encapsulated key. The AEAD nonce is
+/// internal per RFC 9180. `context_id`/`author_did`/`epoch` are bound into both
+/// `info` and `aad` to prevent cross-context/cross-author/cross-epoch replay.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if HPKE sealing fails.
+pub fn seal_broadcast_key_to_subscriber(
+    broadcast_key: &SenderKey,
+    subscriber_wrapping_pub: &[u8; 32],
+    context_id: &str,
+    author_did: &str,
+    epoch: u64,
+) -> Result<(Vec<u8>, [u8; 32]), SenderKeyError> {
+    let info = build_broadcast_key_hpke_info(context_id, author_did, epoch);
+    let aad = build_broadcast_key_hpke_aad(context_id, author_did, epoch);
+
+    let (enc, ct) = crate::crypto::hpke::seal(
+        subscriber_wrapping_pub,
+        &info,
+        &aad,
+        broadcast_key.as_bytes(),
+    )
+    .map_err(|e| SenderKeyError::HpkeEncryptionFailed(e.to_string()))?;
+
+    Ok((ct, enc))
+}
+
+/// HPKE-opens a sealed broadcast key using a software-held X25519 wrapping
+/// secret (RFC 9180 Base mode, §5.14.2).
+///
+/// `enc` is the HPKE encapsulated key from
+/// [`seal_broadcast_key_to_subscriber`]. Custody-held wrapping keys must use
+/// [`crate::crypto::hpke::custody::open_with_external_dh`].
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if HPKE open fails or the
+/// recovered plaintext is not exactly 32 bytes.
+pub fn open_broadcast_key(
+    sealed: &[u8],
+    enc: &[u8; 32],
+    wrapping_secret: &[u8; 32],
+    context_id: &str,
+    author_did: &str,
+    epoch: u64,
+) -> Result<SenderKey, SenderKeyError> {
+    let info = build_broadcast_key_hpke_info(context_id, author_did, epoch);
+    let aad = build_broadcast_key_hpke_aad(context_id, author_did, epoch);
+
+    let plaintext = crate::crypto::hpke::open(wrapping_secret, enc, &info, &aad, sealed)
+        .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?;
+
+    let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
+        SenderKeyError::HpkeDecryptionFailed(format!(
+            "decrypted broadcast key must be 32 bytes, got {}",
+            plaintext.len()
+        ))
+    })?;
+
+    Ok(SenderKey::from_bytes(key_bytes))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1616,5 +1737,89 @@ mod tests {
             let decrypted = test_open(&key, &envelope).unwrap();
             prop_assert_eq!(plaintext, decrypted);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Broadcast key distribution (RFC 9180 HPKE, §5.14.2)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn broadcast_key_hpke_distribution_roundtrip() {
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let key = generate_broadcast_key("did:dht:author");
+        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
+        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+
+        let (ct, enc) = seal_broadcast_key_to_subscriber(
+            key.key(),
+            &subscriber_pub.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        )
+        .unwrap();
+
+        // ct is exactly 48 bytes: 32-byte key + 16-byte AEAD tag.
+        assert_eq!(ct.len(), 48);
+
+        let recovered = open_broadcast_key(
+            &ct,
+            &enc,
+            &subscriber_secret.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        )
+        .unwrap();
+        assert_eq!(recovered.as_bytes(), key.key().as_bytes());
+    }
+
+    #[test]
+    fn broadcast_key_hpke_rejects_wrong_context() {
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let key = generate_broadcast_key("did:dht:author");
+        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
+        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+
+        let (ct, enc) = seal_broadcast_key_to_subscriber(
+            key.key(),
+            &subscriber_pub.to_bytes(),
+            "ctx-A",
+            "did:dht:author",
+            0,
+        )
+        .unwrap();
+
+        // Open under a different context_id — wrong info/aad → AEAD failure.
+        let result = open_broadcast_key(
+            &ct,
+            &enc,
+            &subscriber_secret.to_bytes(),
+            "ctx-B",
+            "did:dht:author",
+            0,
+        );
+        assert!(result.is_err(), "wrong context should fail HPKE open");
+    }
+
+    #[test]
+    fn broadcast_key_hpke_info_distinct_from_sender_key() {
+        // Domain separation: broadcast-key info prefix must differ from the
+        // sender-key prefix so a sender-key ciphertext cannot open as a
+        // broadcast key over the same keypair.
+        let info = build_broadcast_key_hpke_info("ctx", "did:dht:author", 1);
+        assert!(info.starts_with(b"scp-broadcast-key-v1"));
+        assert!(!info.starts_with(b"scp-sender-key-v1"));
+    }
+
+    #[test]
+    fn broadcast_key_hpke_info_length_prefixes_prevent_boundary_shift() {
+        // ("ab", "c") and ("a", "bc") must produce distinct info despite the
+        // same concatenated bytes — length prefixes disambiguate.
+        let a = build_broadcast_key_hpke_info("ab", "c", 0);
+        let b = build_broadcast_key_hpke_info("a", "bc", 0);
+        assert_ne!(a, b);
     }
 }
