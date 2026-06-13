@@ -702,35 +702,6 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Optio
     Some(wrapped)
 }
 
-/// Unwraps a PSK wrapped by [`wrap_psk_for_device`] using a software-held
-/// device X25519 secret (RFC 9180 HPKE Base mode, §3.7.2).
-///
-/// This is the device-side open counterpart of the PSK distribution protocol:
-/// a device that receives a `PskRotated` / `DeviceWrappedPsk` entry recovers
-/// the new PSK with this function. `wrapped` is `enc(32) || ct(48)`.
-///
-/// Device keys are custody-held per §3.7.2; callers holding a custody handle
-/// should instead compute the DH inside custody and call
-/// [`scp_protocol::crypto::hpke::custody::open_with_external_dh`] with the same
-/// `info` (`"scp-private-state-v1" || len(did) || did || "psk-rotate"`).
-///
-/// Returns `None` if the wire layout is wrong (not 80 bytes) or HPKE open
-/// fails (wrong device key, wrong `did`, or tampered ciphertext).
-#[must_use]
-pub fn unwrap_psk_for_device(wrapped: &[u8], device_sk: &[u8; 32], did: &str) -> Option<[u8; 32]> {
-    if wrapped.len() != WRAPPED_PSK_LEN {
-        return None;
-    }
-    let enc: [u8; 32] = wrapped[..32].try_into().ok()?;
-    let ct = &wrapped[32..];
-
-    let info = build_psk_hpke_info(did, PSK_PURPOSE_ROTATE);
-    let plaintext = zeroize::Zeroizing::new(
-        scp_protocol::crypto::hpke::open(device_sk, &enc, &info, &[], ct).ok()?,
-    );
-    plaintext.as_slice().try_into().ok()
-}
-
 // ---------------------------------------------------------------------------
 // ProductionRecoveryBackend — real implementation of RecoveryBackend
 // ---------------------------------------------------------------------------
@@ -2430,8 +2401,39 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // wrap_psk_for_device / unwrap_psk_for_device unit tests (RFC 9180, §3.7.2)
+    // wrap_psk_for_device unit tests (RFC 9180, §3.7.2)
+    //
+    // These verify the PRODUCTION wrap path (`wrap_psk_for_device`, called by
+    // `rotate_psk`). The device-side open counterpart is exercised here by
+    // calling `scp_protocol::crypto::hpke::open` directly against the wrapped
+    // wire (`enc(32) || ct(48)`), reconstructing the §3.7.2 `info` via the
+    // shared `build_psk_hpke_info` helper that the production wrap also uses.
+    // Opening through `hpke::open` keeps every negative ciphertext-level: a
+    // real AEAD verification failure, not a builder-string comparison.
     // -----------------------------------------------------------------------
+
+    /// Device-side open of a wrapped PSK, mirroring what a device that receives
+    /// a `PskRotated` / `DeviceWrappedPsk` entry does: split `enc(32) || ct(48)`,
+    /// rebuild the §3.7.2 `info`, and HPKE-open with the device X25519 secret.
+    ///
+    /// Returns `None` on wrong wire length, invalid `enc`, or any HPKE/AEAD
+    /// failure (wrong device key, wrong `did`, tampered ciphertext) — exactly
+    /// the failure surface the negatives below assert against.
+    fn open_wrapped_psk(wrapped: &[u8], device_sk: &[u8; 32], did: &str) -> Option<[u8; 32]> {
+        if wrapped.len() != super::WRAPPED_PSK_LEN {
+            return None;
+        }
+        let enc: [u8; 32] = wrapped[..32].try_into().ok()?;
+        let ct = &wrapped[32..];
+
+        // Reconstruct the §3.7.2 info via the SAME helper the production wrap
+        // uses, so the test cannot drift from the wrap's info construction.
+        let info = super::build_psk_hpke_info(did, super::PSK_PURPOSE_ROTATE);
+        let plaintext = zeroize::Zeroizing::new(
+            scp_protocol::crypto::hpke::open(device_sk, &enc, &info, &[], ct).ok()?,
+        );
+        plaintext.as_slice().try_into().ok()
+    }
 
     #[test]
     fn psk_wrapping_is_80_bytes_with_fresh_enc() {
@@ -2470,16 +2472,17 @@ mod tests {
         let psk = [0x42u8; 32];
         let did = "did:dht:zPskTest";
 
+        // Production wrap → device-side open via hpke::open must recover the PSK.
         let wrapped =
             super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap failed");
 
-        let recovered = super::unwrap_psk_for_device(&wrapped, &device_secret.to_bytes(), did)
-            .expect("unwrap failed");
+        let recovered =
+            open_wrapped_psk(&wrapped, &device_secret.to_bytes(), did).expect("open failed");
         assert_eq!(recovered, psk, "roundtrip mismatch");
     }
 
     #[test]
-    fn psk_unwrapping_rejects_wrong_did() {
+    fn psk_opening_rejects_wrong_did() {
         use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
         let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
@@ -2491,14 +2494,13 @@ mod tests {
 
         // A different DID changes the HPKE info → AEAD open fails.
         assert!(
-            super::unwrap_psk_for_device(&wrapped, &device_secret.to_bytes(), "did:dht:zBob")
-                .is_none(),
-            "wrong DID must fail to unwrap"
+            open_wrapped_psk(&wrapped, &device_secret.to_bytes(), "did:dht:zBob").is_none(),
+            "wrong DID must fail to open"
         );
     }
 
     #[test]
-    fn psk_unwrapping_rejects_wrong_device_and_tamper() {
+    fn psk_opening_rejects_wrong_device_and_tamper() {
         use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
         let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
@@ -2512,7 +2514,7 @@ mod tests {
 
         // Wrong device key.
         assert!(
-            super::unwrap_psk_for_device(&wrapped, &wrong_secret.to_bytes(), did).is_none(),
+            open_wrapped_psk(&wrapped, &wrong_secret.to_bytes(), did).is_none(),
             "wrong device key must fail"
         );
 
@@ -2520,13 +2522,13 @@ mod tests {
         let mut tampered = wrapped.clone();
         tampered[40] ^= 0x01;
         assert!(
-            super::unwrap_psk_for_device(&tampered, &device_secret.to_bytes(), did).is_none(),
+            open_wrapped_psk(&tampered, &device_secret.to_bytes(), did).is_none(),
             "tampered ciphertext must fail"
         );
 
         // Wrong length.
         assert!(
-            super::unwrap_psk_for_device(&wrapped[..79], &device_secret.to_bytes(), did).is_none(),
+            open_wrapped_psk(&wrapped[..79], &device_secret.to_bytes(), did).is_none(),
             "wrong length must fail"
         );
     }
