@@ -1144,9 +1144,9 @@ impl MlsCryptoProvider {
                 )
                 .map_err(|e| ContextError::CryptoFailed(format!("HPKE seal failed: {e}")))?;
 
-            let sealed: [u8; 60] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+            let sealed: [u8; 48] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
                 ContextError::CryptoFailed(format!(
-                    "HPKE seal produced {} bytes, expected 60",
+                    "HPKE seal produced {} bytes, expected 48",
                     v.len()
                 ))
             })?;
@@ -1280,12 +1280,12 @@ impl MlsCryptoProvider {
 
             match seal_result {
                 Ok((sealed_vec, ephemeral_pub)) => {
-                    let sealed: [u8; 60] = match sealed_vec.try_into() {
+                    let sealed: [u8; 48] = match sealed_vec.try_into() {
                         Ok(s) => s,
                         Err(v) => {
                             tracing::warn!(
                                 member_did = %member_did,
-                                "HPKE seal produced {} bytes, expected 60 — skipping",
+                                "HPKE seal produced {} bytes, expected 48 — skipping",
                                 v.len()
                             );
                             continue;
@@ -1528,8 +1528,8 @@ impl MlsCryptoProvider {
             )
             .map_err(|e| ContextError::CryptoFailed(format!("HPKE seal failed: {e}")))?;
 
-        let sealed: [u8; 60] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
-            ContextError::CryptoFailed(format!("HPKE seal produced {} bytes, expected 60", v.len()))
+        let sealed: [u8; 48] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+            ContextError::CryptoFailed(format!("HPKE seal produced {} bytes, expected 48", v.len()))
         })?;
 
         let response = SenderKeyResponse {
@@ -3314,7 +3314,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        let sealed: [u8; 60] = sealed_vec.try_into().unwrap();
+        let sealed: [u8; 48] = sealed_vec.try_into().unwrap();
 
         let response = SenderKeyResponse {
             sender_did: TEST_DID.to_string(),
