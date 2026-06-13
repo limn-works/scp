@@ -1135,6 +1135,146 @@ mod tests {
         drop(adapter);
     }
 
+    /// Verifies that an explicitly-started cover traffic task emits dummy
+    /// blobs to the relay across multiple intervals (AC7). Asserts on the
+    /// observable side effect — blobs landing in the relay's blob store —
+    /// rather than a fixed sleep, polling until at least three dummies have
+    /// arrived (proving emission spans more than one interval).
+    #[tokio::test]
+    async fn cover_traffic_emits_dummies_at_interval() {
+        use crate::cover_traffic::CoverTrafficConfig;
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::{BlobStorage, BlobStorageBackend};
+        use crate::profile::CoverTrafficTier;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Start a local relay server, holding our own handle to the shared
+        // blob storage so we can observe what the relay persists.
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, Arc::clone(&storage));
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+            .await
+            .unwrap();
+
+        // Explicitly start cover traffic with a short 50ms interval and no
+        // budget cap, so dummies emit continuously.
+        let _ct_handle = adapter.start_cover_traffic(CoverTrafficConfig {
+            tier: CoverTrafficTier::Custom {
+                interval: Duration::from_millis(50),
+                padding_bytes: 256,
+            },
+            bandwidth_budget_bytes_per_min: None,
+        });
+
+        // Poll the blob store until at least three dummies have arrived,
+        // bounded by a generous timeout. Three blobs prove emission across
+        // multiple intervals (the initial random delay is < one interval).
+        let observed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let count = storage.count().await.unwrap();
+                if count >= 3 {
+                    return count;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cover traffic should emit at least 3 dummies within 3s");
+
+        assert!(
+            observed >= 3,
+            "expected at least 3 dummy blobs across multiple intervals, got {observed}"
+        );
+    }
+
+    /// Verifies that a per-minute bandwidth budget degrades the effective
+    /// tier to `Off` once exhausted, halting emission for the remainder of
+    /// the period (AC8). A 256-byte budget is consumed by the first 256-byte
+    /// dummy; subsequent ticks within the same minute send nothing.
+    #[tokio::test]
+    async fn cover_traffic_budget_degrades_tier() {
+        use crate::cover_traffic::CoverTrafficConfig;
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::{BlobStorage, BlobStorageBackend};
+        use crate::profile::CoverTrafficTier;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, Arc::clone(&storage));
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+            .await
+            .unwrap();
+
+        // 256-byte/min budget with 256-byte dummies: the first dummy exhausts
+        // the budget, degrading the effective tier to Off for the rest of the
+        // 1-minute period.
+        let _ct_handle = adapter.start_cover_traffic(CoverTrafficConfig {
+            tier: CoverTrafficTier::Custom {
+                interval: Duration::from_millis(50),
+                padding_bytes: 256,
+            },
+            bandwidth_budget_bytes_per_min: Some(256),
+        });
+
+        // Wait for the single budgeted dummy to land.
+        let reached_one = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if storage.count().await.unwrap() >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            reached_one.is_ok(),
+            "the first (budgeted) dummy should be emitted within 3s"
+        );
+
+        // Observe across ~500ms (10 intervals). No minute boundary is crossed,
+        // so the budget never resets and the count must stay pinned at 1.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let count = storage.count().await.unwrap();
+            assert_eq!(
+                count, 1,
+                "budget should cap emission at exactly 1 dummy, got {count}"
+            );
+        }
+    }
+
     // --- Heartbeat monitoring tests (#1533) ---
 
     /// Verifies that connecting with a `TransportProfile` creates a heartbeat
