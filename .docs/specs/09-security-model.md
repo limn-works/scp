@@ -282,7 +282,9 @@ The full list of sync-persisted operations (which is a superset of the downward-
 
 ### 9.4.3 Saga Journal Secret Handling
 
-The cross-context saga coordinator writes phase transitions to a durable journal (§5.15.4, §17.16). Saga evidence carried in journal entries is classified as **secret-bearing** or **public**. Bearer artifacts (migration custody handovers; unrevoked proof tokens that would authorize action on their own) are secret-bearing; plan-level metadata and public identifiers are not.
+The cross-context saga coordinator writes phase transitions to a durable journal (§5.15.4, §17.16). Saga evidence carried in journal entries is classified as **secret-bearing** or **public**. Bearer artifacts (unrevoked proof tokens that would authorize action on their own; any future evidence that carries usable secret material) are secret-bearing; plan-level metadata and public identifiers are not.
+
+**No saga is secret-bearing today.** All three defined sagas — standing-pair creation (§5.15.8), cross-context tool invocation (§6.2.4), and broadcast hosting handshake (§5.14.13) — are public-metadata-only: their journals and envelopes carry no bearer material (the tool invocation carries a UCAN *index*, not the token; the broadcast key is delivered out-of-band via HPKE after Commit; the standing pair journals only public plan-metadata). This section is therefore the **contract any *future* secret-bearing saga MUST satisfy**, currently with **no instance**. The requirements below are normative for any such future saga.
 
 **Commitment construction.** Secret-bearing sagas MUST journal only a commitment — never the bearer bytes. The commitment is constructed as:
 
@@ -292,7 +294,7 @@ commitment = SHA-256(domain_separator ‖ bearer_envelope ‖ nonce)
 
 where:
 
-- `domain_separator` is a fixed, per-saga-type byte string of at least 16 bytes, unique across saga types and distinct from any other protocol hash domain (e.g., `"scp/saga-commit/migration/v1"`).
+- `domain_separator` is a fixed, per-saga-type byte string of at least 16 bytes, unique across saga types and distinct from any other protocol hash domain (e.g., `"scp/saga-commit/<saga-type>/v1"` for the future saga type). It MUST be registered in the §9.18.2 Domain Separators table when such a saga is introduced.
 - `bearer_envelope` is the canonical serialization of the bearer artifact (deterministic; two conforming implementations produce byte-identical envelopes for equivalent inputs).
 - `nonce` is a freshly sampled 32-byte value from a cryptographically secure random source (OsRng or equivalent). The nonce is distinct per saga instance; nonce reuse is a protocol violation.
 
@@ -347,6 +349,7 @@ All signed structures in the protocol use a single canonical hash construction. 
 - **u64 integers:** 8 bytes, big-endian (network byte order).
 - **u32 integers:** 4 bytes, big-endian.
 - **u16 integers:** 2 bytes, big-endian.
+- **u8 integers:** 1 byte (no endianness — a single octet).
 - **Fixed-length bytes of other sizes** (`[u8; 16]`): raw bytes, no length prefix.
 - **Optional fields:** if present, encoded as above. If absent, encoded as `SHA-256(0x00)` (32-byte sentinel). The sentinel is distinguishable from any real hash because `SHA-256(0x00)` is not a valid hash of structured data with a domain separator.
 
@@ -1570,7 +1573,7 @@ The following constants are protocol invariants. All implementations MUST use th
 
 #### 9.18.2 Domain Separators
 
-All domain separators are UTF-8 strings used as prefixes in canonical hash constructions (§9.5.1). Each separator identifies the struct type being hashed to prevent cross-protocol hash confusion.
+All domain separators are UTF-8 strings used as prefixes in canonical hash, signature-preimage, or key/id-derivation constructions (§9.5.1 governs signature preimages; other constructions — key/id-derivation domains and id-construction prefixes — are noted per row). Most entries are §9.5.1 field-enumerated signature-preimage separators; the table also includes non-§9.5.1 entries (for example the `"scp-standing-group-v1:"` length-prefixed `SHA-256` key/id-derivation domain and the `"standing:"` / `"standing-"` context-id construction prefixes, §5.15.8), and §9.4.3 directs a future secret-bearing saga to register its `"scp/saga-commit/<saga-type>/v1"` commitment separator (a commitment-hash domain, also non-§9.5.1) here. Each separator identifies the struct or derivation being hashed to prevent cross-protocol hash confusion.
 
 | Domain Separator | Used For | Spec Reference |
 |------------------|----------|----------------|
@@ -1609,6 +1612,11 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-COMMIT-RANGE-RESP-V1:"` | Commit range response signing | §23.16.3 |
 | `"SCP-CONTEXT-SNAPSHOT-V1:"` | Tier-2 sync-delta context snapshot signing | §23.16.4 |
 | `"SCP-CONTEXT-EXPORT-V1:"` | Signed context export snapshot signing | §23.16.8 |
+| `"SCP-XCTX-RECEIPT-V1:"` | Cross-context tool receipt signing | §6.2.4 |
+| `"SCP-BCAST-HOST-REQ-V1:"` | Broadcast hosting request signing | §5.14.13 |
+| `"SCP-BCAST-HOST-GRANT-V1:"` | Broadcast hosting grant signing | §5.14.13 |
+| `"scp-standing-group-v1:"` | Standing-pair MLS group-id derivation — a length-prefixed `SHA-256` key/id-derivation domain, NOT a §9.5.1 field-enumerated signature-preimage separator | §5.15.8 |
+| `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction, NOT a §9.5.1 signature-preimage separator (the colon-join is non-§9.5.1; `"standing-"` is an output id-prefix) | §5.15.8 |
 
 #### 9.18.3 Key Derivation and HPKE Labels
 
