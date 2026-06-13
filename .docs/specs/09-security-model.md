@@ -331,7 +331,7 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 The `0x00`/`0x01` domain separation prevents second-preimage attacks where an attacker constructs an interior node that is interpreted as a leaf (or vice versa). This is a critical security property: without it, an attacker could forge inclusion proofs by substituting tree layers.
 
-The Merkle root provides tamper-evident integrity over the entire event history. Inclusion proofs (proving a specific event is in the log) require `O(log N)` hashes. Consistency proofs (proving one log state is an extension of another) also require `O(log N)` hashes. These are used for equivocation detection (§9.9) and context state verification (§7.3.1).
+The Merkle root provides tamper-evident integrity over the entire event history. Inclusion proofs (proving a specific event is in the log) require `O(log N)` hashes. Consistency proofs (proving one log state is a prefix-extension of a *later state of the same log*) also require `O(log N)` hashes. These are used for **same-log catch-up integrity** during sync reconciliation (§23.7): a member fetching missed events verifies that the relay did not rewrite history — its older root is a prefix of the newer root. Consistency proofs are **NOT** used for cross-member equivocation detection (§9.9.3): different members hold different logs, so equivocation is detected by **Merkle-root equality at the same event count** and resolved with **inclusion** proofs for the conflicting events, not consistency proofs.
 
 ### 9.5.1 Canonical Hash Construction
 
