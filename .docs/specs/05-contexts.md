@@ -807,6 +807,15 @@ MetadataSnapshot {
 3. If accepted, process `welcome_message` via MLS to join the group (Encrypted contexts) or initialize subscriber state (Broadcast contexts).
 4. Use `context_metadata_key` to derive the metadata routing ID for ongoing metadata retrieval.
 
+**HPKE encryption.** The serialized `InvitationBundle` (and, symmetrically, the `JoinResponse` of §5.12.3.2) is encrypted to the recipient with HPKE Base mode (RFC 9180) using the SCP HPKE suite (§9.5): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The recipient X25519 public key is derived from their Ed25519 identity key via RFC 7748 birational mapping. The HPKE `info` and `aad` parameters are:
+
+```
+info = "scp-invitation-v1" || len(context_id) || context_id || len(creator_did) || creator_did
+aad  = "scp-invitation-aad-v1" || len(context_id) || context_id || len(creator_did) || creator_did
+```
+
+Where `context_id` and `creator_did` are UTF-8 bytes, each preceded by a 4-byte big-endian unsigned length prefix (`len(...)`) per the §9.5.1 encoding rules. The wire output is `(enc, ct)` where `enc` is the 32-byte HPKE encapsulated key and `ct` is the AEAD ciphertext-and-tag — the RFC 9180 KEM context binds `enc` into the key schedule (`kem_context = enc || pkRm`, RFC 9180 §4.1), so `enc` is NOT additionally carried in `aad`. The `"scp-invitation-v1"` / `"scp-invitation-aad-v1"` domain separators are distinct from sender-key (`"scp-sender-key-v1"`), access-key (`"scp-access-key-v1"`), broadcast-key (`"scp-broadcast-key-v1"`), and private-state (`"scp-private-state-v1"`) HPKE strings.
+
 #### 5.12.3.2 JoinResponse Wire Format
 
 After accepting an invitation bundle, the invitee sends a join response back to the creator via the relay. The response is serialized as MessagePack and encrypted to the creator's public key.
@@ -1395,11 +1404,11 @@ Each author holds an AES-256-GCM broadcast key with a monotonic epoch counter. T
 **HPKE parameters for broadcast key distribution.** Broadcast key distribution uses HPKE Base mode (RFC 9180) with the same suite as sender key distribution (§9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The `info` and `aad` parameters use a distinct domain separator:
 
 ```
-info = "scp-broadcast-key-v1" || context_id || author_did || epoch_bytes
-aad  = context_id || author_did || epoch_bytes
+info = "scp-broadcast-key-v1" || len(context_id) || context_id || len(author_did) || author_did || epoch_bytes
+aad  = len(context_id) || context_id || len(author_did) || author_did || epoch_bytes
 ```
 
-Where `context_id` and `author_did` are UTF-8 bytes and `epoch_bytes` is the 8-byte big-endian encoding of the broadcast key epoch. The `"scp-broadcast-key-v1"` domain separator is distinct from `"scp-sender-key-v1"` (encrypted contexts) and `"scp-access-key-v1"` (content access keys), preventing cross-protocol key confusion. The three domain separators ensure that an HPKE ciphertext produced in one protocol cannot be replayed in another — different `info` values produce different HPKE key schedules.
+Where `context_id` and `author_did` are UTF-8 bytes, each preceded by a 4-byte big-endian unsigned length prefix (`len(...)`) per the §9.5.1 encoding rules, and `epoch_bytes` is the 8-byte big-endian encoding of the broadcast key epoch (fixed-width, no length prefix needed). The length prefixes prevent boundary-shift ambiguity, where a `context_id` suffix could masquerade as an `author_did` prefix — matching the sender-key (§9.16.2) and access-key (§9.17.1) `info`/`aad` constructions. The `"scp-broadcast-key-v1"` domain separator is distinct from `"scp-sender-key-v1"` (encrypted contexts) and `"scp-access-key-v1"` (content access keys), preventing cross-protocol key confusion. The three domain separators ensure that an HPKE ciphertext produced in one protocol cannot be replayed in another — different `info` values produce different HPKE key schedules.
 
 ### 5.14.3 Subscriber Registration
 
