@@ -61,7 +61,9 @@ pub fn generate_wrapping_keypair() -> ([u8; 32], [u8; 32]) {
 pub const MAX_SENDER_KEY_MESSAGE_SIZE: usize = 65_536;
 
 /// HKDF info domain separator for sender key HPKE encryption (§9.16.2).
-/// The full info string is `"scp-sender-key-v1" || context_id || sender_did || epoch_BE`.
+/// The full info string is length-prefixed (see [`build_hpke_info`]):
+/// `"scp-sender-key-v1" || BE32(len(context_id)) || context_id ||
+/// BE32(len(sender_did)) || sender_did || BE64(epoch)`.
 const HPKE_INFO_PREFIX: &[u8] = b"scp-sender-key-v1";
 
 /// Grace period in seconds during which the old key should still be accepted
