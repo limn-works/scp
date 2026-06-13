@@ -165,7 +165,8 @@ mod tests {
 
         let plaintext = b"hello world, this is an invitation bundle";
         let (sealed, eph_pub) =
-            hpke_seal_invitation(plaintext, public.as_bytes(), "ctx-123", "did:dht:z6MkAlice").unwrap();
+            hpke_seal_invitation(plaintext, public.as_bytes(), "ctx-123", "did:dht:z6MkAlice")
+                .unwrap();
 
         let recovered = hpke_open_invitation(
             &sealed,

@@ -226,7 +226,11 @@ mod tests {
                 b"a7".to_vec(),
                 b"the quick brown fox".to_vec(),
             ),
-            (b"info-8".to_vec(), b"a8".to_vec(), vec![0x11, 0x22, 0x33, 0x44]),
+            (
+                b"info-8".to_vec(),
+                b"a8".to_vec(),
+                vec![0x11, 0x22, 0x33, 0x44],
+            ),
             (b"info-9".to_vec(), b"a9".to_vec(), vec![0u8; 4096]),
         ];
 
@@ -265,7 +269,10 @@ mod tests {
         let mut sk = [0u8; X25519_SECRET_KEY_LEN];
         sk.copy_from_slice(&sk_vec);
 
-        let (enc, ct) = backend.seal(&pk, b"info", b"aad", b"payload").await.unwrap();
+        let (enc, ct) = backend
+            .seal(&pk, b"info", b"aad", b"payload")
+            .await
+            .unwrap();
         let enc_arr: [u8; 32] = enc.as_slice().try_into().unwrap();
 
         let recovered = hpke::open(&sk, &enc_arr, b"info", b"aad", &ct).unwrap();
@@ -353,7 +360,10 @@ mod tests {
         let mut sk = [0u8; X25519_SECRET_KEY_LEN];
         sk.copy_from_slice(&sk_vec);
 
-        let (enc, ct) = backend.seal(&pk, b"info-a", b"aad", b"payload").await.unwrap();
+        let (enc, ct) = backend
+            .seal(&pk, b"info-a", b"aad", b"payload")
+            .await
+            .unwrap();
         let err = backend
             .unseal(&sk, &enc, b"info-b", b"aad", &ct)
             .await
@@ -371,7 +381,10 @@ mod tests {
         let mut sk = [0u8; X25519_SECRET_KEY_LEN];
         sk.copy_from_slice(&sk_vec);
 
-        let (enc, ct) = backend.seal(&pk, b"info", b"aad-a", b"payload").await.unwrap();
+        let (enc, ct) = backend
+            .seal(&pk, b"info", b"aad-a", b"payload")
+            .await
+            .unwrap();
         let err = backend
             .unseal(&sk, &enc, b"info", b"aad-b", &ct)
             .await

@@ -827,8 +827,9 @@ const BROADCAST_KEY_HPKE_INFO_PREFIX: &[u8] = b"scp-broadcast-key-v1";
 pub fn build_broadcast_key_hpke_info(context_id: &str, author_did: &str, epoch: u64) -> Vec<u8> {
     let ctx = context_id.as_bytes();
     let did = author_did.as_bytes();
-    let mut info =
-        Vec::with_capacity(BROADCAST_KEY_HPKE_INFO_PREFIX.len() + 4 + ctx.len() + 4 + did.len() + 8);
+    let mut info = Vec::with_capacity(
+        BROADCAST_KEY_HPKE_INFO_PREFIX.len() + 4 + ctx.len() + 4 + did.len() + 8,
+    );
     info.extend_from_slice(BROADCAST_KEY_HPKE_INFO_PREFIX);
     #[allow(clippy::cast_possible_truncation)] // context_id/DID lengths << u32::MAX
     let ctx_len = ctx.len() as u32;

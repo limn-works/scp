@@ -700,14 +700,20 @@ mod tests {
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
 
         // Seal via the shared RFC 9180 HPKE core.
-        let (enc, sealed) =
-            hpke::seal(&wrapping_public.to_bytes(), &info, &aad, access_key.as_bytes()).unwrap();
+        let (enc, sealed) = hpke::seal(
+            &wrapping_public.to_bytes(),
+            &info,
+            &aad,
+            access_key.as_bytes(),
+        )
+        .unwrap();
 
         // ct is exactly 48 bytes: 32-byte key + 16-byte AEAD tag.
         assert_eq!(sealed.len(), 48);
 
         // Open with the software-held secret.
-        let plaintext = hpke::open(&wrapping_secret.to_bytes(), &enc, &info, &aad, &sealed).unwrap();
+        let plaintext =
+            hpke::open(&wrapping_secret.to_bytes(), &enc, &info, &aad, &sealed).unwrap();
 
         assert_eq!(plaintext.len(), 32);
         assert_eq!(plaintext.as_slice(), access_key.as_bytes());
@@ -721,7 +727,8 @@ mod tests {
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
 
         let key_bytes = [42u8; 32];
-        let (_enc, sealed) = hpke::seal(&wrapping_public.to_bytes(), &info, &aad, &key_bytes).unwrap();
+        let (_enc, sealed) =
+            hpke::seal(&wrapping_public.to_bytes(), &info, &aad, &key_bytes).unwrap();
 
         // RFC 9180: ct = plaintext (32) + AEAD tag (16) = 48. No external nonce.
         assert_eq!(sealed.len(), 32 + 16);
@@ -995,9 +1002,14 @@ mod tests {
         let enc: [u8; 32] = response.ephemeral_pubkey.as_slice().try_into().unwrap();
         let info = build_hpke_info("ctx-1", "did:dht:alice", 0);
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
-        let plaintext =
-            hpke::open(&wrapping_secret.to_bytes(), &enc, &info, &aad, &response.hpke_sealed_key)
-                .unwrap();
+        let plaintext = hpke::open(
+            &wrapping_secret.to_bytes(),
+            &enc,
+            &info,
+            &aad,
+            &response.hpke_sealed_key,
+        )
+        .unwrap();
 
         let recovered_bytes: [u8; 32] = plaintext.as_slice().try_into().unwrap();
         assert_eq!(recovered_bytes, original_key_bytes);

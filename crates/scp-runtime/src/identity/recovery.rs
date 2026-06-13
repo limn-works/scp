@@ -716,6 +716,7 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Optio
 ///
 /// Returns `None` if the wire layout is wrong (not 80 bytes) or HPKE open
 /// fails (wrong device key, wrong `did`, or tampered ciphertext).
+#[must_use]
 pub fn unwrap_psk_for_device(wrapped: &[u8], device_sk: &[u8; 32], did: &str) -> Option<[u8; 32]> {
     if wrapped.len() != WRAPPED_PSK_LEN {
         return None;
@@ -2462,8 +2463,8 @@ mod tests {
         let psk = [0x42u8; 32];
         let did = "did:dht:zPskTest";
 
-        let wrapped = super::wrap_psk_for_device(&psk, device_public.as_bytes(), did)
-            .expect("wrap failed");
+        let wrapped =
+            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap failed");
 
         let recovered = super::unwrap_psk_for_device(&wrapped, &device_secret.to_bytes(), did)
             .expect("unwrap failed");
@@ -2478,9 +2479,8 @@ mod tests {
         let device_public = X25519Pub::from(&device_secret);
         let psk = [0x42u8; 32];
 
-        let wrapped =
-            super::wrap_psk_for_device(&psk, device_public.as_bytes(), "did:dht:zAlice")
-                .expect("wrap failed");
+        let wrapped = super::wrap_psk_for_device(&psk, device_public.as_bytes(), "did:dht:zAlice")
+            .expect("wrap failed");
 
         // A different DID changes the HPKE info → AEAD open fails.
         assert!(
@@ -2500,8 +2500,8 @@ mod tests {
         let psk = [0x42u8; 32];
         let did = "did:dht:zPskTest";
 
-        let wrapped = super::wrap_psk_for_device(&psk, device_public.as_bytes(), did)
-            .expect("wrap failed");
+        let wrapped =
+            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap failed");
 
         // Wrong device key.
         assert!(
