@@ -1823,4 +1823,148 @@ mod tests {
         let b = build_broadcast_key_hpke_info("a", "bc", 0);
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn broadcast_key_hpke_rejects_tampered_ciphertext() {
+        // Flipping a single ciphertext bit must make the AEAD open fail.
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let key = generate_broadcast_key("did:dht:author");
+        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
+        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+
+        let (mut ct, enc) = seal_broadcast_key_to_subscriber(
+            key.key(),
+            &subscriber_pub.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        )
+        .unwrap();
+
+        ct[0] ^= 0x01;
+
+        let result = open_broadcast_key(
+            &ct,
+            &enc,
+            &subscriber_secret.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        );
+        assert!(result.is_err(), "tampered ciphertext must fail HPKE open");
+    }
+
+    #[test]
+    fn broadcast_key_hpke_rejects_tampered_enc() {
+        // Flipping a bit of the encapsulated key changes the recovered DH
+        // shared secret, so the AEAD open must fail.
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let key = generate_broadcast_key("did:dht:author");
+        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
+        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+
+        let (ct, mut enc) = seal_broadcast_key_to_subscriber(
+            key.key(),
+            &subscriber_pub.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        )
+        .unwrap();
+
+        enc[0] ^= 0x01;
+
+        let result = open_broadcast_key(
+            &ct,
+            &enc,
+            &subscriber_secret.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        );
+        assert!(result.is_err(), "tampered enc must fail HPKE open");
+    }
+
+    #[test]
+    fn broadcast_key_hpke_rejects_wrong_recipient() {
+        // Sealing to subscriber A's pubkey and opening with subscriber B's
+        // secret must fail: B's DH yields a different shared secret.
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let key = generate_broadcast_key("did:dht:author");
+
+        let recipient_secret = StaticSecret::random_from_rng(OsRng);
+        let recipient_pub = X25519Pub::from(&recipient_secret);
+        let intruder_secret = StaticSecret::random_from_rng(OsRng);
+
+        let (ct, enc) = seal_broadcast_key_to_subscriber(
+            key.key(),
+            &recipient_pub.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        )
+        .unwrap();
+
+        let result = open_broadcast_key(
+            &ct,
+            &enc,
+            &intruder_secret.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "opening with the wrong recipient secret must fail HPKE open"
+        );
+    }
+
+    #[test]
+    fn broadcast_key_hpke_rejects_sender_key_domain_ciphertext() {
+        // Real cross-path domain separation: seal a 32-byte payload using the
+        // SENDER-KEY info/aad builders, then attempt to open it with the
+        // BROADCAST info/aad. The AEAD must reject the mismatched info/aad —
+        // this proves enforcement at the ciphertext level, not just that the
+        // two info strings differ.
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        use super::super::key_protocol_verify::{
+            build_hpke_aad as build_sender_key_hpke_aad,
+            build_hpke_info as build_sender_key_hpke_info,
+        };
+
+        let subscriber_secret = StaticSecret::random_from_rng(OsRng);
+        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+
+        let payload = [0x42u8; 32];
+
+        // Seal under the SENDER-KEY domain (different info prefix + aad).
+        let sender_info = build_sender_key_hpke_info("ctx-broadcast", "did:dht:author", 0);
+        let sender_aad = build_sender_key_hpke_aad("ctx-broadcast", "did:dht:author", 0);
+        let (enc, ct) = crate::crypto::hpke::seal(
+            &subscriber_pub.to_bytes(),
+            &sender_info,
+            &sender_aad,
+            &payload,
+        )
+        .unwrap();
+
+        // Attempt to open it as a BROADCAST key (broadcast info/aad) on the
+        // same keypair + enc + ct. The AEAD must reject the wrong info/aad.
+        let result = open_broadcast_key(
+            &ct,
+            &enc,
+            &subscriber_secret.to_bytes(),
+            "ctx-broadcast",
+            "did:dht:author",
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "a sender-key-domain ciphertext must not open as a broadcast key"
+        );
+    }
 }
