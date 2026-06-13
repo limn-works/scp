@@ -725,7 +725,9 @@ pub fn unwrap_psk_for_device(wrapped: &[u8], device_sk: &[u8; 32], did: &str) ->
     let ct = &wrapped[32..];
 
     let info = build_psk_hpke_info(did, PSK_PURPOSE_ROTATE);
-    let plaintext = scp_protocol::crypto::hpke::open(device_sk, &enc, &info, &[], ct).ok()?;
+    let plaintext = zeroize::Zeroizing::new(
+        scp_protocol::crypto::hpke::open(device_sk, &enc, &info, &[], ct).ok()?,
+    );
     plaintext.as_slice().try_into().ok()
 }
 

@@ -18,6 +18,7 @@
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 use scp_primitives::Clock;
@@ -378,7 +379,7 @@ pub async fn open_access_key_response(
         .dh_agree(wrapping_key_handle, &enc)
         .await
         .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
-    let dh_bytes: [u8; 32] = *dh.as_bytes();
+    let dh_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*dh.as_bytes());
 
     // Fetch pkRm for the same handle (kem_context = enc || pkRm).
     let pk_rm = key_custody
@@ -393,15 +394,17 @@ pub async fn open_access_key_response(
     let info = build_hpke_info(&response.context_id, &response.member_did, response.epoch);
     let aad = build_hpke_aad(&response.context_id, &response.member_did, response.epoch);
 
-    let plaintext = hpke::custody::open_with_external_dh(
-        &dh_bytes,
-        &pk_rm_bytes,
-        &enc,
-        &info,
-        &aad,
-        &response.hpke_sealed_key,
-    )
-    .map_err(|e| AccessKeyError::HpkeDecryptionFailed(e.to_string()))?;
+    let plaintext = Zeroizing::new(
+        hpke::custody::open_with_external_dh(
+            &dh_bytes,
+            &pk_rm_bytes,
+            &enc,
+            &info,
+            &aad,
+            &response.hpke_sealed_key,
+        )
+        .map_err(|e| AccessKeyError::HpkeDecryptionFailed(e.to_string()))?,
+    );
 
     let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
         AccessKeyError::HpkeDecryptionFailed(format!(

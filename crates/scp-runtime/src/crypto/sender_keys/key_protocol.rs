@@ -16,6 +16,7 @@ use std::hash::BuildHasher;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
+use zeroize::Zeroizing;
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 
@@ -344,7 +345,7 @@ pub async fn open_sender_key_response(
         .dh_agree(wrapping_key_handle, &enc)
         .await
         .map_err(|e| SenderKeyError::KeyCustodyError(e.to_string()))?;
-    let dh_bytes: [u8; 32] = *dh.as_bytes();
+    let dh_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*dh.as_bytes());
 
     // Fetch pkRm for the same handle, needed for kem_context = enc || pkRm.
     let pk_rm = key_custody
@@ -359,15 +360,17 @@ pub async fn open_sender_key_response(
     let info = build_hpke_info(context_id, &response.sender_did, response.epoch);
     let aad = build_hpke_aad(context_id, &response.sender_did, response.epoch);
 
-    let plaintext = scp_protocol::crypto::hpke::custody::open_with_external_dh(
-        &dh_bytes,
-        &pk_rm_bytes,
-        &enc,
-        &info,
-        &aad,
-        &response.hpke_sealed_key,
-    )
-    .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?;
+    let plaintext = Zeroizing::new(
+        scp_protocol::crypto::hpke::custody::open_with_external_dh(
+            &dh_bytes,
+            &pk_rm_bytes,
+            &enc,
+            &info,
+            &aad,
+            &response.hpke_sealed_key,
+        )
+        .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?,
+    );
 
     let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
         SenderKeyError::HpkeDecryptionFailed(format!(
