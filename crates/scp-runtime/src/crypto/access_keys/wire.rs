@@ -109,9 +109,11 @@ pub struct AccessKeyResponse {
     pub member_did: String,
     /// The epoch of the distributed access key.
     pub epoch: u64,
-    /// HPKE ciphertext (`ct = ciphertext || tag`, 48 bytes for a 32-byte key).
-    #[serde(with = "serde_bytes")]
-    pub hpke_sealed_key: Vec<u8>,
+    /// HPKE ciphertext (`ct = ciphertext || tag`, exactly 48 bytes: a 32-byte
+    /// access key plus the 16-byte AES-128-GCM tag). Fixed-size so deserialize
+    /// cannot allocate an arbitrarily large buffer from malicious input.
+    #[serde(with = "scp_protocol::serde_util::serde_hpke_sealed_48")]
+    pub hpke_sealed_key: [u8; 48],
     /// HPKE encapsulated key (`enc`, the 32-byte ephemeral X25519 public key).
     #[serde(with = "serde_bytes")]
     pub ephemeral_pubkey: Vec<u8>,
@@ -318,8 +320,18 @@ pub fn handle_access_key_request(
         access_key.member_did(),
         access_key.epoch(),
     );
-    let (enc, sealed) = hpke::seal(&wrapping_bytes, &info, &aad, access_key.as_bytes())
+    let (enc, sealed_vec) = hpke::seal(&wrapping_bytes, &info, &aad, access_key.as_bytes())
         .map_err(|e| AccessKeyError::HpkeEncryptionFailed(e.to_string()))?;
+
+    // Convert to fixed-size array. The HPKE seal always returns exactly 48
+    // bytes (ciphertext 32 + AES-128-GCM tag 16) for a 32-byte access key;
+    // the AEAD nonce is internal per RFC 9180.
+    let sealed: [u8; 48] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+        AccessKeyError::HpkeEncryptionFailed(format!(
+            "HPKE seal produced {} bytes, expected 48",
+            v.len()
+        ))
+    })?;
 
     let response = AccessKeyResponse {
         context_id: access_key.context_id().to_owned(),
@@ -570,7 +582,7 @@ mod tests {
             context_id: "ctx-1".to_owned(),
             member_did: "did:dht:alice".to_owned(),
             epoch: 5,
-            hpke_sealed_key: vec![1, 2, 3, 4],
+            hpke_sealed_key: [0x11; 48],
             ephemeral_pubkey: vec![0u8; 32],
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -603,7 +615,7 @@ mod tests {
             context_id: "ctx-2".to_owned(),
             member_did: "did:dht:bob".to_owned(),
             epoch: 10,
-            hpke_sealed_key: vec![5, 6, 7, 8],
+            hpke_sealed_key: [0x55; 48],
             ephemeral_pubkey: vec![99u8; 32],
         };
         let bytes = rmp_serde::to_vec(&response).unwrap();

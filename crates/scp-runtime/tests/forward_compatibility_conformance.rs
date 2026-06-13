@@ -1020,7 +1020,7 @@ mod access_key_types {
             context_id: "ctx-access-test".to_string(),
             member_did: "did:dht:member".to_string(),
             epoch: 5,
-            hpke_sealed_key: vec![0xEE; 48],
+            hpke_sealed_key: [0xEE; 48],
             ephemeral_pubkey: vec![0xFF; 32],
         };
         let bytes = rmp_serde::to_vec_named(&response).unwrap();
@@ -1036,7 +1036,7 @@ mod access_key_types {
         assert_eq!(decoded.context_id, "ctx-access-test");
         assert_eq!(decoded.member_did, "did:dht:member");
         assert_eq!(decoded.epoch, 5);
-        assert_eq!(decoded.hpke_sealed_key, vec![0xEE; 48]);
+        assert_eq!(decoded.hpke_sealed_key, [0xEE; 48]);
         assert_eq!(decoded.ephemeral_pubkey, vec![0xFF; 32]);
     }
 }
