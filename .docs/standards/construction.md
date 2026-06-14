@@ -59,6 +59,7 @@ For each entry point, one choice is designated **security-critical**. It must be
 - **Node / host_site:** publishing an address to the DHT discloses location/IP. `dht: DhtMode` defaults to `Memory` (no publish). Any `Reach` variant that publishes a routable address requires `DhtMode::Production`, and selecting a publishing `Reach` with `DhtMode::Memory` is a precise, loud error — not a silent publish, not a silent no-op.
 - **Site TLS:** `TlsMode::Plaintext` is never a default. A config that omits TLS does not silently serve plaintext on a public reach.
 - **Identity:** the security-critical choice is whether to **persist key material**. `persistence: None` (an ephemeral identity, no key material at rest) is the fail-safe default; persisting is the explicit `Some(StorageSlot)` choice, never reached by omission. When persistence *is* chosen, the slot is `EncryptedStorage`-bound — persisting is encrypted-only (see the EncryptedStorage compile-time split). This is the same model as a Node's persisted identity, which persists into the Node's own `storage` slot; the only difference is the source of the slot — Node reuses `NodeConfig.storage`, standalone Identity names its own `IdentityConfig.persistence`.
+- **Relay:** the security-critical choice is the `BridgeRole` selection. `bridge: BridgeRole` defaults to `Disabled` (the fail-safe — a relay that brokers nothing); `Enabled` is an explicit opt-in never reached by omission, and `BridgeRole::Enabled` with `bridge_secret: None` is a loud error (M3), never a silently-disabled bridge.
 - **Context:** the security-critical choice is the `ContextCreation` Template-vs-Explicit selection itself — a required enum with no default, so M2 applies **per-variant**: within `Explicit`, the permission `ceiling` is a required field (no over-broad default ceiling), and `Template` resolves only to the named template's fail-safe parameters.
 
 > **Un-mechanizable carve-out (human-review).** "A `Template` resolves only to fail-safe parameters" is a property of the template **data**, not of config **shape** — the structural check `scripts/check-construction-pattern.py` (AC-9) inspects type/field structure, so it **cannot** verify what values a named template expands to. This clause is therefore enforced by human review, exactly like the M1 boolean carve-out (whether a surviving `bool` is "genuinely binary state with no behavioral fork" is also a judgment the check cannot make). Stating it keeps the mechanical-vs-prose line honest: the check guards config shape; template-data fail-safety and the M1 bool judgment are the two properties it cannot.
@@ -202,14 +203,14 @@ ContextConfig {
 ### Identity — `IdentityConfig`
 
 ```
-IdentityConfig {
-    method: DidMethodSlot,            // required
-    custody: KeyCustodySlot,          // required
-    persistence: Option<StorageSlot>, // None = ephemeral identity (fail-safe default; M2). Some(slot) is EncryptedStorage-bound on the production `Identity::create` path — persisting is encrypted-only, the same seal as `Node::start`.
+IdentityConfig<S> {                       // generic over the storage type S, exactly as NodeConfig<S> is
+    method: DidMethodSlot,                // required
+    custody: KeyCustodySlot,              // required
+    persistence: Option<StorageSlot<S>>,  // None = ephemeral identity (fail-safe default; M2). Some(slot) carries S, giving the EncryptedStorage bound somewhere to attach: on the production `Identity::create<S: EncryptedStorage>` path the slot is EncryptedStorage-bound — persisting is encrypted-only, the same seal as `Node::start`.
 }
 ```
 
-Entry: `Identity::create(IdentityConfig)`.
+Entry: `Identity::create(IdentityConfig)` (production, `where S: EncryptedStorage`), mirroring `Node::start`. The `S` generic is carried by the config and its `StorageSlot<S>` slot, exactly as `NodeConfig<S>` carries it.
 
 ## Five-language equivalence
 
