@@ -890,9 +890,14 @@ pub(crate) fn build_merged_router(
 /// while the website projection routes serve normally.
 ///
 /// **Caller note:** whatever `app_router` is passed IS exposed on the public
-/// self-host bind. The self-host binary passes only the Prometheus `/metrics`
-/// router (matching the other run modes). Do not merge any sensitive or
-/// mutating routes into `app_router` for the self-host surface.
+/// self-host bind. The self-host serve path
+/// ([`serve_background_with_surface_tls`](crate::ApplicationNode::serve_background_with_surface_tls))
+/// passes an EMPTY app router (`axum::Router::new()`), so the self-host surface
+/// exposes NO app routes — in particular it does NOT expose `/metrics`. This is
+/// deliberate: the self-host bind is a public, unauthenticated surface, and
+/// unauthenticated Prometheus metrics there would leak operational detail. Do
+/// not merge any sensitive, mutating, or operational routes into `app_router`
+/// for the self-host surface.
 pub(crate) fn build_self_host_router(
     app_router: Router,
     well_known: Router,
@@ -1333,7 +1338,7 @@ mod vhost_tests {
     use scp_transport::native::storage::{BlobStorageBackend, InMemoryBlobStorage};
 
     use crate::http::NodeState;
-    use crate::projection::test_helpers::store_content_blob;
+    use crate::projection::test_helpers::{entry_for, store_content_blob};
     use crate::projection::{
         ProjectedContext, SiteConfig, broadcast_projection_router, hex_encode,
     };
@@ -1423,7 +1428,7 @@ mod vhost_tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("deploy-1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -1559,7 +1564,7 @@ mod vhost_tests {
         let blob_id_a = store_content_blob(&storage, routing_id_a, &key_a, &bc_a).await;
         let path_a = ContentPath::new("/index.html").unwrap();
         let mut entries_a = HashMap::new();
-        entries_a.insert(path_a, blob_id_a);
+        entries_a.insert(path_a, entry_for(blob_id_a, &bc_a));
         projected_a.commit_deploy("deploy-a".into(), entries_a);
 
         // Content for B: "Content B".
@@ -1577,7 +1582,7 @@ mod vhost_tests {
         let blob_id_b = store_content_blob(&storage, routing_id_b, &key_b, &bc_b).await;
         let path_b = ContentPath::new("/index.html").unwrap();
         let mut entries_b = HashMap::new();
-        entries_b.insert(path_b, blob_id_b);
+        entries_b.insert(path_b, entry_for(blob_id_b, &bc_b));
         projected_b.commit_deploy("deploy-b".into(), entries_b);
 
         let mut projected_map = HashMap::new();

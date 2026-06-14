@@ -87,11 +87,36 @@ pub fn compute_routing_id(context_id: &str) -> [u8; 32] {
 // Path index and deploy types (§18.11.10, §18.11.11)
 // ---------------------------------------------------------------------------
 
-/// Path index mapping content paths to blob IDs for a single deploy.
+/// A single resolved asset in a deploy's path index: the storage blob id
+/// plus the content hash (`compute_etag(body)` = hex SHA-256 of the
+/// plaintext body) and the immutability flag.
+///
+/// The content hash and immutability flag are captured at commit time so the
+/// site handler can compute the exact `"<deploy_id>:<content_hash>"` `ETag` and
+/// answer a conditional GET (304) WITHOUT decrypting the blob. The
+/// immutability flag is needed because the original (post-decrypt) 304 only
+/// fired for non-immutable assets; capturing it here keeps the pre-decrypt
+/// short-circuit behavior-identical.
+#[derive(Debug, Clone)]
+pub struct PathEntry {
+    /// Storage blob id (SHA-256 of the wrapped ciphertext envelope).
+    pub blob_id: [u8; 32],
+    /// `compute_etag(body)` — hex SHA-256 of the plaintext body.
+    pub content_hash: String,
+    /// Whether the asset is immutable (long-lived cache, no revalidation
+    /// `ETag`). Immutable assets are excluded from the pre-decrypt 304 path.
+    pub immutable: bool,
+    /// Declared MIME type captured at commit time (`metadata.content_type`), so
+    /// the pre-decrypt 304 can emit the same `Content-Type` as the served
+    /// 200/post-decrypt-304 response.
+    pub content_type: Option<String>,
+}
+
+/// Path index mapping content paths to resolved assets for a single deploy.
 ///
 /// Built immutably at commit time; swapped atomically via [`ArcSwap`].
 /// Lock-free reads for concurrent HTTP handlers.
-pub type PathIndex = HashMap<ContentPath, [u8; 32]>;
+pub type PathIndex = HashMap<ContentPath, PathEntry>;
 
 /// Maximum number of deploys retained per projected context.
 const MAX_DEPLOY_RETENTION: usize = 8;
@@ -119,6 +144,17 @@ pub struct DeployManifestEntry {
     pub path: String,
     /// The blob ID as hex-encoded string.
     pub blob_id: String,
+    /// `compute_etag(body)` — hex SHA-256 of the plaintext body. Persisted so
+    /// the path index can answer conditional GETs (304) after a restart
+    /// without decrypting the blob.
+    pub content_hash: String,
+    /// Whether the asset is immutable. Persisted so the rebuilt path index
+    /// preserves the pre-decrypt 304 gating across restarts.
+    pub immutable: bool,
+    /// Declared MIME type (`metadata.content_type`). Persisted so the rebuilt
+    /// path index can emit the same `Content-Type` on the pre-decrypt 304 as
+    /// the served 200/post-decrypt-304 response across restarts.
+    pub content_type: Option<String>,
 }
 
 /// Node-local site configuration for broadcast projection (§18.11.12).
@@ -730,11 +766,7 @@ impl ProjectedContext {
     /// atomically swaps the current pointer, and pushes the old deploy to history.
     ///
     /// Returns the number of paths in the new index.
-    pub fn commit_deploy(
-        &mut self,
-        deploy_id: String,
-        entries: HashMap<ContentPath, [u8; 32]>,
-    ) -> usize {
+    pub fn commit_deploy(&mut self, deploy_id: String, entries: PathIndex) -> usize {
         let count = entries.len();
         let new_state = DeployState {
             deploy_id,
@@ -803,13 +835,21 @@ impl ProjectedContext {
     ///
     /// Returns an error string if any path in the manifest is invalid.
     pub fn load_manifest(&mut self, manifest: &DeployManifest) -> Result<(), String> {
-        let mut entries = HashMap::new();
+        let mut entries: PathIndex = HashMap::new();
         for entry in &manifest.entries {
             let path = ContentPath::new(&entry.path)
                 .map_err(|e| format!("invalid path in manifest: {e}"))?;
             let blob_id = hex_decode(&entry.blob_id)
                 .ok_or_else(|| format!("invalid blob_id hex in manifest: {}", entry.blob_id))?;
-            entries.insert(path, blob_id);
+            entries.insert(
+                path,
+                PathEntry {
+                    blob_id,
+                    content_hash: entry.content_hash.clone(),
+                    immutable: entry.immutable,
+                    content_type: entry.content_type.clone(),
+                },
+            );
         }
         self.commit_deploy(manifest.deploy_id.clone(), entries);
         Ok(())
@@ -2091,9 +2131,52 @@ pub async fn site_handler(
     };
 
     // Look up in path index.
-    let Some(blob_id) = deploy_state.index.get(&normalized_path) else {
+    let Some(entry) = deploy_state.index.get(&normalized_path) else {
         return not_found_no_store();
     };
+    let blob_id = &entry.blob_id;
+
+    // Conditional GET (pre-decrypt). Mutable assets carry an
+    // `"<deploy_id>:<content_hash>"` ETag; if the client revalidates with a
+    // matching `If-None-Match`, answer 304 BEFORE fetching and decrypting the
+    // blob (avoids a decryption-amplification vector). The content hash is
+    // captured in the path index at commit time, so this never decrypts.
+    //
+    // Gated on `!entry.immutable` to exactly reproduce the original
+    // post-decrypt behavior: immutable assets emit no revalidation ETag and
+    // were never 304'd here.
+    if !entry.immutable
+        && let Some(inm) = headers.get(axum::http::header::IF_NONE_MATCH)
+        && let Ok(inm_str) = inm.to_str()
+    {
+        let candidate_etag = format!("\"{}:{}\"", deploy_state.deploy_id, entry.content_hash);
+        if inm_str == candidate_etag {
+            // Reproduce the exact headers the 200/post-decrypt 304 path
+            // emits for a mutable asset: security headers + Content-Type +
+            // revalidate Cache-Control + ETag. Content-Type is captured in the
+            // path index at commit time so this never decrypts.
+            let mut resp_headers = site_security_headers(&csp_owned);
+            let content_type = entry
+                .content_type
+                .as_deref()
+                .unwrap_or("application/octet-stream");
+            if let Ok(val) = axum::http::HeaderValue::from_str(content_type) {
+                resp_headers.insert(axum::http::header::CONTENT_TYPE, val);
+            }
+            let revalidate_cache = match rule {
+                ProjectionRule::Public => "public, max-age=0, must-revalidate",
+                _ => "private, max-age=0, must-revalidate",
+            };
+            resp_headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static(revalidate_cache),
+            );
+            if let Ok(val) = axum::http::HeaderValue::from_str(&candidate_etag) {
+                resp_headers.insert(axum::http::header::ETAG, val);
+            }
+            return (StatusCode::NOT_MODIFIED, resp_headers).into_response();
+        }
+    }
 
     // Fetch blob from storage.
     let stored = match state.blob_storage.get(blob_id).await {
@@ -2383,6 +2466,34 @@ pub(crate) mod test_helpers {
             .unwrap();
         blob_id
     }
+
+    /// Builds a [`PathEntry`] for a stored `BroadcastContent`, capturing the
+    /// same `content_hash` (= `compute_etag(body)`) and `immutable` flag the
+    /// production commit path records. Use for site/integration tests so the
+    /// served `ETag` matches what a real deploy would emit.
+    pub fn entry_for(blob_id: [u8; 32], content: &BroadcastContent) -> PathEntry {
+        PathEntry {
+            blob_id,
+            content_hash: scp_core::context::broadcast_content::compute_etag(&content.body),
+            immutable: content.metadata.immutable,
+            content_type: content
+                .metadata
+                .content_type
+                .as_ref()
+                .map(|m| m.as_str().to_owned()),
+        }
+    }
+
+    /// Builds a [`PathEntry`] from a raw blob id for path-index plumbing tests
+    /// that do not exercise the HTTP serve path (no real content body).
+    pub fn entry_raw(blob_id: [u8; 32]) -> PathEntry {
+        PathEntry {
+            blob_id,
+            content_hash: String::new(),
+            immutable: false,
+            content_type: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2395,7 +2506,7 @@ mod tests {
     use super::*;
     use scp_core::crypto::sender_keys::{generate_broadcast_key, rotate_broadcast_key};
 
-    use super::test_helpers::test_seal;
+    use super::test_helpers::{entry_raw, test_seal};
 
     // -----------------------------------------------------------------------
     // Hex helpers
@@ -5721,7 +5832,7 @@ mod tests {
 
         let mut entries = HashMap::new();
         let path = ContentPath::new("/index.html").unwrap();
-        entries.insert(path.clone(), [0xAA; 32]);
+        entries.insert(path.clone(), entry_raw([0xAA; 32]));
 
         let count = ctx.commit_deploy("deploy-1".into(), entries);
         assert_eq!(count, 1);
@@ -5729,7 +5840,7 @@ mod tests {
         let guard = ctx.path_index.load();
         let state = guard.as_ref().as_ref().unwrap();
         assert_eq!(state.deploy_id, "deploy-1");
-        assert_eq!(*state.index.get(&path).unwrap(), [0xAA; 32]);
+        assert_eq!(state.index.get(&path).unwrap().blob_id, [0xAA; 32]);
     }
 
     #[test]
@@ -5747,7 +5858,7 @@ mod tests {
         let path = ContentPath::new("/index.html").unwrap();
         for i in 0..3 {
             let mut entries = HashMap::new();
-            entries.insert(path.clone(), [i; 32]);
+            entries.insert(path.clone(), entry_raw([i; 32]));
             ctx.commit_deploy(format!("deploy-{i}"), entries);
         }
 
@@ -5772,7 +5883,7 @@ mod tests {
         let path = ContentPath::new("/index.html").unwrap();
         for i in 0..5 {
             let mut entries = HashMap::new();
-            entries.insert(path.clone(), [i; 32]);
+            entries.insert(path.clone(), entry_raw([i; 32]));
             ctx.commit_deploy(format!("deploy-{i}"), entries);
         }
 
@@ -5795,11 +5906,11 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries1 = HashMap::new();
-        entries1.insert(path.clone(), [0x01; 32]);
+        entries1.insert(path.clone(), entry_raw([0x01; 32]));
         ctx.commit_deploy("deploy-1".into(), entries1);
 
         let mut entries2 = HashMap::new();
-        entries2.insert(path.clone(), [0x02; 32]);
+        entries2.insert(path.clone(), entry_raw([0x02; 32]));
         ctx.commit_deploy("deploy-2".into(), entries2);
 
         // Current is deploy-2. Rollback to deploy-1.
@@ -5808,7 +5919,7 @@ mod tests {
         let guard = ctx.path_index.load();
         let state = guard.as_ref().as_ref().unwrap();
         assert_eq!(state.deploy_id, "deploy-1");
-        assert_eq!(*state.index.get(&path).unwrap(), [0x01; 32]);
+        assert_eq!(state.index.get(&path).unwrap().blob_id, [0x01; 32]);
     }
 
     #[test]
@@ -5839,10 +5950,16 @@ mod tests {
                 DeployManifestEntry {
                     path: "/index.html".into(),
                     blob_id: hex_encode(&[0xAA; 32]),
+                    content_hash: String::new(),
+                    immutable: false,
+                    content_type: Some("text/html".into()),
                 },
                 DeployManifestEntry {
                     path: "/style.css".into(),
                     blob_id: hex_encode(&[0xBB; 32]),
+                    content_hash: String::new(),
+                    immutable: false,
+                    content_type: Some("text/css".into()),
                 },
             ],
         };
@@ -5853,6 +5970,22 @@ mod tests {
         let state = guard.as_ref().as_ref().unwrap();
         assert_eq!(state.deploy_id, "manifest-deploy");
         assert_eq!(state.index.len(), 2);
+        // content_type survives the manifest round-trip into the path index.
+        let index_path = ContentPath::new("/index.html").unwrap();
+        assert_eq!(
+            state
+                .index
+                .get(&index_path)
+                .unwrap()
+                .content_type
+                .as_deref(),
+            Some("text/html")
+        );
+        let css_path = ContentPath::new("/style.css").unwrap();
+        assert_eq!(
+            state.index.get(&css_path).unwrap().content_type.as_deref(),
+            Some("text/css")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5863,7 +5996,7 @@ mod tests {
         BROADCAST_CONTENT_VERSION, BroadcastContent, ContentMetadata, MimeType,
     };
 
-    use super::test_helpers::store_content_blob;
+    use super::test_helpers::{entry_for, store_content_blob};
 
     #[tokio::test]
     async fn site_returns_correct_content_type_and_body() {
@@ -5897,7 +6030,7 @@ mod tests {
         // Commit deploy.
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("deploy-1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -5930,6 +6063,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn site_handler_conditional_get_returns_304_before_decrypt() {
+        // A conditional GET whose If-None-Match matches the
+        // "<deploy_id>:<content_hash>" ETag must short-circuit to 304 BEFORE
+        // the handler fetches and decrypts the blob (decryption-amplification
+        // guard). The content_hash lives in the path index, captured at commit
+        // time, so the 304 needs no plaintext.
+        //
+        // Hermetic proof of "before decrypt": the PathEntry points at a
+        // blob_id that is ABSENT from blob storage. The fetch+decrypt path
+        // would therefore return 404 (Ok(None) -> not_found_no_store). If the
+        // handler still answers 304, it provably short-circuited before the
+        // storage fetch. Remove the early-304 block and this test fails (404).
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_ctx_304_before_decrypt";
+        let mut projected = ProjectedContext::new(context_id, key, BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "early304.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        // Empty storage on purpose: the matched blob does not exist.
+        let storage = InMemoryBlobStorage::new();
+
+        let deploy_id = "deploy-early304";
+        let content_hash =
+            scp_core::context::broadcast_content::compute_etag(b"<h1>cached body</h1>");
+        let absent_blob_id = [0x5A; 32];
+
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(
+            path,
+            PathEntry {
+                blob_id: absent_blob_id,
+                content_hash: content_hash.clone(),
+                immutable: false,
+                content_type: Some("text/html".into()),
+            },
+        );
+        projected.commit_deploy(deploy_id.into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        let etag_value = format!("\"{deploy_id}:{content_hash}\"");
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .header(axum::http::header::IF_NONE_MATCH, &etag_value)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Short-circuit before fetch+decrypt: 304, NOT 404.
+        assert_eq!(resp.status(), HttpStatus::NOT_MODIFIED);
+
+        // 304 carries the same revalidation headers as the 200/post-decrypt
+        // path: the matching ETag and a must-revalidate Cache-Control.
+        let headers = resp.headers().clone();
+        let etag = headers
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(etag, etag_value);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "public, max-age=0, must-revalidate");
+
+        // Full header parity with the served 200/post-decrypt-304 path: the
+        // early-304 emits the same Content-Type, captured in the path index at
+        // commit time, so the two 304 paths are byte-identical for a mutable
+        // asset.
+        let ct = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html");
+
+        // 304 has an empty body.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn site_handler_conditional_get_non_matching_falls_through_to_decrypt() {
+        // Counterpart to the early-304 proof: a NON-matching If-None-Match
+        // must NOT short-circuit. With the blob absent from storage, falling
+        // through to the fetch path yields 404 — proving the early-304 only
+        // fires on an exact ETag match.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_ctx_304_nomatch";
+        let mut projected = ProjectedContext::new(context_id, key, BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "nomatch304.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        let deploy_id = "deploy-nomatch";
+        let content_hash =
+            scp_core::context::broadcast_content::compute_etag(b"<h1>cached body</h1>");
+
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(
+            path,
+            PathEntry {
+                blob_id: [0x5A; 32],
+                content_hash,
+                immutable: false,
+                content_type: None,
+            },
+        );
+        projected.commit_deploy(deploy_id.into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        // A stale/wrong ETag (different deploy id) must not match.
+        let wrong_etag = format!("\"other-deploy:{}\"", "00".repeat(32));
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .header(axum::http::header::IF_NONE_MATCH, &wrong_etag)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // No short-circuit: fetch path runs, blob absent -> 404.
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn site_returns_all_security_headers() {
         let key = generate_broadcast_key("did:dht:alice");
         let context_id = "site_headers_ctx";
@@ -5959,7 +6239,7 @@ mod tests {
 
         let path = ContentPath::new("/page.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("d-1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6045,7 +6325,7 @@ mod tests {
 
         let path = ContentPath::new("/assets/style.a1b2c3.css").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("d-2".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6119,7 +6399,7 @@ mod tests {
 
         let path = ContentPath::new("/assets/app.hash.js").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("gated-d1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6193,7 +6473,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("gated-d2".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6253,7 +6533,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("d-3".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6406,7 +6686,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries1 = HashMap::new();
-        entries1.insert(path.clone(), blob_v1);
+        entries1.insert(path.clone(), entry_for(blob_v1, &content_v1));
         projected.commit_deploy("v1".into(), entries1);
 
         // Second deploy: /index.html -> "v2"
@@ -6424,7 +6704,7 @@ mod tests {
         let blob_v2 = store_content_blob(&storage, routing_id, &key, &content_v2).await;
 
         let mut entries2 = HashMap::new();
-        entries2.insert(path, blob_v2);
+        entries2.insert(path, entry_for(blob_v2, &content_v2));
         projected.commit_deploy("v2".into(), entries2);
 
         // Verify current deploy is v2.
@@ -6483,7 +6763,7 @@ mod tests {
         // Put this blob in the path index anyway.
         let path = ContentPath::new("/old-page.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_raw(blob_id));
         projected.commit_deploy("legacy-deploy".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6540,7 +6820,7 @@ mod tests {
         // Commit deploy.
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("deploy-e2e".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6676,8 +6956,8 @@ mod tests {
         let path_html = ContentPath::new("/index.html").unwrap();
         let path_css = ContentPath::new("/style.css").unwrap();
         let mut entries1 = HashMap::new();
-        entries1.insert(path_html.clone(), blob_v1_html);
-        entries1.insert(path_css.clone(), blob_v1_css);
+        entries1.insert(path_html.clone(), entry_for(blob_v1_html, &v1_html));
+        entries1.insert(path_css.clone(), entry_for(blob_v1_css, &v1_css));
         projected.commit_deploy("v1".into(), entries1);
 
         // Deploy v2: /index.html->"v2", /style.css->"v2-css"
@@ -6707,8 +6987,8 @@ mod tests {
         let blob_v2_css = store_content_blob(&storage, routing_id, &key, &v2_css).await;
 
         let mut entries2 = HashMap::new();
-        entries2.insert(path_html, blob_v2_html);
-        entries2.insert(path_css, blob_v2_css);
+        entries2.insert(path_html, entry_for(blob_v2_html, &v2_html));
+        entries2.insert(path_css, entry_for(blob_v2_css, &v2_css));
         projected.commit_deploy("v2".into(), entries2);
 
         // Verify both serve v2 (no mixed state) after atomic deploy switch.
@@ -6773,7 +7053,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries1 = HashMap::new();
-        entries1.insert(path.clone(), blob_v1);
+        entries1.insert(path.clone(), entry_for(blob_v1, &v1_content));
         projected.commit_deploy("v1".into(), entries1);
 
         // Deploy v2.
@@ -6791,7 +7071,7 @@ mod tests {
         let blob_v2 = store_content_blob(&storage, routing_id, &key, &v2_content).await;
 
         let mut entries2 = HashMap::new();
-        entries2.insert(path, blob_v2);
+        entries2.insert(path, entry_for(blob_v2, &v2_content));
         projected.commit_deploy("v2".into(), entries2);
 
         // Verify v2 is the current deploy.
@@ -6865,7 +7145,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("gated-d1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6926,7 +7206,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("gated-d2".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6999,8 +7279,8 @@ mod tests {
         let path_html = ContentPath::new("/index.html").unwrap();
         let path_css = ContentPath::new("/style.css").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path_html, blob_html);
-        entries.insert(path_css, blob_css);
+        entries.insert(path_html, entry_for(blob_html, &html_content));
+        entries.insert(path_css, entry_for(blob_css, &css_content));
         projected.commit_deploy("mfst-d1".into(), entries);
 
         // Extract the deploy manifest.
@@ -7010,10 +7290,28 @@ mod tests {
                 DeployManifestEntry {
                     path: "/index.html".into(),
                     blob_id: hex_encode(&blob_html),
+                    content_hash: scp_core::context::broadcast_content::compute_etag(
+                        &html_content.body,
+                    ),
+                    immutable: html_content.metadata.immutable,
+                    content_type: html_content
+                        .metadata
+                        .content_type
+                        .as_ref()
+                        .map(|m| m.as_str().to_owned()),
                 },
                 DeployManifestEntry {
                     path: "/style.css".into(),
                     blob_id: hex_encode(&blob_css),
+                    content_hash: scp_core::context::broadcast_content::compute_etag(
+                        &css_content.body,
+                    ),
+                    immutable: css_content.metadata.immutable,
+                    content_type: css_content
+                        .metadata
+                        .content_type
+                        .as_ref()
+                        .map(|m| m.as_str().to_owned()),
                 },
             ],
         };
@@ -7219,7 +7517,7 @@ mod tests {
         state: &Arc<NodeState>,
         routing_id: [u8; 32],
         deploy_id: &str,
-        entries: HashMap<ContentPath, [u8; 32]>,
+        entries: HashMap<ContentPath, PathEntry>,
     ) -> usize {
         let mut guard = state.projected_contexts.write().await;
         let ctx = guard.get_mut(&routing_id).unwrap();
@@ -7275,8 +7573,14 @@ mod tests {
         let v1_html_id = store_content_blob(&storage, routing_id, &key, &v1_html).await;
         let v1_css_id = store_content_blob(&storage, routing_id, &key, &v1_css).await;
         let mut e1 = HashMap::new();
-        e1.insert(ContentPath::new("/index.html").unwrap(), v1_html_id);
-        e1.insert(ContentPath::new("/style.css").unwrap(), v1_css_id);
+        e1.insert(
+            ContentPath::new("/index.html").unwrap(),
+            entry_for(v1_html_id, &v1_html),
+        );
+        e1.insert(
+            ContentPath::new("/style.css").unwrap(),
+            entry_for(v1_css_id, &v1_css),
+        );
         assert_eq!(projected.commit_deploy("deploy-v1".into(), e1), 2);
 
         let mut pm = HashMap::new();
@@ -7314,8 +7618,14 @@ mod tests {
         let v2_html = make_content("/index.html", "text/html", "deploy-v2", b"<h1>V2</h1>");
         let v2_html_id = store_content_blob(&storage, routing_id, &key, &v2_html).await;
         let mut e2 = HashMap::new();
-        e2.insert(ContentPath::new("/index.html").unwrap(), v2_html_id);
-        e2.insert(ContentPath::new("/style.css").unwrap(), v1_css_id);
+        e2.insert(
+            ContentPath::new("/index.html").unwrap(),
+            entry_for(v2_html_id, &v2_html),
+        );
+        e2.insert(
+            ContentPath::new("/style.css").unwrap(),
+            entry_for(v1_css_id, &v1_css),
+        );
         assert_eq!(
             commit_via_state(&state, routing_id, "deploy-v2", e2).await,
             2
@@ -7378,7 +7688,10 @@ mod tests {
         let v1 = make_content("/index.html", "text/html", "gated-v1", b"<h1>Gated V1</h1>");
         let v1_id = store_content_blob(&storage, routing_id, &key, &v1).await;
         let mut e1 = HashMap::new();
-        e1.insert(ContentPath::new("/index.html").unwrap(), v1_id);
+        e1.insert(
+            ContentPath::new("/index.html").unwrap(),
+            entry_for(v1_id, &v1),
+        );
         assert_eq!(projected.commit_deploy("gated-v1".into(), e1), 1);
 
         let mut pm = HashMap::new();
@@ -7413,7 +7726,10 @@ mod tests {
         let v2 = make_content("/index.html", "text/html", "gated-v2", b"<h1>Gated V2</h1>");
         let v2_id = store_content_blob(&storage, routing_id, &key, &v2).await;
         let mut e2 = HashMap::new();
-        e2.insert(ContentPath::new("/index.html").unwrap(), v2_id);
+        e2.insert(
+            ContentPath::new("/index.html").unwrap(),
+            entry_for(v2_id, &v2),
+        );
         commit_via_state(&state, routing_id, "gated-v2", e2).await;
 
         // Verify v2.

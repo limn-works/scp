@@ -18,8 +18,8 @@
 //!   node's real broadcast projection router via [`tower::ServiceExt::oneshot`].
 //!
 //! This is the same code path the production binary runs (`main.rs`
-//! `run_self_host` -> `deploy_self_host_site` -> `deploy_site`), minus the
-//! binary-only concerns (banner, NAT mapper, serve loop).
+//! `run_self_host` -> `run_self_host_with` -> `SelfHostDeployer::deploy`), minus
+//! the binary-only concerns (banner, NAT mapper, serve loop).
 //!
 //! Provenance: `.docs/guides/self-hosting-a-website-on-scp.md`; specs §10.12.8
 //! (Infrastructure & Self-Hosting) + §18 (Addressability & Deployment).
@@ -1013,4 +1013,168 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
         "skip_nat_probe must publish a loopback relay URL"
     );
     node.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 7 — self-host serving path: restricted surface + loopback relay seam
+// ---------------------------------------------------------------------------
+
+/// FINDING 7 (defense-in-depth, structural): binds the two security invariants
+/// of the `--self-host` serving path together so a future refactor cannot
+/// silently (1) serve the `Full` surface in place of `SelfHost`, or (2) bind the
+/// relay listener on a non-loopback address in no-domain mode.
+///
+/// Invariant 1 (`PublicSurface::SelfHost`): serving via the restricted surface
+/// must NOT route the relay upgrade (`/scp/v1`) — a plain GET 404s (route
+/// absent) while the site projection serves — and the SAME GET on the `Full`
+/// surface IS routed (non-404, the WebSocket extractor rejecting a plain GET),
+/// proving the self-host 404 is genuine route absence, not a generic rejection.
+/// (The companion `self_host_public_surface_excludes_relay_and_bridge` covers
+/// the bridge routes and the full surface/site detail; this test deliberately
+/// keeps the surface half tight and adds the relay-loopback binding the other
+/// test lacks.)
+///
+/// Invariant 2 (loopback relay bind): a no-domain self-host node
+/// (`build_self_host_node`, `FixedTierNatStrategy`) must bind its relay listener
+/// on a loopback address — the §10.12.8 security seam that keeps the relay
+/// reachable only in-process (the in-process supervisor connects over
+/// `127.0.0.1`; the relay is never on the public surface).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_host_uses_selfhost_surface_and_loopback_relay() {
+    let built = build_self_host_node().await;
+
+    // -- Invariant 2: the relay listener is bound on a loopback address. --
+    // `build_self_host_node` already asserts the relay port is a real, non-zero
+    // OS-assigned port; here we additionally pin that the bind IP is loopback.
+    assert!(
+        built.node.relay().bound_addr().ip().is_loopback(),
+        "no-domain self-host relay must bind a loopback address (got {}), \
+         keeping it reachable only in-process (§10.12.8)",
+        built.node.relay().bound_addr(),
+    );
+
+    // Deploy so the SelfHost site route has content to serve.
+    let node_did = built.node.identity().did().to_owned();
+    let context_id = self_host_context_id(&node_did);
+    let deployer = build_deployer(&built, &context_id).await;
+    deploy_through(&deployer, &built, "selfhost-seam-deploy").await;
+    let routing_hex = scp_node::routing_id_hex(&context_id);
+
+    // -- Invariant 1a: the RESTRICTED self-host surface serves the site but does
+    //    NOT route the relay upgrade. --
+    let addr = built
+        .node
+        .serve_background_with_surface(
+            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            scp_node::PublicSurface::SelfHost,
+        )
+        .await
+        .expect("self-host background listener should bind");
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let site = client
+        .get(format!(
+            "{base}/scp/broadcast/{routing_hex}/site/index.html"
+        ))
+        .send()
+        .await
+        .expect("site request should complete");
+    assert_eq!(
+        site.status().as_u16(),
+        200,
+        "the self-host (restricted) surface must serve the website projection"
+    );
+
+    let self_host_relay = client
+        .get(format!("{base}/scp/v1"))
+        .send()
+        .await
+        .expect("relay probe should complete");
+    assert_eq!(
+        self_host_relay.status().as_u16(),
+        404,
+        "the relay upgrade `/scp/v1` must NOT be routed on the self-host surface, got {}",
+        self_host_relay.status()
+    );
+
+    built.node.shutdown();
+
+    // -- Invariant 1b: on the FULL surface the SAME GET IS routed (non-404),
+    //    proving the 404 above is route ABSENCE on the restricted surface, not a
+    //    generic rejection. A fresh node is used because `serve_background` is
+    //    single-shot and the prior node is shut down. --
+    let full = build_self_host_node().await;
+    let full_addr = full
+        .node
+        .serve_background_with_surface(
+            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            scp_node::PublicSurface::Full,
+        )
+        .await
+        .expect("full background listener should bind");
+    let full_relay = client
+        .get(format!("http://{full_addr}/scp/v1"))
+        .send()
+        .await
+        .expect("full relay probe should complete");
+    assert_ne!(
+        full_relay.status().as_u16(),
+        404,
+        "on the FULL surface `/scp/v1` must be routed (the WebSocket extractor \
+         rejects a plain GET with a non-404 status), proving the self-host 404 is \
+         route absence; got {}",
+        full_relay.status()
+    );
+    full.node.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 10(b) — ACME is never engaged on a no-domain self-host node
+// ---------------------------------------------------------------------------
+
+/// FINDING 10(b) (alignment/coverage): in `--self-host` (no-domain) mode the
+/// node serves via self-signed TLS and NEVER provisions ACME — there is no DNS
+/// name to validate. The ACME challenge route
+/// (`GET /.well-known/acme-challenge/{token}`) is mounted ONLY when the node's
+/// ACME challenge state is present (`NodeState::acme_challenges == Some`), which
+/// a no-domain node never sets. Since that private state has no public getter,
+/// this asserts the observable consequence: a GET to an ACME challenge path on
+/// the self-host surface 404s, because the challenge route is absent and the
+/// request falls through to the virtual-host fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_host_no_domain_skips_acme() {
+    let built = build_self_host_node().await;
+
+    // Open the restricted self-host surface (the surface the binary serves).
+    let addr = built
+        .node
+        .serve_background_with_surface(
+            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            scp_node::PublicSurface::SelfHost,
+        )
+        .await
+        .expect("self-host background listener should bind");
+
+    let client = reqwest::Client::new();
+
+    // No ACME challenge route is mounted (no-domain => acme_challenges == None),
+    // so the request falls through to the virtual-host fallback and 404s.
+    let acme = client
+        .get(format!(
+            "http://{addr}/.well-known/acme-challenge/some-token"
+        ))
+        .send()
+        .await
+        .expect("acme-challenge probe should complete");
+    assert_eq!(
+        acme.status().as_u16(),
+        404,
+        "a no-domain self-host node must not serve ACME challenges (ACME is never \
+         engaged without a DNS name), got {}",
+        acme.status()
+    );
+
+    built.node.shutdown();
 }

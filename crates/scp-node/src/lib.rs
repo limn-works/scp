@@ -43,7 +43,9 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 pub use http::BroadcastContext;
-pub use projection::{DeployManifest, DeployManifestEntry, ProjectedContext, SiteConfig};
+pub use projection::{
+    DeployManifest, DeployManifestEntry, PathEntry, ProjectedContext, SiteConfig,
+};
 pub use self_host::{
     Asset, DeploySiteParams, SelfHostDeployer, SelfHostError, content_type_for, deploy_site,
     embedded_assets, routing_id_hex,
@@ -1203,7 +1205,7 @@ impl<S: Storage> ApplicationNode<S> {
             .await
             .map_err(|e| NodeError::Storage(e.to_string()))?;
 
-        let mut entries: HashMap<ContentPath, [u8; 32]> = HashMap::new();
+        let mut entries: HashMap<ContentPath, projection::PathEntry> = HashMap::new();
         let mut manifest_entries: Vec<projection::DeployManifestEntry> = Vec::new();
         let mut total_size: u64 = 0;
         // Track per-path sizes so path collisions subtract the old size before
@@ -1266,6 +1268,20 @@ impl<S: Storage> ApplicationNode<S> {
                 )));
             }
 
+            // Capture the ETag content hash and immutability flag BEFORE
+            // moving `path` out of `content.metadata`. The ETag is guaranteed
+            // `Some` here (populated/verified just above); the let-else is the
+            // clippy-clean way to unwrap it.
+            let Some(content_hash) = content.metadata.etag.clone() else {
+                continue;
+            };
+            let immutable = content.metadata.immutable;
+            let content_type = content
+                .metadata
+                .content_type
+                .as_ref()
+                .map(|m| m.as_str().to_owned());
+
             // Extract path.
             let Some(path) = content.metadata.path else {
                 continue;
@@ -1297,10 +1313,21 @@ impl<S: Storage> ApplicationNode<S> {
             manifest_entries.push(projection::DeployManifestEntry {
                 path: path.as_str().to_owned(),
                 blob_id: projection::hex_encode(&stored.blob_id),
+                content_hash: content_hash.clone(),
+                immutable,
+                content_type: content_type.clone(),
             });
 
             path_sizes.insert(path.clone(), new_size);
-            entries.insert(path, stored.blob_id);
+            entries.insert(
+                path,
+                projection::PathEntry {
+                    blob_id: stored.blob_id,
+                    content_hash,
+                    immutable,
+                    content_type,
+                },
+            );
         }
 
         // Store deploy manifest as a special blob.
@@ -1394,7 +1421,7 @@ impl<S: Storage> ApplicationNode<S> {
                 guard
                     .as_ref()
                     .as_ref()
-                    .and_then(|state| state.index.values().next().copied())
+                    .and_then(|state| state.index.values().next().map(|e| e.blob_id))
             })
         };
         if let Some(blob_id) = sample_blob_id {
@@ -3364,6 +3391,26 @@ async fn validate_persisted_custody<K: KeyCustody>(
             ))
         })?;
     verify_vm_match(&persisted.document, "#0", &identity_pub, "identity key")?;
+
+    // Re-derive the self-certifying DID from the #0 identity key and confirm it
+    // matches the persisted DID string. The did:dht identifier is
+    // `did:dht:z<zbase32(#0 public key)>`; a stored DID that does not re-derive
+    // from the custody-held key indicates tampering or corruption of the
+    // persisted record, so reject the load.
+    let id_key_bytes: [u8; 32] = identity_pub.as_bytes().try_into().map_err(|_| {
+        NodeError::Storage(format!(
+            "persisted #0 identity public key is not 32 bytes (got {})",
+            identity_pub.as_bytes().len()
+        ))
+    })?;
+    let derived_did = scp_identity::dht::did_from_ed25519_public_key(&id_key_bytes);
+    if derived_did != persisted.identity.did {
+        return Err(NodeError::Storage(format!(
+            "persisted DID does not match DID re-derived from #0 identity key \
+             (stored: {}, derived: {derived_did})",
+            persisted.identity.did
+        )));
+    }
 
     // --- #active Signing Key ---
     let active_pub = key_custody
@@ -6506,6 +6553,86 @@ mod tests {
             msg.contains("not found in custody"),
             "expected custody validation error, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_identity_with_tampered_did_is_rejected() {
+        // The did:dht identifier is self-certifying: it is derived directly
+        // from the `#0` identity key. A stored DID string that no longer
+        // re-derives from the custody-held key indicates tampering or
+        // corruption of the persisted record, and the load MUST be rejected
+        // even though the custody key handles and document verification
+        // methods are still internally consistent.
+
+        // First run: create and persist a real identity.
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let node1 = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("tampered-did.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "tampered-did.example.com".to_owned(),
+            }))
+            .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build_for_testing()
+            .await
+            .unwrap();
+
+        let original_did = node1.identity().did().to_owned();
+        node1.shutdown();
+
+        // Tamper: rewrite ONLY the persisted DID string, leaving the custody
+        // key handles and DID document verification methods untouched so that
+        // `validate_persisted_custody`'s VM-match checks still pass and the
+        // DID re-derivation check is the sole gate that can catch the
+        // corruption.
+        let stored = storage
+            .retrieve(IDENTITY_STORAGE_KEY)
+            .await
+            .unwrap()
+            .expect("identity should be persisted after first run");
+        let mut envelope: StoredValue<PersistedIdentity> = rmp_serde::from_slice(&stored).unwrap();
+        let tampered_did = "did:dht:zyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy".to_owned();
+        assert_ne!(
+            tampered_did, original_did,
+            "tampered DID must differ from the genuine DID"
+        );
+        envelope.data.identity.did = tampered_did.clone();
+        let tampered_bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+        storage
+            .store(IDENTITY_STORAGE_KEY, &tampered_bytes)
+            .await
+            .unwrap();
+
+        // Second run: same custody (so VMs still match) but the stored DID no
+        // longer re-derives from the `#0` key → load MUST be rejected.
+        let result = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("tampered-did.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "tampered-did.example.com".to_owned(),
+            }))
+            .identity_with_storage(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build_for_testing()
+            .await;
+
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("does not match DID re-derived from #0 identity key"),
+                    "expected DID re-derivation mismatch error, got: {msg}"
+                );
+            }
+            Ok(node) => {
+                node.shutdown();
+                panic!("expected tampered-DID rejection, but build succeeded");
+            }
+        }
     }
 
     /// Regression: persisted `ScpIdentity` blobs from interim builds
