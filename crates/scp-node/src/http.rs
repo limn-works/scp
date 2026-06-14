@@ -637,13 +637,42 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         app_router: Router,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), NodeError> {
+        self.serve_with_surface(app_router, crate::PublicSurface::Full, shutdown)
+            .await
+    }
+
+    /// Like [`serve`](Self::serve) but restricts the public HTTP surface to
+    /// the requested [`PublicSurface`](crate::PublicSurface).
+    ///
+    /// [`PublicSurface::Full`](crate::PublicSurface::Full) is identical to
+    /// [`serve`](Self::serve). [`PublicSurface::SelfHost`](crate::PublicSurface::SelfHost)
+    /// exposes ONLY the read-only website projection surface on the public
+    /// bind — the relay upgrade (`/scp/v1`) and bridge routes
+    /// (`/v1/scp/bridge/*`) are not mounted, so anonymous internet clients
+    /// cannot reach the node's loopback relay or bridge through the public
+    /// listener (§10.12.8).
+    ///
+    /// TLS termination, the dev API listener, and the HTTP/3 listener behave
+    /// exactly as in [`serve`](Self::serve); the only difference is which SCP
+    /// routes are merged onto the public listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] if either server cannot bind or
+    /// encounters a fatal I/O error.
+    pub async fn serve_with_surface(
+        self,
+        app_router: Router,
+        surface: crate::PublicSurface,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), NodeError> {
         spawn_projection_rate_limit_cleanup(
             self.state.projection_rate_limiter.clone(),
             self.state.shutdown_token.clone(),
         );
 
-        // Build the full merged router via the shared helper.
-        let merged = self.build_scp_router(app_router);
+        // Build the merged router for the requested public surface.
+        let merged = self.build_scp_router_with_surface(app_router, surface);
 
         let dev_router = self
             .state
@@ -818,6 +847,46 @@ pub(crate) fn build_merged_router(
         .merge(bridge)
         .merge(bridge_webhook);
 
+    finalize_router(merged, state)
+}
+
+/// Builds the restricted public router for `--self-host` mode.
+///
+/// Mounts ONLY the read-only website surface: the caller's `app_router`,
+/// `.well-known/scp`, the broadcast projection endpoints (`/scp/broadcast/*`,
+/// including `/feed`, `/messages`, and `/site/*`), any configured ACME
+/// challenge routes, and the virtual-host fallback. It deliberately does NOT
+/// merge the relay upgrade router (`/scp/v1`) nor the bridge routers
+/// (`/v1/scp/bridge/*`).
+///
+/// This is the security seam for §10.12.8: in self-host mode the node's own
+/// loopback relay is reached in-process over `127.0.0.1` (the relay's listener
+/// stays loopback), so the relay upgrade/bridge must never be exposed on the
+/// public bind. An external client hitting `/scp/v1` or `/v1/scp/bridge/*` on
+/// the self-host public listener therefore falls through to the virtual-host
+/// fallback and receives 404 (no registered hostname matches those paths),
+/// while the website projection routes serve normally.
+///
+/// **Caller note:** whatever `app_router` is passed IS exposed on the public
+/// self-host bind. The self-host binary passes only the Prometheus `/metrics`
+/// router (matching the other run modes). Do not merge any sensitive or
+/// mutating routes into `app_router` for the self-host surface.
+pub(crate) fn build_self_host_router(
+    app_router: Router,
+    well_known: Router,
+    projection: Router,
+    state: &Arc<NodeState>,
+) -> Router {
+    let merged = app_router.merge(well_known).merge(projection);
+
+    finalize_router(merged, state)
+}
+
+/// Mounts the ACME challenge router (when configured) and installs the
+/// virtual-host fallback. Shared by [`build_merged_router`] and
+/// [`build_self_host_router`] so both surfaces use the identical,
+/// path-traversal-safe fallback.
+fn finalize_router(merged: Router, state: &Arc<NodeState>) -> Router {
     // Mount ACME challenge router for renewal challenges (issue #305).
     // Serves `GET /.well-known/acme-challenge/{token}` so the ACME CA can
     // validate domain ownership during certificate renewal.

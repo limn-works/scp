@@ -45,8 +45,8 @@ use zeroize::Zeroizing;
 pub use http::BroadcastContext;
 pub use projection::{DeployManifest, DeployManifestEntry, ProjectedContext, SiteConfig};
 pub use self_host::{
-    Asset, DeploySiteParams, SelfHostError, content_type_for, deploy_site, embedded_assets,
-    routing_id_hex,
+    Asset, DeploySiteParams, SelfHostDeployer, SelfHostError, content_type_for, deploy_site,
+    embedded_assets, routing_id_hex,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,6 +97,33 @@ pub(crate) const MAX_BROADCAST_CONTEXTS: usize = 1024;
 ///
 /// See spec section 18.11.6.
 pub const DEFAULT_PROJECTION_RATE_LIMIT: u32 = 60;
+
+// ---------------------------------------------------------------------------
+// Public HTTP surface selection
+// ---------------------------------------------------------------------------
+
+/// Selects which routes the public HTTP listener exposes when serving.
+///
+/// The default run modes (relay-only, persistent, ephemeral) serve the
+/// [`Full`](PublicSurface::Full) protocol surface. The `--self-host`
+/// website-hosting mode serves the restricted [`SelfHost`](PublicSurface::SelfHost)
+/// surface so the public bind exposes only the read-only website projection
+/// and never the relay upgrade or bridge routes (§10.12.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicSurface {
+    /// Full protocol surface: `.well-known/scp`, the `/scp/v1` relay
+    /// WebSocket upgrade, broadcast projection (`/scp/broadcast/*`), the
+    /// bridge routes (`/v1/scp/bridge/*`), ACME challenges, and the
+    /// virtual-host fallback. Used by every run mode except `--self-host`.
+    Full,
+    /// Restricted website surface for `--self-host`: `.well-known/scp`, the
+    /// broadcast projection endpoints (`/scp/broadcast/*`, including
+    /// `/feed`, `/messages`, and `/site`), and the virtual-host fallback —
+    /// and nothing else. The relay upgrade/bridge (`/scp/v1`) and the bridge
+    /// routes (`/v1/scp/bridge/*`) are NOT mounted, so an anonymous internet
+    /// client cannot reach the node's relay or bridge through the public bind.
+    SelfHost,
+}
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -463,31 +490,68 @@ impl<S: Storage> ApplicationNode<S> {
         }
     }
 
-    /// Builds the merged SCP protocol router (well-known, relay, projection,
-    /// bridge, ACME challenge routes) for use by both [`serve`](Self::serve)
-    /// and [`serve_background`](Self::serve_background).
+    /// Returns a clone of the node's graceful-shutdown cancellation token.
     ///
-    /// `app_router` is the caller-supplied application router that SCP routes
-    /// are merged onto. Pass `axum::Router::new()` when there is no
-    /// application router (e.g. `serve_background`).
-    fn build_scp_router(&self, app_router: axum::Router) -> axum::Router {
+    /// The token is cancelled by [`shutdown`](Self::shutdown) (and when a
+    /// [`serve`](Self::serve)/[`serve_background`](Self::serve_background) loop
+    /// completes). Background tasks that should stop when the node stops — for
+    /// example a self-host site refresh loop — can observe this token to exit
+    /// cleanly without racing the listener teardown.
+    #[must_use]
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.state.shutdown_token.clone()
+    }
+
+    /// Builds the merged SCP protocol router for the requested
+    /// [`PublicSurface`].
+    ///
+    /// [`PublicSurface::Full`] exposes the complete protocol surface:
+    /// `.well-known/scp`, the `/scp/v1` relay WebSocket upgrade, the broadcast
+    /// projection endpoints (`/scp/broadcast/*`), the bridge routes
+    /// (`/v1/scp/bridge/*`), ACME challenges, and the virtual-host fallback.
+    ///
+    /// [`PublicSurface::SelfHost`] exposes ONLY the read-only website surface:
+    /// `.well-known/scp`, the broadcast projection endpoints, and the
+    /// virtual-host fallback. The relay upgrade/bridge (`/scp/v1`) and the
+    /// bridge routes (`/v1/scp/bridge/*`) are deliberately NOT mounted — in
+    /// self-host mode the node's loopback relay is reached in-process over
+    /// `127.0.0.1` and must never be exposed to anonymous internet clients on
+    /// the public bind (§10.12.8; exposing `/scp/v1` would let an anonymous
+    /// external client publish/subscribe/query/delete on the node's relay,
+    /// carrying the node's own bridge bearer token, with every external client
+    /// collapsed to `127.0.0.1` for per-IP limits — a site-takedown and
+    /// metadata-exfiltration vector).
+    fn build_scp_router_with_surface(
+        &self,
+        app_router: axum::Router,
+        surface: PublicSurface,
+    ) -> axum::Router {
         let cors = http::build_cors_layer(&self.state.cors_origins);
         let well_known = http::well_known_router(Arc::clone(&self.state)).layer(cors.clone());
-        let relay_rt = http::relay_router(Arc::clone(&self.state));
         let projection =
             crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
-        let (bridge, bridge_webhook) =
-            http::build_bridge_routers(&self.state.bridge_state, self.state.bridge_lookup.as_ref());
 
-        http::build_merged_router(
-            app_router,
-            well_known,
-            relay_rt,
-            projection,
-            bridge,
-            bridge_webhook,
-            &self.state,
-        )
+        match surface {
+            PublicSurface::Full => {
+                let relay_rt = http::relay_router(Arc::clone(&self.state));
+                let (bridge, bridge_webhook) = http::build_bridge_routers(
+                    &self.state.bridge_state,
+                    self.state.bridge_lookup.as_ref(),
+                );
+                http::build_merged_router(
+                    app_router,
+                    well_known,
+                    relay_rt,
+                    projection,
+                    bridge,
+                    bridge_webhook,
+                    &self.state,
+                )
+            }
+            PublicSurface::SelfHost => {
+                http::build_self_host_router(app_router, well_known, projection, &self.state)
+            }
+        }
     }
 
     /// Returns the HTTP URL of the background server, if running.
@@ -553,6 +617,30 @@ impl<S: Storage> ApplicationNode<S> {
         &self,
         bind_addr: Option<SocketAddr>,
     ) -> Result<SocketAddr, NodeError> {
+        self.serve_background_with_surface(bind_addr, PublicSurface::Full)
+            .await
+    }
+
+    /// Like [`serve_background`](Self::serve_background) but restricts the
+    /// public HTTP surface to the requested [`PublicSurface`].
+    ///
+    /// [`PublicSurface::SelfHost`] mounts ONLY the read-only website
+    /// projection surface (`.well-known/scp`, `/scp/broadcast/*`, and the
+    /// virtual-host fallback) — the relay upgrade (`/scp/v1`) and bridge
+    /// routes (`/v1/scp/bridge/*`) are not exposed on the background listener
+    /// (§10.12.8). All other behavior (no TLS, no dev API, double-serve
+    /// prevention, shutdown via the node's cancellation token) is identical to
+    /// [`serve_background`](Self::serve_background).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] under the same conditions as
+    /// [`serve_background`](Self::serve_background).
+    pub async fn serve_background_with_surface(
+        &self,
+        bind_addr: Option<SocketAddr>,
+        surface: PublicSurface,
+    ) -> Result<SocketAddr, NodeError> {
         // Reject if the node has already been shut down — the cancellation
         // token is already cancelled so the server would exit immediately.
         if self.state.shutdown_token.is_cancelled() {
@@ -586,8 +674,8 @@ impl<S: Storage> ApplicationNode<S> {
 
         let shutdown_token = self.state.shutdown_token.clone();
 
-        // Build the full merged router (same as serve()).
-        let merged = self.build_scp_router(axum::Router::new());
+        // Build the merged router for the requested public surface.
+        let merged = self.build_scp_router_with_surface(axum::Router::new(), surface);
 
         // Bind the TCP listener before spawning so we can report errors
         // and the bound address synchronously.

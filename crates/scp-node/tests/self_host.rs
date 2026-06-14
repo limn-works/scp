@@ -18,8 +18,8 @@
 //!   node's real broadcast projection router via [`tower::ServiceExt::oneshot`].
 //!
 //! This is the same code path the production binary runs (`main.rs`
-//! `run_self_host` -> `deploy_and_announce_self_host_site` -> `deploy_site`),
-//! minus the binary-only concerns (banner, NAT mapper, serve loop).
+//! `run_self_host` -> `deploy_self_host_site` -> `deploy_site`), minus the
+//! binary-only concerns (banner, NAT mapper, serve loop).
 //!
 //! Provenance: `.docs/guides/self-hosting-a-website-on-scp.md`; specs §10.12.8
 //! (Infrastructure & Self-Hosting) + §18 (Addressability & Deployment).
@@ -123,9 +123,18 @@ async fn build_self_host_node() -> BuiltNode {
     let sign_fn = TestDidDht::make_sign_fn(Arc::clone(&custody));
     let did_method = Arc::new(DidDht::with_client_and_signer(dht_client, cache, sign_fn));
 
+    // Persistent, disk-backed blob storage — the SAME wiring the production
+    // `--self-host` path uses (`run_self_host_with` calls `.blob_storage(...)`
+    // with a SQLite backend under the storage dir). The relay and projection
+    // share this `Arc`, so publish -> commit_deploy closes the loop on disk.
+    let blob_storage =
+        scp_transport::native::storage::BlobStorageBackend::sqlite(&storage_dir.join("blobs"))
+            .expect("sqlite blob storage should open");
+
     // `.build()` requires `S: EncryptedStorage`, satisfied by `SqliteStorage`.
     let node = ApplicationNodeBuilder::new()
         .storage(node_storage)
+        .blob_storage(blob_storage)
         .no_domain()
         .nat_strategy(Arc::new(FixedTierNatStrategy))
         .generate_identity_with(custody.clone(), did_method)
@@ -274,5 +283,261 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
     assert!(
         body_str.contains(&format!("content=\"{node_did}\"")),
         "served index should carry the injected scp-did <meta> tag"
+    );
+}
+
+/// Builds a [`scp_node::SelfHostDeployer`] over `built`, mirroring the
+/// production `build_self_host_deployer`: a single MLS `SQLite` database under
+/// `storage_dir/mls` and one reusable broadcast group.
+async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHostDeployer {
+    let node_did = built.node.identity().did().to_owned();
+    let mls_inner = Arc::new(
+        SqliteStorage::new(&built.storage_dir.join("mls"), built.storage_key.as_ref())
+            .expect("MLS SQLite should open"),
+    );
+    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+        Arc::new(
+            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
+        );
+    let signing_key_handle = built.node.identity().identity().active_signing_key;
+    scp_node::SelfHostDeployer::start(
+        &built.node,
+        node_did,
+        context_id.to_owned(),
+        "selfhost.scp.local".to_owned(),
+        signing_key_handle,
+        mls_storage,
+    )
+    .await
+    .expect("deployer setup should succeed")
+}
+
+/// Publishes + commits the embedded site through `deployer` under `deploy_id`,
+/// asserting the committed count matches the asset count. Mirrors a single
+/// production deploy iteration.
+async fn deploy_through(
+    deployer: &scp_node::SelfHostDeployer,
+    built: &BuiltNode,
+    deploy_id: &str,
+) -> usize {
+    let node_did = built.node.identity().did().to_owned();
+    let assets = scp_node::embedded_assets(Some(&node_did));
+    let expected = assets.len();
+    let committed = deployer
+        .deploy(&built.node, deploy_id, built.custody.as_ref(), &assets)
+        .await
+        .expect("self-host deploy should succeed end to end");
+    assert_eq!(
+        committed, expected,
+        "commit_deploy must report exactly the number of published assets"
+    );
+    committed
+}
+
+/// Fetches `path` from the node's broadcast projection router, returning the
+/// HTTP status code.
+async fn projection_status(node: &scp_node::ApplicationNode<SqliteStorage>, path: &str) -> u16 {
+    let router = node.broadcast_projection_router();
+    let req = Request::builder()
+        .uri(path)
+        .body(Body::empty())
+        .expect("request should build");
+    router
+        .oneshot(req)
+        .await
+        .expect("router should respond")
+        .status()
+        .as_u16()
+}
+
+/// FIX 1 (security): the self-host PUBLIC surface must expose ONLY the
+/// read-only website projection — never the relay upgrade (`/scp/v1`) nor the
+/// bridge routes (`/v1/scp/bridge/*`).
+///
+/// Builds the restricted self-host router via `serve_background_with_surface`
+/// against a real bound listener, then asserts over the wire that the site
+/// route serves while `/scp/v1` and `/v1/scp/bridge/shadow` are NOT routed
+/// (they fall through to the virtual-host fallback -> 404).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_host_public_surface_excludes_relay_and_bridge() {
+    let built = build_self_host_node().await;
+    let node_did = built.node.identity().did().to_owned();
+    let context_id = self_host_context_id(&node_did);
+
+    // Deploy so the site route has content to serve.
+    let deployer = build_deployer(&built, &context_id).await;
+    deploy_through(&deployer, &built, "selfhost-surface-deploy").await;
+    let routing_hex = scp_node::routing_id_hex(&context_id);
+
+    // Open the RESTRICTED self-host surface on a real loopback listener.
+    let addr = built
+        .node
+        .serve_background_with_surface(
+            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            scp_node::PublicSurface::SelfHost,
+        )
+        .await
+        .expect("self-host background listener should bind");
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // -- The website projection route IS reachable (200). --
+    let site = client
+        .get(format!(
+            "{base}/scp/broadcast/{routing_hex}/site/index.html"
+        ))
+        .send()
+        .await
+        .expect("site request should complete");
+    assert_eq!(
+        site.status().as_u16(),
+        200,
+        "self-host public surface must serve the website projection"
+    );
+
+    // -- The relay upgrade `/scp/v1` is NOT routed on the public surface. --
+    // A plain GET (no WebSocket upgrade) to a mounted relay route would return
+    // 426/400/101-class handling; when the route is absent it falls through to
+    // the virtual-host fallback, which 404s for an unregistered host/path.
+    let relay = client
+        .get(format!("{base}/scp/v1"))
+        .send()
+        .await
+        .expect("relay probe should complete");
+    assert_eq!(
+        relay.status().as_u16(),
+        404,
+        "relay upgrade `/scp/v1` must NOT be reachable on the self-host public surface, \
+         got {}",
+        relay.status()
+    );
+
+    // -- The bridge routes `/v1/scp/bridge/*` are NOT routed publicly. --
+    let bridge = client
+        .post(format!("{base}/v1/scp/bridge/shadow"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("bridge probe should complete");
+    assert_eq!(
+        bridge.status().as_u16(),
+        404,
+        "bridge route `/v1/scp/bridge/shadow` must NOT be reachable on the self-host \
+         public surface, got {}",
+        bridge.status()
+    );
+
+    built.node.shutdown();
+
+    // -- Contrast: on the FULL surface, `/scp/v1` IS routed. A plain GET (no
+    //    WebSocket upgrade headers) hits the relay upgrade handler's
+    //    `WebSocketUpgrade` extractor, which rejects with a non-404 status
+    //    (426/400-class) — proving the 404 above is route ABSENCE on the
+    //    self-host surface, not a generic rejection that would occur anyway.
+    //    A fresh node is used because the prior one has been shut down and
+    //    `serve_background` is single-shot.
+    let full = build_self_host_node().await;
+    let full_addr = full
+        .node
+        .serve_background_with_surface(
+            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            scp_node::PublicSurface::Full,
+        )
+        .await
+        .expect("full background listener should bind");
+    let full_relay = client
+        .get(format!("http://{full_addr}/scp/v1"))
+        .send()
+        .await
+        .expect("full relay probe should complete");
+    assert_ne!(
+        full_relay.status().as_u16(),
+        404,
+        "on the FULL surface `/scp/v1` must be routed (the WebSocket extractor \
+         rejects a plain GET with a non-404 status), proving the self-host 404 is \
+         route absence; got {}",
+        full_relay.status()
+    );
+    full.node.shutdown();
+}
+
+/// FIX 3 + FIX 4 (correctness): re-deploying the site (as the refresh loop
+/// does) against the SAME persistent node — each with a freshly-minted unique
+/// deploy id — must succeed and keep the site served, never tripping the
+/// `commit_deploy` count-mismatch that a constant deploy id over persistent,
+/// within-TTL blobs would cause.
+///
+/// This also exercises FIX 2 indirectly: the node is built with a persistent
+/// `SQLite` blob store (see `build_self_host_node`), so the second deploy
+/// commits against on-disk blobs from the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_host_redeploy_with_unique_deploy_ids_keeps_site_served() {
+    let built = build_self_host_node().await;
+    let node_did = built.node.identity().did().to_owned();
+    let context_id = self_host_context_id(&node_did);
+    let routing_hex = scp_node::routing_id_hex(&context_id);
+    let site_path = format!("/scp/broadcast/{routing_hex}/site/index.html");
+
+    // One deployer reused across both deploys — exactly as the production
+    // refresh loop reuses a single `SelfHostDeployer`.
+    let deployer = build_deployer(&built, &context_id).await;
+
+    // -- First deploy (initial). --
+    deploy_through(&deployer, &built, "selfhost-redeploy-run-1").await;
+    assert_eq!(
+        projection_status(&built.node, &site_path).await,
+        200,
+        "site must be served after the first deploy"
+    );
+
+    // -- Second deploy (refresh) with a DISTINCT deploy id, against the same
+    //    node and the same on-disk blob store still holding run-1's blobs. With
+    //    a constant deploy id this would count run-1's stale blobs and fail with
+    //    CommitCountMismatch; with a unique id per run it commits cleanly.
+    deploy_through(&deployer, &built, "selfhost-redeploy-run-2").await;
+
+    // After the refresh, the site must not only return 200 but serve the
+    // correct, fully-decrypted body — proving the reused single-group key still
+    // decrypts the freshly-published blobs (no epoch/key divergence across
+    // deploys).
+    let router = built.node.broadcast_projection_router();
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri(&site_path)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "site must remain served after a refresh deploy with a fresh deploy id"
+    );
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("body should collect")
+        .to_bytes();
+    let expected_index = scp_node::embedded_assets(Some(&node_did))
+        .into_iter()
+        .find(|a| a.path == "/index.html")
+        .expect("embedded site must include /index.html")
+        .body;
+    assert_eq!(
+        &body[..],
+        &expected_index[..],
+        "served body after refresh must byte-match the embedded index.html"
+    );
+
+    // -- The routing id (and thus the site URL) is stable across refreshes. --
+    assert_eq!(
+        scp_node::routing_id_hex(&context_id),
+        routing_hex,
+        "the site routing id must be stable across refresh deploys"
     );
 }

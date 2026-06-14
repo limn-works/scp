@@ -254,51 +254,147 @@ where
         assets,
     } = params;
 
-    let author_did: scp_identity::DID = scp_identity::DID::from(node_did.clone());
-
-    // Build the in-process supervisor on the node's OWN loopback relay and
-    // register the local DID + the broadcast context.
-    let supervisor = connect_loopback_supervisor(node, &node_did, &author_did, mls_storage).await?;
-    node.register_broadcast_context(context_id.clone(), Some("SCP Self-Host Site".to_owned()))
-        .await
-        .map_err(|e| SelfHostError::RegisterContext(e.to_string()))?;
-    let context_params = scp_core::context::ContextParams {
-        mode: scp_core::context::params::ContextMode::Broadcast,
-        // Broadcast contexts only support `MemoryScope::Full`; the default scope
-        // is `Ephemeral`, which `create_context` rejects for broadcast mode.
-        memory_scope: scp_core::context::params::MemoryScope::Full,
-        ..Default::default()
-    };
-    supervisor
-        .create_context(context_id.clone(), context_params, author_did.clone(), None)
-        .await
-        .map_err(|e| SelfHostError::CreateContext(e.to_string()))?;
-
-    // Publish every asset, then enable projection + commit the deploy.
-    publish_assets(
-        &supervisor,
-        &context_id,
-        &author_did,
-        &deploy_id,
+    let deployer = SelfHostDeployer::start(
+        node,
+        node_did,
+        context_id,
+        hostname,
         signing_key_handle,
-        custody,
-        assets,
+        mls_storage,
     )
     .await?;
-    enable_projection(&supervisor, node, &context_id, &node_did, hostname).await?;
 
-    let committed = node
-        .commit_deploy(&context_id, &deploy_id)
-        .await
-        .map_err(|e| SelfHostError::CommitDeploy(e.to_string()))?;
-    if committed != assets.len() {
-        return Err(SelfHostError::CommitCountMismatch {
-            committed,
-            expected: assets.len(),
-        });
+    deployer.deploy(node, &deploy_id, custody, assets).await
+}
+
+/// A long-lived self-host site deployer bound to ONE in-process supervisor and
+/// its single broadcast group.
+///
+/// The setup work — building the loopback supervisor, registering the DID and
+/// broadcast context, creating the MLS broadcast group, and enabling
+/// projection with the group's broadcast key — happens exactly once in
+/// [`start`](Self::start). Each call to [`deploy`](Self::deploy) then publishes
+/// the supplied assets under a fresh `deploy_id` and commits, reusing the SAME
+/// supervisor, group, and broadcast key/epoch.
+///
+/// Reusing one group across deploys is what makes the self-host refresh loop
+/// correct: every published blob (current and prior deploys alike) is sealed
+/// under the same epoch key, so a prior deploy's blobs stay decryptable right
+/// up to the moment a new deploy's manifest is committed — there is no window
+/// where the projected manifest points at blobs the projection can no longer
+/// decrypt. (Building a fresh group per deploy would mint a new key at the same
+/// initial epoch number, silently overwriting the prior key in the projection
+/// registry and breaking decryption of the still-referenced prior blobs until
+/// the commit completes.)
+pub struct SelfHostDeployer {
+    supervisor: Arc<scp_core::context::supervisor::Supervisor>,
+    author_did: scp_identity::DID,
+    context_id: String,
+    signing_key_handle: scp_platform::KeyHandle,
+}
+
+impl SelfHostDeployer {
+    /// Performs the one-time setup: connects the loopback supervisor, registers
+    /// the broadcast context on the node, creates the MLS broadcast group, and
+    /// enables broadcast site projection under the group's broadcast key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SelfHostError`] if relay connect, DID/context registration,
+    /// context creation, key resolution, or projection enable fails.
+    pub async fn start<S>(
+        node: &ApplicationNode<S>,
+        node_did: String,
+        context_id: String,
+        hostname: String,
+        signing_key_handle: scp_platform::KeyHandle,
+        mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    ) -> Result<Self, SelfHostError>
+    where
+        S: Storage + 'static,
+    {
+        let author_did: scp_identity::DID = scp_identity::DID::from(node_did.clone());
+
+        // Build the in-process supervisor on the node's OWN loopback relay and
+        // register the local DID + the broadcast context.
+        let supervisor =
+            connect_loopback_supervisor(node, &node_did, &author_did, mls_storage).await?;
+        node.register_broadcast_context(context_id.clone(), Some("SCP Self-Host Site".to_owned()))
+            .await
+            .map_err(|e| SelfHostError::RegisterContext(e.to_string()))?;
+        let context_params = scp_core::context::ContextParams {
+            mode: scp_core::context::params::ContextMode::Broadcast,
+            // Broadcast contexts only support `MemoryScope::Full`; the default
+            // scope is `Ephemeral`, which `create_context` rejects for
+            // broadcast mode.
+            memory_scope: scp_core::context::params::MemoryScope::Full,
+            ..Default::default()
+        };
+        supervisor
+            .create_context(context_id.clone(), context_params, author_did.clone(), None)
+            .await
+            .map_err(|e| SelfHostError::CreateContext(e.to_string()))?;
+
+        // Enable projection ONCE with the group's broadcast key/epoch. Because
+        // the group (and thus the key/epoch) is stable for this deployer's
+        // lifetime, every later `deploy` publishes under the same key and the
+        // registry needs no further key updates.
+        enable_projection(&supervisor, node, &context_id, &node_did, hostname).await?;
+
+        Ok(Self {
+            supervisor,
+            author_did,
+            context_id,
+            signing_key_handle,
+        })
     }
 
-    Ok(committed)
+    /// Publishes `assets` under `deploy_id` through the reused supervisor/group
+    /// and commits the deploy, returning the number of assets committed.
+    ///
+    /// Each call should use a fresh, unique `deploy_id` so `commit_deploy`
+    /// counts only this deploy's blobs (prior deploys' blobs, still inside
+    /// their TTL, carry earlier deploy ids and are ignored).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SelfHostError`] if any asset publish fails, the commit
+    /// fails, or the committed count does not match `assets.len()`.
+    pub async fn deploy<S, C>(
+        &self,
+        node: &ApplicationNode<S>,
+        deploy_id: &str,
+        custody: &C,
+        assets: &[Asset],
+    ) -> Result<usize, SelfHostError>
+    where
+        S: Storage + 'static,
+        C: KeyCustody,
+    {
+        publish_assets(
+            &self.supervisor,
+            &self.context_id,
+            &self.author_did,
+            deploy_id,
+            self.signing_key_handle,
+            custody,
+            assets,
+        )
+        .await?;
+
+        let committed = node
+            .commit_deploy(&self.context_id, deploy_id)
+            .await
+            .map_err(|e| SelfHostError::CommitDeploy(e.to_string()))?;
+        if committed != assets.len() {
+            return Err(SelfHostError::CommitCountMismatch {
+                committed,
+                expected: assets.len(),
+            });
+        }
+
+        Ok(committed)
+    }
 }
 
 /// Builds an in-process [`Supervisor`](scp_core::context::supervisor::Supervisor)

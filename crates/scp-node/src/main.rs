@@ -675,8 +675,16 @@ fn self_host_context_id(node_did: &str) -> String {
     hex::encode(digest)
 }
 
-/// The fixed deploy id used by the self-host binary.
-const SELF_HOST_DEPLOY_ID: &str = "selfhost-deploy-1";
+/// Default interval, in seconds, between self-host site re-deploys.
+///
+/// Site assets are published with a fixed 3600s blob TTL (`DEFAULT_BLOB_TTL`
+/// in the transport envelope builder), after which the relay's blob store
+/// treats them as expired and the projection 404s. Re-deploying on an interval
+/// well under that TTL keeps the site continuously reachable. 1800s (half the
+/// TTL) leaves ample margin for a slow or transiently-failing refresh to retry
+/// before the previous deploy's blobs expire. Configurable via
+/// `SCP_NODE_SELF_HOST_REFRESH_SECS`.
+const SELF_HOST_DEPLOY_REFRESH_SECS: u64 = 1800;
 
 /// RFC-1123 hostname placeholder for the self-host site projection.
 ///
@@ -890,20 +898,34 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
     .await;
 }
 
-/// Builds the no-domain node, deploys the site via [`scp_node::deploy_site`],
-/// prints the live URL, and serves until shutdown (releasing the NAT mapping
-/// on the way out). Parameterized over the DID method so both the production
-/// and memory DHT paths share this body.
-#[allow(clippy::too_many_arguments)] // mirrors run_node_with; composing concrete deps in one call
-async fn run_self_host_with<D: scp_identity::DidMethod + 'static>(
+/// Builds the no-domain self-host [`ApplicationNode`] over persistent,
+/// disk-backed storage, returning it behind an `Arc` alongside the retained NAT
+/// port-mapper handles (`UPnP` + NAT-PMP) for clean teardown.
+///
+/// The blob storage is a `SQLite` backend under the node's storage dir: it IS the
+/// site's system of record (`commit_deploy` scans it; the projection/site
+/// handler reads from it), so it must persist across restarts and is the SAME
+/// `Arc` the relay and projection share. The in-memory default backend is
+/// dev-only and is lost on restart, so it is unsuitable here.
+///
+/// The mapper handles are only ever `Some` when built with the `upnp` feature;
+/// otherwise they are `None` (Tier 2 STUN discovery only, no router mapping).
+/// Exits the process on storage or build failure — there is nothing to serve
+/// without a node. `build()` establishes the inbound port mapping during its
+/// NAT tier selection and can still fail afterward (e.g. DID publish), so on
+/// build failure the mappings are released best-effort before exiting.
+///
+/// [`ApplicationNode`]: scp_node::ApplicationNode
+async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
     http_addr: SocketAddr,
-    port: u16,
     storage_dir: &std::path::Path,
     storage_key: &Zeroizing<[u8; 32]>,
     custody: Arc<SqliteKeyCustody>,
-    seq_init: SeqInitFn,
     did_method: Arc<D>,
-    site_dir: Option<&PathBuf>,
+) -> (
+    Arc<scp_node::ApplicationNode<SqliteStorage>>,
+    OptionalPortMapper,
+    OptionalPortMapper,
 ) {
     let projection_rate: u32 = startup::env_or(
         "SCP_NODE_PROJECTION_RATE_LIMIT",
@@ -911,9 +933,20 @@ async fn run_self_host_with<D: scp_identity::DidMethod + 'static>(
     );
     let builder_storage = open_sqlite_or_exit(storage_dir, storage_key);
 
+    let blob_db = storage_dir.join("blobs");
+    let blob_storage = match scp_transport::native::storage::BlobStorageBackend::sqlite(&blob_db) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                path = %blob_db.display(),
+                "failed to open persistent SQLite blob storage for self-host"
+            );
+            std::process::exit(1);
+        }
+    };
+
     // -- NAT strategy with RETAINED mapper handles for clean teardown --
-    // Only meaningful with the `upnp` feature; without it no router mapping
-    // happens (Tier 2 STUN discovery only) — the gap documented in the guide.
     #[cfg(feature = "upnp")]
     let (nat_strategy, upnp_mapper, natpmp_mapper): (
         Option<Arc<dyn scp_node::NatStrategy>>,
@@ -933,112 +966,308 @@ async fn run_self_host_with<D: scp_identity::DidMethod + 'static>(
             Some(natpmp),
         )
     };
-    // Without the upnp feature there are no mappers to retain or release.
     #[cfg(not(feature = "upnp"))]
     let (upnp_mapper, natpmp_mapper): (OptionalPortMapper, OptionalPortMapper) = (None, None);
 
-    // -- Build the no-domain node --
     let builder = ApplicationNodeBuilder::new()
         .storage(builder_storage)
-        .generate_identity_with(custody.clone(), did_method)
+        .blob_storage(blob_storage)
+        .generate_identity_with(custody, did_method)
         .no_domain()
         .http_bind_addr(http_addr)
         .projection_rate_limit(projection_rate);
-    // Apply the NAT strategy only when built with the `upnp` feature.
     #[cfg(feature = "upnp")]
     let builder = match nat_strategy {
         Some(strategy) => builder.nat_strategy(strategy),
         None => builder,
     };
 
-    let node = match builder.build().await {
-        Ok(n) => n,
+    match builder.build().await {
+        Ok(n) => (Arc::new(n), upnp_mapper, natpmp_mapper),
         Err(e) => {
             tracing::error!(error = %e, "self-host application node failed to build");
+            // `build()` establishes the inbound port mapping during its NAT
+            // tier selection and CAN still fail afterward (e.g. DID publish),
+            // so release the mappings best-effort before exiting to avoid
+            // leaving the public port mapped at the router.
+            release_self_host_mappings(upnp_mapper, natpmp_mapper, http_addr.port()).await;
             std::process::exit(1);
         }
-    };
+    }
+}
+
+/// Builds the no-domain node, deploys the site via [`scp_node::deploy_site`],
+/// prints the live URL, and serves until shutdown (releasing the NAT mapping
+/// on the way out). Parameterized over the DID method so both the production
+/// and memory DHT paths share this body.
+///
+/// The site is deployed once before the public listener opens, then refreshed
+/// on a fixed interval (well under the blob TTL) so the projected content never
+/// expires while the node runs (see [`spawn_site_refresh_loop`]). The public
+/// listener exposes only the restricted self-host surface (read-only website
+/// projection; no relay upgrade, no bridge routes — §10.12.8). The retained NAT
+/// port mappings are released on EVERY exit path, graceful or error, via
+/// [`release_self_host_mappings`].
+#[allow(clippy::too_many_arguments)] // mirrors run_node_with; composing concrete deps in one call
+async fn run_self_host_with<D: scp_identity::DidMethod + 'static>(
+    http_addr: SocketAddr,
+    port: u16,
+    storage_dir: &std::path::Path,
+    storage_key: &Zeroizing<[u8; 32]>,
+    custody: Arc<SqliteKeyCustody>,
+    seq_init: SeqInitFn,
+    did_method: Arc<D>,
+    site_dir: Option<&PathBuf>,
+) {
+    // -- Build the no-domain node with persistent blob storage + retained NAT
+    //    mapper handles for clean teardown on every exit path. --
+    let (node, upnp_mapper, natpmp_mapper) = build_self_host_node(
+        http_addr,
+        storage_dir,
+        storage_key,
+        custody.clone(),
+        did_method,
+    )
+    .await;
 
     let node_did = node.identity().did().to_owned();
     if let Err(e) = seq_init(node_did.clone()).await {
         tracing::error!(error = %e, "failed to initialize BEP44 sequence — publishing may fail");
     }
 
-    // -- Deploy the site through the shared core and announce its live URL --
-    deploy_and_announce_self_host_site(&node, storage_dir, storage_key, &custody, site_dir, port)
-        .await;
-
-    // -- Serve until shutdown, releasing the NAT mapping on the way out --
-    let metrics_router = install_metrics_recorder();
-    let shutdown = self_host_shutdown(upnp_mapper, natpmp_mapper, port);
-    if let Err(e) = node.serve(metrics_router, shutdown).await {
-        tracing::error!(error = %e, "self-host node exited with error");
-        std::process::exit(1);
-    }
-    tracing::info!("scp-node (self-host) stopped");
-}
-
-/// Builds the supervisor's MLS storage, loads the site assets, deploys them
-/// through the shared [`scp_node::deploy_site`] core, and announces the live
-/// URL.
-///
-/// Extracted from [`run_self_host_with`] to keep that function focused on
-/// node/NAT setup and the serve loop. Exits the process (matching the rest of
-/// the self-host startup path) if MLS storage, asset loading, or the deploy
-/// fails — there is nothing to serve without a committed deploy.
-async fn deploy_and_announce_self_host_site<S>(
-    node: &scp_node::ApplicationNode<S>,
-    storage_dir: &std::path::Path,
-    storage_key: &Zeroizing<[u8; 32]>,
-    custody: &Arc<SqliteKeyCustody>,
-    site_dir: Option<&PathBuf>,
-    port: u16,
-) where
-    S: scp_platform::EncryptedStorage + 'static,
-{
-    let node_did = node.identity().did().to_owned();
-
-    // -- Build the supervisor's MLS storage over a SECOND sqlite handle --
-    let mls_inner = Arc::new(open_sqlite_or_exit(&storage_dir.join("mls"), storage_key));
-    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-        Arc::new(
-            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
-        );
-
-    // -- Load assets + deploy the site through the shared core --
     let context_id = self_host_context_id(&node_did);
+
+    // -- Load the site assets once. The same asset set is (re)published on every
+    //    deploy; the embedded default injects the node DID into index.html. --
     let assets = match load_self_host_assets(site_dir, &node_did) {
-        Ok(a) => a,
+        Ok(a) => Arc::new(a),
         Err(e) => {
             tracing::error!(error = %e, "failed to load self-host site assets");
+            release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
             std::process::exit(1);
         }
     };
     let asset_count = assets.len();
 
-    let signing_key_handle = node.identity().identity().active_signing_key;
-    let deploy_params = scp_node::DeploySiteParams {
-        node_did: node_did.clone(),
-        context_id: context_id.clone(),
-        deploy_id: SELF_HOST_DEPLOY_ID.to_owned(),
-        hostname: SELF_HOST_HOSTNAME.to_owned(),
-        signing_key_handle,
-        custody: custody.as_ref(),
-        mls_storage,
-        assets: &assets,
-    };
-    match scp_node::deploy_site(node, deploy_params).await {
-        Ok(committed) => {
-            tracing::info!(committed, "self-host site deployed");
-        }
+    // -- Build the deployer ONCE: one supervisor, one broadcast group, one
+    //    broadcast key. Reused for the initial deploy and every refresh so all
+    //    blobs are sealed under the same epoch key (see `SelfHostDeployer`). --
+    let deployer = match build_self_host_deployer(
+        node.as_ref(),
+        storage_dir,
+        storage_key,
+        &node_did,
+        &context_id,
+    )
+    .await
+    {
+        Ok(d) => Arc::new(d),
         Err(e) => {
-            tracing::error!(error = %e, "failed to deploy self-host site");
+            tracing::error!(error = %e, "failed to set up self-host deployer");
+            release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
             std::process::exit(1);
         }
+    };
+
+    // -- Initial deploy, BEFORE the public port opens, so the site is live the
+    //    moment the listener accepts connections. --
+    if let Err(e) = deployer
+        .deploy(node.as_ref(), &mint_deploy_id(), custody.as_ref(), &assets)
+        .await
+    {
+        tracing::error!(error = %e, "failed to deploy self-host site");
+        release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
+        std::process::exit(1);
+    }
+    tracing::info!(committed = asset_count, "self-host site deployed");
+
+    print_self_host_live_url(&context_id, port, &node_did, asset_count);
+
+    // -- Open the RESTRICTED public surface in the background --
+    // Only the read-only website projection (+ `.well-known/scp` + virtual-host
+    // fallback) is exposed on the public bind. The relay upgrade (`/scp/v1`)
+    // and bridge routes (`/v1/scp/bridge/*`) are NOT mounted publicly — the
+    // in-process supervisor reaches the node's relay over loopback `127.0.0.1`
+    // instead (§10.12.8).
+    if let Err(e) = node
+        .serve_background_with_surface(Some(http_addr), scp_node::PublicSurface::SelfHost)
+        .await
+    {
+        tracing::error!(error = %e, "self-host public listener failed to start");
+        release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
+        std::process::exit(1);
     }
 
-    // -- Print the live URL --
-    print_self_host_live_url(&context_id, port, &node_did, asset_count);
+    // -- Keep the site alive past the blob TTL via a periodic re-deploy --
+    let refresh = spawn_site_refresh_loop(
+        Arc::clone(&deployer),
+        Arc::clone(&node),
+        Arc::clone(&custody),
+        Arc::clone(&assets),
+        node.shutdown_token(),
+    );
+
+    // -- Serve until the process receives a shutdown signal --
+    startup::shutdown_signal().await;
+    tracing::warn!("shutdown signal received — stopping self-host site refresh and listener");
+
+    // Stop the refresh loop and the background listener, then release the NAT
+    // mappings. `shutdown()` cancels the node's token, which both the refresh
+    // loop and the background HTTP server observe.
+    node.shutdown();
+    refresh.abort();
+    release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
+
+    tracing::info!("scp-node (self-host) stopped");
+}
+
+/// Builds the supervisor's MLS storage and performs the one-time
+/// [`SelfHostDeployer`] setup (loopback supervisor, broadcast group, projection
+/// enable).
+///
+/// The MLS storage is a single `SQLite` database under `storage_dir/mls` for the
+/// deployer's whole lifetime — the broadcast group is created once and reused
+/// across every deploy, so there is no per-deploy MLS state to isolate or prune.
+///
+/// [`SelfHostDeployer`]: scp_node::SelfHostDeployer
+async fn build_self_host_deployer<S>(
+    node: &scp_node::ApplicationNode<S>,
+    storage_dir: &std::path::Path,
+    storage_key: &Zeroizing<[u8; 32]>,
+    node_did: &str,
+    context_id: &str,
+) -> Result<scp_node::SelfHostDeployer, String>
+where
+    S: scp_platform::EncryptedStorage + 'static,
+{
+    let mls_inner = Arc::new(
+        scp_platform::sqlite::SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
+            .map_err(|e| format!("failed to open MLS SQLite storage: {e}"))?,
+    );
+    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+        Arc::new(
+            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
+        );
+
+    let signing_key_handle = node.identity().identity().active_signing_key;
+    scp_node::SelfHostDeployer::start(
+        node,
+        node_did.to_owned(),
+        context_id.to_owned(),
+        SELF_HOST_HOSTNAME.to_owned(),
+        signing_key_handle,
+        mls_storage,
+    )
+    .await
+    .map_err(|e| format!("deployer setup failed: {e}"))
+}
+
+/// Mints a unique deploy id for a single self-host deploy run.
+///
+/// With persistent blob storage and content within its TTL, `commit_deploy`
+/// scans EVERY blob for the site routing id and counts those whose decrypted
+/// `deploy_id` matches the requested one. A constant deploy id would therefore
+/// count stale blobs from a previous run (e.g. a since-removed `/old.html`)
+/// still inside their TTL, producing a `CommitCountMismatch`. Minting a fresh
+/// id per run guarantees `commit_deploy` only ever sees the current run's
+/// blobs.
+///
+/// The id combines a process-start-relative nanosecond timestamp with OS
+/// randomness so it is unique across runs even on coarse-grained clocks and
+/// stable for the lifetime of a single deploy.
+fn mint_deploy_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let mut rand_bytes = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rand_bytes);
+    format!("selfhost-{nanos:032x}-{}", hex::encode(rand_bytes))
+}
+
+/// Spawns the periodic site refresh loop.
+///
+/// Site assets are published with a fixed blob TTL (`DEFAULT_BLOB_TTL` =
+/// 3600s); after that the relay's blob store treats them as expired and the
+/// projection 404s. The broadcast publish path exposes no per-publish TTL
+/// override (the TTL is fixed deep in the transport envelope builder, shared by
+/// every publish path), so the correct, self-contained fix is to re-publish the
+/// site on an interval well under the TTL. Each refresh reuses the deployer's
+/// supervisor/group/key, mints a fresh `deploy_id`, and re-points the deploy
+/// manifest at fresh, full-TTL blobs.
+///
+/// The interval is configurable via `SCP_NODE_SELF_HOST_REFRESH_SECS` and
+/// defaults to [`SELF_HOST_DEPLOY_REFRESH_SECS`]. The loop runs until the
+/// node's shutdown token is cancelled. Returns the task handle so the caller
+/// can abort it on shutdown.
+fn spawn_site_refresh_loop(
+    deployer: Arc<scp_node::SelfHostDeployer>,
+    node: Arc<scp_node::ApplicationNode<scp_platform::sqlite::SqliteStorage>>,
+    custody: Arc<SqliteKeyCustody>,
+    assets: Arc<Vec<scp_node::Asset>>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let refresh_secs: u64 = startup::env_or(
+        "SCP_NODE_SELF_HOST_REFRESH_SECS",
+        SELF_HOST_DEPLOY_REFRESH_SECS,
+    )
+    .max(1);
+    let period = std::time::Duration::from_secs(refresh_secs);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        // Skip the immediate first tick; the caller already performed the
+        // initial deploy before opening the public port.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                () = shutdown_token.cancelled() => {
+                    tracing::debug!("self-host refresh loop observed shutdown");
+                    break;
+                }
+                _ = interval.tick() => {
+                    match deployer
+                        .deploy(node.as_ref(), &mint_deploy_id(), custody.as_ref(), &assets)
+                        .await
+                    {
+                        Ok(committed) => tracing::info!(
+                            committed,
+                            "self-host site refreshed (TTL renewal)"
+                        ),
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "self-host site refresh failed; will retry next interval"
+                        ),
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Best-effort release of the retained NAT port mappings on BOTH mappers.
+///
+/// Called on every exit path that occurs after the node (and thus its port
+/// mapping) is built — graceful shutdown and every error exit alike — so the
+/// public port is never left mapped at the router. The mapper handles are only
+/// ever `Some` when built with the `upnp` feature; otherwise this is a no-op.
+async fn release_self_host_mappings(
+    upnp: OptionalPortMapper,
+    natpmp: OptionalPortMapper,
+    port: u16,
+) {
+    for (label, mapper) in [("upnp", upnp), ("natpmp", natpmp)] {
+        if let Some(mapper) = mapper {
+            match mapper.remove(port).await {
+                Ok(()) => tracing::info!(mapper = label, port, "released NAT port mapping"),
+                Err(e) => tracing::warn!(
+                    mapper = label,
+                    port,
+                    error = %e,
+                    "failed to release NAT port mapping; it will persist until lease expiry"
+                ),
+            }
+        }
+    }
 }
 
 /// Logs and prints the live site URL after a successful deploy.
@@ -1061,32 +1290,6 @@ fn print_self_host_live_url(context_id: &str, port: u16, node_did: &str, asset_c
          (substitute your public IP for 0.0.0.0; SCP-aware clients can resolve it via did:dht.\n  \
          The node DID is: {node_did})\n"
     );
-}
-
-/// Shutdown future for self-host mode.
-///
-/// Awaits the process shutdown signal, then best-effort releases the NAT port
-/// mapping on both retained mappers (`UPnP` + NAT-PMP). The mapper handles are
-/// only ever `Some` when the `upnp` feature is built; under the default build
-/// they are `None` and no release is attempted.
-///
-/// Owns the `Arc`s and the port, so the returned future is `Send + 'static`.
-async fn self_host_shutdown(upnp: OptionalPortMapper, natpmp: OptionalPortMapper, port: u16) {
-    startup::shutdown_signal().await;
-    tracing::warn!("shutdown signal received — releasing NAT port mapping and stopping self-host");
-    for (label, mapper) in [("upnp", upnp), ("natpmp", natpmp)] {
-        if let Some(mapper) = mapper {
-            match mapper.remove(port).await {
-                Ok(()) => tracing::info!(mapper = label, port, "released NAT port mapping"),
-                Err(e) => tracing::warn!(
-                    mapper = label,
-                    port,
-                    error = %e,
-                    "failed to release NAT port mapping; it will persist until lease expiry"
-                ),
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,6 +1514,12 @@ async fn main() {
                 "SCP_RELAY_BIND_ADDR",
                 SocketAddr::from(([127, 0, 0, 1], 9000)),
             )
+        } else if config.self_host {
+            // Self-host binds the site listener on SCP_NODE_SELF_HOST_PORT
+            // (default 8443), NOT SCP_NODE_BIND_ADDR. Probe that port on
+            // loopback so `--health` matches the port `--self-host` opens.
+            let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
+            SocketAddr::from(([127, 0, 0, 1], port))
         } else {
             startup::env_or(
                 "SCP_NODE_BIND_ADDR",
