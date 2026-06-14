@@ -510,12 +510,21 @@ fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> Sqli
 
 /// Initializes storage path, encryption key, and `SQLite` databases for the
 /// persistent node. Returns `(storage_dir, storage_key, node_storage, custody)`.
+///
+/// The root `node_storage` is returned behind an `Arc` because it holds the
+/// process-exclusive advisory lock on `{dir}/scp.db.lock` for its lifetime, and
+/// that single handle is shared by every root-DB consumer (the BEP44 sequence
+/// store AND the `ApplicationNode` builder). Opening a second `SqliteStorage`
+/// against the same root directory while this one is alive fails with an
+/// advisory-lock conflict (os error 35) — see `SqliteStorage::new`. Sharing the
+/// one handle via `Arc::clone` (which implements [`Storage`]/[`EncryptedStorage`]
+/// through the blanket `Arc<T>` impls) keeps exactly one lock holder.
 async fn init_persistent_storage(
     storage_path: Option<&PathBuf>,
 ) -> (
     PathBuf,
     Zeroizing<[u8; 32]>,
-    SqliteStorage,
+    Arc<SqliteStorage>,
     Arc<SqliteKeyCustody>,
 ) {
     let storage_dir = resolve_storage_path(storage_path);
@@ -528,7 +537,7 @@ async fn init_persistent_storage(
         }
     };
 
-    let node_storage = open_sqlite_or_exit(&storage_dir, &storage_key);
+    let node_storage = Arc::new(open_sqlite_or_exit(&storage_dir, &storage_key));
     let custody_storage = open_sqlite_or_exit(&storage_dir.join("custody"), &storage_key);
 
     let custody = match SqliteKeyCustody::new(custody_storage).await {
@@ -593,7 +602,12 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     let resolved_path = resolve_storage_path(storage_path);
     validate_storage_path(&resolved_path);
 
-    let (storage_dir, storage_key, node_storage, custody) =
+    // The root storage key is intentionally unused beyond `init_persistent_storage`:
+    // the single root `SqliteStorage` handle it opens (held alive via
+    // `node_storage_arc`) is the ONLY root handle and is reused for both the BEP44
+    // sequence store and the node builder. Reopening the root DB while that handle
+    // is alive would fail with an advisory-lock conflict (os error 35).
+    let (storage_dir, _storage_key, node_storage_arc, custody) =
         init_persistent_storage(storage_path).await;
 
     tracing::info!(
@@ -604,7 +618,6 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
         "starting scp-node with SQLite storage (SQLCipher encrypted)"
     );
 
-    let node_storage_arc = Arc::new(node_storage);
     let cache = Arc::new(DidCache::new());
 
     // Use storage-backed sequence store for BEP44 sequence persistence.
@@ -628,8 +641,17 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
 
         let seq_init_method = Arc::clone(&did_method);
         let seq_init = make_seq_init(seq_init_method);
-        let storage = open_sqlite_or_exit(&storage_dir, &storage_key);
-        run_node_with(domain, http_addr, custody, seq_init, did_method, storage).await;
+        // Reuse the single root handle (shared via `Arc`) rather than reopening,
+        // which would conflict on the advisory lock (os error 35).
+        run_node_with(
+            domain,
+            http_addr,
+            custody,
+            seq_init,
+            did_method,
+            Arc::clone(&node_storage_arc),
+        )
+        .await;
         return;
     }
 
@@ -645,15 +667,16 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
 
     let seq_init_method = Arc::clone(&did_method);
     let seq_init = make_seq_init(seq_init_method);
-    let builder_storage = open_sqlite_or_exit(&storage_dir, &storage_key);
 
+    // Reuse the single root handle (shared via `Arc`) rather than reopening,
+    // which would conflict on the advisory lock (os error 35).
     run_node_with(
         domain,
         http_addr,
         custody,
         seq_init,
         did_method,
-        builder_storage,
+        Arc::clone(&node_storage_arc),
     )
     .await;
 }
@@ -831,7 +854,7 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
     // -- Storage + custody (same as the persistent node) --
     let resolved_path = resolve_storage_path(storage_path);
     validate_storage_path(&resolved_path);
-    let (storage_dir, storage_key, node_storage, custody) =
+    let (storage_dir, storage_key, node_storage_arc, custody) =
         init_persistent_storage(storage_path).await;
 
     tracing::info!(
@@ -842,7 +865,11 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
     );
 
     // -- DID method: production pkarr by default; memory for offline testing --
-    let node_storage_arc = Arc::new(node_storage);
+    // `node_storage_arc` is the single root `SqliteStorage` handle (it owns the
+    // advisory lock on `{dir}/scp.db.lock`). It is shared by `Arc::clone` between
+    // the BEP44 sequence store and the node builder — the root DB is NEVER opened
+    // a second time, which would conflict on the lock (os error 35). The `mls/`
+    // and `blobs/` subdirectories are distinct paths with their own locks.
     let cache = Arc::new(DidCache::new());
     let sequence_store: Arc<dyn SequenceStore> =
         Arc::new(StorageSequenceStore::new(Arc::clone(&node_storage_arc)));
@@ -867,6 +894,7 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
             port,
             &storage_dir,
             &storage_key,
+            Arc::clone(&node_storage_arc),
             custody,
             seq_init,
             did_method,
@@ -890,6 +918,7 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         port,
         &storage_dir,
         &storage_key,
+        Arc::clone(&node_storage_arc),
         custody,
         seq_init,
         did_method,
@@ -901,6 +930,13 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
 /// Builds the no-domain self-host [`ApplicationNode`] over persistent,
 /// disk-backed storage, returning it behind an `Arc` alongside the retained NAT
 /// port-mapper handles (`UPnP` + NAT-PMP) for clean teardown.
+///
+/// The root `node_storage` is the single, already-open `Arc<SqliteStorage>` from
+/// [`init_persistent_storage`] — it is NOT reopened here. That handle owns the
+/// advisory lock on `{dir}/scp.db.lock`; opening a second handle on the same root
+/// directory while it is alive fails with an advisory-lock conflict (os error 35).
+/// Sharing the one handle (`Arc<SqliteStorage>` implements [`EncryptedStorage`])
+/// keeps exactly one lock holder for the root DB.
 ///
 /// The blob storage is a `SQLite` backend under the node's storage dir: it IS the
 /// site's system of record (`commit_deploy` scans it; the projection/site
@@ -919,11 +955,11 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
 async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
     http_addr: SocketAddr,
     storage_dir: &std::path::Path,
-    storage_key: &Zeroizing<[u8; 32]>,
+    node_storage: Arc<SqliteStorage>,
     custody: Arc<SqliteKeyCustody>,
     did_method: Arc<D>,
 ) -> (
-    Arc<scp_node::ApplicationNode<SqliteStorage>>,
+    Arc<scp_node::ApplicationNode<Arc<SqliteStorage>>>,
     OptionalPortMapper,
     OptionalPortMapper,
 ) {
@@ -931,7 +967,6 @@ async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
         "SCP_NODE_PROJECTION_RATE_LIMIT",
         scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
     );
-    let builder_storage = open_sqlite_or_exit(storage_dir, storage_key);
 
     let blob_db = storage_dir.join("blobs");
     let blob_storage = match scp_transport::native::storage::BlobStorageBackend::sqlite(&blob_db) {
@@ -970,7 +1005,7 @@ async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
     let (upnp_mapper, natpmp_mapper): (OptionalPortMapper, OptionalPortMapper) = (None, None);
 
     let builder = ApplicationNodeBuilder::new()
-        .storage(builder_storage)
+        .storage(node_storage)
         .blob_storage(blob_storage)
         .generate_identity_with(custody, did_method)
         .no_domain()
@@ -1014,17 +1049,22 @@ async fn run_self_host_with<D: scp_identity::DidMethod + 'static>(
     port: u16,
     storage_dir: &std::path::Path,
     storage_key: &Zeroizing<[u8; 32]>,
+    node_storage: Arc<SqliteStorage>,
     custody: Arc<SqliteKeyCustody>,
     seq_init: SeqInitFn,
     did_method: Arc<D>,
     site_dir: Option<&PathBuf>,
 ) {
     // -- Build the no-domain node with persistent blob storage + retained NAT
-    //    mapper handles for clean teardown on every exit path. --
+    //    mapper handles for clean teardown on every exit path. The root node
+    //    storage is the SAME `Arc<SqliteStorage>` already opened in
+    //    `init_persistent_storage` (one advisory-lock holder); the deployer's
+    //    `mls/` storage and the relay's `blobs/` storage live under distinct
+    //    subdirectories with their own locks. --
     let (node, upnp_mapper, natpmp_mapper) = build_self_host_node(
         http_addr,
         storage_dir,
-        storage_key,
+        node_storage,
         custody.clone(),
         did_method,
     )
@@ -1199,13 +1239,16 @@ fn mint_deploy_id() -> String {
 /// defaults to [`SELF_HOST_DEPLOY_REFRESH_SECS`]. The loop runs until the
 /// node's shutdown token is cancelled. Returns the task handle so the caller
 /// can abort it on shutdown.
-fn spawn_site_refresh_loop(
+fn spawn_site_refresh_loop<S>(
     deployer: Arc<scp_node::SelfHostDeployer>,
-    node: Arc<scp_node::ApplicationNode<scp_platform::sqlite::SqliteStorage>>,
+    node: Arc<scp_node::ApplicationNode<S>>,
     custody: Arc<SqliteKeyCustody>,
     assets: Arc<Vec<scp_node::Asset>>,
     shutdown_token: tokio_util::sync::CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<()>
+where
+    S: scp_platform::EncryptedStorage + 'static,
+{
     let refresh_secs: u64 = startup::env_or(
         "SCP_NODE_SELF_HOST_REFRESH_SECS",
         SELF_HOST_DEPLOY_REFRESH_SECS,

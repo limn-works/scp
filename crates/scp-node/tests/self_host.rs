@@ -42,6 +42,7 @@ use scp_identity::dht_client::InMemoryDhtClient;
 use scp_node::{
     ApplicationNodeBuilder, DeploySiteParams, NatStrategy, NodeError, ReachabilityTier,
 };
+use scp_platform::Storage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 
 /// Concrete `DidDht` type used in this test (in-memory DHT, system clock).
@@ -539,5 +540,198 @@ async fn self_host_redeploy_with_unique_deploy_ids_keeps_site_served() {
         scp_node::routing_id_hex(&context_id),
         routing_hex,
         "the site routing id must be stable across refresh deploys"
+    );
+}
+
+/// Regression: the production binary's storage wiring must NOT open the root
+/// `SQLite` database twice.
+///
+/// The binary (`main.rs`) opens the root DB once in `init_persistent_storage`
+/// and keeps that handle alive for the whole run (the BEP44 `StorageSequenceStore`
+/// holds an `Arc` clone). Previously, `build_self_host_node` (and the full-node
+/// path) then opened a SECOND `SqliteStorage` on the SAME root directory for the
+/// node builder. Because `SqliteStorage` takes a process-exclusive advisory lock
+/// on `{dir}/scp.db.lock` for its lifetime, the second open failed with
+/// `os error 35` ("already open by another SCP instance") and the binary exited
+/// before serving anything. The existing end-to-end tests missed this because
+/// they open the root handle exactly once and hand it straight to the builder.
+///
+/// This test reproduces the binary's wiring exactly:
+/// 1. it asserts the FAILURE MODE directly — a naive second `SqliteStorage::new`
+///    on the same root, while the first handle is alive, IS rejected; then
+/// 2. it asserts the FIX — sharing the single `Arc<SqliteStorage>` between a live
+///    sequence-store-like owner AND the node builder lets the node build and
+///    serve `index.html`, with exactly one advisory-lock holder.
+///
+/// Provenance: `.docs/guides/self-hosting-a-website-on-scp.md`; specs §10.12.8.
+// Multi-thread runtime required for the broadcast publish path (see the
+// end-to-end test above for the rationale).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_host_shares_single_root_storage_handle_and_serves() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let storage_dir = tmp.path().to_path_buf();
+    let storage_key = Zeroizing::new([0x5Au8; 32]);
+
+    // -- Step 1: open the root DB ONCE, exactly as `init_persistent_storage` does,
+    //    and keep the handle alive behind an `Arc`. --
+    let root_storage = Arc::new(
+        SqliteStorage::new(&storage_dir, storage_key.as_ref())
+            .expect("root SQLite should open the first time"),
+    );
+
+    // -- Assert the FAILURE MODE: while `root_storage` is alive, a second open of
+    //    the SAME root directory MUST be rejected by the advisory lock. This is
+    //    precisely what the binary used to do at its second `open_sqlite_or_exit`
+    //    call, and is the bug this fix removes. --
+    let second_open = SqliteStorage::new(&storage_dir, storage_key.as_ref());
+    let err = second_open
+        .err()
+        .expect("opening the root DB twice (while the first handle lives) must fail");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("already open by another SCP instance"),
+        "the second root open must be rejected by the advisory lock, got: {err_str}"
+    );
+
+    // -- A second, live owner of the SAME handle, standing in for the binary's
+    //    BEP44 `StorageSequenceStore` (which holds an `Arc` clone for the whole
+    //    run). Keeping this alive across the build proves the node builder shares
+    //    the one handle rather than racing a second open. --
+    let sequence_store_owner: Arc<SqliteStorage> = Arc::clone(&root_storage);
+    // Use it concurrently to prove it is a live, functional handle, not just a
+    // dangling reference: write+read a BEP44-style key like the real store does.
+    sequence_store_owner
+        .store("bep44/seq/test", &1u64.to_be_bytes())
+        .await
+        .expect("the shared root handle must be usable while the node also holds it");
+
+    // -- Custody + DID method (offline in-memory DHT), as in `build_self_host_node`. --
+    let custody = build_custody(&storage_dir, &storage_key).await;
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let cache = Arc::new(DidCache::new());
+    let sign_fn = TestDidDht::make_sign_fn(Arc::clone(&custody));
+    let did_method = Arc::new(DidDht::with_client_and_signer(dht_client, cache, sign_fn));
+
+    let blob_storage =
+        scp_transport::native::storage::BlobStorageBackend::sqlite(&storage_dir.join("blobs"))
+            .expect("sqlite blob storage should open");
+
+    // -- Step 2: build the node over the SHARED root handle (`Arc::clone`), exactly
+    //    as the fixed `build_self_host_node` does. `Arc<SqliteStorage>` implements
+    //    `EncryptedStorage`, so the builder accepts it. This must NOT trip the
+    //    advisory-lock conflict because there is only ONE underlying handle. --
+    let node = ApplicationNodeBuilder::new()
+        .storage(Arc::clone(&root_storage))
+        .blob_storage(blob_storage)
+        .no_domain()
+        .nat_strategy(Arc::new(FixedTierNatStrategy))
+        .generate_identity_with(custody.clone(), did_method)
+        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .http_bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .build()
+        .await
+        .expect(
+            "the node must build over the SHARED root storage handle without a \
+             lock conflict (os error 35)",
+        );
+
+    // -- Deploy the embedded site and assert it serves end to end. The
+    //    sequence-store-like owner is passed in so it stays alive across the
+    //    deploy/serve — exactly one advisory-lock holder for the whole test. --
+    deploy_embedded_and_assert_serves(
+        &node,
+        custody.as_ref(),
+        &storage_dir,
+        &storage_key,
+        "selfhost-shared-storage-deploy",
+    )
+    .await;
+
+    drop(sequence_store_owner);
+    node.shutdown();
+}
+
+/// Deploys the embedded default site onto `node` and asserts it serves
+/// `index.html` (200, `text/html`, hello-world body) back over the projection
+/// router. Generic over the node's storage type so it works for both the
+/// concrete `SqliteStorage` and the shared `Arc<SqliteStorage>` node.
+///
+/// The supervisor MLS storage is a `SQLite` database under the distinct `mls/`
+/// subdirectory — its own advisory lock, never conflicting with the root DB.
+async fn deploy_embedded_and_assert_serves<S>(
+    node: &scp_node::ApplicationNode<S>,
+    custody: &SqliteKeyCustody,
+    storage_dir: &std::path::Path,
+    storage_key: &Zeroizing<[u8; 32]>,
+    deploy_id: &str,
+) where
+    S: scp_platform::EncryptedStorage + 'static,
+{
+    let node_did = node.identity().did().to_owned();
+    let context_id = self_host_context_id(&node_did);
+
+    let mls_inner = Arc::new(
+        SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
+            .expect("MLS SQLite should open (distinct subdirectory)"),
+    );
+    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+        Arc::new(
+            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
+        );
+
+    let assets = scp_node::embedded_assets(Some(&node_did));
+    let expected_count = assets.len();
+    let signing_key_handle = node.identity().identity().active_signing_key;
+    let committed = scp_node::deploy_site(
+        node,
+        DeploySiteParams {
+            node_did: node_did.clone(),
+            context_id: context_id.clone(),
+            deploy_id: deploy_id.to_owned(),
+            hostname: "selfhost.scp.local".to_owned(),
+            signing_key_handle,
+            custody,
+            mls_storage,
+            assets: &assets,
+        },
+    )
+    .await
+    .expect("self-host deploy should succeed over the shared-storage node");
+    assert_eq!(committed, expected_count, "every asset must be committed");
+
+    let routing_hex = scp_node::routing_id_hex(&context_id);
+    let resp = node
+        .broadcast_projection_router()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the shared-storage self-host node must serve index.html"
+    );
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(content_type, "text/html", "index.html must be text/html");
+
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("body should collect")
+        .to_bytes();
+    let body_str = String::from_utf8(body.to_vec()).expect("index.html is UTF-8");
+    assert!(
+        body_str.contains("hello, world."),
+        "served body must be the embedded hello-world page"
     );
 }
