@@ -18,6 +18,7 @@ pub mod dns_provider;
 pub(crate) mod error;
 pub mod http;
 pub mod projection;
+pub mod self_host;
 pub mod tls;
 pub mod webhook;
 mod well_known;
@@ -43,6 +44,10 @@ use zeroize::Zeroizing;
 
 pub use http::BroadcastContext;
 pub use projection::{DeployManifest, DeployManifestEntry, ProjectedContext, SiteConfig};
+pub use self_host::{
+    Asset, DeploySiteParams, SelfHostError, content_type_for, deploy_site, embedded_assets,
+    routing_id_hex,
+};
 
 // ---------------------------------------------------------------------------
 // Default HTTP bind address

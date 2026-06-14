@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hello from SCP</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main class="card">
+    <div class="badge" id="badge">● live on SCP</div>
+    <h1>hello, world.</h1>
+    <p class="lede">
+      You're looking at a website with <strong>no web server</strong> underneath it.
+      No nginx. No CDN. No cloud. Every layer here is the
+      <strong>Shared Context Protocol</strong>.
+    </p>
+
+    <ul class="stack">
+      <li><span>web server</span> SCP application node (decrypts &amp; serves on request)</li>
+      <li><span>data</span> per-author AES-256-GCM broadcast envelopes in SCP blob storage</li>
+      <li><span>networking</span> SCP relay + NAT-PMP-mapped port (no manual port-forward)</li>
+      <li><span>identity</span> <code id="did">did:dht:…</code></li>
+      <li><span>address</span> published to the BitTorrent Mainline DHT — no DNS, no CA</li>
+    </ul>
+
+    <p class="meta">
+      Path: <code id="path">/index.html</code> ·
+      Served at <code id="host">—</code> ·
+      <span id="clock">—</span>
+    </p>
+
+    <footer>
+      This page was published as encrypted assets into a broadcast context,
+      then projected back to plaintext by the node that holds the key.
+      The relay only ever saw ciphertext.
+    </footer>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
