@@ -954,6 +954,37 @@ class SCP:
         """Delegate to ``_scp_core.SCP.context_reset_ttl_timer``."""
         return await asyncio.to_thread(self._native.context_reset_ttl_timer, handle, new_seconds)
 
+    async def reconnect(
+        self,
+        identity_did: str,
+        context_ids: list[str],
+        last_relay_contacts: dict[str, int] | None = None,
+    ) -> Any:
+        """Reconnect ``identity_did``'s contexts after an offline period.
+
+        Runs the ADR-029 six-phase reconnection protocol for each context in
+        ``context_ids`` flagged ``needs_reconnect`` (§23.11). The driver lives
+        at the FFI relay-client layer: it pulls relay-buffered messages via the
+        ``TransportManager`` and reaches actor-owned reconnection state (MLS
+        epoch, Commit/Welcome processing, checkpoint build/compare, MLS update)
+        through the ``Supervisor``. On success each context's
+        ``needs_reconnect`` flag is cleared.
+
+        ``last_relay_contacts`` maps ``context_id`` to the last-relay-contact
+        Unix-seconds timestamp (used to classify the offline tier). Contexts
+        absent from the map default to the most conservative tier.
+
+        Requires an active relay connection (call ``transport_connect`` first).
+
+        Delegates to ``_scp_core.SCP.context_reconnect``.
+        """
+        return await asyncio.to_thread(
+            self._native.context_reconnect,
+            identity_did,
+            context_ids,
+            last_relay_contacts,
+        )
+
     async def context_send(
         self,
         handle: Any,

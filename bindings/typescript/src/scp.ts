@@ -326,6 +326,42 @@ export interface McpAllowlistState {
 }
 
 /**
+ * Per-context result of {@link SCP.reconnect} (#1540, ADR-029).
+ */
+export interface ContextReconnectResult {
+  /** Context that was reconnected. */
+  readonly contextId: string;
+  /** Offline tier: `"short"` / `"extended"` / `"long"`. */
+  readonly tier: string;
+  /** Outcome (`"fully_caught_up"`, `"reset"`, `"failed"`, …). */
+  readonly outcome: string;
+  /** MLS epochs caught up. */
+  readonly epochsCaughtUp: number;
+  /** Event-log events recovered. */
+  readonly eventsRecovered: number;
+  /** Whether an MLS Update was issued (§9.12). */
+  readonly mlsUpdateIssued: boolean;
+  /** Number of equivocation alerts surfaced (§9.9.3). */
+  readonly equivocationsDetected: number;
+  /** Whether `needsReconnect` was cleared on success. */
+  readonly needsReconnectCleared: boolean;
+}
+
+/**
+ * Aggregate result of {@link SCP.reconnect} (#1540, ADR-029).
+ */
+export interface ReconnectReport {
+  /** Per-context results. */
+  readonly contexts: readonly ContextReconnectResult[];
+  /** Total queued messages drained (Phase 6). */
+  readonly messagesDrained: number;
+  /** Total queued messages discarded. */
+  readonly messagesDiscarded: number;
+  /** Total reconnection duration in milliseconds. */
+  readonly totalDurationMs: number;
+}
+
+/**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
  * Implement this to back a DID's key material with a platform keystore (OS
@@ -1414,6 +1450,37 @@ export class SCP {
       handle,
       newDurationSecs,
     );
+  }
+
+  /**
+   * Reconnect `identityDid`'s contexts after an offline period.
+   *
+   * Runs the ADR-029 six-phase reconnection protocol for each context in
+   * `contextIds` flagged `needsReconnect` (§23.11). The driver lives at the
+   * FFI relay-client layer: it pulls relay-buffered messages via the
+   * `TransportManager` and reaches actor-owned reconnection state (MLS epoch,
+   * Commit/Welcome processing, checkpoint build/compare, MLS update) through
+   * the `Supervisor`. On success each context's `needsReconnect` flag is
+   * cleared.
+   *
+   * `lastRelayContacts` maps context id to last-relay-contact Unix seconds
+   * (used to classify the offline tier); absent contexts default to the most
+   * conservative tier.
+   *
+   * Requires an active relay connection (call `transportConnect` first).
+   */
+  async reconnect(
+    identityDid: string,
+    contextIds: readonly string[],
+    lastRelayContacts?: Readonly<Record<string, number>>,
+  ): Promise<ReconnectReport> {
+    return await (
+      this.#native.contextReconnect as (
+        did: string,
+        ids: readonly string[],
+        contacts: Readonly<Record<string, number>> | undefined,
+      ) => Promise<ReconnectReport>
+    )(identityDid, contextIds, lastRelayContacts);
   }
 
   // ───────────────────────────────────────────────────────────────────────

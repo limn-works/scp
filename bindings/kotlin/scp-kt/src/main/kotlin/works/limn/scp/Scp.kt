@@ -666,6 +666,30 @@ class SCP internal constructor(
         spendingUcanJwt = spendingUcanJwt,
     )
 
+    /**
+     * Reconnects [identity]'s contexts after an offline period, running the
+     * ADR-029 six-phase reconnection protocol for each of [contextIds] flagged
+     * `needsReconnect` (§23.11).
+     *
+     * The driver lives at the FFI relay-client layer (ADR-029
+     * reconnection-driver addendum): it pulls relay-buffered messages via the
+     * `TransportManager` and reaches actor-owned reconnection state through the
+     * `Supervisor`. On success each context's `needsReconnect` flag is cleared.
+     * [lastRelayContacts] maps context id to last-relay-contact Unix seconds
+     * (tier classification); absent contexts default to the most conservative
+     * tier. Forwards to [NativeScp.contextReconnect] on [inner].
+     */
+    suspend fun reconnect(
+        identity: Identity,
+        contextIds: List<String>,
+        lastRelayContacts: Map<String, ULong> = emptyMap(),
+    ): ReconnectReport =
+        inner.contextReconnect(
+            identity = identity,
+            contextIds = contextIds,
+            lastRelayContacts = lastRelayContacts,
+        )
+
     /** Forwards to [NativeScp.contextSubscribe] on [inner]. */
     suspend fun contextSubscribe(
         handle: ContextHandle,
