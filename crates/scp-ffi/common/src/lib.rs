@@ -165,7 +165,7 @@ pub use resolvers::*;
 #[cfg(feature = "resolvers")]
 pub mod discovery;
 
-// Relay-backed reconnection driver (#1540, ADR-029 reconnection-driver
+// Relay-backed reconnection driver (ADR-029 reconnection-driver
 // addendum). Implements SyncPhaseDriver (Tier 1) / SnapshotTransport
 // (Tier 2) / ResetTransport (Tier 3) over a TransportManager (relay-client
 // retrieval) + Supervisor (actor-owned reconnection state). The driver

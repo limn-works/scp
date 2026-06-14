@@ -326,7 +326,7 @@ export interface McpAllowlistState {
 }
 
 /**
- * Per-context result of {@link SCP.reconnect} (#1540, ADR-029).
+ * Per-context result of {@link SCP.reconnect} (ADR-029).
  */
 export interface ContextReconnectResult {
   /** Context that was reconnected. */
@@ -348,7 +348,7 @@ export interface ContextReconnectResult {
 }
 
 /**
- * Aggregate result of {@link SCP.reconnect} (#1540, ADR-029).
+ * Aggregate result of {@link SCP.reconnect} (ADR-029).
  */
 export interface ReconnectReport {
   /** Per-context results. */

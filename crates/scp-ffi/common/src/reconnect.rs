@@ -1,4 +1,4 @@
-//! Relay-backed reconnection driver (#1540).
+//! Relay-backed reconnection driver (ADR-029).
 //!
 //! After the ADR-049 actor refactor, the per-context actor's
 //! [`ContextTransportProvider`] is **send-only** — it has no
@@ -24,7 +24,7 @@
 //! - **Tier 3** ([`scp_core::sync::weeks_offline::ResetTransport`]) —
 //!   plaintext reset request + admin re-add + Welcome await.
 //!
-//! # Composition with checkpoint exchange (#1540 Steps 2/3)
+//! # Composition with checkpoint exchange (§9.9.3)
 //!
 //! Phase 3 (`event_log_sync`) builds + broadcasts the **local** checkpoint
 //! through [`Supervisor::build_local_checkpoint`] (one actor turn — the
@@ -39,7 +39,7 @@
 //! `SCP-CHECKPOINT-V1:` canonical hash, same comparison helper — the
 //! driver only sequences the exchange.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use scp_core::context::supervisor::Supervisor;
@@ -59,11 +59,15 @@ use scp_transport::{RoutingId, TransportManager};
 /// the relay's accepted TTL band.
 const RESET_BLOB_TTL_SECS: u32 = 3600;
 
-/// Maximum local Ed25519-signing-key bytes carried for checkpoint build.
+/// Local Ed25519 signing-key seed carried for checkpoint build.
 /// Held in [`RelayActorSyncDriver`] so Phase 3 can sign the local
 /// checkpoint as the application send path does — the signing key is not
 /// actor-owned state (it lives at the FFI boundary).
-type SigningKeyBytes = [u8; 32];
+///
+/// Wrapped in [`Zeroizing`](zeroize::Zeroizing) so the 32-byte private seed
+/// is zeroed when the driver (and every clone threaded into the per-tier
+/// engines) drops, rather than lingering in freed heap/stack memory.
+type SigningKeyBytes = zeroize::Zeroizing<[u8; 32]>;
 
 /// Relay-backed driver for the ADR-029 reconnection protocol.
 ///
@@ -116,7 +120,7 @@ impl<'a> RelayActorSyncDriver<'a> {
     /// `SHA-256(context_id)`); encrypted contexts use the domain-separated
     /// `context_routing_id`. Mirrors the `context_subscribe` selection so
     /// the driver pulls from the same routing key the live subscription
-    /// uses (#1534).
+    /// uses (§5.14).
     async fn shared_routing_id(&self, context_id: &str) -> RoutingId {
         // `local_mls_epoch` returns `None` for a broadcast context — reuse
         // that single source of truth rather than re-deriving the mode.
@@ -154,17 +158,28 @@ impl<'a> RelayActorSyncDriver<'a> {
         })
     }
 
-    /// Drains the actor's receive buffer and maps any
-    /// `ContextEvent::EquivocationDetected` to a
-    /// [`SyncEvent::EquivocationDetected`] alert (§9.9.3).
+    /// Drains ONLY the `EquivocationDetected` alerts from the actor's
+    /// receive buffer and maps each to a
+    /// [`SyncEvent::EquivocationDetected`] alert (§9.9.3), leaving all
+    /// other buffered events (application messages, membership changes)
+    /// untouched for the SDK's normal receive polling.
     ///
     /// The actor emits the equivocation event from inside
     /// `compare_remote_checkpoint` (reached via `deliver_commit_blob` for
-    /// retrieved checkpoint blobs). Draining here surfaces those alerts to
-    /// the Phase-3 result so the reconnection report carries them.
+    /// retrieved checkpoint blobs), carrying the real divergent local /
+    /// remote Merkle roots. Those roots are surfaced verbatim on the
+    /// alert here and are ALSO persisted in the event-log append payload
+    /// by the actor (§9.9.4: security events must not be silently
+    /// discarded). The `evidence` field (the two signed checkpoints) is
+    /// not reconstructed at this layer — the divergent roots are the
+    /// load-bearing proof of equivocation and travel on the event itself.
+    ///
+    /// Uses [`Supervisor::drain_equivocation_alerts`] (NOT the total
+    /// `drain_events`) so catch-up does not destroy buffered application
+    /// traffic.
     async fn collect_equivocation_alerts(&self, context_id: &str, now: u64) -> Vec<SyncEvent> {
         self.supervisor
-            .drain_events(context_id)
+            .drain_equivocation_alerts(context_id)
             .await
             .into_iter()
             .filter_map(|event| match event {
@@ -172,18 +187,19 @@ impl<'a> RelayActorSyncDriver<'a> {
                     context_id: ctx,
                     remote_sender_did,
                     event_count,
+                    local_merkle_root,
+                    remote_merkle_root,
                 } => Some(SyncEvent::EquivocationDetected(Box::new(
                     scp_protocol::sync::EquivocationAlert {
                         context_id: ctx,
                         detector_did: self.member_did.clone(),
                         divergent_did: remote_sender_did,
                         divergent_event_count: event_count,
-                        // The local/remote roots are recorded inside the
-                        // event log by the actor; the alert surfaced to the
-                        // SDK carries the count + DIDs (the roots are
-                        // available via the event log for forensics).
-                        local_merkle_root: [0u8; 32],
-                        remote_merkle_root: [0u8; 32],
+                        // Real divergent roots carried on the event by the
+                        // actor's compare_remote_checkpoint, also persisted
+                        // in the event-log payload for forensics.
+                        local_merkle_root,
+                        remote_merkle_root,
                         evidence: None,
                         detected_at: now,
                         local_epoch: None,
@@ -215,12 +231,15 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
                 reason: e.to_string(),
             })?;
 
-        let now = since.max(last_stored_at);
-        let mut seen: HashMap<String, ()> = HashMap::with_capacity(envelopes.len());
+        // `since` is `last_stored_at` minus the 5s overlap, so it is always
+        // <= `last_stored_at`; the local receive time recorded on each
+        // buffered message is the caller-supplied `last_stored_at`.
+        let now = last_stored_at;
+        let mut seen: HashSet<String> = HashSet::with_capacity(envelopes.len());
         let mut messages = Vec::with_capacity(envelopes.len());
         for envelope in &envelopes {
             if let Some(msg) = Self::envelope_to_buffered(context_id, envelope, now)
-                && seen.insert(msg.blob_id.clone(), ()).is_none()
+                && seen.insert(msg.blob_id.clone())
             {
                 messages.push(msg);
             }
@@ -235,12 +254,29 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
     /// the actor (which decrypts, verifies, and `merge_staged_commit`s
     /// Commits to advance the local epoch), bounded by the policy's
     /// sequential-Commit limit, then re-read the local epoch.
+    ///
+    /// `messages` is the Phase-1 retrieved buffer, threaded in so this
+    /// phase does not re-query the relay from zero.
+    ///
+    /// # Commit ordering across epochs
+    ///
+    /// Phase 1 sorts blobs by `blob_id` (`SHA-256` — effectively random),
+    /// not by epoch, because the relay-assigned `stored_at` is untrusted
+    /// and not carried on the wire. `OpenMLS` only accepts a Commit whose
+    /// epoch matches the group's CURRENT epoch, so a single linear pass
+    /// advances at most one epoch (every Commit for a later epoch is
+    /// rejected as stale before its predecessor merges). To catch up
+    /// across multiple epochs we loop: each pass feeds the still-rejected
+    /// set against the now-advanced epoch and retries; we stop when a full
+    /// pass merges nothing (steady state) or the cumulative merge count
+    /// reaches the sequential-Commit budget.
     async fn epoch_reconciliation(
         &self,
         context_id: &str,
         local_epoch: u64,
         target_epoch: u64,
         policy: &SyncPolicy,
+        messages: &[BufferedMessage],
     ) -> Result<EpochCatchUpState, SyncError> {
         let mut state = EpochCatchUpState::new(context_id.to_owned(), local_epoch, target_epoch);
 
@@ -257,29 +293,63 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
             return Ok(state);
         }
 
-        // Re-fetch the buffered blobs and feed them to the actor. Each
-        // Commit the actor merges advances its local MLS epoch; application
-        // messages are buffered by the actor for normal receive polling.
-        let messages = self.relay_catch_up(context_id, 0).await?;
         let limit = usize::try_from(policy.max_sequential_commits).unwrap_or(usize::MAX);
-        for msg in messages.into_iter().take(limit) {
-            match self
-                .supervisor
-                .deliver_commit_blob(context_id, msg.payload)
-                .await
-            {
-                Ok(_) => state.record_commit_processed(),
-                Err(e) => {
-                    // A single bad blob (replay, stale epoch) is not fatal
-                    // to the whole catch-up; log and continue. A genuinely
-                    // gone context surfaces below via the epoch re-read.
-                    tracing::debug!(
-                        context_id,
-                        error = %e,
-                        "epoch_reconciliation: deliver_commit_blob rejected a blob; continuing"
-                    );
+
+        // The pending set starts as the full Phase-1 buffer (capped at the
+        // budget). Commits accepted on a pass advance the epoch; rejected
+        // blobs are retried on the next pass against the new epoch.
+        let mut pending: Vec<Vec<u8>> = messages
+            .iter()
+            .take(limit)
+            .map(|m| m.payload.clone())
+            .collect();
+        let mut total_merged: usize = 0;
+
+        while !pending.is_empty() && total_merged < limit {
+            let mut still_pending: Vec<Vec<u8>> = Vec::with_capacity(pending.len());
+            let mut merged_this_pass = 0usize;
+
+            for payload in pending {
+                if total_merged >= limit {
+                    // Budget exhausted mid-pass; carry the remainder so the
+                    // loop terminates without dropping blobs silently.
+                    still_pending.push(payload);
+                    continue;
+                }
+                match self
+                    .supervisor
+                    .deliver_commit_blob(context_id, payload.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        state.record_commit_processed();
+                        merged_this_pass += 1;
+                        total_merged += 1;
+                    }
+                    Err(e) => {
+                        // Rejected at the current epoch (out-of-epoch Commit,
+                        // replay, or a non-Commit application blob). Retain
+                        // it for a retry against the next epoch; a genuinely
+                        // bad blob is simply never accepted and falls out
+                        // when the loop reaches steady state.
+                        tracing::trace!(
+                            context_id,
+                            error = %e,
+                            "epoch_reconciliation: blob rejected at current epoch; retrying next pass"
+                        );
+                        still_pending.push(payload);
+                    }
                 }
             }
+
+            if merged_this_pass == 0 {
+                // A full pass advanced nothing — steady state. The
+                // remaining blobs are not Commits applicable to any
+                // reachable epoch (application messages, replays, or a
+                // genuine gap requiring Welcome-based fast-forward).
+                break;
+            }
+            pending = still_pending;
         }
 
         // Re-read the authoritative local epoch from the actor.
@@ -330,17 +400,20 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
         &self,
         context_id: &str,
         _policy: &SyncPolicy,
+        messages: &[BufferedMessage],
     ) -> Result<u64, SyncError> {
         // Sender-key management messages (advance / request / response) ride
         // the same routing key as application data and are processed by the
-        // actor's deliver path. Re-running catch-up + deliver in Phase 2
-        // already drains them; here we re-query specifically and feed any
-        // remaining blobs so a late-arriving advance is not missed.
-        let messages = self.relay_catch_up(context_id, 0).await?;
+        // actor's deliver path. Phase 2 already fed the buffer to advance
+        // the MLS epoch; here we re-feed the SAME Phase-1 buffer (threaded
+        // in, NOT re-queried from zero) so a late-arriving sender-key
+        // advance interleaved among the blobs is not missed. Re-delivery is
+        // idempotent — already-merged Commits and already-processed
+        // management messages are rejected without side effects.
         for msg in messages {
             if let Err(e) = self
                 .supervisor
-                .deliver_commit_blob(context_id, msg.payload)
+                .deliver_commit_blob(context_id, msg.payload.clone())
                 .await
             {
                 tracing::debug!(
@@ -395,11 +468,19 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
 
     /// Phase 6 — queue drain. The outbound offline queue is owned by
     /// `ProtocolRepository` at the bridge layer (not actor state), so the
-    /// bridge surface drains it directly via
-    /// `ReconnectionCoordinator::drain_context_queue` after `execute`
-    /// returns. The in-trait hook therefore reports a no-op `(0, 0)` and
-    /// the real drain runs at the bridge surface where the repository
-    /// lives. See the ADR-029 reconnection-driver addendum.
+    /// in-trait hook reports a no-op `(0, 0)`; the bridge surface owns the
+    /// drain.
+    ///
+    /// Current reality: all three bridges invoke
+    /// [`reconnect_contexts_no_drain`] (drain callback = `None`), so the
+    /// queue drain is presently a NO-OP end to end. The producer that would
+    /// populate the outbound queue — the offline send-enqueue path
+    /// (`store::queue::enqueue_message`) — has no production caller yet, so
+    /// there is nothing to drain. Wiring that offline-enqueue producer (so
+    /// `send` while disconnected buffers to the queue, and reconnection
+    /// drains it via `ReconnectionCoordinator::drain_context_queue`) is the
+    /// explicit follow-up scope; until it lands, do not claim the queue is
+    /// drained on reconnect. See the ADR-029 reconnection-driver addendum.
     async fn queue_drain(
         &self,
         _context_id: &str,
@@ -713,7 +794,12 @@ where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = (u64, u64)>,
 {
-    let driver = RelayActorSyncDriver::new(transport, supervisor, member_did.clone(), signing_key);
+    let driver = RelayActorSyncDriver::new(
+        transport,
+        supervisor,
+        member_did.clone(),
+        signing_key.clone(),
+    );
 
     let coordinator = ReconnectionCoordinator::with_policy(
         member_did,
@@ -757,7 +843,7 @@ where
                     transport,
                     supervisor,
                     coordinator.member_did().clone(),
-                    signing_key,
+                    signing_key.clone(),
                 ));
                 let outcome = match engine.fetch_snapshot(&context_id).await {
                     Ok(Some(_snapshot)) => scp_protocol::sync::SyncOutcome::FullyCaughtUp,
@@ -777,7 +863,7 @@ where
                     transport,
                     supervisor,
                     coordinator.member_did().clone(),
-                    signing_key,
+                    signing_key.clone(),
                 ));
                 let timeout_secs = policy_welcome_timeout_secs();
                 let outcome = match executor.await_welcome(&context_id, timeout_secs).await {

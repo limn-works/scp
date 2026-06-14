@@ -49,6 +49,7 @@ scp-ffi-common = { path = "../scp-ffi/common", features = ["resolvers"] }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+zeroize = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 hex = { workspace = true }

@@ -1935,7 +1935,7 @@ pub struct TrustInput {
     pub evaluated_at: u64,
 }
 
-/// Per-context reconnection result (#1540, ADR-029).
+/// Per-context reconnection result (ADR-029).
 ///
 /// Flat mirror of [`scp_ffi_common::reconnect::ContextReconnectResult`].
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1958,7 +1958,7 @@ pub struct ContextReconnectResult {
     pub needs_reconnect_cleared: bool,
 }
 
-/// Aggregate reconnection report (#1540, ADR-029).
+/// Aggregate reconnection report (ADR-029).
 ///
 /// Flat mirror of [`scp_ffi_common::reconnect::ReconnectReport`].
 #[derive(Debug, Clone, uniffi::Record)]
@@ -5548,9 +5548,14 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             context_id,
             remote_sender_did,
             event_count,
+            local_merkle_root,
+            remote_merkle_root,
         } => scp_ffi_common::html_escape_event_string(&format!(
             "equivocation_detected:context={context_id},\
-             remote_sender={remote_sender_did},event_count={event_count}"
+             remote_sender={remote_sender_did},event_count={event_count},\
+             local_merkle_root={},remote_merkle_root={}",
+            hex::encode(local_merkle_root),
+            hex::encode(remote_merkle_root),
         )),
         other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
     }
@@ -11247,13 +11252,16 @@ impl Scp {
         // Resolve the local member's Ed25519 signing key from the identity's
         // retained custody (used to sign the Phase-3 consistency checkpoint).
         // Private key never crosses FFI beyond this in-process driver call.
+        // The 32-byte seed is held in `Zeroizing` so it is wiped after the
+        // driver call rather than lingering in freed memory.
         let signing_key = resolve_identity_signing_key(&identity).await?;
+        let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
 
         let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
             &transport,
             supervisor,
             scp_identity::DID(identity.did.clone()),
-            signing_key.to_bytes(),
+            signing_key_bytes,
             context_ids,
             last_relay_contacts,
             scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),

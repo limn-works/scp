@@ -77,7 +77,7 @@ const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
-// Reconnection-driver source (#1540, ADR-029 reconnection-driver addendum).
+// Reconnection-driver source (ADR-029 reconnection-driver addendum).
 // The FFI/SDK-layer RelayActorSyncDriver lives here because the actor's
 // ContextTransportProvider is send-only; the b3_reconnect assertion below
 // pins the driver's event_log_sync to the build + compare checkpoint
@@ -89,7 +89,7 @@ const RECONNECT_DRIVER_SRC: &str =
 // Actor messaging-handler source — owns `handle_build_local_checkpoint`,
 // the actor-turn body that builds AND broadcasts the Phase-3 checkpoint so
 // the FFI driver never needs the `pub(crate)` `send_checkpoint` across the
-// crate boundary (#1540).
+// crate boundary (ADR-029).
 const HANDLERS_MESSAGING_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/messaging.rs");
 
@@ -383,7 +383,7 @@ fn open_calls_decrypt_sender_layer() {
     );
 }
 
-// --- Envelope layer (#1534) — NOW WIRED ---
+// --- Envelope layer (§13) — NOW WIRED ---
 
 #[test]
 fn encrypt_path_calls_create_outer_envelope_or_seal() {
@@ -394,7 +394,7 @@ fn encrypt_path_calls_create_outer_envelope_or_seal() {
     );
 }
 
-// --- Inner envelope / signatures (#1534, #1547) — NOW WIRED ---
+// --- Inner envelope / signatures (§9.8, #1547) — NOW WIRED ---
 
 #[test]
 fn encrypt_path_calls_create_inner_envelope() {
@@ -438,7 +438,7 @@ fn decrypt_path_calls_unwrap_content() {
     );
 }
 
-// --- Padding (#1534) — NOW WIRED ---
+// --- Padding (§13) — NOW WIRED ---
 
 #[test]
 fn decrypt_path_calls_strip_padding() {
@@ -1144,7 +1144,7 @@ fn b3_heartbeat_monitor_instantiated() {
 /// Checkpoint generation must be wired into the context lifecycle.
 /// close_context must call force_create_checkpoint for archival.
 /// finalize_send must call create_checkpoint_if_due periodically AND broadcast
-/// a due checkpoint to peers via send_checkpoint (§9.9.3, §23.7, #1540).
+/// a due checkpoint to peers via send_checkpoint (§9.9.3, §23.7).
 #[test]
 fn b3_checkpoint_generation_wired() {
     // close_context_with_key must call force_create_checkpoint for archival.
@@ -1192,7 +1192,7 @@ fn b3_checkpoint_generation_wired() {
 /// compare_remote_checkpoint must compare local and remote Merkle roots and emit
 /// EquivocationDetected when divergent (§9.9.3, ADR-011 AC-8), AND it must be
 /// reached from the receive path: deliver_incoming dispatches a received
-/// ConsistencyCheckpoint message to compare_remote_checkpoint (#1540).
+/// ConsistencyCheckpoint message to compare_remote_checkpoint (§9.9.3).
 #[test]
 fn b3_merkle_proof_verification_wired() {
     // compare_remote_checkpoint must exist and perform comparison.
@@ -1210,7 +1210,7 @@ fn b3_merkle_proof_verification_wired() {
     // Real call-site assertion: the receive path must actually REACH the
     // comparison. deliver_incoming dispatches a ConsistencyCheckpoint message to
     // deliver_checkpoint_message, which calls compare_remote_checkpoint. Without
-    // this chain the detection logic is dead code (the #1540 gap).
+    // this chain the detection logic is dead code (the reconnection-path gap).
     assert!(
         fn_body_contains(
             MANAGER_SRC,
@@ -1241,7 +1241,7 @@ fn b3_merkle_proof_verification_wired() {
 /// `compare_remote_checkpoint` (pinned by `b3_merkle_proof_verification_wired`)
 /// — so feeding the blobs is what reaches the comparison. Real call-site
 /// assertions (not bare string searches): without these the driver would be a
-/// dead reconnection path severed from the #1540 Step 2/3 equivocation core.
+/// dead reconnection path severed from the equivocation core (§9.9.3).
 #[test]
 fn b3_reconnect_drives_checkpoint_exchange() {
     // Phase 3: event_log_sync must build (and, via the actor turn, broadcast)
@@ -1271,7 +1271,7 @@ fn b3_reconnect_drives_checkpoint_exchange() {
     // Phase 2: epoch_reconciliation must feed retrieved blobs through
     // deliver_commit_blob — the DeliverIncoming path that dispatches
     // ConsistencyCheckpoint messages to compare_remote_checkpoint. This is the
-    // composition seam with #1540 Step 2/3: feeding the blobs is what reaches
+    // composition seam with the equivocation core (§9.9.3): feeding the blobs is what reaches
     // the comparison.
     assert!(
         fn_body_contains(

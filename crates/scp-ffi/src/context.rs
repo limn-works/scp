@@ -1060,13 +1060,18 @@ fn convert_context_event(
             context_id: ctx_id,
             remote_sender_did,
             event_count,
+            local_merkle_root,
+            remote_merkle_root,
         } => (
             "scp:system".to_owned(),
             format!(
                 "equivocation_detected:context={},\
-                 remote_sender={},event_count={event_count}",
+                 remote_sender={},event_count={event_count},\
+                 local_merkle_root={},remote_merkle_root={}",
                 html_escape_event_string(&ctx_id),
                 html_escape_event_string(remote_sender_did.as_ref()),
+                hex::encode(local_merkle_root),
+                hex::encode(remote_merkle_root),
             )
             .into_bytes(),
             ts,
@@ -1828,7 +1833,7 @@ fn parse_template_id(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Reconnection report (#1540, ADR-029)
+// Reconnection report (ADR-029)
 // ---------------------------------------------------------------------------
 
 /// Per-context reconnection result surfaced to Python.
@@ -2059,7 +2064,7 @@ impl crate::scp::PyScp {
         // py_mcp_load_contexts. Reuse the pre-derived pseudonym routing ID
         // (§9.10.4, SCP-214 criterion 4). Falls back to context_routing_id
         // for encrypted contexts or broadcast_routing_id for broadcast contexts.
-        // Bug fix (#1534): broadcast contexts use broadcast_routing_id (plain
+        // Broadcast contexts use broadcast_routing_id (plain
         // SHA-256) matching the send path, not context_routing_id (domain-separated).
         {
             let routing_id = local_pseudonym.unwrap_or_else(|| {
@@ -4781,9 +4786,11 @@ impl crate::scp::PyScp {
 
         // Resolve the local member's Ed25519 signing key (used to sign the
         // Phase-3 consistency checkpoint). Private key never crosses FFI
-        // beyond this in-process driver call.
+        // beyond this in-process driver call. The 32-byte seed is held in
+        // `Zeroizing` so it is wiped when this call returns rather than
+        // lingering on the stack/heap.
         let signing_key = resolve_signing_key(bi, identity_did)?;
-        let signing_key_bytes = signing_key.to_bytes();
+        let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
 
         let contacts = last_relay_contacts.unwrap_or_default();
         let now = scp_primitives::SystemClock.now_secs();
@@ -5306,7 +5313,7 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyContextParams>()?;
     m.add_class::<PyMessage>()?;
     m.add_class::<PyMessageReceiver>()?;
-    // Reconnection report (#1540, ADR-029)
+    // Reconnection report (ADR-029)
     m.add_class::<PyReconnectReport>()?;
     m.add_class::<PyContextReconnectResult>()?;
     // Governance (#369)

@@ -66,13 +66,17 @@ pub trait SyncPhaseDriver: Send + Sync {
     /// target epoch observed from relay messages and process Commits
     /// sequentially or fall back to Welcome-based fast-forward.
     ///
-    /// Returns the catch-up state after reconciliation completes.
+    /// `messages` is the Phase-1 retrieved-and-deduplicated buffer, threaded
+    /// in so the driver does not re-query the relay from zero (Phase 1
+    /// already did that retrieval). Returns the catch-up state after
+    /// reconciliation completes.
     async fn epoch_reconciliation(
         &self,
         context_id: &str,
         local_epoch: u64,
         target_epoch: u64,
         policy: &SyncPolicy,
+        messages: &[BufferedMessage],
     ) -> Result<EpochCatchUpState, SyncError>;
 
     /// Phase 3 — Event log sync: exchange consistency checkpoints with online
@@ -84,11 +88,16 @@ pub trait SyncPhaseDriver: Send + Sync {
     /// Phase 4 — Sender key re-acquisition: request current sender keys for
     /// any senders whose keys advanced during the offline period.
     ///
-    /// Returns the number of unrecoverable messages (sender key timeout).
+    /// `messages` is the Phase-1 retrieved-and-deduplicated buffer, threaded
+    /// in so the driver re-feeds the already-retrieved blobs (catching a
+    /// late-arriving sender-key advance) without re-querying the relay from
+    /// zero. Returns the number of unrecoverable messages (sender key
+    /// timeout).
     async fn sender_key_reacquire(
         &self,
         context_id: &str,
         policy: &SyncPolicy,
+        messages: &[BufferedMessage],
     ) -> Result<u64, SyncError>;
 
     /// Phase 5 — MLS Update: issue an MLS Update proposal for post-compromise
@@ -1066,9 +1075,15 @@ impl ReconnectionCoordinator {
             context_id,
             "observed_target_epoch",
         );
-        let (epochs_caught_up, catch_up_outcome) =
-            Self::reconcile_epoch(context_id, local_epoch, target_epoch, &self.policy, driver)
-                .await;
+        let (epochs_caught_up, catch_up_outcome) = Self::reconcile_epoch(
+            context_id,
+            local_epoch,
+            target_epoch,
+            &self.policy,
+            driver,
+            &messages,
+        )
+        .await;
 
         // If epoch reconciliation failed, return early.
         if let SyncOutcome::Failed { .. } = &catch_up_outcome {
@@ -1097,19 +1112,23 @@ impl ReconnectionCoordinator {
             }
         };
 
-        // Phase 4: Sender key re-acquisition.
-        let messages_unrecoverable =
-            match driver.sender_key_reacquire(context_id, &self.policy).await {
-                Ok(count) => count,
-                Err(e) => {
-                    tracing::warn!(
-                        context_id,
-                        error = %e,
-                        "Phase 4: sender_key_reacquire failed, continuing with zero unrecoverable"
-                    );
-                    0
-                }
-            };
+        // Phase 4: Sender key re-acquisition. Re-feeds the Phase-1 buffer
+        // (no fresh relay query) so a late-arriving sender-key advance is
+        // not missed.
+        let messages_unrecoverable = match driver
+            .sender_key_reacquire(context_id, &self.policy, &messages)
+            .await
+        {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "Phase 4: sender_key_reacquire failed, continuing with zero unrecoverable"
+                );
+                0
+            }
+        };
 
         // Phase 5: MLS Update.
         let mls_update_issued = match driver.mls_update(context_id).await {
@@ -1190,11 +1209,12 @@ impl ReconnectionCoordinator {
         target_epoch: Option<u64>,
         policy: &SyncPolicy,
         driver: &D,
+        messages: &[BufferedMessage],
     ) -> (u64, SyncOutcome) {
         match (local_epoch, target_epoch) {
             (Some(local), Some(target)) if target > local => {
                 match driver
-                    .epoch_reconciliation(context_id, local, target, policy)
+                    .epoch_reconciliation(context_id, local, target, policy, messages)
                     .await
                 {
                     Ok(state) => {
@@ -2511,6 +2531,7 @@ mod tests {
             local_epoch: u64,
             target_epoch: u64,
             _policy: &SyncPolicy,
+            _messages: &[BufferedMessage],
         ) -> Result<EpochCatchUpState, SyncError> {
             let mut state =
                 EpochCatchUpState::new(context_id.to_owned(), local_epoch, target_epoch);
@@ -2532,6 +2553,7 @@ mod tests {
             &self,
             _context_id: &str,
             _policy: &SyncPolicy,
+            _messages: &[BufferedMessage],
         ) -> Result<u64, SyncError> {
             Ok(0)
         }

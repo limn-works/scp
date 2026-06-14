@@ -1305,7 +1305,7 @@ pub(crate) async fn context_subscribe_on(
     // (plain hash, matching the send path in messaging.rs). Encrypted contexts
     // use `context_routing_id` = SHA-256("scp:context-routing:" || context_id)
     // (domain-separated). Using the wrong routing ID means messages never
-    // reach subscribers. Bug fix (#1534).
+    // reach subscribers. Bug fix.
     //
     // For encrypted contexts, also subscribe to the member's pseudonym
     // routing ID for pseudonym-routed application messages (§9.10.4).
@@ -1753,9 +1753,14 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             context_id,
             remote_sender_did,
             event_count,
+            local_merkle_root,
+            remote_merkle_root,
         } => scp_ffi_common::html_escape_event_string(&format!(
             "equivocation_detected:context={context_id},\
-             remote_sender={remote_sender_did},event_count={event_count}"
+             remote_sender={remote_sender_did},event_count={event_count},\
+             local_merkle_root={},remote_merkle_root={}",
+            hex::encode(local_merkle_root),
+            hex::encode(remote_merkle_root),
         )),
         other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
     }
@@ -2637,7 +2642,7 @@ pub(crate) async fn context_execute_governance_action_on(
 }
 
 // ---------------------------------------------------------------------------
-// Reconnection (#1540, ADR-029)
+// Reconnection (ADR-029)
 // ---------------------------------------------------------------------------
 
 /// Per-context reconnection result surfaced to TypeScript.
@@ -2760,11 +2765,15 @@ pub(crate) async fn context_reconnect_on(
         .collect();
     let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
 
+    // Hold the 32-byte seed in `Zeroizing` so it is wiped after the driver
+    // call rather than lingering in freed memory.
+    let signing_key_bytes = zeroize::Zeroizing::new(sk.to_bytes());
+
     let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
         &transport,
         supervisor,
         DID(identity_did),
-        sk.to_bytes(),
+        signing_key_bytes,
         context_ids,
         contacts,
         now,

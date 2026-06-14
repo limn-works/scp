@@ -1,4 +1,4 @@
-//! Integration test for the #1540 reconnection driver (ADR-029).
+//! Integration test for the reconnection driver (ADR-029).
 //!
 //! Exercises the FFI/SDK-layer `RelayActorSyncDriver` and the
 //! `reconnect_contexts` orchestration against a **real** native relay and two
@@ -16,7 +16,7 @@
 //!   reflects her own epoch and the driver re-reads it after reconciliation.
 //! - **Checkpoint exchange.** The driver's Phase 3 builds + broadcasts Alice's
 //!   local consistency checkpoint via `Supervisor::build_local_checkpoint`,
-//!   composing with the #1540 Step 2/3 equivocation core.
+//!   composing with the equivocation core (§9.9.3).
 //! - **Equivocation on forgery.** A forged divergent checkpoint (equal event
 //!   count, different Merkle root) fed through `Supervisor::deliver_commit_blob`
 //!   surfaces `ContextEvent::EquivocationDetected` (§9.9.3).
@@ -195,7 +195,7 @@ async fn reconnect_classifies_all_three_tiers() {
         &transport,
         &alice.manager,
         DID::from(ALICE_DID),
-        signing_key_for(ALICE_DID).to_bytes(),
+        zeroize::Zeroizing::new(signing_key_for(ALICE_DID).to_bytes()),
         vec![short_ctx.to_owned()],
         short_contacts,
         now,
