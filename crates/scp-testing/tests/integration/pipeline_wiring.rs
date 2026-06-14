@@ -77,6 +77,22 @@ const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
+// Reconnection-driver source (#1540, ADR-029 reconnection-driver addendum).
+// The FFI/SDK-layer RelayActorSyncDriver lives here because the actor's
+// ContextTransportProvider is send-only; the b3_reconnect assertion below
+// pins the driver's event_log_sync to the build + compare checkpoint
+// exchange so a future refactor cannot silently sever the reconnection
+// path from the equivocation-detection core.
+const RECONNECT_DRIVER_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/common/src/reconnect.rs");
+
+// Actor messaging-handler source — owns `handle_build_local_checkpoint`,
+// the actor-turn body that builds AND broadcasts the Phase-3 checkpoint so
+// the FFI driver never needs the `pub(crate)` `send_checkpoint` across the
+// crate boundary (#1540).
+const HANDLERS_MESSAGING_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/messaging.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
@@ -1212,6 +1228,73 @@ fn b3_merkle_proof_verification_wired() {
         ),
         "deliver_checkpoint_message must call compare_remote_checkpoint so a \
          received checkpoint is checked for equivocation (§9.9.3)"
+    );
+}
+
+/// The FFI/SDK reconnection driver must DRIVE the checkpoint exchange, not
+/// merely re-implement it. The ADR-029 reconnection driver lives at the
+/// relay-client layer (the actor's transport provider is send-only); its
+/// Phase-3 `event_log_sync` must build + broadcast the local checkpoint via
+/// `Supervisor::build_local_checkpoint` AND surface remote-checkpoint
+/// equivocation alerts. Phase 2 (`epoch_reconciliation`) feeds retrieved
+/// blobs through `deliver_commit_blob`, whose `deliver_incoming` path reaches
+/// `compare_remote_checkpoint` (pinned by `b3_merkle_proof_verification_wired`)
+/// — so feeding the blobs is what reaches the comparison. Real call-site
+/// assertions (not bare string searches): without these the driver would be a
+/// dead reconnection path severed from the #1540 Step 2/3 equivocation core.
+#[test]
+fn b3_reconnect_drives_checkpoint_exchange() {
+    // Phase 3: event_log_sync must build (and, via the actor turn, broadcast)
+    // the local checkpoint through the supervisor mailbox wrapper.
+    assert!(
+        fn_body_contains(
+            RECONNECT_DRIVER_SRC,
+            "event_log_sync",
+            "build_local_checkpoint",
+        ),
+        "RelayActorSyncDriver::event_log_sync must build the local checkpoint \
+         via Supervisor::build_local_checkpoint (§9.9.3 Phase 3)"
+    );
+
+    // Phase 3: event_log_sync must surface the EquivocationDetected alerts the
+    // actor emitted while comparing retrieved remote checkpoints.
+    assert!(
+        fn_body_contains(
+            RECONNECT_DRIVER_SRC,
+            "event_log_sync",
+            "collect_equivocation_alerts",
+        ),
+        "RelayActorSyncDriver::event_log_sync must collect EquivocationDetected \
+         alerts surfaced by compare_remote_checkpoint (§9.9.3)"
+    );
+
+    // Phase 2: epoch_reconciliation must feed retrieved blobs through
+    // deliver_commit_blob — the DeliverIncoming path that dispatches
+    // ConsistencyCheckpoint messages to compare_remote_checkpoint. This is the
+    // composition seam with #1540 Step 2/3: feeding the blobs is what reaches
+    // the comparison.
+    assert!(
+        fn_body_contains(
+            RECONNECT_DRIVER_SRC,
+            "epoch_reconciliation",
+            "deliver_commit_blob",
+        ),
+        "RelayActorSyncDriver::epoch_reconciliation must feed retrieved blobs \
+         through Supervisor::deliver_commit_blob so received checkpoints reach \
+         compare_remote_checkpoint (composes with b3_merkle_proof_verification)"
+    );
+
+    // The build wrapper itself must reach send_checkpoint inside the actor turn
+    // (build + broadcast in one mailbox round-trip) so the driver never needs
+    // the pub(crate) send_checkpoint helper across the crate boundary.
+    assert!(
+        fn_body_contains(
+            HANDLERS_MESSAGING_SRC,
+            "handle_build_local_checkpoint",
+            "send_checkpoint",
+        ),
+        "handle_build_local_checkpoint must broadcast the freshly-built \
+         checkpoint to peers via send_checkpoint (Phase 3 build + broadcast)"
     );
 }
 
