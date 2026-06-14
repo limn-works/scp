@@ -61,8 +61,17 @@ const CHECKPOINT_TIME_INTERVAL_SECS: u64 = 600; // 10 minutes
 /// If two members produce checkpoints with different Merkle roots for the
 /// same event count, relay equivocation is detected.
 ///
-/// See ADR-011 acceptance criterion 8.
-#[derive(Debug, Clone)]
+/// This is the single canonical checkpoint type for the workspace. It is
+/// transmitted on the wire (the §9.9.3 checkpoint-exchange message carries a
+/// `MessagePack`-serialized value through the inner-envelope pipeline) and
+/// embedded in [`crate::sync`]-layer equivocation evidence, so it derives the
+/// full serde + equality surface those uses require. `deny_unknown_fields`
+/// rejects adversarial extra fields at the deserialization boundary;
+/// `serde_bytes` encodes the signature as a compact `MessagePack` binary blob.
+///
+/// See ADR-011 acceptance criterion 8 and spec §9.9.3.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConsistencyCheckpoint {
     /// The context this checkpoint belongs to.
     pub context_id: ContextId,
@@ -78,6 +87,7 @@ pub struct ConsistencyCheckpoint {
     pub timestamp: u64,
     /// Ed25519 signature over the canonical hash of all checkpoint fields
     /// (excluding the signature itself).
+    #[serde(with = "serde_bytes")]
     pub signature: Ed25519Signature,
 }
 

@@ -39,11 +39,7 @@ pub mod conflict_resolution;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 
-use crate::crypto::canonical::{CanonicalField, canonical_hash};
-use crate::crypto::ed25519::verify_ed25519_signature;
-use crate::trust::attestation::DidPublicKeyResolver;
 use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
@@ -253,104 +249,25 @@ pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTi
 /// Domain separator for `ConsistencyCheckpoint` canonical hash (§9.18.2, §23.16.1).
 pub const CONSISTENCY_CHECKPOINT_DOMAIN_SEPARATOR: &str = "SCP-CHECKPOINT-V1:";
 
-/// A signed consistency checkpoint used by the Relay Consistency Protocol.
+/// The single canonical consistency-checkpoint type for the workspace,
+/// re-exported from `scp-event-log` (the crate that owns checkpoint
+/// generation, the `SCP-CHECKPOINT-V1:` canonical hash via
+/// [`scp_event_log::checkpoint::compute_checkpoint_canonical_hash`], and
+/// signature verification via
+/// [`scp_event_log::checkpoint::verify_checkpoint_signature`]).
 ///
-/// At regular intervals (recommended: every 50 events or every 10 minutes,
-/// whichever comes first), each member computes and broadcasts a checkpoint
-/// over their local event log state. Other members compare received checkpoints
-/// against their own to detect relay equivocation.
+/// The pre-ADR-049 duplicate that lived here has been removed: the actor
+/// state, `create_checkpoint_if_due`, the FFI bridges, and this sync layer
+/// all reference one type, so a checkpoint produced by the event log can be
+/// compared and embedded as equivocation evidence without a lossy conversion.
 ///
-/// Checkpoints are sent as regular MLS application messages (encrypted,
-/// authenticated). See spec §9.9.3.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConsistencyCheckpoint {
-    /// The context this checkpoint belongs to.
-    pub context_id: ContextId,
-    /// The DID of the member who generated this checkpoint.
-    pub sender_did: DID,
-    /// Number of events in the sender's local event log.
-    pub event_count: u64,
-    /// Merkle root hash of the sender's local event log.
-    pub merkle_root: [u8; 32],
-    /// Current MLS epoch on the sender's device. `None` for Broadcast contexts.
-    pub epoch: Option<u64>,
-    /// Unix timestamp (seconds) when this checkpoint was generated.
-    pub timestamp: u64,
-    /// Ed25519 signature over all fields above, signed by the sender's
-    /// `#active` or `#agent` verification method key (ADR-039).
-    #[serde(with = "serde_bytes")]
-    pub signature: Ed25519Signature,
-}
-
-impl ConsistencyCheckpoint {
-    /// Computes the canonical hash for signing/verification (§23.16.1).
-    ///
-    /// Field order matches `scp-event-log` `compute_checkpoint_canonical_hash`:
-    /// `context_id`, `sender_did`, `event_count`, `merkle_root`, `epoch` (with
-    /// presence flag), `timestamp`.
-    /// Domain separator: `"SCP-CHECKPOINT-V1:"`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::crypto::canonical::CanonicalError::FieldTooLarge`] if
-    /// any variable-length field exceeds `u32::MAX` bytes. Cannot occur in
-    /// practice — context and DID strings are bounded to 512 bytes by
-    /// validation.
-    pub fn canonical_hash(&self) -> Result<[u8; 32], crate::crypto::canonical::CanonicalError> {
-        let mut fields: Vec<CanonicalField<'_>> = Vec::with_capacity(8);
-        fields.push(CanonicalField::VarBytes(self.context_id.as_bytes()));
-        fields.push(CanonicalField::VarBytes(self.sender_did.as_bytes()));
-        fields.push(CanonicalField::U64(self.event_count));
-        fields.push(CanonicalField::Fixed32(&self.merkle_root));
-        match self.epoch {
-            Some(epoch) => {
-                fields.push(CanonicalField::U8(0x01));
-                fields.push(CanonicalField::U64(epoch));
-            }
-            None => {
-                fields.push(CanonicalField::U8(0x00));
-            }
-        }
-        fields.push(CanonicalField::U64(self.timestamp));
-
-        canonical_hash(CONSISTENCY_CHECKPOINT_DOMAIN_SEPARATOR, &fields)
-    }
-
-    /// Verifies the Ed25519 signature on this checkpoint against the sender's
-    /// public key resolved via `resolver`.
-    ///
-    /// See spec §23.12.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::CheckpointSignatureFailure`] if the sender's
-    /// public key cannot be resolved or if the Ed25519 signature does not
-    /// verify against the canonical checkpoint hash.
-    pub fn verify_signature(&self, resolver: &impl DidPublicKeyResolver) -> Result<(), SyncError> {
-        let public_key = resolver.resolve_public_key(&self.sender_did).map_err(|e| {
-            SyncError::CheckpointSignatureFailure {
-                context_id: self.context_id.clone(),
-                sender_did: self.sender_did.clone(),
-                reason: format!("failed to resolve public key: {e}"),
-            }
-        })?;
-        let canonical =
-            self.canonical_hash()
-                .map_err(|e| SyncError::CheckpointSignatureFailure {
-                    context_id: self.context_id.clone(),
-                    sender_did: self.sender_did.clone(),
-                    reason: format!("canonical hash failed: {e}"),
-                })?;
-        verify_ed25519_signature(&public_key, &canonical, &self.signature).map_err(|reason| {
-            SyncError::CheckpointSignatureFailure {
-                context_id: self.context_id.clone(),
-                sender_did: self.sender_did.clone(),
-                reason,
-            }
-        })
-    }
-}
+/// `scp-protocol` already depends on `scp-event-log`, and `scp-event-log`
+/// pulls in no async runtime (it builds for `wasm32`), so this unification
+/// adds no new dependency and does not affect the no-tokio / wasm32 build
+/// constraint on `scp-protocol`.
+///
+/// See spec §9.9.3 and ADR-011 acceptance criterion 8.
+pub use scp_event_log::checkpoint::ConsistencyCheckpoint;
 
 // ---------------------------------------------------------------------------
 // EquivocationEvidence
@@ -755,64 +672,14 @@ pub enum SyncOutcome {
 // ---------------------------------------------------------------------------
 // Checkpoint comparison
 // ---------------------------------------------------------------------------
-
-/// Compares a local consistency checkpoint against a received remote
-/// checkpoint and returns an `EquivocationAlert` if divergence is detected.
-///
-/// The remote checkpoint's Ed25519 signature is verified against the sender's
-/// public key (resolved via `resolver`) before comparison. If the signature
-/// is invalid or the key cannot be resolved, returns
-/// [`SyncError::CheckpointSignatureFailure`].
-///
-/// Returns `Ok(None)` if context IDs differ (cross-context comparison is
-/// meaningless), if event counts differ (one member is behind), or if
-/// Merkle roots match (consistent). See spec §9.9.3, §23.12.
-///
-/// # Parameters
-///
-/// * `now` - Current timestamp (seconds since epoch). Used only to
-///   stamp the output `EquivocationAlert`. No freshness validation is
-///   performed on the remote checkpoint's timestamp -- replay
-///   protection relies on event-count divergence detection, not
-///   temporal freshness.
-///
-/// # Errors
-///
-/// Returns [`SyncError::CheckpointSignatureFailure`] if the remote
-/// checkpoint's signature is invalid.
-pub fn compare_checkpoints(
-    local: &ConsistencyCheckpoint,
-    remote: &ConsistencyCheckpoint,
-    now: u64,
-    resolver: &impl DidPublicKeyResolver,
-) -> Result<Option<EquivocationAlert>, SyncError> {
-    remote.verify_signature(resolver)?;
-
-    if local.context_id != remote.context_id {
-        return Ok(None);
-    }
-    if local.event_count != remote.event_count {
-        return Ok(None);
-    }
-    if bool::from(local.merkle_root.ct_eq(&remote.merkle_root)) {
-        return Ok(None);
-    }
-    Ok(Some(EquivocationAlert {
-        context_id: local.context_id.clone(),
-        detector_did: local.sender_did.clone(),
-        divergent_did: remote.sender_did.clone(),
-        divergent_event_count: local.event_count,
-        local_merkle_root: local.merkle_root,
-        remote_merkle_root: remote.merkle_root,
-        evidence: Some(EquivocationEvidence {
-            local_checkpoint: local.clone(),
-            remote_checkpoint: remote.clone(),
-            divergent_event_count: local.event_count,
-        }),
-        detected_at: now,
-        local_epoch: local.epoch,
-    }))
-}
+//
+// Cross-member checkpoint comparison that emits an equivocation event lives in
+// the runtime (`queries_helpers::compare_remote_checkpoint`), which has access
+// to the actor's live event-log provider and the key resolver. The previous
+// pure `compare_checkpoints` free function that lived here has been removed: it
+// had zero production callers, and its `epoch is None ⇒ FullyCaughtUp`
+// short-circuit (the #1216 defect) is not present in the runtime path, which
+// keys equivocation strictly on equal-event-count-different-root per §9.9.3.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -908,242 +775,58 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ConsistencyCheckpoint & compare_checkpoints tests
+    // ConsistencyCheckpoint (canonical type, re-exported from scp-event-log)
     // -----------------------------------------------------------------------
 
-    use crate::trust::TrustError;
-    use ed25519_dalek::{Signer, SigningKey};
-
-    /// Test resolver that maps DID strings to Ed25519 public key bytes.
-    struct TestDidResolver {
-        keys: std::collections::HashMap<String, Vec<u8>>,
-    }
-
-    impl TestDidResolver {
-        fn new() -> Self {
-            Self {
-                keys: std::collections::HashMap::new(),
-            }
-        }
-
-        fn insert(&mut self, did: &str, pk: &[u8]) {
-            self.keys.insert(did.to_owned(), pk.to_vec());
-        }
-    }
-
-    impl DidPublicKeyResolver for TestDidResolver {
-        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
-            self.keys
-                .get(did)
-                .cloned()
-                .ok_or_else(|| TrustError::AttestationSignatureInvalid {
-                    attestation_id: String::new(),
-                    reason: format!("unknown DID: {did}"),
-                })
-        }
-    }
-
-    /// Build a checkpoint and sign it with the provided signing key.
+    /// Build an unsigned canonical checkpoint for serde/embedding tests.
+    ///
+    /// Cross-member comparison and signature verification are exercised in the
+    /// runtime (`queries_helpers::compare_remote_checkpoint`) and in
+    /// `scp-event-log` (`verify_checkpoint_signature`); the sync layer only
+    /// needs to confirm the re-exported type round-trips and embeds in
+    /// equivocation evidence.
     fn make_checkpoint(
         context_id: &str,
         sender_did: &str,
         event_count: u64,
         merkle_root: [u8; 32],
         epoch: Option<u64>,
-        signing_key: &SigningKey,
     ) -> ConsistencyCheckpoint {
-        let mut cp = ConsistencyCheckpoint {
+        ConsistencyCheckpoint {
             context_id: context_id.to_owned(),
             sender_did: DID::from(sender_did),
             event_count,
             merkle_root,
             epoch,
             timestamp: 1_700_000_000,
-            signature: Vec::new(),
-        };
-        let canonical = cp.canonical_hash().unwrap();
-        cp.signature = signing_key.sign(&canonical).to_bytes().to_vec();
-        cp
-    }
-
-    /// Create a signing key and register its public key in the resolver.
-    fn make_keypair(resolver: &mut TestDidResolver, did: &str, seed: [u8; 32]) -> SigningKey {
-        let sk = SigningKey::from_bytes(&seed);
-        resolver.insert(did, sk.verifying_key().as_bytes());
-        sk
+            signature: vec![0xAB; 64],
+        }
     }
 
     #[test]
     fn consistency_checkpoint_serialization_roundtrip() {
-        let sk = SigningKey::from_bytes(&[0xAA; 32]);
-        let cp = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10), &sk);
+        let cp = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10));
         let json = serde_json::to_string(&cp).unwrap();
         let deserialized: ConsistencyCheckpoint = serde_json::from_str(&json).unwrap();
         assert_eq!(cp, deserialized);
     }
 
     #[test]
-    fn compare_checkpoints_cross_context_returns_none() {
-        // Two different contexts with same event count but different roots
-        // must NOT trigger equivocation — they are independent contexts.
-        let mut resolver = TestDidResolver::new();
-        let sk_a = make_keypair(&mut resolver, "did:key:alice", [0xAA; 32]);
-        let sk_b = make_keypair(&mut resolver, "did:key:bob", [0xBB; 32]);
-        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10), &sk_a);
-        let remote = make_checkpoint("ctx-2", "did:key:bob", 100, [2u8; 32], Some(10), &sk_b);
-        assert!(
-            compare_checkpoints(&local, &remote, 1_700_000_100, &resolver)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn compare_checkpoints_consistent() {
-        let mut resolver = TestDidResolver::new();
-        let sk_a = make_keypair(&mut resolver, "did:key:alice", [0xAA; 32]);
-        let sk_b = make_keypair(&mut resolver, "did:key:bob", [0xBB; 32]);
-        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10), &sk_a);
-        let remote = make_checkpoint("ctx-1", "did:key:bob", 100, [1u8; 32], Some(10), &sk_b);
-        assert!(
-            compare_checkpoints(&local, &remote, 1_700_000_100, &resolver)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn compare_checkpoints_different_event_counts_not_equivocation() {
-        let mut resolver = TestDidResolver::new();
-        let sk_a = make_keypair(&mut resolver, "did:key:alice", [0xAA; 32]);
-        let sk_b = make_keypair(&mut resolver, "did:key:bob", [0xBB; 32]);
-        let local = make_checkpoint("ctx-1", "did:key:alice", 95, [1u8; 32], Some(10), &sk_a);
-        let remote = make_checkpoint("ctx-1", "did:key:bob", 100, [2u8; 32], Some(10), &sk_b);
-        assert!(
-            compare_checkpoints(&local, &remote, 1_700_000_100, &resolver)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn compare_checkpoints_detects_equivocation() {
-        let mut resolver = TestDidResolver::new();
-        let sk_a = make_keypair(&mut resolver, "did:key:alice", [0xAA; 32]);
-        let sk_b = make_keypair(&mut resolver, "did:key:bob", [0xBB; 32]);
-        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10), &sk_a);
-        let remote = make_checkpoint("ctx-1", "did:key:bob", 100, [2u8; 32], Some(10), &sk_b);
-        let alert = compare_checkpoints(&local, &remote, 1_700_000_100, &resolver)
-            .unwrap()
-            .unwrap();
-        assert_eq!(alert.context_id, "ctx-1");
-        assert_eq!(alert.detector_did, DID::from("did:key:alice"));
-        assert_eq!(alert.divergent_did, DID::from("did:key:bob"));
-        assert_eq!(alert.divergent_event_count, 100);
-        assert_eq!(alert.local_merkle_root, [1u8; 32]);
-        assert_eq!(alert.remote_merkle_root, [2u8; 32]);
-        assert!(alert.evidence.is_some());
-    }
-
-    #[test]
-    fn compare_checkpoints_evidence_contains_both() {
-        let mut resolver = TestDidResolver::new();
-        let sk_a = make_keypair(&mut resolver, "did:key:alice", [0xAA; 32]);
-        let sk_b = make_keypair(&mut resolver, "did:key:bob", [0xBB; 32]);
-        let local = make_checkpoint("ctx-1", "did:key:alice", 50, [0xAA; 32], Some(5), &sk_a);
-        let remote = make_checkpoint("ctx-1", "did:key:bob", 50, [0xBB; 32], Some(5), &sk_b);
-        let alert = compare_checkpoints(&local, &remote, 1_700_001_000, &resolver)
-            .unwrap()
-            .unwrap();
-        let evidence = alert.evidence.unwrap();
-        assert_eq!(evidence.local_checkpoint, local);
-        assert_eq!(evidence.remote_checkpoint, remote);
-        assert_eq!(evidence.divergent_event_count, 50);
-    }
-
-    // -----------------------------------------------------------------------
-    // Signature verification tests (§23.12, #623)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn consistency_checkpoint_verify_signature_standalone() {
-        let mut resolver = TestDidResolver::new();
-        let sk = make_keypair(&mut resolver, "did:key:alice", [0x11; 32]);
-        let cp = make_checkpoint("ctx-1", "did:key:alice", 42, [0xCC; 32], Some(7), &sk);
-        cp.verify_signature(&resolver).unwrap();
-    }
-
-    #[test]
-    fn compare_checkpoints_rejects_forged_signature() {
-        let mut resolver = TestDidResolver::new();
-        let sk_a = make_keypair(&mut resolver, "did:key:alice", [0xAA; 32]);
-        let sk_b = make_keypair(&mut resolver, "did:key:bob", [0xBB; 32]);
-        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10), &sk_a);
-        let mut remote = make_checkpoint("ctx-1", "did:key:bob", 100, [2u8; 32], Some(10), &sk_b);
-        // Tamper with the signature bytes.
-        remote.signature[0] ^= 0xFF;
-        let result = compare_checkpoints(&local, &remote, 1_700_000_100, &resolver);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, SyncError::CheckpointSignatureFailure { .. }),
-            "expected CheckpointSignatureFailure, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn compare_checkpoints_rejects_wrong_signer() {
-        let mut resolver = TestDidResolver::new();
-        let sk_a = make_keypair(&mut resolver, "did:key:alice", [0xAA; 32]);
-        // Sign remote checkpoint with key A, but resolver maps bob to key C.
-        let sk_c = SigningKey::from_bytes(&[0xCC; 32]);
-        resolver.insert("did:key:bob", sk_c.verifying_key().as_bytes());
-        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10), &sk_a);
-        let remote = make_checkpoint("ctx-1", "did:key:bob", 100, [2u8; 32], Some(10), &sk_a);
-        let result = compare_checkpoints(&local, &remote, 1_700_000_100, &resolver);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            SyncError::CheckpointSignatureFailure { .. }
-        ),);
-    }
-
-    #[test]
-    fn compare_checkpoints_rejects_unresolvable_did() {
-        let mut resolver = TestDidResolver::new();
-        let sk_a = make_keypair(&mut resolver, "did:key:alice", [0xAA; 32]);
-        let sk_unknown = SigningKey::from_bytes(&[0xDD; 32]);
-        // Do NOT register "did:key:unknown" in the resolver.
-        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10), &sk_a);
-        let remote = make_checkpoint(
-            "ctx-1",
-            "did:key:unknown",
-            100,
-            [2u8; 32],
-            Some(10),
-            &sk_unknown,
-        );
-        let result = compare_checkpoints(&local, &remote, 1_700_000_100, &resolver);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("failed to resolve public key"),
-            "expected resolution failure message, got: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn compare_checkpoints_valid_signature_detects_equivocation() {
-        let mut resolver = TestDidResolver::new();
-        let sk_a = make_keypair(&mut resolver, "did:key:alice", [0xAA; 32]);
-        let sk_b = make_keypair(&mut resolver, "did:key:bob", [0xBB; 32]);
-        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10), &sk_a);
-        let remote = make_checkpoint("ctx-1", "did:key:bob", 100, [2u8; 32], Some(10), &sk_b);
-        let result = compare_checkpoints(&local, &remote, 1_700_000_100, &resolver);
-        let alert = result.unwrap().unwrap();
-        assert_eq!(alert.context_id, "ctx-1");
-        assert_eq!(alert.divergent_event_count, 100);
-        assert_ne!(alert.local_merkle_root, alert.remote_merkle_root);
+    fn equivocation_evidence_embeds_canonical_checkpoints() {
+        let local = make_checkpoint("ctx-1", "did:key:alice", 50, [0xAA; 32], Some(5));
+        let remote = make_checkpoint("ctx-1", "did:key:bob", 50, [0xBB; 32], Some(5));
+        let evidence = EquivocationEvidence {
+            local_checkpoint: local.clone(),
+            remote_checkpoint: remote.clone(),
+            divergent_event_count: 50,
+        };
+        // The evidence struct embeds the canonical scp-event-log checkpoint
+        // type directly (no lossy conversion) and round-trips via serde.
+        let json = serde_json::to_string(&evidence).unwrap();
+        let deserialized: EquivocationEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.local_checkpoint, local);
+        assert_eq!(deserialized.remote_checkpoint, remote);
+        assert_eq!(deserialized.divergent_event_count, 50);
     }
 
     #[test]
