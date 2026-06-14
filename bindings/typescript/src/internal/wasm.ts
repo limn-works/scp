@@ -410,6 +410,7 @@ interface WasmModule {
     epoch: number | null;
     timestamp: number;
     signingPayloadHash: string;
+    signature: string;
   }>;
   // Context drain/export/import
   context_drain_events: (handle: BridgeContextHandle) => string;
@@ -1520,15 +1521,16 @@ export function createWasmBridge(): Bridge {
     ): Promise<Checkpoint> {
       const wasm = getWasm();
       const result = await wasm.event_log_checkpoint(handle, identityDid, epoch);
-      // WASM cannot sign in-process (ADR-006/ADR-034); it returns the unsigned
-      // signable payload hash for a JS SDK to sign. Surface it so the capability
-      // is actually usable (ADR-048 §7b semantic divergence — see the
-      // `signingPayloadHash` doc on the `Checkpoint` type).
+      // WASM signs the checkpoint in-process with the identity's `#active`
+      // Ed25519 key (WASM identities are Rust-custodied; the private key never
+      // crosses FFI, ADR-006). Surface the `signed: true` variant carrying the
+      // signature, matching the NAPI bridge (see the `Checkpoint` type doc).
       return {
         root: result.merkleRoot,
         eventCount: result.eventCount,
         timestamp: result.timestamp,
-        signingPayloadHash: result.signingPayloadHash,
+        signed: true,
+        signature: result.signature,
       };
     },
 

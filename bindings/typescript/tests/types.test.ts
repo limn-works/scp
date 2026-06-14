@@ -9,6 +9,7 @@
 import { describe, expect, it } from "bun:test";
 import type {
   AddressResolution,
+  Checkpoint,
   ContextParams,
   DIDDocument,
   Event,
@@ -360,6 +361,37 @@ describe("type definitions", () => {
     expect(config.maxDeploySizeBytes).toBe(268435456);
     expect(config.deployRetentionCount).toBe(4);
     expect(config.cspOverride).toBe("default-src 'self'");
+  });
+
+  it("Checkpoint narrows the signed/unsigned discriminated union", () => {
+    // `signed: true` — the variant every live runtime (NAPI + WASM) returns.
+    // After narrowing on `signed`, `signature` is reachable and `signingPayloadHash`
+    // is not part of the variant (would be a type error to read it).
+    const signed: Checkpoint = {
+      root: "deadbeef",
+      eventCount: 3,
+      timestamp: 1700000000,
+      signed: true,
+      signature: "a".repeat(128),
+    };
+    expect(signed.signed).toBe(true);
+    if (signed.signed) {
+      expect(signed.signature).toMatch(/^[0-9a-f]{128}$/);
+    }
+
+    // `signed: false` — forward-compat variant (no current code path emits it).
+    // After narrowing, `signingPayloadHash` is the reachable field.
+    const unsigned: Checkpoint = {
+      root: "cafef00d",
+      eventCount: 0,
+      timestamp: 1650000000,
+      signed: false,
+      signingPayloadHash: "b".repeat(64),
+    };
+    expect(unsigned.signed).toBe(false);
+    if (!unsigned.signed) {
+      expect(unsigned.signingPayloadHash).toMatch(/^[0-9a-f]{64}$/);
+    }
   });
 });
 

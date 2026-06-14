@@ -79,20 +79,25 @@ impl WasmProof {
 // WasmCheckpoint
 // ---------------------------------------------------------------------------
 
-/// An unsigned consistency checkpoint from the context event log.
+/// A signed consistency checkpoint from the context event log.
 ///
-/// The `signing_payload_hash` field contains the SHA-256 hash of the canonical
-/// signing payload. On the WASM/browser runtime the Rust bridge cannot access
-/// the identity's private key (ADR-006/ADR-034: signing is a JS-side
-/// responsibility), so this checkpoint is the *unsigned signable payload*, not
-/// a finished signed checkpoint. A JS SDK is expected to sign
-/// `signing_payload_hash` via `SubtleCrypto`/`WebCrypto` to produce a signed
-/// checkpoint; that signing step is not yet implemented in the TS SDK. The
-/// native bridges (PyO3/NAPI/UniFFI) sign in-process and return a signed
-/// checkpoint instead — this WASM vs. native difference is recorded as an
-/// ADR-048 §7b cross-bridge semantic divergence for `event_log_checkpoint*`.
+/// The WASM bridge signs the checkpoint **in-process** with the identity's
+/// `#active` Ed25519 key, mirroring the native bridges (PyO3/NAPI/UniFFI).
+/// WASM identities are Rust-custodied — the `IDENTITY_REGISTRY` is keyed by DID
+/// and holds the private key material from an `OsRng`-generated keypair — so
+/// the private key never crosses the FFI boundary (ADR-006 satisfied) and
+/// signing happens entirely on the Rust side. The `signature` field carries the
+/// 64-byte Ed25519 signature (hex) over the canonical checkpoint hash;
+/// `JsKeyCustody` remains an unused ADR-022 injection-point surface and is not
+/// consulted here.
 ///
-/// See ADR-011 acceptance criterion 8 and ADR-030.
+/// The `signing_payload_hash` field retains the SHA-256 of the canonical
+/// signing payload (hex) — the exact 32 bytes the signature is computed over —
+/// so callers can independently verify the signature against the canonical
+/// hash. The byte layout matches `compute_checkpoint_canonical_hash` in
+/// `scp-event-log/src/checkpoint.rs` and is identical across all bridges.
+///
+/// See ADR-011 acceptance criterion 8, ADR-030, and ADR-048 §7b.
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct WasmCheckpoint {
@@ -103,6 +108,7 @@ pub struct WasmCheckpoint {
     epoch: Option<u64>,
     timestamp: f64,
     signing_payload_hash: String,
+    signature: String,
 }
 
 #[wasm_bindgen]
@@ -151,13 +157,28 @@ impl WasmCheckpoint {
 
     /// Returns the SHA-256 hash of the canonical signing payload (hex).
     ///
-    /// This is the signable payload; WASM does not sign it (ADR-006/ADR-034).
-    /// A JS SDK is expected to sign this hash via `SubtleCrypto`/`WebCrypto` to
-    /// produce a signed checkpoint (not yet implemented in the TS SDK).
+    /// This is the exact 32-byte preimage the [`signature`](Self::signature) is
+    /// computed over (`compute_checkpoint_canonical_hash`, identical across all
+    /// bridges). It is retained alongside the signature so callers can verify
+    /// the Ed25519 signature against the canonical hash without rebuilding the
+    /// payload.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "signingPayloadHash")]
     pub fn signing_payload_hash(&self) -> String {
         self.signing_payload_hash.clone()
+    }
+
+    /// Returns the Ed25519 signature over the canonical checkpoint hash (hex).
+    ///
+    /// 64 bytes hex-encoded. WASM signs the checkpoint in-process with the
+    /// identity's `#active` key (ADR-006 satisfied — the private key never
+    /// crosses FFI), matching the native bridges. Verify it against the
+    /// [`signing_payload_hash`](Self::signing_payload_hash) using the signer's
+    /// `#active` verifying key.
+    #[must_use]
+    #[wasm_bindgen(getter)]
+    pub fn signature(&self) -> String {
+        self.signature.clone()
     }
 }
 
@@ -373,29 +394,32 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
     })
 }
 
-/// Generates a consistency checkpoint from the current event log state.
+/// Generates a signed consistency checkpoint from the current event log state.
 ///
-/// Retrieves the event log's Merkle root and event count, then returns an
-/// *unsigned* checkpoint. WASM cannot sign in-process (ADR-006/ADR-034): the
-/// returned `WasmCheckpoint` carries `signing_payload_hash`, the SHA-256 of the
-/// canonical signing payload, which a JS SDK is expected to sign via
-/// `WebCrypto`/`SubtleCrypto` to produce a signed checkpoint (not yet
-/// implemented in the TS SDK). The native bridges sign in-process and return a
-/// signed checkpoint — recorded as an ADR-048 §7b semantic divergence.
+/// Retrieves the event log's Merkle root and event count, builds the canonical
+/// `SCP-CHECKPOINT-V1` payload, and signs its SHA-256 hash **in-process** with
+/// the identity's `#active` Ed25519 key — mirroring the native bridges
+/// (PyO3/NAPI/UniFFI). WASM identities are Rust-custodied (the DID-keyed
+/// `IDENTITY_REGISTRY` holds the private key); the key never crosses FFI
+/// (ADR-006 satisfied). The returned `WasmCheckpoint` carries both the
+/// `signature` (64-byte Ed25519, hex) and `signingPayloadHash` (the canonical
+/// hash the signature is over) so callers can verify without rebuilding the
+/// payload.
 ///
 /// # Arguments
 ///
 /// * `context` — The context whose event log to checkpoint.
-/// * `identity_did` — The DID of the identity generating the checkpoint.
+/// * `identity_did` — The DID of the identity generating the checkpoint. Must
+///   be a local identity created via `identity_create`; a DID with no retained
+///   signing key surfaces `SCP-IDENT-1001`.
 /// * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
 ///
 /// # Returns
 ///
-/// A `Promise<WasmCheckpoint>` whose `signingPayloadHash` field is the
-/// hex-encoded SHA-256 of the canonical checkpoint payload to be signed JS-side
-/// via `SubtleCrypto.sign`.
+/// A `Promise<WasmCheckpoint>` carrying the in-process Ed25519 `signature` and
+/// the `signingPayloadHash` it was computed over.
 ///
-/// See ADR-011 acceptance criterion 8 and ADR-030.
+/// See ADR-011 acceptance criterion 8, ADR-030, and ADR-048 §7b.
 #[wasm_bindgen]
 pub fn event_log_checkpoint(
     context: &WasmContextHandle,
@@ -405,30 +429,32 @@ pub fn event_log_checkpoint(
     checkpoint_promise(context, identity_did, epoch)
 }
 
-/// Generates a consistency checkpoint scoped to a member DID.
+/// Generates a signed consistency checkpoint scoped to a member DID.
 ///
 /// Identical in behaviour to [`event_log_checkpoint`]: the WASM bridge has no
-/// `Identity` opaque object and no DID-keyed registry — it already operates
-/// purely on the `did` string, deferring Ed25519 signing to the JS-side
-/// `WebCrypto` custody. The `did` names the member the checkpoint is attributed
-/// to and is recorded as `sender_did` in the returned `WasmCheckpoint`. This
-/// is the WASM port of the NAPI/PyO3 `event_log_checkpoint_by_did` entry point,
-/// requiring no `scp-runtime` dependency (the canonical payload is built from
+/// `Identity` opaque object, so both entry points operate on the `did` string
+/// and resolve the signing key from the DID-keyed `IDENTITY_REGISTRY`, signing
+/// the canonical hash in-process with the member's `#active` Ed25519 key. The
+/// `did` names the member the checkpoint is attributed to and is recorded as
+/// `sender_did` in the returned `WasmCheckpoint`. This is the WASM port of the
+/// NAPI/PyO3 `event_log_checkpoint_by_did` entry point; it requires no
+/// `scp-runtime` dependency (the canonical payload is built from
 /// `scp_event_log` Merkle state alone, per ADR-034).
 ///
 /// # Arguments
 ///
 /// * `context` — The context whose event log to checkpoint.
-/// * `did` — The DID of the member generating the checkpoint.
+/// * `did` — The DID of the member generating the checkpoint. Must be a local
+///   identity created via `identity_create`; a DID with no retained signing key
+///   surfaces `SCP-IDENT-1001`.
 /// * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
 ///
 /// # Returns
 ///
-/// A `Promise<WasmCheckpoint>` whose `signingPayloadHash` field is the
-/// hex-encoded SHA-256 of the canonical checkpoint payload to be signed JS-side
-/// via `SubtleCrypto.sign`.
+/// A `Promise<WasmCheckpoint>` carrying the in-process Ed25519 `signature` and
+/// the `signingPayloadHash` it was computed over.
 ///
-/// See ADR-011 acceptance criterion 8 and ADR-030.
+/// See ADR-011 acceptance criterion 8, ADR-030, and ADR-048 §7b.
 #[wasm_bindgen]
 pub fn event_log_checkpoint_by_did(
     context: &WasmContextHandle,
@@ -438,13 +464,59 @@ pub fn event_log_checkpoint_by_did(
     checkpoint_promise(context, did, epoch)
 }
 
+/// Builds the canonical checkpoint signing payload (the SHA-256 preimage).
+///
+/// Single source of truth for the byte layout so the producer
+/// ([`checkpoint_promise`]) and the conformance test cannot drift. The layout
+/// is byte-identical to `compute_checkpoint_canonical_hash` in
+/// `scp-event-log/src/checkpoint.rs`, so `SHA-256` of this payload equals the
+/// native bridges' canonical checkpoint hash:
+///
+/// ```text
+/// "SCP-CHECKPOINT-V1:" || BE32(len(ctx)) || ctx || BE32(len(did)) || did
+///   || event_count_BE || merkle_root(32 raw bytes)
+///   || epoch_flag (0x01 Some / 0x00 None) || [epoch_BE if Some] || timestamp_BE
+/// ```
+fn build_checkpoint_signing_payload(
+    context_id: &str,
+    sender_did: &str,
+    event_count: u64,
+    merkle_root: &[u8; 32],
+    epoch: Option<u64>,
+    timestamp: u64,
+) -> Vec<u8> {
+    let ctx_bytes = context_id.as_bytes();
+    let did_bytes = sender_did.as_bytes();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"SCP-CHECKPOINT-V1:");
+    #[allow(clippy::cast_possible_truncation)]
+    payload.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+    payload.extend_from_slice(ctx_bytes);
+    #[allow(clippy::cast_possible_truncation)]
+    payload.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+    payload.extend_from_slice(did_bytes);
+    payload.extend_from_slice(&event_count.to_be_bytes());
+    payload.extend_from_slice(merkle_root);
+    match epoch {
+        Some(e) => {
+            payload.push(0x01);
+            payload.extend_from_slice(&e.to_be_bytes());
+        }
+        None => payload.push(0x00),
+    }
+    payload.extend_from_slice(&timestamp.to_be_bytes());
+    payload
+}
+
 /// Shared checkpoint-generation body for [`event_log_checkpoint`] and
 /// [`event_log_checkpoint_by_did`].
 ///
 /// Both WASM checkpoint entry points are scoped to a member DID string (WASM
 /// has no `Identity` object), so they share this implementation: validate the
 /// DID, snapshot the event log's Merkle root + event count, build the canonical
-/// `SCP-CHECKPOINT-V1` payload, and return its SHA-256 hash for JS-side signing.
+/// `SCP-CHECKPOINT-V1` payload, hash it, sign that hash in-process with the
+/// member's `#active` Ed25519 key (ADR-006 satisfied — the key never crosses
+/// FFI), and return the signed `WasmCheckpoint`.
 fn checkpoint_promise(context: &WasmContextHandle, identity_did: String, epoch: f64) -> Promise {
     if let Err(e) = validate_did(&identity_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
@@ -458,13 +530,6 @@ fn checkpoint_promise(context: &WasmContextHandle, identity_did: String, epoch: 
             validate_non_negative_epoch(epoch).map_err(|e| JsValue::from(e.into_js()))?;
 
         let timestamp_secs = crate::time::now_secs();
-
-        // Build canonical checkpoint payload for signing, matching native Rust's
-        // compute_checkpoint_canonical_hash in scp-event-log/src/checkpoint.rs.
-        // Format: "SCP-CHECKPOINT-V1:" || BE32(len(ctx)) || ctx || BE32(len(did)) || did
-        //         || event_count_BE || merkle_root(raw 32 bytes) || epoch_flag || [epoch_BE] || timestamp_BE
-        let ctx_bytes = context_id.as_bytes();
-        let did_bytes = identity_did.as_bytes();
 
         // Decode the hex merkle root to raw bytes for cross-platform compatibility.
         let merkle_root_bytes: [u8; 32] = {
@@ -488,23 +553,22 @@ fn checkpoint_promise(context: &WasmContextHandle, identity_did: String, epoch: 
             arr
         };
 
-        let mut signing_payload = Vec::new();
-        signing_payload.extend_from_slice(b"SCP-CHECKPOINT-V1:");
-        #[allow(clippy::cast_possible_truncation)]
-        signing_payload.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
-        signing_payload.extend_from_slice(ctx_bytes);
-        #[allow(clippy::cast_possible_truncation)]
-        signing_payload.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
-        signing_payload.extend_from_slice(did_bytes);
-        signing_payload.extend_from_slice(&event_count.to_be_bytes());
-        signing_payload.extend_from_slice(&merkle_root_bytes);
-        // epoch_flag: 0x01 if Some, 0x00 if None (always Some here since we accept epoch param).
-        signing_payload.push(0x01);
-        signing_payload.extend_from_slice(&epoch_u64.to_be_bytes());
-        signing_payload.extend_from_slice(&timestamp_secs.to_be_bytes());
+        // Build the canonical checkpoint signing payload via the single-source
+        // helper so producer, verifier, and test cannot drift. The byte layout
+        // matches `compute_checkpoint_canonical_hash` in
+        // scp-event-log/src/checkpoint.rs (epoch is always `Some` here).
+        let signing_payload = build_checkpoint_signing_payload(
+            &context_id,
+            &identity_did,
+            event_count,
+            &merkle_root_bytes,
+            Some(epoch_u64),
+            timestamp_secs,
+        );
 
-        // Compute SHA-256 hash of the canonical signing payload. The
-        // TypeScript SDK wrapper must sign this hash via SubtleCrypto.
+        // Compute SHA-256 hash of the canonical signing payload. This is the
+        // 32-byte preimage the Ed25519 signature is computed over — identical
+        // to the native bridges' `compute_checkpoint_canonical_hash` output.
         let payload_hash = sha2::Sha256::digest(&signing_payload);
         let payload_hex = payload_hash
             .iter()
@@ -513,6 +577,18 @@ fn checkpoint_promise(context: &WasmContextHandle, identity_did: String, epoch: 
                 let _ = write!(acc, "{b:02x}");
                 acc
             });
+
+        // Sign the canonical hash in-process with the identity's `#active`
+        // Ed25519 key. WASM identities are Rust-custodied (DID-keyed
+        // IDENTITY_REGISTRY); the private key never crosses FFI (ADR-006). The
+        // native bridges sign the same 32-byte digest, so the resulting
+        // signature is byte-identical across runtimes (Ed25519 is
+        // deterministic). Do NOT re-hash — `payload_hash` is already the
+        // canonical hash the verifier checks against.
+        let signature_bytes =
+            crate::identity::sign_with_identity(&identity_did, "#active", payload_hash.as_slice())
+                .map_err(ScpWasmError::into_js)?;
+        let signature_hex = hex::encode(signature_bytes);
 
         Ok(JsValue::from(WasmCheckpoint {
             context_id,
@@ -523,6 +599,7 @@ fn checkpoint_promise(context: &WasmContextHandle, identity_did: String, epoch: 
             #[allow(clippy::cast_precision_loss)]
             timestamp: timestamp_secs as f64,
             signing_payload_hash: payload_hex,
+            signature: signature_hex,
         }))
     })
 }
@@ -670,5 +747,86 @@ mod tests {
         let filter = Some(serde_json::json!({ "eventType": "MessageSent" }));
         let parsed = extract_filter(filter.as_ref());
         assert!(parsed.limit.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Canonical checkpoint payload — WASM byte layout matches scp-event-log
+    // -----------------------------------------------------------------------
+
+    /// The WASM checkpoint signing payload's SHA-256 MUST equal the native
+    /// bridges' `compute_checkpoint_canonical_hash` for the same inputs. Both
+    /// the in-process WASM signature and the native signature are computed over
+    /// this 32-byte digest, so any drift here would silently break cross-bridge
+    /// checkpoint verification. Fixed inputs keep the assertion deterministic.
+    #[test]
+    fn wasm_checkpoint_payload_hash_matches_event_log_canonical() {
+        let context_id = "ctx-checkpoint-conformance";
+        let sender_did = "did:dht:zexampleconformancecheckpoint";
+        let event_count: u64 = 7;
+        let merkle_root: [u8; 32] = [0xAB; 32];
+        let epoch: Option<u64> = Some(3);
+        let timestamp: u64 = 1_700_000_000;
+
+        let payload = build_checkpoint_signing_payload(
+            context_id,
+            sender_did,
+            event_count,
+            &merkle_root,
+            epoch,
+            timestamp,
+        );
+        let wasm_hash = sha2::Sha256::digest(&payload);
+
+        let native_hash = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
+            context_id,
+            sender_did,
+            event_count,
+            &merkle_root,
+            epoch,
+            timestamp,
+        );
+
+        assert_eq!(
+            wasm_hash.as_slice(),
+            native_hash.as_slice(),
+            "WASM checkpoint payload hash must equal scp-event-log canonical hash"
+        );
+    }
+
+    /// The `None`-epoch branch (Broadcast contexts on the native path) must
+    /// also match — guards the `epoch_flag` byte and the absence of the epoch
+    /// field, which only this branch exercises.
+    #[test]
+    fn wasm_checkpoint_payload_hash_matches_canonical_without_epoch() {
+        let context_id = "ctx-broadcast";
+        let sender_did = "did:dht:zbroadcastsender";
+        let event_count: u64 = 0;
+        let merkle_root: [u8; 32] = [0x11; 32];
+        let timestamp: u64 = 1_650_000_123;
+
+        let payload = build_checkpoint_signing_payload(
+            context_id,
+            sender_did,
+            event_count,
+            &merkle_root,
+            None,
+            timestamp,
+        );
+        let wasm_hash = sha2::Sha256::digest(&payload);
+
+        let native_hash = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
+            context_id,
+            sender_did,
+            event_count,
+            &merkle_root,
+            None,
+            timestamp,
+        );
+
+        assert_eq!(
+            wasm_hash.as_slice(),
+            native_hash.as_slice(),
+            "WASM None-epoch checkpoint payload hash must equal canonical hash"
+        );
     }
 }

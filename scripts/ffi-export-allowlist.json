@@ -1348,6 +1348,12 @@
       "reason": "Getter for the message sender DID on a result type."
     },
     {
+      "name": "signature",
+      "path": "crates/scp-ffi/wasm/src/event_log.rs",
+      "kind": "getter",
+      "reason": "Getter for the in-process Ed25519 checkpoint signature (hex) on a result type."
+    },
+    {
       "name": "signing_payload_hash",
       "path": "crates/scp-ffi/wasm/src/event_log.rs",
       "kind": "getter",

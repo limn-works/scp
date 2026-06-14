@@ -694,13 +694,14 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(checkpoint.root).toBeTruthy();
       expect(typeof checkpoint.eventCount).toBe("number");
       expect(typeof checkpoint.timestamp).toBe("number");
-      // The native (NAPI) bridge signs the checkpoint in-process and the SDK
-      // surfaces the Ed25519 signature (hex). On native, `signature` is present
-      // and `signingPayloadHash` is absent (the inverse holds for WASM).
-      expect(typeof checkpoint.signature).toBe("string");
-      expect(checkpoint.signature).toMatch(/^[0-9a-f]+$/);
-      expect((checkpoint.signature as string).length).toBeGreaterThan(0);
-      expect(checkpoint.signingPayloadHash).toBeUndefined();
+      // The NAPI bridge signs the checkpoint in-process, so the SDK returns the
+      // `signed: true` variant carrying the Ed25519 signature (hex, 128 chars).
+      // Narrow on the `signed` discriminant before reading `signature`.
+      expect(checkpoint.signed).toBe(true);
+      if (checkpoint.signed) {
+        expect(typeof checkpoint.signature).toBe("string");
+        expect(checkpoint.signature).toMatch(/^[0-9a-f]{128}$/);
+      }
     });
   });
 
