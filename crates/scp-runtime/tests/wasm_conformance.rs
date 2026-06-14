@@ -2343,43 +2343,6 @@ fn source_type_string_format_is_stable() {
 // Test: WASM and native checkpoint signing produce byte-identical signatures
 // ===========================================================================
 
-/// Builds the WASM checkpoint signing payload (mirrors
-/// `build_checkpoint_signing_payload` in `crates/scp-ffi/wasm/src/event_log.rs`).
-/// The byte layout is identical to `compute_checkpoint_canonical_hash`, so
-/// SHA-256 of this payload equals the native bridges' canonical checkpoint hash.
-// Length-prefix fields are DIDs / context IDs — short strings whose lengths
-// never approach u32::MAX, so the `as u32` truncation cannot occur (mirrors the
-// WASM source's `#[allow]` on the same length-prefix casts).
-#[allow(clippy::cast_possible_truncation)]
-fn wasm_checkpoint_signing_payload(
-    context_id: &str,
-    sender_did: &str,
-    event_count: u64,
-    merkle_root: &[u8; 32],
-    epoch: Option<u64>,
-    timestamp: u64,
-) -> Vec<u8> {
-    let ctx_bytes = context_id.as_bytes();
-    let did_bytes = sender_did.as_bytes();
-    let mut payload = Vec::new();
-    payload.extend_from_slice(b"SCP-CHECKPOINT-V1:");
-    payload.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
-    payload.extend_from_slice(ctx_bytes);
-    payload.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
-    payload.extend_from_slice(did_bytes);
-    payload.extend_from_slice(&event_count.to_be_bytes());
-    payload.extend_from_slice(merkle_root);
-    match epoch {
-        Some(e) => {
-            payload.push(0x01);
-            payload.extend_from_slice(&e.to_be_bytes());
-        }
-        None => payload.push(0x00),
-    }
-    payload.extend_from_slice(&timestamp.to_be_bytes());
-    payload
-}
-
 /// Minimal `EventLogSigner` over a fixed Ed25519 key — mirrors how the native
 /// checkpoint path signs (`signer.sign(&canonical_hash)` in
 /// `generate_checkpoint_at`). A fixed key lets the parity test assert that the
@@ -2397,14 +2360,18 @@ impl scp_event_log::EventLogSigner for FixedKeySigner {
 /// Cross-runtime parity: the WASM bridge signs a checkpoint in-process with the
 /// identity's `#active` Ed25519 key over the canonical checkpoint hash, exactly
 /// as the native bridges do (`generate_checkpoint_at` →
-/// `signer.sign(&canonical_hash)` in `scp-event-log/src/checkpoint.rs`). This
-/// test proves three things for fixed inputs:
+/// `signer.sign(&canonical_hash)` in `scp-event-log/src/checkpoint.rs`). Both
+/// the WASM producer (`checkpoint_promise` in
+/// `crates/scp-ffi/wasm/src/event_log.rs`) and the native path call
+/// `compute_checkpoint_canonical_hash` directly, so there is no separate WASM
+/// payload layout to assert — they share one canonical hash by construction.
 ///
-/// 1. The WASM-style payload's SHA-256 equals `compute_checkpoint_canonical_hash`.
-/// 2. The native-style signature and the WASM-path signature are byte-identical
-///    64-byte Ed25519 signatures (Ed25519 over the same digest with the same key
-///    is deterministic).
-/// 3. Both signatures `verify_strict` against the `#active` verifying key.
+/// This test proves the signing parity for fixed inputs:
+///
+/// 1. The native-style signature and the WASM-path signature are byte-identical
+///    64-byte Ed25519 signatures (Ed25519 over the same canonical digest with
+///    the same key is deterministic).
+/// 2. Both signatures `verify_strict` against the `#active` verifying key.
 #[tokio::test]
 async fn wasm_and_native_checkpoint_signatures_are_byte_identical() {
     use ed25519_dalek::Signer as _;
@@ -2424,16 +2391,9 @@ async fn wasm_and_native_checkpoint_signatures_are_byte_identical() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
     let verifying_key = signing_key.verifying_key();
 
-    // (1) WASM payload hash == native canonical hash.
-    let wasm_payload = wasm_checkpoint_signing_payload(
-        context_id,
-        sender_did,
-        event_count,
-        &merkle_root,
-        epoch,
-        timestamp,
-    );
-    let wasm_hash = Sha256::digest(&wasm_payload);
+    // Both the WASM producer and the native path compute the signing digest via
+    // `compute_checkpoint_canonical_hash` directly — the single shared canonical
+    // function. Sign that 32-byte digest exactly as each runtime does.
     let canonical_hash = compute_checkpoint_canonical_hash(
         context_id,
         sender_did,
@@ -2442,13 +2402,8 @@ async fn wasm_and_native_checkpoint_signatures_are_byte_identical() {
         epoch,
         timestamp,
     );
-    assert_eq!(
-        wasm_hash.as_slice(),
-        canonical_hash.as_slice(),
-        "WASM checkpoint payload hash must equal the native canonical hash"
-    );
 
-    // (2) Native-style signing via `EventLogSigner::sign(&canonical_hash)`.
+    // (1) Native-style signing via `EventLogSigner::sign(&canonical_hash)`.
     let native_signer = FixedKeySigner(signing_key.clone());
     let native_sig_bytes = native_signer
         .sign(&canonical_hash)
@@ -2458,7 +2413,7 @@ async fn wasm_and_native_checkpoint_signatures_are_byte_identical() {
 
     // WASM-path signing: exactly what `sign_with_identity` does — Ed25519
     // `Signer::sign` over the same 32-byte canonical hash, returning [u8; 64].
-    let wasm_sig: [u8; 64] = signing_key.sign(wasm_hash.as_slice()).to_bytes();
+    let wasm_sig: [u8; 64] = signing_key.sign(canonical_hash.as_slice()).to_bytes();
 
     assert_eq!(
         native_sig_bytes.as_slice(),
@@ -2466,7 +2421,7 @@ async fn wasm_and_native_checkpoint_signatures_are_byte_identical() {
         "WASM and native checkpoint signatures must be byte-identical"
     );
 
-    // (3) Both signatures verify_strict against the `#active` key.
+    // (2) Both signatures verify_strict against the `#active` key.
     let native_sig = ed25519_dalek::Signature::from_bytes(
         native_sig_bytes
             .as_slice()
@@ -2478,6 +2433,6 @@ async fn wasm_and_native_checkpoint_signatures_are_byte_identical() {
         .verify_strict(canonical_hash.as_slice(), &native_sig)
         .expect("native signature must verify against #active key");
     verifying_key
-        .verify_strict(wasm_hash.as_slice(), &wasm_sig_parsed)
+        .verify_strict(canonical_hash.as_slice(), &wasm_sig_parsed)
         .expect("WASM signature must verify against #active key");
 }

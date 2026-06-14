@@ -694,14 +694,10 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(checkpoint.root).toBeTruthy();
       expect(typeof checkpoint.eventCount).toBe("number");
       expect(typeof checkpoint.timestamp).toBe("number");
-      // The NAPI bridge signs the checkpoint in-process, so the SDK returns the
-      // `signed: true` variant carrying the Ed25519 signature (hex, 128 chars).
-      // Narrow on the `signed` discriminant before reading `signature`.
-      expect(checkpoint.signed).toBe(true);
-      if (checkpoint.signed) {
-        expect(typeof checkpoint.signature).toBe("string");
-        expect(checkpoint.signature).toMatch(/^[0-9a-f]{128}$/);
-      }
+      // The NAPI bridge signs the checkpoint in-process, so the SDK returns a
+      // flat checkpoint carrying the Ed25519 signature (hex, 128 chars).
+      expect(typeof checkpoint.signature).toBe("string");
+      expect(checkpoint.signature).toMatch(/^[0-9a-f]{128}$/);
     });
   });
 

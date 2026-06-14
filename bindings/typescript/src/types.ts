@@ -725,43 +725,26 @@ export interface Proof {
   readonly details: Readonly<Record<string, unknown>>;
 }
 
-/** Fields common to every {@link Checkpoint} variant. */
-export interface CheckpointBase {
+/**
+ * A consistency checkpoint from the event log.
+ *
+ * Every runtime — NAPI (Node/Bun) **and** WASM (browser) — signs the canonical
+ * checkpoint payload in-process with the identity's `#active` Ed25519 key, so a
+ * checkpoint always carries a hex `signature` over the canonical checkpoint
+ * hash. WASM identities are Rust-custodied; the private key never crosses the
+ * FFI boundary (ADR-006). The shape matches the flat signed checkpoint returned
+ * by the Python, Swift, and Kotlin SDKs.
+ */
+export interface Checkpoint {
   /** The Merkle root hash as a hex string. */
   readonly root: string;
   /** The number of events in the log at checkpoint time. */
   readonly eventCount: number;
   /** Timestamp of the checkpoint (seconds since epoch). */
   readonly timestamp: number;
+  /** Ed25519 signature over the canonical checkpoint hash (hex, 64 bytes / 128 chars). */
+  readonly signature: string;
 }
-
-/**
- * A consistency checkpoint from the event log, discriminated on `signed`.
- *
- * Every runtime — NAPI (Node/Bun) **and** WASM (browser) — signs the canonical
- * checkpoint payload in-process with the identity's `#active` Ed25519 key, so
- * the live SDK always produces the `signed: true` variant carrying a hex
- * `signature`. WASM identities are Rust-custodied; the private key never
- * crosses the FFI boundary (ADR-006).
- *
- * The `signed: false` variant exists for forward-compatibility — e.g. a future
- * external-custody runtime that returns only the unsigned `signingPayloadHash`
- * for the caller to sign out of band. No current code path emits it; narrow on
- * `signed` before reading either the `signature` or the `signingPayloadHash`.
- */
-export type Checkpoint =
-  | (CheckpointBase & {
-      /** Discriminant: the checkpoint was signed in-process. */
-      readonly signed: true;
-      /** Ed25519 signature over the canonical checkpoint hash (hex, 64 bytes / 128 chars). */
-      readonly signature: string;
-    })
-  | (CheckpointBase & {
-      /** Discriminant: the checkpoint is unsigned (forward-compat; not currently emitted). */
-      readonly signed: false;
-      /** SHA-256 of the canonical signing payload (hex) for out-of-band signing. */
-      readonly signingPayloadHash: string;
-    });
 
 /** Filter parameters for event log queries. */
 export interface EventFilter {

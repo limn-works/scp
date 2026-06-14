@@ -363,35 +363,20 @@ describe("type definitions", () => {
     expect(config.cspOverride).toBe("default-src 'self'");
   });
 
-  it("Checkpoint narrows the signed/unsigned discriminated union", () => {
-    // `signed: true` — the variant every live runtime (NAPI + WASM) returns.
-    // After narrowing on `signed`, `signature` is reachable and `signingPayloadHash`
-    // is not part of the variant (would be a type error to read it).
-    const signed: Checkpoint = {
+  it("Checkpoint is a flat always-signed shape with a required signature", () => {
+    // Every live runtime (NAPI + WASM) signs the checkpoint in-process, so the
+    // SDK surface is a flat checkpoint carrying a required hex `signature` —
+    // matching the Python, Swift, and Kotlin SDKs.
+    const checkpoint: Checkpoint = {
       root: "deadbeef",
       eventCount: 3,
       timestamp: 1700000000,
-      signed: true,
       signature: "a".repeat(128),
     };
-    expect(signed.signed).toBe(true);
-    if (signed.signed) {
-      expect(signed.signature).toMatch(/^[0-9a-f]{128}$/);
-    }
-
-    // `signed: false` — forward-compat variant (no current code path emits it).
-    // After narrowing, `signingPayloadHash` is the reachable field.
-    const unsigned: Checkpoint = {
-      root: "cafef00d",
-      eventCount: 0,
-      timestamp: 1650000000,
-      signed: false,
-      signingPayloadHash: "b".repeat(64),
-    };
-    expect(unsigned.signed).toBe(false);
-    if (!unsigned.signed) {
-      expect(unsigned.signingPayloadHash).toMatch(/^[0-9a-f]{64}$/);
-    }
+    expect(checkpoint.root).toBe("deadbeef");
+    expect(checkpoint.eventCount).toBe(3);
+    expect(checkpoint.timestamp).toBe(1700000000);
+    expect(checkpoint.signature).toMatch(/^[0-9a-f]{128}$/);
   });
 });
 

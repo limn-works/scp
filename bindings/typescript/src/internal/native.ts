@@ -1150,9 +1150,8 @@ export function createNativeBridge(scp: SCP): Bridge {
         eventCount: raw.eventCount,
         timestamp: raw.timestamp,
         // The NAPI bridge signs the checkpoint in-process; surface the Ed25519
-        // signature (hex) under the `signed: true` variant. WASM signs the same
-        // way (see `Checkpoint` type doc and `internal/wasm.ts`).
-        signed: true,
+        // signature (hex). WASM signs the same way (see the `Checkpoint` type
+        // doc and `internal/wasm.ts`).
         signature: raw.signature,
       };
     },

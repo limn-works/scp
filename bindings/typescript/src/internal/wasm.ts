@@ -1523,13 +1523,12 @@ export function createWasmBridge(): Bridge {
       const result = await wasm.event_log_checkpoint(handle, identityDid, epoch);
       // WASM signs the checkpoint in-process with the identity's `#active`
       // Ed25519 key (WASM identities are Rust-custodied; the private key never
-      // crosses FFI, ADR-006). Surface the `signed: true` variant carrying the
+      // crosses FFI, ADR-006). Surface the flat signed checkpoint carrying the
       // signature, matching the NAPI bridge (see the `Checkpoint` type doc).
       return {
         root: result.merkleRoot,
         eventCount: result.eventCount,
         timestamp: result.timestamp,
-        signed: true,
         signature: result.signature,
       };
     },
