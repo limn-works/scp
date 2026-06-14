@@ -741,9 +741,31 @@ pub fn compare_remote_checkpoint(
                 }
             }
         }
-        std::cmp::Ordering::Less => scp_event_log::checkpoint::CheckpointComparison::Behind {
-            missing_events: remote.event_count - local_count,
-        },
+        std::cmp::Ordering::Less => {
+            // #1535 SEAM — same-log catch-up integrity (§23.7 step 3).
+            //
+            // The local member is behind the remote (fewer events at the same
+            // context). This is the EXPECTED case after an offline period and
+            // is NOT equivocation: equivocation is keyed strictly on equal
+            // event count with different Merkle root (the `Equal` arm above,
+            // per §9.9.3). Here the member must fetch the missing events and,
+            // to confirm the fetched suffix is a genuine continuation of its
+            // own history (the relay did not rewrite already-held events),
+            // verify a Merkle CONSISTENCY proof that its last-known root is a
+            // prefix of the remote root (RFC 6962 §2.1.2; ADR-011).
+            //
+            // The consistency-proof verification wires here in #1535. Its
+            // building blocks are already reachable from the actor:
+            // [`prove_event_consistency`] generates the proof between two tree
+            // sizes and [`verify_event_consistency`] checks it. This branch is
+            // intentionally left as the named integration point — #1535 owns
+            // the event-range fetch + proof exchange that consumes them. Do NOT
+            // implement that fetch here; surfacing `Behind` lets the caller
+            // drive catch-up.
+            scp_event_log::checkpoint::CheckpointComparison::Behind {
+                missing_events: remote.event_count - local_count,
+            }
+        }
         std::cmp::Ordering::Greater => scp_event_log::checkpoint::CheckpointComparison::Ahead {
             extra_events: local_count - remote.event_count,
         },

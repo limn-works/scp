@@ -1127,7 +1127,8 @@ fn b3_heartbeat_monitor_instantiated() {
 
 /// Checkpoint generation must be wired into the context lifecycle.
 /// close_context must call force_create_checkpoint for archival.
-/// send_message/deliver_incoming should call create_checkpoint_if_due periodically.
+/// finalize_send must call create_checkpoint_if_due periodically AND broadcast
+/// a due checkpoint to peers via send_checkpoint (§9.9.3, §23.7, #1540).
 #[test]
 fn b3_checkpoint_generation_wired() {
     // close_context_with_key must call force_create_checkpoint for archival.
@@ -1138,18 +1139,44 @@ fn b3_checkpoint_generation_wired() {
         "close_context_with_key must generate a final checkpoint"
     );
 
-    // finalize_send must call create_checkpoint_if_due for periodic checkpoints.
-    let send_body = extract_fn_body(MANAGER_SRC, "finalize_send")
-        .expect("finalize_send must exist in manager source");
+    // finalize_send must DELEGATE periodic checkpoint creation + broadcast to
+    // create_and_broadcast_checkpoint_if_due. Real call-site assertion (not a
+    // bare string search): finalize_send → create_and_broadcast_checkpoint_if_due
+    // → create_checkpoint_if_due (create + retain locally) AND send_checkpoint
+    // (broadcast to peers for equivocation detection, §23.7).
     assert!(
-        send_body.contains("create_checkpoint_if_due") || send_body.contains("checkpoint"),
-        "finalize_send must track checkpoint events"
+        fn_body_contains(
+            MANAGER_SRC,
+            "finalize_send",
+            "create_and_broadcast_checkpoint_if_due",
+        ),
+        "finalize_send must drive periodic checkpoint create+broadcast via \
+         create_and_broadcast_checkpoint_if_due"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "create_and_broadcast_checkpoint_if_due",
+            "create_checkpoint_if_due",
+        ),
+        "create_and_broadcast_checkpoint_if_due must call create_checkpoint_if_due"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "create_and_broadcast_checkpoint_if_due",
+            "send_checkpoint",
+        ),
+        "create_and_broadcast_checkpoint_if_due must broadcast a due checkpoint \
+         to peers via send_checkpoint (§9.9.3 checkpoint exchange)"
     );
 }
 
 /// Merkle proof verification must be wired into the equivocation detection path.
-/// compare_remote_checkpoint must compare local and remote Merkle roots
-/// and emit EquivocationDetected when divergent (§9.9.3, ADR-011 AC-8).
+/// compare_remote_checkpoint must compare local and remote Merkle roots and emit
+/// EquivocationDetected when divergent (§9.9.3, ADR-011 AC-8), AND it must be
+/// reached from the receive path: deliver_incoming dispatches a received
+/// ConsistencyCheckpoint message to compare_remote_checkpoint (#1540).
 #[test]
 fn b3_merkle_proof_verification_wired() {
     // compare_remote_checkpoint must exist and perform comparison.
@@ -1162,6 +1189,29 @@ fn b3_merkle_proof_verification_wired() {
     assert!(
         body.contains("Divergent") || body.contains("EquivocationDetected"),
         "compare_remote_checkpoint must detect divergence / equivocation"
+    );
+
+    // Real call-site assertion: the receive path must actually REACH the
+    // comparison. deliver_incoming dispatches a ConsistencyCheckpoint message to
+    // deliver_checkpoint_message, which calls compare_remote_checkpoint. Without
+    // this chain the detection logic is dead code (the #1540 gap).
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "deliver_incoming",
+            "deliver_checkpoint_message"
+        ),
+        "deliver_incoming must dispatch ConsistencyCheckpoint messages to \
+         deliver_checkpoint_message"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "deliver_checkpoint_message",
+            "compare_remote_checkpoint",
+        ),
+        "deliver_checkpoint_message must call compare_remote_checkpoint so a \
+         received checkpoint is checked for equivocation (§9.9.3)"
     );
 }
 

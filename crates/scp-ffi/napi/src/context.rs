@@ -1746,6 +1746,17 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
              action={action_type},success={success},\
              context={context_id}"
         ),
+        // Relay equivocation detected (§9.9.3, §23.7). Security event — MUST NOT
+        // be silently discarded (§9.9.4); surface as a structured, non-lossy,
+        // HTML-escaped record rather than a Debug blob.
+        scp_core::context::membership::ContextEvent::EquivocationDetected {
+            context_id,
+            remote_sender_did,
+            event_count,
+        } => scp_ffi_common::html_escape_event_string(&format!(
+            "equivocation_detected:context={context_id},\
+             remote_sender={remote_sender_did},event_count={event_count}"
+        )),
         other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
     }
 }

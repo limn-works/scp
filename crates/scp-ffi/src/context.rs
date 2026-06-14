@@ -1053,6 +1053,24 @@ fn convert_context_event(
             .into_bytes(),
             ts,
         ),
+        // Relay equivocation detected (§9.9.3, §23.7). This is a security event
+        // and MUST NOT be silently discarded (§9.9.4) — surface it as a
+        // structured, non-lossy, HTML-escaped record rather than a Debug blob.
+        scp_core::context::membership::ContextEvent::EquivocationDetected {
+            context_id: ctx_id,
+            remote_sender_did,
+            event_count,
+        } => (
+            "scp:system".to_owned(),
+            format!(
+                "equivocation_detected:context={},\
+                 remote_sender={},event_count={event_count}",
+                html_escape_event_string(&ctx_id),
+                html_escape_event_string(remote_sender_did.as_ref()),
+            )
+            .into_bytes(),
+            ts,
+        ),
         other => (
             "scp:system".to_owned(),
             html_escape_event_string(&format!("{other:?}")).into_bytes(),
