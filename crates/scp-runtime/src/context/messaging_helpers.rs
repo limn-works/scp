@@ -76,7 +76,8 @@ use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_helpers;
 use crate::context::state::{
-    self, PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement, emit_event_into,
+    self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, PSEUDONYM_ANNOUNCEMENT_TAG,
+    PseudonymAnnouncement, emit_event_into,
 };
 use crate::crypto::mls::provider::MlsCryptoProvider;
 
@@ -122,6 +123,7 @@ pub fn build_encrypted_envelope(
     recipients_data: &std::collections::HashMap<String, AccessKey>,
     sequence: u64,
     source_provenance: Option<&SourceContextInfo>,
+    message_type: MessageType,
 ) -> Result<Vec<u8>, ContextError> {
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
     let provenance = source_provenance.map(|source_info| {
@@ -169,7 +171,7 @@ pub fn build_encrypted_envelope(
         generation: 0,
         sequence,
         timestamp,
-        message_type: MessageType::Content,
+        message_type,
         payload: &wrapped_bytes,
         provenance,
         signing_key_id: SigningKeyId::Active,
@@ -909,6 +911,7 @@ pub async fn send_message(
         sequence,
         source_provenance,
         &send_routing_ids,
+        MessageType::Content,
     );
     if let Err(e) = phase2_result {
         // Void escrow + roll back ticket on send failure.
@@ -1073,6 +1076,15 @@ pub fn deliver_incoming(
         sender_is_admin,
     )?;
 
+    // Consistency-checkpoint dispatch (§9.9.3, §23.7). A checkpoint message is
+    // NOT application content: it is processed for equivocation detection and
+    // MUST NOT advance the per-sender application sequence, so it is handled
+    // here — after signature/integrity verification, before the anti-replay /
+    // reorder sequence machinery — and returns `Ok(None)`.
+    if inner.message_type == MessageType::ConsistencyCheckpoint {
+        return deliver_checkpoint_message(state, deps, context_id, &sender_did, &plaintext);
+    }
+
     // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
     let now_ms = deps.clock.now_millis();
     let sequence_check = validate_and_drain_timeouts(state, deps, context_id, &inner, now_ms)?;
@@ -1112,6 +1124,65 @@ pub fn deliver_incoming(
     }
 }
 
+/// Processes a received consistency-checkpoint message (§9.9.3, §23.7).
+///
+/// Deserializes the tagged [`CheckpointMessage`] from the verified plaintext,
+/// confirms it carries the [`CHECKPOINT_PAYLOAD_TAG`] and that its embedded
+/// `sender_did` matches the MLS-authenticated sender (a checkpoint claiming a
+/// different author is a spoof), then hands it to
+/// [`compare_remote_checkpoint`](crate::context::queries_helpers::compare_remote_checkpoint),
+/// which verifies the checkpoint's own Ed25519 signature, compares Merkle roots
+/// at equal event counts, and surfaces a
+/// [`ContextEvent::EquivocationDetected`] when divergent.
+///
+/// Always returns `Ok(None)`: a checkpoint is never delivered as application
+/// content and never advances the per-sender application sequence.
+///
+/// # Errors
+///
+/// Returns [`ContextError::CryptoFailed`] if the payload is not a well-formed
+/// tagged checkpoint or the embedded sender does not match, and propagates the
+/// error from `compare_remote_checkpoint` (member-not-found or signature
+/// failure).
+fn deliver_checkpoint_message(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    sender_did: &str,
+    plaintext: &[u8],
+) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+    let message: CheckpointMessage = rmp_serde::from_slice(plaintext).map_err(|e| {
+        ContextError::CryptoFailed(format!("checkpoint message deserialization failed: {e}"))
+    })?;
+    if message.tag != CHECKPOINT_PAYLOAD_TAG {
+        return Err(ContextError::CryptoFailed(
+            "checkpoint message missing expected tag".into(),
+        ));
+    }
+    // Bind the checkpoint author to the MLS-authenticated envelope sender: a
+    // member may only publish checkpoints for their own DID. compare_remote_
+    // checkpoint additionally verifies the checkpoint's own signature against
+    // the resolved key for this DID, so a forged author cannot pass both gates.
+    if message.checkpoint.sender_did.as_ref() != sender_did {
+        return Err(ContextError::CryptoFailed(format!(
+            "checkpoint sender_did {} does not match envelope sender {sender_did}",
+            message.checkpoint.sender_did
+        )));
+    }
+
+    // Equivocation detection (§9.9.3): verifies the checkpoint signature,
+    // compares Merkle roots, and emits ContextEvent::EquivocationDetected into
+    // the receive buffer when divergent (tier (a) of §23.7).
+    crate::context::queries_helpers::compare_remote_checkpoint(
+        state,
+        deps,
+        context_id,
+        &message.checkpoint,
+    )?;
+
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // 9. encrypt_and_send
 // ---------------------------------------------------------------------------
@@ -1130,6 +1201,7 @@ pub fn encrypt_and_send(
     sequence: u64,
     source_provenance: Option<&SourceContextInfo>,
     routing_ids: &[[u8; 32]],
+    message_type: MessageType,
 ) -> Result<(), ContextError> {
     let encrypted = if let Some(envelope) = broadcast_envelope {
         rmp_serde::to_vec_named(&envelope)
@@ -1149,6 +1221,7 @@ pub fn encrypt_and_send(
             recipients_data,
             sequence,
             source_provenance,
+            message_type,
         )?;
         crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
         result
@@ -1183,6 +1256,95 @@ pub fn encrypt_and_send(
             .unwrap_or_else(|| ContextError::TransportFailed("all fan-out sends failed".into())));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 9b. send_checkpoint (§9.9.3, §23.7)
+// ---------------------------------------------------------------------------
+
+/// Broadcasts a signed [`ConsistencyCheckpoint`] to context peers so they can
+/// compare Merkle roots at equal event counts and detect relay equivocation
+/// (§9.9.3, §23.7).
+///
+/// The checkpoint is wrapped behind the [`CHECKPOINT_PAYLOAD_TAG`] magic tag,
+/// `MessagePack`-encoded, and routed through the regular
+/// [`encrypt_and_send`] envelope machinery with
+/// [`MessageType::ConsistencyCheckpoint`]. The checkpoint already carries its
+/// own `SCP-CHECKPOINT-V1:` signature; the outer envelope adds the usual
+/// MLS + Ed25519 layers. This send is independent of the application content
+/// sequence — it uses sequence `0`, and the receive path returns `Ok(None)`
+/// before the content sequence tracker so a checkpoint never advances the
+/// per-sender application sequence.
+///
+/// Routing mirrors the application-data send path:
+/// - **Encrypted contexts** fan out to each known peer pseudonym routing ID.
+///   With no peers yet known (lone member or pre-bootstrap), there is nobody
+///   to inform and the call is a successful no-op.
+/// - **Broadcast contexts** publish to the derivable broadcast routing ID
+///   (`SHA-256(context_id)`); the checkpoint's `epoch` is `None` for broadcast
+///   contexts per §23.16.1 (set by the caller via `build_checkpoint`).
+///
+/// # Errors
+///
+/// Returns [`ContextError::CryptoFailed`] if the checkpoint cannot be
+/// serialized, or the underlying transport error from [`encrypt_and_send`] if
+/// every fan-out send fails. Callers that publish checkpoints opportunistically
+/// (the periodic-broadcast path in [`finalize_send`]) treat any error as
+/// best-effort and MUST NOT roll back the originating send.
+pub fn send_checkpoint(
+    deps: &ActorDeps,
+    state: &PerContextState,
+    context_id: &str,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    checkpoint: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+) -> Result<(), ContextError> {
+    let message = CheckpointMessage {
+        tag: CHECKPOINT_PAYLOAD_TAG.to_owned(),
+        checkpoint: checkpoint.clone(),
+    };
+    let payload = rmp_serde::to_vec_named(&message).map_err(|e| {
+        ContextError::CryptoFailed(format!("checkpoint message serialization: {e}"))
+    })?;
+
+    // Routing parallels the application-data send path (§9.10.4): broadcast
+    // contexts address the derivable broadcast RID; encrypted contexts fan out
+    // to each known peer pseudonym. An empty encrypted routing set (no peers
+    // known yet) is a legitimate no-op — there is simply nobody to inform.
+    let (broadcast_envelope, recipients_data, routing_ids) = if state.broadcast_context.is_some() {
+        let broadcast_rid = scp_protocol::context::broadcast_routing_id(context_id);
+        // Broadcast contexts carry the checkpoint inside an encrypted inner
+        // envelope addressed to the broadcast RID (the checkpoint exchange is
+        // an MLS-management-style message, not author-keyed broadcast content).
+        (None, std::collections::HashMap::new(), vec![broadcast_rid])
+    } else {
+        let peer_pseudonyms: Vec<[u8; 32]> = state
+            .routing
+            .peer_registry()
+            .map(|reg| reg.values().copied().collect())
+            .unwrap_or_default();
+        (
+            None,
+            state.access.access_key_store.get_all(context_id),
+            peer_pseudonyms,
+        )
+    };
+
+    encrypt_and_send(
+        deps,
+        broadcast_envelope,
+        Some(signing_key),
+        context_id,
+        sender_did,
+        &payload,
+        &recipients_data,
+        // Checkpoints do not consume the application content sequence; the
+        // receive path dispatches them before the sequence tracker.
+        0,
+        None,
+        &routing_ids,
+        MessageType::ConsistencyCheckpoint,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,22 +1652,7 @@ pub fn finalize_send(
 
     // Checkpoint tracking (§9.9.3).
     state.checkpoint_events_since += 1;
-    if let Some(sk) = signing_key {
-        let broadcast_context_is_none = state.broadcast_context.is_none();
-        let mls_epoch = state.epoch.mls_epoch;
-        crate::context::queries_helpers::create_checkpoint_if_due(
-            context_id,
-            broadcast_context_is_none,
-            mls_epoch,
-            &mut state.checkpoints,
-            &mut state.checkpoint_events_since,
-            &mut state.checkpoint_last_time_secs,
-            sender_did,
-            sk,
-            now,
-            &*deps.event_log,
-        );
-    }
+    create_and_broadcast_checkpoint_if_due(state, deps, context_id, sender_did, signing_key, now);
 
     persist_finalized_send(
         state,
@@ -1515,6 +1662,55 @@ pub fn finalize_send(
         spending_nonce_committed,
         is_broadcast,
     )
+}
+
+/// Creates a consistency checkpoint when due (§9.9.3 thresholds) and, when one
+/// is produced, broadcasts it to peers via [`send_checkpoint`] so they can
+/// detect relay equivocation (§23.7).
+///
+/// Factored out of [`finalize_send`] to keep that function within the clippy
+/// line budget. The local retention (pushing into `state.checkpoints`) happens
+/// inside `create_checkpoint_if_due`; the broadcast is **best-effort** — a
+/// transport failure is logged but never rolls back the just-completed
+/// application send, because the checkpoint is an independent
+/// consistency-monitoring artifact, not part of the message's delivery
+/// guarantee. A missing signing key (e.g. a context with no local custody)
+/// skips checkpoint creation entirely.
+fn create_and_broadcast_checkpoint_if_due(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    sender_did: &DID,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
+    now: u64,
+) {
+    let Some(sk) = signing_key else {
+        return;
+    };
+    let broadcast_context_is_none = state.broadcast_context.is_none();
+    let mls_epoch = state.epoch.mls_epoch;
+    let due_checkpoint = crate::context::queries_helpers::create_checkpoint_if_due(
+        context_id,
+        broadcast_context_is_none,
+        mls_epoch,
+        &mut state.checkpoints,
+        &mut state.checkpoint_events_since,
+        &mut state.checkpoint_last_time_secs,
+        sender_did,
+        sk,
+        now,
+        &*deps.event_log,
+    );
+    if let Some(checkpoint) = due_checkpoint
+        && let Err(e) = send_checkpoint(deps, state, context_id, sender_did, sk, &checkpoint)
+    {
+        tracing::warn!(
+            context_id,
+            error = %e,
+            "failed to broadcast consistency checkpoint to peers (best-effort; \
+             send not rolled back) (§9.9.3)"
+        );
+    }
 }
 
 /// Final persist step of [`finalize_send`], factored out so the success body
@@ -2618,5 +2814,55 @@ mod pseudonym_routing_tests {
             ),
             AnnouncementOutcome::Rejected(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Consistency-checkpoint wire message (§9.9.3, §23.7)
+    // -----------------------------------------------------------------------
+
+    use crate::context::state::{CHECKPOINT_PAYLOAD_TAG, CheckpointMessage};
+
+    fn sample_checkpoint(sender: &str) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+        scp_event_log::checkpoint::ConsistencyCheckpoint {
+            context_id: "ctx-1".to_owned(),
+            sender_did: DID(sender.to_owned()),
+            event_count: 42,
+            merkle_root: [7u8; 32],
+            epoch: Some(3),
+            timestamp: 1_700_000_000,
+            signature: vec![0xAB; 64],
+        }
+    }
+
+    /// The on-the-wire checkpoint message round-trips through `MessagePack`
+    /// (the format `send_checkpoint` produces and `deliver_checkpoint_message`
+    /// consumes).
+    #[test]
+    fn checkpoint_message_roundtrips_over_messagepack() {
+        let msg = CheckpointMessage {
+            tag: CHECKPOINT_PAYLOAD_TAG.to_owned(),
+            checkpoint: sample_checkpoint(ALICE),
+        };
+        let bytes = rmp_serde::to_vec_named(&msg).expect("serialize checkpoint message");
+        let decoded: CheckpointMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize checkpoint message");
+        assert_eq!(decoded.tag, CHECKPOINT_PAYLOAD_TAG);
+        assert_eq!(decoded.checkpoint, msg.checkpoint);
+    }
+
+    /// The checkpoint tag is `\0`-prefixed so ordinary UTF-8 application
+    /// content can never be mistaken for a checkpoint message, mirroring the
+    /// pseudonym-announcement tag invariant.
+    #[test]
+    fn checkpoint_tag_is_null_prefixed() {
+        assert!(
+            CHECKPOINT_PAYLOAD_TAG.starts_with('\0'),
+            "checkpoint tag must be null-prefixed to avoid UTF-8 content collision"
+        );
+        assert_ne!(
+            CHECKPOINT_PAYLOAD_TAG,
+            crate::context::state::PSEUDONYM_ANNOUNCEMENT_TAG,
+            "checkpoint and announcement tags must be distinct"
+        );
     }
 }

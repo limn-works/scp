@@ -4750,6 +4750,7 @@ mod tests {
             &recipients,
             0,
             None,
+            scp_protocol::envelope::inner::MessageType::Content,
         )
         .unwrap();
 
@@ -4792,6 +4793,7 @@ mod tests {
             &recipients,
             0,
             None,
+            scp_protocol::envelope::inner::MessageType::Content,
         )
         .unwrap();
 
