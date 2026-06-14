@@ -691,9 +691,15 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       );
 
       const checkpoint = await napi.eventLogCheckpoint(ctx, identity.did, 0);
-      expect(checkpoint.root).toBeTruthy();
+      expect(checkpoint.merkleRoot).toBeTruthy();
       expect(typeof checkpoint.eventCount).toBe("number");
       expect(typeof checkpoint.timestamp).toBe("number");
+      // The flat checkpoint mirrors the Python/Swift/Kotlin field set: it
+      // carries the context id, the signing member's DID, and the MLS epoch
+      // alongside the Merkle root.
+      expect(checkpoint.contextId).toBe(ctx.contextId);
+      expect(checkpoint.senderDid).toBe(identity.did);
+      expect(checkpoint.epoch).toBe(0);
       // The NAPI bridge signs the checkpoint in-process, so the SDK returns a
       // flat checkpoint carrying the Ed25519 signature (hex, 128 chars).
       expect(typeof checkpoint.signature).toBe("string");

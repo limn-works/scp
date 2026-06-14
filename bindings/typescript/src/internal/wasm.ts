@@ -1526,8 +1526,13 @@ export function createWasmBridge(): Bridge {
       // crosses FFI, ADR-006). Surface the flat signed checkpoint carrying the
       // signature, matching the NAPI bridge (see the `Checkpoint` type doc).
       return {
-        root: result.merkleRoot,
+        contextId: result.contextId,
+        senderDid: result.senderDid,
+        merkleRoot: result.merkleRoot,
         eventCount: result.eventCount,
+        // The WASM bridge surfaces `epoch` as `null` for Broadcast contexts;
+        // normalize to `undefined` to match the `Checkpoint` optional field.
+        epoch: result.epoch ?? undefined,
         timestamp: result.timestamp,
         signature: result.signature,
       };

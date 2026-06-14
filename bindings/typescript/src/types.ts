@@ -732,14 +732,20 @@ export interface Proof {
  * checkpoint payload in-process with the identity's `#active` Ed25519 key, so a
  * checkpoint always carries a hex `signature` over the canonical checkpoint
  * hash. WASM identities are Rust-custodied; the private key never crosses the
- * FFI boundary (ADR-006). The shape matches the flat signed checkpoint returned
- * by the Python, Swift, and Kotlin SDKs.
+ * FFI boundary (ADR-006). The field set matches the flat signed checkpoint
+ * returned by the Python (`SignedCheckpoint`), Swift, and Kotlin SDKs.
  */
 export interface Checkpoint {
-  /** The Merkle root hash as a hex string. */
-  readonly root: string;
+  /** The context this checkpoint belongs to. */
+  readonly contextId: string;
+  /** The DID of the member who generated this checkpoint. */
+  readonly senderDid: string;
+  /** The Merkle root hash at checkpoint time, as a hex string. */
+  readonly merkleRoot: string;
   /** The number of events in the log at checkpoint time. */
   readonly eventCount: number;
+  /** Current MLS epoch. `undefined` for Broadcast contexts. */
+  readonly epoch?: number | undefined;
   /** Timestamp of the checkpoint (seconds since epoch). */
   readonly timestamp: number;
   /** Ed25519 signature over the canonical checkpoint hash (hex, 64 bytes / 128 chars). */

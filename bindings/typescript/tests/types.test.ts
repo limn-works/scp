@@ -366,15 +366,23 @@ describe("type definitions", () => {
   it("Checkpoint is a flat always-signed shape with a required signature", () => {
     // Every live runtime (NAPI + WASM) signs the checkpoint in-process, so the
     // SDK surface is a flat checkpoint carrying a required hex `signature` —
-    // matching the Python, Swift, and Kotlin SDKs.
+    // matching the Python (`SignedCheckpoint`), Swift, and Kotlin SDKs. The
+    // field set (contextId, senderDid, merkleRoot, eventCount, epoch,
+    // timestamp, signature) mirrors those SDKs.
     const checkpoint: Checkpoint = {
-      root: "deadbeef",
+      contextId: "ctx-test",
+      senderDid: "did:dht:z6MkTest",
+      merkleRoot: "deadbeef",
       eventCount: 3,
+      epoch: 7,
       timestamp: 1700000000,
       signature: "a".repeat(128),
     };
-    expect(checkpoint.root).toBe("deadbeef");
+    expect(checkpoint.contextId).toBe("ctx-test");
+    expect(checkpoint.senderDid).toBe("did:dht:z6MkTest");
+    expect(checkpoint.merkleRoot).toBe("deadbeef");
     expect(checkpoint.eventCount).toBe(3);
+    expect(checkpoint.epoch).toBe(7);
     expect(checkpoint.timestamp).toBe(1700000000);
     expect(checkpoint.signature).toMatch(/^[0-9a-f]{128}$/);
   });

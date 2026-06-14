@@ -228,6 +228,25 @@ if (napiBridge === null || scp === null || wasmModule === null) {
       expect(typeof checkpoint.eventCount).toBe("number");
       expect(checkpoint.signature).toMatch(/^[0-9a-f]{128}$/);
       expect(checkpoint.signingPayloadHash).toMatch(/^[0-9a-f]{64}$/);
+
+      // NOTE: this test asserts the SHAPE of the signed checkpoint, not a
+      // real Ed25519 verification of `signature` against `signingPayloadHash`.
+      // The checkpoint is signed with the identity's `#active` key (see
+      // `sign_with_identity(did, "#active", ...)` in
+      // crates/scp-ffi/wasm/src/event_log.rs), but the WASM bridge does not
+      // currently expose the `#active` verifying key to JS — the only
+      // TS-reachable key surface is `WasmIdentity.verifyingKey`, which is the
+      // `#0` identity key (cross-bridge parity per ADR-046), NOT `#active`.
+      // The internal `#active` resolver `resolve_verification_method_key` is
+      // `pub(crate)`, and there is no `verify`-checkpoint export. Surfacing
+      // the `#active` verifying key (or a verify-checkpoint function) is new
+      // FFI surface and is intentionally out of scope for this ticket; the
+      // cryptographer flagged this as non-blocking. The production signing
+      // path's sign-then-verify is covered in-crate by
+      // `generate_creates_valid_signed_checkpoint` in
+      // crates/scp-event-log/src/checkpoint.rs, which signs via the same
+      // `compute_checkpoint_canonical_hash` digest the WASM bridge uses and
+      // verifies it with `verify_checkpoint_signature`.
     });
 
     test("WASM event_log_checkpoint_by_did signs with the named member key", async () => {
