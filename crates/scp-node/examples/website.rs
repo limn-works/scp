@@ -26,12 +26,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         skip_nat: true,
         dht_mode: DhtMode::Memory,
         // `PORT` overrides the bind port. The demo defaults to 8080 (not the
-        // conventional 8443) so it won't collide with a real node already
-        // bound to 8443. Unset or unparseable `PORT` falls back to 8080.
-        port: std::env::var("PORT")
-            .ok()
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(8080),
+        // conventional 8443) so it won't collide with a real node already bound
+        // to 8443. An unset `PORT` uses 8080 silently; a set-but-invalid `PORT`
+        // warns and falls back to 8080.
+        port: std::env::var("PORT").map_or(8080, |raw| {
+            raw.parse::<u16>().unwrap_or_else(|_| {
+                eprintln!("PORT={raw:?} is not a valid u16 port number; using 8080");
+                8080
+            })
+        }),
         ..Default::default()
     })
     .await?;
