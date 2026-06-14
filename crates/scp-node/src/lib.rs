@@ -2109,6 +2109,21 @@ fn tier_to_relay_url(tier: &ReachabilityTier) -> String {
     }
 }
 
+/// Resolves the published relay URL for no-domain mode.
+///
+/// `Some(tier)` is the probed reachability tier; `None` means the NAT probe was
+/// skipped (operator opted out — e.g. behind a tunnel/proxy), in which case the
+/// node falls back to a loopback relay URL on the public HTTP port. The loopback
+/// fallback keeps the published URL and the self-signed certificate SANs
+/// localhost-only, which is the correct posture when external reachability is
+/// provided by the proxy/tunnel rather than NAT traversal.
+fn no_domain_relay_url(tier: Option<&ReachabilityTier>, http_port: u16) -> String {
+    tier.map_or_else(
+        || format!("ws://127.0.0.1:{http_port}/scp/v1"),
+        tier_to_relay_url,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // NAT port-mapping lease renewal (spec §10.12.2)
 // ---------------------------------------------------------------------------
@@ -2479,6 +2494,16 @@ pub struct ApplicationNodeBuilder<
     /// subdomain (issue #642). When set, `build()` overrides the domain
     /// and TLS provider with DNS-derived values after identity resolution.
     dns_provider_config: Option<dns_provider::DnsProviderConfig>,
+    /// When `true`, the no-domain build path skips the blocking STUN/NAT
+    /// external-address probe entirely, binds and serves immediately, and
+    /// publishes a loopback relay URL. Set via [`skip_nat_probe`](Self::skip_nat_probe).
+    ///
+    /// This is the correct posture when the node is reached through a
+    /// tunnel/proxy (e.g. a Cloudflare tunnel terminating on `localhost`): the
+    /// external reachability discovery is dead weight there, and the discovered
+    /// external IP would only feed the published relay URL and an extra cert SAN
+    /// that the tunnel never uses. Ignored in domain mode (which never probes).
+    skip_nat_probe: bool,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -2512,6 +2537,7 @@ impl ApplicationNodeBuilder {
             http3_config: None,
             persist_identity: false,
             dns_provider_config: None,
+            skip_nat_probe: false,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2558,6 +2584,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2596,6 +2623,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2864,6 +2892,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2880,6 +2909,32 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
     #[must_use]
     pub fn blob_storage(mut self, blob_storage: impl Into<BlobStorageBackend>) -> Self {
         self.blob_storage = Some(blob_storage.into());
+        self
+    }
+
+    /// Skips the blocking STUN/NAT external-address probe in no-domain
+    /// (`§10.12.8`) mode.
+    ///
+    /// By default a no-domain build probes NAT type over STUN, attempts a
+    /// UPnP/NAT-PMP port mapping, and runs a reachability self-test before it
+    /// publishes a relay URL — discovery that can add tens of seconds to
+    /// startup. When the node is reached through a tunnel/proxy that terminates
+    /// on `localhost` (e.g. a Cloudflare tunnel), that discovery is dead weight:
+    /// external reachability is provided by the tunnel, and the discovered
+    /// external IP would only feed the published relay URL and an extra
+    /// certificate SAN the tunnel never uses.
+    ///
+    /// When set, the no-domain build path:
+    /// * does NOT call [`NatStrategy::select_tier`] (no STUN, no port mapping);
+    /// * publishes a loopback relay URL (`ws://127.0.0.1:<port>/scp/v1`), so no
+    ///   external IP is disclosed and no external-IP certificate SAN is added;
+    /// * does NOT spawn the periodic tier re-evaluation task (there is no tier
+    ///   to re-evaluate).
+    ///
+    /// Has no effect in domain mode, which never probes NAT.
+    #[must_use]
+    pub const fn skip_nat_probe(mut self) -> Self {
+        self.skip_nat_probe = true;
         self
     }
 }
@@ -2923,6 +2978,7 @@ impl<S: Storage + 'static, Dom>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2961,6 +3017,7 @@ impl<S: Storage + 'static, Dom>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -3047,6 +3104,7 @@ impl<S: Storage + 'static, Dom>
             http3_config: self.http3_config,
             persist_identity: true,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -3234,6 +3292,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     subscription_registry,
                     #[cfg(feature = "quic")]
                     publish_rate_limiter,
+                    self.skip_nat_probe,
                 )
                 .await
             }
@@ -3865,18 +3924,25 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
     #[cfg(feature = "quic")]
     publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
+    skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError> {
     // NAT strategy needs the public HTTP port, not the internal relay port (#641).
     let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
-    let tier = nat_strategy.select_tier(http_bind_addr.port()).await?;
-
-    let relay_url = match &tier {
-        ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
-            format!("ws://{external_addr}/scp/v1")
-        }
-        ReachabilityTier::Bridge { bridge_url } => bridge_url.clone(),
+    // When `skip_nat_probe` is set (operator opted out — e.g. behind a
+    // tunnel/proxy that terminates on `localhost`), the STUN/NAT probe is dead
+    // weight and adds tens of seconds to startup. Skip `select_tier` entirely
+    // and fall back to a loopback relay URL: no external IP is discovered or
+    // disclosed to the DHT, and no periodic tier re-evaluation task is spawned
+    // (there is no tier to re-evaluate). External reachability is provided by
+    // the proxy/tunnel, not by NAT traversal.
+    let tier = if skip_nat_probe {
+        None
+    } else {
+        Some(nat_strategy.select_tier(http_bind_addr.port()).await?)
     };
+
+    let relay_url = no_domain_relay_url(tier.as_ref(), http_bind_addr.port());
 
     push_relay_service(&mut document, &relay_url);
 
@@ -3888,6 +3954,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         relay_url = %relay_url,
         bound_addr = %bound_addr,
         did = %identity.did,
+        nat_probe_skipped = skip_nat_probe,
         "application node started (no-domain mode, §10.12.8)"
     );
 
@@ -3896,17 +3963,23 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     });
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
     let bg_identity = identity.clone();
-    let tier_reeval = spawn_tier_reevaluation(
-        nat_strategy,
-        network_detector,
-        publisher,
-        bg_identity,
-        document.clone(),
-        http_bind_addr.port(),
-        relay_url.clone(),
-        Some(tier_event_tx),
-        TIER_REEVALUATION_INTERVAL,
-    );
+    // No tier to re-evaluate when the probe was skipped: the node is reached via
+    // a proxy/tunnel, not via a NAT-traversed tier that could change.
+    let tier_reeval = if skip_nat_probe {
+        None
+    } else {
+        Some(spawn_tier_reevaluation(
+            nat_strategy,
+            network_detector,
+            publisher,
+            bg_identity,
+            document.clone(),
+            http_bind_addr.port(),
+            relay_url.clone(),
+            Some(tier_event_tx),
+            TIER_REEVALUATION_INTERVAL,
+        ))
+    };
 
     // Bridge auth lookup — audience is relay URL in no-domain mode (spec 12.10.2).
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
@@ -3965,8 +4038,10 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         identity: IdentityHandle { identity, document },
         storage,
         state,
-        tier_reeval: Some(tier_reeval),
-        tier_change_rx: Some(tier_event_rx),
+        // `None` for both when the NAT probe was skipped: there is no
+        // re-evaluation task and no tier-change stream to surface.
+        tier_change_rx: tier_reeval.as_ref().map(|_| tier_event_rx),
+        tier_reeval,
         // HTTP/3 is not supported in no-domain mode (no TLS certificate).
         #[cfg(feature = "http3")]
         http3_config: None,
@@ -4034,6 +4109,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
         let persist = self.persist_identity;
+        let skip_nat_probe = self.skip_nat_probe;
 
         let (identity, document, did_method) =
             resolve_identity_persistent(identity_source, persist, protocol_repository.storage())
@@ -4097,6 +4173,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             subscription_registry,
             #[cfg(feature = "quic")]
             publish_rate_limiter,
+            skip_nat_probe,
         )
         .await
     }

@@ -40,7 +40,8 @@ use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
 use scp_node::{
-    ApplicationNodeBuilder, DeploySiteParams, NatStrategy, NodeError, ReachabilityTier,
+    ApplicationNode, ApplicationNodeBuilder, DeploySiteParams, NatStrategy, NodeError,
+    ReachabilityTier,
 };
 use scp_platform::Storage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
@@ -860,4 +861,156 @@ async fn deploy_embedded_and_assert_serves<S>(
         body_str.contains("hello, world."),
         "served body must be the embedded hello-world page"
     );
+}
+
+// ---------------------------------------------------------------------------
+// FIX A — stable DID across restarts (load-or-create persisted identity)
+// ---------------------------------------------------------------------------
+
+/// Builds a no-domain `ApplicationNode` over the encrypted `SQLite` databases in
+/// `dir` via the production `.build()` path, using `identity_with_storage` —
+/// the exact identity wiring the `--self-host` binary uses
+/// (`build_self_host_node` in `main.rs`). The first build over a fresh `dir`
+/// creates and persists the identity; subsequent builds over the SAME `dir`
+/// reload it, keeping the DID stable.
+async fn build_self_host_node_over_dir(dir: &std::path::Path) -> ApplicationNode<SqliteStorage> {
+    let storage_key = Zeroizing::new([0x5Au8; 32]);
+
+    let node_storage =
+        SqliteStorage::new(dir, storage_key.as_ref()).expect("node SQLite should open");
+    let custody = build_custody(dir, &storage_key).await;
+
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let cache = Arc::new(DidCache::new());
+    let sign_fn = TestDidDht::make_sign_fn(Arc::clone(&custody));
+    let did_method = Arc::new(DidDht::with_client_and_signer(dht_client, cache, sign_fn));
+
+    let blob_storage =
+        scp_transport::native::storage::BlobStorageBackend::sqlite(&dir.join("blobs"))
+            .expect("sqlite blob storage should open");
+
+    ApplicationNodeBuilder::new()
+        .storage(node_storage)
+        .blob_storage(blob_storage)
+        .no_domain()
+        .nat_strategy(Arc::new(FixedTierNatStrategy))
+        // The production `--self-host` identity wiring: load-or-create from the
+        // root storage so the DID is stable across restarts.
+        .identity_with_storage(custody, did_method)
+        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .http_bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .build()
+        .await
+        .expect("no-domain node should build over encrypted SQLite storage")
+}
+
+/// FIX A: two sequential builds over ONE storage path must yield the SAME DID.
+///
+/// This is the in-process analogue of restarting `scp-node --self-host` against
+/// the same `--storage-path`: the persisted identity (and custody keyring) live
+/// on disk, so the second boot reloads the identity instead of minting a fresh
+/// `did:dht`. The first node is fully shut down before the second is built, so
+/// the root `SQLite` advisory lock is released between boots, exactly like a
+/// real restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_host_did_is_stable_across_restarts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().to_path_buf();
+
+    // -- Boot 1: fresh dir -> creates and persists the identity. --
+    let node1 = build_self_host_node_over_dir(&dir).await;
+    let did1 = node1.identity().did().to_owned();
+    assert!(
+        did1.starts_with("did:dht:"),
+        "boot 1 DID should be a did:dht, got {did1}"
+    );
+    // Release the root SQLite advisory lock before re-opening (real restart).
+    node1.shutdown();
+    drop(node1);
+
+    // -- Boot 2: SAME dir -> reloads the persisted identity. --
+    let node2 = build_self_host_node_over_dir(&dir).await;
+    let did2 = node2.identity().did().to_owned();
+    node2.shutdown();
+
+    assert_eq!(
+        did1, did2,
+        "self-host DID MUST be stable across restarts over the same storage path \
+         (boot 1: {did1}, boot 2: {did2})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX B — skip_nat_probe binds on a loopback relay URL without probing
+// ---------------------------------------------------------------------------
+
+/// A NAT strategy that PANICS if `select_tier` is ever called.
+///
+/// `skip_nat_probe()` must short-circuit before any tier selection, so a node
+/// built with it active must never invoke this strategy.
+struct PanicOnProbeNatStrategy;
+
+impl NatStrategy for PanicOnProbeNatStrategy {
+    fn select_tier(
+        &self,
+        _relay_port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+    > {
+        Box::pin(async {
+            panic!("select_tier must NOT be called when skip_nat_probe() is set");
+        })
+    }
+}
+
+/// FIX B: `skip_nat_probe()` must skip the STUN/NAT probe entirely and publish a
+/// loopback relay URL.
+///
+/// The node is built with a NAT strategy that panics if probed; a successful
+/// build proves the probe was skipped. The published relay URL must be the
+/// loopback fallback (`ws://127.0.0.1:<http_port>/scp/v1`) — the correct posture
+/// behind a tunnel/proxy, and what keeps the self-signed cert SANs localhost-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().to_path_buf();
+    let storage_key = Zeroizing::new([0x5Au8; 32]);
+
+    let node_storage =
+        SqliteStorage::new(&dir, storage_key.as_ref()).expect("node SQLite should open");
+    let custody = build_custody(&dir, &storage_key).await;
+
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let cache = Arc::new(DidCache::new());
+    let sign_fn = TestDidDht::make_sign_fn(Arc::clone(&custody));
+    let did_method = Arc::new(DidDht::with_client_and_signer(dht_client, cache, sign_fn));
+
+    let blob_storage =
+        scp_transport::native::storage::BlobStorageBackend::sqlite(&dir.join("blobs"))
+            .expect("sqlite blob storage should open");
+
+    // A fixed HTTP bind port so we can assert the exact loopback relay URL.
+    let http_port = 28444u16;
+
+    let node = ApplicationNodeBuilder::new()
+        .storage(node_storage)
+        .blob_storage(blob_storage)
+        .no_domain()
+        // If the probe is NOT skipped this strategy panics — a clean build proves
+        // skip_nat_probe short-circuited the probe.
+        .nat_strategy(Arc::new(PanicOnProbeNatStrategy))
+        .skip_nat_probe()
+        .identity_with_storage(custody, did_method)
+        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .http_bind_addr(SocketAddr::from(([127, 0, 0, 1], http_port)))
+        .build()
+        .await
+        .expect("no-domain node should build with the NAT probe skipped");
+
+    assert_eq!(
+        node.relay_url(),
+        format!("ws://127.0.0.1:{http_port}/scp/v1"),
+        "skip_nat_probe must publish a loopback relay URL"
+    );
+    node.shutdown();
 }

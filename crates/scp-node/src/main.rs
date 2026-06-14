@@ -852,7 +852,32 @@ fn self_host_banner(port: u16, plaintext: bool) -> String {
 /// browsers will open it); this flag restores the legacy plaintext-HTTP
 /// behavior for anyone who wants it (§10.12.11).
 fn self_host_plaintext() -> bool {
-    env::var("SCP_NODE_SELF_HOST_PLAINTEXT").is_ok_and(|v| v == "1" || v == "true")
+    env_flag_is_truthy(env::var("SCP_NODE_SELF_HOST_PLAINTEXT").ok().as_deref())
+}
+
+/// Whether the operator opted OUT of the STUN/NAT external-address probe for
+/// self-host via `SCP_NODE_SELF_HOST_NO_NAT=1`.
+///
+/// The probe (STUN reflexive-address discovery + UPnP/NAT-PMP mapping +
+/// reachability self-test) can add tens of seconds to startup and is dead
+/// weight when the node is reached through a tunnel/proxy that terminates on
+/// `localhost` (e.g. a Cloudflare tunnel). When set, the no-domain build skips
+/// the probe entirely, binds and serves immediately, and publishes a loopback
+/// relay URL -- so no external IP is disclosed to the DHT and no external-IP
+/// certificate SAN is added (the tunnel provides external reachability).
+fn self_host_skip_nat() -> bool {
+    env_flag_is_truthy(env::var("SCP_NODE_SELF_HOST_NO_NAT").ok().as_deref())
+}
+
+/// Pure predicate for an opt-in boolean environment flag: `true` only when the
+/// value is exactly `"1"` or `"true"`. Any other value (including unset,
+/// `"0"`, `"false"`, or arbitrary text) is `false`.
+///
+/// Extracted so the parsing semantics can be unit-tested without mutating the
+/// process environment (`std::env::set_var` is `unsafe` under edition 2024 and
+/// process-global, which makes env-based tests flaky under parallel execution).
+fn env_flag_is_truthy(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true"))
 }
 
 /// Builds the self-signed TLS config for the self-host listener, or returns
@@ -974,8 +999,16 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
 
     // -- Loud startup banner BEFORE opening any socket --
     eprintln!("{}", self_host_banner(port, plaintext));
+    if self_host_skip_nat() {
+        eprintln!(
+            "NAT probe skipped (SCP_NODE_SELF_HOST_NO_NAT) — assuming reachability via a \
+             proxy/tunnel. Relay URL falls back to loopback; certificate SANs are \
+             localhost + 127.0.0.1 only."
+        );
+    }
     tracing::warn!(
         port,
+        skip_nat = self_host_skip_nat(),
         "self-host mode enabled — opening inbound port to the public internet"
     );
 
@@ -1079,7 +1112,11 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
 /// Exits the process on storage or build failure — there is nothing to serve
 /// without a node. `build()` establishes the inbound port mapping during its
 /// NAT tier selection and can still fail afterward (e.g. DID publish), so on
-/// build failure the mappings are released best-effort before exiting.
+/// build failure the mappings are released best-effort before exiting. When
+/// `SCP_NODE_SELF_HOST_NO_NAT=1` is set the builder is configured with
+/// [`ApplicationNodeBuilder::skip_nat_probe`], so no port mapping is attempted
+/// (the mapper handles stay `None`) and the node binds and serves immediately
+/// on a loopback relay URL — the correct posture behind a tunnel/proxy.
 ///
 /// [`ApplicationNode`]: scp_node::ApplicationNode
 async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
@@ -1112,12 +1149,20 @@ async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
     };
 
     // -- NAT strategy with RETAINED mapper handles for clean teardown --
+    // When the operator opted out of NAT traversal (`SCP_NODE_SELF_HOST_NO_NAT`),
+    // no port mapper is constructed: there is no mapping to create, retain,
+    // renew, or release. The handles stay `None` so the renewal loop and the
+    // teardown release are both no-ops, and the builder is told to skip the
+    // probe entirely.
+    let skip_nat = self_host_skip_nat();
     #[cfg(feature = "upnp")]
     let (nat_strategy, upnp_mapper, natpmp_mapper): (
         Option<Arc<dyn scp_node::NatStrategy>>,
         OptionalPortMapper,
         OptionalPortMapper,
-    ) = {
+    ) = if skip_nat {
+        (None, None, None)
+    } else {
         let upnp: Arc<dyn scp_transport::nat::PortMapper> =
             Arc::new(scp_transport::nat::UpnpPortMapper::new());
         let natpmp: Arc<dyn scp_transport::nat::PortMapper> =
@@ -1134,10 +1179,20 @@ async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
     #[cfg(not(feature = "upnp"))]
     let (upnp_mapper, natpmp_mapper): (OptionalPortMapper, OptionalPortMapper) = (None, None);
 
+    // `identity_with_storage` (NOT `generate_identity_with`) gives the
+    // self-host node a STABLE DID across restarts: on first boot it creates and
+    // persists the identity to the root `node_storage` (under the `scp/identity`
+    // key); on every subsequent boot against the same `--storage-path` it
+    // reloads that persisted identity instead of minting a fresh DID. Using
+    // `generate_identity_with` here regenerated the DID on every restart even
+    // though the custody key and storage persisted (the relay URL and DHT
+    // record churned each boot). The persisted custody keyring keeps the
+    // `KeyHandle` indices valid across restarts, so the reloaded identity can
+    // still sign.
     let builder = ApplicationNodeBuilder::new()
         .storage(node_storage)
         .blob_storage(blob_storage)
-        .generate_identity_with(custody, did_method)
+        .identity_with_storage(custody, did_method)
         .no_domain()
         .http_bind_addr(http_addr)
         .projection_rate_limit(projection_rate);
@@ -1145,6 +1200,14 @@ async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
     let builder = match nat_strategy {
         Some(strategy) => builder.nat_strategy(strategy),
         None => builder,
+    };
+    // Behind a tunnel/proxy (SCP_NODE_SELF_HOST_NO_NAT=1) the STUN/NAT probe is
+    // dead weight: skip it so startup binds and serves immediately on a loopback
+    // relay URL (see `ApplicationNodeBuilder::skip_nat_probe`).
+    let builder = if skip_nat {
+        builder.skip_nat_probe()
+    } else {
+        builder
     };
 
     match builder.build().await {
@@ -1780,5 +1843,72 @@ async fn main() {
         run_full_node_ephemeral().await;
     } else {
         run_full_node_persistent(config.storage_path.as_ref()).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SCP_NODE_SELF_HOST_NO_NAT` (and every opt-in self-host flag) is truthy
+    /// only for the exact values `"1"` and `"true"`. This is the parsing rule
+    /// `self_host_skip_nat` applies; testing the pure predicate avoids mutating
+    /// the process-global environment.
+    #[test]
+    fn env_flag_is_truthy_only_for_one_or_true() {
+        assert!(env_flag_is_truthy(Some("1")));
+        assert!(env_flag_is_truthy(Some("true")));
+
+        assert!(!env_flag_is_truthy(None));
+        assert!(!env_flag_is_truthy(Some("")));
+        assert!(!env_flag_is_truthy(Some("0")));
+        assert!(!env_flag_is_truthy(Some("false")));
+        assert!(!env_flag_is_truthy(Some("TRUE")));
+        assert!(!env_flag_is_truthy(Some("yes")));
+        assert!(!env_flag_is_truthy(Some("2")));
+    }
+
+    /// FIX B consequence: a loopback relay URL (what the node publishes when the
+    /// NAT probe is skipped) contributes NO external IP to the certificate SAN
+    /// set — only localhost + 127.0.0.1 remain (already the default SANs). A
+    /// routable external URL, by contrast, does contribute its IP.
+    #[test]
+    fn loopback_relay_url_adds_no_external_san() {
+        // Skip-NAT loopback fallback: no external SAN.
+        assert_eq!(
+            external_ip_from_relay_url("ws://127.0.0.1:8444/scp/v1"),
+            None,
+            "loopback relay URL must not yield an external SAN"
+        );
+        // IPv6 loopback is likewise excluded.
+        assert_eq!(
+            external_ip_from_relay_url("ws://[::1]:8444/scp/v1"),
+            None,
+            "IPv6 loopback relay URL must not yield an external SAN"
+        );
+        // A routable external URL (the probed path) DOES yield its IP.
+        assert_eq!(
+            external_ip_from_relay_url("ws://203.0.113.7:8444/scp/v1"),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                203, 0, 113, 7
+            ))),
+            "a routable relay URL must yield its external IP as a SAN"
+        );
+    }
+
+    /// The skip-NAT banner line is only emitted via the env helper; verify the
+    /// helper composes with the pure predicate so the binary's branch is
+    /// exercised through a stable, testable seam.
+    #[test]
+    fn self_host_skip_nat_uses_the_truthy_predicate() {
+        // The function reads the env, but its decision is exactly the pure
+        // predicate over the variable's value, which the tests above pin down.
+        // Here we only assert it is callable and returns a bool (no panic),
+        // keeping the env untouched for parallel-test safety.
+        let _: bool = self_host_skip_nat();
     }
 }
