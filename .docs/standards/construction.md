@@ -47,7 +47,7 @@ A boolean parameter that selects between two named behaviors is a misuse-magnet:
 |---|---|
 | `plaintext: bool` (site TLS) | `tls: TlsMode { SelfSigned, Acme { … }, Plaintext, Terminated }` |
 | `skip_nat: bool` + addressing flags | `reach: Reach { Domain{…}, NatTraversal, Tunnel{…}, Local }` |
-| `supports_bridge: bool` (relay) | `bridge: BridgeRole { Disabled, Enabled{…} }` |
+| `supports_bridge: bool` (relay) | `bridge: BridgeRole { Disabled, Enabled{…} }` (`Default = Disabled`) |
 | `in_memory: bool` (DHT publish) | `dht: DhtMode { Memory, Production{…} }` |
 
 Booleans that are genuinely binary state with no behavioral fork (e.g. `http3: bool` enabling an additional listener) are permitted, but the bar is high: if the choice has security or addressing consequences, it is an enum.
@@ -58,8 +58,10 @@ For each entry point, one choice is designated **security-critical**. It must be
 
 - **Node / host_site:** publishing an address to the DHT discloses location/IP. `dht: DhtMode` defaults to `Memory` (no publish). Any `Reach` variant that publishes a routable address requires `DhtMode::Production`, and selecting a publishing `Reach` with `DhtMode::Memory` is a precise, loud error — not a silent publish, not a silent no-op.
 - **Site TLS:** `TlsMode::Plaintext` is never a default. A config that omits TLS does not silently serve plaintext on a public reach.
-- **Identity:** the security-critical choice is whether to **persist key material**. `persistence: None` (an ephemeral identity, no key material at rest) is the fail-safe default; persisting is the explicit `Some(StorageSlot)` choice, never reached by omission.
+- **Identity:** the security-critical choice is whether to **persist key material**. `persistence: None` (an ephemeral identity, no key material at rest) is the fail-safe default; persisting is the explicit `Some(StorageSlot)` choice, never reached by omission. When persistence *is* chosen, the slot is `EncryptedStorage`-bound — persisting is encrypted-only (see the EncryptedStorage compile-time split). This is the same model as a Node's persisted identity, which persists into the Node's own `storage` slot; the only difference is the source of the slot — Node reuses `NodeConfig.storage`, standalone Identity names its own `IdentityConfig.persistence`.
 - **Context:** the security-critical choice is the `ContextCreation` Template-vs-Explicit selection itself — a required enum with no default, so M2 applies **per-variant**: within `Explicit`, the permission `ceiling` is a required field (no over-broad default ceiling), and `Template` resolves only to the named template's fail-safe parameters.
+
+> **Un-mechanizable carve-out (human-review).** "A `Template` resolves only to fail-safe parameters" is a property of the template **data**, not of config **shape** — the structural check `scripts/check-construction-pattern.py` (AC-9) inspects type/field structure, so it **cannot** verify what values a named template expands to. This clause is therefore enforced by human review, exactly like the M1 boolean carve-out (whether a surviving `bool` is "genuinely binary state with no behavioral fork" is also a judgment the check cannot make). Stating it keeps the mechanical-vs-prose line honest: the check guards config shape; template-data fail-safety and the M1 bool judgment are the two properties it cannot.
 
 Convenience sugar (presets) may only ever resolve to fail-safe values.
 
@@ -82,7 +84,7 @@ Instead:
   NodeConfig { reach, identity, storage, ..NodeConfig::defaults(reach2, identity2, storage2) }
   ```
 
-A config whose every field is genuinely fail-safe **may** keep `Default` — `RelayConfig` qualifies, since every field has a safe default. The rule fires only when a field is security-relevant or irreducible.
+A config whose every field is genuinely fail-safe **may** keep `Default` — `RelayConfig` qualifies, since every field has a safe default. This explicitly depends on `BridgeRole::default() == Disabled`: `bridge` is `RelayConfig`'s only security-consequential field, and because its `Default` is the fail-safe `Disabled` (a relay that brokers nothing until explicitly enabled), the whole struct's `Default` manufactures no unsafe value. If `BridgeRole::default()` were `Enabled`, `RelayConfig` would forfeit this exception and M4 would fire. The rule fires only when a field is security-relevant or irreducible *and lacks a fail-safe default*.
 
 ### M5 — One greppable contract
 
@@ -107,9 +109,16 @@ impl Node {
 }
 ```
 
-This is the **only** sanctioned two-entry-point split. ADR-051 AC-9 additionally requires a structural test proving the unencrypted-storage path is unreachable from the production `Node::start` constructor.
+This is the **only** sanctioned two-entry-point split. ADR-051 AC-9 additionally requires a structural test proving the unencrypted-storage path is unreachable from the production identity-persisting constructors — `Node::start` and `Identity::create` (the two paths that persist identity key material).
 
 > Rule: the seal stays a compile-time `S: EncryptedStorage` bound, never a runtime check. Rationale: ADR-051 Rejected Alternative #3.
+
+**The seal covers every identity-key persistence path, not just Node.** Identity key material persists only to an encrypted storage slot. Any `StorageSlot` used to persist identity keys is bound by `EncryptedStorage` exactly as `Node::start` is — on **both** production persistence paths:
+
+- **Node** — `NodeConfig.storage` on the production `Node::start` path (`where S: EncryptedStorage`). A Node's persisted identity uses the Node's *own* `storage` slot; there is no separate identity slot to seal.
+- **Identity** — `IdentityConfig.persistence` on the production `Identity::create` path. When the slot is `Some(StorageSlot)`, the concrete type it carries must be `EncryptedStorage`-bound, the same compile-time bound as `Node::start`.
+
+Consequently identity key material can **never** persist to plaintext, including via `StorageSlot::Custom`: the `Custom(concrete)` variant on a production persistence path must carry an `EncryptedStorage` type, not merely any `Storage`. This is the storage-layer realization of M2 for Identity — the security-critical Identity choice is persist-or-not, and *persisting is encrypted-only*.
 
 ## Providers stay typed enum-selectors — never `dyn`
 
@@ -141,7 +150,11 @@ NodeConfig {
     // `PublicSurface`, `ReachabilityTier`, and the `skip_nat` / `no_domain` flags
     // (`crates/scp-node/src`) — into one required field.
     identity: IdentitySource,  // Generate{custody, did_method} | Persisted{custody, did_method} | Explicit{identity, document}
-    storage: StorageSlot,      // core storage slot, generic over S; fail-closed (M3). The FFI bridges mirror this as their per-bridge `StorageConfig` enum.
+    // `IdentitySource::Persisted` means "load-or-create the node's identity, persisting it
+    // into the Node's OWN `storage` slot below." It carries no separate storage slot — it
+    // reuses `NodeConfig.storage`. (Same persist-to-an-encrypted-slot model as standalone
+    // `Identity`, which instead names its own `IdentityConfig.persistence` slot.)
+    storage: StorageSlot,      // core storage slot, generic over S; fail-closed (M3); EncryptedStorage-bound on the production `Node::start` path. The FFI bridges mirror this as their per-bridge `StorageConfig` enum.
     // Enums (M1):
     tls: TlsMode,
     dht: DhtMode,              // defaults Memory / no-publish (M2)
@@ -156,7 +169,7 @@ Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `No
 
 ### Relay — `RelayConfig`
 
-Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled{ bridge_secret, … } }` (M1); `BridgeRole::Enabled` with no `bridge_secret` is a loud error (M3). Entry: `Relay::start(RelayConfig)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire).
+Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled{ bridge_secret, … } }` (M1); `BridgeRole::Enabled` with no `bridge_secret` is a loud error (M3). Entry: `Relay::start(RelayConfig)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire), an exception that holds **precisely because** `BridgeRole::default() == Disabled` (its sole security-consequential field has a fail-safe default).
 
 ### host_site — `SiteConfig`
 
@@ -170,6 +183,8 @@ SiteConfig {
     site_dir, port, storage_path, …
 }
 ```
+
+`SiteConfig` carries **both** a `tls: TlsMode` and a `dht: DhtMode`, and inherits the **same M2 DHT-publish rule as `NodeConfig`**: a publishing `Reach` (one that advertises a routable address) requires `DhtMode::Production`, and `DhtMode::Memory` (no publish) is the fail-safe default. M2 therefore fires for Site on **both** axes — Site TLS *and* Site DHT — not TLS alone: omitting TLS never silently serves plaintext on a public reach, and selecting a publishing `Reach` with `DhtMode::Memory` is the same precise, loud error it is for `NodeConfig`, not a silent publish or silent no-op.
 
 `host_site` (today `host_site(opts: HostSiteOptions)`, `crates/scp-node/src/self_host.rs`) remains the fail-safe **sugar** tier: it constructs a full `SiteConfig` and delegates to `Node::start` — never a parallel construction path (matches `start_local` / `start_in_memory`).
 
@@ -190,7 +205,7 @@ ContextConfig {
 IdentityConfig {
     method: DidMethodSlot,            // required
     custody: KeyCustodySlot,          // required
-    persistence: Option<StorageSlot>, // None = ephemeral identity (fail-safe default; M2)
+    persistence: Option<StorageSlot>, // None = ephemeral identity (fail-safe default; M2). Some(slot) is EncryptedStorage-bound on the production `Identity::create` path — persisting is encrypted-only, the same seal as `Node::start`.
 }
 ```
 
