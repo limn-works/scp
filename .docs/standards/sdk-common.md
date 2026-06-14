@@ -181,18 +181,22 @@ All public handle types (`Identity`, `ContextHandle`/`Context`, `TransportManage
 
 Context creation has two paths: template-based (primary) and explicit params (advanced). Both produce identical `ContextHandle` objects. See spec §5.12 for protocol-level template definitions.
 
+Construction follows the unified config-object pattern (`.docs/standards/construction.md`, ADR-051): all five SDKs — Rust included — pass a single `ContextConfig` whose `creation: ContextCreation` field makes the template-vs-explicit choice a required enum (`Template { template, peer }` | `Explicit { ceiling, roles, governance, memory_scope }`). The previous Rust fluent `create_context().template().build()` builder is replaced so that every language uses the same options-object shape.
+
 ### Template-based creation (primary path)
 
 All SDKs expose template-based context creation as the default. The template handles parameter selection; the caller provides only what varies (peer, TTL, tools for templates that allow them).
 
 ```
 // Rust
-let ctx = sdk.create_context()
-    .template(Template::BilateralEphemeral)
-    .peer(&bob_did)
-    .ttl(Duration::from_secs(300))
-    .build()
-    .await?;
+let ctx = sdk.create_context(ContextConfig {
+    creation: ContextCreation::Template {
+        template: Template::BilateralEphemeral,
+        peer: Some(bob_did.clone()),
+    },
+    ttl: Some(Duration::from_secs(300)),
+    ..ContextConfig::defaults()
+}).await?;
 
 // Python
 ctx = await sdk.create_context(
@@ -222,15 +226,17 @@ For contexts that don't fit a well-known template. The caller specifies all para
 
 ```
 // Rust
-let ctx = sdk.create_context()
-    .ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite, Capability::ToolInvokeAll])
-    .roles(vec![admin_role, member_role, observer_role])
-    .governance(Governance::SingleAdmin)
-    .memory_scope(MemoryScope::Summary)
-    .ttl(Duration::from_secs(3600))
-    .tools(vec![recipe_search, nutrition_lookup])
-    .build()
-    .await?;
+let ctx = sdk.create_context(ContextConfig {
+    creation: ContextCreation::Explicit {
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite, Capability::ToolInvokeAll],
+        roles: vec![admin_role, member_role, observer_role],
+        governance: Governance::SingleAdmin,
+        memory_scope: MemoryScope::Summary,
+    },
+    ttl: Some(Duration::from_secs(3600)),
+    tools: vec![recipe_search, nutrition_lookup],
+    ..ContextConfig::defaults()
+}).await?;
 ```
 
 ### Bilateral shorthand

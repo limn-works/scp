@@ -39,6 +39,7 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 - **No shortcuts.** No force unwraps, no placeholders, no "good enough."
 - **Provenance is paramount.** Every line traces to a documented decision. Chain: `.docs/` sources → `.docs/prds/` stories (or GitHub comments, feature-local artifacts). Before writing or changing code, read the full provenance chain — not summaries, not headers, the actual artifacts. Fresh agents must retrace full context quickly. Broken provenance is a bug.
 - **Always run CI locally before pushing.** Pushing lint, format, and test failures is a waste of CI minutes.
+- **Agent-first API design.** The SDK's primary author is an LLM. Optimize every public API for first-pass LLM authorability: one canonical pattern; flat named-field config objects over builders and typestate; enums over booleans for consequential choices; no silent security defaults; an identical shape across all language bindings. Typestate / phantom required-ordering a model can't track is a defect, not a safety feature — encode required choices as required fields. The measure: an agent writes correct code from the type signature plus one example, with no compile-retry loop. Enacted mechanically via `.docs/standards/construction.md` + a structural check (see ADR-051).
 
 ## Tools
 
@@ -126,7 +127,7 @@ Weakening, removing, or exempting existing assertions requires human approval.
 
 **Architecture:**
 - Protocol-first design; inject through initializers; no singletons
-- APIs: self-evident, one happy path
+- APIs: self-evident, one happy path, optimized for LLM authorability (see the Agent-first API design tenet)
 
 **PRD stories (MANDATORY):**
 - **Before creating, editing, or updating any story in `.docs/prds/`**, read `.docs/standards/prd.md` in full. No exceptions.

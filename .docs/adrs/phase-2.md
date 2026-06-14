@@ -1062,6 +1062,8 @@ Implement a complete addressability and deployment layer as specified in §18:
 
 6. **`scp-node` crate** with `ApplicationNode` builder: `.domain()`, `.identity()` / `.generate_identity()`, `.storage()`, `.build()`. Build wires relay server start, DID publication with SCPRelay entries, storage initialization. `node.relay()`, `node.identity()`, `node.storage()` accessors work.
 
+   > **Superseded by ADR-051 (Unified Construction Pattern).** The fluent typestate builder (`.domain()/.identity()/.storage()/.build()`) mandated here is replaced by a flat `NodeConfig` config object constructed via `Node::start(config)` / `Node::start_for_testing(config)`. Only this AC is superseded; the rest of ADR-032 stands. See ADR-051 for the rationale and the full pattern.
+
 7. **TLS provisioning:** ACME HTTP-01 challenge handler. Certificate storage in SqliteStorage. Auto-renewal 30 days before expiry. TLS 1.3 enforced.
 
 8. **HTTP server:** `node.well_known_router()` returns axum Router serving `GET /.well-known/scp` with dynamically generated content. `node.relay_router()` returns axum Router handling WebSocket upgrade at `/scp/v1`. `node.serve(app_router)` merges routes and binds HTTPS.
@@ -1516,3 +1518,78 @@ Key design choices:
 | `bindings/python/scp_sdk/context.py` | `broadcast_publish_asset`, `broadcast_publish_assets` |
 
 **Estimated functions:** ~20-25 public functions, ~15-20 internal helpers across all files.
+
+---
+
+## ADR-051: Unified Construction Pattern
+
+> **Note:** ADR-051 is numbered non-sequentially (same convention as ADR-032/035/042). It lives in the Phase 2 document because its primary worked example is `ApplicationNode` construction (ADR-032, `scp-node`), but its scope is cross-cutting: it governs every developer-facing construction entry point across all five language SDKs.
+
+**Status:** Decided
+
+### Context
+
+SCP's thesis is the agentic Internet, and a direct corollary governs the SDK: **its primary author is an LLM**, writing across five languages (Rust core + Python, TypeScript, Swift, Kotlin). "Best for the model writing against it" — first-pass authorability with no compile-retry loop — is therefore *the* design criterion for the construction surface, not idiomatic-Rust-for-its-own-sake. This is now ratified as the **Agent-first API design** builder tenet in CLAUDE.md; this ADR is its first worked example, and `.docs/standards/construction.md` is its enforced enactment.
+
+Today the construction surface is **three different patterns**:
+
+1. **Typestate builder** — `ApplicationNodeBuilder` (`crates/scp-node/src/lib.rs`): generic markers `<K, D, S, Dom, Id>`, `HasDomain`/`HasNoDomain`/`HasIdentity` `PhantomData` states, ~25 `.with_*` methods, and a `build()`/`build_for_testing()` split. This is the LLM-hostile outlier: phantom required-ordering the model loses track of (→ compile-retry loops), required steps invisible because they are encoded in types rather than fields, and a shape that does not translate to four of five languages (Python, TypeScript, Swift, Kotlin have no typestate).
+2. **Flat config objects** — `RelayConfig` (`crates/scp-transport/src/native/server.rs`), `HostSiteOptions` (`crates/scp-node/src/self_host.rs`), and the cross-FFI `StorageConfig` enum. Already the target shape, already mapped identically across all four bridges.
+3. **Options-objects in SDK wrappers** — Context and Identity already use them in Python/TypeScript/Swift, while Rust uses a fluent builder (the `sdk-common.md` Context-creation divergence). The same operation has two different shapes depending on language.
+
+ADR-032 §AC-6 mandated the typestate builder. Eliminating it follows directly from the Agent-first API design tenet (CLAUDE.md): typestate the LLM author cannot track is a defect, not a safety feature.
+
+### Decision
+
+Adopt **one flat-config-object construction pattern** for every developer-facing construction entry point — Node, Relay, `host_site`, Context, Identity — **identical in all five languages**, optimized for first-pass LLM authorability. Each entry point is **one flat config object** plus a single entry function, named by the entry-verb rule (construction.md): `Thing::start(config)` for entry points that **spawn a running server/runtime** (`Node::start`, `Relay::start`), `Thing::create(config)` for **value/handle construction** (`Identity::create`, `Context::create`).
+
+This supersedes **only ADR-032 §AC-6** (the `.domain()/.identity()/.storage()/.build()` builder mandate). Every other acceptance criterion and decision in ADR-032 stands unchanged.
+
+The pattern and its five mechanical rules (M1–M5) are specified in full in `.docs/standards/construction.md`. In summary:
+
+- **M1** — enums, not booleans, for semantic choices (`Reach`, `BridgeRole`, `TlsMode`, `DhtMode`).
+- **M2** — the security-critical choice is required or fail-safe-defaulted, never silently unsafe (DHT address publication defaults to no-publish; publishing requires an explicit production-tier selection). This DHT-publish rule applies to **both** `NodeConfig` and `SiteConfig` — each carries a `dht: DhtMode`, so M2 fires for Site TLS *and* Site DHT, not TLS alone. M2 covers all five entry points: Relay's security-critical choice is `BridgeRole`, which defaults to the fail-safe `Disabled` (an `Enabled` bridge is reached only by explicit opt-in, never by omission); Identity's is persist-or-not (`persistence: None` is the ephemeral fail-safe default); Context's is the required `ContextCreation` enum (no default).
+- **M3** — required capabilities fail loud, never silent no-op (modelled on `StorageConfig` fail-closed).
+- **M4** — no whole-struct `Default` when any field is security-relevant or irreducible; required fields are non-`Option`, with a `Thing::defaults(required…)` factory for the spread idiom.
+- **M5** — one greppable contract: exactly one real constructor per type; no `*Builder`, no typestate markers, no positional construction. The `EncryptedStorage` `start`/`start_for_testing` trait-bound split is the single allowed exception.
+
+The two guarantees the typestate markers previously enforced collapse into **required enum fields** — still compile-checked, but LLM-legible:
+
+- `Reach` (the addressing XOR, one required field): `Domain { domain }` | `NatTraversal` | `Tunnel { public_url }` | `Local`.
+- `IdentitySource` (required): `Generate { custody, did_method }` | `Persisted { custody, did_method }` | `Explicit { identity, document }`.
+
+### Rationale
+
+- **Cites the Agent-first API design tenet (CLAUDE.md).** Typestate is unsafe *for the actual author* — a model that cannot track phantom ordering enters a compile-retry loop. Encoding required choices as required fields makes the same compile-time guarantee legible.
+- **"No DOA decisions" (CLAUDE.md).** Three divergent construction patterns is a design that needs replacing; replacing it now, with one pattern that holds across all five languages, is the permanent commitment.
+- **"APIs: self-evident, one happy path" (CLAUDE.md).** One config object, one entry function, one shape per operation across all bindings — the maximally self-evident surface.
+- **Injection-through-initializers is preserved (architecture.md §2.5).** Custody, storage, DID method, and transport remain trait-injected; they are carried as typed fields/selectors *inside* the config object. Nothing is constructed by a module that should receive it. The flat config object is the initializer the §2.5 invariant already requires — it is the vehicle for injection, not a bypass of it.
+- **Proven cross-language mapping.** The existing `StorageConfig` FFI mapping already demonstrates the equivalence (see the canonical table in construction.md §Five-language equivalence). The pattern is not speculative.
+
+### Rejected Alternatives
+
+1. **Keep the typestate builder kernel (status quo).** Rejected. The typestate markers are the precise mechanism that produces compile-retry loops for an LLM author and the shape that does not translate to four of five languages. "Compile-time safety" is real but is fully recovered by required enum fields, which are also legible. Retaining the builder would entrench the worst case against the Agent-first tenet.
+2. **Box the injected providers as `dyn` (e.g. `Arc<dyn Storage>`) to flatten the generics away.** Impossible, not merely undesirable: `KeyCustody`, `Storage`, and `DidMethod` use return-position `impl Trait` in trait (RPITIT) and are **not object-safe** — `Arc<dyn Storage>` does not compile, and the codebase already works around this in several places. Boxing would also put `async-trait` allocation on storage-read and sign hot paths, regressing the ADR-049 lock-free-read invariant. Providers therefore stay **typed enum-selectors / concrete types**, never `dyn`. The config object carries the generics on its selectors; they are not erased.
+3. **Demote the `EncryptedStorage` seal to a runtime check** so production and testing share one unconditional `start(config)`. Rejected — this weakens the compile-time encryption-at-rest guarantee (`EncryptedStorage` is a sealed trait; production `Node::start` requires `S: EncryptedStorage`, the `start_for_testing` path is feature-gated). Production must not be able to persist plaintext, and that must hold at compile time, not by convention. The guarantee is preserved as the `start`/`start_for_testing` trait-bound split — the one allowed exception to M5 — and additionally backed by a structural test that the unencrypted path is unreachable from the production constructor.
+
+### Acceptance Criteria
+
+1. **`.docs/standards/construction.md`** exists, frames itself as the enactment of the Agent-first API design tenet, and specifies rules M1–M5, the per-entry-point target shapes, and the five-language equivalence table.
+2. **CLAUDE.md** carries the **Agent-first API design** builder tenet, and the "APIs: self-evident, one happy path" architecture rule references it.
+3. **`NodeConfig`** replaces `ApplicationNodeBuilder`: required fields `reach: Reach`, `identity: IdentitySource`, and a required storage slot (no whole-struct `Default`); enum fields `tls`, `dht`; defaulted optionals for the remainder. The Rust-core `NodeConfig` stays generic over the storage type `S` (the `<K, D, S>` generics survive, carried by the config and its selectors) and carries the injected provider as a typed core slot — it does **not** carry the FFI `StorageConfig` enum (scp-core does not depend on scp-ffi). Each FFI bridge mirrors `NodeConfig` as its own per-bridge config, lowering the storage slot to that bridge's `StorageConfig` enum. Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) and `Node::start_for_testing(NodeConfig)` (feature-gated, any `Storage`). The `Dom`/`Id` typestate markers are deleted.
+4. **`RelayConfig`** replaces `supports_bridge: bool` with a `BridgeRole` enum (`Default = Disabled`, the fail-safe); `BridgeRole::Enabled` with no `bridge_secret` is a loud runtime error (M3). `RelayConfig` may keep its whole-struct `Default` under M4 precisely because `BridgeRole::default() == Disabled` makes its sole security-consequential field fail-safe. Entry: `Relay::start(RelayConfig)` (the SDK-facing entry, which wraps the internal low-level `RelayServer::new(config, storage)` — `RelayServer::new` is not the public pattern surface; see the entry-verb rule in construction.md).
+5. **`SiteConfig`** folds `HostSiteOptions`: `reach: Reach` (required), `tls: TlsMode` (the same enum as `NodeConfig.tls`; folds the `plaintext` bool), `dht: DhtMode`, plus deployment fields. `host_site` (today `host_site(opts: HostSiteOptions)`) remains the fail-safe sugar tier, constructing a full `SiteConfig` and delegating. `Reach` is a new enum (built in P1) that folds the existing `PublicSurface`, `ReachabilityTier`, and `skip_nat`/`no_domain` machinery in `crates/scp-node/src`; `DhtMode` (currently in `crates/scp-node/src/self_host.rs`) is promoted to a shared location so Node and Site share one definition.
+6. **`ContextConfig { creation: ContextCreation }`** with `Context::create(ContextConfig)` replaces the Rust `create_context().template().build()` builder, where `ContextCreation = Template { template, peer } | Explicit { ceiling, roles, governance, memory_scope }`. This eliminates the `sdk-common.md` Rust/options-object divergence — all five languages now use the same options-object shape.
+7. **`IdentityConfig { method, custody, persistence }`** with `Identity::create(IdentityConfig)`; `method` and `custody` required. `persistence: None` is the fail-safe default (ephemeral identity, no key material at rest); when `Some(StorageSlot)`, the production `Identity::create` path binds the slot to `EncryptedStorage` exactly as `Node::start` does — identity key material persists only to an encrypted slot, including via `StorageSlot::Custom` (the `Custom(concrete)` it carries must be an `EncryptedStorage` type). A Node's persisted identity is the same model sourced differently: it reuses the Node's own `NodeConfig.storage` slot rather than a separate identity slot.
+8. **Five-language equivalence:** each config object and its enums map identically across Rust, Python, TypeScript, Swift, and Kotlin, per the canonical five-language equivalence table in `.docs/standards/construction.md` (the existing per-bridge `StorageConfig` mirror is the worked precedent). The Rust-core-only `Custom(concrete)` advanced-injection variant and its FFI-named/`parse_custody` asymmetry are likewise stated canonically in construction.md (§Five-language equivalence) — a Rust trait object cannot cross the FFI boundary, so the bridge mirror enums omit it. This Rust-core-only/FFI-named split is correct, not a coverage gap.
+9. **Enforcement (additive):** a structural check (`scripts/check-construction-pattern.py`) bans `*Builder` types and typestate markers in construction modules and bans bools where M1 requires enums; the `EncryptedStorage` structural test proves the unencrypted-storage path is unreachable from the production identity-persisting constructors (`Node::start` and `Identity::create`). Three clauses are **not** mechanically checkable and are enforced by human review: (a) whether a surviving `bool` is "genuinely binary state with no behavioral fork" (the M1 carve-out), (b) whether a named `Template` resolves only to fail-safe parameters (a property of template data, not config shape — M2 Context), and (c) whether each entry point's M2 default *direction* points at the fail-safe value (per entry point: Node/Site DHT no-publish, Relay `BridgeRole::Disabled`, Identity ephemeral `persistence: None`) — the check sees a default exists but cannot judge whether it is the safe one. The structural check guards config *shape*; these three are out of its reach by construction.
+
+### Dependencies
+
+- **ADR-032 (Addressability and Deployment):** supersedes §AC-6 only; consumes `ApplicationNode`, `RelayServer`, `host_site`.
+- **ADR-035 / ADR-042 (`SiteConfig`):** the `SiteConfig` reshape extends the existing node-local site configuration.
+- **ADR-048 (per-SDK idiom):** the FFI Rust layer keeps pure helpers as free functions; this ADR governs *construction entry points*, which are first-class objects in every SDK — consistent with ADR-048 §1/§7.
+- **ADR-049 (lock-free-read invariant):** providers stay enum-selectors / concrete types, never boxed `dyn`, to keep allocation off the read/sign hot paths.
+- **architecture.md §2.5 (injection-through-initializers):** preserved; the config object is the initializer through which injection happens.
+- **Name reconciliation (`IdentitySource`):** `crates/scp-node/src/lib.rs` already defines a *private* `enum IdentitySource<K, D>` (variants `Generate { key_custody, did_method }`, `Explicit(Box<ExplicitIdentity>)`) used by the existing typestate builder. The public `IdentitySource` this ADR introduces has different variants (adds `Persisted`, field names `custody`/`did_method`). Phase B-P1 reconciles the collision — extend/reuse the existing enum or rename one — before the public type ships. The final name is an implementation decision, not fixed here.
+
