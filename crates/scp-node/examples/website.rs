@@ -1,6 +1,9 @@
 //! Host a static website on SCP. Run: `cargo run -p scp-node --example website`
 //! Then open the printed URL.
 //!
+//! Override the port with the `PORT` env var, e.g.
+//! `PORT=9000 cargo run -p scp-node --example website`.
+//!
 //! This is a safe LOCAL demo: it serves plain HTTP, skips all NAT/UPnP port
 //! mapping, and uses an in-memory DHT — so NO router port is opened and NOTHING
 //! is published to the network. (The listener binds `0.0.0.0`, so it is also
@@ -22,6 +25,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         plaintext: true,
         skip_nat: true,
         dht_mode: DhtMode::Memory,
+        // `PORT` overrides the bind port. The demo defaults to 8080 (not the
+        // conventional 8443) so it won't collide with a real node already bound
+        // to 8443. An unset `PORT` uses 8080 silently; a set-but-invalid `PORT`
+        // warns and falls back to 8080.
+        port: std::env::var("PORT").map_or(8080, |raw| {
+            raw.parse::<u16>().unwrap_or_else(|_| {
+                eprintln!("PORT={raw:?} is not a valid u16 port number; using 8080");
+                8080
+            })
+        }),
         ..Default::default()
     })
     .await?;
