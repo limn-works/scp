@@ -816,11 +816,20 @@ Checkpoints are sent as regular MLS application messages (encrypted, authenticat
 - `merkleRoot`: Must match for the same `eventCount`. Divergence indicates equivocation or log corruption.
 - `epoch`: Must match. Divergence indicates a missed MLS Commit (possible suppression).
 
+**Cryptographic equivocation test vs. application-layer heuristics.** The "divergence of more than 5 events" / "within tolerance" language on `eventCount` is an application-layer heuristic for distinguishing benign catch-up lag (a peer that is merely Behind or Ahead because it has not yet observed all in-flight events) from an alarm condition worth surfacing. It is NOT the cryptographic equivocation test. The cryptographic equivocation test is unambiguous and conservative: **equal `eventCount` with different `merkleRoot`**. Two honest members reporting the same event count but different roots cannot be reconciled by any ordering of in-flight messages — one of them was served a forged history. Implementations MUST NOT loosen the equal-count test (e.g., by tolerating root divergence within the 5-event window); the count tolerance applies only to deciding whether a count gap is alarming, never to weakening the equal-count-different-root signal.
+
 **Divergence resolution:** If Merkle roots diverge, members exchange event log proofs to identify the first divergent event. This reveals which relay served which version. The context's governance model handles the response.
 
 **Sybil-amplified equivocation defense:** The Relay Consistency Protocol is NOT a majority vote. ANY divergence between ANY two honest members detects equivocation. An attacker who controls Sybil members and a relay can make the Sybil members confirm the attacker's version, but this is irrelevant — two honest members comparing checkpoints will detect the equivocation regardless of how many Sybils agree with the attacker. The defense requires only two honest members in the context.
 
-**Equivocation response protocol.** When equivocation is detected (divergent Merkle roots at the same event count between two honest members), the detecting member initiates the following response:
+**Two-tier equivocation response.** The response to detected equivocation has two distinct tiers, and they are specified — and may be implemented — separately:
+
+- **(a) Local detection alert (detect-and-surface).** On observing two checkpoints with the same `eventCount` but different Merkle roots, an honest member raises a *local, SDK-surfaced* `EquivocationDetected` alert (the runtime/SDK event; see §23.7). This is the minimum conformant equivocation-detection behavior: a conformant member MUST detect the divergence and surface it to the application layer and event log. Tier (a) does NOT require constructing or distributing the signed, proof-bearing `EquivocationAlert` MLS message described below — an implementation of the detection step alone is complete without it.
+- **(b) Signed governance alert (the equivocation governance response).** The publication of a signed, proof-bearing, MLS-distributed `EquivocationAlert` (with `proof: Vec<MerkleProof>` inclusion proofs and `conflicting_hashes`) and the `equivocation_policy` enforcement that follows are a *separate, subsequent governance flow*, specified separately. Tier (a) always precedes tier (b): detection is what triggers the governance response.
+
+The numbered steps below specify tier (b), the equivocation governance response. They build on — and are gated by — the tier (a) detection above.
+
+**Equivocation governance response.** When equivocation is detected (divergent Merkle roots at the same event count between two honest members) and tier (a) has surfaced it, the equivocation governance response proceeds as follows:
 
 1. **EquivocationAlert event.** The detector publishes an `EquivocationAlert` as an MLS application message, signed by the detector's Active Signing Key or Agent Signing Key (ADR-039):
 
@@ -842,7 +851,7 @@ The signature covers `context_id || detector_did || relay_url || local_checkpoin
 
 2. **Alert distribution.** The `EquivocationAlert` is distributed to all context members as a standard MLS application message (encrypted, authenticated). Every member's SDK processes the alert independently.
 
-3. **Governance response.** The context's governance engine processes the `EquivocationAlert`. The response is configurable per context via `equivocation_policy` in context parameters:
+3. **Governance response.** The context's governance engine processes the `EquivocationAlert`. The response is configurable per context via `equivocation_policy` in context parameters. The `equivocation_policy` parameter and its enforcement (`warn` / `suspend_relay` / `remove_relay`, below) are part of the equivocation governance response (tier (b)), not the local detection step (tier (a)) — a member that has only implemented tier (a) detection neither reads nor enforces `equivocation_policy`. The configurable responses are:
 
    - `warn` — Log the alert and notify the application layer. No automated enforcement. Suitable for low-stakes contexts where equivocation may be benign (e.g., relay software bugs).
    - `suspend_relay` (default) — Mark the suspected relay as untrusted in the context's relay set. Members MUST stop publishing to and subscribing from the suspected relay for this context. Members migrate to alternative relays in the context's relay set. If no alternative relays are available, the context enters a degraded state and members are notified.
