@@ -2142,6 +2142,33 @@ impl Scp {
         crate::context::context_member_count_on(&self.inner, handle).await
     }
 
+    /// Reconnects `identity_did`'s contexts after an offline period,
+    /// running the ADR-029 six-phase reconnection protocol for each of
+    /// `contextIds` flagged `needs_reconnect` (§23.11).
+    ///
+    /// The driver lives at the FFI relay-client layer (ADR-029
+    /// reconnection-driver addendum): it pulls relay-buffered messages via
+    /// the `TransportManager` and reaches actor-owned reconnection state
+    /// through the `Supervisor`. On success each context's `needs_reconnect`
+    /// flag is cleared. `lastRelayContacts` maps context id → last-contact
+    /// Unix seconds (tier classification); absent contexts default to the
+    /// most conservative tier.
+    #[napi(js_name = "contextReconnect")]
+    pub async fn context_reconnect(
+        &self,
+        identity_did: String,
+        context_ids: Vec<String>,
+        last_relay_contacts: Option<std::collections::HashMap<String, f64>>,
+    ) -> napi::Result<crate::context::NapiReconnectReport> {
+        crate::context::context_reconnect_on(
+            &self.inner,
+            identity_did,
+            context_ids,
+            last_relay_contacts,
+        )
+        .await
+    }
+
     /// Per-instance equivalent of the free-function `context_is_member`.
     #[napi(js_name = "contextIsMember")]
     pub async fn context_is_member(

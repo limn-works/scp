@@ -597,3 +597,274 @@ pub const fn catch_up_is_terminal(status: &CatchUpStatus) -> bool {
         CatchUpStatus::Complete | CatchUpStatus::FastForwarded { .. }
     )
 }
+
+// ---------------------------------------------------------------------------
+// Bridge-facing orchestration
+// ---------------------------------------------------------------------------
+
+use scp_core::sync::days_offline::{DeltaSyncEngine, RelayBackedDeltaSyncEngine};
+use scp_core::sync::hours_offline::ReconnectionCoordinator;
+use scp_core::sync::weeks_offline::{ReJoinExecutor, RelayBackedReJoinExecutor};
+use scp_protocol::sync::OfflineTier;
+
+/// Flat, FFI-friendly per-context reconnection result. Each bridge maps
+/// this into its own object type (`PyO3` dict, `NAPI` object, `UniFFI` record,
+/// WASM JSON) for the SDK surface.
+#[derive(Debug, Clone)]
+pub struct ContextReconnectResult {
+    /// Context that was reconnected.
+    pub context_id: String,
+    /// Offline tier classification: `"short"` / `"extended"` / `"long"`.
+    pub tier: String,
+    /// Outcome: `"fully_caught_up"` / `"fast_forwarded"` / `"reset"` /
+    /// `"context_gone"` / `"failed"` / `"pending"`.
+    pub outcome: String,
+    /// MLS epochs caught up (Tier 1).
+    pub epochs_caught_up: u64,
+    /// Event-log events recovered.
+    pub events_recovered: u64,
+    /// Whether an MLS Update was issued after catch-up (§9.12).
+    pub mls_update_issued: bool,
+    /// Number of `EquivocationDetected` alerts surfaced during this
+    /// context's sync (§9.9.3).
+    pub equivocations_detected: u64,
+    /// Whether the `needs_reconnect` flag was cleared on success.
+    pub needs_reconnect_cleared: bool,
+}
+
+/// Flat, FFI-friendly reconnection report. Aggregates per-context results
+/// plus queue-drain totals. Each bridge maps this into its SDK return type.
+#[derive(Debug, Clone, Default)]
+pub struct ReconnectReport {
+    /// Per-context results.
+    pub contexts: Vec<ContextReconnectResult>,
+    /// Total queued messages drained across all contexts (Phase 6).
+    pub messages_drained: u64,
+    /// Total queued messages discarded (expired / context gone).
+    pub messages_discarded: u64,
+    /// Total reconnection duration in milliseconds.
+    pub total_duration_ms: u64,
+}
+
+/// Maps an [`OfflineTier`] to a stable lowercase wire string.
+fn tier_str(tier: OfflineTier) -> String {
+    match tier {
+        OfflineTier::Short => "short",
+        OfflineTier::Extended => "extended",
+        OfflineTier::Long => "long",
+    }
+    .to_owned()
+}
+
+/// Maps a [`SyncOutcome`](scp_protocol::sync::SyncOutcome) to a stable
+/// lowercase wire string and a terminal-success boolean (used to decide
+/// whether to clear `needs_reconnect`).
+fn outcome_str(outcome: &scp_protocol::sync::SyncOutcome) -> (String, bool) {
+    use scp_protocol::sync::SyncOutcome;
+    match outcome {
+        SyncOutcome::Pending => ("pending".to_owned(), false),
+        SyncOutcome::FullyCaughtUp => ("fully_caught_up".to_owned(), true),
+        SyncOutcome::FastForwarded { .. } => ("fast_forwarded".to_owned(), true),
+        SyncOutcome::Reset => ("reset".to_owned(), true),
+        SyncOutcome::ContextGone => ("context_gone".to_owned(), true),
+        SyncOutcome::Failed { .. } => ("failed".to_owned(), false),
+    }
+}
+
+/// Drives the full ADR-029 reconnection protocol for the given contexts at
+/// the bridge surface and returns a flat report.
+///
+/// For each context the [`ReconnectionCoordinator`] classifies the offline
+/// tier from `last_relay_contacts` and:
+/// - **Tier 1 (Short)** — runs the six-phase protocol via
+///   [`ReconnectionCoordinator::execute`] against a [`RelayActorSyncDriver`].
+/// - **Tier 2 (Extended)** — fetches the relay snapshot via a
+///   [`RelayBackedDeltaSyncEngine`] (delta application is the actor's job
+///   once the snapshot lands; here we confirm a snapshot is reachable).
+/// - **Tier 3 (Long)** — awaits a Welcome via a [`RelayBackedReJoinExecutor`]
+///   (admin-side re-add + Welcome processing through the actor).
+///
+/// On a terminal-success outcome the context's `needs_reconnect` flag is
+/// cleared via [`Supervisor::clear_needs_reconnect`]. After per-context
+/// execution, the optional `drain` callback is invoked once per context to
+/// drain the bridge-owned outbound queue (Phase 6) — the queue lives in
+/// `ProtocolRepository` at the bridge layer, not in actor state, so the
+/// caller supplies the drain.
+///
+/// `signing_key` is the 32-byte Ed25519 seed for `member_did`; it signs the
+/// Phase-3 local checkpoint.
+// `implicit_hasher`: `last_relay_contacts` is forwarded verbatim to
+// `ReconnectionCoordinator::with_policy`, which fixes the default
+// `RandomState` hasher; generalizing here would only force every caller to
+// re-annotate the same concrete type.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn reconnect_contexts<F, Fut>(
+    transport: &Arc<TransportManager>,
+    supervisor: &Arc<Supervisor>,
+    member_did: DID,
+    signing_key: SigningKeyBytes,
+    context_ids: Vec<String>,
+    last_relay_contacts: HashMap<String, u64>,
+    now: u64,
+    policy: SyncPolicy,
+    mut drain: Option<F>,
+) -> ReconnectReport
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = (u64, u64)>,
+{
+    let driver = RelayActorSyncDriver::new(transport, supervisor, member_did.clone(), signing_key);
+
+    let coordinator = ReconnectionCoordinator::with_policy(
+        member_did,
+        context_ids.clone(),
+        last_relay_contacts,
+        policy,
+    );
+
+    // Tier 1 contexts are executed by the coordinator's six-phase loop;
+    // Tier 2 / Tier 3 contexts are reported with their classification and
+    // driven through the tier engines below.
+    let report = coordinator.execute(now, &driver).await;
+
+    let mut results = Vec::with_capacity(report.contexts_synced.len());
+    let mut messages_drained = report.messages_drained;
+    let mut messages_discarded = report.messages_discarded;
+
+    for ctx_result in report.contexts_synced {
+        let context_id = ctx_result.context_id.clone();
+        let tier = ctx_result.tier;
+
+        // Tier 2 / Tier 3 contexts are not executed by `execute` (it only
+        // runs Tier 1); drive their engines here so all three tiers are
+        // reachable from `context_reconnect`.
+        let (outcome, epochs, events, mls_update, equivocations) = match tier {
+            OfflineTier::Short => {
+                let equivocations = ctx_result.sync_events.len() as u64;
+                (
+                    ctx_result.outcome,
+                    ctx_result.epochs_caught_up,
+                    ctx_result.events_recovered,
+                    ctx_result.mls_update_issued,
+                    equivocations,
+                )
+            }
+            OfflineTier::Extended => {
+                // Tier 2 delta sync: fetch the latest relay snapshot. The
+                // actor applies the delta when the snapshot is delivered;
+                // a reachable snapshot means recovery can proceed.
+                let engine = RelayBackedDeltaSyncEngine::new(RelayActorSyncDriver::new(
+                    transport,
+                    supervisor,
+                    coordinator.member_did().clone(),
+                    signing_key,
+                ));
+                let outcome = match engine.fetch_snapshot(&context_id).await {
+                    Ok(Some(_snapshot)) => scp_protocol::sync::SyncOutcome::FullyCaughtUp,
+                    Ok(None) => scp_protocol::sync::SyncOutcome::Failed {
+                        reason: "no relay snapshot available for Tier 2 delta sync".to_owned(),
+                    },
+                    Err(e) => scp_protocol::sync::SyncOutcome::Failed {
+                        reason: format!("Tier 2 snapshot fetch failed: {e}"),
+                    },
+                };
+                (outcome, 0, 0, false, 0)
+            }
+            OfflineTier::Long => {
+                // Tier 3 reset: await a Welcome (admin-side re-add +
+                // Welcome processing through the actor).
+                let executor = RelayBackedReJoinExecutor::new(RelayActorSyncDriver::new(
+                    transport,
+                    supervisor,
+                    coordinator.member_did().clone(),
+                    signing_key,
+                ));
+                let timeout_secs = policy_welcome_timeout_secs();
+                let outcome = match executor.await_welcome(&context_id, timeout_secs).await {
+                    Ok(_epoch) => scp_protocol::sync::SyncOutcome::Reset,
+                    Err(e) => scp_protocol::sync::SyncOutcome::Failed {
+                        reason: format!("Tier 3 re-join failed: {e}"),
+                    },
+                };
+                (outcome, 0, 0, false, 0)
+            }
+        };
+
+        let (outcome_string, terminal_success) = outcome_str(&outcome);
+
+        // Clear needs_reconnect on terminal success so a later restore does
+        // not re-drive the already-synced context (§23.11).
+        let needs_reconnect_cleared = if terminal_success {
+            supervisor.clear_needs_reconnect(&context_id).await.is_ok()
+        } else {
+            false
+        };
+
+        // Phase 6: drain the bridge-owned outbound queue for this context.
+        if let Some(drain_fn) = drain.as_mut() {
+            let (drained, discarded) = drain_fn(context_id.clone()).await;
+            messages_drained = messages_drained.saturating_add(drained);
+            messages_discarded = messages_discarded.saturating_add(discarded);
+        }
+
+        results.push(ContextReconnectResult {
+            context_id,
+            tier: tier_str(tier),
+            outcome: outcome_string,
+            epochs_caught_up: epochs,
+            events_recovered: events,
+            mls_update_issued: mls_update,
+            equivocations_detected: equivocations,
+            needs_reconnect_cleared,
+        });
+    }
+
+    ReconnectReport {
+        contexts: results,
+        messages_drained,
+        messages_discarded,
+        total_duration_ms: report.total_duration_ms,
+    }
+}
+
+/// Welcome-await timeout (seconds) for Tier 3 re-join. Matches the
+/// ADR-029 §4 reset-protocol Welcome window.
+const fn policy_welcome_timeout_secs() -> u64 {
+    30
+}
+
+/// Concrete no-op drain closure type — lets the `None` variant's closure
+/// generics be inferred without each caller spelling them out.
+type NoDrainFn = fn(String) -> std::future::Ready<(u64, u64)>;
+
+/// Convenience over [`reconnect_contexts`] for the no-queue-drain case.
+///
+/// For bridges whose outbound queue has no persistent enqueued entries to
+/// drain (e.g. encrypted in-memory storage), passes a typed `None` drain
+/// callback so callers do not have to spell out the closure generics.
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+pub async fn reconnect_contexts_no_drain(
+    transport: &Arc<TransportManager>,
+    supervisor: &Arc<Supervisor>,
+    member_did: DID,
+    signing_key: SigningKeyBytes,
+    context_ids: Vec<String>,
+    last_relay_contacts: HashMap<String, u64>,
+    now: u64,
+    policy: SyncPolicy,
+) -> ReconnectReport {
+    // Concrete closure type so the `None` variant's generics are inferred.
+    let drain: Option<NoDrainFn> = None;
+    reconnect_contexts(
+        transport,
+        supervisor,
+        member_did,
+        signing_key,
+        context_ids,
+        last_relay_contacts,
+        now,
+        policy,
+        drain,
+    )
+    .await
+}

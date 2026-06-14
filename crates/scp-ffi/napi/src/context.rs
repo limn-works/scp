@@ -2637,6 +2637,144 @@ pub(crate) async fn context_execute_governance_action_on(
 }
 
 // ---------------------------------------------------------------------------
+// Reconnection (#1540, ADR-029)
+// ---------------------------------------------------------------------------
+
+/// Per-context reconnection result surfaced to TypeScript.
+///
+/// Flat mirror of [`scp_ffi_common::reconnect::ContextReconnectResult`].
+#[napi(object)]
+pub struct NapiContextReconnectResult {
+    /// Context that was reconnected.
+    pub context_id: String,
+    /// Offline tier: `"short"` / `"extended"` / `"long"`.
+    pub tier: String,
+    /// Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
+    pub outcome: String,
+    /// MLS epochs caught up.
+    pub epochs_caught_up: f64,
+    /// Event-log events recovered.
+    pub events_recovered: f64,
+    /// Whether an MLS Update was issued (§9.12).
+    pub mls_update_issued: bool,
+    /// Number of equivocation alerts surfaced (§9.9.3).
+    pub equivocations_detected: f64,
+    /// Whether `needs_reconnect` was cleared on success.
+    pub needs_reconnect_cleared: bool,
+}
+
+/// Aggregate reconnection report surfaced to TypeScript.
+///
+/// Flat mirror of [`scp_ffi_common::reconnect::ReconnectReport`].
+#[napi(object)]
+pub struct NapiReconnectReport {
+    /// Per-context results.
+    pub contexts: Vec<NapiContextReconnectResult>,
+    /// Total queued messages drained (Phase 6).
+    pub messages_drained: f64,
+    /// Total queued messages discarded.
+    pub messages_discarded: f64,
+    /// Total reconnection duration in milliseconds.
+    pub total_duration_ms: f64,
+}
+
+impl From<scp_ffi_common::reconnect::ReconnectReport> for NapiReconnectReport {
+    // Event/epoch counts and durations are JS `number` (f64) at the napi
+    // boundary; the magnitudes here are far below 2^52, so the precision
+    // loss is not reachable in practice.
+    #[allow(clippy::cast_precision_loss)]
+    fn from(report: scp_ffi_common::reconnect::ReconnectReport) -> Self {
+        Self {
+            contexts: report
+                .contexts
+                .into_iter()
+                .map(|c| NapiContextReconnectResult {
+                    context_id: c.context_id,
+                    tier: c.tier,
+                    outcome: c.outcome,
+                    epochs_caught_up: c.epochs_caught_up as f64,
+                    events_recovered: c.events_recovered as f64,
+                    mls_update_issued: c.mls_update_issued,
+                    equivocations_detected: c.equivocations_detected as f64,
+                    needs_reconnect_cleared: c.needs_reconnect_cleared,
+                })
+                .collect(),
+            messages_drained: report.messages_drained as f64,
+            messages_discarded: report.messages_discarded as f64,
+            total_duration_ms: report.total_duration_ms as f64,
+        }
+    }
+}
+
+/// Per-bridge-instance implementation of `context_reconnect`.
+///
+/// Runs the ADR-029 six-phase reconnection protocol for each of
+/// `context_ids` flagged `needs_reconnect` (§23.11). The driver lives at
+/// this FFI relay-client layer (ADR-029 reconnection-driver addendum): it
+/// pulls relay-buffered messages via the `TransportManager` and reaches
+/// actor-owned reconnection state through the `Supervisor`. On success
+/// each context's `needs_reconnect` flag is cleared.
+// `last_relay_contacts` arrives as JS `number` (f64) Unix seconds; the
+// truncation to u64 is the intended floor of a whole-second timestamp.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) async fn context_reconnect_on(
+    bi: &NapiBridgeInstance,
+    identity_did: String,
+    context_ids: Vec<String>,
+    last_relay_contacts: Option<std::collections::HashMap<String, f64>>,
+) -> napi::Result<NapiReconnectReport> {
+    let supervisor = crate::runtime::supervisor(bi)?;
+    let transport = crate::transport::get_transport_manager_on(bi).ok_or_else(|| {
+        NapiError::from(ScpNapiError::Transport {
+            message: "no relay connection — call transportConnect() before reconnecting".to_owned(),
+            code: codes::TRANS_5010.to_owned(),
+        })
+    })?;
+
+    // Resolve the local member's Ed25519 signing key from the identity
+    // registry (used to sign the Phase-3 consistency checkpoint). Private
+    // key never crosses FFI beyond this in-process driver call.
+    let (custody, key_handle) = crate::runtime::with_identity(bi, &identity_did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
+    })
+    .map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("cannot resolve signing key for reconnect: {e}"),
+            code: codes::IDENT_1001.to_owned(),
+        })
+    })?;
+    let sk = custody
+        .export_ed25519_signing_key(&key_handle)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("failed to export signing key for reconnect: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            })
+        })?;
+
+    let contacts: std::collections::HashMap<String, u64> = last_relay_contacts
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k, v as u64))
+        .collect();
+    let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+
+    let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
+        &transport,
+        supervisor,
+        DID(identity_did),
+        sk.to_bytes(),
+        context_ids,
+        contacts,
+        now,
+        scp_core::sync::SyncPolicy::default(),
+    )
+    .await;
+    Ok(report.into())
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions — governance proposal lifecycle (#621)
 // ---------------------------------------------------------------------------
 
