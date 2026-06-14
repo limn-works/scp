@@ -36,10 +36,17 @@ host_site(HostSiteOptions {
 })
 ```
 
-Build with NAT-PMP/UPnP support so the router port opens automatically:
+Build with NAT-PMP/UPnP support so the router port opens automatically. `upnp` is a feature of
+the `scp-node` crate, so a downstream app re-exposes it through its own `Cargo.toml`:
+
+```toml
+# your app's Cargo.toml
+[features]
+upnp = ["scp-node/upnp"]
+```
 
 ```sh
-cargo run --release --features upnp     # in your app; or build scp-node with --features upnp
+cargo run --release --features upnp
 ```
 
 External infrastructure:
