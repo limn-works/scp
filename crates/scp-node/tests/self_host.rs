@@ -464,6 +464,132 @@ async fn self_host_public_surface_excludes_relay_and_bridge() {
     full.node.shutdown();
 }
 
+/// Fetches `path` at the origin root over `client`, asserting HTTP 200 and the
+/// expected `Content-Type`. Used to verify root-absolute asset references
+/// (`/style.css`, `/app.js`) resolve through the default-site root mount.
+async fn assert_root_asset(client: &reqwest::Client, base: &str, path: &str, expected_ct: &str) {
+    let resp = client
+        .get(format!("{base}{path}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("request for {path} should complete: {e}"));
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "GET {path} must resolve at the origin root"
+    );
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some(expected_ct),
+        "{path} must be served as {expected_ct}"
+    );
+}
+
+/// FIX 1 (browser correctness): in `--self-host` mode the single deployed site
+/// must be reachable at the ORIGIN ROOT, so a browser loading the embedded
+/// `index.html` resolves its root-absolute `/style.css` and `/app.js`.
+///
+/// After `set_default_site_routing_id`, the virtual-host fallback serves
+/// bare-path requests (`GET /`, `GET /style.css`) from the deployed context
+/// even when the request `Host` matches no registered hostname (raw-IP access).
+/// `GET /` maps to the site `index_path` via `site_handler`. The relay upgrade
+/// (`/scp/v1`) still 404s — origin-root mounting must not re-expose it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_host_root_mount_serves_index_and_assets() {
+    let built = build_self_host_node().await;
+    let node_did = built.node.identity().did().to_owned();
+    let context_id = self_host_context_id(&node_did);
+
+    // Deploy the embedded site (index.html + style.css + app.js).
+    let deployer = build_deployer(&built, &context_id).await;
+    deploy_through(&deployer, &built, "selfhost-root-deploy").await;
+
+    // The expected index body (with the injected DID meta), to byte-compare.
+    let assets = scp_node::embedded_assets(Some(&node_did));
+    let index_body = assets
+        .iter()
+        .find(|a| a.path == "/index.html")
+        .expect("embedded site must include /index.html")
+        .body
+        .clone();
+
+    // Mount the deployed context at the origin root, exactly as the binary does.
+    let routing_id = scp_node::projection::compute_routing_id(&context_id);
+    built.node.set_default_site_routing_id(routing_id);
+
+    // Open the restricted self-host surface on a real loopback listener.
+    let addr = built
+        .node
+        .serve_background_with_surface(
+            Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            scp_node::PublicSurface::SelfHost,
+        )
+        .await
+        .expect("self-host background listener should bind");
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // -- GET / -> 200 text/html, body byte-matches the deployed index.html. --
+    let root = client
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .expect("root request should complete");
+    assert_eq!(
+        root.status().as_u16(),
+        200,
+        "GET / must serve the deployed index at the origin root"
+    );
+    assert_eq!(
+        root.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/html"),
+        "origin-root index must be served as text/html"
+    );
+    let root_body = root.bytes().await.expect("root body").to_vec();
+    assert_eq!(
+        root_body, index_body,
+        "GET / body must byte-match the deployed index.html"
+    );
+
+    // -- Root-absolute assets resolve with the right content types. --
+    assert_root_asset(&client, &base, "/style.css", "text/css").await;
+    assert_root_asset(&client, &base, "/app.js", "application/javascript").await;
+
+    // -- The relay upgrade `/scp/v1` must STILL 404 with the root mount on. --
+    let relay = client
+        .get(format!("{base}/scp/v1"))
+        .send()
+        .await
+        .expect("relay probe should complete");
+    assert_eq!(
+        relay.status().as_u16(),
+        404,
+        "origin-root mounting must not re-expose the relay upgrade `/scp/v1`, got {}",
+        relay.status()
+    );
+
+    // -- An unknown deep path with no default-eligible asset 404s (the default
+    //    site has no `/no/such/path`), proving the fallback is content-bounded.
+    let missing = client
+        .get(format!("{base}/no/such/path"))
+        .send()
+        .await
+        .expect("missing-path probe should complete");
+    assert_eq!(
+        missing.status().as_u16(),
+        404,
+        "an unknown path under the default site must 404, got {}",
+        missing.status()
+    );
+
+    built.node.shutdown();
+}
+
 /// FIX 3 + FIX 4 (correctness): re-deploying the site (as the refresh loop
 /// does) against the SAME persistent node — each with a freshly-minted unique
 /// deploy id — must succeed and keep the site served, never tripping the

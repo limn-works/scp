@@ -806,19 +806,34 @@ fn read_site_dir_recursive(
 /// Builds the loud self-host startup banner shown on stderr before any socket
 /// is opened.
 ///
-/// States, in plain language, the three consequences the operator is opting
-/// into (public-port exposure, public-IP<->DID DHT disclosure, plaintext
-/// transport) plus the Finding-D NAT self-test note so a Tier-2 line in the
-/// logs is not mistaken for a hosting failure.
-fn self_host_banner(port: u16) -> String {
+/// States, in plain language, the consequences the operator is opting into
+/// (public-port exposure, public-IP<->DID DHT disclosure, and the transport
+/// security posture) plus the Finding-D NAT self-test note so a Tier-2 line in
+/// the logs is not mistaken for a hosting failure.
+///
+/// `plaintext` reflects whether the operator opted OUT of TLS via
+/// `SCP_NODE_SELF_HOST_PLAINTEXT=1`. By default self-host serves a self-signed
+/// (no-CA) HTTPS certificate, so the transport line describes the expected
+/// one-time browser untrusted-cert warning; under the plaintext opt-out it
+/// describes the cleartext exposure instead.
+fn self_host_banner(port: u16, plaintext: bool) -> String {
+    let transport_line = if plaintext {
+        "  * Transport is PLAINTEXT HTTP (SCP_NODE_SELF_HOST_PLAINTEXT=1): traffic is\n\
+         \x20    readable and tamper-able in transit. The hosted content is public broadcast\n\
+         \x20    content anyway, but HTTPS-Only browsers will refuse to open http://."
+    } else {
+        "  * Transport is self-signed HTTPS (TLS 1.3, no CA -- the \"be your own CA\" model):\n\
+         \x20    browsers show a ONE-TIME untrusted-certificate warning because there is no\n\
+         \x20    DNS name and no certificate authority. This is EXPECTED for the no-DNS model.\n\
+         \x20    Set SCP_NODE_SELF_HOST_PLAINTEXT=1 to serve plain HTTP instead."
+    };
     format!(
         "================================ SELF-HOST MODE ================================\n\
          scp-node is about to open inbound TCP port {port} to the PUBLIC INTERNET via\n\
          NAT-PMP/UPnP (when built with --features upnp). Consequences you are opting into:\n\
            * Your host's PUBLIC IP will be published to the global Mainline DHT, bound to\n\
              this node's DID. This is an IP<->identity disclosure (approximate-location dox).\n\
-           * Transport is PLAINTEXT HTTP (no TLS): traffic is readable and tamper-able in\n\
-             transit. The hosted content is public broadcast content anyway.\n\
+         {transport_line}\n\
            * A residential uplink cannot absorb a volumetric/distributed DDoS; per-IP rate\n\
              limiting protects CPU/keys but not raw bandwidth.\n\
          NAT self-test note (Finding D): if the NAT-PMP reachability self-test reports Tier 2\n\
@@ -828,6 +843,118 @@ fn self_host_banner(port: u16) -> String {
          This mode is opt-in (--self-host) and never a default.\n\
          ==============================================================================="
     )
+}
+
+/// Whether the operator opted OUT of TLS for self-host via
+/// `SCP_NODE_SELF_HOST_PLAINTEXT=1`.
+///
+/// Self-host serves a self-signed HTTPS certificate by default (so HTTPS-Only
+/// browsers will open it); this flag restores the legacy plaintext-HTTP
+/// behavior for anyone who wants it (§10.12.11).
+fn self_host_plaintext() -> bool {
+    env::var("SCP_NODE_SELF_HOST_PLAINTEXT").is_ok_and(|v| v == "1" || v == "true")
+}
+
+/// Builds the self-signed TLS config for the self-host listener, or returns
+/// `None` when the plaintext opt-out is set.
+///
+/// The "be your own CA" no-DNS model: there is no DNS name and no certificate
+/// authority, so the certificate instead presents a Subject Alternative Name
+/// for every address a browser might use to reach the site. The SAN set always
+/// covers `localhost` (DNS) and `127.0.0.1` (IP); when the node's external IP
+/// is known at serve time (parsed from the node's relay URL, which the NAT tier
+/// populated with the reflexive/mapped address, e.g.
+/// `ws://71.249.150.234:8443/scp/v1`), that IP is added too so raw-IP HTTPS
+/// presents a matching SAN. Browsers show a one-time untrusted-certificate
+/// warning because there is no CA; this is expected.
+///
+/// Returns `None` only when `plaintext` is `true`. On certificate-generation or
+/// TLS-config failure the process exits — there is no safe silent fallback to
+/// plaintext once HTTPS was requested (that would surprise the operator and the
+/// browser).
+fn build_self_host_tls_config(
+    relay_url: &str,
+    bind_ip: std::net::IpAddr,
+    plaintext: bool,
+) -> Option<Arc<rustls::ServerConfig>> {
+    if plaintext {
+        tracing::warn!(
+            "SCP_NODE_SELF_HOST_PLAINTEXT set — serving plain HTTP (HTTPS-Only browsers \
+             will refuse to open the site)"
+        );
+        return None;
+    }
+
+    // Always-present SANs: localhost + loopback.
+    let dns_sans = vec!["localhost".to_owned()];
+    let mut ip_sans: Vec<std::net::IpAddr> =
+        vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+
+    // Add the bind IP when it is a concrete, routable interface address (skip
+    // the unspecified 0.0.0.0/:: placeholder and loopback, already covered).
+    if !bind_ip.is_unspecified() && !bind_ip.is_loopback() {
+        ip_sans.push(bind_ip);
+    }
+
+    // Add the external/reflexive IP parsed from the relay URL (the NAT tier
+    // wrote `ws://<external_ip>:<port>/scp/v1` in no-domain mode). De-dup so a
+    // bind IP that equals the external IP is not added twice.
+    if let Some(external_ip) = external_ip_from_relay_url(relay_url)
+        && !ip_sans.contains(&external_ip)
+    {
+        ip_sans.push(external_ip);
+    }
+
+    let cert = match scp_node::tls::generate_self_signed_multi(&dns_sans, &ip_sans) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to generate self-signed self-host certificate");
+            std::process::exit(1);
+        }
+    };
+    let server_config = match scp_node::tls::build_tls_server_config(&cert) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build self-host TLS server config");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        dns_sans = ?dns_sans,
+        ip_sans = ?ip_sans,
+        "self-host serving self-signed HTTPS (TLS 1.3, no CA)"
+    );
+    Some(Arc::new(server_config))
+}
+
+/// Parses the external IP from a no-domain relay URL of the form
+/// `ws://<host>:<port>/scp/v1`, returning it only when `<host>` is a bare IP
+/// literal (not a DNS name and not loopback/unspecified).
+///
+/// Returns `None` when the URL has no host, the host is not an IP literal, or
+/// the IP is loopback/unspecified (those are already covered by the default
+/// SANs and add no reachability value).
+fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
+    // Strip the scheme.
+    let after_scheme = relay_url
+        .split_once("://")
+        .map_or(relay_url, |(_, rest)| rest);
+    // Take the authority (up to the first '/').
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Strip an optional `:port`. IPv6 literals are bracketed, so handle both.
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // `[::1]:8443` -> `::1`
+        rest.split_once(']').map(|(h, _)| h)?
+    } else {
+        // `1.2.3.4:8443` -> `1.2.3.4`
+        authority.split(':').next().unwrap_or(authority)
+    };
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    if ip.is_loopback() || ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 /// Runs the node in self-host mode: an [`ApplicationNode`] in `no_domain`
@@ -843,9 +970,10 @@ fn self_host_banner(port: u16) -> String {
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
     let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let plaintext = self_host_plaintext();
 
     // -- Loud startup banner BEFORE opening any socket --
-    eprintln!("{}", self_host_banner(port));
+    eprintln!("{}", self_host_banner(port, plaintext));
     tracing::warn!(
         port,
         "self-host mode enabled — opening inbound port to the public internet"
@@ -892,6 +1020,7 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         run_self_host_with(
             http_addr,
             port,
+            plaintext,
             &storage_dir,
             &storage_key,
             Arc::clone(&node_storage_arc),
@@ -916,6 +1045,7 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
     run_self_host_with(
         http_addr,
         port,
+        plaintext,
         &storage_dir,
         &storage_key,
         Arc::clone(&node_storage_arc),
@@ -1047,6 +1177,7 @@ async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
 async fn run_self_host_with<D: scp_identity::DidMethod + 'static>(
     http_addr: SocketAddr,
     port: u16,
+    plaintext: bool,
     storage_dir: &std::path::Path,
     storage_key: &Zeroizing<[u8; 32]>,
     node_storage: Arc<SqliteStorage>,
@@ -1121,16 +1252,38 @@ async fn run_self_host_with<D: scp_identity::DidMethod + 'static>(
     }
     tracing::info!(committed = asset_count, "self-host site deployed");
 
-    print_self_host_live_url(&context_id, port, &node_did, asset_count);
+    // -- Mount the single deployed site at the ORIGIN ROOT (§10.12.11). --
+    // `GET /`, `GET /style.css`, `GET /app.js`, and raw-IP access (where the
+    // `Host` header matches no registered hostname) all resolve to this
+    // context's site through the virtual-host fallback's default-site path,
+    // reusing the same `site_handler` (ContentPath traversal protection,
+    // decryption, ETag, Cache-Control, CSP). This is what lets the embedded
+    // index.html's root-absolute `/style.css` and `/app.js` references load.
+    let default_routing_id = scp_node::projection::compute_routing_id(&context_id);
+    node.set_default_site_routing_id(default_routing_id);
+
+    print_self_host_live_url(&context_id, port, &node_did, asset_count, plaintext);
+
+    // -- Build the self-host TLS config (self-signed, multi-SAN) unless the
+    //    operator opted out via SCP_NODE_SELF_HOST_PLAINTEXT. The cert covers
+    //    localhost + 127.0.0.1 and, when known, the node's external/bind IP so
+    //    HTTPS-Only browsers can open the site (one-time untrusted-cert warning,
+    //    expected for the no-DNS "be your own CA" model). --
+    let tls_config = build_self_host_tls_config(node.relay_url(), http_addr.ip(), plaintext);
 
     // -- Open the RESTRICTED public surface in the background --
     // Only the read-only website projection (+ `.well-known/scp` + virtual-host
     // fallback) is exposed on the public bind. The relay upgrade (`/scp/v1`)
     // and bridge routes (`/v1/scp/bridge/*`) are NOT mounted publicly — the
     // in-process supervisor reaches the node's relay over loopback `127.0.0.1`
-    // instead (§10.12.8).
+    // instead (§10.12.8; §10.12.11). TLS (when enabled) is purely what is spoken on the
+    // mapped TCP port; the NAT-PMP/UPnP port mapping is unaffected.
     if let Err(e) = node
-        .serve_background_with_surface(Some(http_addr), scp_node::PublicSurface::SelfHost)
+        .serve_background_with_surface_tls(
+            Some(http_addr),
+            scp_node::PublicSurface::SelfHost,
+            tls_config,
+        )
         .await
     {
         tracing::error!(error = %e, "self-host public listener failed to start");
@@ -1315,21 +1468,44 @@ async fn release_self_host_mappings(
 
 /// Logs and prints the live site URL after a successful deploy.
 ///
-/// The URL uses the `0.0.0.0` bind placeholder; the operator substitutes their
+/// The URLs use the `0.0.0.0` bind placeholder; the operator substitutes their
 /// public IP (or an SCP-aware client resolves it via `did:dht`). The node DID
-/// is included so the operator can verify the IP<->identity binding.
-fn print_self_host_live_url(context_id: &str, port: u16, node_did: &str, asset_count: usize) {
+/// is included so the operator can verify the IP<->identity binding. The scheme
+/// is `https` by default (self-signed) or `http` under the plaintext opt-out.
+///
+/// Both the origin-root URL (the site is mounted at `/`) and the explicit
+/// routing-id path are shown — the root URL is what a browser loads; the
+/// explicit path is the canonical SCP projection address.
+fn print_self_host_live_url(
+    context_id: &str,
+    port: u16,
+    node_did: &str,
+    asset_count: usize,
+    plaintext: bool,
+) {
+    let scheme = if plaintext { "http" } else { "https" };
     let routing_hex = scp_node::routing_id_hex(context_id);
-    let url = format!("http://0.0.0.0:{port}/scp/broadcast/{routing_hex}/site/index.html");
+    let root_url = format!("{scheme}://0.0.0.0:{port}/");
+    let canonical_url =
+        format!("{scheme}://0.0.0.0:{port}/scp/broadcast/{routing_hex}/site/index.html");
     tracing::info!(
         did = %node_did,
         assets = asset_count,
-        url = %url,
+        url = %root_url,
+        canonical_url = %canonical_url,
         "self-host site live"
     );
+    let tls_note = if plaintext {
+        ""
+    } else {
+        "  (your browser will show a one-time untrusted-certificate warning: there is no\n  \
+         certificate authority in the no-DNS self-host model — accept it to proceed.)\n"
+    };
     eprintln!(
         "\nSelf-host site is LIVE:\n  \
-         {url}\n  \
+         {root_url}            (origin root — the page a browser loads)\n  \
+         {canonical_url}  (canonical SCP projection path)\n\
+         {tls_note}  \
          (substitute your public IP for 0.0.0.0; SCP-aware clients can resolve it via did:dht.\n  \
          The node DID is: {node_did})\n"
     );

@@ -569,6 +569,42 @@ impl<S: Storage> ApplicationNode<S> {
         guard.map(|addr| format!("http://{addr}"))
     }
 
+    /// Designates a single projected context as the **default site** served at
+    /// the origin root (`--self-host` mode, §10.12.8).
+    ///
+    /// After this is set, the public listener's virtual-host fallback serves
+    /// bare-path requests (`GET /`, `GET /style.css`, `GET /<anything>`) from
+    /// this routing ID's projected site whenever the request `Host` header does
+    /// not match a registered site hostname — including raw-IP access, where no
+    /// `Host` matches. The bare path passes through the same
+    /// [`site_handler`](crate::projection::site_handler) the explicit
+    /// `/scp/broadcast/<rid>/site/...` route uses, so `ContentPath` traversal
+    /// protection, decryption, `ETag`, `Cache-Control`, and CSP all still apply,
+    /// and `/` maps to the site's configured `index_path`.
+    ///
+    /// `routing_id` must be `SHA-256(context_id)` for a context that has been
+    /// projected with a site config (e.g. via
+    /// [`enable_broadcast_projection_with_site`](Self::enable_broadcast_projection_with_site));
+    /// the value is exactly [`projection::compute_routing_id`]. If the
+    /// designated context is not (yet) projected, the fallback simply 404s
+    /// until it is — no panic, no broken state.
+    ///
+    /// Intended for the single-site self-host surface. The Full protocol
+    /// surface never sets this, so origin-root serving is a self-host-only
+    /// behavior.
+    pub fn set_default_site_routing_id(&self, routing_id: [u8; 32]) {
+        match self.state.default_site_routing_id.write() {
+            Ok(mut guard) => *guard = Some(routing_id),
+            Err(poisoned) => {
+                // A poisoned lock means a prior writer panicked while holding
+                // it — recover the guard and overwrite rather than propagate,
+                // since the stored value is a plain `Option<[u8; 32]>` with no
+                // invariant a panic could have left half-updated.
+                *poisoned.into_inner() = Some(routing_id);
+            }
+        }
+    }
+
     /// Starts serving HTTP traffic in a background tokio task.
     ///
     /// Unlike [`serve`](Self::serve), this method does **not** consume the
@@ -641,6 +677,38 @@ impl<S: Storage> ApplicationNode<S> {
         bind_addr: Option<SocketAddr>,
         surface: PublicSurface,
     ) -> Result<SocketAddr, NodeError> {
+        self.serve_background_with_surface_tls(bind_addr, surface, None)
+            .await
+    }
+
+    /// Like [`serve_background_with_surface`](Self::serve_background_with_surface)
+    /// but optionally terminates TLS with a caller-supplied
+    /// `rustls::ServerConfig`.
+    ///
+    /// When `tls_config` is `Some`, the background listener speaks HTTPS/WSS
+    /// using [`tls::serve_tls`] (TLS 1.3, HTTP/1.1+HTTP/2 auto-detect, and
+    /// per-connection `ConnectInfo` for rate limiting). When `None`, it serves
+    /// plaintext HTTP exactly as
+    /// [`serve_background_with_surface`](Self::serve_background_with_surface).
+    ///
+    /// This is the seam the `--self-host` binary uses to serve a self-signed
+    /// certificate (the "be your own CA" no-DNS model, §10.12.11): the cert's
+    /// SANs depend on the node's external/LAN IP, which is only known after
+    /// `build()`, so the config is constructed at serve time and injected here
+    /// rather than baked into [`NodeState`]'s `tls_config` (which stays `None`
+    /// in no-domain mode). TLS is purely what is spoken on the bound TCP port;
+    /// the NAT/port-mapping behavior is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] under the same conditions as
+    /// [`serve_background_with_surface`](Self::serve_background_with_surface).
+    pub async fn serve_background_with_surface_tls(
+        &self,
+        bind_addr: Option<SocketAddr>,
+        surface: PublicSurface,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<SocketAddr, NodeError> {
         // Reject if the node has already been shut down — the cancellation
         // token is already cancelled so the server would exit immediately.
         if self.state.shutdown_token.is_cancelled() {
@@ -662,8 +730,10 @@ impl<S: Storage> ApplicationNode<S> {
 
         let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
 
-        // Security: warn when binding to a non-loopback address.
-        if !addr.ip().is_loopback() {
+        // Security: warn when binding a *plaintext* listener to a non-loopback
+        // address. When a TLS config is present (self-host self-signed cert),
+        // traffic is encrypted, so the "unencrypted" warning would be wrong.
+        if !addr.ip().is_loopback() && tls_config.is_none() {
             tracing::warn!(
                 bind_addr = %addr,
                 "serve_background binding to non-loopback address — \
@@ -714,19 +784,37 @@ impl<S: Storage> ApplicationNode<S> {
         let serving_flag = Arc::clone(&self.serving);
         let serving_addr_ref = Arc::clone(&self.serving_addr);
 
-        // Spawn the background server task.
+        // Spawn the background server task. When a TLS config is supplied
+        // (self-host self-signed cert), terminate TLS via `tls::serve_tls`;
+        // otherwise serve plaintext HTTP. Both honor the graceful-shutdown
+        // token and clear the serving flag/address on exit.
         tokio::spawn(async move {
+            let scheme = if tls_config.is_some() {
+                "HTTPS"
+            } else {
+                "HTTP"
+            };
             tracing::info!(
                 addr = %local_addr,
+                scheme,
                 "background HTTP server started"
             );
 
-            let result = axum::serve(
-                listener,
-                merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(shutdown_token.cancelled_owned())
-            .await;
+            let result = if let Some(tls_cfg) = tls_config {
+                tls::serve_tls(listener, tls_cfg, merged, shutdown_token.clone())
+                    .await
+                    .map_err(|e| match e {
+                        NodeError::Serve(msg) => std::io::Error::other(msg),
+                        other => std::io::Error::other(other.to_string()),
+                    })
+            } else {
+                axum::serve(
+                    listener,
+                    merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown_token.cancelled_owned())
+                .await
+            };
 
             if let Err(ref e) = result {
                 tracing::error!(error = %e, "background HTTP server exited with error");
@@ -3541,6 +3629,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         subscription_registry,
         acme_challenges,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
+        default_site_routing_id: std::sync::RwLock::new(None),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
         #[cfg(feature = "quic")]
@@ -3693,6 +3782,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         subscription_registry,
         acme_challenges: None,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
+        default_site_routing_id: std::sync::RwLock::new(None),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
         // No-domain mode is plaintext `ws://` (no cert), so QUIC is not served (§10.14.3).

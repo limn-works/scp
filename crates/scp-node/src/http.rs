@@ -201,6 +201,28 @@ pub struct NodeState {
     /// Read locks on `hostname_index` must be dropped before accessing `projected_contexts`.
     pub(crate) hostname_index: RwLock<HashMap<String, [u8; 32]>>,
 
+    /// Default site routing ID for origin-root serving in `--self-host` mode.
+    ///
+    /// When `Some`, the virtual-host fallback serves bare-path requests
+    /// (`GET /`, `GET /style.css`, `GET /<anything>`) from this routing ID's
+    /// projected site whenever the request's `Host` header does not match any
+    /// entry in [`hostname_index`](Self::hostname_index). This lets a single
+    /// deployed self-host site be reached at the origin root (and via raw IP,
+    /// where no `Host` matches), so a browser loading the embedded
+    /// `index.html` resolves its root-absolute `/style.css` and `/app.js`
+    /// references (§10.12.11). The routing ID is `SHA-256(context_id)` — the
+    /// same value the explicit `/scp/broadcast/<rid>/site/...` route uses.
+    ///
+    /// `None` for the Full surface and for any node that has not designated a
+    /// default site, in which case the fallback behaves exactly as before
+    /// (404 on an unmatched host). Set once after the self-host deploy via
+    /// [`ApplicationNode::set_default_site_routing_id`].
+    ///
+    /// Uses `std::sync::RwLock` (not tokio): it is written once after deploy
+    /// and read in the synchronous tail of the async fallback handler, where
+    /// the critical section is a single `Option` copy with no `.await`.
+    pub(crate) default_site_routing_id: std::sync::RwLock<Option<[u8; 32]>>,
+
     /// Shared state for bridge shadow operations.
     ///
     /// Holds per-context shadow registries and sender key stores for the
@@ -946,33 +968,55 @@ async fn virtual_host_fallback(
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
 
-    // Extract the Host header value.
+    // Extract the Host header value. A missing/invalid Host header is not
+    // fatal: it simply means no hostname can match, so we fall straight through
+    // to the default-site lookup below (which serves the single self-host site
+    // at the origin root, including raw-IP access where no Host matches).
     let host_value = req
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok());
 
-    let Some(host_raw) = host_value else {
-        return StatusCode::NOT_FOUND.into_response();
+    // Resolve the routing ID: first by Host header against the hostname index;
+    // if that misses (or there is no usable Host), fall back to the default
+    // site routing ID when one is configured (§10.12.11 origin-root serving).
+    let routing_id = match host_value {
+        Some(host_raw) => {
+            // Strip port and lowercase.
+            // IPv6 bracket notation (e.g., "[::1]:8080") requires finding the
+            // closing bracket first; plain hostnames/IPv4 just split on ':'.
+            let hostname = if host_raw.starts_with('[') {
+                // IPv6 bracket notation: find closing bracket
+                host_raw.find(']').map_or(host_raw, |i| &host_raw[..=i])
+            } else {
+                // IPv4 or plain hostname: strip optional ":port"
+                host_raw.split(':').next().unwrap_or(host_raw)
+            }
+            .to_ascii_lowercase();
+
+            let index = state.hostname_index.read().await;
+            index.get(&hostname).copied()
+        }
+        None => None,
     };
 
-    // Strip port and lowercase.
-    // IPv6 bracket notation (e.g., "[::1]:8080") requires finding the closing
-    // bracket first; plain hostnames/IPv4 just split on ':'.
-    let hostname = if host_raw.starts_with('[') {
-        // IPv6 bracket notation: find closing bracket
-        host_raw.find(']').map_or(host_raw, |i| &host_raw[..=i])
-    } else {
-        // IPv4 or plain hostname: strip optional ":port"
-        host_raw.split(':').next().unwrap_or(host_raw)
-    }
-    .to_ascii_lowercase();
-
-    // Look up in the hostname index.
-    let routing_id = {
-        let index = state.hostname_index.read().await;
-        index.get(&hostname).copied()
-    };
+    // Default-site fallback: when no hostname matched, serve the single
+    // designated self-host site (set after deploy). This is what makes
+    // `GET /`, `GET /style.css`, and raw-IP access resolve to the deployed
+    // context at the origin root. `site_handler` maps an empty/`/` path to the
+    // site's `index_path` and runs full `ContentPath` traversal protection,
+    // decryption, ETag, and CSP — identical to the explicit site route.
+    let routing_id = routing_id.or_else(|| {
+        // Recover from a poisoned lock rather than swallowing it to `None`: the
+        // stored value is a plain `Option<[u8; 32]>` with no invariant a panic
+        // could corrupt, and silently disabling origin-root serving on poison
+        // would 404 the whole site. Mirrors the setter's poison recovery.
+        let guard = state
+            .default_site_routing_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard
+    });
 
     let Some(routing_id) = routing_id else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1143,6 +1187,7 @@ mod tests {
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
             hostname_index: RwLock::new(HashMap::new()),
+            default_site_routing_id: std::sync::RwLock::new(None),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
             #[cfg(feature = "quic")]
@@ -1336,6 +1381,7 @@ mod vhost_tests {
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
             hostname_index: RwLock::new(hostname_index),
+            default_site_routing_id: std::sync::RwLock::new(None),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
             #[cfg(feature = "quic")]
