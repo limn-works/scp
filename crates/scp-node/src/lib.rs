@@ -18,6 +18,7 @@ pub mod dns_provider;
 pub(crate) mod error;
 pub mod http;
 pub mod projection;
+pub mod self_host;
 pub mod tls;
 pub mod webhook;
 mod well_known;
@@ -42,7 +43,13 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 pub use http::BroadcastContext;
-pub use projection::{DeployManifest, DeployManifestEntry, ProjectedContext, SiteConfig};
+pub use projection::{
+    DeployManifest, DeployManifestEntry, PathEntry, ProjectedContext, SiteConfig,
+};
+pub use self_host::{
+    Asset, DeploySiteParams, SelfHostDeployer, SelfHostError, content_type_for, deploy_site,
+    embedded_assets, routing_id_hex,
+};
 
 // ---------------------------------------------------------------------------
 // Default HTTP bind address
@@ -92,6 +99,33 @@ pub(crate) const MAX_BROADCAST_CONTEXTS: usize = 1024;
 ///
 /// See spec section 18.11.6.
 pub const DEFAULT_PROJECTION_RATE_LIMIT: u32 = 60;
+
+// ---------------------------------------------------------------------------
+// Public HTTP surface selection
+// ---------------------------------------------------------------------------
+
+/// Selects which routes the public HTTP listener exposes when serving.
+///
+/// The default run modes (relay-only, persistent, ephemeral) serve the
+/// [`Full`](PublicSurface::Full) protocol surface. The `--self-host`
+/// website-hosting mode serves the restricted [`SelfHost`](PublicSurface::SelfHost)
+/// surface so the public bind exposes only the read-only website projection
+/// and never the relay upgrade or bridge routes (§10.12.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicSurface {
+    /// Full protocol surface: `.well-known/scp`, the `/scp/v1` relay
+    /// WebSocket upgrade, broadcast projection (`/scp/broadcast/*`), the
+    /// bridge routes (`/v1/scp/bridge/*`), ACME challenges, and the
+    /// virtual-host fallback. Used by every run mode except `--self-host`.
+    Full,
+    /// Restricted website surface for `--self-host`: `.well-known/scp`, the
+    /// broadcast projection endpoints (`/scp/broadcast/*`, including
+    /// `/feed`, `/messages`, and `/site`), and the virtual-host fallback —
+    /// and nothing else. The relay upgrade/bridge (`/scp/v1`) and the bridge
+    /// routes (`/v1/scp/bridge/*`) are NOT mounted, so an anonymous internet
+    /// client cannot reach the node's relay or bridge through the public bind.
+    SelfHost,
+}
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -458,31 +492,68 @@ impl<S: Storage> ApplicationNode<S> {
         }
     }
 
-    /// Builds the merged SCP protocol router (well-known, relay, projection,
-    /// bridge, ACME challenge routes) for use by both [`serve`](Self::serve)
-    /// and [`serve_background`](Self::serve_background).
+    /// Returns a clone of the node's graceful-shutdown cancellation token.
     ///
-    /// `app_router` is the caller-supplied application router that SCP routes
-    /// are merged onto. Pass `axum::Router::new()` when there is no
-    /// application router (e.g. `serve_background`).
-    fn build_scp_router(&self, app_router: axum::Router) -> axum::Router {
+    /// The token is cancelled by [`shutdown`](Self::shutdown) (and when a
+    /// [`serve`](Self::serve)/[`serve_background`](Self::serve_background) loop
+    /// completes). Background tasks that should stop when the node stops — for
+    /// example a self-host site refresh loop — can observe this token to exit
+    /// cleanly without racing the listener teardown.
+    #[must_use]
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.state.shutdown_token.clone()
+    }
+
+    /// Builds the merged SCP protocol router for the requested
+    /// [`PublicSurface`].
+    ///
+    /// [`PublicSurface::Full`] exposes the complete protocol surface:
+    /// `.well-known/scp`, the `/scp/v1` relay WebSocket upgrade, the broadcast
+    /// projection endpoints (`/scp/broadcast/*`), the bridge routes
+    /// (`/v1/scp/bridge/*`), ACME challenges, and the virtual-host fallback.
+    ///
+    /// [`PublicSurface::SelfHost`] exposes ONLY the read-only website surface:
+    /// `.well-known/scp`, the broadcast projection endpoints, and the
+    /// virtual-host fallback. The relay upgrade/bridge (`/scp/v1`) and the
+    /// bridge routes (`/v1/scp/bridge/*`) are deliberately NOT mounted — in
+    /// self-host mode the node's loopback relay is reached in-process over
+    /// `127.0.0.1` and must never be exposed to anonymous internet clients on
+    /// the public bind (§10.12.8; exposing `/scp/v1` would let an anonymous
+    /// external client publish/subscribe/query/delete on the node's relay,
+    /// carrying the node's own bridge bearer token, with every external client
+    /// collapsed to `127.0.0.1` for per-IP limits — a site-takedown and
+    /// metadata-exfiltration vector).
+    fn build_scp_router_with_surface(
+        &self,
+        app_router: axum::Router,
+        surface: PublicSurface,
+    ) -> axum::Router {
         let cors = http::build_cors_layer(&self.state.cors_origins);
         let well_known = http::well_known_router(Arc::clone(&self.state)).layer(cors.clone());
-        let relay_rt = http::relay_router(Arc::clone(&self.state));
         let projection =
             crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
-        let (bridge, bridge_webhook) =
-            http::build_bridge_routers(&self.state.bridge_state, self.state.bridge_lookup.as_ref());
 
-        http::build_merged_router(
-            app_router,
-            well_known,
-            relay_rt,
-            projection,
-            bridge,
-            bridge_webhook,
-            &self.state,
-        )
+        match surface {
+            PublicSurface::Full => {
+                let relay_rt = http::relay_router(Arc::clone(&self.state));
+                let (bridge, bridge_webhook) = http::build_bridge_routers(
+                    &self.state.bridge_state,
+                    self.state.bridge_lookup.as_ref(),
+                );
+                http::build_merged_router(
+                    app_router,
+                    well_known,
+                    relay_rt,
+                    projection,
+                    bridge,
+                    bridge_webhook,
+                    &self.state,
+                )
+            }
+            PublicSurface::SelfHost => {
+                http::build_self_host_router(app_router, well_known, projection, &self.state)
+            }
+        }
     }
 
     /// Returns the HTTP URL of the background server, if running.
@@ -498,6 +569,42 @@ impl<S: Storage> ApplicationNode<S> {
     pub async fn http_url(&self) -> Option<String> {
         let guard = self.serving_addr.lock().await;
         guard.map(|addr| format!("http://{addr}"))
+    }
+
+    /// Designates a single projected context as the **default site** served at
+    /// the origin root (`--self-host` mode, §10.12.8).
+    ///
+    /// After this is set, the public listener's virtual-host fallback serves
+    /// bare-path requests (`GET /`, `GET /style.css`, `GET /<anything>`) from
+    /// this routing ID's projected site whenever the request `Host` header does
+    /// not match a registered site hostname — including raw-IP access, where no
+    /// `Host` matches. The bare path passes through the same
+    /// [`site_handler`](crate::projection::site_handler) the explicit
+    /// `/scp/broadcast/<rid>/site/...` route uses, so `ContentPath` traversal
+    /// protection, decryption, `ETag`, `Cache-Control`, and CSP all still apply,
+    /// and `/` maps to the site's configured `index_path`.
+    ///
+    /// `routing_id` must be `SHA-256(context_id)` for a context that has been
+    /// projected with a site config (e.g. via
+    /// [`enable_broadcast_projection_with_site`](Self::enable_broadcast_projection_with_site));
+    /// the value is exactly [`projection::compute_routing_id`]. If the
+    /// designated context is not (yet) projected, the fallback simply 404s
+    /// until it is — no panic, no broken state.
+    ///
+    /// Intended for the single-site self-host surface. The Full protocol
+    /// surface never sets this, so origin-root serving is a self-host-only
+    /// behavior.
+    pub fn set_default_site_routing_id(&self, routing_id: [u8; 32]) {
+        match self.state.default_site_routing_id.write() {
+            Ok(mut guard) => *guard = Some(routing_id),
+            Err(poisoned) => {
+                // A poisoned lock means a prior writer panicked while holding
+                // it — recover the guard and overwrite rather than propagate,
+                // since the stored value is a plain `Option<[u8; 32]>` with no
+                // invariant a panic could have left half-updated.
+                *poisoned.into_inner() = Some(routing_id);
+            }
+        }
     }
 
     /// Starts serving HTTP traffic in a background tokio task.
@@ -548,6 +655,62 @@ impl<S: Storage> ApplicationNode<S> {
         &self,
         bind_addr: Option<SocketAddr>,
     ) -> Result<SocketAddr, NodeError> {
+        self.serve_background_with_surface(bind_addr, PublicSurface::Full)
+            .await
+    }
+
+    /// Like [`serve_background`](Self::serve_background) but restricts the
+    /// public HTTP surface to the requested [`PublicSurface`].
+    ///
+    /// [`PublicSurface::SelfHost`] mounts ONLY the read-only website
+    /// projection surface (`.well-known/scp`, `/scp/broadcast/*`, and the
+    /// virtual-host fallback) — the relay upgrade (`/scp/v1`) and bridge
+    /// routes (`/v1/scp/bridge/*`) are not exposed on the background listener
+    /// (§10.12.8). All other behavior (no TLS, no dev API, double-serve
+    /// prevention, shutdown via the node's cancellation token) is identical to
+    /// [`serve_background`](Self::serve_background).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] under the same conditions as
+    /// [`serve_background`](Self::serve_background).
+    pub async fn serve_background_with_surface(
+        &self,
+        bind_addr: Option<SocketAddr>,
+        surface: PublicSurface,
+    ) -> Result<SocketAddr, NodeError> {
+        self.serve_background_with_surface_tls(bind_addr, surface, None)
+            .await
+    }
+
+    /// Like [`serve_background_with_surface`](Self::serve_background_with_surface)
+    /// but optionally terminates TLS with a caller-supplied
+    /// `rustls::ServerConfig`.
+    ///
+    /// When `tls_config` is `Some`, the background listener speaks HTTPS/WSS
+    /// using [`tls::serve_tls`] (TLS 1.3, HTTP/1.1+HTTP/2 auto-detect, and
+    /// per-connection `ConnectInfo` for rate limiting). When `None`, it serves
+    /// plaintext HTTP exactly as
+    /// [`serve_background_with_surface`](Self::serve_background_with_surface).
+    ///
+    /// This is the seam the `--self-host` binary uses to serve a self-signed
+    /// certificate (the "be your own CA" no-DNS model, §10.12.11): the cert's
+    /// SANs depend on the node's external/LAN IP, which is only known after
+    /// `build()`, so the config is constructed at serve time and injected here
+    /// rather than baked into [`NodeState`]'s `tls_config` (which stays `None`
+    /// in no-domain mode). TLS is purely what is spoken on the bound TCP port;
+    /// the NAT/port-mapping behavior is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] under the same conditions as
+    /// [`serve_background_with_surface`](Self::serve_background_with_surface).
+    pub async fn serve_background_with_surface_tls(
+        &self,
+        bind_addr: Option<SocketAddr>,
+        surface: PublicSurface,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<SocketAddr, NodeError> {
         // Reject if the node has already been shut down — the cancellation
         // token is already cancelled so the server would exit immediately.
         if self.state.shutdown_token.is_cancelled() {
@@ -569,8 +732,10 @@ impl<S: Storage> ApplicationNode<S> {
 
         let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
 
-        // Security: warn when binding to a non-loopback address.
-        if !addr.ip().is_loopback() {
+        // Security: warn when binding a *plaintext* listener to a non-loopback
+        // address. When a TLS config is present (self-host self-signed cert),
+        // traffic is encrypted, so the "unencrypted" warning would be wrong.
+        if !addr.ip().is_loopback() && tls_config.is_none() {
             tracing::warn!(
                 bind_addr = %addr,
                 "serve_background binding to non-loopback address — \
@@ -581,8 +746,8 @@ impl<S: Storage> ApplicationNode<S> {
 
         let shutdown_token = self.state.shutdown_token.clone();
 
-        // Build the full merged router (same as serve()).
-        let merged = self.build_scp_router(axum::Router::new());
+        // Build the merged router for the requested public surface.
+        let merged = self.build_scp_router_with_surface(axum::Router::new(), surface);
 
         // Bind the TCP listener before spawning so we can report errors
         // and the bound address synchronously.
@@ -621,19 +786,37 @@ impl<S: Storage> ApplicationNode<S> {
         let serving_flag = Arc::clone(&self.serving);
         let serving_addr_ref = Arc::clone(&self.serving_addr);
 
-        // Spawn the background server task.
+        // Spawn the background server task. When a TLS config is supplied
+        // (self-host self-signed cert), terminate TLS via `tls::serve_tls`;
+        // otherwise serve plaintext HTTP. Both honor the graceful-shutdown
+        // token and clear the serving flag/address on exit.
         tokio::spawn(async move {
+            let scheme = if tls_config.is_some() {
+                "HTTPS"
+            } else {
+                "HTTP"
+            };
             tracing::info!(
                 addr = %local_addr,
+                scheme,
                 "background HTTP server started"
             );
 
-            let result = axum::serve(
-                listener,
-                merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(shutdown_token.cancelled_owned())
-            .await;
+            let result = if let Some(tls_cfg) = tls_config {
+                tls::serve_tls(listener, tls_cfg, merged, shutdown_token.clone())
+                    .await
+                    .map_err(|e| match e {
+                        NodeError::Serve(msg) => std::io::Error::other(msg),
+                        other => std::io::Error::other(other.to_string()),
+                    })
+            } else {
+                axum::serve(
+                    listener,
+                    merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown_token.cancelled_owned())
+                .await
+            };
 
             if let Err(ref e) = result {
                 tracing::error!(error = %e, "background HTTP server exited with error");
@@ -1022,7 +1205,7 @@ impl<S: Storage> ApplicationNode<S> {
             .await
             .map_err(|e| NodeError::Storage(e.to_string()))?;
 
-        let mut entries: HashMap<ContentPath, [u8; 32]> = HashMap::new();
+        let mut entries: HashMap<ContentPath, projection::PathEntry> = HashMap::new();
         let mut manifest_entries: Vec<projection::DeployManifestEntry> = Vec::new();
         let mut total_size: u64 = 0;
         // Track per-path sizes so path collisions subtract the old size before
@@ -1085,6 +1268,20 @@ impl<S: Storage> ApplicationNode<S> {
                 )));
             }
 
+            // Capture the ETag content hash and immutability flag BEFORE
+            // moving `path` out of `content.metadata`. The ETag is guaranteed
+            // `Some` here (populated/verified just above); the let-else is the
+            // clippy-clean way to unwrap it.
+            let Some(content_hash) = content.metadata.etag.clone() else {
+                continue;
+            };
+            let immutable = content.metadata.immutable;
+            let content_type = content
+                .metadata
+                .content_type
+                .as_ref()
+                .map(|m| m.as_str().to_owned());
+
             // Extract path.
             let Some(path) = content.metadata.path else {
                 continue;
@@ -1116,10 +1313,21 @@ impl<S: Storage> ApplicationNode<S> {
             manifest_entries.push(projection::DeployManifestEntry {
                 path: path.as_str().to_owned(),
                 blob_id: projection::hex_encode(&stored.blob_id),
+                content_hash: content_hash.clone(),
+                immutable,
+                content_type: content_type.clone(),
             });
 
             path_sizes.insert(path.clone(), new_size);
-            entries.insert(path, stored.blob_id);
+            entries.insert(
+                path,
+                projection::PathEntry {
+                    blob_id: stored.blob_id,
+                    content_hash,
+                    immutable,
+                    content_type,
+                },
+            );
         }
 
         // Store deploy manifest as a special blob.
@@ -1213,7 +1421,7 @@ impl<S: Storage> ApplicationNode<S> {
                 guard
                     .as_ref()
                     .as_ref()
-                    .and_then(|state| state.index.values().next().copied())
+                    .and_then(|state| state.index.values().next().map(|e| e.blob_id))
             })
         };
         if let Some(blob_id) = sample_blob_id {
@@ -1928,6 +2136,182 @@ fn tier_to_relay_url(tier: &ReachabilityTier) -> String {
     }
 }
 
+/// Resolves the published relay URL for no-domain mode.
+///
+/// `Some(tier)` is the probed reachability tier; `None` means the NAT probe was
+/// skipped (operator opted out — e.g. behind a tunnel/proxy), in which case the
+/// node falls back to a loopback relay URL on the public HTTP port. The loopback
+/// fallback keeps the published URL and the self-signed certificate SANs
+/// localhost-only, which is the correct posture when external reachability is
+/// provided by the proxy/tunnel rather than NAT traversal.
+fn no_domain_relay_url(tier: Option<&ReachabilityTier>, http_port: u16) -> String {
+    tier.map_or_else(
+        || format!("ws://127.0.0.1:{http_port}/scp/v1"),
+        tier_to_relay_url,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// NAT port-mapping lease renewal (spec §10.12.2)
+// ---------------------------------------------------------------------------
+
+/// Fraction of the mapping lease TTL at which renewal is attempted.
+///
+/// Per spec §10.12.2: "`UPnP` mappings have a TTL ... The SDK renews at 50% TTL"
+/// and "NAT-PMP/PCP mappings have explicit lifetimes ... The SDK renews at 50%
+/// lifetime." Renewing at half the lease leaves a full half-life of headroom to
+/// retry on transient failure before the mapping actually expires.
+const MAPPING_RENEWAL_FRACTION: f64 = 0.5;
+
+/// Minimum renewal interval, clamping 50%-of-TTL for very short leases so the
+/// renewal loop never busy-spins.
+const MIN_MAPPING_RENEWAL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Lease TTL assumed when a mapper reports an unusable lifetime (zero/unknown).
+///
+/// NAT-PMP/PCP report explicit lifetimes and UPnP-IGD echoes the requested lease,
+/// so in practice the real TTL is always used; this is only the fall-back when a
+/// gateway returns a degenerate value. 3600s (1h) matches the NAT-PMP default
+/// lease requested by [`scp_transport::nat::NatPmpPortMapper`].
+const DEFAULT_MAPPING_LEASE: Duration = Duration::from_hours(1);
+
+/// Backoff before retrying after a failed renewal attempt.
+///
+/// Spec §10.12.2: on renewal failure the host "re-probes" rather than giving up.
+/// A short fixed backoff means a transient gateway hiccup costs at most this
+/// delay; because it is far shorter than a half-life of headroom, the mapping is
+/// not dropped while retries are in flight.
+const MAPPING_RENEWAL_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Computes the renewal interval as [`MAPPING_RENEWAL_FRACTION`] of the lease
+/// TTL, clamped to [`MIN_MAPPING_RENEWAL_INTERVAL`].
+///
+/// A zero (or sub-floor) TTL maps to the floor, never to zero, so the caller
+/// can pass a gateway-reported lease through unconditionally.
+fn mapping_renewal_interval(ttl: Duration) -> Duration {
+    let half = ttl.mul_f64(MAPPING_RENEWAL_FRACTION);
+    if half < MIN_MAPPING_RENEWAL_INTERVAL {
+        MIN_MAPPING_RENEWAL_INTERVAL
+    } else {
+        half
+    }
+}
+
+/// Re-issues the port mapping once, trying the supplied mappers in order
+/// (primary first, fallback second — the same order [`DefaultNatStrategy`] used
+/// to acquire it). Returns the result of the first mapper that succeeds.
+///
+/// NAT-PMP renewal is "re-send the mapping request" (RFC 6886 §3.3) and UPnP-IGD
+/// renewal is "re-add the same mapping"; both are idempotent and extend the lease
+/// rather than creating a duplicate. Issuing the request in acquisition order
+/// keeps the renewal aligned with whichever protocol the gateway actually honors,
+/// even if that changes mid-session (e.g. `UPnP` comes back after a router reboot).
+async fn renew_mapping_once(
+    mappers: &[Arc<dyn scp_transport::nat::PortMapper>],
+    port: u16,
+) -> Option<scp_transport::nat::PortMappingResult> {
+    for mapper in mappers {
+        match mapper.map_port(port).await {
+            Ok(result) => return Some(result),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    port,
+                    "NAT mapping renewal attempt failed for one mapper, trying next"
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Runs the NAT port-mapping renewal loop until `cancel` is triggered.
+///
+/// The loop is the single owner of every post-acquisition renewal for the
+/// self-host node (spec §10.12.2). On each cycle it re-issues the mapping (which
+/// extends the lease and reports the gateway's current TTL), schedules the next
+/// cycle at 50% of that TTL, and logs the outcome. On failure it logs a warning
+/// and retries after a short backoff — a transient gateway error never
+/// permanently drops the mapping; the half-life of headroom absorbs the retry.
+///
+/// The very first action is an immediate renewal so the loop learns the real
+/// lease TTL (the acquiring [`DefaultNatStrategy`] discards it). That first
+/// re-issue is idempotent against the mapping `build()` already created.
+async fn run_mapping_renewal_loop(
+    mappers: Vec<Arc<dyn scp_transport::nat::PortMapper>>,
+    port: u16,
+    cancel: CancellationToken,
+) {
+    if mappers.is_empty() {
+        return;
+    }
+
+    // The granted lease TTL is not observable here: the acquiring
+    // `DefaultNatStrategy` discards it (it returns only the external address).
+    // A self-host gateway may grant a lease far shorter than an hour (spec
+    // §10.12.2 calls 10-60 min typical), so seeding the first interval at 50% of
+    // an *assumed* hour could let a short lease expire before the first renewal.
+    // Instead, schedule the first renewal at the floor: an early, idempotent
+    // re-issue (NAT-PMP re-send / UPnP re-add) extends the mapping `build()`
+    // already created and reports the gateway's real TTL, which then drives every
+    // subsequent interval at the true 50%. The floor keeps this off the hot path.
+    let mut next_interval = MIN_MAPPING_RENEWAL_INTERVAL;
+
+    loop {
+        // Wait for the scheduled interval or cancellation, whichever comes first.
+        tokio::select! {
+            () = cancel.cancelled() => {
+                tracing::debug!(port, "NAT mapping renewal loop cancelled");
+                return;
+            }
+            () = tokio::time::sleep(next_interval) => {}
+        }
+
+        if let Some(result) = renew_mapping_once(&mappers, port).await {
+            let ttl = if result.ttl.is_zero() {
+                DEFAULT_MAPPING_LEASE
+            } else {
+                result.ttl
+            };
+            next_interval = mapping_renewal_interval(ttl);
+            tracing::info!(
+                protocol = %result.protocol,
+                external_addr = %result.external_addr,
+                ttl_secs = ttl.as_secs(),
+                next_renewal_secs = next_interval.as_secs(),
+                port,
+                "NAT port mapping lease renewed (§10.12.2)"
+            );
+        } else {
+            next_interval = MAPPING_RENEWAL_RETRY_BACKOFF;
+            tracing::warn!(
+                port,
+                retry_secs = MAPPING_RENEWAL_RETRY_BACKOFF.as_secs(),
+                "NAT port mapping renewal failed on all mappers; retrying after backoff"
+            );
+        }
+    }
+}
+
+/// Spawns the NAT port-mapping renewal loop, tied to `cancel` for shutdown.
+///
+/// Hold the returned [`JoinHandle`] for the node's lifetime. On shutdown, trigger
+/// `cancel` and `await` the handle so the renewal loop fully stops *before* the
+/// mapping is released — renewal must never race the teardown `remove()`.
+///
+/// The `mappers` slice should contain the retained mapper handles in acquisition
+/// order (primary, then fallback). An empty slice yields a task that returns
+/// immediately, so the default (non-`upnp`) build spawns a harmless no-op exactly
+/// like the bare one-shot path.
+#[must_use]
+pub fn spawn_self_host_mapping_renewal(
+    mappers: Vec<Arc<dyn scp_transport::nat::PortMapper>>,
+    port: u16,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_mapping_renewal_loop(mappers, port, cancel))
+}
+
 /// Handles a detected tier change: updates the DID document, republishes it,
 /// and emits the event only after successful publish. Returns the new URL and
 /// document on success.
@@ -2137,6 +2521,16 @@ pub struct ApplicationNodeBuilder<
     /// subdomain (issue #642). When set, `build()` overrides the domain
     /// and TLS provider with DNS-derived values after identity resolution.
     dns_provider_config: Option<dns_provider::DnsProviderConfig>,
+    /// When `true`, the no-domain build path skips the blocking STUN/NAT
+    /// external-address probe entirely, binds and serves immediately, and
+    /// publishes a loopback relay URL. Set via [`skip_nat_probe`](Self::skip_nat_probe).
+    ///
+    /// This is the correct posture when the node is reached through a
+    /// tunnel/proxy (e.g. a Cloudflare tunnel terminating on `localhost`): the
+    /// external reachability discovery is dead weight there, and the discovered
+    /// external IP would only feed the published relay URL and an extra cert SAN
+    /// that the tunnel never uses. Ignored in domain mode (which never probes).
+    skip_nat_probe: bool,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -2170,6 +2564,7 @@ impl ApplicationNodeBuilder {
             http3_config: None,
             persist_identity: false,
             dns_provider_config: None,
+            skip_nat_probe: false,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2216,6 +2611,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2254,6 +2650,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2522,6 +2919,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2538,6 +2936,32 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
     #[must_use]
     pub fn blob_storage(mut self, blob_storage: impl Into<BlobStorageBackend>) -> Self {
         self.blob_storage = Some(blob_storage.into());
+        self
+    }
+
+    /// Skips the blocking STUN/NAT external-address probe in no-domain
+    /// (`§10.12.8`) mode.
+    ///
+    /// By default a no-domain build probes NAT type over STUN, attempts a
+    /// UPnP/NAT-PMP port mapping, and runs a reachability self-test before it
+    /// publishes a relay URL — discovery that can add tens of seconds to
+    /// startup. When the node is reached through a tunnel/proxy that terminates
+    /// on `localhost` (e.g. a Cloudflare tunnel), that discovery is dead weight:
+    /// external reachability is provided by the tunnel, and the discovered
+    /// external IP would only feed the published relay URL and an extra
+    /// certificate SAN the tunnel never uses.
+    ///
+    /// When set, the no-domain build path:
+    /// * does NOT call [`NatStrategy::select_tier`] (no STUN, no port mapping);
+    /// * publishes a loopback relay URL (`ws://127.0.0.1:<port>/scp/v1`), so no
+    ///   external IP is disclosed and no external-IP certificate SAN is added;
+    /// * does NOT spawn the periodic tier re-evaluation task (there is no tier
+    ///   to re-evaluate).
+    ///
+    /// Has no effect in domain mode, which never probes NAT.
+    #[must_use]
+    pub const fn skip_nat_probe(mut self) -> Self {
+        self.skip_nat_probe = true;
         self
     }
 }
@@ -2581,6 +3005,7 @@ impl<S: Storage + 'static, Dom>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2619,6 +3044,7 @@ impl<S: Storage + 'static, Dom>
             http3_config: self.http3_config,
             persist_identity: self.persist_identity,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2705,6 +3131,7 @@ impl<S: Storage + 'static, Dom>
             http3_config: self.http3_config,
             persist_identity: true,
             dns_provider_config: self.dns_provider_config,
+            skip_nat_probe: self.skip_nat_probe,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -2892,6 +3319,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     subscription_registry,
                     #[cfg(feature = "quic")]
                     publish_rate_limiter,
+                    self.skip_nat_probe,
                 )
                 .await
             }
@@ -2963,6 +3391,26 @@ async fn validate_persisted_custody<K: KeyCustody>(
             ))
         })?;
     verify_vm_match(&persisted.document, "#0", &identity_pub, "identity key")?;
+
+    // Re-derive the self-certifying DID from the #0 identity key and confirm it
+    // matches the persisted DID string. The did:dht identifier is
+    // `did:dht:z<zbase32(#0 public key)>`; a stored DID that does not re-derive
+    // from the custody-held key indicates tampering or corruption of the
+    // persisted record, so reject the load.
+    let id_key_bytes: [u8; 32] = identity_pub.as_bytes().try_into().map_err(|_| {
+        NodeError::Storage(format!(
+            "persisted #0 identity public key is not 32 bytes (got {})",
+            identity_pub.as_bytes().len()
+        ))
+    })?;
+    let derived_did = scp_identity::dht::did_from_ed25519_public_key(&id_key_bytes);
+    if derived_did != persisted.identity.did {
+        return Err(NodeError::Storage(format!(
+            "persisted DID does not match DID re-derived from #0 identity key \
+             (stored: {}, derived: {derived_did})",
+            persisted.identity.did
+        )));
+    }
 
     // --- #active Signing Key ---
     let active_pub = key_custody
@@ -3448,6 +3896,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         subscription_registry,
         acme_challenges,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
+        default_site_routing_id: std::sync::RwLock::new(None),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
         #[cfg(feature = "quic")]
@@ -3522,18 +3971,25 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
     #[cfg(feature = "quic")]
     publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
+    skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError> {
     // NAT strategy needs the public HTTP port, not the internal relay port (#641).
     let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
-    let tier = nat_strategy.select_tier(http_bind_addr.port()).await?;
-
-    let relay_url = match &tier {
-        ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
-            format!("ws://{external_addr}/scp/v1")
-        }
-        ReachabilityTier::Bridge { bridge_url } => bridge_url.clone(),
+    // When `skip_nat_probe` is set (operator opted out — e.g. behind a
+    // tunnel/proxy that terminates on `localhost`), the STUN/NAT probe is dead
+    // weight and adds tens of seconds to startup. Skip `select_tier` entirely
+    // and fall back to a loopback relay URL: no external IP is discovered or
+    // disclosed to the DHT, and no periodic tier re-evaluation task is spawned
+    // (there is no tier to re-evaluate). External reachability is provided by
+    // the proxy/tunnel, not by NAT traversal.
+    let tier = if skip_nat_probe {
+        None
+    } else {
+        Some(nat_strategy.select_tier(http_bind_addr.port()).await?)
     };
+
+    let relay_url = no_domain_relay_url(tier.as_ref(), http_bind_addr.port());
 
     push_relay_service(&mut document, &relay_url);
 
@@ -3545,6 +4001,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         relay_url = %relay_url,
         bound_addr = %bound_addr,
         did = %identity.did,
+        nat_probe_skipped = skip_nat_probe,
         "application node started (no-domain mode, §10.12.8)"
     );
 
@@ -3553,17 +4010,23 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     });
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
     let bg_identity = identity.clone();
-    let tier_reeval = spawn_tier_reevaluation(
-        nat_strategy,
-        network_detector,
-        publisher,
-        bg_identity,
-        document.clone(),
-        http_bind_addr.port(),
-        relay_url.clone(),
-        Some(tier_event_tx),
-        TIER_REEVALUATION_INTERVAL,
-    );
+    // No tier to re-evaluate when the probe was skipped: the node is reached via
+    // a proxy/tunnel, not via a NAT-traversed tier that could change.
+    let tier_reeval = if skip_nat_probe {
+        None
+    } else {
+        Some(spawn_tier_reevaluation(
+            nat_strategy,
+            network_detector,
+            publisher,
+            bg_identity,
+            document.clone(),
+            http_bind_addr.port(),
+            relay_url.clone(),
+            Some(tier_event_tx),
+            TIER_REEVALUATION_INTERVAL,
+        ))
+    };
 
     // Bridge auth lookup — audience is relay URL in no-domain mode (spec 12.10.2).
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
@@ -3600,6 +4063,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         subscription_registry,
         acme_challenges: None,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
+        default_site_routing_id: std::sync::RwLock::new(None),
         bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         bridge_lookup: Some(bridge_lookup),
         // No-domain mode is plaintext `ws://` (no cert), so QUIC is not served (§10.14.3).
@@ -3621,8 +4085,10 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         identity: IdentityHandle { identity, document },
         storage,
         state,
-        tier_reeval: Some(tier_reeval),
-        tier_change_rx: Some(tier_event_rx),
+        // `None` for both when the NAT probe was skipped: there is no
+        // re-evaluation task and no tier-change stream to surface.
+        tier_change_rx: tier_reeval.as_ref().map(|_| tier_event_rx),
+        tier_reeval,
         // HTTP/3 is not supported in no-domain mode (no TLS certificate).
         #[cfg(feature = "http3")]
         http3_config: None,
@@ -3690,6 +4156,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
         let persist = self.persist_identity;
+        let skip_nat_probe = self.skip_nat_probe;
 
         let (identity, document, did_method) =
             resolve_identity_persistent(identity_source, persist, protocol_repository.storage())
@@ -3753,6 +4220,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             subscription_registry,
             #[cfg(feature = "quic")]
             publish_rate_limiter,
+            skip_nat_probe,
         )
         .await
     }
@@ -6087,6 +6555,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn persisted_identity_with_tampered_did_is_rejected() {
+        // The did:dht identifier is self-certifying: it is derived directly
+        // from the `#0` identity key. A stored DID string that no longer
+        // re-derives from the custody-held key indicates tampering or
+        // corruption of the persisted record, and the load MUST be rejected
+        // even though the custody key handles and document verification
+        // methods are still internally consistent.
+
+        // First run: create and persist a real identity.
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let node1 = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("tampered-did.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "tampered-did.example.com".to_owned(),
+            }))
+            .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build_for_testing()
+            .await
+            .unwrap();
+
+        let original_did = node1.identity().did().to_owned();
+        node1.shutdown();
+
+        // Tamper: rewrite ONLY the persisted DID string, leaving the custody
+        // key handles and DID document verification methods untouched so that
+        // `validate_persisted_custody`'s VM-match checks still pass and the
+        // DID re-derivation check is the sole gate that can catch the
+        // corruption.
+        let stored = storage
+            .retrieve(IDENTITY_STORAGE_KEY)
+            .await
+            .unwrap()
+            .expect("identity should be persisted after first run");
+        let mut envelope: StoredValue<PersistedIdentity> = rmp_serde::from_slice(&stored).unwrap();
+        let tampered_did = "did:dht:zyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy".to_owned();
+        assert_ne!(
+            tampered_did, original_did,
+            "tampered DID must differ from the genuine DID"
+        );
+        envelope.data.identity.did = tampered_did.clone();
+        let tampered_bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+        storage
+            .store(IDENTITY_STORAGE_KEY, &tampered_bytes)
+            .await
+            .unwrap();
+
+        // Second run: same custody (so VMs still match) but the stored DID no
+        // longer re-derives from the `#0` key → load MUST be rejected.
+        let result = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("tampered-did.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "tampered-did.example.com".to_owned(),
+            }))
+            .identity_with_storage(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build_for_testing()
+            .await;
+
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("does not match DID re-derived from #0 identity key"),
+                    "expected DID re-derivation mismatch error, got: {msg}"
+                );
+            }
+            Ok(node) => {
+                node.shutdown();
+                panic!("expected tampered-DID rejection, but build succeeded");
+            }
+        }
+    }
+
     /// Regression: persisted `ScpIdentity` blobs from interim builds
     /// (where `pre_rotation_key: KeyHandle` was briefly a field on the
     /// struct) MUST deserialize cleanly into the post-revert struct,
@@ -6324,5 +6872,228 @@ mod tests {
         );
 
         node2.shutdown();
+    }
+
+    // -- NAT port-mapping lease renewal (spec §10.12.2) ----------------------
+
+    mod mapping_renewal {
+        use super::super::{
+            MAPPING_RENEWAL_RETRY_BACKOFF, MIN_MAPPING_RENEWAL_INTERVAL, mapping_renewal_interval,
+            run_mapping_renewal_loop,
+        };
+        use scp_transport::nat::{
+            MappingProtocol, PortMapper, PortMappingError, PortMappingResult,
+        };
+        use std::future::Future;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        fn ext_addr() -> SocketAddr {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 8443)
+        }
+
+        /// A `PortMapper` for renewal tests. Counts `map_port` calls and returns
+        /// a programmable sequence of results (cycling on the last entry), so a
+        /// renewal loop can be driven across many cycles without exhausting it.
+        struct CountingMapper {
+            map_calls: AtomicU32,
+            results: Vec<Result<PortMappingResult, PortMappingError>>,
+        }
+
+        impl CountingMapper {
+            fn new(results: Vec<Result<PortMappingResult, PortMappingError>>) -> Self {
+                Self {
+                    map_calls: AtomicU32::new(0),
+                    results,
+                }
+            }
+
+            /// Always succeeds with the given TTL.
+            fn always_ok(ttl: Duration) -> Self {
+                Self::new(vec![Ok(PortMappingResult {
+                    external_addr: ext_addr(),
+                    ttl,
+                    protocol: MappingProtocol::NatPmp,
+                })])
+            }
+
+            fn calls(&self) -> u32 {
+                self.map_calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl PortMapper for CountingMapper {
+            fn map_port(
+                &self,
+                _internal_port: u16,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    let idx = self.map_calls.fetch_add(1, Ordering::SeqCst) as usize;
+                    let pick = idx.min(self.results.len().saturating_sub(1));
+                    self.results[pick].clone()
+                })
+            }
+
+            fn renew(
+                &self,
+                internal_port: u16,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>,
+            > {
+                self.map_port(internal_port)
+            }
+
+            fn remove(
+                &self,
+                _internal_port: u16,
+            ) -> Pin<Box<dyn Future<Output = Result<(), PortMappingError>> + Send + '_>>
+            {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        #[test]
+        fn interval_is_50_percent_of_ttl() {
+            assert_eq!(
+                mapping_renewal_interval(Duration::from_hours(1)),
+                Duration::from_mins(30),
+            );
+            assert_eq!(
+                mapping_renewal_interval(Duration::from_mins(10)),
+                Duration::from_mins(5),
+            );
+        }
+
+        #[test]
+        fn interval_is_floored_for_short_and_zero_ttls() {
+            // 50% of 4s = 2s, below the 5s floor.
+            assert_eq!(
+                mapping_renewal_interval(Duration::from_secs(4)),
+                MIN_MAPPING_RENEWAL_INTERVAL,
+            );
+            // A zero TTL still yields the floor, never zero.
+            assert_eq!(
+                mapping_renewal_interval(Duration::ZERO),
+                MIN_MAPPING_RENEWAL_INTERVAL,
+            );
+        }
+
+        /// The loop re-issues the mapping after the renewal interval, and stops
+        /// renewing once cancelled. Time is injected via tokio's paused clock so
+        /// the test is hermetic (no real 1800s wait).
+        #[tokio::test(start_paused = true)]
+        async fn renews_after_interval_then_stops_on_cancel() {
+            // 100s TTL → second-and-later interval = 50s. The FIRST interval is
+            // the floor (5s); after that the loop learns the real reported TTL.
+            let mapper = Arc::new(CountingMapper::always_ok(Duration::from_secs(100)));
+            let mappers: Vec<Arc<dyn PortMapper>> = vec![mapper.clone()];
+            let cancel = CancellationToken::new();
+
+            let handle = tokio::spawn(run_mapping_renewal_loop(mappers, 8443, cancel.clone()));
+
+            // Let the spawned loop reach its first `sleep` and register the timer
+            // against the paused clock before we advance it.
+            tokio::task::yield_now().await;
+
+            // No renewal before the first interval elapses.
+            assert_eq!(
+                mapper.calls(),
+                0,
+                "must not renew before the first interval"
+            );
+
+            // The first renewal is seeded at the floor (not 50% of an assumed
+            // hour) so a short gateway lease can never expire before the loop
+            // learns the real TTL. Advancing just past the floor fires it.
+            tokio::time::advance(MIN_MAPPING_RENEWAL_INTERVAL + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                mapper.calls() >= 1,
+                "expected the first renewal at the floor interval, got {}",
+                mapper.calls()
+            );
+
+            // Advance past the next interval (now derived from the real 100s TTL
+            // = 50s) and confirm a second renewal fires.
+            let after_first = mapper.calls();
+            tokio::time::advance(Duration::from_secs(50) + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                mapper.calls() > after_first,
+                "expected a second renewal at 50% of the reported TTL"
+            );
+
+            // Cancel and confirm renewals stop: no further map calls after a long
+            // advance.
+            cancel.cancel();
+            let _ = handle.await;
+            let at_cancel = mapper.calls();
+            tokio::time::advance(Duration::from_secs(10_000)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                mapper.calls(),
+                at_cancel,
+                "cancellation must stop all further renewals"
+            );
+        }
+
+        /// A transient renewal failure must NOT permanently drop the mapping: the
+        /// loop retries after the backoff and recovers on the next success.
+        #[tokio::test(start_paused = true)]
+        async fn retries_after_a_failed_renewal() {
+            // First renewal fails, second succeeds. The loop must survive the
+            // failure and renew successfully afterward.
+            let mapper = Arc::new(CountingMapper::new(vec![
+                Err(PortMappingError::Timeout),
+                Ok(PortMappingResult {
+                    external_addr: ext_addr(),
+                    ttl: Duration::from_secs(200),
+                    protocol: MappingProtocol::NatPmp,
+                }),
+            ]));
+            let mappers: Vec<Arc<dyn PortMapper>> = vec![mapper.clone()];
+            let cancel = CancellationToken::new();
+
+            let handle = tokio::spawn(run_mapping_renewal_loop(mappers, 8443, cancel.clone()));
+
+            // Let the loop register its first timer against the paused clock.
+            tokio::task::yield_now().await;
+
+            // Trigger the first (failing) renewal. The first interval is the
+            // floor (seeded so a short lease cannot expire before the first
+            // renewal), so advance just past it.
+            tokio::time::advance(MIN_MAPPING_RENEWAL_INTERVAL + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(mapper.calls(), 1, "first renewal attempt should have run");
+
+            // After failure the loop backs off, then retries. Advance past the
+            // backoff and confirm a second attempt fires (the loop did not give
+            // up).
+            tokio::time::advance(MAPPING_RENEWAL_RETRY_BACKOFF + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                mapper.calls() >= 2,
+                "loop must retry after a failed renewal, not give up; got {} calls",
+                mapper.calls()
+            );
+
+            cancel.cancel();
+            let _ = handle.await;
+        }
+
+        /// With no mappers (the default, non-`upnp` build) the loop is a no-op
+        /// that returns immediately.
+        #[tokio::test(start_paused = true)]
+        async fn empty_mappers_is_noop() {
+            let cancel = CancellationToken::new();
+            // Returns immediately; awaiting must not hang or require cancellation.
+            run_mapping_renewal_loop(Vec::new(), 8443, cancel).await;
+        }
     }
 }

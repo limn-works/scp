@@ -201,6 +201,28 @@ pub struct NodeState {
     /// Read locks on `hostname_index` must be dropped before accessing `projected_contexts`.
     pub(crate) hostname_index: RwLock<HashMap<String, [u8; 32]>>,
 
+    /// Default site routing ID for origin-root serving in `--self-host` mode.
+    ///
+    /// When `Some`, the virtual-host fallback serves bare-path requests
+    /// (`GET /`, `GET /style.css`, `GET /<anything>`) from this routing ID's
+    /// projected site whenever the request's `Host` header does not match any
+    /// entry in [`hostname_index`](Self::hostname_index). This lets a single
+    /// deployed self-host site be reached at the origin root (and via raw IP,
+    /// where no `Host` matches), so a browser loading the embedded
+    /// `index.html` resolves its root-absolute `/style.css` and `/app.js`
+    /// references (§10.12.11). The routing ID is `SHA-256(context_id)` — the
+    /// same value the explicit `/scp/broadcast/<rid>/site/...` route uses.
+    ///
+    /// `None` for the Full surface and for any node that has not designated a
+    /// default site, in which case the fallback behaves exactly as before
+    /// (404 on an unmatched host). Set once after the self-host deploy via
+    /// [`ApplicationNode::set_default_site_routing_id`].
+    ///
+    /// Uses `std::sync::RwLock` (not tokio): it is written once after deploy
+    /// and read in the synchronous tail of the async fallback handler, where
+    /// the critical section is a single `Option` copy with no `.await`.
+    pub(crate) default_site_routing_id: std::sync::RwLock<Option<[u8; 32]>>,
+
     /// Shared state for bridge shadow operations.
     ///
     /// Holds per-context shadow registries and sender key stores for the
@@ -637,13 +659,42 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         app_router: Router,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), NodeError> {
+        self.serve_with_surface(app_router, crate::PublicSurface::Full, shutdown)
+            .await
+    }
+
+    /// Like [`serve`](Self::serve) but restricts the public HTTP surface to
+    /// the requested [`PublicSurface`](crate::PublicSurface).
+    ///
+    /// [`PublicSurface::Full`](crate::PublicSurface::Full) is identical to
+    /// [`serve`](Self::serve). [`PublicSurface::SelfHost`](crate::PublicSurface::SelfHost)
+    /// exposes ONLY the read-only website projection surface on the public
+    /// bind — the relay upgrade (`/scp/v1`) and bridge routes
+    /// (`/v1/scp/bridge/*`) are not mounted, so anonymous internet clients
+    /// cannot reach the node's loopback relay or bridge through the public
+    /// listener (§10.12.8).
+    ///
+    /// TLS termination, the dev API listener, and the HTTP/3 listener behave
+    /// exactly as in [`serve`](Self::serve); the only difference is which SCP
+    /// routes are merged onto the public listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] if either server cannot bind or
+    /// encounters a fatal I/O error.
+    pub async fn serve_with_surface(
+        self,
+        app_router: Router,
+        surface: crate::PublicSurface,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), NodeError> {
         spawn_projection_rate_limit_cleanup(
             self.state.projection_rate_limiter.clone(),
             self.state.shutdown_token.clone(),
         );
 
-        // Build the full merged router via the shared helper.
-        let merged = self.build_scp_router(app_router);
+        // Build the merged router for the requested public surface.
+        let merged = self.build_scp_router_with_surface(app_router, surface);
 
         let dev_router = self
             .state
@@ -818,6 +869,51 @@ pub(crate) fn build_merged_router(
         .merge(bridge)
         .merge(bridge_webhook);
 
+    finalize_router(merged, state)
+}
+
+/// Builds the restricted public router for `--self-host` mode.
+///
+/// Mounts ONLY the read-only website surface: the caller's `app_router`,
+/// `.well-known/scp`, the broadcast projection endpoints (`/scp/broadcast/*`,
+/// including `/feed`, `/messages`, and `/site/*`), any configured ACME
+/// challenge routes, and the virtual-host fallback. It deliberately does NOT
+/// merge the relay upgrade router (`/scp/v1`) nor the bridge routers
+/// (`/v1/scp/bridge/*`).
+///
+/// This is the security seam for §10.12.8: in self-host mode the node's own
+/// loopback relay is reached in-process over `127.0.0.1` (the relay's listener
+/// stays loopback), so the relay upgrade/bridge must never be exposed on the
+/// public bind. An external client hitting `/scp/v1` or `/v1/scp/bridge/*` on
+/// the self-host public listener therefore falls through to the virtual-host
+/// fallback and receives 404 (no registered hostname matches those paths),
+/// while the website projection routes serve normally.
+///
+/// **Caller note:** whatever `app_router` is passed IS exposed on the public
+/// self-host bind. The self-host serve path
+/// ([`serve_background_with_surface_tls`](crate::ApplicationNode::serve_background_with_surface_tls))
+/// passes an EMPTY app router (`axum::Router::new()`), so the self-host surface
+/// exposes NO app routes — in particular it does NOT expose `/metrics`. This is
+/// deliberate: the self-host bind is a public, unauthenticated surface, and
+/// unauthenticated Prometheus metrics there would leak operational detail. Do
+/// not merge any sensitive, mutating, or operational routes into `app_router`
+/// for the self-host surface.
+pub(crate) fn build_self_host_router(
+    app_router: Router,
+    well_known: Router,
+    projection: Router,
+    state: &Arc<NodeState>,
+) -> Router {
+    let merged = app_router.merge(well_known).merge(projection);
+
+    finalize_router(merged, state)
+}
+
+/// Mounts the ACME challenge router (when configured) and installs the
+/// virtual-host fallback. Shared by [`build_merged_router`] and
+/// [`build_self_host_router`] so both surfaces use the identical,
+/// path-traversal-safe fallback.
+fn finalize_router(merged: Router, state: &Arc<NodeState>) -> Router {
     // Mount ACME challenge router for renewal challenges (issue #305).
     // Serves `GET /.well-known/acme-challenge/{token}` so the ACME CA can
     // validate domain ownership during certificate renewal.
@@ -877,33 +973,55 @@ async fn virtual_host_fallback(
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
 
-    // Extract the Host header value.
+    // Extract the Host header value. A missing/invalid Host header is not
+    // fatal: it simply means no hostname can match, so we fall straight through
+    // to the default-site lookup below (which serves the single self-host site
+    // at the origin root, including raw-IP access where no Host matches).
     let host_value = req
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok());
 
-    let Some(host_raw) = host_value else {
-        return StatusCode::NOT_FOUND.into_response();
+    // Resolve the routing ID: first by Host header against the hostname index;
+    // if that misses (or there is no usable Host), fall back to the default
+    // site routing ID when one is configured (§10.12.11 origin-root serving).
+    let routing_id = match host_value {
+        Some(host_raw) => {
+            // Strip port and lowercase.
+            // IPv6 bracket notation (e.g., "[::1]:8080") requires finding the
+            // closing bracket first; plain hostnames/IPv4 just split on ':'.
+            let hostname = if host_raw.starts_with('[') {
+                // IPv6 bracket notation: find closing bracket
+                host_raw.find(']').map_or(host_raw, |i| &host_raw[..=i])
+            } else {
+                // IPv4 or plain hostname: strip optional ":port"
+                host_raw.split(':').next().unwrap_or(host_raw)
+            }
+            .to_ascii_lowercase();
+
+            let index = state.hostname_index.read().await;
+            index.get(&hostname).copied()
+        }
+        None => None,
     };
 
-    // Strip port and lowercase.
-    // IPv6 bracket notation (e.g., "[::1]:8080") requires finding the closing
-    // bracket first; plain hostnames/IPv4 just split on ':'.
-    let hostname = if host_raw.starts_with('[') {
-        // IPv6 bracket notation: find closing bracket
-        host_raw.find(']').map_or(host_raw, |i| &host_raw[..=i])
-    } else {
-        // IPv4 or plain hostname: strip optional ":port"
-        host_raw.split(':').next().unwrap_or(host_raw)
-    }
-    .to_ascii_lowercase();
-
-    // Look up in the hostname index.
-    let routing_id = {
-        let index = state.hostname_index.read().await;
-        index.get(&hostname).copied()
-    };
+    // Default-site fallback: when no hostname matched, serve the single
+    // designated self-host site (set after deploy). This is what makes
+    // `GET /`, `GET /style.css`, and raw-IP access resolve to the deployed
+    // context at the origin root. `site_handler` maps an empty/`/` path to the
+    // site's `index_path` and runs full `ContentPath` traversal protection,
+    // decryption, ETag, and CSP — identical to the explicit site route.
+    let routing_id = routing_id.or_else(|| {
+        // Recover from a poisoned lock rather than swallowing it to `None`: the
+        // stored value is a plain `Option<[u8; 32]>` with no invariant a panic
+        // could corrupt, and silently disabling origin-root serving on poison
+        // would 404 the whole site. Mirrors the setter's poison recovery.
+        let guard = state
+            .default_site_routing_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard
+    });
 
     let Some(routing_id) = routing_id else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1074,6 +1192,7 @@ mod tests {
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
             hostname_index: RwLock::new(HashMap::new()),
+            default_site_routing_id: std::sync::RwLock::new(None),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
             #[cfg(feature = "quic")]
@@ -1219,7 +1338,7 @@ mod vhost_tests {
     use scp_transport::native::storage::{BlobStorageBackend, InMemoryBlobStorage};
 
     use crate::http::NodeState;
-    use crate::projection::test_helpers::store_content_blob;
+    use crate::projection::test_helpers::{entry_for, store_content_blob};
     use crate::projection::{
         ProjectedContext, SiteConfig, broadcast_projection_router, hex_encode,
     };
@@ -1267,6 +1386,7 @@ mod vhost_tests {
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
             hostname_index: RwLock::new(hostname_index),
+            default_site_routing_id: std::sync::RwLock::new(None),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
             #[cfg(feature = "quic")]
@@ -1308,7 +1428,7 @@ mod vhost_tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("deploy-1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -1444,7 +1564,7 @@ mod vhost_tests {
         let blob_id_a = store_content_blob(&storage, routing_id_a, &key_a, &bc_a).await;
         let path_a = ContentPath::new("/index.html").unwrap();
         let mut entries_a = HashMap::new();
-        entries_a.insert(path_a, blob_id_a);
+        entries_a.insert(path_a, entry_for(blob_id_a, &bc_a));
         projected_a.commit_deploy("deploy-a".into(), entries_a);
 
         // Content for B: "Content B".
@@ -1462,7 +1582,7 @@ mod vhost_tests {
         let blob_id_b = store_content_blob(&storage, routing_id_b, &key_b, &bc_b).await;
         let path_b = ContentPath::new("/index.html").unwrap();
         let mut entries_b = HashMap::new();
-        entries_b.insert(path_b, blob_id_b);
+        entries_b.insert(path_b, entry_for(blob_id_b, &bc_b));
         projected_b.commit_deploy("deploy-b".into(), entries_b);
 
         let mut projected_map = HashMap::new();

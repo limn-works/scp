@@ -87,11 +87,36 @@ pub fn compute_routing_id(context_id: &str) -> [u8; 32] {
 // Path index and deploy types (§18.11.10, §18.11.11)
 // ---------------------------------------------------------------------------
 
-/// Path index mapping content paths to blob IDs for a single deploy.
+/// A single resolved asset in a deploy's path index: the storage blob id
+/// plus the content hash (`compute_etag(body)` = hex SHA-256 of the
+/// plaintext body) and the immutability flag.
+///
+/// The content hash and immutability flag are captured at commit time so the
+/// site handler can compute the exact `"<deploy_id>:<content_hash>"` `ETag` and
+/// answer a conditional GET (304) WITHOUT decrypting the blob. The
+/// immutability flag is needed because the original (post-decrypt) 304 only
+/// fired for non-immutable assets; capturing it here keeps the pre-decrypt
+/// short-circuit behavior-identical.
+#[derive(Debug, Clone)]
+pub struct PathEntry {
+    /// Storage blob id (SHA-256 of the wrapped ciphertext envelope).
+    pub blob_id: [u8; 32],
+    /// `compute_etag(body)` — hex SHA-256 of the plaintext body.
+    pub content_hash: String,
+    /// Whether the asset is immutable (long-lived cache, no revalidation
+    /// `ETag`). Immutable assets are excluded from the pre-decrypt 304 path.
+    pub immutable: bool,
+    /// Declared MIME type captured at commit time (`metadata.content_type`), so
+    /// the pre-decrypt 304 can emit the same `Content-Type` as the served
+    /// 200/post-decrypt-304 response.
+    pub content_type: Option<String>,
+}
+
+/// Path index mapping content paths to resolved assets for a single deploy.
 ///
 /// Built immutably at commit time; swapped atomically via [`ArcSwap`].
 /// Lock-free reads for concurrent HTTP handlers.
-pub type PathIndex = HashMap<ContentPath, [u8; 32]>;
+pub type PathIndex = HashMap<ContentPath, PathEntry>;
 
 /// Maximum number of deploys retained per projected context.
 const MAX_DEPLOY_RETENTION: usize = 8;
@@ -119,6 +144,17 @@ pub struct DeployManifestEntry {
     pub path: String,
     /// The blob ID as hex-encoded string.
     pub blob_id: String,
+    /// `compute_etag(body)` — hex SHA-256 of the plaintext body. Persisted so
+    /// the path index can answer conditional GETs (304) after a restart
+    /// without decrypting the blob.
+    pub content_hash: String,
+    /// Whether the asset is immutable. Persisted so the rebuilt path index
+    /// preserves the pre-decrypt 304 gating across restarts.
+    pub immutable: bool,
+    /// Declared MIME type (`metadata.content_type`). Persisted so the rebuilt
+    /// path index can emit the same `Content-Type` on the pre-decrypt 304 as
+    /// the served 200/post-decrypt-304 response across restarts.
+    pub content_type: Option<String>,
 }
 
 /// Node-local site configuration for broadcast projection (§18.11.12).
@@ -730,11 +766,7 @@ impl ProjectedContext {
     /// atomically swaps the current pointer, and pushes the old deploy to history.
     ///
     /// Returns the number of paths in the new index.
-    pub fn commit_deploy(
-        &mut self,
-        deploy_id: String,
-        entries: HashMap<ContentPath, [u8; 32]>,
-    ) -> usize {
+    pub fn commit_deploy(&mut self, deploy_id: String, entries: PathIndex) -> usize {
         let count = entries.len();
         let new_state = DeployState {
             deploy_id,
@@ -803,13 +835,21 @@ impl ProjectedContext {
     ///
     /// Returns an error string if any path in the manifest is invalid.
     pub fn load_manifest(&mut self, manifest: &DeployManifest) -> Result<(), String> {
-        let mut entries = HashMap::new();
+        let mut entries: PathIndex = HashMap::new();
         for entry in &manifest.entries {
             let path = ContentPath::new(&entry.path)
                 .map_err(|e| format!("invalid path in manifest: {e}"))?;
             let blob_id = hex_decode(&entry.blob_id)
                 .ok_or_else(|| format!("invalid blob_id hex in manifest: {}", entry.blob_id))?;
-            entries.insert(path, blob_id);
+            entries.insert(
+                path,
+                PathEntry {
+                    blob_id,
+                    content_hash: entry.content_hash.clone(),
+                    immutable: entry.immutable,
+                    content_type: entry.content_type.clone(),
+                },
+            );
         }
         self.commit_deploy(manifest.deploy_id.clone(), entries);
         Ok(())
@@ -1995,6 +2035,92 @@ fn site_security_headers(csp: &str) -> axum::http::HeaderMap {
     headers
 }
 
+/// Resolves a requested site path to a [`PathEntry`] in the deploy's
+/// [`PathIndex`], applying standard static-host clean-URL fallbacks.
+///
+/// Resolution depends on whether the request carried a trailing slash. A
+/// trailing slash is an explicit directory request (as on nginx/Apache), so the
+/// extensionless `.html` candidate is skipped for it — the directory index
+/// wins. Resolution order (first hit wins):
+///
+/// **Non-trailing-slash request** (e.g. `/white-paper`, `/docs`):
+/// 1. **Exact** — the requested path as-is (the only behavior prior to the
+///    clean-URL fallback).
+/// 2. **Extensionless `.html`** — `<path>.html` (e.g. `/white-paper` →
+///    `/white-paper.html`).
+/// 3. **Directory index** — `<path>/index.html` (e.g. `/docs` →
+///    `/docs/index.html`).
+///
+/// **Trailing-slash request** (e.g. `/docs/`):
+/// 1. **Exact** — the requested path as-is (rejected by `ContentPath::new`,
+///    which disallows a trailing slash, so this is effectively skipped).
+/// 2. **Directory index** — `<dir>/index.html`, where `<dir>` is the request
+///    with its single trailing slash removed (e.g. `/docs/` →
+///    `/docs/index.html`). The `<dir>.html` candidate is NOT tried, matching
+///    conventional static hosts: a trailing slash names the directory, so its
+///    index is served even when a sibling `<dir>.html` also exists.
+///
+/// Every candidate — including the exact match — is constructed through
+/// [`ContentPath::new`], so traversal (`..`), control characters, trailing
+/// slashes, and every other invalid form are rejected by the same validation
+/// the rest of the path index relies on. An invalid candidate is skipped (not
+/// an error); the next candidate is tried. The lookup is purely in-memory
+/// against the supplied [`PathIndex`] — no filesystem access.
+///
+/// Returns the resolved [`PathEntry`] borrowed from `index`, or `None` if no
+/// candidate is both a valid [`ContentPath`] and present in the index.
+///
+/// `with_slash` is the requested path with a leading `/` already prepended. It
+/// is NOT pre-validated: directory-style requests carry a trailing slash
+/// (e.g. `/docs/`), which is not a valid [`ContentPath`] but is a legitimate
+/// directory-index request. Each candidate is validated independently via
+/// [`ContentPath::new`].
+///
+/// The root request (empty path or `/`) is resolved by the caller to
+/// `index_path` before reaching this function, so it is never double-resolved
+/// here.
+///
+/// See spec §10.12.11.
+fn resolve_site_entry<'a>(index: &'a PathIndex, with_slash: &str) -> Option<&'a PathEntry> {
+    // 1. Exact match. `with_slash` may itself be invalid (e.g. a trailing-slash
+    //    directory request); `ContentPath::new` rejects those, and the lookup
+    //    is simply skipped in favor of the fallback candidates below.
+    if let Ok(exact) = ContentPath::new(with_slash)
+        && let Some(entry) = index.get(&exact)
+    {
+        return Some(entry);
+    }
+
+    // Whether the request explicitly names a directory (trailing slash). The
+    // root `/` is never reached here — the caller maps it to `index_path` — so
+    // a trailing slash here always denotes a non-root directory request.
+    let is_directory_request = with_slash.ends_with('/');
+
+    // The directory base: the requested path with a single trailing slash
+    // removed. For a non-slash path this is the path itself.
+    let dir_base = with_slash.strip_suffix('/').unwrap_or(with_slash);
+
+    // 2. Extensionless `<path>.html`. Skipped for an explicit directory request
+    //    (trailing slash): a trailing slash names the directory, so the index
+    //    must win over a sibling `<dir>.html` — matching nginx/Apache. For a
+    //    non-slash request, `dir_base` is the path itself.
+    if !is_directory_request
+        && let Ok(html_candidate) = ContentPath::new(format!("{dir_base}.html"))
+        && let Some(entry) = index.get(&html_candidate)
+    {
+        return Some(entry);
+    }
+
+    // 3. Directory index `<dir>/index.html`.
+    if let Ok(index_candidate) = ContentPath::new(format!("{dir_base}/index.html"))
+        && let Some(entry) = index.get(&index_candidate)
+    {
+        return Some(entry);
+    }
+
+    None
+}
+
 /// Axum handler for `GET /scp/broadcast/<routing_id>/site/*path`.
 ///
 /// Resolves the path in the current deploy's `PathIndex`, fetches the blob,
@@ -2075,25 +2201,73 @@ pub async fn site_handler(
         return not_found_no_store();
     };
 
-    // Normalize path: prepend "/" if missing, map "/" to index_path.
-    let normalized_path = if site_path.is_empty() || site_path == "/" {
-        index_path
+    // Resolve the requested path to a path-index entry.
+    //
+    // The root request (empty path or `/`) maps directly to the configured
+    // `index_path` (no clean-URL fallback — it is already the directory index).
+    // Every other request goes through `resolve_site_entry`, which tries the
+    // exact path, then the extensionless `<path>.html`, then the directory
+    // index `<dir>/index.html`. Every candidate is validated via
+    // `ContentPath::new`, so traversal and other invalid forms never resolve.
+    let entry = if site_path.is_empty() || site_path == "/" {
+        let Some(entry) = deploy_state.index.get(&index_path) else {
+            return not_found_no_store();
+        };
+        entry
     } else {
         let with_slash = if site_path.starts_with('/') {
             site_path.clone()
         } else {
             format!("/{site_path}")
         };
-        match ContentPath::new(&with_slash) {
-            Ok(p) => p,
-            Err(_) => return not_found_no_store(),
-        }
+        let Some(entry) = resolve_site_entry(&deploy_state.index, &with_slash) else {
+            return not_found_no_store();
+        };
+        entry
     };
+    let blob_id = &entry.blob_id;
 
-    // Look up in path index.
-    let Some(blob_id) = deploy_state.index.get(&normalized_path) else {
-        return not_found_no_store();
-    };
+    // Conditional GET (pre-decrypt). Mutable assets carry an
+    // `"<deploy_id>:<content_hash>"` ETag; if the client revalidates with a
+    // matching `If-None-Match`, answer 304 BEFORE fetching and decrypting the
+    // blob (avoids a decryption-amplification vector). The content hash is
+    // captured in the path index at commit time, so this never decrypts.
+    //
+    // Gated on `!entry.immutable` to exactly reproduce the original
+    // post-decrypt behavior: immutable assets emit no revalidation ETag and
+    // were never 304'd here.
+    if !entry.immutable
+        && let Some(inm) = headers.get(axum::http::header::IF_NONE_MATCH)
+        && let Ok(inm_str) = inm.to_str()
+    {
+        let candidate_etag = format!("\"{}:{}\"", deploy_state.deploy_id, entry.content_hash);
+        if inm_str == candidate_etag {
+            // Reproduce the exact headers the 200/post-decrypt 304 path
+            // emits for a mutable asset: security headers + Content-Type +
+            // revalidate Cache-Control + ETag. Content-Type is captured in the
+            // path index at commit time so this never decrypts.
+            let mut resp_headers = site_security_headers(&csp_owned);
+            let content_type = entry
+                .content_type
+                .as_deref()
+                .unwrap_or("application/octet-stream");
+            if let Ok(val) = axum::http::HeaderValue::from_str(content_type) {
+                resp_headers.insert(axum::http::header::CONTENT_TYPE, val);
+            }
+            let revalidate_cache = match rule {
+                ProjectionRule::Public => "public, max-age=0, must-revalidate",
+                _ => "private, max-age=0, must-revalidate",
+            };
+            resp_headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static(revalidate_cache),
+            );
+            if let Ok(val) = axum::http::HeaderValue::from_str(&candidate_etag) {
+                resp_headers.insert(axum::http::header::ETAG, val);
+            }
+            return (StatusCode::NOT_MODIFIED, resp_headers).into_response();
+        }
+    }
 
     // Fetch blob from storage.
     let stored = match state.blob_storage.get(blob_id).await {
@@ -2383,6 +2557,34 @@ pub(crate) mod test_helpers {
             .unwrap();
         blob_id
     }
+
+    /// Builds a [`PathEntry`] for a stored `BroadcastContent`, capturing the
+    /// same `content_hash` (= `compute_etag(body)`) and `immutable` flag the
+    /// production commit path records. Use for site/integration tests so the
+    /// served `ETag` matches what a real deploy would emit.
+    pub fn entry_for(blob_id: [u8; 32], content: &BroadcastContent) -> PathEntry {
+        PathEntry {
+            blob_id,
+            content_hash: scp_core::context::broadcast_content::compute_etag(&content.body),
+            immutable: content.metadata.immutable,
+            content_type: content
+                .metadata
+                .content_type
+                .as_ref()
+                .map(|m| m.as_str().to_owned()),
+        }
+    }
+
+    /// Builds a [`PathEntry`] from a raw blob id for path-index plumbing tests
+    /// that do not exercise the HTTP serve path (no real content body).
+    pub fn entry_raw(blob_id: [u8; 32]) -> PathEntry {
+        PathEntry {
+            blob_id,
+            content_hash: String::new(),
+            immutable: false,
+            content_type: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2395,7 +2597,7 @@ mod tests {
     use super::*;
     use scp_core::crypto::sender_keys::{generate_broadcast_key, rotate_broadcast_key};
 
-    use super::test_helpers::test_seal;
+    use super::test_helpers::{entry_raw, test_seal};
 
     // -----------------------------------------------------------------------
     // Hex helpers
@@ -2623,6 +2825,7 @@ mod tests {
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
             hostname_index: RwLock::new(HashMap::new()),
+            default_site_routing_id: std::sync::RwLock::new(None),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
             #[cfg(feature = "quic")]
@@ -5720,7 +5923,7 @@ mod tests {
 
         let mut entries = HashMap::new();
         let path = ContentPath::new("/index.html").unwrap();
-        entries.insert(path.clone(), [0xAA; 32]);
+        entries.insert(path.clone(), entry_raw([0xAA; 32]));
 
         let count = ctx.commit_deploy("deploy-1".into(), entries);
         assert_eq!(count, 1);
@@ -5728,7 +5931,7 @@ mod tests {
         let guard = ctx.path_index.load();
         let state = guard.as_ref().as_ref().unwrap();
         assert_eq!(state.deploy_id, "deploy-1");
-        assert_eq!(*state.index.get(&path).unwrap(), [0xAA; 32]);
+        assert_eq!(state.index.get(&path).unwrap().blob_id, [0xAA; 32]);
     }
 
     #[test]
@@ -5746,7 +5949,7 @@ mod tests {
         let path = ContentPath::new("/index.html").unwrap();
         for i in 0..3 {
             let mut entries = HashMap::new();
-            entries.insert(path.clone(), [i; 32]);
+            entries.insert(path.clone(), entry_raw([i; 32]));
             ctx.commit_deploy(format!("deploy-{i}"), entries);
         }
 
@@ -5771,7 +5974,7 @@ mod tests {
         let path = ContentPath::new("/index.html").unwrap();
         for i in 0..5 {
             let mut entries = HashMap::new();
-            entries.insert(path.clone(), [i; 32]);
+            entries.insert(path.clone(), entry_raw([i; 32]));
             ctx.commit_deploy(format!("deploy-{i}"), entries);
         }
 
@@ -5794,11 +5997,11 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries1 = HashMap::new();
-        entries1.insert(path.clone(), [0x01; 32]);
+        entries1.insert(path.clone(), entry_raw([0x01; 32]));
         ctx.commit_deploy("deploy-1".into(), entries1);
 
         let mut entries2 = HashMap::new();
-        entries2.insert(path.clone(), [0x02; 32]);
+        entries2.insert(path.clone(), entry_raw([0x02; 32]));
         ctx.commit_deploy("deploy-2".into(), entries2);
 
         // Current is deploy-2. Rollback to deploy-1.
@@ -5807,7 +6010,7 @@ mod tests {
         let guard = ctx.path_index.load();
         let state = guard.as_ref().as_ref().unwrap();
         assert_eq!(state.deploy_id, "deploy-1");
-        assert_eq!(*state.index.get(&path).unwrap(), [0x01; 32]);
+        assert_eq!(state.index.get(&path).unwrap().blob_id, [0x01; 32]);
     }
 
     #[test]
@@ -5838,10 +6041,16 @@ mod tests {
                 DeployManifestEntry {
                     path: "/index.html".into(),
                     blob_id: hex_encode(&[0xAA; 32]),
+                    content_hash: String::new(),
+                    immutable: false,
+                    content_type: Some("text/html".into()),
                 },
                 DeployManifestEntry {
                     path: "/style.css".into(),
                     blob_id: hex_encode(&[0xBB; 32]),
+                    content_hash: String::new(),
+                    immutable: false,
+                    content_type: Some("text/css".into()),
                 },
             ],
         };
@@ -5852,6 +6061,22 @@ mod tests {
         let state = guard.as_ref().as_ref().unwrap();
         assert_eq!(state.deploy_id, "manifest-deploy");
         assert_eq!(state.index.len(), 2);
+        // content_type survives the manifest round-trip into the path index.
+        let index_path = ContentPath::new("/index.html").unwrap();
+        assert_eq!(
+            state
+                .index
+                .get(&index_path)
+                .unwrap()
+                .content_type
+                .as_deref(),
+            Some("text/html")
+        );
+        let css_path = ContentPath::new("/style.css").unwrap();
+        assert_eq!(
+            state.index.get(&css_path).unwrap().content_type.as_deref(),
+            Some("text/css")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5862,7 +6087,7 @@ mod tests {
         BROADCAST_CONTENT_VERSION, BroadcastContent, ContentMetadata, MimeType,
     };
 
-    use super::test_helpers::store_content_blob;
+    use super::test_helpers::{entry_for, store_content_blob};
 
     #[tokio::test]
     async fn site_returns_correct_content_type_and_body() {
@@ -5896,7 +6121,7 @@ mod tests {
         // Commit deploy.
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("deploy-1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -5929,6 +6154,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn site_handler_conditional_get_returns_304_before_decrypt() {
+        // A conditional GET whose If-None-Match matches the
+        // "<deploy_id>:<content_hash>" ETag must short-circuit to 304 BEFORE
+        // the handler fetches and decrypts the blob (decryption-amplification
+        // guard). The content_hash lives in the path index, captured at commit
+        // time, so the 304 needs no plaintext.
+        //
+        // Hermetic proof of "before decrypt": the PathEntry points at a
+        // blob_id that is ABSENT from blob storage. The fetch+decrypt path
+        // would therefore return 404 (Ok(None) -> not_found_no_store). If the
+        // handler still answers 304, it provably short-circuited before the
+        // storage fetch. Remove the early-304 block and this test fails (404).
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_ctx_304_before_decrypt";
+        let mut projected = ProjectedContext::new(context_id, key, BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "early304.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        // Empty storage on purpose: the matched blob does not exist.
+        let storage = InMemoryBlobStorage::new();
+
+        let deploy_id = "deploy-early304";
+        let content_hash =
+            scp_core::context::broadcast_content::compute_etag(b"<h1>cached body</h1>");
+        let absent_blob_id = [0x5A; 32];
+
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(
+            path,
+            PathEntry {
+                blob_id: absent_blob_id,
+                content_hash: content_hash.clone(),
+                immutable: false,
+                content_type: Some("text/html".into()),
+            },
+        );
+        projected.commit_deploy(deploy_id.into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        let etag_value = format!("\"{deploy_id}:{content_hash}\"");
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .header(axum::http::header::IF_NONE_MATCH, &etag_value)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Short-circuit before fetch+decrypt: 304, NOT 404.
+        assert_eq!(resp.status(), HttpStatus::NOT_MODIFIED);
+
+        // 304 carries the same revalidation headers as the 200/post-decrypt
+        // path: the matching ETag and a must-revalidate Cache-Control.
+        let headers = resp.headers().clone();
+        let etag = headers
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(etag, etag_value);
+        let cc = headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "public, max-age=0, must-revalidate");
+
+        // Full header parity with the served 200/post-decrypt-304 path: the
+        // early-304 emits the same Content-Type, captured in the path index at
+        // commit time, so the two 304 paths are byte-identical for a mutable
+        // asset.
+        let ct = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html");
+
+        // 304 has an empty body.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn site_handler_conditional_get_non_matching_falls_through_to_decrypt() {
+        // Counterpart to the early-304 proof: a NON-matching If-None-Match
+        // must NOT short-circuit. With the blob absent from storage, falling
+        // through to the fetch path yields 404 — proving the early-304 only
+        // fires on an exact ETag match.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_ctx_304_nomatch";
+        let mut projected = ProjectedContext::new(context_id, key, BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "nomatch304.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        let deploy_id = "deploy-nomatch";
+        let content_hash =
+            scp_core::context::broadcast_content::compute_etag(b"<h1>cached body</h1>");
+
+        let path = ContentPath::new("/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(
+            path,
+            PathEntry {
+                blob_id: [0x5A; 32],
+                content_hash,
+                immutable: false,
+                content_type: None,
+            },
+        );
+        projected.commit_deploy(deploy_id.into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        // A stale/wrong ETag (different deploy id) must not match.
+        let wrong_etag = format!("\"other-deploy:{}\"", "00".repeat(32));
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/index.html"))
+            .header(axum::http::header::IF_NONE_MATCH, &wrong_etag)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // No short-circuit: fetch path runs, blob absent -> 404.
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn site_returns_all_security_headers() {
         let key = generate_broadcast_key("did:dht:alice");
         let context_id = "site_headers_ctx";
@@ -5958,7 +6330,7 @@ mod tests {
 
         let path = ContentPath::new("/page.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("d-1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6044,7 +6416,7 @@ mod tests {
 
         let path = ContentPath::new("/assets/style.a1b2c3.css").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("d-2".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6118,7 +6490,7 @@ mod tests {
 
         let path = ContentPath::new("/assets/app.hash.js").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("gated-d1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6192,7 +6564,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("gated-d2".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6252,7 +6624,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("d-3".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6322,6 +6694,456 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(cc, "no-store");
+    }
+
+    // -----------------------------------------------------------------------
+    // Clean-URL fallback (§10.12.11): extensionless `<path>` -> `<path>.html`,
+    // directory `<dir>/` (or `<dir>`) -> `<dir>/index.html`. Standard
+    // static-host behavior; in-memory path-index only, no filesystem.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn site_extensionless_path_resolves_to_html() {
+        // Only `/white-paper.html` is deployed; a request for `/white-paper`
+        // (no extension) must resolve to it and serve it exactly.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_clean_html_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "clean-html.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/white-paper.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("d-clean-html".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>white paper</h1>".to_vec(),
+        };
+
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+
+        let path = ContentPath::new("/white-paper.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, entry_for(blob_id, &content));
+        projected.commit_deploy("d-clean-html".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        // Request WITHOUT the `.html` extension.
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/white-paper"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html");
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<h1>white paper</h1>");
+    }
+
+    #[tokio::test]
+    async fn site_extensionless_conditional_get_304_before_decrypt() {
+        // The pre-decrypt early-304 must work when the entry was reached via the
+        // clean-URL fallback (extensionless `/white-paper` -> `/white-paper.html`),
+        // not only on an exact-path match. The entry points at a blob that is
+        // ABSENT from storage: if the handler reached fetch+decrypt it would
+        // 404, so a 304 proves it short-circuited on the RESOLVED entry's
+        // content_hash before decrypting.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_clean_304_ctx";
+        let mut projected = ProjectedContext::new(context_id, key, BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "clean-304.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        // Empty storage on purpose: the matched blob does not exist.
+        let storage = InMemoryBlobStorage::new();
+
+        let deploy_id = "d-clean-304";
+        let content_hash = scp_core::context::broadcast_content::compute_etag(b"<h1>cached</h1>");
+        let absent_blob_id = [0x7C; 32];
+
+        // Only the `.html` form is in the index; the request omits the suffix.
+        let path = ContentPath::new("/white-paper.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(
+            path,
+            PathEntry {
+                blob_id: absent_blob_id,
+                content_hash: content_hash.clone(),
+                immutable: false,
+                content_type: Some("text/html".into()),
+            },
+        );
+        projected.commit_deploy(deploy_id.into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        let etag_value = format!("\"{deploy_id}:{content_hash}\"");
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/white-paper"))
+            .header(axum::http::header::IF_NONE_MATCH, &etag_value)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        // Short-circuit before fetch+decrypt of the absent blob: 304, not 404.
+        assert_eq!(resp.status(), HttpStatus::NOT_MODIFIED);
+
+        // The 304 carries the resolved entry's ETag and Content-Type.
+        let headers = resp.headers().clone();
+        assert_eq!(
+            headers
+                .get(axum::http::header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            etag_value,
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/html",
+        );
+    }
+
+    #[tokio::test]
+    async fn site_directory_request_resolves_to_index_html() {
+        // `/docs/index.html` is deployed; both `/docs/` (trailing slash) and
+        // `/docs` (bare) must resolve to it and serve it exactly.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_clean_dir_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "clean-dir.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/docs/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("d-clean-dir".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>docs index</h1>".to_vec(),
+        };
+
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+
+        let path = ContentPath::new("/docs/index.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, entry_for(blob_id, &content));
+        projected.commit_deploy("d-clean-dir".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+
+        // Trailing-slash directory request.
+        let req_slash = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/docs/"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_slash = router.clone().oneshot(req_slash).await.unwrap();
+        assert_eq!(resp_slash.status(), HttpStatus::OK);
+        let body_slash = resp_slash.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body_slash[..], b"<h1>docs index</h1>");
+
+        // Bare directory request (no trailing slash) resolves identically.
+        let req_bare = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/docs"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_bare = router.oneshot(req_bare).await.unwrap();
+        assert_eq!(resp_bare.status(), HttpStatus::OK);
+        let ct = resp_bare
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html");
+        let body_bare = resp_bare.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body_bare[..], b"<h1>docs index</h1>");
+    }
+
+    #[tokio::test]
+    async fn site_trailing_slash_prefers_index_over_sibling_html() {
+        // Both `/docs.html` and `/docs/index.html` are deployed. A trailing-slash
+        // request (`/docs/`) explicitly names the directory, so it must serve
+        // the directory index — NOT the sibling `/docs.html` — matching
+        // nginx/Apache. A bare request (`/docs`) still serves `/docs.html`.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_clean_slash_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "clean-slash.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Sibling `/docs.html`.
+        let sibling = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/docs.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("d-clean-slash".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>docs sibling html</h1>".to_vec(),
+        };
+        let sibling_blob = store_content_blob(&storage, routing_id, &key, &sibling).await;
+
+        // Directory index `/docs/index.html`.
+        let index_doc = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/docs/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("d-clean-slash".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>docs dir index</h1>".to_vec(),
+        };
+        let index_blob = store_content_blob(&storage, routing_id, &key, &index_doc).await;
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            ContentPath::new("/docs.html").unwrap(),
+            entry_for(sibling_blob, &sibling),
+        );
+        entries.insert(
+            ContentPath::new("/docs/index.html").unwrap(),
+            entry_for(index_blob, &index_doc),
+        );
+        projected.commit_deploy("d-clean-slash".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+
+        // Trailing-slash request resolves to the directory INDEX, not the
+        // sibling `/docs.html`.
+        let req_slash = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/docs/"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_slash = router.clone().oneshot(req_slash).await.unwrap();
+        assert_eq!(resp_slash.status(), HttpStatus::OK);
+        let body_slash = resp_slash.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body_slash[..], b"<h1>docs dir index</h1>");
+
+        // Bare (no trailing slash) request still serves the sibling `/docs.html`
+        // via the extensionless fallback — unchanged behavior.
+        let req_bare = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/docs"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_bare = router.oneshot(req_bare).await.unwrap();
+        assert_eq!(resp_bare.status(), HttpStatus::OK);
+        let body_bare = resp_bare.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body_bare[..], b"<h1>docs sibling html</h1>");
+    }
+
+    #[tokio::test]
+    async fn site_clean_url_genuinely_missing_still_404s() {
+        // A path with no exact, no `.html`, and no directory-index candidate in
+        // the index must still 404 (Cache-Control: no-store) — the fallback
+        // does not invent content.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_clean_miss_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "clean-miss.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Deploy ONE asset so the deploy is non-empty, but it does not match
+        // any candidate derived from the requested path.
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/white-paper.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("d-clean-miss".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>white paper</h1>".to_vec(),
+        };
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+        let path = ContentPath::new("/white-paper.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, entry_for(blob_id, &content));
+        projected.commit_deploy("d-clean-miss".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/totally-missing"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+        let cc = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cc, "no-store");
+    }
+
+    #[test]
+    fn resolve_site_entry_rejects_traversal_candidates() {
+        // The fallback derives candidates via `ContentPath::new`, which rejects
+        // `..` segments. A traversal-shaped request must never resolve to an
+        // index entry — even one that, decoded naively, could escape the mount.
+        let mut index: PathIndex = HashMap::new();
+        // A "secret" sibling the attacker would want to reach.
+        index.insert(
+            ContentPath::new("/secret.html").unwrap(),
+            entry_raw([0x11; 32]),
+        );
+        index.insert(
+            ContentPath::new("/index.html").unwrap(),
+            entry_raw([0x22; 32]),
+        );
+
+        // Traversal forms: each must yield None (no candidate validates).
+        for traversal in [
+            "/../secret",
+            "/../secret.html",
+            "/docs/../../secret",
+            "/..",
+            "/../",
+            "/a/../secret",
+        ] {
+            assert!(
+                resolve_site_entry(&index, traversal).is_none(),
+                "traversal candidate {traversal} must not resolve",
+            );
+        }
+
+        // Sanity: a legitimate extensionless request DOES resolve, proving the
+        // resolver is wired (the traversal rejections above are meaningful).
+        let resolved = resolve_site_entry(&index, "/secret").expect("clean URL resolves");
+        assert_eq!(resolved.blob_id, [0x11; 32]);
+    }
+
+    #[tokio::test]
+    async fn site_clean_url_traversal_request_404s() {
+        // End-to-end: a traversal-shaped request through the live handler must
+        // 404, never serving a sibling asset via the clean-URL fallback.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_clean_traversal_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "clean-traversal.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+        let content = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/secret.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("d-clean-traversal".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>secret</h1>".to_vec(),
+        };
+        let blob_id = store_content_blob(&storage, routing_id, &key, &content).await;
+        let path = ContentPath::new("/secret.html").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(path, entry_for(blob_id, &content));
+        projected.commit_deploy("d-clean-traversal".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+        // `%2e%2e` would be percent-decoded by axum; a literal `..` segment in
+        // the wildcard tail reaches the handler and must be rejected.
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/sub/../secret"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -6405,7 +7227,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries1 = HashMap::new();
-        entries1.insert(path.clone(), blob_v1);
+        entries1.insert(path.clone(), entry_for(blob_v1, &content_v1));
         projected.commit_deploy("v1".into(), entries1);
 
         // Second deploy: /index.html -> "v2"
@@ -6423,7 +7245,7 @@ mod tests {
         let blob_v2 = store_content_blob(&storage, routing_id, &key, &content_v2).await;
 
         let mut entries2 = HashMap::new();
-        entries2.insert(path, blob_v2);
+        entries2.insert(path, entry_for(blob_v2, &content_v2));
         projected.commit_deploy("v2".into(), entries2);
 
         // Verify current deploy is v2.
@@ -6482,7 +7304,7 @@ mod tests {
         // Put this blob in the path index anyway.
         let path = ContentPath::new("/old-page.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_raw(blob_id));
         projected.commit_deploy("legacy-deploy".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6539,7 +7361,7 @@ mod tests {
         // Commit deploy.
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("deploy-e2e".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6675,8 +7497,8 @@ mod tests {
         let path_html = ContentPath::new("/index.html").unwrap();
         let path_css = ContentPath::new("/style.css").unwrap();
         let mut entries1 = HashMap::new();
-        entries1.insert(path_html.clone(), blob_v1_html);
-        entries1.insert(path_css.clone(), blob_v1_css);
+        entries1.insert(path_html.clone(), entry_for(blob_v1_html, &v1_html));
+        entries1.insert(path_css.clone(), entry_for(blob_v1_css, &v1_css));
         projected.commit_deploy("v1".into(), entries1);
 
         // Deploy v2: /index.html->"v2", /style.css->"v2-css"
@@ -6706,8 +7528,8 @@ mod tests {
         let blob_v2_css = store_content_blob(&storage, routing_id, &key, &v2_css).await;
 
         let mut entries2 = HashMap::new();
-        entries2.insert(path_html, blob_v2_html);
-        entries2.insert(path_css, blob_v2_css);
+        entries2.insert(path_html, entry_for(blob_v2_html, &v2_html));
+        entries2.insert(path_css, entry_for(blob_v2_css, &v2_css));
         projected.commit_deploy("v2".into(), entries2);
 
         // Verify both serve v2 (no mixed state) after atomic deploy switch.
@@ -6772,7 +7594,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries1 = HashMap::new();
-        entries1.insert(path.clone(), blob_v1);
+        entries1.insert(path.clone(), entry_for(blob_v1, &v1_content));
         projected.commit_deploy("v1".into(), entries1);
 
         // Deploy v2.
@@ -6790,7 +7612,7 @@ mod tests {
         let blob_v2 = store_content_blob(&storage, routing_id, &key, &v2_content).await;
 
         let mut entries2 = HashMap::new();
-        entries2.insert(path, blob_v2);
+        entries2.insert(path, entry_for(blob_v2, &v2_content));
         projected.commit_deploy("v2".into(), entries2);
 
         // Verify v2 is the current deploy.
@@ -6864,7 +7686,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("gated-d1".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6925,7 +7747,7 @@ mod tests {
 
         let path = ContentPath::new("/index.html").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path, blob_id);
+        entries.insert(path, entry_for(blob_id, &content));
         projected.commit_deploy("gated-d2".into(), entries);
 
         let mut projected_map = HashMap::new();
@@ -6998,8 +7820,8 @@ mod tests {
         let path_html = ContentPath::new("/index.html").unwrap();
         let path_css = ContentPath::new("/style.css").unwrap();
         let mut entries = HashMap::new();
-        entries.insert(path_html, blob_html);
-        entries.insert(path_css, blob_css);
+        entries.insert(path_html, entry_for(blob_html, &html_content));
+        entries.insert(path_css, entry_for(blob_css, &css_content));
         projected.commit_deploy("mfst-d1".into(), entries);
 
         // Extract the deploy manifest.
@@ -7009,10 +7831,28 @@ mod tests {
                 DeployManifestEntry {
                     path: "/index.html".into(),
                     blob_id: hex_encode(&blob_html),
+                    content_hash: scp_core::context::broadcast_content::compute_etag(
+                        &html_content.body,
+                    ),
+                    immutable: html_content.metadata.immutable,
+                    content_type: html_content
+                        .metadata
+                        .content_type
+                        .as_ref()
+                        .map(|m| m.as_str().to_owned()),
                 },
                 DeployManifestEntry {
                     path: "/style.css".into(),
                     blob_id: hex_encode(&blob_css),
+                    content_hash: scp_core::context::broadcast_content::compute_etag(
+                        &css_content.body,
+                    ),
+                    immutable: css_content.metadata.immutable,
+                    content_type: css_content
+                        .metadata
+                        .content_type
+                        .as_ref()
+                        .map(|m| m.as_str().to_owned()),
                 },
             ],
         };
@@ -7218,7 +8058,7 @@ mod tests {
         state: &Arc<NodeState>,
         routing_id: [u8; 32],
         deploy_id: &str,
-        entries: HashMap<ContentPath, [u8; 32]>,
+        entries: HashMap<ContentPath, PathEntry>,
     ) -> usize {
         let mut guard = state.projected_contexts.write().await;
         let ctx = guard.get_mut(&routing_id).unwrap();
@@ -7274,8 +8114,14 @@ mod tests {
         let v1_html_id = store_content_blob(&storage, routing_id, &key, &v1_html).await;
         let v1_css_id = store_content_blob(&storage, routing_id, &key, &v1_css).await;
         let mut e1 = HashMap::new();
-        e1.insert(ContentPath::new("/index.html").unwrap(), v1_html_id);
-        e1.insert(ContentPath::new("/style.css").unwrap(), v1_css_id);
+        e1.insert(
+            ContentPath::new("/index.html").unwrap(),
+            entry_for(v1_html_id, &v1_html),
+        );
+        e1.insert(
+            ContentPath::new("/style.css").unwrap(),
+            entry_for(v1_css_id, &v1_css),
+        );
         assert_eq!(projected.commit_deploy("deploy-v1".into(), e1), 2);
 
         let mut pm = HashMap::new();
@@ -7313,8 +8159,14 @@ mod tests {
         let v2_html = make_content("/index.html", "text/html", "deploy-v2", b"<h1>V2</h1>");
         let v2_html_id = store_content_blob(&storage, routing_id, &key, &v2_html).await;
         let mut e2 = HashMap::new();
-        e2.insert(ContentPath::new("/index.html").unwrap(), v2_html_id);
-        e2.insert(ContentPath::new("/style.css").unwrap(), v1_css_id);
+        e2.insert(
+            ContentPath::new("/index.html").unwrap(),
+            entry_for(v2_html_id, &v2_html),
+        );
+        e2.insert(
+            ContentPath::new("/style.css").unwrap(),
+            entry_for(v1_css_id, &v1_css),
+        );
         assert_eq!(
             commit_via_state(&state, routing_id, "deploy-v2", e2).await,
             2
@@ -7377,7 +8229,10 @@ mod tests {
         let v1 = make_content("/index.html", "text/html", "gated-v1", b"<h1>Gated V1</h1>");
         let v1_id = store_content_blob(&storage, routing_id, &key, &v1).await;
         let mut e1 = HashMap::new();
-        e1.insert(ContentPath::new("/index.html").unwrap(), v1_id);
+        e1.insert(
+            ContentPath::new("/index.html").unwrap(),
+            entry_for(v1_id, &v1),
+        );
         assert_eq!(projected.commit_deploy("gated-v1".into(), e1), 1);
 
         let mut pm = HashMap::new();
@@ -7412,7 +8267,10 @@ mod tests {
         let v2 = make_content("/index.html", "text/html", "gated-v2", b"<h1>Gated V2</h1>");
         let v2_id = store_content_blob(&storage, routing_id, &key, &v2).await;
         let mut e2 = HashMap::new();
-        e2.insert(ContentPath::new("/index.html").unwrap(), v2_id);
+        e2.insert(
+            ContentPath::new("/index.html").unwrap(),
+            entry_for(v2_id, &v2),
+        );
         commit_via_state(&state, routing_id, "gated-v2", e2).await;
 
         // Verify v2.

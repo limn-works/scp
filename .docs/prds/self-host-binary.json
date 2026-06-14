@@ -1,0 +1,292 @@
+{
+  "project": "scp",
+  "description": "A `--self-host` run mode for the `scp-node` reference binary that selects the already-specced `no_domain()` deployment path (NAT-PMP/UPnP port mapping + STUN + did:dht publish + broadcast site projection) so an operator can host a static website behind a cone NAT with no manual port-forward and no domain. The mechanism is fully specified (§10.12 reachability tiers, §10.12.8 ApplicationNode Integration, §18.6 ApplicationNode, §18.11.12 SiteConfig) and implemented (ApplicationNodeBuilder::no_domain, enable_broadcast_projection_with_site, commit_deploy). This PRD wires that mechanism into the shipped binary as an opt-in run mode and proves it end to end.",
+  "gates": [
+    {
+      "id": "gate-self-host-1",
+      "name": "Self-Host Binary Run Mode",
+      "priority": "P1",
+      "status": "done",
+      "stories": [
+        "SHB-001",
+        "SHB-002",
+        "SHB-003",
+        "SHB-004",
+        "SHB-005",
+        "SHB-006"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SHB-001",
+      "title": "Add --self-host flag and SCP_NODE_SELF_HOST env selection (opt-in, non-default upnp feature)",
+      "gate": "gate-self-host-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "done",
+      "files": [
+        "crates/scp-node/src/main.rs",
+        "crates/scp-node/Cargo.toml"
+      ],
+      "description": "The shipped `scp-node` binary mandates `SCP_NODE_DOMAIN` and always takes the `.domain()` path (`crates/scp-node/src/main.rs`), so the binary itself never calls `no_domain()` and does no NAT traversal. This story adds an opt-in self-host run mode: a `--self-host` CLI flag and a `SCP_NODE_SELF_HOST` environment variable that select the `.no_domain()` deployment path described in §10.12.8 ('Behavior when `.no_domain()` is set') and the `--self-host` website surface specified in §10.12.11. Self-host mode MUST be opt-in only — never selected by default; when neither the flag nor the env var is set the binary keeps its existing domain behavior unchanged. A `--site-dir <PATH>` override is also parsed for use by SHB-003. NAT port-mapping (Tier 1) depends on the `upnp` cargo feature, which MUST remain non-default (`upnp = [\"scp-transport/upnp\"]` is already declared in `crates/scp-node/Cargo.toml` and absent from `[features].default`); this story only verifies that invariant and does not change defaults. This is the entry-point selection story; the Supervisor/relay wiring is SHB-002, payload publication is SHB-003.",
+      "acceptanceCriteria": [
+        "main.rs prints a `--self-host` line in its usage/help text: CI command `grep -q -- '--self-host' crates/scp-node/src/main.rs` returns true (the line is emitted by `print_help`)",
+        "main.rs reads `SCP_NODE_SELF_HOST`: when set to `1` and no `--self-host` flag is passed, self-host mode is selected (test `cli_self_host_env_selects_self_host_mode` asserts the parsed CliConfig self_host field is true)",
+        "main.rs `--self-host` flag selects self-host mode regardless of env (test `cli_self_host_flag_selects_self_host_mode` asserts the parsed CliConfig self_host field is true)",
+        "Self-host mode is opt-in: when neither `--self-host` nor `SCP_NODE_SELF_HOST` is set, the parsed CliConfig self_host field is false (test `cli_defaults_to_not_self_host`)",
+        "Self-host mode does NOT require `SCP_NODE_DOMAIN`: test `cli_self_host_does_not_require_domain` parses CliConfig from args `[\"--self-host\"]` with no domain env and asserts self-host mode is selected without a missing-domain error",
+        "main.rs parses `--site-dir <PATH>` into the CliConfig site_dir field: test `cli_site_dir_argument_is_parsed` asserts the path is captured",
+        "main.rs parses `--storage-path <PATH>` overriding `SCP_STORAGE_PATH` (test `cli_storage_path_argument_overrides_env`) and env fallbacks apply when the argument is absent (test `cli_env_fallbacks_apply_when_no_argument`)",
+        "The `[features]` `default` list does NOT contain `upnp` (CI command: `grep -A2 '^default' crates/scp-node/Cargo.toml | grep -qv upnp`)",
+        "`grep -q 'upnp = \\[\"scp-transport/upnp\"\\]' crates/scp-node/Cargo.toml` confirms the non-default `upnp` feature is declared"
+      ],
+      "actionItems": [
+        "Add `self_host: bool` and `site_dir: Option<PathBuf>` fields to CliConfig in main.rs",
+        "Parse `--self-host` flag and `SCP_NODE_SELF_HOST` env var (flag OR env selects the mode)",
+        "Parse `--site-dir <PATH>` argument into site_dir",
+        "Add `--self-host`, `--site-dir`, and `SCP_NODE_SELF_HOST` lines to the printed usage/help text",
+        "Make the domain requirement conditional: domain is only mandated on the non-self-host path",
+        "Add tests: cli_self_host_flag_selects_self_host_mode, cli_self_host_env_selects_self_host_mode, cli_defaults_to_not_self_host, cli_self_host_does_not_require_domain, cli_site_dir_argument_is_parsed, cli_storage_path_argument_overrides_env, cli_env_fallbacks_apply_when_no_argument"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.8 ApplicationNode Integration"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.11 Self-Hosted Website Surface"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-032: Addressability and Deployment"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SHB-002",
+      "title": "Run an in-process Supervisor on a loopback relay for the self-host publish path",
+      "gate": "gate-self-host-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "done",
+      "files": [
+        "crates/scp-node/src/main.rs",
+        "crates/scp-node/src/self_host.rs"
+      ],
+      "description": "Self-host mode must publish broadcast site assets and then project them. The publish path requires a protocol participant (a Supervisor / ContextManager) connected to a relay so that `BroadcastContent` assets can be PUBLISHed before `commit_deploy` projects them. This story builds the self-host run path: construct an `ApplicationNode` via `ApplicationNodeBuilder::no_domain()` (per §10.12.8, §10.12.11) AND an in-process Supervisor connected to the node's own loopback relay (`ws://127.0.0.1:<relay_port>/scp/v1`, `RelayUrlSource::DhtResolved`, authenticated with the node's bridge bearer token; `connect_loopback_supervisor` in `crates/scp-node/src/self_host.rs`). The Supervisor publishes sealed `BroadcastContent` envelopes onto that relay's blob storage and `commit_deploy` scans the same relay's blob storage — communication is via the loopback relay, NOT a directly-shared `Arc` blob backend between Supervisor and node. This closes the publish -> commit_deploy loop. Asset publication and projection activation are SHB-003; this story is the runtime wiring (no_domain node + loopback-relay-connected Supervisor) only.",
+      "acceptanceCriteria": [
+        "Self-host run path constructs the node via `ApplicationNodeBuilder::no_domain()`: `grep -q 'no_domain()' crates/scp-node/src/main.rs` returns true on the self-host code path",
+        "Self-host run path constructs an in-process Supervisor connected to the node's own loopback relay: test `self_host_uses_selfhost_surface_and_loopback_relay` asserts the self-host surface is selected and the Supervisor publishes via a `127.0.0.1` loopback relay URL",
+        "Behind a tunnel/proxy (`SCP_NODE_SELF_HOST_NO_NAT=1`), the loopback relay URL is used without running the STUN probe: test `skip_nat_probe_uses_loopback_relay_url_without_probing` asserts the loopback relay URL is bound and no NAT probe is performed",
+        "Self-host run path does NOT call `.domain()` or provision ACME TLS: test `self_host_no_domain_skips_acme` asserts no ACME/domain TLS provisioning is invoked on the self-host path",
+        "End-to-end publish -> commit -> serve through the loopback relay succeeds: test `self_host_shares_single_root_storage_handle_and_serves` publishes assets through the Supervisor over the loopback relay and asserts the node serves them (proving the publish->commit_deploy loop closes over one shared root storage handle)"
+      ],
+      "actionItems": [
+        "Add a `run_self_host` function in main.rs guarded by the self_host CliConfig field",
+        "Build the ApplicationNode with `ApplicationNodeBuilder::no_domain()`",
+        "Construct an in-process Supervisor/ContextManager connected to the node's loopback relay (bridge-bearer-authenticated) in `self_host.rs`",
+        "Add tests: self_host_uses_selfhost_surface_and_loopback_relay, skip_nat_probe_uses_loopback_relay_url_without_probing, self_host_no_domain_skips_acme, self_host_shares_single_root_storage_handle_and_serves"
+      ],
+      "blockedBy": [
+        "SHB-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.8 ApplicationNode Integration"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.11 Self-Hosted Website Surface"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.6 Application Node"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-035: Local HTTP Control API and Broadcast Projection"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SHB-003",
+      "title": "Publish embedded/--site-dir static payload as BroadcastContent assets and project the site",
+      "gate": "gate-self-host-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "done",
+      "files": [
+        "crates/scp-node/src/main.rs",
+        "crates/scp-node/src/self_host.rs",
+        "crates/scp-node/assets/selfhost/index.html",
+        "crates/scp-node/assets/selfhost/style.css",
+        "crates/scp-node/assets/selfhost/app.js"
+      ],
+      "description": "With the publish path open (SHB-002), self-host mode must take a static payload, publish each asset as a `BroadcastContent` message, enable site projection, and commit a deploy so the node serves the site over HTTP (§10.12.11 website surface, §18.11.12 SiteConfig, ADR-042 broadcast content delivery). The default payload is embedded from `crates/scp-node/assets/selfhost/` (`index.html`, `style.css`, `app.js` already exist) via `include_str!` in `crates/scp-node/src/self_host.rs` (`embedded_assets()`); `--site-dir <PATH>` (parsed in SHB-001) overrides the default to read assets from disk (`load_self_host_assets` in `crates/scp-node/src/main.rs`). The run path creates a broadcast context, publishes each asset via the Supervisor, calls `enable_broadcast_projection_with_site` (in `crates/scp-node/src/self_host.rs`) with a `SiteConfig`, and calls `commit_deploy` to build the immutable `path -> blob_id` index. Per §18.11.12, `index_path` defaults to `/index.html`.",
+      "acceptanceCriteria": [
+        "Default payload is embedded from `crates/scp-node/assets/selfhost/`: CI command `grep -q \"include_str!(\\\"../assets/selfhost/index.html\\\")\" crates/scp-node/src/self_host.rs` returns true (embedded via `EMBEDDED_INDEX_HTML`/`EMBEDDED_STYLE_CSS`/`EMBEDDED_APP_JS` and exposed by `embedded_assets()`)",
+        "`--site-dir <PATH>` overrides the embedded payload by reading assets from disk: `grep -q 'fn load_self_host_assets' crates/scp-node/src/main.rs` returns true and the function reads from `site_dir` when `Some` (requiring a root `index.html`); the `--site-dir` argument parse is covered by test `cli_site_dir_argument_is_parsed`",
+        "Each asset is published as a BroadcastContent message via the Supervisor: `grep -q 'fn publish_assets' crates/scp-node/src/self_host.rs` returns true and the loop publishes one sealed BroadcastContent per asset; end-to-end publication is exercised by integration test `self_host_deploys_embedded_site_and_serves_index_over_http`",
+        "Site projection is enabled via `enable_broadcast_projection_with_site` with a non-None SiteConfig: `grep -q 'enable_broadcast_projection_with_site' crates/scp-node/src/self_host.rs` returns true",
+        "`commit_deploy` builds a path index containing `/index.html` that is served: integration test `self_host_deploys_embedded_site_and_serves_index_over_http` GETs `/index.html` and asserts HTTP 200, and projection unit test `load_manifest_rebuilds_index` asserts the committed manifest index is rebuilt",
+        "SiteConfig index_path defaults to `/index.html` per §18.11.12: `grep -q 'ContentPath::new(\"/index.html\")' crates/scp-node/src/self_host.rs` returns true (the self-host `SiteConfig` sets `index_path` to `/index.html`)"
+      ],
+      "actionItems": [
+        "Embed `assets/selfhost/{index.html,style.css,app.js}` via `include_str!` in self_host.rs (`embedded_assets()`)",
+        "When site_dir is Some, read assets from disk instead of the embedded defaults (`load_self_host_assets` in main.rs)",
+        "Create a broadcast context and publish each asset as a BroadcastContent message via the Supervisor (`publish_assets`)",
+        "Call `enable_broadcast_projection_with_site` with a SiteConfig (index_path `/index.html`)",
+        "Call `commit_deploy` to build and swap in the path index",
+        "Cover with tests: cli_site_dir_argument_is_parsed, self_host_deploys_embedded_site_and_serves_index_over_http, load_manifest_rebuilds_index"
+      ],
+      "blockedBy": [
+        "SHB-002"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.11 Self-Hosted Website Surface"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.12 Site Configuration"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SHB-004",
+      "title": "Loud opt-in startup disclosure of public-port exposure, IP-DID linkage, and self-signed-cert posture",
+      "gate": "gate-self-host-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "done",
+      "files": [
+        "crates/scp-node/src/main.rs"
+      ],
+      "description": "Self-host mode opens the node's public HTTP port to the internet via NAT port-mapping and publishes the operator's residential IP into the DHT-stored DID document (§10.12.9 'Residential IP exposure in DID document'). The website surface serves self-signed HTTPS (TLS 1.3) by default per §10.12.11 ('Transport security (website surface)'), with plaintext as an explicit opt-out via `SCP_NODE_SELF_HOST_PLAINTEXT=1` ('Plaintext opt-out'). The operator must be made explicitly aware. On startup of self-host mode, the binary MUST emit a loud, legible banner (`self_host_banner` in `crates/scp-node/src/main.rs`) stating: (1) a public TCP port is being opened to the internet; (2) the operator's IP becomes publicly bound to their DID (an IP<->identity dox published to the Mainline DHT); (3) the transport posture — self-signed HTTPS with a one-time untrusted-certificate warning and no CA by default, OR plaintext HTTP when `SCP_NODE_SELF_HOST_PLAINTEXT=1` is set. The disclosure is gated to self-host mode only and never printed on the default domain path.",
+      "acceptanceCriteria": [
+        "Self-host startup banner names public-port exposure: test `self_host_banner_states_disclosures` asserts the banner string contains the bound public port and the phrase `PUBLIC INTERNET`",
+        "Banner names the IP<->DID/identity linkage and DHT publication: test `self_host_banner_states_disclosures` asserts the banner references `PUBLIC IP`, `DHT`, and `IP<->identity`",
+        "Banner discloses the self-signed-cert (no-CA) posture by default: test `self_host_banner_states_disclosures` asserts the HTTPS-default banner contains `self-signed HTTPS` and does NOT contain `PLAINTEXT HTTP`",
+        "Banner discloses the plaintext opt-out when selected: test `self_host_banner_states_disclosures` asserts the plaintext banner contains `PLAINTEXT HTTP` and names `SCP_NODE_SELF_HOST_PLAINTEXT`",
+        "The banner helper is emitted at startup of the self-host run path before the NAT mapping is opened: CI command `grep -q 'fn self_host_banner' crates/scp-node/src/main.rs` returns true and `run_self_host` emits the banner prior to NAT/port-mapping in main.rs"
+      ],
+      "actionItems": [
+        "Add a `self_host_banner(port, plaintext) -> String` helper in main.rs covering port exposure, IP<->identity/DHT linkage, and the self-signed-HTTPS-by-default vs plaintext-opt-out transport posture",
+        "Emit the banner via `tracing::warn!`/`eprintln!` at the start of the self-host run path, before NAT mapping",
+        "Gate the banner to self-host mode only (never on the default domain path)",
+        "Add test: self_host_banner_states_disclosures (covers public port, public-internet exposure, IP<->identity/DHT dox, self-signed-HTTPS default, and plaintext opt-out)"
+      ],
+      "blockedBy": [
+        "SHB-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.11 Self-Hosted Website Surface"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.9 Threat Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SHB-005",
+      "title": "Release the NAT mapping on shutdown and keep dev/bridge endpoints loopback-only",
+      "gate": "gate-self-host-1",
+      "priority": "P1",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "crates/scp-node/src/main.rs",
+        "crates/scp-node/src/dev_api.rs"
+      ],
+      "description": "Self-host mode opens an inbound NAT port mapping (§10.12.2). On clean shutdown the mapping MUST be released so the operator's router does not retain a stale public forward after the process exits (`release_self_host_mappings` in `crates/scp-node/src/main.rs` removes the mapping on each mapper); when no mapper is present (the non-`upnp` build) the release is a safe no-op. Separately, the node's dev/control and bridge endpoints MUST NOT be exposed to the public internet by self-host mode: the dev API restricts itself to loopback hosts (`dev_api::ALLOWED_HOSTS = [\"localhost\", \"127.0.0.1\", \"[::1]\"]`), and the self-host public surface (§10.12.11 'Origin-root mount') never mounts the relay upgrade (`/scp/v1`) or bridge routes (`/v1/scp/bridge/*`). This is the teardown + endpoint-exposure hardening story.",
+      "acceptanceCriteria": [
+        "On clean shutdown the self-host path releases the port mapping on every mapper: test `release_self_host_mappings_removes_mapping_on_both_mappers` asserts both the UPnP and NAT-PMP mappers' remove is invoked for the served port (via recording mappers)",
+        "When no mapper is present (non-`upnp` build, both handles `None`), the release is a clean no-op: test `release_self_host_mappings_noop_when_no_mappers` completes without panicking",
+        "`grep -q 'ALLOWED_HOSTS' crates/scp-node/src/dev_api.rs` confirms the loopback-only host allowlist (`[\"localhost\", \"127.0.0.1\", \"[::1]\"]`) is enforced for the dev API",
+        "Self-host mode does NOT expose the relay/bridge endpoints on the public surface: test `self_host_public_surface_excludes_relay_and_bridge` asserts over a real bound listener that the site route serves while `/scp/v1` and `/v1/scp/bridge/*` are NOT routed (fall through to 404)"
+      ],
+      "actionItems": [
+        "Hold the PortMapper handles from the no_domain build and release the mapping in the self-host shutdown sequence (`release_self_host_mappings`)",
+        "Make release a safe no-op when no mapper is present (non-upnp build)",
+        "Keep the dev API bind loopback-only under self-host mode (`ALLOWED_HOSTS`)",
+        "Ensure the self-host public surface does not mount the relay upgrade or bridge routes",
+        "Add tests: release_self_host_mappings_removes_mapping_on_both_mappers, release_self_host_mappings_noop_when_no_mappers, self_host_public_surface_excludes_relay_and_bridge"
+      ],
+      "blockedBy": [
+        "SHB-002"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.2 Tier 1: UPnP/NAT-PMP Port Mapping"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.11 Self-Hosted Website Surface"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SHB-006",
+      "title": "Integration test: in-process publish -> commit -> HTTP GET serves the site",
+      "gate": "gate-self-host-1",
+      "priority": "P1",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "crates/scp-node/tests/self_host.rs"
+      ],
+      "description": "End-to-end proof that self-host mode serves a real site without any external network. An integration test stands up the self-host run path entirely in-process (no-domain node on real encrypted SQLite storage + loopback relay + Supervisor, no NAT mapping required), publishes the embedded payload, enables projection, commits a deploy, then performs an HTTP GET against the node's loopback HTTP server at the site route and asserts the served plaintext bytes equal the published `index.html`. This is the acceptance gate for the whole feature: it exercises SHB-002 (publish path), SHB-003 (asset publication + projection), and confirms the served output (ADR-042 broadcast content delivery, §18.11.12 SiteConfig, §10.12.11 website surface).",
+      "acceptanceCriteria": [
+        "Test file `crates/scp-node/tests/self_host.rs` exists and is exercised by `cargo test -p scp-node --test self_host`",
+        "Test `self_host_deploys_embedded_site_and_serves_index_over_http` stands up the in-process self-host path (no-domain node on SQLite storage + loopback relay + Supervisor), publishes the embedded payload, enables projection, and commits a deploy",
+        "Test performs an HTTP GET against the node's loopback site route for `/index.html` and asserts HTTP 200",
+        "Test asserts the served response body bytes equal the published `index.html` bytes (plaintext, server-side decrypted)",
+        "Test asserts the served `Content-Type` for `/index.html` is `text/html`",
+        "`DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test -p scp-node --test self_host self_host_deploys_embedded_site_and_serves_index_over_http` passes"
+      ],
+      "actionItems": [
+        "Add the integration test to `crates/scp-node/tests/self_host.rs`",
+        "Build the in-process self-host path (no-domain node on SQLite storage, loopback relay, Supervisor)",
+        "Publish embedded assets, enable projection with SiteConfig, commit_deploy",
+        "GET the loopback site route for `/index.html`, assert 200 + body equals published bytes + Content-Type text/html",
+        "Add test self_host_deploys_embedded_site_and_serves_index_over_http"
+      ],
+      "blockedBy": [
+        "SHB-003"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.11 Self-Hosted Website Surface"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.12 Site Configuration"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-042: Broadcast Content Delivery"
+        }
+      ],
+      "details": {}
+    }
+  ]
+}

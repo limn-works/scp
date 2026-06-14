@@ -642,6 +642,7 @@ mod tests {
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
             hostname_index: RwLock::new(HashMap::new()),
+            default_site_routing_id: std::sync::RwLock::new(None),
             bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
             bridge_lookup: None,
             #[cfg(feature = "quic")]

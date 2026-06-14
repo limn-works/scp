@@ -1,6 +1,6 @@
 //! SCP application node binary.
 //!
-//! Three modes of operation:
+//! Four modes of operation:
 //!
 //! 1. **Full node** (default): Starts an [`ApplicationNode`] with DID identity,
 //!    relay, and HTTP server (`.well-known/scp` + WebSocket upgrade). Uses
@@ -9,6 +9,10 @@
 //!    to the standalone `scp-relay` binary.
 //! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
 //!    subsystems — nothing persists across restarts.
+//! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
+//!    (`no_domain` mode) — opens an inbound public port, publishes the host's
+//!    IP to the DHT, and serves the site over self-signed HTTPS by default
+//!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP).
 //!
 //! Configuration is read from CLI flags and environment variables.
 
@@ -48,6 +52,11 @@ struct CliConfig {
     ephemeral: bool,
     /// Path to the `SQLite` database directory. `None` = use default XDG path.
     storage_path: Option<PathBuf>,
+    /// Run in self-host mode: host the static site entirely on SCP.
+    self_host: bool,
+    /// Directory of static site files to host (self-host mode). `None` = use
+    /// the embedded default site.
+    site_dir: Option<PathBuf>,
     /// Show help text and exit.
     show_help: bool,
 }
@@ -63,23 +72,61 @@ struct CliConfig {
 fn parse_args() -> CliConfig {
     let args: Vec<String> = env::args().collect();
 
+    // Resolve the environment-derived inputs once, here, so the arg/env merge
+    // itself lives in the pure `parse_cli_from` (unit-testable without touching
+    // the process-global environment).
+    let self_host_env = env_flag_is_truthy(env::var("SCP_NODE_SELF_HOST").ok().as_deref());
+    let storage_env = env::var("SCP_STORAGE_PATH").ok().map(PathBuf::from);
+    let site_env = env::var("SCP_NODE_SITE_DIR").ok().map(PathBuf::from);
+
+    parse_cli_from(&args, self_host_env, storage_env, site_env)
+}
+
+/// Pure CLI parsing over an explicit args slice plus the already-resolved
+/// environment-derived inputs, so the selection/merge logic is unit-testable
+/// without mutating the process-global environment (`std::env::set_var` is
+/// `unsafe` under edition 2024 and process-global, which makes env-based tests
+/// flaky under parallel execution).
+///
+/// `self_host_env` is the resolved `SCP_NODE_SELF_HOST` flag; `storage_env` /
+/// `site_env` are the resolved `SCP_STORAGE_PATH` / `SCP_NODE_SITE_DIR` values.
+/// CLI arguments take precedence over the environment fallbacks, matching the
+/// production resolution order. This is a behavior-preserving extraction of the
+/// body [`parse_args`] used to run inline.
+fn parse_cli_from(
+    args: &[String],
+    self_host_env: bool,
+    storage_env: Option<PathBuf>,
+    site_env: Option<PathBuf>,
+) -> CliConfig {
     let relay_only = args.iter().any(|a| a == "--relay-only");
     let health = args.iter().any(|a| a == "--health");
     let ephemeral = args.iter().any(|a| a == "--ephemeral");
     let show_help = args.iter().any(|a| a == "--help" || a == "-h");
+
+    let self_host = args.iter().any(|a| a == "--self-host") || self_host_env;
 
     let storage_path = args
         .iter()
         .position(|a| a == "--storage-path")
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
-        .or_else(|| env::var("SCP_STORAGE_PATH").ok().map(PathBuf::from));
+        .or(storage_env);
+
+    let site_dir = args
+        .iter()
+        .position(|a| a == "--site-dir")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+        .or(site_env);
 
     CliConfig {
         relay_only,
         health,
         ephemeral,
         storage_path,
+        self_host,
+        site_dir,
         show_help,
     }
 }
@@ -96,13 +143,33 @@ USAGE:
 OPTIONS:
     --relay-only            Run as a bare relay server only (no identity, no HTTP)
     --ephemeral             Use in-memory storage for all subsystems (no persistence)
+    --self-host             Host a static site entirely on SCP (no_domain mode).
+                            Opens an inbound port to the PUBLIC INTERNET and
+                            publishes the host's IP to the DHT.
+                            Self-signed HTTPS by default (SCP_NODE_SELF_HOST_PLAINTEXT=1
+                            for plain HTTP). See the loud startup banner for the full warning.
+    --site-dir <PATH>       Directory of static files to host in --self-host mode
+                            (must contain index.html). Default: embedded site.
+                            Also configurable via SCP_NODE_SITE_DIR env var
     --storage-path <PATH>   SQLite database directory (default: $XDG_DATA_HOME/scp/node)
                             Also configurable via SCP_STORAGE_PATH env var
     --health                TCP health probe (exit 0 on success, 1 on failure)
     --help, -h              Show this help message
 
 ENVIRONMENT VARIABLES:
-    SCP_NODE_DOMAIN             Domain for full node mode (required unless --relay-only)
+    SCP_NODE_DOMAIN             Domain for full node mode (required unless --relay-only
+                               or --self-host)
+    SCP_NODE_SELF_HOST         Set to '1' to enable self-host mode (same as --self-host)
+    SCP_NODE_SITE_DIR          Static site directory for self-host mode (same as --site-dir)
+    SCP_NODE_SELF_HOST_PORT    HTTP/site port for self-host mode (default: 8443)
+    SCP_NODE_SELF_HOST_PLAINTEXT  Set to '1' to serve plain HTTP instead of self-signed
+                                HTTPS in self-host mode (default: HTTPS). Traffic is then
+                                unencrypted.
+    SCP_NODE_SELF_HOST_NO_NAT  Set to '1' to skip NAT/UPnP port-probing in self-host mode
+                               (default: probe). Use behind a tunnel/proxy; binds a
+                               loopback relay URL.
+    SCP_NODE_SELF_HOST_REFRESH_SECS  Interval (seconds) between self-host site re-deploys
+                                to beat the blob TTL (default: 1800).
     SCP_NODE_BIND_ADDR          HTTP bind address (default: 0.0.0.0:9000)
     SCP_NODE_TLS_SELF_SIGNED    Set to '1' for self-signed TLS (development only)
     SCP_NODE_PROJECTION_RATE_LIMIT  Per-IP rate limit for projection endpoints (default: 60)
@@ -482,12 +549,21 @@ fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> Sqli
 
 /// Initializes storage path, encryption key, and `SQLite` databases for the
 /// persistent node. Returns `(storage_dir, storage_key, node_storage, custody)`.
+///
+/// The root `node_storage` is returned behind an `Arc` because it holds the
+/// process-exclusive advisory lock on `{dir}/scp.db.lock` for its lifetime, and
+/// that single handle is shared by every root-DB consumer (the BEP44 sequence
+/// store AND the `ApplicationNode` builder). Opening a second `SqliteStorage`
+/// against the same root directory while this one is alive fails with an
+/// advisory-lock conflict (os error 35) — see `SqliteStorage::new`. Sharing the
+/// one handle via `Arc::clone` (which implements [`Storage`]/[`EncryptedStorage`]
+/// through the blanket `Arc<T>` impls) keeps exactly one lock holder.
 async fn init_persistent_storage(
     storage_path: Option<&PathBuf>,
 ) -> (
     PathBuf,
     Zeroizing<[u8; 32]>,
-    SqliteStorage,
+    Arc<SqliteStorage>,
     Arc<SqliteKeyCustody>,
 ) {
     let storage_dir = resolve_storage_path(storage_path);
@@ -500,7 +576,7 @@ async fn init_persistent_storage(
         }
     };
 
-    let node_storage = open_sqlite_or_exit(&storage_dir, &storage_key);
+    let node_storage = Arc::new(open_sqlite_or_exit(&storage_dir, &storage_key));
     let custody_storage = open_sqlite_or_exit(&storage_dir.join("custody"), &storage_key);
 
     let custody = match SqliteKeyCustody::new(custody_storage).await {
@@ -565,7 +641,12 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     let resolved_path = resolve_storage_path(storage_path);
     validate_storage_path(&resolved_path);
 
-    let (storage_dir, storage_key, node_storage, custody) =
+    // The root storage key is intentionally unused beyond `init_persistent_storage`:
+    // the single root `SqliteStorage` handle it opens (held alive via
+    // `node_storage_arc`) is the ONLY root handle and is reused for both the BEP44
+    // sequence store and the node builder. Reopening the root DB while that handle
+    // is alive would fail with an advisory-lock conflict (os error 35).
+    let (storage_dir, _storage_key, node_storage_arc, custody) =
         init_persistent_storage(storage_path).await;
 
     tracing::info!(
@@ -576,7 +657,6 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
         "starting scp-node with SQLite storage (SQLCipher encrypted)"
     );
 
-    let node_storage_arc = Arc::new(node_storage);
     let cache = Arc::new(DidCache::new());
 
     // Use storage-backed sequence store for BEP44 sequence persistence.
@@ -585,49 +665,973 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
 
     let dht_mode = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
 
-    if dht_mode == "memory" {
-        tracing::warn!(
-            "using InMemoryDhtClient — DID documents will NOT be published to the network"
-        );
-        let dht_client = Arc::new(InMemoryDhtClient::new());
-        let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
-        let did_method = Arc::new(DidDht::with_client_signer_and_store(
-            dht_client,
-            cache,
-            sign_fn,
-            sequence_store,
-        ));
+    // Explicit match: a typo (e.g. "memroy") must NOT silently fall through to
+    // the production DHT, which would publish the host's address to the network.
+    match dht_mode.as_str() {
+        "memory" => {
+            tracing::warn!(
+                "using InMemoryDhtClient — DID documents will NOT be published to the network"
+            );
+            let (did_method, seq_init) =
+                build_memory_did_method(Arc::clone(&custody), cache, sequence_store);
+            // Reuse the single root handle (shared via `Arc`) rather than reopening,
+            // which would conflict on the advisory lock (os error 35).
+            run_node_with(
+                domain,
+                http_addr,
+                custody,
+                seq_init,
+                did_method,
+                Arc::clone(&node_storage_arc),
+            )
+            .await;
+        }
+        "production" => {
+            let (did_method, seq_init) =
+                build_production_did_method(Arc::clone(&custody), cache, sequence_store);
+            // Reuse the single root handle (shared via `Arc`) rather than reopening,
+            // which would conflict on the advisory lock (os error 35).
+            run_node_with(
+                domain,
+                http_addr,
+                custody,
+                seq_init,
+                did_method,
+                Arc::clone(&node_storage_arc),
+            )
+            .await;
+        }
+        other => {
+            tracing::error!(
+                value = %other,
+                "unrecognized SCP_NODE_DHT_MODE (expected 'memory' or 'production'); \
+                 refusing to default to production DHT to avoid unintended IP publication"
+            );
+            std::process::exit(1);
+        }
+    }
+}
 
-        let seq_init_method = Arc::clone(&did_method);
-        let seq_init = make_seq_init(seq_init_method);
-        let storage = open_sqlite_or_exit(&storage_dir, &storage_key);
-        run_node_with(domain, http_addr, custody, seq_init, did_method, storage).await;
-        return;
+// ---------------------------------------------------------------------------
+// Self-host mode (--self-host)
+// ---------------------------------------------------------------------------
+
+/// Derives a deterministic, hex-encoded broadcast context id for the
+/// self-hosted site from the node's DID.
+///
+/// `register_broadcast_context` requires the context id to be 1-64 lowercase
+/// hex characters, so we hash the DID with SHA-256 and hex-encode it (64 hex
+/// chars). The id is stable across restarts for a given identity, so the
+/// site's routing id (and thus its URL) is stable.
+fn self_host_context_id(node_did: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(node_did.as_bytes());
+    hex::encode(digest)
+}
+
+/// Default interval, in seconds, between self-host site re-deploys.
+///
+/// Site assets are published with a fixed 3600s blob TTL (`DEFAULT_BLOB_TTL`
+/// in the transport envelope builder), after which the relay's blob store
+/// treats them as expired and the projection 404s. Re-deploying on an interval
+/// well under that TTL keeps the site continuously reachable. 1800s (half the
+/// TTL) leaves ample margin for a slow or transiently-failing refresh to retry
+/// before the previous deploy's blobs expire. Configurable via
+/// `SCP_NODE_SELF_HOST_REFRESH_SECS`.
+const SELF_HOST_DEPLOY_REFRESH_SECS: u64 = 1800;
+
+/// RFC-1123 hostname placeholder for the self-host site projection.
+///
+/// Reachability is via the routing-id path (`/scp/broadcast/<rid>/site/...`),
+/// which ignores the `Host` header, so this value is a non-empty, valid
+/// placeholder only. It must not collide with the node's own domain — in
+/// no-domain mode there is none, so any valid hostname is safe.
+const SELF_HOST_HOSTNAME: &str = "selfhost.scp.local";
+
+/// An optionally-present NAT port mapper handle, retained for clean teardown.
+///
+/// `Some` only when the binary is built with the `upnp` feature; `None`
+/// otherwise (no router mapping is attempted, so there is nothing to release).
+type OptionalPortMapper = Option<Arc<dyn scp_transport::nat::PortMapper>>;
+
+/// Loads the site assets to publish.
+///
+/// When `site_dir` is `Some`, every file under it is read recursively and
+/// mapped to a site-absolute path (`<rel>` -> `/<rel>`), with content type
+/// inferred from the extension. An `index.html` at the directory root is
+/// required. User-supplied files are served verbatim (no DID injection).
+///
+/// When `site_dir` is `None`, the embedded default site is used and the node
+/// DID is injected into `index.html` as a `<meta name="scp-did">` tag.
+fn load_self_host_assets(
+    site_dir: Option<&PathBuf>,
+    node_did: &str,
+) -> Result<Vec<scp_node::Asset>, String> {
+    match site_dir {
+        None => Ok(scp_node::embedded_assets(Some(node_did))),
+        Some(dir) => {
+            let mut assets = Vec::new();
+            read_site_dir_recursive(dir, dir, &mut assets)?;
+            if assets.is_empty() {
+                return Err(format!(
+                    "site directory '{}' contains no files",
+                    dir.display()
+                ));
+            }
+            if !assets.iter().any(|a| a.path == "/index.html") {
+                return Err(format!(
+                    "site directory '{}' must contain an index.html at its root",
+                    dir.display()
+                ));
+            }
+            // Deterministic publish order for stable deploys.
+            assets.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(assets)
+        }
+    }
+}
+
+/// Recursively reads every file under `dir`, mapping each to an [`Asset`]
+/// whose path is site-absolute relative to `root`.
+///
+/// [`Asset`]: scp_node::Asset
+fn read_site_dir_recursive(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<scp_node::Asset>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read directory '{}': {e}", dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("failed to read entry in '{}': {e}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("failed to stat '{}': {e}", path.display()))?;
+        if file_type.is_dir() {
+            read_site_dir_recursive(root, &path, out)?;
+        } else if file_type.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| format!("path '{}' is not under site root: {e}", path.display()))?;
+            // Build a forward-slash, site-absolute path.
+            let rel_str = rel
+                .to_str()
+                .ok_or_else(|| format!("non-UTF-8 path: '{}'", rel.display()))?;
+            let site_path = format!("/{}", rel_str.replace('\\', "/"));
+            let body = std::fs::read(&path)
+                .map_err(|e| format!("failed to read file '{}': {e}", path.display()))?;
+            let content_type = scp_node::content_type_for(&site_path).to_owned();
+            out.push(scp_node::Asset {
+                path: site_path,
+                content_type,
+                body,
+            });
+        }
+        // Symlinks and other special files are skipped intentionally.
+    }
+    Ok(())
+}
+
+/// Builds the loud self-host startup banner shown on stderr before any socket
+/// is opened.
+///
+/// States, in plain language, the consequences the operator is opting into
+/// (public-port exposure, public-IP<->DID DHT disclosure, and the transport
+/// security posture) plus the Finding-D NAT self-test note so a Tier-2 line in
+/// the logs is not mistaken for a hosting failure.
+///
+/// `plaintext` reflects whether the operator opted OUT of TLS via
+/// `SCP_NODE_SELF_HOST_PLAINTEXT=1`. By default self-host serves a self-signed
+/// (no-CA) HTTPS certificate, so the transport line describes the expected
+/// one-time browser untrusted-cert warning; under the plaintext opt-out it
+/// describes the cleartext exposure instead.
+fn self_host_banner(port: u16, plaintext: bool) -> String {
+    let transport_line = if plaintext {
+        "  * Transport is PLAINTEXT HTTP (SCP_NODE_SELF_HOST_PLAINTEXT=1): traffic is\n\
+         \x20    readable and tamper-able in transit. The hosted content is public broadcast\n\
+         \x20    content anyway, but HTTPS-Only browsers will refuse to open http://."
+    } else {
+        "  * Transport is self-signed HTTPS (TLS 1.3, no CA -- the \"be your own CA\" model):\n\
+         \x20    browsers show a ONE-TIME untrusted-certificate warning because there is no\n\
+         \x20    DNS name and no certificate authority. This is EXPECTED for the no-DNS model.\n\
+         \x20    Set SCP_NODE_SELF_HOST_PLAINTEXT=1 to serve plain HTTP instead."
+    };
+    format!(
+        "================================ SELF-HOST MODE ================================\n\
+         scp-node is about to open inbound TCP port {port} to the PUBLIC INTERNET via\n\
+         NAT-PMP/UPnP (when built with --features upnp). Consequences you are opting into:\n\
+           * Your host's PUBLIC IP will be published to the global Mainline DHT, bound to\n\
+             this node's DID. This is an IP<->identity disclosure (approximate-location dox).\n\
+         {transport_line}\n\
+           * A residential uplink cannot absorb a volumetric/distributed DDoS; per-IP rate\n\
+             limiting protects CPU/keys but not raw bandwidth.\n\
+         NAT self-test note (Finding D): if the NAT-PMP reachability self-test reports Tier 2\n\
+         (STUN) instead of Tier 1, this is EXPECTED and does NOT mean failure -- the inbound\n\
+         TCP port mapping is created BEFORE the UDP self-test and is not released, so the\n\
+         site remains reachable over the mapped TCP port regardless of the reported tier.\n\
+         This mode is opt-in (--self-host) and never a default.\n\
+         ==============================================================================="
+    )
+}
+
+/// Whether the operator opted OUT of TLS for self-host via
+/// `SCP_NODE_SELF_HOST_PLAINTEXT=1`.
+///
+/// Self-host serves a self-signed HTTPS certificate by default (so HTTPS-Only
+/// browsers will open it); this flag restores the legacy plaintext-HTTP
+/// behavior for anyone who wants it (§10.12.11).
+fn self_host_plaintext() -> bool {
+    env_flag_is_truthy(env::var("SCP_NODE_SELF_HOST_PLAINTEXT").ok().as_deref())
+}
+
+/// Whether the operator opted OUT of the STUN/NAT external-address probe for
+/// self-host via `SCP_NODE_SELF_HOST_NO_NAT=1`.
+///
+/// The probe (STUN reflexive-address discovery + UPnP/NAT-PMP mapping +
+/// reachability self-test) can add tens of seconds to startup and is dead
+/// weight when the node is reached through a tunnel/proxy that terminates on
+/// `localhost` (e.g. a Cloudflare tunnel). When set, the no-domain build skips
+/// the probe entirely, binds and serves immediately, and publishes a loopback
+/// relay URL -- so no external IP is disclosed to the DHT and no external-IP
+/// certificate SAN is added (the tunnel provides external reachability).
+fn self_host_skip_nat() -> bool {
+    env_flag_is_truthy(env::var("SCP_NODE_SELF_HOST_NO_NAT").ok().as_deref())
+}
+
+/// Pure predicate for an opt-in boolean environment flag: `true` only when the
+/// value is exactly `"1"` or `"true"`. Any other value (including unset,
+/// `"0"`, `"false"`, or arbitrary text) is `false`.
+///
+/// Extracted so the parsing semantics can be unit-tested without mutating the
+/// process environment (`std::env::set_var` is `unsafe` under edition 2024 and
+/// process-global, which makes env-based tests flaky under parallel execution).
+fn env_flag_is_truthy(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true"))
+}
+
+/// Builds the self-signed TLS config for the self-host listener, or returns
+/// `None` when the plaintext opt-out is set.
+///
+/// The "be your own CA" no-DNS model: there is no DNS name and no certificate
+/// authority, so the certificate instead presents a Subject Alternative Name
+/// for every address a browser might use to reach the site. The SAN set always
+/// covers `localhost` (DNS) and `127.0.0.1` (IP); when the node's external IP
+/// is known at serve time (parsed from the node's relay URL, which the NAT tier
+/// populated with the reflexive/mapped address, e.g.
+/// `ws://71.249.150.234:8443/scp/v1`), that IP is added too so raw-IP HTTPS
+/// presents a matching SAN. Browsers show a one-time untrusted-certificate
+/// warning because there is no CA; this is expected.
+///
+/// Returns `None` only when `plaintext` is `true`. On certificate-generation or
+/// TLS-config failure the process exits — there is no safe silent fallback to
+/// plaintext once HTTPS was requested (that would surprise the operator and the
+/// browser).
+fn build_self_host_tls_config(
+    relay_url: &str,
+    bind_ip: std::net::IpAddr,
+    plaintext: bool,
+) -> Option<Arc<rustls::ServerConfig>> {
+    if plaintext {
+        tracing::warn!(
+            "SCP_NODE_SELF_HOST_PLAINTEXT set — serving plain HTTP (HTTPS-Only browsers \
+             will refuse to open the site)"
+        );
+        return None;
     }
 
-    // Production DHT.
-    let dht_client = build_pkarr_client();
-    let sign_fn = DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
-    let did_method = Arc::new(DidDht::with_client_signer_and_store(
-        dht_client,
-        cache,
-        sign_fn,
-        sequence_store,
-    ));
+    // Always-present SANs: localhost + loopback.
+    let dns_sans = vec!["localhost".to_owned()];
+    let mut ip_sans: Vec<std::net::IpAddr> =
+        vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
 
-    let seq_init_method = Arc::clone(&did_method);
-    let seq_init = make_seq_init(seq_init_method);
-    let builder_storage = open_sqlite_or_exit(&storage_dir, &storage_key);
+    // Add the bind IP when it is a concrete, routable interface address (skip
+    // the unspecified 0.0.0.0/:: placeholder and loopback, already covered).
+    if !bind_ip.is_unspecified() && !bind_ip.is_loopback() {
+        ip_sans.push(bind_ip);
+    }
 
-    run_node_with(
-        domain,
+    // Add the external/reflexive IP parsed from the relay URL (the NAT tier
+    // wrote `ws://<external_ip>:<port>/scp/v1` in no-domain mode). De-dup so a
+    // bind IP that equals the external IP is not added twice.
+    if let Some(external_ip) = external_ip_from_relay_url(relay_url)
+        && !ip_sans.contains(&external_ip)
+    {
+        ip_sans.push(external_ip);
+    }
+
+    let cert = match scp_node::tls::generate_self_signed_multi(&dns_sans, &ip_sans) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to generate self-signed self-host certificate");
+            std::process::exit(1);
+        }
+    };
+    let server_config = match scp_node::tls::build_tls_server_config(&cert) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build self-host TLS server config");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        dns_sans = ?dns_sans,
+        ip_sans = ?ip_sans,
+        "self-host serving self-signed HTTPS (TLS 1.3, no CA)"
+    );
+    Some(Arc::new(server_config))
+}
+
+/// Parses the external IP from a no-domain relay URL of the form
+/// `ws://<host>:<port>/scp/v1`, returning it only when `<host>` is a bare IP
+/// literal (not a DNS name and not loopback/unspecified).
+///
+/// Returns `None` when the URL has no host, the host is not an IP literal, or
+/// the IP is loopback/unspecified (those are already covered by the default
+/// SANs and add no reachability value).
+fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
+    // Strip the scheme.
+    let after_scheme = relay_url
+        .split_once("://")
+        .map_or(relay_url, |(_, rest)| rest);
+    // Take the authority (up to the first '/').
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Strip an optional `:port`. IPv6 literals are bracketed, so handle both.
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // `[::1]:8443` -> `::1`
+        rest.split_once(']').map(|(h, _)| h)?
+    } else {
+        // `1.2.3.4:8443` -> `1.2.3.4`
+        authority.split(':').next().unwrap_or(authority)
+    };
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    if ip.is_loopback() || ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+/// Runs the node in self-host mode: an [`ApplicationNode`] in `no_domain`
+/// mode hosting a static site published through an in-process supervisor on
+/// the node's own loopback relay (`§10.12` / `§18`,
+/// `.docs/guides/self-hosting-a-website-on-scp.md`).
+///
+/// Opens an inbound TCP port to the public internet (via NAT-PMP/UPnP when the
+/// `upnp` feature is built) and publishes the host's address to the Mainline
+/// DHT. Transport is plaintext HTTP. See the startup banner.
+///
+/// [`ApplicationNode`]: scp_node::ApplicationNode
+async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
+    let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
+    let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let plaintext = self_host_plaintext();
+
+    // -- Loud startup banner BEFORE opening any socket --
+    eprintln!("{}", self_host_banner(port, plaintext));
+    if self_host_skip_nat() {
+        eprintln!(
+            "NAT probe skipped (SCP_NODE_SELF_HOST_NO_NAT) — assuming reachability via a \
+             proxy/tunnel. Relay URL falls back to loopback; certificate SANs are \
+             localhost + 127.0.0.1 only."
+        );
+    }
+    tracing::warn!(
+        port,
+        skip_nat = self_host_skip_nat(),
+        "self-host mode enabled — opening inbound port to the public internet"
+    );
+
+    // -- Storage + custody (same as the persistent node) --
+    let resolved_path = resolve_storage_path(storage_path);
+    validate_storage_path(&resolved_path);
+    let (storage_dir, storage_key, node_storage_arc, custody) =
+        init_persistent_storage(storage_path).await;
+
+    tracing::info!(
+        bind_addr = %http_addr,
+        storage_path = %storage_dir.display(),
+        mode = "self-host",
+        "starting scp-node in self-host mode (SQLite storage, no_domain)"
+    );
+
+    // -- DID method: production pkarr by default; memory for offline testing --
+    // `node_storage_arc` is the single root `SqliteStorage` handle (it owns the
+    // advisory lock on `{dir}/scp.db.lock`). It is shared by `Arc::clone` between
+    // the BEP44 sequence store and the node builder — the root DB is NEVER opened
+    // a second time, which would conflict on the lock (os error 35). The `mls/`
+    // and `blobs/` subdirectories are distinct paths with their own locks.
+    let cache = Arc::new(DidCache::new());
+    let sequence_store: Arc<dyn SequenceStore> =
+        Arc::new(StorageSequenceStore::new(Arc::clone(&node_storage_arc)));
+
+    let dht_mode = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
+
+    // Explicit match: a typo (e.g. "memroy") must NOT silently fall through to
+    // the production DHT, which would publish the host's address to the network.
+    match dht_mode.as_str() {
+        "memory" => {
+            tracing::warn!(
+                "using InMemoryDhtClient — DID document will NOT be published to the network"
+            );
+            let (did_method, seq_init) =
+                build_memory_did_method(Arc::clone(&custody), cache, sequence_store);
+            run_self_host_with(
+                http_addr,
+                port,
+                plaintext,
+                &storage_dir,
+                &storage_key,
+                Arc::clone(&node_storage_arc),
+                custody,
+                seq_init,
+                did_method,
+                site_dir,
+            )
+            .await;
+        }
+        "production" => {
+            let (did_method, seq_init) =
+                build_production_did_method(Arc::clone(&custody), cache, sequence_store);
+            run_self_host_with(
+                http_addr,
+                port,
+                plaintext,
+                &storage_dir,
+                &storage_key,
+                Arc::clone(&node_storage_arc),
+                custody,
+                seq_init,
+                did_method,
+                site_dir,
+            )
+            .await;
+        }
+        other => {
+            tracing::error!(
+                value = %other,
+                "unrecognized SCP_NODE_DHT_MODE (expected 'memory' or 'production'); \
+                 refusing to default to production DHT to avoid unintended IP publication"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Builds the no-domain self-host [`ApplicationNode`] over persistent,
+/// disk-backed storage, returning it behind an `Arc` alongside the retained NAT
+/// port-mapper handles (`UPnP` + NAT-PMP) for clean teardown.
+///
+/// The root `node_storage` is the single, already-open `Arc<SqliteStorage>` from
+/// [`init_persistent_storage`] — it is NOT reopened here. That handle owns the
+/// advisory lock on `{dir}/scp.db.lock`; opening a second handle on the same root
+/// directory while it is alive fails with an advisory-lock conflict (os error 35).
+/// Sharing the one handle (`Arc<SqliteStorage>` implements [`EncryptedStorage`])
+/// keeps exactly one lock holder for the root DB.
+///
+/// The blob storage is a `SQLite` backend under the node's storage dir: it IS the
+/// site's system of record (`commit_deploy` scans it; the projection/site
+/// handler reads from it), so it must persist across restarts and is the SAME
+/// `Arc` the relay and projection share. The in-memory default backend is
+/// dev-only and is lost on restart, so it is unsuitable here.
+///
+/// The mapper handles are only ever `Some` when built with the `upnp` feature;
+/// otherwise they are `None` (Tier 2 STUN discovery only, no router mapping).
+/// Exits the process on storage or build failure — there is nothing to serve
+/// without a node. `build()` establishes the inbound port mapping during its
+/// NAT tier selection and can still fail afterward (e.g. DID publish), so on
+/// build failure the mappings are released best-effort before exiting. When
+/// `SCP_NODE_SELF_HOST_NO_NAT=1` is set the builder is configured with
+/// [`ApplicationNodeBuilder::skip_nat_probe`], so no port mapping is attempted
+/// (the mapper handles stay `None`) and the node binds and serves immediately
+/// on a loopback relay URL — the correct posture behind a tunnel/proxy.
+///
+/// [`ApplicationNode`]: scp_node::ApplicationNode
+async fn build_self_host_node<D: scp_identity::DidMethod + 'static>(
+    http_addr: SocketAddr,
+    storage_dir: &std::path::Path,
+    node_storage: Arc<SqliteStorage>,
+    custody: Arc<SqliteKeyCustody>,
+    did_method: Arc<D>,
+) -> (
+    Arc<scp_node::ApplicationNode<Arc<SqliteStorage>>>,
+    OptionalPortMapper,
+    OptionalPortMapper,
+) {
+    let projection_rate: u32 = startup::env_or(
+        "SCP_NODE_PROJECTION_RATE_LIMIT",
+        scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
+    );
+
+    let blob_db = storage_dir.join("blobs");
+    let blob_storage = match scp_transport::native::storage::BlobStorageBackend::sqlite(&blob_db) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                path = %blob_db.display(),
+                "failed to open persistent SQLite blob storage for self-host"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // -- NAT strategy with RETAINED mapper handles for clean teardown --
+    // When the operator opted out of NAT traversal (`SCP_NODE_SELF_HOST_NO_NAT`),
+    // no port mapper is constructed: there is no mapping to create, retain,
+    // renew, or release. The handles stay `None` so the renewal loop and the
+    // teardown release are both no-ops, and the builder is told to skip the
+    // probe entirely.
+    let skip_nat = self_host_skip_nat();
+    #[cfg(feature = "upnp")]
+    let (nat_strategy, upnp_mapper, natpmp_mapper): (
+        Option<Arc<dyn scp_node::NatStrategy>>,
+        OptionalPortMapper,
+        OptionalPortMapper,
+    ) = if skip_nat {
+        (None, None, None)
+    } else {
+        let upnp: Arc<dyn scp_transport::nat::PortMapper> =
+            Arc::new(scp_transport::nat::UpnpPortMapper::new());
+        let natpmp: Arc<dyn scp_transport::nat::PortMapper> =
+            Arc::new(scp_transport::nat::NatPmpPortMapper::new());
+        let strategy = scp_node::DefaultNatStrategy::new(None, None)
+            .with_port_mapper(Arc::clone(&upnp))
+            .with_fallback_mapper(Arc::clone(&natpmp));
+        (
+            Some(Arc::new(strategy) as Arc<dyn scp_node::NatStrategy>),
+            Some(upnp),
+            Some(natpmp),
+        )
+    };
+    #[cfg(not(feature = "upnp"))]
+    let (upnp_mapper, natpmp_mapper): (OptionalPortMapper, OptionalPortMapper) = (None, None);
+
+    // `identity_with_storage` (NOT `generate_identity_with`) gives the
+    // self-host node a STABLE DID across restarts: on first boot it creates and
+    // persists the identity to the root `node_storage` (under the `scp/identity`
+    // key); on every subsequent boot against the same `--storage-path` it
+    // reloads that persisted identity instead of minting a fresh DID. Using
+    // `generate_identity_with` here regenerated the DID on every restart even
+    // though the custody key and storage persisted (the relay URL and DHT
+    // record churned each boot). The persisted custody keyring keeps the
+    // `KeyHandle` indices valid across restarts, so the reloaded identity can
+    // still sign.
+    let builder = ApplicationNodeBuilder::new()
+        .storage(node_storage)
+        .blob_storage(blob_storage)
+        .identity_with_storage(custody, did_method)
+        .no_domain()
+        .http_bind_addr(http_addr)
+        .projection_rate_limit(projection_rate);
+    #[cfg(feature = "upnp")]
+    let builder = match nat_strategy {
+        Some(strategy) => builder.nat_strategy(strategy),
+        None => builder,
+    };
+    // Behind a tunnel/proxy (SCP_NODE_SELF_HOST_NO_NAT=1) the STUN/NAT probe is
+    // dead weight: skip it so startup binds and serves immediately on a loopback
+    // relay URL (see `ApplicationNodeBuilder::skip_nat_probe`).
+    let builder = if skip_nat {
+        builder.skip_nat_probe()
+    } else {
+        builder
+    };
+
+    match builder.build().await {
+        Ok(n) => (Arc::new(n), upnp_mapper, natpmp_mapper),
+        Err(e) => {
+            tracing::error!(error = %e, "self-host application node failed to build");
+            // `build()` establishes the inbound port mapping during its NAT
+            // tier selection and CAN still fail afterward (e.g. DID publish),
+            // so release the mappings best-effort before exiting to avoid
+            // leaving the public port mapped at the router.
+            release_self_host_mappings(upnp_mapper, natpmp_mapper, http_addr.port()).await;
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Builds the no-domain node, deploys the site via [`scp_node::deploy_site`],
+/// prints the live URL, and serves until shutdown (releasing the NAT mapping
+/// on the way out). Parameterized over the DID method so both the production
+/// and memory DHT paths share this body.
+///
+/// The site is deployed once before the public listener opens, then refreshed
+/// on a fixed interval (well under the blob TTL) so the projected content never
+/// expires while the node runs (see [`spawn_site_refresh_loop`]). The public
+/// listener exposes only the restricted self-host surface (read-only website
+/// projection; no relay upgrade, no bridge routes — §10.12.8). The retained NAT
+/// port mappings are released on EVERY exit path, graceful or error, via
+/// [`release_self_host_mappings`].
+#[allow(clippy::too_many_arguments)] // mirrors run_node_with; composing concrete deps in one call
+async fn run_self_host_with<D: scp_identity::DidMethod + 'static>(
+    http_addr: SocketAddr,
+    port: u16,
+    plaintext: bool,
+    storage_dir: &std::path::Path,
+    storage_key: &Zeroizing<[u8; 32]>,
+    node_storage: Arc<SqliteStorage>,
+    custody: Arc<SqliteKeyCustody>,
+    seq_init: SeqInitFn,
+    did_method: Arc<D>,
+    site_dir: Option<&PathBuf>,
+) {
+    // -- Build the no-domain node with persistent blob storage + retained NAT
+    //    mapper handles for clean teardown on every exit path. The root node
+    //    storage is the SAME `Arc<SqliteStorage>` already opened in
+    //    `init_persistent_storage` (one advisory-lock holder); the deployer's
+    //    `mls/` storage and the relay's `blobs/` storage live under distinct
+    //    subdirectories with their own locks. --
+    let (node, upnp_mapper, natpmp_mapper) = build_self_host_node(
         http_addr,
-        custody,
-        seq_init,
+        storage_dir,
+        node_storage,
+        custody.clone(),
         did_method,
-        builder_storage,
     )
     .await;
+
+    let node_did = node.identity().did().to_owned();
+    if let Err(e) = seq_init(node_did.clone()).await {
+        tracing::error!(error = %e, "failed to initialize BEP44 sequence — publishing may fail");
+    }
+
+    let context_id = self_host_context_id(&node_did);
+
+    // -- Load the site assets once. The same asset set is (re)published on every
+    //    deploy; the embedded default injects the node DID into index.html. --
+    let assets = match load_self_host_assets(site_dir, &node_did) {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to load self-host site assets");
+            release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
+            std::process::exit(1);
+        }
+    };
+    let asset_count = assets.len();
+
+    // -- Build the deployer ONCE: one supervisor, one broadcast group, one
+    //    broadcast key. Reused for the initial deploy and every refresh so all
+    //    blobs are sealed under the same epoch key (see `SelfHostDeployer`). --
+    let deployer = match build_self_host_deployer(
+        node.as_ref(),
+        storage_dir,
+        storage_key,
+        &node_did,
+        &context_id,
+    )
+    .await
+    {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to set up self-host deployer");
+            release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
+            std::process::exit(1);
+        }
+    };
+
+    // -- Initial deploy, BEFORE the public port opens, so the site is live the
+    //    moment the listener accepts connections. --
+    if let Err(e) = deployer
+        .deploy(node.as_ref(), &mint_deploy_id(), custody.as_ref(), &assets)
+        .await
+    {
+        tracing::error!(error = %e, "failed to deploy self-host site");
+        release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
+        std::process::exit(1);
+    }
+    tracing::info!(committed = asset_count, "self-host site deployed");
+
+    // -- Mount the single deployed site at the ORIGIN ROOT (§10.12.11). --
+    // `GET /`, `GET /style.css`, `GET /app.js`, and raw-IP access (where the
+    // `Host` header matches no registered hostname) all resolve to this
+    // context's site through the virtual-host fallback's default-site path,
+    // reusing the same `site_handler` (ContentPath traversal protection,
+    // decryption, ETag, Cache-Control, CSP). This is what lets the embedded
+    // index.html's root-absolute `/style.css` and `/app.js` references load.
+    let default_routing_id = scp_node::projection::compute_routing_id(&context_id);
+    node.set_default_site_routing_id(default_routing_id);
+
+    print_self_host_live_url(&context_id, port, &node_did, asset_count, plaintext);
+
+    // -- Build the self-host TLS config (self-signed, multi-SAN) unless the
+    //    operator opted out via SCP_NODE_SELF_HOST_PLAINTEXT. The cert covers
+    //    localhost + 127.0.0.1 and, when known, the node's external/bind IP so
+    //    HTTPS-Only browsers can open the site (one-time untrusted-cert warning,
+    //    expected for the no-DNS "be your own CA" model). --
+    let tls_config = build_self_host_tls_config(node.relay_url(), http_addr.ip(), plaintext);
+
+    // -- Open the RESTRICTED public surface in the background --
+    // Only the read-only website projection (+ `.well-known/scp` + virtual-host
+    // fallback) is exposed on the public bind. The relay upgrade (`/scp/v1`)
+    // and bridge routes (`/v1/scp/bridge/*`) are NOT mounted publicly — the
+    // in-process supervisor reaches the node's relay over loopback `127.0.0.1`
+    // instead (§10.12.8; §10.12.11). TLS (when enabled) is purely what is spoken on the
+    // mapped TCP port; the NAT-PMP/UPnP port mapping is unaffected.
+    if let Err(e) = node
+        .serve_background_with_surface_tls(
+            Some(http_addr),
+            scp_node::PublicSurface::SelfHost,
+            tls_config,
+        )
+        .await
+    {
+        tracing::error!(error = %e, "self-host public listener failed to start");
+        release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
+        std::process::exit(1);
+    }
+
+    // -- Keep the site alive past the blob TTL via a periodic re-deploy --
+    // The refresh loop owns its OWN cancellation token (not the node's) so it can
+    // be stopped and drained BEFORE `node.shutdown()` tears the node down. Sharing
+    // the node token would let `shutdown()` interrupt an in-flight deploy, which
+    // then logs a spurious ERROR on an otherwise-clean shutdown.
+    let refresh_cancel = tokio_util::sync::CancellationToken::new();
+    let refresh = spawn_site_refresh_loop(
+        Arc::clone(&deployer),
+        Arc::clone(&node),
+        Arc::clone(&custody),
+        Arc::clone(&assets),
+        refresh_cancel.clone(),
+    );
+
+    // -- Renew the NAT port-mapping lease at 50% TTL so the site stays publicly
+    //    reachable past the ~one-hour lease (§10.12.2). `build()` created the
+    //    mapping once via the NAT strategy; without renewal the gateway drops it
+    //    at lease expiry. The loop owns its own cancellation token so it can be
+    //    fully stopped BEFORE the mappings are released on shutdown (renewal must
+    //    never race the teardown `remove()`). The mapper handles only exist under
+    //    the `upnp` feature; otherwise this spawns a harmless no-op, exactly like
+    //    the bare one-shot path. --
+    let renewal_cancel = tokio_util::sync::CancellationToken::new();
+    let renewal_mappers: Vec<Arc<dyn scp_transport::nat::PortMapper>> =
+        [&upnp_mapper, &natpmp_mapper]
+            .into_iter()
+            .filter_map(|m| m.as_ref().map(Arc::clone))
+            .collect();
+    let renewal =
+        scp_node::spawn_self_host_mapping_renewal(renewal_mappers, port, renewal_cancel.clone());
+
+    // -- Serve until the process receives a shutdown signal --
+    startup::shutdown_signal().await;
+    tracing::warn!("shutdown signal received — stopping self-host site refresh and listener");
+
+    // Teardown ordering matters:
+    //  1. Cancel and AWAIT the refresh loop first, on its own token, so any
+    //     in-flight deploy drains before the node is torn down. Doing this before
+    //     `node.shutdown()` is what prevents a spurious deploy-failure ERROR from a
+    //     teardown racing an in-flight refresh.
+    //  2. `node.shutdown()` cancels the node's token, which the background HTTP
+    //     server observes.
+    //  3. Cancel and AWAIT the renewal loop BEFORE `release_self_host_mappings` so
+    //     renewal can never re-issue a mapping concurrently with its removal.
+    refresh_cancel.cancel();
+    let _ = refresh.await;
+    node.shutdown();
+    renewal_cancel.cancel();
+    let _ = renewal.await;
+    release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
+
+    tracing::info!("scp-node (self-host) stopped");
+}
+
+/// Builds the supervisor's MLS storage and performs the one-time
+/// [`SelfHostDeployer`] setup (loopback supervisor, broadcast group, projection
+/// enable).
+///
+/// The MLS storage is a single `SQLite` database under `storage_dir/mls` for the
+/// deployer's whole lifetime — the broadcast group is created once and reused
+/// across every deploy, so there is no per-deploy MLS state to isolate or prune.
+///
+/// [`SelfHostDeployer`]: scp_node::SelfHostDeployer
+async fn build_self_host_deployer<S>(
+    node: &scp_node::ApplicationNode<S>,
+    storage_dir: &std::path::Path,
+    storage_key: &Zeroizing<[u8; 32]>,
+    node_did: &str,
+    context_id: &str,
+) -> Result<scp_node::SelfHostDeployer, String>
+where
+    S: scp_platform::EncryptedStorage + 'static,
+{
+    let mls_inner = Arc::new(
+        scp_platform::sqlite::SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
+            .map_err(|e| format!("failed to open MLS SQLite storage: {e}"))?,
+    );
+    let mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+        Arc::new(
+            scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(mls_inner),
+        );
+
+    let signing_key_handle = node.identity().identity().active_signing_key;
+    scp_node::SelfHostDeployer::start(
+        node,
+        node_did.to_owned(),
+        context_id.to_owned(),
+        SELF_HOST_HOSTNAME.to_owned(),
+        signing_key_handle,
+        mls_storage,
+    )
+    .await
+    .map_err(|e| format!("deployer setup failed: {e}"))
+}
+
+/// Mints a unique deploy id for a single self-host deploy run.
+///
+/// With persistent blob storage and content within its TTL, `commit_deploy`
+/// scans EVERY blob for the site routing id and counts those whose decrypted
+/// `deploy_id` matches the requested one. A constant deploy id would therefore
+/// count stale blobs from a previous run (e.g. a since-removed `/old.html`)
+/// still inside their TTL, producing a `CommitCountMismatch`. Minting a fresh
+/// id per run guarantees `commit_deploy` only ever sees the current run's
+/// blobs.
+///
+/// The id combines a process-start-relative nanosecond timestamp with OS
+/// randomness so it is unique across runs even on coarse-grained clocks and
+/// stable for the lifetime of a single deploy.
+fn mint_deploy_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let mut rand_bytes = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rand_bytes);
+    format!("selfhost-{nanos:032x}-{}", hex::encode(rand_bytes))
+}
+
+/// Spawns the periodic site refresh loop.
+///
+/// Site assets are published with a fixed blob TTL (`DEFAULT_BLOB_TTL` =
+/// 3600s); after that the relay's blob store treats them as expired and the
+/// projection 404s. The broadcast publish path exposes no per-publish TTL
+/// override (the TTL is fixed deep in the transport envelope builder, shared by
+/// every publish path), so the correct, self-contained fix is to re-publish the
+/// site on an interval well under the TTL. Each refresh reuses the deployer's
+/// supervisor/group/key, mints a fresh `deploy_id`, and re-points the deploy
+/// manifest at fresh, full-TTL blobs.
+///
+/// The interval is configurable via `SCP_NODE_SELF_HOST_REFRESH_SECS` and
+/// defaults to [`SELF_HOST_DEPLOY_REFRESH_SECS`]. The loop runs until the
+/// node's shutdown token is cancelled. Returns the task handle so the caller
+/// can abort it on shutdown.
+fn spawn_site_refresh_loop<S>(
+    deployer: Arc<scp_node::SelfHostDeployer>,
+    node: Arc<scp_node::ApplicationNode<S>>,
+    custody: Arc<SqliteKeyCustody>,
+    assets: Arc<Vec<scp_node::Asset>>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()>
+where
+    S: scp_platform::EncryptedStorage + 'static,
+{
+    let refresh_secs: u64 = startup::env_or(
+        "SCP_NODE_SELF_HOST_REFRESH_SECS",
+        SELF_HOST_DEPLOY_REFRESH_SECS,
+    )
+    .max(1);
+    let period = std::time::Duration::from_secs(refresh_secs);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        // Skip the immediate first tick; the caller already performed the
+        // initial deploy before opening the public port.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                () = shutdown_token.cancelled() => {
+                    tracing::debug!("self-host refresh loop observed shutdown");
+                    break;
+                }
+                _ = interval.tick() => {
+                    match deployer
+                        .deploy(node.as_ref(), &mint_deploy_id(), custody.as_ref(), &assets)
+                        .await
+                    {
+                        Ok(committed) => tracing::info!(
+                            committed,
+                            "self-host site refreshed (TTL renewal)"
+                        ),
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "self-host site refresh failed; will retry next interval"
+                        ),
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Best-effort release of the retained NAT port mappings on BOTH mappers.
+///
+/// Called on every exit path that occurs after the node (and thus its port
+/// mapping) is built — graceful shutdown and every error exit alike — so the
+/// public port is never left mapped at the router. The mapper handles are only
+/// ever `Some` when built with the `upnp` feature; otherwise this is a no-op.
+async fn release_self_host_mappings(
+    upnp: OptionalPortMapper,
+    natpmp: OptionalPortMapper,
+    port: u16,
+) {
+    for (label, mapper) in [("upnp", upnp), ("natpmp", natpmp)] {
+        if let Some(mapper) = mapper {
+            match mapper.remove(port).await {
+                Ok(()) => tracing::info!(mapper = label, port, "released NAT port mapping"),
+                Err(e) => tracing::warn!(
+                    mapper = label,
+                    port,
+                    error = %e,
+                    "failed to release NAT port mapping; it will persist until lease expiry"
+                ),
+            }
+        }
+    }
+}
+
+/// Logs and prints the live site URL after a successful deploy.
+///
+/// The URLs use the `0.0.0.0` bind placeholder; the operator substitutes their
+/// public IP (or an SCP-aware client resolves it via `did:dht`). The node DID
+/// is included so the operator can verify the IP<->identity binding. The scheme
+/// is `https` by default (self-signed) or `http` under the plaintext opt-out.
+///
+/// Both the origin-root URL (the site is mounted at `/`) and the explicit
+/// routing-id path are shown — the root URL is what a browser loads; the
+/// explicit path is the canonical SCP projection address.
+fn print_self_host_live_url(
+    context_id: &str,
+    port: u16,
+    node_did: &str,
+    asset_count: usize,
+    plaintext: bool,
+) {
+    let scheme = if plaintext { "http" } else { "https" };
+    let routing_hex = scp_node::routing_id_hex(context_id);
+    let root_url = format!("{scheme}://0.0.0.0:{port}/");
+    let canonical_url =
+        format!("{scheme}://0.0.0.0:{port}/scp/broadcast/{routing_hex}/site/index.html");
+    tracing::info!(
+        did = %node_did,
+        assets = asset_count,
+        url = %root_url,
+        canonical_url = %canonical_url,
+        "self-host site live"
+    );
+    let tls_note = if plaintext {
+        ""
+    } else {
+        "  (your browser will show a one-time untrusted-certificate warning: there is no\n  \
+         certificate authority in the no-DNS self-host model — accept it to proceed.)\n"
+    };
+    eprintln!(
+        "\nSelf-host site is LIVE:\n  \
+         {root_url}            (origin root — the page a browser loads)\n  \
+         {canonical_url}  (canonical SCP projection path)\n\
+         {tls_note}  \
+         (substitute your public IP for 0.0.0.0; SCP-aware clients can resolve it via did:dht.\n  \
+         The node DID is: {node_did})\n"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -689,6 +1693,53 @@ fn make_seq_init<D: scp_identity::DhtClient + 'static>(
     Box::new(move |did| Box::pin(async move { did_method.initialize_sequence(&did).await }))
 }
 
+/// Builds the in-memory DID method (offline; DID docs are NOT published).
+///
+/// Used when `SCP_NODE_DHT_MODE=memory`. The returned method signs with the
+/// supplied custody and persists its BEP44 sequence in `sequence_store`, but its
+/// [`InMemoryDhtClient`] never reaches the network — DID documents stay local.
+/// The companion [`SeqInitFn`] recovers the sequence number after `build()`.
+fn build_memory_did_method(
+    custody: Arc<SqliteKeyCustody>,
+    cache: Arc<DidCache>,
+    sequence_store: Arc<dyn SequenceStore>,
+) -> (Arc<DidDht<InMemoryDhtClient, SystemClock>>, SeqInitFn) {
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(custody);
+    let did_method = Arc::new(DidDht::with_client_signer_and_store(
+        dht_client,
+        cache,
+        sign_fn,
+        sequence_store,
+    ));
+    let seq_init = make_seq_init(Arc::clone(&did_method));
+    (did_method, seq_init)
+}
+
+/// Builds the production pkarr DID method (publishes DID docs to the DHT).
+///
+/// Used when `SCP_NODE_DHT_MODE` is unset or `production`. The returned method
+/// signs with the supplied custody, persists its BEP44 sequence in
+/// `sequence_store`, and publishes via the [`PkarrDhtClient`] built from
+/// [`build_pkarr_client`] (Mainline DHT + optional HTTP gateways). The companion
+/// [`SeqInitFn`] recovers the sequence number after `build()`.
+fn build_production_did_method(
+    custody: Arc<SqliteKeyCustody>,
+    cache: Arc<DidCache>,
+    sequence_store: Arc<dyn SequenceStore>,
+) -> (Arc<DidDht<PkarrDhtClient, SystemClock>>, SeqInitFn) {
+    let dht_client = build_pkarr_client();
+    let sign_fn = DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(custody);
+    let did_method = Arc::new(DidDht::with_client_signer_and_store(
+        dht_client,
+        cache,
+        sign_fn,
+        sequence_store,
+    ));
+    let seq_init = make_seq_init(Arc::clone(&did_method));
+    (did_method, seq_init)
+}
+
 /// Shared implementation for `run_full_node`, parameterized over DID method
 /// and storage type.
 ///
@@ -708,10 +1759,9 @@ async fn run_node_with<
     did_method: Arc<D>,
     storage: S,
 ) {
-    let use_self_signed =
-        env::var("SCP_NODE_TLS_SELF_SIGNED").is_ok_and(|v| v == "1" || v == "true");
+    let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
 
-    let use_dns_provider = env::var("SCP_NODE_DNS_PROVIDER").is_ok_and(|v| v == "1" || v == "true");
+    let use_dns_provider = env_flag_is_truthy(env::var("SCP_NODE_DNS_PROVIDER").ok().as_deref());
 
     let projection_rate: u32 = startup::env_or(
         "SCP_NODE_PROJECTION_RATE_LIMIT",
@@ -852,6 +1902,12 @@ async fn main() {
                 "SCP_RELAY_BIND_ADDR",
                 SocketAddr::from(([127, 0, 0, 1], 9000)),
             )
+        } else if config.self_host {
+            // Self-host binds the site listener on SCP_NODE_SELF_HOST_PORT
+            // (default 8443), NOT SCP_NODE_BIND_ADDR. Probe that port on
+            // loopback so `--health` matches the port `--self-host` opens.
+            let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
+            SocketAddr::from(([127, 0, 0, 1], port))
         } else {
             startup::env_or(
                 "SCP_NODE_BIND_ADDR",
@@ -866,9 +1922,409 @@ async fn main() {
 
     if config.relay_only {
         run_relay_only().await;
+    } else if config.self_host {
+        run_self_host(config.storage_path.as_ref(), config.site_dir.as_ref()).await;
     } else if config.ephemeral {
         run_full_node_ephemeral().await;
     } else {
         run_full_node_persistent(config.storage_path.as_ref()).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SCP_NODE_SELF_HOST_NO_NAT` (and every opt-in self-host flag) is truthy
+    /// only for the exact values `"1"` and `"true"`. This is the parsing rule
+    /// `self_host_skip_nat` applies; testing the pure predicate avoids mutating
+    /// the process-global environment.
+    #[test]
+    fn env_flag_is_truthy_only_for_one_or_true() {
+        assert!(env_flag_is_truthy(Some("1")));
+        assert!(env_flag_is_truthy(Some("true")));
+
+        assert!(!env_flag_is_truthy(None));
+        assert!(!env_flag_is_truthy(Some("")));
+        assert!(!env_flag_is_truthy(Some("0")));
+        assert!(!env_flag_is_truthy(Some("false")));
+        assert!(!env_flag_is_truthy(Some("TRUE")));
+        assert!(!env_flag_is_truthy(Some("yes")));
+        assert!(!env_flag_is_truthy(Some("2")));
+    }
+
+    /// FIX B consequence: a loopback relay URL (what the node publishes when the
+    /// NAT probe is skipped) contributes NO external IP to the certificate SAN
+    /// set — only localhost + 127.0.0.1 remain (already the default SANs). A
+    /// routable external URL, by contrast, does contribute its IP.
+    #[test]
+    fn loopback_relay_url_adds_no_external_san() {
+        // Skip-NAT loopback fallback: no external SAN.
+        assert_eq!(
+            external_ip_from_relay_url("ws://127.0.0.1:8444/scp/v1"),
+            None,
+            "loopback relay URL must not yield an external SAN"
+        );
+        // IPv6 loopback is likewise excluded.
+        assert_eq!(
+            external_ip_from_relay_url("ws://[::1]:8444/scp/v1"),
+            None,
+            "IPv6 loopback relay URL must not yield an external SAN"
+        );
+        // A routable external URL (the probed path) DOES yield its IP.
+        assert_eq!(
+            external_ip_from_relay_url("ws://203.0.113.7:8444/scp/v1"),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                203, 0, 113, 7
+            ))),
+            "a routable relay URL must yield its external IP as a SAN"
+        );
+    }
+
+    /// The skip-NAT banner line is only emitted via the env helper; verify the
+    /// helper composes with the pure predicate so the binary's branch is
+    /// exercised through a stable, testable seam.
+    #[test]
+    fn self_host_skip_nat_uses_the_truthy_predicate() {
+        // The function reads the env, but its decision is exactly the pure
+        // predicate over the variable's value, which the tests above pin down.
+        // Here we only assert it is callable and returns a bool (no panic),
+        // keeping the env untouched for parallel-test safety.
+        let _: bool = self_host_skip_nat();
+    }
+
+    // -----------------------------------------------------------------------
+    // CLI / env mode selection (`parse_cli_from`)
+    //
+    // `parse_args` reads `env::args()` + env vars (process-global, unsafe to
+    // mutate under edition 2024), so it is not hermetically testable. The pure
+    // `parse_cli_from` takes the args slice + already-resolved env inputs
+    // explicitly, so the selection/merge logic is exercised here without
+    // touching the environment. Helper keeps the call sites terse.
+    // -----------------------------------------------------------------------
+
+    /// Builds an owned `Vec<String>` args vector from string literals, matching
+    /// the shape of `env::args().collect()` (argv[0] is the program name).
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// The `--self-host` argument selects self-host mode.
+    #[test]
+    fn cli_self_host_flag_selects_self_host_mode() {
+        let cfg = parse_cli_from(&argv(&["scp-node", "--self-host"]), false, None, None);
+        assert!(
+            cfg.self_host,
+            "--self-host must select self-host mode regardless of env"
+        );
+    }
+
+    /// With no flags and no env override, the node does NOT default to
+    /// self-host (nor relay-only / ephemeral) mode.
+    #[test]
+    fn cli_defaults_to_not_self_host() {
+        let cfg = parse_cli_from(&argv(&["scp-node"]), false, None, None);
+        assert!(!cfg.self_host, "no flags must NOT select self-host mode");
+        assert!(!cfg.relay_only, "no flags must NOT select relay-only mode");
+        assert!(!cfg.ephemeral, "no flags must NOT select ephemeral mode");
+        assert!(!cfg.show_help, "no flags must NOT request help");
+    }
+
+    /// Self-host selection is independent of any domain input: there is no
+    /// `--domain` CLI field (the full-node domain is read later from
+    /// `SCP_NODE_DOMAIN`), so a bare `--self-host` invocation parses cleanly
+    /// with `self_host == true` and no storage path required.
+    #[test]
+    fn cli_self_host_does_not_require_domain() {
+        let cfg = parse_cli_from(&argv(&["scp-node", "--self-host"]), false, None, None);
+        assert!(cfg.self_host, "self-host must be selected without a domain");
+        assert!(
+            cfg.storage_path.is_none(),
+            "self-host selection must not require a storage path"
+        );
+        assert!(
+            cfg.site_dir.is_none(),
+            "self-host selection must not require a site dir"
+        );
+    }
+
+    /// `--site-dir <p>` is parsed into the `site_dir` field.
+    #[test]
+    fn cli_site_dir_argument_is_parsed() {
+        let cfg = parse_cli_from(
+            &argv(&["scp-node", "--self-host", "--site-dir", "/tmp/site"]),
+            false,
+            None,
+            None,
+        );
+        assert_eq!(
+            cfg.site_dir,
+            Some(PathBuf::from("/tmp/site")),
+            "--site-dir must populate the site_dir field"
+        );
+    }
+
+    /// `--storage-path <p>` is parsed into the `storage_path` field, and a CLI
+    /// value takes precedence over the environment fallback.
+    #[test]
+    fn cli_storage_path_argument_overrides_env() {
+        let cfg = parse_cli_from(
+            &argv(&["scp-node", "--storage-path", "/tmp/cli-storage"]),
+            false,
+            Some(PathBuf::from("/tmp/env-storage")),
+            None,
+        );
+        assert_eq!(
+            cfg.storage_path,
+            Some(PathBuf::from("/tmp/cli-storage")),
+            "an explicit --storage-path must override SCP_STORAGE_PATH"
+        );
+    }
+
+    /// The resolved `SCP_NODE_SELF_HOST` env flag selects self-host mode even
+    /// when no `--self-host` argument is present.
+    #[test]
+    fn cli_self_host_env_selects_self_host_mode() {
+        let cfg = parse_cli_from(&argv(&["scp-node"]), true, None, None);
+        assert!(
+            cfg.self_host,
+            "a truthy SCP_NODE_SELF_HOST must select self-host mode without the flag"
+        );
+    }
+
+    /// Environment fallbacks fill `storage_path` / `site_dir` when the matching
+    /// CLI argument is absent — the production resolution order.
+    #[test]
+    fn cli_env_fallbacks_apply_when_no_argument() {
+        let cfg = parse_cli_from(
+            &argv(&["scp-node"]),
+            false,
+            Some(PathBuf::from("/tmp/env-storage")),
+            Some(PathBuf::from("/tmp/env-site")),
+        );
+        assert_eq!(
+            cfg.storage_path,
+            Some(PathBuf::from("/tmp/env-storage")),
+            "SCP_STORAGE_PATH must be used when --storage-path is absent"
+        );
+        assert_eq!(
+            cfg.site_dir,
+            Some(PathBuf::from("/tmp/env-site")),
+            "SCP_NODE_SITE_DIR must be used when --site-dir is absent"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-host disclosure banner content (`self_host_banner`)
+    //
+    // The banner is a pure `String` builder with no side effects — it opens no
+    // socket and performs no NAT work. The ordering invariant "banner is
+    // printed before any socket/NAT" is structurally guaranteed by the call
+    // site: `run_self_host` builds and `eprintln!`s the banner at the top of
+    // the function, BEFORE `init_persistent_storage`, `build_self_host_node`,
+    // and any NAT probing. A pure unit test cannot assert call ordering, so we
+    // assert what IS assertable — the disclosure content — and document the
+    // ordering invariant here.
+    // -----------------------------------------------------------------------
+
+    /// The HTTPS-default banner states every disclosure the operator opts into
+    /// (public-internet port exposure, public-IP<->identity DHT disclosure, and
+    /// the self-signed-HTTPS transport posture) and never claims plaintext; the
+    /// plaintext-opt-out banner instead states the cleartext exposure and names
+    /// the opt-out variable.
+    #[test]
+    fn self_host_banner_states_disclosures() {
+        let port = 8443u16;
+
+        // -- HTTPS default (plaintext = false). --
+        let https = self_host_banner(port, false);
+        assert!(
+            https.contains(&port.to_string()),
+            "banner must name the port being opened"
+        );
+        assert!(
+            https.contains("SELF-HOST MODE"),
+            "banner must announce self-host mode"
+        );
+        assert!(
+            https.contains("PUBLIC INTERNET"),
+            "banner must disclose public-internet port exposure"
+        );
+        assert!(
+            https.contains("PUBLIC IP"),
+            "banner must disclose public-IP publication"
+        );
+        assert!(
+            https.contains("DHT"),
+            "banner must disclose DHT publication of the address"
+        );
+        assert!(
+            https.contains("IP<->identity"),
+            "banner must disclose the IP<->identity binding"
+        );
+        assert!(
+            https.contains("self-signed HTTPS"),
+            "the HTTPS-default banner must describe the self-signed HTTPS posture"
+        );
+        assert!(
+            !https.contains("PLAINTEXT HTTP"),
+            "the HTTPS-default banner must NOT claim plaintext transport"
+        );
+
+        // -- Plaintext opt-out (plaintext = true). --
+        let plain = self_host_banner(port, true);
+        assert!(
+            plain.contains("PLAINTEXT HTTP"),
+            "the plaintext banner must disclose cleartext transport"
+        );
+        assert!(
+            plain.contains("SCP_NODE_SELF_HOST_PLAINTEXT"),
+            "the plaintext banner must name the opt-out environment variable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NAT mapping release on shutdown (`release_self_host_mappings`)
+    //
+    // A mock `PortMapper` records the port passed to `remove` (and that
+    // `remove` was called at all). `map_port` / `renew` are never invoked by
+    // `release_self_host_mappings`, so their arms return a benign error rather
+    // than panicking. Lock-free atomics keep the test free of unwrap/expect,
+    // matching the existing main.rs test style.
+    // -----------------------------------------------------------------------
+
+    /// A `PortMapper` mock that records the port passed to `remove`.
+    struct RecordingMapper {
+        /// The port passed to the most recent `remove` call (`0` = never called).
+        removed_port: Arc<std::sync::atomic::AtomicU16>,
+        /// Set true once `remove` is invoked.
+        removed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RecordingMapper {
+        fn new() -> Self {
+            Self {
+                removed_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+                removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl scp_transport::nat::PortMapper for RecordingMapper {
+        fn map_port(
+            &self,
+            _internal_port: u16,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            scp_transport::nat::PortMappingResult,
+                            scp_transport::nat::PortMappingError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            // Never called by `release_self_host_mappings`; return a benign error.
+            Box::pin(async {
+                Err(scp_transport::nat::PortMappingError::NotSupported(
+                    "map_port is not exercised by release_self_host_mappings".to_owned(),
+                ))
+            })
+        }
+
+        fn renew(
+            &self,
+            _internal_port: u16,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            scp_transport::nat::PortMappingResult,
+                            scp_transport::nat::PortMappingError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            // Never called by `release_self_host_mappings`; return a benign error.
+            Box::pin(async {
+                Err(scp_transport::nat::PortMappingError::NotSupported(
+                    "renew is not exercised by release_self_host_mappings".to_owned(),
+                ))
+            })
+        }
+
+        fn remove(
+            &self,
+            internal_port: u16,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), scp_transport::nat::PortMappingError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let removed_port = Arc::clone(&self.removed_port);
+            let removed = Arc::clone(&self.removed);
+            Box::pin(async move {
+                removed_port.store(internal_port, std::sync::atomic::Ordering::SeqCst);
+                removed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// `release_self_host_mappings` calls `remove(port)` on BOTH mappers when
+    /// both are present — the graceful-shutdown teardown path.
+    #[tokio::test]
+    async fn release_self_host_mappings_removes_mapping_on_both_mappers() {
+        const PORT: u16 = 8443;
+
+        let upnp = Arc::new(RecordingMapper::new());
+        let natpmp = Arc::new(RecordingMapper::new());
+        let upnp_port = Arc::clone(&upnp.removed_port);
+        let upnp_flag = Arc::clone(&upnp.removed);
+        let natpmp_port = Arc::clone(&natpmp.removed_port);
+        let natpmp_flag = Arc::clone(&natpmp.removed);
+
+        release_self_host_mappings(
+            Some(upnp as Arc<dyn scp_transport::nat::PortMapper>),
+            Some(natpmp as Arc<dyn scp_transport::nat::PortMapper>),
+            PORT,
+        )
+        .await;
+
+        assert!(
+            upnp_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the upnp mapper's remove must be called"
+        );
+        assert_eq!(
+            upnp_port.load(std::sync::atomic::Ordering::SeqCst),
+            PORT,
+            "the upnp mapper must be asked to remove the served port"
+        );
+        assert!(
+            natpmp_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the natpmp mapper's remove must be called"
+        );
+        assert_eq!(
+            natpmp_port.load(std::sync::atomic::Ordering::SeqCst),
+            PORT,
+            "the natpmp mapper must be asked to remove the served port"
+        );
+    }
+
+    /// With no mappers present (the non-`upnp` build, where both handles are
+    /// `None`), `release_self_host_mappings` is a no-op and does not panic.
+    #[tokio::test]
+    async fn release_self_host_mappings_noop_when_no_mappers() {
+        const PORT: u16 = 8443;
+        // No mappers: nothing to remove. This must complete cleanly.
+        release_self_host_mappings(None, None, PORT).await;
     }
 }

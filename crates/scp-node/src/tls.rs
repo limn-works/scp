@@ -841,18 +841,73 @@ pub async fn serve_tls(
 /// Generate a self-signed certificate for the given domain.
 ///
 /// Intended for testing and local development only. The certificate uses
-/// Ed25519 (via rcgen defaults) and is valid for 365 days.
+/// Ed25519 (via rcgen defaults) and is valid for 365 days. The single domain
+/// is the sole DNS SAN and the certificate Common Name.
+///
+/// Delegates to [`generate_self_signed_multi`] with one DNS SAN and no IP SANs,
+/// so both share one code path.
 ///
 /// # Errors
 ///
 /// Returns [`TlsError::Certificate`] if certificate generation fails.
 pub fn generate_self_signed(domain: &str) -> Result<CertificateData, TlsError> {
-    let mut params = rcgen::CertificateParams::new(vec![domain.to_owned()])
-        .map_err(|e| TlsError::Certificate(format!("failed to create cert params: {e}")))?;
+    generate_self_signed_multi(&[domain.to_owned()], &[])
+}
+
+/// Generate a self-signed certificate covering multiple DNS and IP SANs.
+///
+/// Used by the `--self-host` ("be your own CA") path, where the node has no
+/// DNS name and no CA: the certificate must instead present a Subject
+/// Alternative Name for every address a browser might use to reach the site —
+/// at minimum `localhost`, `127.0.0.1`, and (when known at serve time) the
+/// node's external/LAN IP — so raw-IP HTTPS presents a matching SAN. There is
+/// no chain of trust, so browsers show a one-time untrusted-certificate
+/// warning; this is expected for the no-DNS model.
+///
+/// `dns_sans` are added as `SanType::DnsName` SANs; `ip_sans` as
+/// `SanType::IpAddress` SANs. The certificate Common Name is set to the first
+/// DNS SAN when present, else the first IP SAN, else left empty — the CN is
+/// advisory only (modern browsers validate against SANs, not the CN). The
+/// certificate uses Ed25519 (rcgen defaults) and is valid for 365 days.
+///
+/// Duplicate or empty inputs are not de-duplicated here; callers pass a
+/// curated set. At least one SAN should be supplied so the certificate is
+/// usable.
+///
+/// # Errors
+///
+/// Returns [`TlsError::Certificate`] if any DNS SAN is not a valid IA5 string
+/// or if certificate generation fails.
+pub fn generate_self_signed_multi(
+    dns_sans: &[String],
+    ip_sans: &[std::net::IpAddr],
+) -> Result<CertificateData, TlsError> {
+    // Build the SAN list explicitly rather than via `CertificateParams::new`'s
+    // string auto-detection, so DNS names and IPs are typed deliberately.
+    let mut sans: Vec<rcgen::SanType> = Vec::with_capacity(dns_sans.len() + ip_sans.len());
+    for name in dns_sans {
+        let ia5 = rcgen::string::Ia5String::try_from(name.clone())
+            .map_err(|e| TlsError::Certificate(format!("invalid DNS SAN '{name}': {e}")))?;
+        sans.push(rcgen::SanType::DnsName(ia5));
+    }
+    for ip in ip_sans {
+        sans.push(rcgen::SanType::IpAddress(*ip));
+    }
+
+    let mut params = rcgen::CertificateParams::default();
+    params.subject_alt_names = sans;
+
+    // Common Name is advisory; prefer the first DNS name, else the first IP.
+    let common_name = dns_sans
+        .first()
+        .cloned()
+        .or_else(|| ip_sans.first().map(std::string::ToString::to_string));
     params.distinguished_name = rcgen::DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, domain);
+    if let Some(cn) = common_name {
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+    }
 
     let key_pair = rcgen::KeyPair::generate()
         .map_err(|e| TlsError::Certificate(format!("failed to generate key pair: {e}")))?;
@@ -903,6 +958,114 @@ mod tests {
             1,
             "self-signed should have exactly one cert"
         );
+    }
+
+    /// Extracts the Subject Alternative Name entries from a generated cert as
+    /// two sets: DNS names and IP addresses. Parses the leaf DER with
+    /// `x509_parser` and reads the SAN extension.
+    fn extract_sans(cert: &CertificateData) -> (Vec<String>, Vec<std::net::IpAddr>) {
+        use x509_parser::extensions::GeneralName;
+
+        let der = cert.certificate_chain_der().unwrap();
+        let leaf = der.first().expect("at least one cert");
+        let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref()).unwrap();
+        let mut dns = Vec::new();
+        let mut ips = Vec::new();
+        for ext in parsed.extensions() {
+            if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+                ext.parsed_extension()
+            {
+                for name in &san.general_names {
+                    match name {
+                        GeneralName::DNSName(d) => dns.push((*d).to_owned()),
+                        GeneralName::IPAddress(bytes) => {
+                            let ip = match bytes.len() {
+                                4 => {
+                                    let arr: [u8; 4] = (*bytes).try_into().unwrap();
+                                    std::net::IpAddr::V4(arr.into())
+                                }
+                                16 => {
+                                    let arr: [u8; 16] = (*bytes).try_into().unwrap();
+                                    std::net::IpAddr::V6(arr.into())
+                                }
+                                other => panic!("unexpected IP SAN length {other}"),
+                            };
+                            ips.push(ip);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        (dns, ips)
+    }
+
+    #[test]
+    fn generate_self_signed_multi_includes_all_dns_and_ip_sans() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let dns = vec!["localhost".to_owned(), "selfhost.scp.local".to_owned()];
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(71, 249, 150, 234)),
+        ];
+        let cert = generate_self_signed_multi(&dns, &ips).unwrap();
+
+        let (got_dns, got_ips) = extract_sans(&cert);
+        for name in &dns {
+            assert!(
+                got_dns.contains(name),
+                "DNS SAN \'{name}\' must be present, got {got_dns:?}"
+            );
+        }
+        for ip in &ips {
+            assert!(
+                got_ips.contains(ip),
+                "IP SAN \'{ip}\' must be present, got {got_ips:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_self_signed_multi_covers_localhost_and_loopback_ip() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // The minimum self-host SAN set: localhost (DNS) + 127.0.0.1 (IP).
+        let cert = generate_self_signed_multi(
+            &["localhost".to_owned()],
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        )
+        .unwrap();
+        let (dns, ips) = extract_sans(&cert);
+        assert!(dns.contains(&"localhost".to_owned()), "got {dns:?}");
+        assert!(
+            ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "127.0.0.1 IP SAN must be present, got {ips:?}"
+        );
+    }
+
+    #[test]
+    fn generate_self_signed_delegates_to_multi_with_single_dns_san() {
+        // The single-domain helper must still produce a cert whose only DNS
+        // SAN is the domain and which carries no IP SANs.
+        let cert = generate_self_signed("single.example.com").unwrap();
+        let (dns, ips) = extract_sans(&cert);
+        assert_eq!(dns, vec!["single.example.com".to_owned()]);
+        assert!(ips.is_empty(), "single-domain cert should have no IP SANs");
+    }
+
+    #[test]
+    fn generate_self_signed_multi_builds_usable_tls_config() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // A multi-SAN cert must be accepted by the TLS config builder (valid
+        // key + chain), proving it is servable, not just parseable.
+        let cert = generate_self_signed_multi(
+            &["localhost".to_owned()],
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        )
+        .unwrap();
+        let _config = build_tls_server_config(&cert).unwrap();
     }
 
     #[test]
