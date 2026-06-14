@@ -1300,15 +1300,36 @@ async fn run_self_host_with<D: scp_identity::DidMethod + 'static>(
         node.shutdown_token(),
     );
 
+    // -- Renew the NAT port-mapping lease at 50% TTL so the site stays publicly
+    //    reachable past the ~one-hour lease (§10.12.2). `build()` created the
+    //    mapping once via the NAT strategy; without renewal the gateway drops it
+    //    at lease expiry. The loop owns its own cancellation token so it can be
+    //    fully stopped BEFORE the mappings are released on shutdown (renewal must
+    //    never race the teardown `remove()`). The mapper handles only exist under
+    //    the `upnp` feature; otherwise this spawns a harmless no-op, exactly like
+    //    the bare one-shot path. --
+    let renewal_cancel = tokio_util::sync::CancellationToken::new();
+    let renewal_mappers: Vec<Arc<dyn scp_transport::nat::PortMapper>> =
+        [&upnp_mapper, &natpmp_mapper]
+            .into_iter()
+            .filter_map(|m| m.as_ref().map(Arc::clone))
+            .collect();
+    let renewal =
+        scp_node::spawn_self_host_mapping_renewal(renewal_mappers, port, renewal_cancel.clone());
+
     // -- Serve until the process receives a shutdown signal --
     startup::shutdown_signal().await;
     tracing::warn!("shutdown signal received — stopping self-host site refresh and listener");
 
-    // Stop the refresh loop and the background listener, then release the NAT
-    // mappings. `shutdown()` cancels the node's token, which both the refresh
-    // loop and the background HTTP server observe.
+    // Stop the refresh loop and background listener, stop the renewal loop, then
+    // release the NAT mappings. `shutdown()` cancels the node's token, which both
+    // the refresh loop and the background HTTP server observe. The renewal loop
+    // is cancelled and awaited to completion BEFORE `release_self_host_mappings`
+    // so renewal can never re-issue a mapping concurrently with its removal.
     node.shutdown();
     refresh.abort();
+    renewal_cancel.cancel();
+    let _ = renewal.await;
     release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
 
     tracing::info!("scp-node (self-host) stopped");

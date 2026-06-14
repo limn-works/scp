@@ -2109,6 +2109,167 @@ fn tier_to_relay_url(tier: &ReachabilityTier) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NAT port-mapping lease renewal (spec §10.12.2)
+// ---------------------------------------------------------------------------
+
+/// Fraction of the mapping lease TTL at which renewal is attempted.
+///
+/// Per spec §10.12.2: "`UPnP` mappings have a TTL ... The SDK renews at 50% TTL"
+/// and "NAT-PMP/PCP mappings have explicit lifetimes ... The SDK renews at 50%
+/// lifetime." Renewing at half the lease leaves a full half-life of headroom to
+/// retry on transient failure before the mapping actually expires.
+const MAPPING_RENEWAL_FRACTION: f64 = 0.5;
+
+/// Minimum renewal interval, clamping 50%-of-TTL for very short leases so the
+/// renewal loop never busy-spins.
+const MIN_MAPPING_RENEWAL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Lease TTL assumed when a mapper reports an unusable lifetime (zero/unknown).
+///
+/// NAT-PMP/PCP report explicit lifetimes and UPnP-IGD echoes the requested lease,
+/// so in practice the real TTL is always used; this is only the fall-back when a
+/// gateway returns a degenerate value. 3600s (1h) matches the NAT-PMP default
+/// lease requested by [`scp_transport::nat::NatPmpPortMapper`].
+const DEFAULT_MAPPING_LEASE: Duration = Duration::from_hours(1);
+
+/// Backoff before retrying after a failed renewal attempt.
+///
+/// Spec §10.12.2: on renewal failure the host "re-probes" rather than giving up.
+/// A short fixed backoff means a transient gateway hiccup costs at most this
+/// delay; because it is far shorter than a half-life of headroom, the mapping is
+/// not dropped while retries are in flight.
+const MAPPING_RENEWAL_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Computes the renewal interval as [`MAPPING_RENEWAL_FRACTION`] of the lease
+/// TTL, clamped to [`MIN_MAPPING_RENEWAL_INTERVAL`].
+///
+/// A zero (or sub-floor) TTL maps to the floor, never to zero, so the caller
+/// can pass a gateway-reported lease through unconditionally.
+fn mapping_renewal_interval(ttl: Duration) -> Duration {
+    let half = ttl.mul_f64(MAPPING_RENEWAL_FRACTION);
+    if half < MIN_MAPPING_RENEWAL_INTERVAL {
+        MIN_MAPPING_RENEWAL_INTERVAL
+    } else {
+        half
+    }
+}
+
+/// Re-issues the port mapping once, trying the supplied mappers in order
+/// (primary first, fallback second — the same order [`DefaultNatStrategy`] used
+/// to acquire it). Returns the result of the first mapper that succeeds.
+///
+/// NAT-PMP renewal is "re-send the mapping request" (RFC 6886 §3.3) and UPnP-IGD
+/// renewal is "re-add the same mapping"; both are idempotent and extend the lease
+/// rather than creating a duplicate. Issuing the request in acquisition order
+/// keeps the renewal aligned with whichever protocol the gateway actually honors,
+/// even if that changes mid-session (e.g. `UPnP` comes back after a router reboot).
+async fn renew_mapping_once(
+    mappers: &[Arc<dyn scp_transport::nat::PortMapper>],
+    port: u16,
+) -> Option<scp_transport::nat::PortMappingResult> {
+    for mapper in mappers {
+        match mapper.map_port(port).await {
+            Ok(result) => return Some(result),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    port,
+                    "NAT mapping renewal attempt failed for one mapper, trying next"
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Runs the NAT port-mapping renewal loop until `cancel` is triggered.
+///
+/// The loop is the single owner of every post-acquisition renewal for the
+/// self-host node (spec §10.12.2). On each cycle it re-issues the mapping (which
+/// extends the lease and reports the gateway's current TTL), schedules the next
+/// cycle at 50% of that TTL, and logs the outcome. On failure it logs a warning
+/// and retries after a short backoff — a transient gateway error never
+/// permanently drops the mapping; the half-life of headroom absorbs the retry.
+///
+/// The very first action is an immediate renewal so the loop learns the real
+/// lease TTL (the acquiring [`DefaultNatStrategy`] discards it). That first
+/// re-issue is idempotent against the mapping `build()` already created.
+async fn run_mapping_renewal_loop(
+    mappers: Vec<Arc<dyn scp_transport::nat::PortMapper>>,
+    port: u16,
+    cancel: CancellationToken,
+) {
+    if mappers.is_empty() {
+        return;
+    }
+
+    // The granted lease TTL is not observable here: the acquiring
+    // `DefaultNatStrategy` discards it (it returns only the external address).
+    // A self-host gateway may grant a lease far shorter than an hour (spec
+    // §10.12.2 calls 10-60 min typical), so seeding the first interval at 50% of
+    // an *assumed* hour could let a short lease expire before the first renewal.
+    // Instead, schedule the first renewal at the floor: an early, idempotent
+    // re-issue (NAT-PMP re-send / UPnP re-add) extends the mapping `build()`
+    // already created and reports the gateway's real TTL, which then drives every
+    // subsequent interval at the true 50%. The floor keeps this off the hot path.
+    let mut next_interval = MIN_MAPPING_RENEWAL_INTERVAL;
+
+    loop {
+        // Wait for the scheduled interval or cancellation, whichever comes first.
+        tokio::select! {
+            () = cancel.cancelled() => {
+                tracing::debug!(port, "NAT mapping renewal loop cancelled");
+                return;
+            }
+            () = tokio::time::sleep(next_interval) => {}
+        }
+
+        if let Some(result) = renew_mapping_once(&mappers, port).await {
+            let ttl = if result.ttl.is_zero() {
+                DEFAULT_MAPPING_LEASE
+            } else {
+                result.ttl
+            };
+            next_interval = mapping_renewal_interval(ttl);
+            tracing::info!(
+                protocol = %result.protocol,
+                external_addr = %result.external_addr,
+                ttl_secs = ttl.as_secs(),
+                next_renewal_secs = next_interval.as_secs(),
+                port,
+                "NAT port mapping lease renewed (§10.12.2)"
+            );
+        } else {
+            next_interval = MAPPING_RENEWAL_RETRY_BACKOFF;
+            tracing::warn!(
+                port,
+                retry_secs = MAPPING_RENEWAL_RETRY_BACKOFF.as_secs(),
+                "NAT port mapping renewal failed on all mappers; retrying after backoff"
+            );
+        }
+    }
+}
+
+/// Spawns the NAT port-mapping renewal loop, tied to `cancel` for shutdown.
+///
+/// Hold the returned [`JoinHandle`] for the node's lifetime. On shutdown, trigger
+/// `cancel` and `await` the handle so the renewal loop fully stops *before* the
+/// mapping is released — renewal must never race the teardown `remove()`.
+///
+/// The `mappers` slice should contain the retained mapper handles in acquisition
+/// order (primary, then fallback). An empty slice yields a task that returns
+/// immediately, so the default (non-`upnp`) build spawns a harmless no-op exactly
+/// like the bare one-shot path.
+#[must_use]
+pub fn spawn_self_host_mapping_renewal(
+    mappers: Vec<Arc<dyn scp_transport::nat::PortMapper>>,
+    port: u16,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_mapping_renewal_loop(mappers, port, cancel))
+}
+
 /// Handles a detected tier change: updates the DID document, republishes it,
 /// and emits the event only after successful publish. Returns the new URL and
 /// document on success.
@@ -6507,5 +6668,228 @@ mod tests {
         );
 
         node2.shutdown();
+    }
+
+    // -- NAT port-mapping lease renewal (spec §10.12.2) ----------------------
+
+    mod mapping_renewal {
+        use super::super::{
+            MAPPING_RENEWAL_RETRY_BACKOFF, MIN_MAPPING_RENEWAL_INTERVAL, mapping_renewal_interval,
+            run_mapping_renewal_loop,
+        };
+        use scp_transport::nat::{
+            MappingProtocol, PortMapper, PortMappingError, PortMappingResult,
+        };
+        use std::future::Future;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        fn ext_addr() -> SocketAddr {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 8443)
+        }
+
+        /// A `PortMapper` for renewal tests. Counts `map_port` calls and returns
+        /// a programmable sequence of results (cycling on the last entry), so a
+        /// renewal loop can be driven across many cycles without exhausting it.
+        struct CountingMapper {
+            map_calls: AtomicU32,
+            results: Vec<Result<PortMappingResult, PortMappingError>>,
+        }
+
+        impl CountingMapper {
+            fn new(results: Vec<Result<PortMappingResult, PortMappingError>>) -> Self {
+                Self {
+                    map_calls: AtomicU32::new(0),
+                    results,
+                }
+            }
+
+            /// Always succeeds with the given TTL.
+            fn always_ok(ttl: Duration) -> Self {
+                Self::new(vec![Ok(PortMappingResult {
+                    external_addr: ext_addr(),
+                    ttl,
+                    protocol: MappingProtocol::NatPmp,
+                })])
+            }
+
+            fn calls(&self) -> u32 {
+                self.map_calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl PortMapper for CountingMapper {
+            fn map_port(
+                &self,
+                _internal_port: u16,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    let idx = self.map_calls.fetch_add(1, Ordering::SeqCst) as usize;
+                    let pick = idx.min(self.results.len().saturating_sub(1));
+                    self.results[pick].clone()
+                })
+            }
+
+            fn renew(
+                &self,
+                internal_port: u16,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>,
+            > {
+                self.map_port(internal_port)
+            }
+
+            fn remove(
+                &self,
+                _internal_port: u16,
+            ) -> Pin<Box<dyn Future<Output = Result<(), PortMappingError>> + Send + '_>>
+            {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        #[test]
+        fn interval_is_50_percent_of_ttl() {
+            assert_eq!(
+                mapping_renewal_interval(Duration::from_hours(1)),
+                Duration::from_mins(30),
+            );
+            assert_eq!(
+                mapping_renewal_interval(Duration::from_mins(10)),
+                Duration::from_mins(5),
+            );
+        }
+
+        #[test]
+        fn interval_is_floored_for_short_and_zero_ttls() {
+            // 50% of 4s = 2s, below the 5s floor.
+            assert_eq!(
+                mapping_renewal_interval(Duration::from_secs(4)),
+                MIN_MAPPING_RENEWAL_INTERVAL,
+            );
+            // A zero TTL still yields the floor, never zero.
+            assert_eq!(
+                mapping_renewal_interval(Duration::ZERO),
+                MIN_MAPPING_RENEWAL_INTERVAL,
+            );
+        }
+
+        /// The loop re-issues the mapping after the renewal interval, and stops
+        /// renewing once cancelled. Time is injected via tokio's paused clock so
+        /// the test is hermetic (no real 1800s wait).
+        #[tokio::test(start_paused = true)]
+        async fn renews_after_interval_then_stops_on_cancel() {
+            // 100s TTL → second-and-later interval = 50s. The FIRST interval is
+            // the floor (5s); after that the loop learns the real reported TTL.
+            let mapper = Arc::new(CountingMapper::always_ok(Duration::from_secs(100)));
+            let mappers: Vec<Arc<dyn PortMapper>> = vec![mapper.clone()];
+            let cancel = CancellationToken::new();
+
+            let handle = tokio::spawn(run_mapping_renewal_loop(mappers, 8443, cancel.clone()));
+
+            // Let the spawned loop reach its first `sleep` and register the timer
+            // against the paused clock before we advance it.
+            tokio::task::yield_now().await;
+
+            // No renewal before the first interval elapses.
+            assert_eq!(
+                mapper.calls(),
+                0,
+                "must not renew before the first interval"
+            );
+
+            // The first renewal is seeded at the floor (not 50% of an assumed
+            // hour) so a short gateway lease can never expire before the loop
+            // learns the real TTL. Advancing just past the floor fires it.
+            tokio::time::advance(MIN_MAPPING_RENEWAL_INTERVAL + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                mapper.calls() >= 1,
+                "expected the first renewal at the floor interval, got {}",
+                mapper.calls()
+            );
+
+            // Advance past the next interval (now derived from the real 100s TTL
+            // = 50s) and confirm a second renewal fires.
+            let after_first = mapper.calls();
+            tokio::time::advance(Duration::from_secs(50) + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                mapper.calls() > after_first,
+                "expected a second renewal at 50% of the reported TTL"
+            );
+
+            // Cancel and confirm renewals stop: no further map calls after a long
+            // advance.
+            cancel.cancel();
+            let _ = handle.await;
+            let at_cancel = mapper.calls();
+            tokio::time::advance(Duration::from_secs(10_000)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                mapper.calls(),
+                at_cancel,
+                "cancellation must stop all further renewals"
+            );
+        }
+
+        /// A transient renewal failure must NOT permanently drop the mapping: the
+        /// loop retries after the backoff and recovers on the next success.
+        #[tokio::test(start_paused = true)]
+        async fn retries_after_a_failed_renewal() {
+            // First renewal fails, second succeeds. The loop must survive the
+            // failure and renew successfully afterward.
+            let mapper = Arc::new(CountingMapper::new(vec![
+                Err(PortMappingError::Timeout),
+                Ok(PortMappingResult {
+                    external_addr: ext_addr(),
+                    ttl: Duration::from_secs(200),
+                    protocol: MappingProtocol::NatPmp,
+                }),
+            ]));
+            let mappers: Vec<Arc<dyn PortMapper>> = vec![mapper.clone()];
+            let cancel = CancellationToken::new();
+
+            let handle = tokio::spawn(run_mapping_renewal_loop(mappers, 8443, cancel.clone()));
+
+            // Let the loop register its first timer against the paused clock.
+            tokio::task::yield_now().await;
+
+            // Trigger the first (failing) renewal. The first interval is the
+            // floor (seeded so a short lease cannot expire before the first
+            // renewal), so advance just past it.
+            tokio::time::advance(MIN_MAPPING_RENEWAL_INTERVAL + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(mapper.calls(), 1, "first renewal attempt should have run");
+
+            // After failure the loop backs off, then retries. Advance past the
+            // backoff and confirm a second attempt fires (the loop did not give
+            // up).
+            tokio::time::advance(MAPPING_RENEWAL_RETRY_BACKOFF + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                mapper.calls() >= 2,
+                "loop must retry after a failed renewal, not give up; got {} calls",
+                mapper.calls()
+            );
+
+            cancel.cancel();
+            let _ = handle.await;
+        }
+
+        /// With no mappers (the default, non-`upnp` build) the loop is a no-op
+        /// that returns immediately.
+        #[tokio::test(start_paused = true)]
+        async fn empty_mappers_is_noop() {
+            let cancel = CancellationToken::new();
+            // Returns immediately; awaiting must not hang or require cancellation.
+            run_mapping_renewal_loop(Vec::new(), 8443, cancel).await;
+        }
     }
 }
