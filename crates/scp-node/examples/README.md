@@ -47,6 +47,8 @@ tunnel) keep `skip_nat: true` and let the tunnel provide external reachability.
 
 See the full guide: [`.docs/guides/self-hosting-a-website-on-scp.md`](../../../.docs/guides/self-hosting-a-website-on-scp.md).
 
+For the three ways to expose a site publicly (direct IP, outbound tunnel, reverse proxy), see the [deployment recipes guide](../../../.docs/guides/deploying-an-scp-website.md).
+
 ### Turnkey alternative
 
 If you don't need to embed hosting in your own program, the `scp-node` binary

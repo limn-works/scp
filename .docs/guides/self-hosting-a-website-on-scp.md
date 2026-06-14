@@ -1,5 +1,7 @@
 # Self-Hosting a Website on SCP
 
+For concrete public-deployment recipes (direct IP / tunnel / reverse proxy), see [deploying-an-scp-website.md](./deploying-an-scp-website.md).
+
 > **Status:** Living document — written as we build. Started 2026-06-13.
 > **Goal:** Host a real, production website **entirely on SCP** — web server, data
 > layer, networking, identity, and addressing all provided by the protocol, with
