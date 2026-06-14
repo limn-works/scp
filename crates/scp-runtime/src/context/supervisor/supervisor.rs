@@ -1900,7 +1900,21 @@ impl Supervisor {
             }
             | LifecycleCommand::RestoreContextAccessKey {
                 context_id, reply, ..
-            } => {
+            }
+            // `ClearNeedsReconnect` shares the `Result<(), _>` reply
+            // shape of the access-key variants, so it folds into this
+            // unknown-context fallthrough group (surfaces a typed
+            // `ContextNotRegistered` / poison error on the oneshot).
+            | LifecycleCommand::ClearNeedsReconnect { context_id, reply } => {
+                let err = self.lookup_miss_error(&context_id, context_id.clone());
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            // `IssueMlsUpdate` carries a `Result<Vec<u8>, _>` reply
+            // (serialized Commit bytes), so it cannot fold into the
+            // `Result<(), _>` group above and keeps its own arm.
+            LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
                 let err = self.lookup_miss_error(&context_id, context_id.clone());
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
@@ -2659,7 +2673,9 @@ impl Supervisor {
             | QueriesCommand::ContextParams { .. }
             | QueriesCommand::GetRoleState { .. }
             | QueriesCommand::PendingCommits { .. }
-            | QueriesCommand::CommitFault { .. } => {
+            | QueriesCommand::CommitFault { .. }
+            | QueriesCommand::LocalMlsEpoch { .. }
+            | QueriesCommand::NeedsReconnect { .. } => {
                 reply_with_soft_default(cmd);
             }
             // EventLogEntries never reaches this method — `dispatch_query`
@@ -5412,6 +5428,214 @@ impl Supervisor {
         Ok(reconnected)
     }
 
+    // -------------------------------------------------------------------
+    // Reconnection-driver passthroughs (#1540, ADR-029 reconnection-driver
+    // addendum). The FFI/SDK-layer `RelayActorSyncDriver` reaches
+    // actor-owned reconnection state through these thin wrappers — never
+    // by widening `ContextTransportProvider` (which is send-only). Each
+    // builds a typed `ContextCommand`, enqueues it via the matching
+    // dispatch helper, and awaits the actor's typed reply.
+    // -------------------------------------------------------------------
+
+    /// Returns the local MLS epoch for `context_id` (§9.12). `Some(epoch)`
+    /// for an encrypted context; `None` for a broadcast context. Soft
+    /// `None` on unknown context or mailbox failure. Routes through the
+    /// actor mailbox via [`Self::dispatch_query`].
+    ///
+    /// Used by the reconnection driver's Phase 2 (`local_epoch`).
+    #[must_use]
+    pub async fn local_mls_epoch(&self, context_id: &str) -> Option<u64> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::LocalMlsEpoch {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return None;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    /// Returns whether `context_id` is flagged `needs_reconnect`
+    /// (spec §23.11). Soft `false` on unknown context or mailbox failure.
+    /// Routes through the actor mailbox via [`Self::dispatch_query`].
+    #[must_use]
+    pub async fn needs_reconnect(&self, context_id: &str) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::NeedsReconnect {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return false;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
+    /// Builds (forces) a signed local consistency checkpoint for
+    /// `context_id` from the current event-log state (§9.9.3). Routes
+    /// through the actor mailbox via [`Self::dispatch_command`].
+    ///
+    /// Used by the reconnection driver's Phase 3 (`event_log_sync`): the
+    /// caller supplies its locally-controlled `sender_did` + `signing_key`
+    /// exactly as the application send path does.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the handler;
+    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    pub async fn build_local_checkpoint(
+        &self,
+        context_id: &str,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::BuildLocalCheckpoint {
+            context_id: context_id.to_owned(),
+            sender_did: sender_did.clone(),
+            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
+                signing_key,
+            ),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::build_local_checkpoint — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Compares a remote consistency checkpoint against local event-log
+    /// state for equivocation detection (§9.9.3). Routes through the actor
+    /// mailbox via [`Self::dispatch_command`].
+    ///
+    /// Returns the typed
+    /// [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison)
+    /// (`Consistent` / `Behind` / `Ahead` / `Divergent`). A `Divergent`
+    /// result has already emitted `ContextEvent::EquivocationDetected`
+    /// inside the handler. Used by the reconnection driver's Phase 3.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the handler (e.g.
+    /// `MemberNotFound`, `CryptoFailed`);
+    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    pub async fn compare_remote_checkpoint(
+        &self,
+        context_id: &str,
+        remote: scp_event_log::checkpoint::ConsistencyCheckpoint,
+    ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::CompareRemoteCheckpoint {
+            context_id: context_id.to_owned(),
+            remote: Box::new(remote),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::compare_remote_checkpoint — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Clears the `needs_reconnect` flag for `context_id` (spec §23.11)
+    /// after a successful reconnection. Routes through the actor mailbox
+    /// via [`Self::dispatch_lifecycle_command`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the handler;
+    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    pub async fn clear_needs_reconnect(
+        self: &Arc<Self>,
+        context_id: &str,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::ClearNeedsReconnect {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_lifecycle_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::clear_needs_reconnect — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Issues an MLS Update proposal + self-Commit for `context_id`
+    /// (§9.12 step 2). Returns the TLS-serialized Commit bytes for the
+    /// caller to distribute to all members. Routes through the actor
+    /// mailbox via [`Self::dispatch_lifecycle_command`].
+    ///
+    /// Used by the reconnection driver's Phase 5 (`mls_update`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the handler (e.g. `CryptoFailed`
+    /// for a broadcast context or MLS failure);
+    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    pub async fn issue_mls_update(
+        self: &Arc<Self>,
+        context_id: &str,
+    ) -> Result<Vec<u8>, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::IssueMlsUpdate {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_lifecycle_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::issue_mls_update — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Feeds a retrieved Commit / Welcome / application blob into the
+    /// context's actor via the existing `DeliverIncoming` path — which
+    /// decrypts, verifies, and (for Commits) calls `merge_staged_commit`
+    /// to advance the local MLS epoch. Routes through the actor mailbox
+    /// via [`Self::dispatch_command`].
+    ///
+    /// Alias over `DeliverIncoming` for the reconnection driver's Phase 2
+    /// (`epoch_reconciliation`). `Ok(None)` for a control message
+    /// (Commit / Proposal); `Ok(Some((plaintext, sender_did)))` for an
+    /// application message.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the handler (decrypt / signature /
+    /// anti-replay failure); [`ContextError::TransportFailed`] if the
+    /// reply channel is dropped.
+    pub async fn deliver_commit_blob(
+        &self,
+        context_id: &str,
+        envelope_bytes: Vec<u8>,
+    ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::DeliverIncoming {
+            context_id: context_id.to_owned(),
+            envelope_bytes,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::deliver_commit_blob — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Returns the current member count for `context_id`, or `None` if
     /// the context is not registered. Routes through the actor mailbox
     /// via [`Self::dispatch_query`].
@@ -6581,9 +6805,9 @@ impl Supervisor {
             LifecycleCommand::ExportContext { context_id, .. }
             | LifecycleCommand::GenerateContextAccessKey { context_id, .. }
             | LifecycleCommand::RevokeContextAccessKey { context_id, .. }
-            | LifecycleCommand::RestoreContextAccessKey { context_id, .. } => {
-                Some(context_id.as_str())
-            }
+            | LifecycleCommand::RestoreContextAccessKey { context_id, .. }
+            | LifecycleCommand::ClearNeedsReconnect { context_id, .. }
+            | LifecycleCommand::IssueMlsUpdate { context_id, .. } => Some(context_id.as_str()),
             LifecycleCommand::CreateContext { payload, .. } => Some(payload.context_id.as_str()),
             LifecycleCommand::JoinContext { payload, .. } => Some(payload.context_id.as_str()),
             LifecycleCommand::LeaveContext { payload, .. } => Some(payload.context_id.as_str()),
@@ -6791,7 +7015,9 @@ impl Supervisor {
             | QueriesCommand::ContextParams { context_id, .. }
             | QueriesCommand::GetRoleState { context_id, .. }
             | QueriesCommand::PendingCommits { context_id, .. }
-            | QueriesCommand::CommitFault { context_id, .. } => Some(context_id.as_str()),
+            | QueriesCommand::CommitFault { context_id, .. }
+            | QueriesCommand::LocalMlsEpoch { context_id, .. }
+            | QueriesCommand::NeedsReconnect { context_id, .. } => Some(context_id.as_str()),
             QueriesCommand::EventLogEntries { .. } => None,
             #[cfg(feature = "testing")]
             QueriesCommand::GetAccessKey { context_id, .. }
@@ -7023,6 +7249,14 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         // Legacy `commit_fault` returns `None`.
         QueriesCommand::CommitFault { reply, .. } => {
             let _ = reply.send(Ok(None));
+        }
+        // An unknown context has no local MLS epoch.
+        QueriesCommand::LocalMlsEpoch { reply, .. } => {
+            let _ = reply.send(Ok(None));
+        }
+        // An unknown context has nothing to reconnect.
+        QueriesCommand::NeedsReconnect { reply, .. } => {
+            let _ = reply.send(Ok(false));
         }
         // `EventLogEntries` does not take a per-context lock and never
         // reaches this fallback path; the top-level dispatch handles it

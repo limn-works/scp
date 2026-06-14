@@ -726,6 +726,18 @@ impl ContextActor {
                     "messaging::report_degraded_mode (use Supervisor::dispatch_command during commits 8-11)",
                 );
             }
+            ContextCommand::Messaging(MessagingCommand::BuildLocalCheckpoint { reply, .. }) => {
+                let _ = reply.send(Err(ContextError::NotImplemented(
+                    "messaging::build_local_checkpoint (use Supervisor::build_local_checkpoint — actor mailbox)".to_owned(),
+                )));
+            }
+            ContextCommand::Messaging(MessagingCommand::CompareRemoteCheckpoint {
+                reply, ..
+            }) => {
+                let _ = reply.send(Err(ContextError::NotImplemented(
+                    "messaging::compare_remote_checkpoint (use Supervisor::compare_remote_checkpoint — actor mailbox)".to_owned(),
+                )));
+            }
             #[cfg(feature = "testing")]
             ContextCommand::Messaging(MessagingCommand::SeedPeerPseudonym { reply, .. }) => {
                 ack_not_impl(
@@ -848,6 +860,12 @@ impl ContextActor {
             QueriesCommand::EventLogEntries { reply, .. } => {
                 ack_not_impl(reply, "queries::event_log_entries");
             }
+            QueriesCommand::LocalMlsEpoch { reply, .. } => {
+                ack_not_impl(reply, "queries::local_mls_epoch");
+            }
+            QueriesCommand::NeedsReconnect { reply, .. } => {
+                ack_not_impl(reply, "queries::needs_reconnect");
+            }
             #[cfg(feature = "testing")]
             QueriesCommand::GetAccessKey { reply, .. } => {
                 ack_not_impl(reply, "queries::get_access_key");
@@ -958,6 +976,14 @@ impl ContextActor {
             LifecycleCommand::ReportBufferLen { reply } => {
                 let _ = reply.send(0);
             }
+            LifecycleCommand::ClearNeedsReconnect { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::clear_needs_reconnect (use Supervisor::clear_needs_reconnect — actor mailbox)",
+            ),
+            LifecycleCommand::IssueMlsUpdate { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::issue_mls_update (use Supervisor::issue_mls_update — actor mailbox)",
+            ),
         }
     }
 

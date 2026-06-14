@@ -168,6 +168,43 @@ pub fn member_count(state: &PerContextState) -> usize {
     state.membership.count()
 }
 
+/// Returns the local MLS epoch for the context (§9.12).
+///
+/// `Some(epoch)` for an encrypted (MLS) context; `None` for a broadcast
+/// context, which uses the per-author AES-GCM layer and carries no MLS
+/// epoch. Mirrors the broadcast-vs-MLS discrimination used by
+/// [`build_checkpoint`] (`broadcast_context.is_none()` ⇒ MLS).
+///
+/// Consumed by the reconnection driver's Phase 2 (`local_epoch`).
+#[must_use]
+pub const fn local_mls_epoch(state: &PerContextState) -> Option<u64> {
+    if state.broadcast_context.is_some() {
+        None
+    } else {
+        Some(state.epoch.mls_epoch)
+    }
+}
+
+/// Returns whether the context's `EpochState` is flagged
+/// `needs_reconnect` (spec §23.11).
+///
+/// The flag is set on respawn when crypto state could not be restored.
+/// The reconnection driver consumes it at the FFI/SDK layer to decide
+/// which contexts to drive through the six-phase protocol.
+#[must_use]
+pub const fn needs_reconnect(state: &PerContextState) -> bool {
+    state.epoch.needs_reconnect
+}
+
+/// Clears the context's `EpochState.needs_reconnect` flag (spec §23.11).
+///
+/// Mutating — called by the reconnection driver after a context completes
+/// the six-phase protocol successfully so a later restore does not
+/// re-drive the already-synced context.
+pub const fn clear_needs_reconnect(state: &mut PerContextState) {
+    state.epoch.needs_reconnect = false;
+}
+
 /// Reads this actor's current lifecycle
 /// [`ContextState`](scp_protocol::context::ContextState).
 ///

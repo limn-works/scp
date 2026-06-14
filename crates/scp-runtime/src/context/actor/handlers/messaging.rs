@@ -140,6 +140,24 @@ pub async fn dispatch(
             unsupported_features,
             reply,
         ),
+        MessagingCommand::BuildLocalCheckpoint {
+            context_id,
+            sender_did,
+            signing_key,
+            reply,
+        } => handle_build_local_checkpoint(
+            state,
+            deps,
+            &context_id,
+            &sender_did,
+            &signing_key,
+            reply,
+        ),
+        MessagingCommand::CompareRemoteCheckpoint {
+            context_id,
+            remote,
+            reply,
+        } => handle_compare_remote_checkpoint(state, deps, &context_id, &remote, reply),
     }
 }
 
@@ -374,6 +392,72 @@ fn handle_report_degraded_mode(
     );
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
+}
+
+/// Handle [`MessagingCommand::BuildLocalCheckpoint`] (actor-shape).
+///
+/// Forces a signed consistency checkpoint from the current event-log
+/// state via
+/// [`force_create_checkpoint_fields`](crate::context::queries_helpers::force_create_checkpoint_fields),
+/// threading disjoint sub-borrows of the actor-owned state exactly as
+/// the periodic broadcast path does. Synchronous (no transport await);
+/// no `tokio::time::timeout` wrapper required. Always replies
+/// `Ok(checkpoint)`; reports [`Outcome::ok_mutated`] because the
+/// checkpoint ring and counters changed.
+fn handle_build_local_checkpoint(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    sender_did: &scp_identity::DID,
+    signing_key: &crate::context::actor::commands::SigningKeyBytes,
+    reply: crate::context::actor::commands::BuildLocalCheckpointReply,
+) -> Outcome<()> {
+    let sk = signing_key.to_signing_key();
+    let now = deps.clock.now_secs();
+    let broadcast_context_is_none = state.broadcast_context.is_none();
+    let mls_epoch = state.epoch.mls_epoch;
+    let checkpoint = crate::context::queries_helpers::force_create_checkpoint_fields(
+        context_id,
+        broadcast_context_is_none,
+        mls_epoch,
+        &mut state.checkpoint_events_since,
+        &mut state.checkpoint_last_time_secs,
+        &mut state.checkpoints,
+        sender_did,
+        &sk,
+        now,
+        &*deps.event_log,
+    );
+    let _ = reply.send(Ok(checkpoint));
+    Outcome::ok_mutated(())
+}
+
+/// Handle [`MessagingCommand::CompareRemoteCheckpoint`] (actor-shape).
+///
+/// Compares a remote checkpoint against local event-log state via
+/// [`compare_remote_checkpoint`](crate::context::queries_helpers::compare_remote_checkpoint),
+/// which verifies membership + the checkpoint Ed25519 signature, compares
+/// Merkle roots, and emits `ContextEvent::EquivocationDetected` on a
+/// `Divergent` result (§9.9.3). Synchronous; forwards the typed
+/// `Result<CheckpointComparison, ContextError>` verbatim so the caller
+/// sees the `Behind` (#1535 seam) / `Ahead` / `Consistent` / `Divergent`
+/// classification and any `MemberNotFound` / `CryptoFailed` error.
+fn handle_compare_remote_checkpoint(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    reply: crate::context::actor::commands::CompareRemoteCheckpointReply,
+) -> Outcome<()> {
+    let result =
+        crate::context::queries_helpers::compare_remote_checkpoint(state, deps, context_id, remote);
+    let mutated = result.is_ok();
+    let _ = reply.send(result);
+    if mutated {
+        Outcome::ok_mutated(())
+    } else {
+        Outcome::ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
