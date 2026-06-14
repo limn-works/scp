@@ -682,7 +682,11 @@ fn handle_issue_mls_update_actor(
     if mutated {
         Outcome::ok_mutated(())
     } else {
-        Outcome::err_mutated(ContextError::CryptoFailed(format!(
+        // advance_epoch failed — the early `result.is_ok()` branch did NOT
+        // bump the epoch, so no actor-owned state changed. Report an
+        // unmutated error so the actor's post-dispatch persistence does not
+        // treat this turn as dirtying state.
+        Outcome::err(ContextError::CryptoFailed(format!(
             "IssueMlsUpdate failed for context {context_id}"
         )))
     }

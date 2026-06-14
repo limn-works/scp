@@ -91,6 +91,9 @@ pub async fn dispatch(
         MessagingCommand::DrainEvents { context_id, reply } => {
             handle_drain_events(state, &context_id, reply).await
         }
+        MessagingCommand::DrainEquivocationAlerts { context_id, reply } => {
+            handle_drain_equivocation_alerts(state, &context_id, reply).await
+        }
         MessagingCommand::SendPseudonymAnnouncement { payload, reply } => {
             let p = *payload;
             handle_send_pseudonym_announcement(
@@ -323,6 +326,36 @@ async fn handle_drain_events(
     outcome
 }
 
+/// Handle [`MessagingCommand::DrainEquivocationAlerts`] (actor-shape).
+///
+/// Extracts only the `EquivocationDetected` alerts from the actor-owned
+/// receive buffer, leaving every other buffered event in place and in
+/// order for the SDK's normal receive polling. This is the targeted
+/// counterpart to [`handle_drain_events`]: the reconnection driver uses
+/// it so catch-up does not destroy buffered application traffic
+/// (messages, membership changes) that arrived during the sync.
+async fn handle_drain_equivocation_alerts(
+    state: &mut PerContextState,
+    context_id: &str,
+    reply: crate::context::actor::commands::DrainEventsReply,
+) -> Outcome<()> {
+    let drain_fut = async { state.receive_buffer.drain_equivocation_alerts() };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
+        Ok(events) => (Outcome::ok_mutated(()), Ok(events)),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "drain_equivocation_alerts exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
 /// Handle [`MessagingCommand::SendPseudonymAnnouncement`] (actor-shape).
 async fn handle_send_pseudonym_announcement(
     state: &mut PerContextState,
@@ -471,7 +504,8 @@ fn handle_build_local_checkpoint(
 /// Merkle roots, and emits `ContextEvent::EquivocationDetected` on a
 /// `Divergent` result (§9.9.3). Synchronous; forwards the typed
 /// `Result<CheckpointComparison, ContextError>` verbatim so the caller
-/// sees the `Behind` (#1535 seam) / `Ahead` / `Consistent` / `Divergent`
+/// sees the `Behind` (consistency-proof catch-up seam, specified
+/// separately) / `Ahead` / `Consistent` / `Divergent`
 /// classification and any `MemberNotFound` / `CryptoFailed` error.
 fn handle_compare_remote_checkpoint(
     state: &mut PerContextState,

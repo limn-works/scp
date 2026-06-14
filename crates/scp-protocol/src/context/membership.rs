@@ -761,6 +761,14 @@ pub enum ContextEvent {
         remote_sender_did: DID,
         /// Event count at which the divergence was detected.
         event_count: u64,
+        /// The local member's Merkle root at the divergent event count.
+        /// This is the forensic evidence persisted alongside the event so
+        /// the divergent histories are recoverable, not discarded.
+        local_merkle_root: [u8; 32],
+        /// The remote member's (divergent) Merkle root at the same event
+        /// count. Together with `local_merkle_root` this is the proof of
+        /// equivocation: identical counts, different roots (§9.9.3).
+        remote_merkle_root: [u8; 32],
     },
     /// An MLS Commit broadcast exceeded `MAX_COMMIT_RETRIES` or `MAX_COMMIT_AGE_SECS`
     /// and the context has been placed in fault-marker fail-close state
@@ -994,6 +1002,34 @@ impl ReceiveBuffer {
     pub fn drain(&mut self) -> Vec<ContextEvent> {
         self.dropped_since_last_consume = 0;
         self.events.drain(..).collect()
+    }
+
+    /// Removes and returns ONLY the [`ContextEvent::EquivocationDetected`]
+    /// events from the buffer, preserving the order and buffered position
+    /// of every other event.
+    ///
+    /// Unlike [`drain`](Self::drain), this is non-destructive for
+    /// application traffic: messages, `MemberJoined`/`MemberLeft`, and all
+    /// other events buffered during reconnection catch-up stay in the
+    /// buffer for normal SDK receive-polling. Only the security alerts the
+    /// reconnection driver needs are extracted.
+    ///
+    /// The `dropped_since_last_consume` counter is left untouched — pulling
+    /// alerts out is not a consumer-side consumption of the application
+    /// stream, so the overflow accounting must not be reset (that would
+    /// hide a real overflow from the next genuine `drain`/`pop`).
+    pub fn drain_equivocation_alerts(&mut self) -> Vec<ContextEvent> {
+        let mut alerts = Vec::new();
+        let mut keep = VecDeque::with_capacity(self.events.len());
+        for event in self.events.drain(..) {
+            if matches!(event, ContextEvent::EquivocationDetected { .. }) {
+                alerts.push(event);
+            } else {
+                keep.push_back(event);
+            }
+        }
+        self.events = keep;
+        alerts
     }
 
     /// Truncates the buffer to `len` events, removing from the back.

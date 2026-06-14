@@ -678,7 +678,7 @@ pub enum SyncOutcome {
 // to the actor's live event-log provider and the key resolver. The previous
 // pure `compare_checkpoints` free function that lived here has been removed: it
 // had zero production callers, and its `epoch is None ⇒ FullyCaughtUp`
-// short-circuit (the #1216 defect) is not present in the runtime path, which
+// short-circuit (the historical defect) is not present in the runtime path, which
 // keys equivocation strictly on equal-event-count-different-root per §9.9.3.
 
 // ---------------------------------------------------------------------------

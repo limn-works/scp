@@ -5429,7 +5429,7 @@ impl Supervisor {
     }
 
     // -------------------------------------------------------------------
-    // Reconnection-driver passthroughs (#1540, ADR-029 reconnection-driver
+    // Reconnection-driver passthroughs (ADR-029 reconnection-driver
     // addendum). The FFI/SDK-layer `RelayActorSyncDriver` reaches
     // actor-owned reconnection state through these thin wrappers — never
     // by widening `ContextTransportProvider` (which is send-only). Each
@@ -5771,6 +5771,32 @@ impl Supervisor {
     pub async fn drain_events(&self, context_id: &str) -> Vec<ContextEvent> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::DrainEvents {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_command(context_id, cmd).await.is_err() {
+            return Vec::new();
+        }
+        match rx.await {
+            Ok(Ok(events)) => events,
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        }
+    }
+
+    /// Drains ONLY the `EquivocationDetected` alerts from `context_id`'s
+    /// receive buffer via the actor mailbox, leaving every other buffered
+    /// event in place and in order.
+    ///
+    /// The reconnection driver uses this instead of [`drain_events`] so
+    /// that application traffic (messages, membership changes) buffered
+    /// during catch-up is preserved for the SDK's normal receive polling
+    /// rather than being silently discarded. Same soft-default contract as
+    /// [`drain_events`]: returns an empty `Vec` on unknown context, mailbox
+    /// enqueue failure, or dropped reply channel.
+    #[must_use]
+    pub async fn drain_equivocation_alerts(&self, context_id: &str) -> Vec<ContextEvent> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::DrainEquivocationAlerts {
             context_id: context_id.to_owned(),
             reply: tx,
         };

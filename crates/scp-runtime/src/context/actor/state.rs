@@ -937,6 +937,16 @@ pub struct PerContextState {
     /// `state::PerContextState::checkpoints`.
     pub checkpoints: Vec<ConsistencyCheckpoint>,
 
+    /// Highest `(event_count, timestamp)` observed per remote checkpoint
+    /// sender DID (§9.9.3 replay defense). A remote checkpoint that is not
+    /// strictly newer than the last-seen pair for that sender is a no-op
+    /// in `compare_remote_checkpoint`: it neither re-appends an
+    /// `EquivocationDetected` event nor re-bumps `checkpoint_events_since`.
+    /// Without this, a relay can replay one signed divergent checkpoint
+    /// unboundedly to inflate the event log and flood the receive buffer
+    /// with duplicate alerts.
+    pub last_seen_remote_checkpoint: HashMap<DID, (u64, u64)>,
+
     // -----------------------------------------------------------------
     // New actor-shape fields (no legacy equivalent)
     // -----------------------------------------------------------------
@@ -1111,6 +1121,7 @@ impl PerContextState {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             checkpoints: Vec::new(),
+            last_seen_remote_checkpoint: HashMap::new(),
             send_tracker: SendSequenceTracker::new(),
             recv_tracker: RecvSequenceTracker::new(),
             saga_pending: HashMap::new(),
@@ -1322,6 +1333,7 @@ mod tests {
             checkpoint_events_since,
             checkpoint_last_time_secs,
             checkpoints,
+            last_seen_remote_checkpoint,
             send_tracker,
             recv_tracker,
             saga_pending,
@@ -1375,6 +1387,7 @@ mod tests {
         assert_eq!(checkpoint_events_since, 0);
         assert_eq!(checkpoint_last_time_secs, 0);
         assert!(checkpoints.is_empty());
+        assert!(last_seen_remote_checkpoint.is_empty());
 
         // New actor-shape fields.
         assert_eq!(send_tracker.last_issued(), 0);
@@ -1422,6 +1435,7 @@ mod tests {
             checkpoint_events_since: _,
             checkpoint_last_time_secs: _,
             checkpoints: _,
+            last_seen_remote_checkpoint: _,
             send_tracker: _,
             recv_tracker: _,
             saga_pending: _,

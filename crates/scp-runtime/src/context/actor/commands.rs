@@ -257,6 +257,33 @@ pub enum MessagingCommand {
         reply: DrainEventsReply,
     },
 
+    /// Drain ONLY the [`ContextEvent::EquivocationDetected`](scp_protocol::context::membership::ContextEvent::EquivocationDetected)
+    /// alerts from the per-context receive buffer, leaving every other
+    /// buffered event in place and in order.
+    ///
+    /// The reconnection driver (FFI/SDK layer) needs the equivocation
+    /// alerts surfaced during catch-up to populate its report, but the
+    /// receive buffer is ALSO the SDK's only application-delivery queue.
+    /// Using the total [`DrainEvents`](Self::DrainEvents) for that purpose
+    /// would silently discard every message / `MemberJoined` / etc. that
+    /// arrived during catch-up. This command partitions the buffer in the
+    /// actor turn and returns only the alerts, preserving the application
+    /// stream for the SDK's normal receive polling.
+    ///
+    /// # Mutation classification
+    ///
+    /// Mutating — like [`DrainEvents`](Self::DrainEvents) it edits the
+    /// receive buffer (removes the alert subset). Routed through the
+    /// messaging dispatch alongside the other receive-buffer mutations.
+    DrainEquivocationAlerts {
+        /// Context identifier.
+        context_id: String,
+        /// Oneshot reply channel. See [`DrainEventsReply`] — same type
+        /// (a vector of `ContextEvent`), but the returned events are all
+        /// `EquivocationDetected`.
+        reply: DrainEventsReply,
+    },
+
     /// Send the local member's pseudonym announcement (§9.10.4) to the
     /// other members of a context.
     ///
@@ -374,7 +401,8 @@ pub enum MessagingCommand {
     /// The reply carries the typed
     /// [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison)
     /// (`Consistent` / `Behind` / `Ahead` / `Divergent`). The `Behind`
-    /// arm is the post-offline catch-up seam (#1535). Used by the
+    /// arm is the post-offline catch-up seam — the consistency-proof
+    /// catch-up integration point, specified separately. Used by the
     /// reconnection driver's Phase 3.
     CompareRemoteCheckpoint {
         /// Context identifier.

@@ -90,6 +90,7 @@ use scp_identity::DID;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::roles::{Capability, ContextRoleState, RoleAssignment};
 use scp_protocol::context::{ContextError, ContextParams};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::context::actor::deps::ActorDeps;
@@ -707,6 +708,41 @@ fn build_checkpoint(
     }
 }
 
+/// Fail-closed authenticity gate for a remote checkpoint: the sender must
+/// be a current member and the checkpoint's Ed25519 signature must verify
+/// against the sender's resolved public key.
+///
+/// # Errors
+///
+/// - [`ContextError::MemberNotFound`] if the sender is not a member.
+/// - [`ContextError::CryptoFailed`] if the public key cannot be resolved
+///   or the signature verification fails.
+fn verify_remote_checkpoint_authenticity(
+    state: &PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+) -> Result<(), ContextError> {
+    if !state.membership.contains(remote.sender_did.as_ref()) {
+        return Err(ContextError::MemberNotFound(format!(
+            "checkpoint sender {} is not a member of context {context_id}",
+            remote.sender_did
+        )));
+    }
+
+    let sender_pk = (deps.key_resolver)(&remote.sender_did).ok_or_else(|| {
+        ContextError::CryptoFailed(format!(
+            "cannot resolve public key for checkpoint sender {}",
+            remote.sender_did
+        ))
+    })?;
+    scp_event_log::checkpoint::verify_checkpoint_signature(remote, &sender_pk).map_err(|reason| {
+        ContextError::CryptoFailed(format!(
+            "checkpoint signature verification failed: {reason}"
+        ))
+    })
+}
+
 /// Compares a remote checkpoint against local event-log state for
 /// equivocation detection (§9.9.3, ADR-011 AC-8).
 ///
@@ -727,28 +763,8 @@ pub fn compare_remote_checkpoint(
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
 ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
-    // Verify the sender is a member of this context.
-    if !state.membership.contains(remote.sender_did.as_ref()) {
-        return Err(ContextError::MemberNotFound(format!(
-            "checkpoint sender {} is not a member of context {context_id}",
-            remote.sender_did
-        )));
-    }
-
-    // Verify checkpoint Ed25519 signature.
-    let sender_pk = (deps.key_resolver)(&remote.sender_did).ok_or_else(|| {
-        ContextError::CryptoFailed(format!(
-            "cannot resolve public key for checkpoint sender {}",
-            remote.sender_did
-        ))
-    })?;
-    scp_event_log::checkpoint::verify_checkpoint_signature(remote, &sender_pk).map_err(
-        |reason| {
-            ContextError::CryptoFailed(format!(
-                "checkpoint signature verification failed: {reason}"
-            ))
-        },
-    )?;
+    // Membership + Ed25519 signature gate (fail-closed before any compare).
+    verify_remote_checkpoint_authenticity(state, deps, context_id, remote)?;
 
     let context_id_bytes = state::context_id_to_bytes(context_id);
     let local_root = deps
@@ -770,7 +786,12 @@ pub fn compare_remote_checkpoint(
     // sequences, per second-preimage resistance of SHA-256).
     let comparison = match local_count.cmp(&remote.event_count) {
         std::cmp::Ordering::Equal => {
-            if local_root == remote.merkle_root {
+            // Constant-time root comparison: Merkle roots are integrity
+            // values and the comparison gates a security-sensitive
+            // equivocation decision, so match the `ct_eq` idiom the event
+            // log's own consistency checks use (export_import.rs,
+            // event_log.rs) rather than a short-circuiting `==`.
+            if bool::from(local_root.ct_eq(&remote.merkle_root)) {
                 scp_event_log::checkpoint::CheckpointComparison::Consistent
             } else {
                 scp_event_log::checkpoint::CheckpointComparison::Divergent {
@@ -779,26 +800,20 @@ pub fn compare_remote_checkpoint(
             }
         }
         std::cmp::Ordering::Less => {
-            // #1535 SEAM — same-log catch-up integrity (§23.7 step 3).
+            // Local is BEHIND the remote (fewer events) — the EXPECTED
+            // post-offline case, NOT equivocation (which is keyed strictly
+            // on equal count + different root, per the `Equal` arm above,
+            // §9.9.3). Surface `Behind` so the caller drives catch-up.
             //
-            // The local member is behind the remote (fewer events at the same
-            // context). This is the EXPECTED case after an offline period and
-            // is NOT equivocation: equivocation is keyed strictly on equal
-            // event count with different Merkle root (the `Equal` arm above,
-            // per §9.9.3). Here the member must fetch the missing events and,
-            // to confirm the fetched suffix is a genuine continuation of its
-            // own history (the relay did not rewrite already-held events),
-            // verify a Merkle CONSISTENCY proof that its last-known root is a
-            // prefix of the remote root (RFC 6962 §2.1.2; ADR-011).
-            //
-            // The consistency-proof verification wires here in #1535. Its
-            // building blocks are already reachable from the actor:
-            // [`prove_event_consistency`] generates the proof between two tree
-            // sizes and [`verify_event_consistency`] checks it. This branch is
-            // intentionally left as the named integration point — #1535 owns
-            // the event-range fetch + proof exchange that consumes them. Do NOT
-            // implement that fetch here; surfacing `Behind` lets the caller
-            // drive catch-up.
+            // CONSISTENCY-PROOF CATCH-UP SEAM (§23.7 step 3, specified
+            // separately): to confirm the fetched suffix genuinely extends
+            // this member's own history (the relay did not rewrite held
+            // events), the catch-up path must verify a Merkle CONSISTENCY
+            // proof that the last-known root is a prefix of the remote root
+            // (RFC 6962 §2.1.2; ADR-011). `prove_event_consistency` /
+            // `verify_event_consistency` are the reachable building blocks;
+            // the event-range fetch + proof exchange that consumes them is
+            // specified separately. Do NOT implement that fetch here.
             scp_event_log::checkpoint::CheckpointComparison::Behind {
                 missing_events: remote.event_count - local_count,
             }
@@ -808,46 +823,114 @@ pub fn compare_remote_checkpoint(
         },
     };
 
-    // Emit EquivocationDetected event when divergent.
+    // Emit (and persist) an EquivocationDetected event when divergent —
+    // deduped per distinct divergent checkpoint (replay defense).
     if matches!(
         comparison,
         scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
     ) {
-        tracing::warn!(
+        record_equivocation_if_fresh(
+            state,
+            deps,
             context_id,
-            remote_sender = %remote.sender_did,
-            event_count = remote.event_count,
-            "relay equivocation detected — divergent Merkle roots at same event count (§9.9.3)"
-        );
-        if let Err(e) = deps.event_log.append_context_event(
             &context_id_bytes,
-            "EquivocationDetected",
-            remote.sender_did.as_ref(),
-        ) {
-            tracing::warn!(
-                context_id,
-                "failed to append EquivocationDetected to event log: {e}"
-            );
-        }
-        state.checkpoint_events_since += 1;
-        let event = ContextEvent::EquivocationDetected {
-            context_id: context_id.to_owned(),
-            remote_sender_did: remote.sender_did.clone(),
-            event_count: remote.event_count,
-        };
-        state::emit_event_into(
-            &mut state.receive_buffer,
-            event,
-            context_id,
-            deps.event_tx.as_ref(),
+            remote,
+            local_root,
         );
     }
 
     Ok(comparison)
 }
 
+/// Records a divergent remote checkpoint as an `EquivocationDetected`
+/// event (receive buffer + event-log append with forensic roots), but
+/// only ONCE per distinct divergent checkpoint per remote sender.
+///
+/// A malicious relay can replay one signed divergent checkpoint
+/// indefinitely; without idempotency that replay would append an
+/// unbounded run of `EquivocationDetected` events (inflating the Merkle
+/// log and `checkpoint_events_since`) and flood the receive buffer with
+/// duplicate alerts (§9.9.3 replay defense). We track the highest
+/// `(event_count, timestamp)` seen per remote sender DID and treat any
+/// checkpoint not strictly newer than the last-seen pair as a no-op.
+fn record_equivocation_if_fresh(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    local_root: [u8; 32],
+) {
+    let incoming = (remote.event_count, remote.timestamp);
+    let is_fresh = state
+        .last_seen_remote_checkpoint
+        .get(&remote.sender_did)
+        .is_none_or(|last_seen| incoming > *last_seen);
+
+    if !is_fresh {
+        // Replay / stale re-presentation of an already-recorded divergent
+        // checkpoint: the signature already verified, so this is an
+        // authentic (but duplicate) artifact — silently absorb it.
+        tracing::debug!(
+            context_id,
+            remote_sender = %remote.sender_did,
+            event_count = remote.event_count,
+            "duplicate/stale divergent checkpoint suppressed (replay defense, §9.9.3)"
+        );
+        return;
+    }
+
+    state
+        .last_seen_remote_checkpoint
+        .insert(remote.sender_did.clone(), incoming);
+
+    tracing::warn!(
+        context_id,
+        remote_sender = %remote.sender_did,
+        event_count = remote.event_count,
+        "relay equivocation detected — divergent Merkle roots at same event count (§9.9.3)"
+    );
+
+    // Persist the divergent roots in the event-log payload so the
+    // conflicting histories are recoverable for forensics — the bare event
+    // name + sender DID alone would discard the evidence (§9.9.4: security
+    // events MUST NOT be silently discarded).
+    let payload = serde_json::json!({
+        "remote_sender_did": remote.sender_did.as_ref(),
+        "event_count": remote.event_count,
+        "local_merkle_root": hex::encode(local_root),
+        "remote_merkle_root": hex::encode(remote.merkle_root),
+        "remote_checkpoint_timestamp": remote.timestamp,
+    });
+    if let Err(e) = deps.event_log.append_context_event_with_payload(
+        context_id_bytes,
+        "EquivocationDetected",
+        remote.sender_did.as_ref(),
+        Some(&payload),
+    ) {
+        tracing::warn!(
+            context_id,
+            "failed to append EquivocationDetected to event log: {e}"
+        );
+    }
+    state.checkpoint_events_since += 1;
+    let event = ContextEvent::EquivocationDetected {
+        context_id: context_id.to_owned(),
+        remote_sender_did: remote.sender_did.clone(),
+        event_count: remote.event_count,
+        local_merkle_root: local_root,
+        remote_merkle_root: remote.merkle_root,
+    };
+    state::emit_event_into(
+        &mut state.receive_buffer,
+        event,
+        context_id,
+        deps.event_tx.as_ref(),
+    );
+}
+
 // ===========================================================================
-// Merkle proof operations (ADR-011, #1535) — actor-shape
+// Merkle proof operations (ADR-011) — actor-shape
 // ===========================================================================
 
 /// Returns a Merkle inclusion proof for the event at `leaf_index` in

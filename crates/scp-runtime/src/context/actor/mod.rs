@@ -684,67 +684,7 @@ impl ContextActor {
         }
 
         match cmd {
-            ContextCommand::Messaging(MessagingCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "messaging");
-            }
-            ContextCommand::Messaging(MessagingCommand::SendMessage { reply, .. }) => {
-                // Skeleton dispatch does NOT own a ContextManager to
-                // delegate to — the shim routes messaging through
-                // `Supervisor::dispatch_command` (commit 8). Any
-                // caller that mistakenly routes a SendMessage through
-                // the actor mailbox during the migration window gets a
-                // typed error rather than a hang.
-                ack_not_impl(
-                    reply,
-                    "messaging::send_message (use Supervisor::dispatch_command during commits 8-11)",
-                );
-            }
-            ContextCommand::Messaging(MessagingCommand::DeliverIncoming { reply, .. }) => {
-                ack_not_impl(
-                    reply,
-                    "messaging::deliver_incoming (use Supervisor::dispatch_command during commits 8-11)",
-                );
-            }
-            ContextCommand::Messaging(MessagingCommand::DrainEvents { reply, .. }) => {
-                ack_not_impl(
-                    reply,
-                    "messaging::drain_events (use Supervisor::dispatch_drain_events_command during commits 8-11)",
-                );
-            }
-            ContextCommand::Messaging(MessagingCommand::SendPseudonymAnnouncement {
-                reply,
-                ..
-            }) => {
-                ack_not_impl(
-                    reply,
-                    "messaging::send_pseudonym_announcement (use Supervisor::dispatch_command during commits 8-11)",
-                );
-            }
-            ContextCommand::Messaging(MessagingCommand::ReportDegradedMode { reply, .. }) => {
-                ack_not_impl(
-                    reply,
-                    "messaging::report_degraded_mode (use Supervisor::dispatch_command during commits 8-11)",
-                );
-            }
-            ContextCommand::Messaging(MessagingCommand::BuildLocalCheckpoint { reply, .. }) => {
-                let _ = reply.send(Err(ContextError::NotImplemented(
-                    "messaging::build_local_checkpoint (use Supervisor::build_local_checkpoint — actor mailbox)".to_owned(),
-                )));
-            }
-            ContextCommand::Messaging(MessagingCommand::CompareRemoteCheckpoint {
-                reply, ..
-            }) => {
-                let _ = reply.send(Err(ContextError::NotImplemented(
-                    "messaging::compare_remote_checkpoint (use Supervisor::compare_remote_checkpoint — actor mailbox)".to_owned(),
-                )));
-            }
-            #[cfg(feature = "testing")]
-            ContextCommand::Messaging(MessagingCommand::SeedPeerPseudonym { reply, .. }) => {
-                ack_not_impl(
-                    reply,
-                    "messaging::seed_peer_pseudonym (test-only — use Supervisor::dispatch_command)",
-                );
-            }
+            ContextCommand::Messaging(sub) => Self::skeleton_dispatch_messaging(sub),
             ContextCommand::Lifecycle(sub) => Self::skeleton_dispatch_lifecycle(sub),
             ContextCommand::Governance(sub) => Self::skeleton_dispatch_governance(sub),
             ContextCommand::Broadcast(sub) => Self::skeleton_dispatch_broadcast(sub),
@@ -803,6 +743,77 @@ impl ContextActor {
             ContextCommand::LifecycleControl(LifecycleControlCommand::TestInducePanic {
                 ..
             }) => {}
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::Messaging`].
+    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
+    /// stays below the `too_many_lines` clippy threshold (mirrors the
+    /// per-domain `skeleton_dispatch_*` helpers). Each arm acks the
+    /// variant's embedded oneshot with `Err(NotImplemented)`: the real
+    /// messaging path runs through `Supervisor::dispatch_command` /
+    /// `Supervisor::drain_*`, not the actor's skeleton mailbox.
+    fn skeleton_dispatch_messaging(sub: MessagingCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match sub {
+            MessagingCommand::Placeholder { reply } => ack_not_impl(reply, "messaging"),
+            MessagingCommand::SendMessage { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::send_message (use Supervisor::dispatch_command)",
+                );
+            }
+            MessagingCommand::DeliverIncoming { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::deliver_incoming (use Supervisor::dispatch_command)",
+                );
+            }
+            MessagingCommand::DrainEvents { reply, .. }
+            | MessagingCommand::DrainEquivocationAlerts { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::drain_* (use Supervisor::drain_events / drain_equivocation_alerts)",
+                );
+            }
+            MessagingCommand::SendPseudonymAnnouncement { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::send_pseudonym_announcement (use Supervisor::dispatch_command)",
+                );
+            }
+            MessagingCommand::ReportDegradedMode { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::report_degraded_mode (use Supervisor::dispatch_command)",
+                );
+            }
+            MessagingCommand::BuildLocalCheckpoint { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::build_local_checkpoint (use Supervisor — actor mailbox)",
+                );
+            }
+            MessagingCommand::CompareRemoteCheckpoint { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::compare_remote_checkpoint (use Supervisor — actor mailbox)",
+                );
+            }
+            #[cfg(feature = "testing")]
+            MessagingCommand::SeedPeerPseudonym { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::seed_peer_pseudonym (test-only — use Supervisor::dispatch_command)",
+                );
+            }
         }
     }
 

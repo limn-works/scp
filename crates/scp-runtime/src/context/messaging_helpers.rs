@@ -580,7 +580,7 @@ fn ingest_pseudonym_announcement(
 // ---------------------------------------------------------------------------
 
 /// Runs post-delivery governance logic for a single buffered/drained
-/// message. Bug fix (#1534): velocity, event-log append, consequence
+/// message. Bug fix: velocity, event-log append, consequence
 /// evaluation, and checkpoint increment apply to buffered messages too.
 #[allow(clippy::too_many_arguments)]
 pub fn run_buffered_post_delivery(
