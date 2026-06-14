@@ -47,8 +47,9 @@ pub use projection::{
     DeployManifest, DeployManifestEntry, PathEntry, ProjectedContext, SiteConfig,
 };
 pub use self_host::{
-    Asset, DeploySiteParams, SelfHostDeployer, SelfHostError, content_type_for, deploy_site,
-    embedded_assets, routing_id_hex,
+    Asset, DeploySiteParams, DhtMode, HostSiteError, HostSiteOptions, HostSiteReady,
+    SelfHostDeployer, SelfHostError, content_type_for, deploy_site, embedded_assets, host_site,
+    host_site_until, routing_id_hex,
 };
 
 // ---------------------------------------------------------------------------
