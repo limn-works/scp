@@ -400,8 +400,17 @@ fn handle_report_degraded_mode(
 /// state via
 /// [`force_create_checkpoint_fields`](crate::context::queries_helpers::force_create_checkpoint_fields),
 /// threading disjoint sub-borrows of the actor-owned state exactly as
-/// the periodic broadcast path does. Synchronous (no transport await);
-/// no `tokio::time::timeout` wrapper required. Always replies
+/// the periodic broadcast path does, then broadcasts it to peers via
+/// [`send_checkpoint`](crate::context::messaging_helpers::send_checkpoint)
+/// (best-effort — a transport failure is logged but does not fail the
+/// command). The send happens inside the actor turn so the FFI-layer
+/// reconnection driver never needs `send_checkpoint` (a `pub(crate)`
+/// helper) across the crate boundary: Phase 3 (`event_log_sync`) is one
+/// mailbox round-trip — build + broadcast — and the reply carries the
+/// built checkpoint so the driver can record it.
+///
+/// Synchronous (the send body has no awaits); no
+/// `tokio::time::timeout` wrapper required. Always replies
 /// `Ok(checkpoint)`; reports [`Outcome::ok_mutated`] because the
 /// checkpoint ring and counters changed.
 fn handle_build_local_checkpoint(
@@ -428,6 +437,28 @@ fn handle_build_local_checkpoint(
         now,
         &*deps.event_log,
     );
+
+    // Broadcast the freshly-built checkpoint to peers over the regular
+    // encrypted inner-envelope pipeline (§9.9.3). Best-effort: a transport
+    // failure is logged but never fails the build (the reconnection driver
+    // still receives + records the local checkpoint). Mirrors the
+    // periodic `create_and_broadcast_checkpoint_if_due` contract.
+    if let Err(e) = crate::context::messaging_helpers::send_checkpoint(
+        deps,
+        state,
+        context_id,
+        sender_did,
+        &sk,
+        &checkpoint,
+    ) {
+        tracing::warn!(
+            context_id,
+            error = %e,
+            "failed to broadcast forced consistency checkpoint to peers \
+             (best-effort; build not rolled back) (§9.9.3)"
+        );
+    }
+
     let _ = reply.send(Ok(checkpoint));
     Outcome::ok_mutated(())
 }
