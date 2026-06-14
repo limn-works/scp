@@ -1667,8 +1667,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       // At the raw NAPI surface, the checkpoint struct keys use napi
       // camelCase directly (`merkleRoot`). The Bridge wrapper in
-      // `internal/native.ts` remaps to the SDK-facing `root`. Callers
-      // of the SCP class see the NAPI shape as-is.
+      // `internal/native.ts` surfaces the same `merkleRoot` key on the
+      // SDK-facing `Checkpoint`. Callers of the SCP class see the NAPI
+      // shape as-is.
       const checkpoint = scp.eventLogCheckpoint(ctx._rawHandle, identity, 0) as {
         merkleRoot: string;
         eventCount: number;

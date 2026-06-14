@@ -725,41 +725,31 @@ export interface Proof {
   readonly details: Readonly<Record<string, unknown>>;
 }
 
-/** A consistency checkpoint from the event log. */
+/**
+ * A consistency checkpoint from the event log.
+ *
+ * Every runtime — NAPI (Node/Bun) **and** WASM (browser) — signs the canonical
+ * checkpoint payload in-process with the identity's `#active` Ed25519 key, so a
+ * checkpoint always carries a hex `signature` over the canonical checkpoint
+ * hash. WASM identities are Rust-custodied; the private key never crosses the
+ * FFI boundary (ADR-006). The field set matches the flat signed checkpoint
+ * returned by the Python (`SignedCheckpoint`), Swift, and Kotlin SDKs.
+ */
 export interface Checkpoint {
-  /** The Merkle root hash as a hex string. */
-  readonly root: string;
+  /** The context this checkpoint belongs to. */
+  readonly contextId: string;
+  /** The DID of the member who generated this checkpoint. */
+  readonly senderDid: string;
+  /** The Merkle root hash at checkpoint time, as a hex string. */
+  readonly merkleRoot: string;
   /** The number of events in the log at checkpoint time. */
   readonly eventCount: number;
+  /** Current MLS epoch. `undefined` for Broadcast contexts. */
+  readonly epoch?: number | undefined;
   /** Timestamp of the checkpoint (seconds since epoch). */
   readonly timestamp: number;
-  /**
-   * Ed25519 signature over the canonical checkpoint fields (hex), present only
-   * on the NATIVE (NAPI / Node-Bun) backend.
-   *
-   * On the native runtime the Rust bridge holds the identity's signing key in
-   * process and produces a finished signature, which this SDK surfaces here.
-   * On the WASM/browser runtime this field is ABSENT; the bridge instead
-   * returns the unsigned {@link Checkpoint.signingPayloadHash} for JS-side
-   * signing. `signature` and `signingPayloadHash` are the two mutually
-   * exclusive per-runtime surfaces: native = signed (`signature`), WASM =
-   * unsigned payload hash (`signingPayloadHash`).
-   */
-  readonly signature?: string;
-  /**
-   * SHA-256 hash of the canonical signing payload (hex), present only on the
-   * WASM/browser backend.
-   *
-   * On the WASM runtime, the Rust bridge cannot access the identity's private
-   * key (ADR-006/ADR-034: signing is a JS-side responsibility), so it returns
-   * the unsigned signable payload hash here instead of a finished signature. A
-   * JS SDK is expected to sign this hash via WebCrypto/SubtleCrypto to produce
-   * a signed checkpoint; that signing step is not yet implemented in the TS
-   * SDK. This is the ADR-048 §7b cross-bridge semantic divergence for
-   * `event_log_checkpoint*`: native bridges (PyO3/NAPI/UniFFI) sign in-process
-   * and never populate this field; WASM populates it and produces no signature.
-   */
-  readonly signingPayloadHash?: string;
+  /** Ed25519 signature over the canonical checkpoint hash (hex, 64 bytes / 128 chars). */
+  readonly signature: string;
 }
 
 /** Filter parameters for event log queries. */

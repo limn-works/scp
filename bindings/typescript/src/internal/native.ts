@@ -1139,19 +1139,27 @@ export function createNativeBridge(scp: SCP): Bridge {
           did: string,
           epoch: number,
         ) => Promise<{
+          contextId: string;
+          senderDid: string;
           merkleRoot: string;
           eventCount: number;
+          epoch: number | null;
           timestamp: number;
           signature: string;
         }>
       )(handle, identityDid, epoch);
       return {
-        root: raw.merkleRoot,
+        contextId: raw.contextId,
+        senderDid: raw.senderDid,
+        merkleRoot: raw.merkleRoot,
         eventCount: raw.eventCount,
+        // The NAPI bridge surfaces `epoch` as `null` for Broadcast contexts;
+        // normalize to `undefined` to match the `Checkpoint` optional field.
+        epoch: raw.epoch ?? undefined,
         timestamp: raw.timestamp,
-        // Native bridges sign the checkpoint in-process; surface the Ed25519
-        // signature (hex). The WASM backend has no `signature` and returns
-        // `signingPayloadHash` instead (see `Checkpoint` type doc).
+        // The NAPI bridge signs the checkpoint in-process; surface the Ed25519
+        // signature (hex). WASM signs the same way (see the `Checkpoint` type
+        // doc and `internal/wasm.ts`).
         signature: raw.signature,
       };
     },
