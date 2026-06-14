@@ -18,15 +18,26 @@ let node = Node::start(NodeConfig {
 ```
 
 - **One config object** carries every parameter as a named field. Order is irrelevant; the model reads field names, not positions.
-- **One entry function** — `Thing::start(config)` (or `Thing::create(config)`). No fluent chains, no staged transitions, no `.build()` terminator.
+- **One entry function** — `Thing::start(config)` or `Thing::create(config)` per the entry-verb rule below. No fluent chains, no staged transitions, no `.build()` terminator.
 - **Required choices are required fields.** What the type system must guarantee is encoded as non-`Option` fields (often enums), not as phantom typestate ordering. The compiler still enforces them; the author can still read them.
 - **The shape is identical in all five languages.** The same field names, the same enum variants, the same required/optional split. A model that has written the Python config can write the Swift config.
 
 The measure of success (from the tenet): *an agent writes correct code from the type signature plus one example, with no compile-retry loop.*
 
+## The entry-verb rule
+
+The entry function's verb is **not** left to per-type discretion. There are exactly two verbs, chosen mechanically by what the entry point produces:
+
+- **`Thing::start(config)`** — for anything that **spawns a running server/runtime** (a live process with background tasks, listeners, or a runtime loop): **Node**, **Relay**.
+- **`Thing::create(config)`** — for **value/handle construction** (a value or handle with no spawned runtime of its own): **Identity**, **Context**.
+
+This fixes the verb at every entry point: `Node::start`, `Relay::start`, `Identity::create`, `Context::create`. `host_site` keeps its verb-named free-function form as the fail-safe sugar tier over `Node::start`.
+
+For Relay, the SDK-facing entry is **`Relay::start(config)`**. The existing low-level `RelayServer::new(config, storage)` is the internal constructor that `Relay::start` wraps; `RelayServer::new` is therefore **not** part of the public construction-pattern surface and is exempt from the verb rule.
+
 ## The five mechanical rules
 
-These are enforced by a structural check (`scripts/check-construction-pattern.py`, added per ADR-051 §AC-9) over the construction modules, not by documentation alone.
+These are enforced by a structural check (`scripts/check-construction-pattern.py`, added per ADR-051 AC-9) over the construction modules, not by documentation alone.
 
 ### M1 — Enums, not booleans, for semantic choices
 
@@ -34,7 +45,7 @@ A boolean parameter that selects between two named behaviors is a misuse-magnet:
 
 | Replace | With enum |
 |---|---|
-| `plaintext: bool` (site TLS) | `tls: SiteTls { Acme { … }, Plaintext, Terminated }` |
+| `plaintext: bool` (site TLS) | `tls: TlsMode { SelfSigned, Acme { … }, Plaintext, Terminated }` |
 | `skip_nat: bool` + addressing flags | `reach: Reach { Domain{…}, NatTraversal, Tunnel{…}, Local }` |
 | `supports_bridge: bool` (relay) | `bridge: BridgeRole { Disabled, Enabled{…} }` |
 | `in_memory: bool` (DHT publish) | `dht: DhtMode { Memory, Production{…} }` |
@@ -46,13 +57,17 @@ Booleans that are genuinely binary state with no behavioral fork (e.g. `http3: b
 For each entry point, one choice is designated **security-critical**. It must be either an explicit required field, or defaulted to the **fail-safe** value — never defaulted to the unsafe value, and never inferable into the unsafe value by omission.
 
 - **Node / host_site:** publishing an address to the DHT discloses location/IP. `dht: DhtMode` defaults to `Memory` (no publish). Any `Reach` variant that publishes a routable address requires `DhtMode::Production`, and selecting a publishing `Reach` with `DhtMode::Memory` is a precise, loud error — not a silent publish, not a silent no-op.
-- **Site TLS:** `SiteTls::Plaintext` is never a default. A config that omits TLS does not silently serve plaintext on a public reach.
+- **Site TLS:** `TlsMode::Plaintext` is never a default. A config that omits TLS does not silently serve plaintext on a public reach.
+- **Identity:** the security-critical choice is whether to **persist key material**. `persistence: None` (an ephemeral identity, no key material at rest) is the fail-safe default; persisting is the explicit `Some(StorageSlot)` choice, never reached by omission.
+- **Context:** the security-critical choice is the `ContextCreation` Template-vs-Explicit selection itself — a required enum with no default, so M2 applies **per-variant**: within `Explicit`, the permission `ceiling` is a required field (no over-broad default ceiling), and `Template` resolves only to the named template's fail-safe parameters.
 
 Convenience sugar (presets) may only ever resolve to fail-safe values.
 
 ### M3 — Required capabilities fail loud, never silent no-op
 
 A config that names a capability the runtime cannot satisfy must return a typed error at construction, not degrade silently. Model this on `StorageConfig`'s fail-closed behavior (`StorageInitError`): a storage config that cannot initialize returns an error; it never silently falls back to in-memory. Likewise `BridgeRole::Enabled` with no `bridge_secret` is a loud error, not a disabled bridge.
+
+> **M2 vs M3 are distinct axes.** M2 is about the *default direction* of a security-critical choice — when the caller omits it, does it fall to the safe value or the unsafe value? M3 is about a required capability being *satisfiable at runtime* — a config that names something the runtime cannot deliver must fail loud, not silently no-op. They overlap only in "loud error, not silent"; otherwise they are independent (defaults vs. runtime satisfiability).
 
 ### M4 — No whole-struct `Default` when any field is security-relevant or irreducible
 
@@ -77,9 +92,7 @@ Exactly **one real constructor** per type. No `*Builder` types, no typestate / `
 
 ## The EncryptedStorage compile-time split (the one M5 exception)
 
-`EncryptedStorage` is a **sealed trait** (`crates/scp-platform/src/encrypted.rs`). Production construction requires the storage type to implement it; testing construction is feature-gated to accept any `Storage`. This enforces "production cannot persist plaintext" **at compile time**.
-
-The pattern preserves this guarantee as a **trait-bound split**, not a builder:
+`EncryptedStorage` is a sealed trait (`crates/scp-platform/src/encrypted.rs`): production construction requires the storage type to implement it; testing construction is feature-gated to accept any `Storage`. This enforces "production cannot persist plaintext" at compile time. The pattern preserves this guarantee as a **trait-bound split**, not a builder:
 
 ```rust
 // Production: storage must be encryption-at-rest.
@@ -94,13 +107,27 @@ impl Node {
 }
 ```
 
-This is the **only** sanctioned two-entry-point split. ADR-051 §AC-9 additionally requires a structural test proving the unencrypted-storage path is unreachable from the production `Node::start` constructor — a mechanical belt to the compile-time suspenders. Demoting this seal to a runtime check is explicitly rejected (ADR-051 Rejected Alternatives).
+This is the **only** sanctioned two-entry-point split. ADR-051 AC-9 additionally requires a structural test proving the unencrypted-storage path is unreachable from the production `Node::start` constructor.
+
+> Rule: the seal stays a compile-time `S: EncryptedStorage` bound, never a runtime check. Rationale: ADR-051 Rejected Alternative #3.
 
 ## Providers stay typed enum-selectors — never `dyn`
 
-`KeyCustody`, `Storage`, and `DidMethod` use return-position `impl Trait` in trait (RPITIT) and are **not object-safe**: `Arc<dyn Storage>` does not compile. Config objects therefore carry providers as **typed enum-selectors or concrete types**, never as trait objects. This is not a stylistic choice — it is a compiler constraint, and boxing them would also put `async-trait` allocation on storage-read/sign hot paths, regressing the ADR-049 lock-free-read invariant.
+`KeyCustody`, `Storage`, and `DidMethod` use return-position `impl Trait` in trait (RPITIT) and are **not object-safe**: `Arc<dyn Storage>` does not compile. Config objects therefore carry providers as **typed enum-selectors or concrete types**, never as trait objects.
 
 This is consistent with injection-through-initializers (architecture.md §2.5): the config object **is** the initializer through which custody/storage/DID/transport are injected. The flat shape is the vehicle for dependency injection, not a bypass of it.
+
+> Rule: providers are typed enum-selectors / concrete types, never boxed `dyn`. Rationale: ADR-051 Rejected Alternative #2.
+
+## Storage vocabulary
+
+Three names, three jobs — stated once so they are never conflated:
+
+- **`Storage`** — the raw provider **trait** (the persistence capability itself).
+- **`StorageSlot`** — the **Rust-core config selector enum**. Every core config object carries it (`NodeConfig.storage`, `IdentityConfig.persistence`). It includes the **Rust-only `Custom(concrete)`** variant carrying a caller-supplied Rust `Storage` implementation.
+- **`StorageConfig`** — the **per-FFI-bridge mirror** of `StorageSlot`, exposing only the named/convenience variants (`InMemory`, `Sqlite`). A Rust trait object cannot cross the FFI boundary, so the bridge mirror omits `Custom(concrete)`.
+
+All core shapes use `StorageSlot`; the bridges mirror it as `StorageConfig`. These are the same selector at two layers, not two different concepts.
 
 ## Per-entry-point target shapes
 
@@ -125,13 +152,11 @@ NodeConfig {
 }
 ```
 
-Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted; the `<K, D, S>` generics survive, carried by the config and its selectors.
-
-> **Implementation note (name reconciliation).** `crates/scp-node/src/lib.rs` already defines a *private* `enum IdentitySource<K, D>` (current variants `Generate { key_custody, did_method }` and `Explicit(Box<ExplicitIdentity>)`) used internally by the typestate builder. The public `IdentitySource` introduced here has different variants (adds `Persisted`, names fields `custody`/`did_method`). Phase B-P1 reconciles the two — either by extending/reusing the existing enum or renaming one of them — so the new public type and the existing private one do not collide. The final name is decided during implementation, not here.
+Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted; the `<K, D, S>` generics survive, carried by the config and its selectors. (The `IdentitySource` name-reconciliation against the existing private `scp-node` enum is an implementation-sequencing detail — see the ADR-051 Dependencies bullet, not restated here.)
 
 ### Relay — `RelayConfig`
 
-Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled{ bridge_secret, … } }` (M1); `BridgeRole::Enabled` with no `bridge_secret` is a loud error (M3). `RelayServer::new(config, storage)` is the entry. `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire).
+Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled{ bridge_secret, … } }` (M1); `BridgeRole::Enabled` with no `bridge_secret` is a loud error (M3). Entry: `Relay::start(RelayConfig)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire).
 
 ### host_site — `SiteConfig`
 
@@ -140,13 +165,13 @@ Fold `HostSiteOptions` into `SiteConfig`:
 ```
 SiteConfig {
     reach: Reach,        // required
-    tls: SiteTls,        // folds the `plaintext` bool (M1)
+    tls: TlsMode,        // folds the `plaintext` bool (M1); the same enum as NodeConfig.tls
     dht: DhtMode,        // M2
     site_dir, port, storage_path, …
 }
 ```
 
-`host_site` (today `host_site(opts: HostSiteOptions)`, `crates/scp-node/src/self_host.rs`) remains the fail-safe **sugar** tier: it constructs a full `SiteConfig` and delegates — never a parallel construction path (matches `start_local` / `start_in_memory`).
+`host_site` (today `host_site(opts: HostSiteOptions)`, `crates/scp-node/src/self_host.rs`) remains the fail-safe **sugar** tier: it constructs a full `SiteConfig` and delegates to `Node::start` — never a parallel construction path (matches `start_local` / `start_in_memory`).
 
 ### Context — `ContextConfig`
 
@@ -157,15 +182,15 @@ ContextConfig {
 }
 ```
 
-`ContextCreation` makes the template-vs-explicit XOR a **required enum**. This replaces the Rust `create_context().template().build()` fluent builder and aligns Rust to the options-object that Python/TS/Swift already use — eliminating the `sdk-common.md` Context-creation divergence.
+`ContextCreation` makes the template-vs-explicit XOR a **required enum**. This replaces the Rust `create_context().template().build()` fluent builder and aligns Rust to the options-object that Python/TS/Swift already use — eliminating the `sdk-common.md` Context-creation divergence. Entry: `Context::create(ContextConfig)`.
 
 ### Identity — `IdentityConfig`
 
 ```
 IdentityConfig {
-    method: DidMethodSlot,    // required
-    custody: KeyCustodySlot,  // required
-    persistence: Option<Storage>,
+    method: DidMethodSlot,            // required
+    custody: KeyCustodySlot,          // required
+    persistence: Option<StorageSlot>, // None = ephemeral identity (fail-safe default; M2)
 }
 ```
 
@@ -173,7 +198,7 @@ Entry: `Identity::create(IdentityConfig)`.
 
 ## Five-language equivalence
 
-The same config object and its enums map identically across all five language SDKs:
+The same config object and its enums map identically across all five language SDKs. **This table is the canonical statement of the cross-language mapping** — ADR-051 and the lesson reference it rather than re-listing it.
 
 | Concept | Rust | Python | TypeScript | Swift | Kotlin |
 |---|---|---|---|---|---|
@@ -184,7 +209,7 @@ The same config object and its enums map identically across all five language SD
 
 **Worked precedent:** the existing `StorageConfig` FFI mapping already demonstrates this exact equivalence across all four bridges — the pattern is proven, not speculative.
 
-**FFI asymmetry (intentional, precedented).** The core config carries injected providers as typed slots (generic over `S`, or a core capability enum). For advanced injection, a core slot may add a `Custom(concrete)` variant carrying a caller-supplied Rust custody or storage implementation — this variant is a **new, Rust-core-only** design element of this pattern, not an existing enum variant. A Rust trait object cannot be injected across an FFI boundary, so each bridge's mirror enum simply omits it and exposes only the named/convenience variants (e.g. `StorageConfig::Sqlite`, `StorageConfig::InMemory`). The established precedent is the existing `StorageConfig` mirror itself — defined identically per bridge — together with the `parse_custody` asymmetry (the FFI surface accepts named custody selectors, never a caller-supplied Rust object). This Rust-core-only/FFI-named split is correct, not a coverage gap.
+**FFI asymmetry (intentional, precedented).** The core config carries injected providers as typed `StorageSlot` slots (generic over `S`, or a core capability enum). For advanced injection, a core slot may add a `Custom(concrete)` variant carrying a caller-supplied Rust custody or storage implementation — this variant is a **new, Rust-core-only** design element of this pattern, not an existing enum variant. A Rust trait object cannot be injected across an FFI boundary, so each bridge's `StorageConfig` mirror simply omits it and exposes only the named/convenience variants (e.g. `StorageConfig::Sqlite`, `StorageConfig::InMemory`). The established precedent is the existing `StorageConfig` mirror itself — defined identically per bridge — together with the `parse_custody` asymmetry (the FFI surface accepts named custody selectors, never a caller-supplied Rust object). This Rust-core-only/FFI-named split is correct, not a coverage gap.
 
 ## Related artifacts
 

@@ -43,10 +43,9 @@ One flat config object + one entry function (`Thing::start(config)`):
   `IdentitySource`, `ContextCreation`). The compiler still enforces them (omitting a
   non-`Option` field is a compile error), but the requirement is *legible*: it is
   right there in the struct definition.
-- **The shape is identical in all five languages** (Rust struct+enum ↔ Python
-  dataclass+sum ↔ TS interface+discriminated-union ↔ Swift struct+assoc-enum ↔
-  Kotlin data-class+sealed-class). The `StorageConfig` FFI mapping already proves
-  this works across all four bridges.
+- **The shape is identical in all five languages** — see the canonical five-language
+  equivalence table in `.docs/standards/construction.md`. The `StorageConfig` FFI
+  mapping already proves this works across all four bridges.
 
 The compile-time safety the typestate markers provided is **fully recovered** by
 required enum fields — without the retry loop and without the per-language
