@@ -12,7 +12,7 @@ Every construction entry point is **one flat config object** plus **one entry fu
 let node = Node::start(NodeConfig {
     reach: Reach::Domain { domain: "example.com".into() },
     identity: IdentitySource::Generate { custody, did_method },
-    storage: StorageConfig::Sqlite { path, passphrase },
+    storage: StorageSlot::Sqlite { path, passphrase }, // core slot; the FFI bridges mirror it as their `StorageConfig` enum
     ..NodeConfig::defaults(/* required… */)
 }).await?;
 ```
@@ -110,8 +110,11 @@ This is consistent with injection-through-initializers (architecture.md §2.5): 
 NodeConfig {
     // Required (no whole-struct Default; M4):
     reach: Reach,              // Domain{domain} | NatTraversal | Tunnel{public_url} | Local
+    // `Reach` is a NEW enum (P1) that folds the existing addressing machinery —
+    // `PublicSurface`, `ReachabilityTier`, and the `skip_nat` / `no_domain` flags
+    // (`crates/scp-node/src`) — into one required field.
     identity: IdentitySource,  // Generate{custody, did_method} | Persisted{custody, did_method} | Explicit{identity, document}
-    storage: StorageConfig,    // existing cross-FFI enum, fail-closed (M3)
+    storage: StorageSlot,      // core storage slot, generic over S; fail-closed (M3). The FFI bridges mirror this as their per-bridge `StorageConfig` enum.
     // Enums (M1):
     tls: TlsMode,
     dht: DhtMode,              // defaults Memory / no-publish (M2)
@@ -123,6 +126,8 @@ NodeConfig {
 ```
 
 Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted; the `<K, D, S>` generics survive, carried by the config and its selectors.
+
+> **Implementation note (name reconciliation).** `crates/scp-node/src/lib.rs` already defines a *private* `enum IdentitySource<K, D>` (current variants `Generate { key_custody, did_method }` and `Explicit(Box<ExplicitIdentity>)`) used internally by the typestate builder. The public `IdentitySource` introduced here has different variants (adds `Persisted`, names fields `custody`/`did_method`). Phase B-P1 reconciles the two — either by extending/reusing the existing enum or renaming one of them — so the new public type and the existing private one do not collide. The final name is decided during implementation, not here.
 
 ### Relay — `RelayConfig`
 
@@ -141,7 +146,7 @@ SiteConfig {
 }
 ```
 
-`host_site(dir)` survives as fail-safe **sugar** that constructs a full `SiteConfig` and delegates — never a parallel construction path (matches `start_local` / `start_in_memory`).
+`host_site` (today `host_site(opts: HostSiteOptions)`, `crates/scp-node/src/self_host.rs`) remains the fail-safe **sugar** tier: it constructs a full `SiteConfig` and delegates — never a parallel construction path (matches `start_local` / `start_in_memory`).
 
 ### Context — `ContextConfig`
 
@@ -179,7 +184,7 @@ The same config object and its enums map identically across all five language SD
 
 **Worked precedent:** the existing `StorageConfig` FFI mapping already demonstrates this exact equivalence across all four bridges — the pattern is proven, not speculative.
 
-**FFI asymmetry (intentional, precedented).** Capability enums that carry a `Custom(concrete)` variant — e.g. a caller-supplied Rust custody or storage implementation — are **Rust-core-only**. A Rust trait object cannot be injected across an FFI boundary, so the bridge enums expose only the convenience/named variants (e.g. `StorageConfig::Sqlite`, `StorageConfig::Memory`), never `Custom`. This is the established `StorageConfig` / `parse_custody` asymmetry and is correct, not a coverage gap.
+**FFI asymmetry (intentional, precedented).** The core config carries injected providers as typed slots (generic over `S`, or a core capability enum). For advanced injection, a core slot may add a `Custom(concrete)` variant carrying a caller-supplied Rust custody or storage implementation — this variant is a **new, Rust-core-only** design element of this pattern, not an existing enum variant. A Rust trait object cannot be injected across an FFI boundary, so each bridge's mirror enum simply omits it and exposes only the named/convenience variants (e.g. `StorageConfig::Sqlite`, `StorageConfig::InMemory`). The established precedent is the existing `StorageConfig` mirror itself — defined identically per bridge — together with the `parse_custody` asymmetry (the FFI surface accepts named custody selectors, never a caller-supplied Rust object). This Rust-core-only/FFI-named split is correct, not a coverage gap.
 
 ## Related artifacts
 
