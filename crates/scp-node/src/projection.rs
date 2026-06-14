@@ -2038,16 +2038,27 @@ fn site_security_headers(csp: &str) -> axum::http::HeaderMap {
 /// Resolves a requested site path to a [`PathEntry`] in the deploy's
 /// [`PathIndex`], applying standard static-host clean-URL fallbacks.
 ///
-/// Resolution order (first hit wins):
+/// Resolution depends on whether the request carried a trailing slash. A
+/// trailing slash is an explicit directory request (as on nginx/Apache), so the
+/// extensionless `.html` candidate is skipped for it — the directory index
+/// wins. Resolution order (first hit wins):
+///
+/// **Non-trailing-slash request** (e.g. `/white-paper`, `/docs`):
 /// 1. **Exact** — the requested path as-is (the only behavior prior to the
 ///    clean-URL fallback).
 /// 2. **Extensionless `.html`** — `<path>.html` (e.g. `/white-paper` →
-///    `/white-paper.html`). Skipped for directory-style requests (a trailing
-///    slash is stripped before the suffix is appended, so `/docs/` never
-///    becomes `/docs/.html`).
-/// 3. **Directory index** — `<dir>/index.html`, where `<dir>` is the requested
-///    path with any single trailing slash removed (e.g. `/docs/` and `/docs`
-///    both resolve to `/docs/index.html`).
+///    `/white-paper.html`).
+/// 3. **Directory index** — `<path>/index.html` (e.g. `/docs` →
+///    `/docs/index.html`).
+///
+/// **Trailing-slash request** (e.g. `/docs/`):
+/// 1. **Exact** — the requested path as-is (rejected by `ContentPath::new`,
+///    which disallows a trailing slash, so this is effectively skipped).
+/// 2. **Directory index** — `<dir>/index.html`, where `<dir>` is the request
+///    with its single trailing slash removed (e.g. `/docs/` →
+///    `/docs/index.html`). The `<dir>.html` candidate is NOT tried, matching
+///    conventional static hosts: a trailing slash names the directory, so its
+///    index is served even when a sibling `<dir>.html` also exists.
 ///
 /// Every candidate — including the exact match — is constructed through
 /// [`ContentPath::new`], so traversal (`..`), control characters, trailing
@@ -2080,14 +2091,21 @@ fn resolve_site_entry<'a>(index: &'a PathIndex, with_slash: &str) -> Option<&'a 
         return Some(entry);
     }
 
+    // Whether the request explicitly names a directory (trailing slash). The
+    // root `/` is never reached here — the caller maps it to `index_path` — so
+    // a trailing slash here always denotes a non-root directory request.
+    let is_directory_request = with_slash.ends_with('/');
+
     // The directory base: the requested path with a single trailing slash
-    // removed (root `/` is never reached here — the caller maps it to
-    // `index_path`). For a non-slash path this is the path itself.
+    // removed. For a non-slash path this is the path itself.
     let dir_base = with_slash.strip_suffix('/').unwrap_or(with_slash);
 
-    // 2. Extensionless `<path>.html`. Built from `dir_base` so a directory-style
-    //    request (`/docs/`) does not produce `/docs/.html`.
-    if let Ok(html_candidate) = ContentPath::new(format!("{dir_base}.html"))
+    // 2. Extensionless `<path>.html`. Skipped for an explicit directory request
+    //    (trailing slash): a trailing slash names the directory, so the index
+    //    must win over a sibling `<dir>.html` — matching nginx/Apache. For a
+    //    non-slash request, `dir_base` is the path itself.
+    if !is_directory_request
+        && let Ok(html_candidate) = ContentPath::new(format!("{dir_base}.html"))
         && let Some(entry) = index.get(&html_candidate)
     {
         return Some(entry);
@@ -6892,6 +6910,94 @@ mod tests {
         assert_eq!(ct, "text/html");
         let body_bare = resp_bare.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body_bare[..], b"<h1>docs index</h1>");
+    }
+
+    #[tokio::test]
+    async fn site_trailing_slash_prefers_index_over_sibling_html() {
+        // Both `/docs.html` and `/docs/index.html` are deployed. A trailing-slash
+        // request (`/docs/`) explicitly names the directory, so it must serve
+        // the directory index — NOT the sibling `/docs.html` — matching
+        // nginx/Apache. A bare request (`/docs`) still serves `/docs.html`.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "site_clean_slash_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+        projected.set_site_config(SiteConfig {
+            hostname: "clean-slash.example.com".into(),
+            ..SiteConfig::default()
+        });
+        let routing_id = projected.routing_id;
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Sibling `/docs.html`.
+        let sibling = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/docs.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("d-clean-slash".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>docs sibling html</h1>".to_vec(),
+        };
+        let sibling_blob = store_content_blob(&storage, routing_id, &key, &sibling).await;
+
+        // Directory index `/docs/index.html`.
+        let index_doc = BroadcastContent {
+            version: BROADCAST_CONTENT_VERSION,
+            metadata: ContentMetadata {
+                path: Some(ContentPath::new("/docs/index.html").unwrap()),
+                content_type: Some(MimeType::new("text/html").unwrap()),
+                deploy_id: Some("d-clean-slash".into()),
+                etag: None,
+                immutable: false,
+            },
+            body: b"<h1>docs dir index</h1>".to_vec(),
+        };
+        let index_blob = store_content_blob(&storage, routing_id, &key, &index_doc).await;
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            ContentPath::new("/docs.html").unwrap(),
+            entry_for(sibling_blob, &sibling),
+        );
+        entries.insert(
+            ContentPath::new("/docs/index.html").unwrap(),
+            entry_for(index_blob, &index_doc),
+        );
+        projected.commit_deploy("d-clean-slash".into(), entries);
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+
+        let routing_hex = hex_encode(&routing_id);
+
+        // Trailing-slash request resolves to the directory INDEX, not the
+        // sibling `/docs.html`.
+        let req_slash = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/docs/"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_slash = router.clone().oneshot(req_slash).await.unwrap();
+        assert_eq!(resp_slash.status(), HttpStatus::OK);
+        let body_slash = resp_slash.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body_slash[..], b"<h1>docs dir index</h1>");
+
+        // Bare (no trailing slash) request still serves the sibling `/docs.html`
+        // via the extensionless fallback — unchanged behavior.
+        let req_bare = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/site/docs"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_bare = router.oneshot(req_bare).await.unwrap();
+        assert_eq!(resp_bare.status(), HttpStatus::OK);
+        let body_bare = resp_bare.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body_bare[..], b"<h1>docs sibling html</h1>");
     }
 
     #[tokio::test]
