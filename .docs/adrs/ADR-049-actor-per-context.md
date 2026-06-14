@@ -368,6 +368,6 @@ These are deferred work items surfaced by the implementation. They are recorded 
 
 - Plan: `~/.claude/plans/generic-moseying-lightning.md` (execution detail, commit ladder, per-binding criteria, CI enforcement, failure modes)
 - Spec updates (commit 2): `.docs/specs/05-contexts.md` §5.15, `09-security-model.md` §9.4.1–3, `17-persistence-and-storage.md` §17.15–16, `architecture.md` trait contracts
-- Related ADRs: ADR-034 (WASM), ADR-046 (parity), ADR-047 (symmetry), ADR-048 (multi-instance)
+- Related ADRs: ADR-034 (WASM), ADR-046 (parity), ADR-047 (symmetry), ADR-048 (multi-instance), ADR-029 (Offline/Sync — see the "Reconnection driver location after the ADR-049 actor refactor" addendum in `phase-6.md`: the reconnection driver lives at the FFI/SDK relay-client layer because the actor's `ContextTransportProvider` is send-only and buffered-message retrieval is owned by `TransportManager`, not the actor)
 - Lock-free read evidence (Decisions 12–14): OpenSSL issue [#30659](https://github.com/openssl/openssl/issues/30659) ("Analysis of read locks taken while handshaking") and PR [#30670](https://github.com/openssl/openssl/pull/30670) (TTAS fix; visible gains on `randbytes`, none on `handshake`).
 - Prior plans superseded: none (this is the first actor-per-context ADR)

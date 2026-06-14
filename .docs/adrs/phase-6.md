@@ -1617,6 +1617,8 @@ pub enum SyncOutcome {
    - `on_reconnect` executes the six-phase reconnection protocol for all active contexts. Returns a report detailing per-context sync results.
    - Each context is synced concurrently (tokio tasks), with a 120-second overall timeout. Contexts that timeout are marked as `Failed`.
 
+> **ADR-029 Addendum — Reconnection driver location after the ADR-049 actor refactor.** ADR-049 replaced `ContextManager` with a per-context actor (state behind a mailbox; the actor's `ContextTransportProvider` is send-only). Buffered-message retrieval (relay SUBSCRIBE/QUERY-since) is owned by `TransportManager` at the FFI/SDK relay-client layer. Therefore the reconnection driver — the concrete impl of `SyncPhaseDriver` (Tier 1), `SnapshotTransport` (Tier 2), `ResetTransport` (Tier 3) — is constructed and driven at the FFI/SDK layer (same layer as `context_subscribe`). It reads relay-buffered messages/snapshots from `TransportManager`, reaches actor-owned state (MLS epoch, Commit/Welcome processing, checkpoint build/compare, event-log, queue drain) via `Supervisor` commands/queries — never by widening `ContextTransportProvider` — and consumes `EpochState.needs_reconnect` (spec §23.11). `ReconnectionCoordinator` no longer holds `Arc<ContextManager>`/`Arc<TransportManager>`; it is parameterized on a `SyncPhaseDriver` supplied by the relay-client layer. The six-phase protocol (§2) and tier engines are behaviorally unchanged; only the ownership/wiring location is restated. This supersedes the field list in ADR-029 §2 AC 2.
+
 3. **`epoch_catch_up(context_id, local_epoch, target_epoch) -> Result<CatchUpStatus, SyncError>`**
 
    - Implements the three-source epoch catch-up: relay backfill, peer request, Welcome-based fast-forward.
