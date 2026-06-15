@@ -90,7 +90,18 @@ export {
 // Trust — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type { AggregatedTrustInput, AggregationInput } from "./trust";
+export type {
+  AggregatedTrustInput,
+  AggregationInput,
+  Attestation,
+  BehavioralRecord,
+  CapabilityValidation,
+  ChallengeResult,
+  Endorsement,
+  TrustEvaluation,
+  UcanFailureCategory,
+} from "./trust";
+export { evaluateTrust } from "./trust";
 
 // ---------------------------------------------------------------------------
 // Event Log — types only (entry points moved to SCP)
@@ -126,17 +137,24 @@ export type { AggregatedTrustInput, AggregationInput } from "./trust";
 export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle } from "./mcp";
 
 // ---------------------------------------------------------------------------
-// Bridge Connector — types + the bridgeRegister entry point
+// Bridge Connector — types + bridge-provenance trust tier
 // ---------------------------------------------------------------------------
+//
+// Stateful entry points (`bridgeCreateShadow`, credentials) live on SCP.
+// `evaluateTrust` (exported here as `bridgeEvaluateTrust` to disambiguate
+// from the four-layer `evaluateTrust` in `./trust`, mirroring the Python
+// SDK's `bridge_evaluate_trust` re-export name) is the pure bridge-provenance
+// trust-tier classifier (spec §12).
 
 export type {
   BridgeCredential,
   BridgeMode,
   BridgeRegistration,
+  BridgeTrustOptions,
   ShadowIdentity,
   ShadowStatus,
 } from "./bridge";
-export { bridgeEvaluateTrust, bridgeRegister } from "./bridge";
+export { evaluateTrust as bridgeEvaluateTrust, bridgeRegister } from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Discovery — types + pure helpers (entry points for stateful ops moved to SCP)
@@ -261,7 +279,6 @@ export type {
   AttestationType,
   AttestorInfo,
   BatchPublishResult,
-  BehavioralRecord,
   BroadcastAdmissionPolicy,
   CachedAttestation,
   CachedAttestationDuration,
@@ -311,7 +328,6 @@ export type {
   ThresholdRequirement,
   TransportConfig,
   TransportStatus,
-  TrustEvaluation,
   TrustLevel,
   UcanToken,
   VerificationLevel,

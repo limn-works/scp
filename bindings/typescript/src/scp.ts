@@ -41,7 +41,7 @@ import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
 import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
-import { toCapabilityValidation } from "./internal/bridge";
+import { getBridge, toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
 import { StreamingSagaHandle } from "./outlets";
@@ -802,80 +802,84 @@ export class SCP {
     return IdentityCls._fromHandle(this, raw);
   }
 
+  // The five identity-lifecycle operations below act on the identity HANDLE,
+  // not on the `Scp` class: the NAPI bridge implements them as methods on the
+  // `NapiIdentity` handle (`handle.rotateKey()`, `handle.migrate()`, …) and the
+  // WASM bridge as `identity_*` free functions. Both are surfaced uniformly
+  // through the per-instance `Bridge` (`getBridge(this)`), so these wrappers
+  // route through the bridge rather than `this.#native` (which is the `Scp`
+  // class and does not expose them). The returned `BridgeIdentityHandle` is
+  // re-wrapped into an {@link Identity}.
+
   /**
-   * Rotate the identity's active signing key (spec §9.12, ADR-003).
+   * Rotates the `#active` signing key for an identity, publishing the updated
+   * DID document (spec §9.12, ADR-003). The old key is retired; the returned
+   * {@link Identity} carries the same DID with the rotated key material.
    *
-   * The rotate/agent-key/migrate operations dispatch through methods on the
-   * native identity handle itself (not the per-instance `#native` SCP handle),
-   * preserving handle affinity. The returned {@link Identity} wraps the fresh
-   * native handle.
-   *
-   * @param identity The identity whose active key should be rotated.
-   * @returns A new {@link Identity} reflecting the rotated key state.
+   * @param identity The identity whose `#active` key to rotate.
+   * @returns The updated {@link Identity} (same DID, new key).
    */
   async identityRotateKey(identity: Identity): Promise<Identity> {
-    const raw = await (
-      identity._rawHandle as unknown as { rotateKey(): Promise<unknown> }
-    ).rotateKey();
+    const bridge = await getBridge(this);
+    const raw = await bridge.identityRotateKey(identity._rawHandle);
     const { Identity: IdentityCls } = await import("./identity");
     return IdentityCls._fromHandle(this, raw);
   }
 
   /**
-   * Add an agent key to the identity's DID document (spec §3.4, ADR-003).
-   *
-   * @param identity The identity to add an agent key to.
-   * @returns A new {@link Identity} reflecting the added agent key.
-   */
-  async identityAddAgentKey(identity: Identity): Promise<Identity> {
-    const raw = await (
-      identity._rawHandle as unknown as { addAgentKey(): Promise<unknown> }
-    ).addAgentKey();
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
-  }
-
-  /**
-   * Rotate the identity's agent key (spec §3.4, ADR-003).
-   *
-   * @param identity The identity whose agent key should be rotated.
-   * @returns A new {@link Identity} reflecting the rotated agent key.
-   */
-  async identityRotateAgentKey(identity: Identity): Promise<Identity> {
-    const raw = await (
-      identity._rawHandle as unknown as { rotateAgentKey(): Promise<unknown> }
-    ).rotateAgentKey();
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
-  }
-
-  /**
-   * Remove the identity's agent key (spec §3.4, ADR-003).
-   *
-   * @param identity The identity whose agent key should be removed.
-   * @returns A new {@link Identity} reflecting the removed agent key.
-   */
-  async identityRemoveAgentKey(identity: Identity): Promise<Identity> {
-    const raw = await (
-      identity._rawHandle as unknown as { removeAgentKey(): Promise<unknown> }
-    ).removeAgentKey();
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
-  }
-
-  /**
-   * Migrate the identity to a new key, producing a `DidRotationEvent`
-   * (spec §9.12, ADR-003 §4b/4c).
-   *
-   * The returned {@link Identity} preserves the live native handle, whose
-   * `rotationEventJson` getter exposes the JSON-serialized rotation event for
-   * publication.
+   * Migrates an identity to a fresh `#active` key while preserving DID
+   * continuity (spec §9.12, ADR-003 §4b/4c). Used when re-keying across a
+   * custody or device boundary; the returned handle is recovery-bearing.
    *
    * @param identity The identity to migrate.
-   * @returns A new {@link Identity} reflecting the migrated key state.
+   * @returns The migrated {@link Identity} (same DID, migrated key).
    */
   async identityMigrate(identity: Identity): Promise<Identity> {
-    const raw = await (identity._rawHandle as unknown as { migrate(): Promise<unknown> }).migrate();
+    const bridge = await getBridge(this);
+    const raw = await bridge.identityMigrate(identity._rawHandle);
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Adds an `#agent` delegation key to an identity's DID document (spec §9.12,
+   * ADR-003), enabling agent-scoped capability delegation distinct from the
+   * human-bound `#active` key.
+   *
+   * @param identity The identity to add an agent key to.
+   * @returns The updated {@link Identity}.
+   */
+  async identityAddAgentKey(identity: Identity): Promise<Identity> {
+    const bridge = await getBridge(this);
+    const raw = await bridge.identityAddAgentKey(identity._rawHandle);
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Rotates the `#agent` delegation key for an identity, retiring the prior
+   * agent key and publishing the updated DID document (spec §9.12, ADR-003).
+   *
+   * @param identity The identity whose `#agent` key to rotate.
+   * @returns The updated {@link Identity}.
+   */
+  async identityRotateAgentKey(identity: Identity): Promise<Identity> {
+    const bridge = await getBridge(this);
+    const raw = await bridge.identityRotateAgentKey(identity._rawHandle);
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Removes the `#agent` delegation key from an identity's DID document
+   * (spec §9.12, ADR-003), revoking agent-scoped delegation for this DID.
+   *
+   * @param identity The identity whose `#agent` key to remove.
+   * @returns The updated {@link Identity}.
+   */
+  async identityRemoveAgentKey(identity: Identity): Promise<Identity> {
+    const bridge = await getBridge(this);
+    const raw = await bridge.identityRemoveAgentKey(identity._rawHandle);
     const { Identity: IdentityCls } = await import("./identity");
     return IdentityCls._fromHandle(this, raw);
   }
