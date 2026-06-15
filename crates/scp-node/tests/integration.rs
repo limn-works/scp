@@ -24,7 +24,7 @@ use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
 use scp_identity::{DidCache, DidMethod};
-use scp_node::{ApplicationNodeBuilder, TlsProvider};
+use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::protocol::{ClientMessage, RelayMessage};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -44,29 +44,6 @@ fn relay_request(
             .expect("valid header value"),
     );
     request
-}
-
-/// Mock TLS provider that succeeds with a self-signed certificate.
-///
-/// Used in integration tests to avoid contacting a real ACME server.
-struct SucceedingTlsProvider {
-    domain: String,
-}
-
-impl TlsProvider for SucceedingTlsProvider {
-    fn provision(
-        &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<scp_node::tls::CertificateData, scp_node::tls::TlsError>,
-                > + Send
-                + '_,
-        >,
-    > {
-        let domain = self.domain.clone();
-        Box::pin(async move { scp_node::tls::generate_self_signed(&domain) })
-    }
 }
 
 /// Concrete `DidDht` type used in tests (in-memory DHT and system clock).
@@ -93,17 +70,26 @@ async fn build_test_node() -> (
     let custody = Arc::new(InMemoryKeyCustody::new());
     let (dht_client, did_dht) = make_shared_dht(&custody);
 
-    let node = ApplicationNodeBuilder::new()
-        .storage(InMemoryStorage::new())
-        .domain("test.example.com")
-        .tls_provider(Arc::new(SucceedingTlsProvider {
-            domain: "test.example.com".to_owned(),
-        }))
-        .generate_identity_with(custody, Arc::new(did_dht))
-        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .build_for_testing()
-        .await
-        .expect("ApplicationNode should build successfully");
+    // Default `TlsMode::SelfSigned` reproduces the dropped local
+    // `SucceedingTlsProvider` (both generate a self-signed cert for the domain).
+    // `Domain` is a publishing reach → `DhtMode::Production` (M2; advisory in P1
+    // — the in-memory DHT client publishes nothing).
+    let node = Node::start_for_testing(NodeConfig {
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        dht: DhtMode::Production,
+        ..NodeConfig::defaults(
+            Reach::Domain {
+                domain: "test.example.com".to_owned(),
+            },
+            IdentitySource::Generate {
+                custody,
+                did_method: Arc::new(did_dht),
+            },
+            InMemoryStorage::new(),
+        )
+    })
+    .await
+    .expect("ApplicationNode should build successfully");
 
     (node, dht_client)
 }
@@ -469,18 +455,26 @@ async fn build_test_node_with_dev_api() -> (
     let custody = Arc::new(InMemoryKeyCustody::new());
     let (dht_client, did_dht) = make_shared_dht(&custody);
 
-    let node = ApplicationNodeBuilder::new()
-        .storage(InMemoryStorage::new())
-        .domain("test.example.com")
-        .tls_provider(Arc::new(SucceedingTlsProvider {
-            domain: "test.example.com".to_owned(),
-        }))
-        .generate_identity_with(custody, Arc::new(did_dht))
-        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .local_api(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .build_for_testing()
-        .await
-        .expect("ApplicationNode with dev API should build successfully");
+    // Same as `build_test_node` plus the dev API on an OS-assigned port
+    // (`local_api`). Default `TlsMode::SelfSigned` reproduces the dropped
+    // `SucceedingTlsProvider`; `Domain` → `DhtMode::Production` (M2).
+    let node = Node::start_for_testing(NodeConfig {
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        local_api: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        dht: DhtMode::Production,
+        ..NodeConfig::defaults(
+            Reach::Domain {
+                domain: "test.example.com".to_owned(),
+            },
+            IdentitySource::Generate {
+                custody,
+                did_method: Arc::new(did_dht),
+            },
+            InMemoryStorage::new(),
+        )
+    })
+    .await
+    .expect("ApplicationNode with dev API should build successfully");
 
     (node, dht_client)
 }

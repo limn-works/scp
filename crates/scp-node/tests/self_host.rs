@@ -40,8 +40,8 @@ use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
 use scp_node::{
-    ApplicationNode, ApplicationNodeBuilder, DeploySiteParams, NatStrategy, NodeError,
-    ReachabilityTier,
+    ApplicationNode, DeploySiteParams, DhtMode, IdentitySource, NatSlot, NatStrategy, Node,
+    NodeConfig, NodeError, Reach, ReachabilityTier,
 };
 use scp_platform::Storage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
@@ -133,18 +133,27 @@ async fn build_self_host_node() -> BuiltNode {
         scp_transport::native::storage::BlobStorageBackend::sqlite(&storage_dir.join("blobs"))
             .expect("sqlite blob storage should open");
 
-    // `.build()` requires `S: EncryptedStorage`, satisfied by `SqliteStorage`.
-    let node = ApplicationNodeBuilder::new()
-        .storage(node_storage)
-        .blob_storage(blob_storage)
-        .no_domain()
-        .nat_strategy(Arc::new(FixedTierNatStrategy))
-        .generate_identity_with(custody.clone(), did_method)
-        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .http_bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .build()
-        .await
-        .expect("no-domain node should build over encrypted SQLite storage");
+    // `Node::start` requires `S: EncryptedStorage`, satisfied by `SqliteStorage`.
+    // `NatTraversal` (no_domain) is a publishing reach → `DhtMode::Production`
+    // (M2; advisory in P1). The `FixedTierNatStrategy` is supplied via
+    // `NatSlot::Custom`.
+    let node = Node::start(NodeConfig {
+        nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
+        dht: DhtMode::Production,
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        blob_storage: Some(blob_storage),
+        ..NodeConfig::defaults(
+            Reach::NatTraversal,
+            IdentitySource::Generate {
+                custody: custody.clone(),
+                did_method,
+            },
+            node_storage,
+        )
+    })
+    .await
+    .expect("no-domain node should build over encrypted SQLite storage");
 
     assert!(
         node.identity().did().starts_with("did:dht:"),
@@ -747,20 +756,26 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
     //    as the fixed `build_self_host_node` does. `Arc<SqliteStorage>` implements
     //    `EncryptedStorage`, so the builder accepts it. This must NOT trip the
     //    advisory-lock conflict because there is only ONE underlying handle. --
-    let node = ApplicationNodeBuilder::new()
-        .storage(Arc::clone(&root_storage))
-        .blob_storage(blob_storage)
-        .no_domain()
-        .nat_strategy(Arc::new(FixedTierNatStrategy))
-        .generate_identity_with(custody.clone(), did_method)
-        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .http_bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .build()
-        .await
-        .expect(
-            "the node must build over the SHARED root storage handle without a \
-             lock conflict (os error 35)",
-        );
+    let node = Node::start(NodeConfig {
+        nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
+        dht: DhtMode::Production,
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        blob_storage: Some(blob_storage),
+        ..NodeConfig::defaults(
+            Reach::NatTraversal,
+            IdentitySource::Generate {
+                custody: custody.clone(),
+                did_method,
+            },
+            Arc::clone(&root_storage),
+        )
+    })
+    .await
+    .expect(
+        "the node must build over the SHARED root storage handle without a \
+         lock conflict (os error 35)",
+    );
 
     // -- Deploy the embedded site and assert it serves end to end. The
     //    sequence-store-like owner is passed in so it stays alive across the
@@ -889,19 +904,26 @@ async fn build_self_host_node_over_dir(dir: &std::path::Path) -> ApplicationNode
         scp_transport::native::storage::BlobStorageBackend::sqlite(&dir.join("blobs"))
             .expect("sqlite blob storage should open");
 
-    ApplicationNodeBuilder::new()
-        .storage(node_storage)
-        .blob_storage(blob_storage)
-        .no_domain()
-        .nat_strategy(Arc::new(FixedTierNatStrategy))
-        // The production `--self-host` identity wiring: load-or-create from the
-        // root storage so the DID is stable across restarts.
-        .identity_with_storage(custody, did_method)
-        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .http_bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .build()
-        .await
-        .expect("no-domain node should build over encrypted SQLite storage")
+    // The production `--self-host` identity wiring: `IdentitySource::Persisted`
+    // load-or-creates from the root storage so the DID is stable across
+    // restarts. `NatTraversal` (publishing) → `DhtMode::Production` (M2).
+    Node::start(NodeConfig {
+        nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
+        dht: DhtMode::Production,
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        blob_storage: Some(blob_storage),
+        ..NodeConfig::defaults(
+            Reach::NatTraversal,
+            IdentitySource::Persisted {
+                custody,
+                did_method,
+            },
+            node_storage,
+        )
+    })
+    .await
+    .expect("no-domain node should build over encrypted SQLite storage")
 }
 
 /// FIX A: two sequential builds over ONE storage path must yield the SAME DID.
@@ -992,20 +1014,27 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
     // A fixed HTTP bind port so we can assert the exact loopback relay URL.
     let http_port = 28444u16;
 
-    let node = ApplicationNodeBuilder::new()
-        .storage(node_storage)
-        .blob_storage(blob_storage)
-        .no_domain()
-        // If the probe is NOT skipped this strategy panics — a clean build proves
-        // skip_nat_probe short-circuited the probe.
-        .nat_strategy(Arc::new(PanicOnProbeNatStrategy))
-        .skip_nat_probe()
-        .identity_with_storage(custody, did_method)
-        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .http_bind_addr(SocketAddr::from(([127, 0, 0, 1], http_port)))
-        .build()
-        .await
-        .expect("no-domain node should build with the NAT probe skipped");
+    // `Reach::Local` skips the NAT probe (the flat-config equivalent of
+    // `no_domain().skip_nat_probe()`). Local is non-publishing → `DhtMode::Memory`
+    // (the default). The `PanicOnProbeNatStrategy` is still supplied via
+    // `NatSlot::Custom`: a clean build proves `Local` short-circuited the probe
+    // before `select_tier` was ever called.
+    let node = Node::start(NodeConfig {
+        nat: NatSlot::Custom(Arc::new(PanicOnProbeNatStrategy)),
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], http_port))),
+        blob_storage: Some(blob_storage),
+        ..NodeConfig::defaults(
+            Reach::Local,
+            IdentitySource::Persisted {
+                custody,
+                did_method,
+            },
+            node_storage,
+        )
+    })
+    .await
+    .expect("no-domain node should build with the NAT probe skipped");
 
     assert_eq!(
         node.relay_url(),
