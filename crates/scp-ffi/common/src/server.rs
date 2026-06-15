@@ -16,8 +16,8 @@ use scp_core::context::supervisor::Supervisor;
 use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::{DidDocument, InMemoryDhtClient, ScpIdentity};
-use scp_node::NodeError;
-use scp_platform::testing::InMemoryStorage;
+use scp_node::{DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, NodeError, Reach};
+use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
 use zeroize::Zeroizing;
@@ -301,17 +301,33 @@ pub async fn start_node_in_memory(
     let node = match identity {
         None => scp_node::ApplicationNode::dev(0).await?,
         Some(id) => {
-            use scp_node::{ApplicationNodeBuilder, SelfSignedTlsProvider};
-
-            ApplicationNodeBuilder::new()
-                .storage(InMemoryStorage::new())
-                .blob_storage(BlobStorageBackend::in_memory())
-                .domain("localhost")
-                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
-                .identity(id.identity, id.document, id.did_method)
-                .build_for_testing()
-                .await?
+            // Migrated to the ADR-052 flat-config front door (Phase B-P2).
+            // The dropped explicit `SelfSignedTlsProvider::new("localhost")` is
+            // reproduced by the default `TlsMode::SelfSigned`. `Domain` is a
+            // publishing reach, so M2 requires `DhtMode::Production` (advisory
+            // in P1 — the in-memory DHT client publishes nothing).
+            Node::start_for_testing(NodeConfig {
+                bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                blob_storage: Some(BlobStorageBackend::in_memory()),
+                dht: DhtMode::Production,
+                ..NodeConfig::defaults(
+                    Reach::Domain {
+                        domain: "localhost".to_owned(),
+                    },
+                    // `Explicit` carries no custody, so `K` is unconstrained by
+                    // the variant; annotate it to the bridge's in-memory custody
+                    // type (matching `ApplicationNode::dev`'s `K`).
+                    IdentitySource::<InMemoryKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
+                        ExplicitIdentity {
+                            identity: id.identity,
+                            document: id.document,
+                            did_method: id.did_method,
+                        },
+                    )),
+                    InMemoryStorage::new(),
+                )
+            })
+            .await?
         }
     };
 
@@ -369,7 +385,6 @@ pub async fn start_node_local(
     passphrase: Option<zeroize::Zeroizing<String>>,
 ) -> Result<scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>, ServerError> {
     use scp_identity::DidCache;
-    use scp_node::{ApplicationNodeBuilder, SelfSignedTlsProvider};
     use scp_platform::filesystem::FilesystemStorage;
 
     // Validate and ensure data directory exists.
@@ -395,20 +410,37 @@ pub async fn start_node_local(
     let storage = FilesystemStorage::new(&storage_dir)?;
     let blob_storage = BlobStorageBackend::redb(&blob_path)?;
 
-    // Build the node. The `.identity()` and `.identity_with_storage()` methods
-    // return different builder generic types, so we construct separate builder
-    // chains in each arm. The common builder prefix is duplicated because the
-    // storage values are moved into the builder.
+    // Build the node via the ADR-052 flat-config front door (Phase B-P2). The
+    // two identity arms differ only in their `IdentitySource`; the dropped
+    // explicit `SelfSignedTlsProvider::new("localhost")` is reproduced by the
+    // default `TlsMode::SelfSigned`. `Domain` is a publishing reach, so M2
+    // requires `DhtMode::Production` (advisory in P1 — the in-memory DHT client
+    // publishes nothing). The storage values are moved into the config, so the
+    // two arms each build their own config.
     let node = if let Some(id) = identity {
-        ApplicationNodeBuilder::new()
-            .storage(storage)
-            .blob_storage(blob_storage)
-            .domain("localhost")
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
-            .identity(id.identity, id.document, id.did_method)
-            .build_for_testing()
-            .await?
+        Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            blob_storage: Some(blob_storage),
+            dht: DhtMode::Production,
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "localhost".to_owned(),
+                },
+                // `Explicit` carries no custody, so `K` is unconstrained by the
+                // variant; annotate it to the bridge's in-memory custody type
+                // (the persisted arm below uses `FileKeyCustody`, but the
+                // `Explicit` arm has no custody to derive `K` from).
+                IdentitySource::<InMemoryKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
+                    ExplicitIdentity {
+                        identity: id.identity,
+                        document: id.document,
+                        did_method: id.did_method,
+                    },
+                )),
+                storage,
+            )
+        })
+        .await?
     } else {
         // Persistent key custody — keys survive process restarts.
         let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;
@@ -425,15 +457,22 @@ pub async fn start_node_local(
             dht_client, cache, sign_fn,
         ));
 
-        ApplicationNodeBuilder::new()
-            .storage(storage)
-            .blob_storage(blob_storage)
-            .domain("localhost")
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
-            .identity_with_storage(key_custody, did_method)
-            .build_for_testing()
-            .await?
+        Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            blob_storage: Some(blob_storage),
+            dht: DhtMode::Production,
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "localhost".to_owned(),
+                },
+                IdentitySource::Persisted {
+                    custody: key_custody,
+                    did_method,
+                },
+                storage,
+            )
+        })
+        .await?
     };
 
     tracing::info!(
