@@ -574,6 +574,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn message_type_discriminator_bytes_are_stable_and_distinct() {
+        // The discriminator byte is part of the canonical signed hash, so these
+        // values are a wire-format commitment and must never change or collide.
+        // Heartbeat (§9.9.2) was added as discriminator 5 after the highest
+        // prior value (ConsistencyCheckpoint = 4).
+        assert_eq!(MessageType::Content.as_discriminator_byte(), 0);
+        assert_eq!(MessageType::Signaling.as_discriminator_byte(), 1);
+        assert_eq!(MessageType::KeyDistribution.as_discriminator_byte(), 2);
+        assert_eq!(MessageType::Recovery.as_discriminator_byte(), 3);
+        assert_eq!(
+            MessageType::ConsistencyCheckpoint.as_discriminator_byte(),
+            4
+        );
+        assert_eq!(MessageType::Heartbeat.as_discriminator_byte(), 5);
+
+        let all = [
+            MessageType::Content,
+            MessageType::Signaling,
+            MessageType::KeyDistribution,
+            MessageType::Recovery,
+            MessageType::ConsistencyCheckpoint,
+            MessageType::Heartbeat,
+        ];
+        let mut bytes: Vec<u8> = all.iter().map(MessageType::as_discriminator_byte).collect();
+        bytes.sort_unstable();
+        bytes.dedup();
+        assert_eq!(
+            bytes.len(),
+            all.len(),
+            "every MessageType discriminator byte must be distinct"
+        );
+    }
+
+    #[test]
     fn domain_separator_changes_canonical_hash() {
         let payload_hash: [u8; 32] = Sha256::digest(b"test").into();
         let provenance_hash: [u8; 32] = Sha256::digest([0x00]).into();
