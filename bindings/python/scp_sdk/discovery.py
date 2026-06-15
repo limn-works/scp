@@ -101,6 +101,34 @@ def normalize_address(address: str) -> str:
     return bridge.discovery_normalize_address(address)
 
 
+async def discover(query: str) -> list[dict[str, Any]]:
+    """Discover contexts advertised by a DID or named by an ``scp://`` URI.
+
+    For an ``scp://`` URI the lookup is a synchronous parse. For a ``did:``
+    query it resolves the DID document and projects its advertised contexts,
+    which may involve network (DHT) resolution — so the call is dispatched to
+    a worker thread to avoid blocking the event loop.
+
+    Args:
+        query: A ``did:`` identifier or an ``scp://`` context URI.
+
+    Returns:
+        A list of discovery-result dicts, each describing a discoverable
+        context. May be empty if the target advertises none.
+
+    Raises:
+        ValidationError: If ``query`` is neither a DID nor an ``scp://`` URI.
+        ContextError: If DID resolution or URI parsing fails.
+
+    See spec sections 5.14.11, 18.2.2, and 18.4.
+    """
+    import asyncio
+
+    bridge = _bridge()
+    results = await asyncio.to_thread(bridge.context_discover, query)
+    return [dict(item) for item in results]
+
+
 # ---------------------------------------------------------------------------
 # Petname operations (spec section 22.4)
 # ---------------------------------------------------------------------------
@@ -123,6 +151,7 @@ def normalize_address(address: str) -> str:
 
 __all__ = [
     "create_query",
+    "discover",
     "normalize_address",
     "parse_address",
 ]

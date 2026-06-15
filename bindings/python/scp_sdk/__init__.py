@@ -62,7 +62,7 @@ from scp_sdk.context import (
     validate_admission,
     validate_broadcast_key_hex,
 )
-from scp_sdk.discovery import create_query, normalize_address, parse_address
+from scp_sdk.discovery import create_query, discover, normalize_address, parse_address
 from scp_sdk.economy import (
     auto_accept_blocked,
     check_policy_lock,
@@ -257,6 +257,7 @@ __all__ = [
     "check_policy_lock",
     "classify_offline",
     "create_query",
+    "discover",
     "estimate_cost",
     "evaluate_formula",
     "get_policy",
