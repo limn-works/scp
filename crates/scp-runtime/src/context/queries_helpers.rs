@@ -1076,3 +1076,241 @@ pub async fn is_local_did(supervisor: &crate::context::supervisor::Supervisor, d
     // Lock-free read (ADR-049 §Decision 12).
     supervisor.local_dids_ref().load().contains(did)
 }
+
+#[cfg(test)]
+mod equivocation_dedup_tests {
+    //! Focused unit coverage for the `record_equivocation_if_fresh` dedup
+    //! gate (§9.9.3 replay defense, secondary guard). The integration path
+    //! (`reconnect_sync.rs`) rarely reaches this gate because recording a
+    //! divergence appends an `EquivocationDetected` event, advancing
+    //! `local_count` so the same remote count routes to Ahead/Behind — so
+    //! the dedup gate's keyed-on-`(count, root)` behavior is asserted here
+    //! by constructing state directly and calling the helper at a stable
+    //! count, never advancing through `compare_remote_checkpoint`.
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use scp_identity::DID;
+
+    use super::record_equivocation_if_fresh;
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::supervisor::supervisor::Supervisor;
+
+    /// Event-log provider that counts `append_event` calls so the test can
+    /// assert how many `EquivocationDetected` events the dedup gate let
+    /// through. All other methods are no-ops (the gate only appends).
+    #[derive(Default)]
+    struct CountingEventLog {
+        appends: Arc<AtomicUsize>,
+    }
+
+    impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
+        fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: &str,
+            _actor: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.appends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Builds a supervisor-backed `ActorDeps` whose event log counts
+    /// appends, plus a fresh encrypted `PerContextState`. Mirrors the
+    /// `actor::mod` test-deps assembly but threads the counting log so the
+    /// dedup gate's append behavior is observable.
+    async fn deps_with_counting_log(appends: Arc<AtomicUsize>) -> (ActorDeps, PerContextState) {
+        use scp_platform::testing::InMemoryStorage;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestEquivDedup".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(CountingEventLog { appends });
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+            mls_storage,
+        );
+        let deps = supervisor
+            .build_actor_deps(&DID("did:example:equiv-dedup".to_owned()))
+            .await
+            .expect("build_actor_deps");
+
+        let state = PerContextState::new_for_test_encrypted(
+            [9u8; 32],
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        (deps, state)
+    }
+
+    /// Forge a divergent remote checkpoint at a fixed count with a chosen
+    /// remote Merkle root. The signature is never re-verified inside
+    /// `record_equivocation_if_fresh` (authenticity is gated upstream in
+    /// `compare_remote_checkpoint`), so an empty signature is faithful.
+    fn checkpoint(
+        sender: &str,
+        event_count: u64,
+        remote_root: [u8; 32],
+    ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+        scp_event_log::checkpoint::ConsistencyCheckpoint {
+            context_id: "0909090909090909090909090909090909090909090909090909090909090909"
+                .to_owned(),
+            sender_did: DID(sender.to_owned()),
+            event_count,
+            merkle_root: remote_root,
+            epoch: Some(1),
+            timestamp: 1_700_000_100,
+            signature: Vec::new(),
+        }
+    }
+
+    /// (a) The same `(count, root)` recorded twice yields exactly ONE
+    /// event-log append and ONE buffered alert — the exact-divergence
+    /// replay is suppressed by the secondary dedup gate.
+    #[tokio::test]
+    async fn same_count_same_root_dedups_to_one() {
+        let appends = Arc::new(AtomicUsize::new(0));
+        let (deps, mut state) = deps_with_counting_log(Arc::clone(&appends)).await;
+        let ctx_bytes = [9u8; 32];
+        let remote = checkpoint("did:example:bob", 5, [0xAB; 32]);
+        let local_root = [0xCD; 32];
+
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &remote, local_root);
+        // Identical re-presentation: same sender, same count, same root.
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &remote, local_root);
+
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            1,
+            "exact-divergence replay must append EquivocationDetected exactly once"
+        );
+        assert_eq!(
+            state.receive_buffer.drain_equivocation_alerts().len(),
+            1,
+            "exact-divergence replay must emit exactly one buffered alert"
+        );
+    }
+
+    /// (b) The same `count` with a DIFFERENT root yields TWO appends and
+    /// TWO alerts — the regression guard for keying on the root, not on a
+    /// monotone `(count, timestamp)`. A monotone-only gate would suppress
+    /// the second distinct forgery at the same height and discard a §9.9.4
+    /// security event.
+    #[tokio::test]
+    async fn same_count_different_root_records_both() {
+        let appends = Arc::new(AtomicUsize::new(0));
+        let (deps, mut state) = deps_with_counting_log(Arc::clone(&appends)).await;
+        let ctx_bytes = [9u8; 32];
+        let local_root = [0xCD; 32];
+
+        let first = checkpoint("did:example:bob", 5, [0x11; 32]);
+        let second = checkpoint("did:example:bob", 5, [0x22; 32]);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &first, local_root);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &second, local_root);
+
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            2,
+            "distinct forged roots at the same height are distinct §9.9.4 events — both record"
+        );
+        assert_eq!(
+            state.receive_buffer.drain_equivocation_alerts().len(),
+            2,
+            "distinct forged roots at the same height each emit an alert"
+        );
+    }
+
+    /// (c) The per-sender set is bounded at `MAX_SEQUENTIAL_COMMITS`: once
+    /// the set is full the gate STILL EMITS the alert (a security event is
+    /// never silently discarded) but stops growing the set — so a later
+    /// EXACT replay of an evicted-from-set `(count, root)` is no longer
+    /// suppressed by the set (it appends again), proving the cap holds and
+    /// emission is never starved.
+    #[tokio::test]
+    async fn per_sender_set_is_bounded_and_still_emits() {
+        let appends = Arc::new(AtomicUsize::new(0));
+        let (deps, mut state) = deps_with_counting_log(Arc::clone(&appends)).await;
+        let ctx_bytes = [9u8; 32];
+        let local_root = [0xCD; 32];
+        let cap = scp_protocol::sync::MAX_SEQUENTIAL_COMMITS;
+
+        // Pin the set full with `cap` distinct roots (distinct counts keep
+        // every entry distinct). The first divergence is the one we will
+        // later replay; because the set is full by then, that first
+        // `(count, root)` is NOT retained, so the replay re-appends.
+        let first = checkpoint("did:example:mallory", 0, [0x00; 32]);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &first, local_root);
+        for i in 1..cap {
+            let mut root = [0u8; 32];
+            root[0] = (i & 0xFF) as u8;
+            root[1] = ((i >> 8) & 0xFF) as u8;
+            let cp = checkpoint("did:example:mallory", i, root);
+            record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &cp, local_root);
+        }
+
+        let seen_len = state
+            .last_seen_remote_checkpoint
+            .get(&DID("did:example:mallory".to_owned()))
+            .map_or(0, std::collections::HashSet::len) as u64;
+        assert_eq!(
+            seen_len, cap,
+            "the per-sender set must be capped at MAX_SEQUENTIAL_COMMITS"
+        );
+
+        // One more distinct divergence past the cap: alert still EMITTED
+        // (append count keeps climbing) but the set does NOT grow.
+        let appends_before = appends.load(Ordering::SeqCst);
+        let over = checkpoint("did:example:mallory", cap + 1, [0xFF; 32]);
+        record_equivocation_if_fresh(&mut state, &deps, "ctx", &ctx_bytes, &over, local_root);
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            appends_before + 1,
+            "a divergence past the cap must STILL emit (never silently dropped, §9.9.4)"
+        );
+        let seen_len_after = state
+            .last_seen_remote_checkpoint
+            .get(&DID("did:example:mallory".to_owned()))
+            .map_or(0, std::collections::HashSet::len) as u64;
+        assert_eq!(
+            seen_len_after, cap,
+            "the set must stay capped — the over-cap divergence is emitted but not inserted"
+        );
+    }
+}
