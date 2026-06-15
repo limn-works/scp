@@ -1430,6 +1430,37 @@ pub fn send_heartbeat(
     sender_did: &DID,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(), ContextError> {
+    // Send-authorization gates, mirroring `send_message` (§9.9.2 routes a
+    // heartbeat through the same write path, so it must clear the same write
+    // gates). Without these a member whose `MessagesWrite` capability was
+    // suspended or revoked could keep asserting liveness on the write path,
+    // and a heartbeat racing a context close could slip through after the
+    // context is no longer active.
+    //
+    // 1. The context must be active. A send racing context-close is rejected.
+    state::require_active(&state.handle)?;
+    // 2. Capability check (broadcast contexts have no per-member write
+    //    capability and address the public broadcast routing ID, exactly as in
+    //    `send_message`). A suspended capability surfaces a distinct message so
+    //    the scheduler's best-effort log is actionable.
+    if state.broadcast_context.is_none()
+        && !state
+            .role_state
+            .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
+    {
+        let is_suspended = state
+            .role_state
+            .suspended_capabilities
+            .get(sender_did.as_ref())
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite));
+        let msg = if is_suspended {
+            format!("member {sender_did} write access has been revoked")
+        } else {
+            format!("member {sender_did} does not have messages:write capability")
+        };
+        return Err(ContextError::PermissionDenied(msg));
+    }
+
     // Routing parallels the application-data and checkpoint send paths
     // (§9.10.4): broadcast contexts address the derivable broadcast RID;
     // encrypted contexts fan out to each known peer pseudonym. An empty
