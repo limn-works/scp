@@ -707,15 +707,16 @@ fn warn_tunnel_public_url_deferred(public_url: &str) {
 /// with the production `build()` (`where S: EncryptedStorage`). The reach
 /// addressing yields either `HasDomain` or `HasNoDomain` — both have `build()`.
 ///
-/// This and its testing twin [`finish_build_for_testing`] are the **one
-/// irreducible split** in this module: the reach `match` is byte-for-byte
-/// identical, but the terminal call differs by trait bound (`build()` requires
-/// `S: EncryptedStorage` — the production seal; `build_for_testing()` accepts
-/// any `S: Storage`). A single generic finisher cannot name both terminal
-/// methods, because a fn/closure has one fixed `S` bound. The *larger*
-/// duplication — the identity `match` that used to repeat across `Node::start`
-/// and `Node::start_for_testing` — is collapsed into [`start_inner`], which
-/// takes one of these finishers as a closure (the closure carries the bound).
+/// This and its testing twin [`finish_build_for_testing`] are the **one split
+/// no generic finisher can collapse** in this module: the reach `match` is
+/// byte-for-byte identical, but the terminal call differs by trait bound
+/// (`build()` requires `S: EncryptedStorage` — the production seal;
+/// `build_for_testing()` accepts any `S: Storage`). A single generic finisher
+/// cannot name both terminal methods, because a fn/closure has one fixed `S`
+/// bound. The *larger* duplication — the identity `match` that repeats across
+/// `Node::start` and `Node::start_for_testing` — is NOT hoisted into a shared
+/// inner either; see the comment block below this fn for why a generic finisher
+/// cannot absorb it.
 async fn finish_build<K, D, S>(
     builder: ApplicationNodeBuilder<K, D, S, crate::NoDomain, crate::HasIdentity>,
     tail: ConfigTail,
@@ -765,7 +766,8 @@ where
 
 // Why the identity `match` is NOT hoisted into one shared inner across
 // `Node::start` / `Node::start_for_testing` (the dedup the reviewer asked us to
-// attempt). Two independent type-system facts make it irreducible:
+// attempt). It is not reducible *via a generic finisher / closure*: two
+// independent type-system facts block that route.
 //
 //   1. The `Explicit` arm lowers via `base.identity(...)`, which yields a
 //      builder with `K = NoOpCustody`, while `Generate`/`Persisted` lower via
@@ -779,10 +781,16 @@ where
 //      cannot serve both terminals.
 //
 // Either alone might be worked around; together they require a generic-over-`K`
-// trait method whose `S` bound varies per impl — not expressible in Rust. So
-// the ~30-line identity `match` stays duplicated, each arm handing its concrete
-// builder straight to its finisher. The reach lowering inside the finishers is
-// the same irreducible split (see `finish_build`).
+// trait method whose `S` bound varies per impl — not expressible in Rust. So no
+// value-level finisher collapses it. A token-level `macro_rules!` *could* paste
+// the shared arm bodies (macros expand before type-checking, so they sidestep
+// both bounds), but we deliberately do NOT use one here: it would hide the
+// control flow and the per-terminal trait bounds behind an expansion, working
+// against this module's LLM-legibility goal. So the ~30-line identity `match`
+// stays explicitly duplicated, each arm handing its concrete builder straight
+// to its finisher. The reach lowering inside the finishers is the same split,
+// reducible only by the same macro route, and left explicit for the same reason
+// (see `finish_build`).
 
 impl Node {
     /// Constructs and starts an [`ApplicationNode`] from a [`NodeConfig`]
@@ -1678,5 +1686,52 @@ mod tests {
                 "Acme×{reach_name} error must name the contradiction, got: {err}"
             );
         }
+    }
+
+    // --- Test 21: Plaintext / Terminated on a non-Domain reach are no-op builds
+
+    #[tokio::test]
+    async fn local_plaintext_builds() {
+        // `TlsMode::Plaintext` is only valid on a non-`Domain` reach (Domain +
+        // Plaintext is the loud error in Test 11). On `Reach::Local` it is a
+        // no-op in `apply_tls` (the loopback listener is plaintext; no node-side
+        // TLS is provisioned). Pin that contract directly — the existing Local
+        // tests all build with the default `TlsMode::SelfSigned`, so this path
+        // was only transitively covered. Local skips the NAT probe, so the build
+        // stays offline; no NAT mock is needed.
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            tls: TlsMode::Plaintext,
+            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+        })
+        .await
+        .expect("Local + Plaintext is a non-Domain no-op TLS build and must succeed");
+        assert!(
+            node.domain().is_none(),
+            "Local builds a no-domain node regardless of TlsMode::Plaintext"
+        );
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn local_terminated_builds() {
+        // Companion to `local_plaintext_builds`: `TlsMode::Terminated` on a
+        // non-`Domain` reach is likewise a no-op in `apply_tls` (the upstream
+        // proxy terminates TLS; the loopback listener stays plaintext). The
+        // Terminated×Domain path is covered by Test 18; this pins the
+        // non-Domain no-op branch, which was only transitively exercised. Offline
+        // for the same reason as above (Local skips the NAT probe).
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            tls: TlsMode::Terminated,
+            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+        })
+        .await
+        .expect("Local + Terminated is a non-Domain no-op TLS build and must succeed");
+        assert!(
+            node.domain().is_none(),
+            "Local builds a no-domain node regardless of TlsMode::Terminated"
+        );
+        node.shutdown();
     }
 }
