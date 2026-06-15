@@ -18,8 +18,10 @@
 //!   local consistency checkpoint via `Supervisor::build_local_checkpoint`,
 //!   composing with the equivocation core (§9.9.3).
 //! - **Equivocation on forgery.** A forged divergent checkpoint (equal event
-//!   count, different Merkle root) fed through `Supervisor::deliver_commit_blob`
-//!   surfaces `ContextEvent::EquivocationDetected` (§9.9.3).
+//!   count, different Merkle root) compared via `Supervisor::compare_remote_checkpoint`
+//!   surfaces `ContextEvent::EquivocationDetected` (§9.9.3) carrying the real
+//!   divergent roots, drained ONLY by `drain_equivocation_alerts` (the
+//!   non-destructive targeted drain), and replay-deduped.
 //! - **`needs_reconnect` cleared.** `clear_needs_reconnect` flips the §23.11
 //!   flag off after a successful reconnect.
 
@@ -89,6 +91,38 @@ fn encrypted_params() -> ContextParams {
 
 fn context_id_bytes(context_id: &str) -> [u8; 32] {
     scp_core::context::context_id_bytes(context_id)
+}
+
+/// Forges a divergent consistency checkpoint: same `event_count` / `epoch` /
+/// `timestamp` as `reference`, but a Merkle root flipped to differ, authored
+/// and signed by `author_did` (with that DID's deterministic key). §9.9.3
+/// equivocation is equal-count-different-root with a VALID signature.
+fn forge_divergent_checkpoint(
+    ctx_id: &str,
+    author_did: &str,
+    reference: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+) -> (scp_event_log::checkpoint::ConsistencyCheckpoint, [u8; 32]) {
+    let mut forged_root = reference.merkle_root;
+    forged_root[0] ^= 0xFF; // guaranteed different from the reference root
+    let canonical = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
+        ctx_id,
+        author_did,
+        reference.event_count,
+        &forged_root,
+        reference.epoch,
+        reference.timestamp,
+    );
+    let signature = ed25519_dalek::Signer::sign(&signing_key_for(author_did), &canonical);
+    let forged = scp_event_log::checkpoint::ConsistencyCheckpoint {
+        context_id: ctx_id.to_owned(),
+        sender_did: DID::from(author_did),
+        event_count: reference.event_count,
+        merkle_root: forged_root,
+        epoch: reference.epoch,
+        timestamp: reference.timestamp,
+        signature: signature.to_bytes().to_vec(),
+    };
+    (forged, forged_root)
 }
 
 /// Starts an ephemeral native relay on a random port.
@@ -333,27 +367,7 @@ async fn reconnect_detects_forged_divergent_checkpoint() {
         .await
         .expect("alice builds checkpoint");
 
-    let mut forged_root = honest.merkle_root;
-    forged_root[0] ^= 0xFF; // guaranteed different from Alice's local root
-    let bob_sk = signing_key_for(BOB_DID);
-    let canonical = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
-        ctx_id,
-        DID::from(BOB_DID).as_ref(),
-        honest.event_count,
-        &forged_root,
-        honest.epoch,
-        honest.timestamp,
-    );
-    let signature = ed25519_dalek::Signer::sign(&bob_sk, &canonical);
-    let forged = scp_event_log::checkpoint::ConsistencyCheckpoint {
-        context_id: ctx_id.to_owned(),
-        sender_did: DID::from(BOB_DID),
-        event_count: honest.event_count,
-        merkle_root: forged_root,
-        epoch: honest.epoch,
-        timestamp: honest.timestamp,
-        signature: signature.to_bytes().to_vec(),
-    };
+    let (forged, _forged_root) = forge_divergent_checkpoint(ctx_id, BOB_DID, &honest);
 
     // Compare against Alice's local state — divergent at equal count ⇒
     // EquivocationDetected emitted into Alice's receive buffer.
@@ -380,5 +394,147 @@ async fn reconnect_detects_forged_divergent_checkpoint() {
             if remote_sender_did.as_ref() == BOB_DID
         )),
         "compare_remote_checkpoint must emit EquivocationDetected for the forging peer (§9.9.3)"
+    );
+}
+
+/// Runtime actor-dispatch proof for the equivocation receive path + the
+/// non-destructive targeted alert drain (§9.9.3).
+///
+/// Drives a forged divergent checkpoint through the real actor mailbox
+/// (`Supervisor::compare_remote_checkpoint`, i.e. the
+/// `MessagingCommand::CompareRemoteCheckpoint` → handler →
+/// `compare_remote_checkpoint` chain) rather than calling the helper inline,
+/// then asserts:
+///
+/// 1. The runtime dispatch emits `EquivocationDetected` carrying the real
+///    divergent local/remote Merkle roots (the forensic evidence now on the
+///    event, not zeroed).
+/// 2. `Supervisor::drain_equivocation_alerts` returns ONLY that alert while
+///    leaving an unrelated buffered application event in place — proving the
+///    reconnection driver's targeted drain does not destroy the SDK's delivery
+///    queue (the bug this work fixes).
+/// 3. Replaying the identical signed divergent checkpoint is a no-op (replay
+///    idempotency) — no second alert is emitted.
+///
+/// The structural wiring that the *decrypt* prefix
+/// (`deliver_incoming → deliver_checkpoint_message → compare_remote_checkpoint`)
+/// reaches this comparison is pinned separately by
+/// `pipeline_wiring::b3_merkle_proof_verification_wired`; a full cross-member
+/// MLS-decrypt round trip is not reconstructable single-node because MLS
+/// rejects decrypting one's own messages.
+#[tokio::test]
+async fn runtime_equivocation_dispatch_and_targeted_drain() {
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(ALICE_DID, deterministic_key_resolver());
+    let bob = network.create_node(BOB_DID, deterministic_key_resolver());
+
+    let ctx_id = "reconnect-runtime-equivocation-ctx";
+    let ctx_bytes = context_id_bytes(ctx_id);
+    let handle = alice
+        .create_context(ctx_id, encrypted_params())
+        .await
+        .expect("create context");
+    alice.add_member(&handle, BOB_DID).await.expect("add bob");
+    bob.join_from_welcome(ctx_id, &ctx_bytes)
+        .expect("bob joins");
+
+    // Seed an unrelated application event into Alice's receive buffer (the
+    // SystemClose/MemberJoined family buffered during real catch-up). A plain
+    // self-send to a lone member is a no-op, so use report_degraded_mode which
+    // emits a non-equivocation event the targeted drain must preserve.
+    alice
+        .manager
+        .report_degraded_mode(
+            ctx_id,
+            scp_core::envelope::VersionCompatibility::DegradedMode {
+                local_minor: 0,
+                remote_minor: 1,
+            },
+            vec!["unknown-feature".to_owned()],
+        )
+        .await;
+
+    // Build Alice's honest checkpoint to learn the current count/epoch/time,
+    // then forge a divergent one (equal count, different root) signed by Bob.
+    let honest = alice
+        .manager
+        .build_local_checkpoint(ctx_id, &DID::from(ALICE_DID), &signing_key_for(ALICE_DID))
+        .await
+        .expect("alice builds honest checkpoint");
+
+    let (forged, forged_root) = forge_divergent_checkpoint(ctx_id, BOB_DID, &honest);
+
+    // Runtime dispatch #1 — through the actor mailbox command.
+    let comparison = alice
+        .manager
+        .compare_remote_checkpoint(ctx_id, forged.clone())
+        .await
+        .expect("compare via actor mailbox succeeds (valid signature)");
+    assert!(
+        matches!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+        ),
+        "equal-count different-root checkpoint must compare Divergent (§9.9.3)"
+    );
+
+    // Runtime dispatch #2 — REPLAY the identical signed checkpoint. The replay
+    // must NOT emit a second EquivocationDetected alert (idempotency). The
+    // first detection appended an `EquivocationDetected` event to the log,
+    // advancing the local count, so the replayed comparison itself need not be
+    // Divergent — the load-bearing guarantee is "no second alert", asserted by
+    // the exactly-once count below.
+    let _replay = alice
+        .manager
+        .compare_remote_checkpoint(ctx_id, forged)
+        .await
+        .expect("replayed compare still returns a verdict without error");
+
+    // Targeted drain: returns ONLY the equivocation alert, EXACTLY ONCE
+    // (replay suppressed), and the unrelated DegradedMode event must survive
+    // in the receive buffer for the SDK's normal polling.
+    let alerts = alice.manager.drain_equivocation_alerts(ctx_id).await;
+    let equivocation_count = alerts
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ContextEvent::EquivocationDetected {
+                    remote_sender_did,
+                    remote_merkle_root,
+                    ..
+                }
+                if remote_sender_did.as_ref() == BOB_DID && *remote_merkle_root == forged_root
+            )
+        })
+        .count();
+    assert_eq!(
+        equivocation_count, 1,
+        "the actor dispatch must emit EquivocationDetected exactly once (replay \
+         suppressed) carrying the divergent root (§9.9.3); drained: {alerts:?}"
+    );
+    assert!(
+        alerts
+            .iter()
+            .all(|e| matches!(e, ContextEvent::EquivocationDetected { .. })),
+        "drain_equivocation_alerts must return ONLY equivocation alerts, never \
+         other buffered events; drained: {alerts:?}"
+    );
+
+    // The unrelated application event must NOT have been consumed by the
+    // targeted drain — it remains for the SDK's normal receive polling.
+    let remaining = alice.manager.drain_events(ctx_id).await;
+    assert!(
+        remaining
+            .iter()
+            .any(|e| matches!(e, ContextEvent::DegradedMode { .. })),
+        "targeted drain must PRESERVE non-equivocation events (the reconnect \
+         bug this fixes); remaining: {remaining:?}"
+    );
+    assert!(
+        !remaining
+            .iter()
+            .any(|e| matches!(e, ContextEvent::EquivocationDetected { .. })),
+        "equivocation alerts were already drained; none should remain"
     );
 }

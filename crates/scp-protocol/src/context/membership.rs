@@ -1293,6 +1293,75 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn drain_equivocation_alerts_extracts_only_alerts_and_preserves_order() {
+        let mut buffer = ReceiveBuffer::new();
+        // Interleave equivocation alerts among ordinary events.
+        buffer.push(ContextEvent::MemberJoined {
+            member_did: "did:key:alice".into(),
+            role_name: "admin".into(),
+        });
+        buffer.push(ContextEvent::EquivocationDetected {
+            context_id: "ctx".into(),
+            remote_sender_did: DID("did:key:bob".into()),
+            event_count: 7,
+            local_merkle_root: [1u8; 32],
+            remote_merkle_root: [2u8; 32],
+        });
+        buffer.push(ContextEvent::MessageSent {
+            sender_did: "did:key:alice".into(),
+            sequence_number: 0,
+            payload: vec![9],
+        });
+        buffer.push(ContextEvent::EquivocationDetected {
+            context_id: "ctx".into(),
+            remote_sender_did: DID("did:key:carol".into()),
+            event_count: 8,
+            local_merkle_root: [3u8; 32],
+            remote_merkle_root: [4u8; 32],
+        });
+        buffer.push(ContextEvent::MemberLeft {
+            member_did: "did:key:carol".into(),
+        });
+
+        let alerts = buffer.drain_equivocation_alerts();
+
+        // Exactly the two alerts come back, in their original relative order.
+        assert_eq!(alerts.len(), 2);
+        assert!(
+            matches!(&alerts[0], ContextEvent::EquivocationDetected { remote_sender_did, .. } if remote_sender_did.as_ref() == "did:key:bob")
+        );
+        assert!(
+            matches!(&alerts[1], ContextEvent::EquivocationDetected { remote_sender_did, .. } if remote_sender_did.as_ref() == "did:key:carol")
+        );
+
+        // The non-alert events survive, in their original order, for the SDK's
+        // normal receive polling.
+        let remaining = buffer.drain();
+        assert_eq!(remaining.len(), 3);
+        assert!(matches!(remaining[0], ContextEvent::MemberJoined { .. }));
+        assert!(matches!(remaining[1], ContextEvent::MessageSent { .. }));
+        assert!(matches!(remaining[2], ContextEvent::MemberLeft { .. }));
+    }
+
+    #[test]
+    fn drain_equivocation_alerts_on_buffer_without_alerts_is_a_noop() {
+        let mut buffer = ReceiveBuffer::new();
+        buffer.push(ContextEvent::MessageSent {
+            sender_did: "did:key:alice".into(),
+            sequence_number: 0,
+            payload: vec![1],
+        });
+        let alerts = buffer.drain_equivocation_alerts();
+        assert!(alerts.is_empty());
+        // The message is untouched.
+        assert_eq!(buffer.len(), 1);
+        assert!(matches!(
+            buffer.pop().unwrap(),
+            ContextEvent::MessageSent { .. }
+        ));
+    }
+
+    #[test]
     fn receive_buffer_pop_returns_fifo_order() {
         let mut buffer = ReceiveBuffer::new();
         buffer.push(ContextEvent::MemberJoined {

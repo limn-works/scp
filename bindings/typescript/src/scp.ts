@@ -325,23 +325,40 @@ export interface McpAllowlistState {
   readonly unrestricted: boolean;
 }
 
+/** Offline-tier classification reported per reconnected context (ADR-029). */
+export type ReconnectTier = "short" | "extended" | "long";
+
+/** Per-context reconnection outcome reported by {@link SCP.reconnect}. */
+export type ReconnectOutcome =
+  | "fully_caught_up"
+  | "fast_forwarded"
+  | "reset"
+  | "context_gone"
+  | "failed"
+  | "pending";
+
 /**
  * Per-context result of {@link SCP.reconnect} (ADR-029).
  */
 export interface ContextReconnectResult {
   /** Context that was reconnected. */
   readonly contextId: string;
-  /** Offline tier: `"short"` / `"extended"` / `"long"`. */
-  readonly tier: string;
-  /** Outcome (`"fully_caught_up"`, `"reset"`, `"failed"`, …). */
-  readonly outcome: string;
+  /** Offline tier classification. */
+  readonly tier: ReconnectTier;
+  /** Per-context reconnection outcome. */
+  readonly outcome: ReconnectOutcome;
   /** MLS epochs caught up. */
   readonly epochsCaughtUp: number;
   /** Event-log events recovered. */
   readonly eventsRecovered: number;
   /** Whether an MLS Update was issued (§9.12). */
   readonly mlsUpdateIssued: boolean;
-  /** Number of equivocation alerts surfaced (§9.9.3). */
+  /**
+   * Number of equivocation alerts surfaced during this context's sync
+   * (§9.9.3). Each alert's divergent local/remote Merkle roots are delivered
+   * per-event via the receive stream (`EquivocationDetected` events) and
+   * persisted in the event log; this field is the count only.
+   */
   readonly equivocationsDetected: number;
   /** Whether `needsReconnect` was cleared on success. */
   readonly needsReconnectCleared: boolean;
@@ -1468,6 +1485,21 @@ export class SCP {
    * conservative tier.
    *
    * Requires an active relay connection (call `transportConnect` first).
+   *
+   * Key resolution: this backend (NAPI / Python) takes the `identityDid`
+   * **string** and resolves the local member's signing key from the bridge's
+   * identity registry. The Swift / Kotlin SDKs instead take the opaque
+   * `Identity` object directly (`reconnect(identity:…)`) — same protocol, only
+   * the argument shape differs per the UniFFI object-handle convention.
+   *
+   * Catch-up integrity (§9.9.3, §23.7): equivocation where a peer reports the
+   * **same** event count with a **different** Merkle root IS detected and
+   * surfaced (per-context {@link ContextReconnectResult.equivocationsDetected}).
+   * However, reconnection catch-up does NOT yet verify suffix integrity — the
+   * Merkle consistency proof confirming that fetched events genuinely extend
+   * this member's own history is specified separately. An equivocating relay
+   * that keeps a member perpetually *behind* (never reaching equal count) is
+   * therefore not yet detected on the catch-up path.
    */
   async reconnect(
     identityDid: string,

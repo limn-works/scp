@@ -976,6 +976,21 @@ class SCP:
 
         Requires an active relay connection (call ``transport_connect`` first).
 
+        Key resolution: this backend (Python / NAPI) takes the
+        ``identity_did`` **string** and resolves the local member's signing key
+        from the bridge's identity registry. The Swift / Kotlin SDKs instead
+        take the opaque ``Identity`` object directly — same protocol, only the
+        argument shape differs per the UniFFI object-handle convention.
+
+        Catch-up integrity (§9.9.3, §23.7): equivocation where a peer reports
+        the **same** event count with a **different** Merkle root IS detected
+        and surfaced (per-context ``equivocations_detected``). However,
+        reconnection catch-up does NOT yet verify suffix integrity — the Merkle
+        consistency proof confirming that fetched events genuinely extend this
+        member's own history is specified separately. An equivocating relay
+        that keeps a member perpetually *behind* (never reaching equal count)
+        is therefore not yet detected on the catch-up path.
+
         Delegates to ``_scp_core.SCP.context_reconnect``.
         """
         return await asyncio.to_thread(
