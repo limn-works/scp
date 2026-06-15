@@ -71,13 +71,13 @@ pub const ACTOR_MAILBOX_CAPACITY: usize = 256;
 // SagaInput / SagaOutput — plan §"Cross-context saga protocol"
 // ---------------------------------------------------------------------------
 
-/// Input to `Supervisor::start_saga`. The variant enumerates the 4
+/// Input to `Supervisor::start_saga`. The variant enumerates the 3
 /// saga types defined in plan §"Cross-context saga protocol"
-/// (standing-pair create, migration, cross-context tool invoke,
-/// broadcast hosting handshake). Commit 6 lands the enum shape;
-/// real field sets arrive when each handler migrates.
+/// (standing-pair create, cross-context tool invoke, broadcast hosting
+/// handshake). Commit 6 lands the enum shape; real field sets arrive
+/// when each handler migrates.
 ///
-/// The type is a discriminated union so that adding a fifth saga type
+/// The type is a discriminated union so that adding a fourth saga type
 /// later is a compile error at every call site — the default branch is
 /// not permitted.
 pub enum SagaInput {
@@ -88,13 +88,6 @@ pub enum SagaInput {
         local_did: DID,
         /// The remote peer.
         peer_did: DID,
-    },
-    /// Context migration between two identities (target-side).
-    ContextMigration {
-        /// Source context ID.
-        source_context_id: [u8; 32],
-        /// Source identity.
-        source_identity_did: DID,
     },
     /// Cross-context tool invocation.
     CrossContextToolInvocation {
@@ -4340,25 +4333,25 @@ impl Supervisor {
     /// (plan §"Cross-context saga protocol" step Prepare — concurrent
     /// Prepare against the same supervisor is rejected).
     ///
-    /// # Spec-gapped saga use cases
+    /// # Unwired saga use cases (pending Phase 2C)
     ///
-    /// The 4 [`SagaInput`] variants (StandingPairCreate,
-    /// ContextMigration, CrossContextToolInvocation,
-    /// BroadcastHostingHandshake) each require protocol fill-in before
-    /// they can be wired — see
-    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`. This method
-    /// drives the FSM generically; specific `SagaInput` arms return
-    /// [`ContextError::NotImplemented`] at the Prepare dispatch step.
-    /// The coordinator itself — journal writes, phase transitions,
-    /// timeout/retry accounting, terminal resolution — is fully
-    /// implemented.
+    /// The 3 [`SagaInput`] variants (StandingPairCreate,
+    /// CrossContextToolInvocation, BroadcastHostingHandshake) each have
+    /// their wire protocol specced (§5.15.8 / §6.2.4 / §5.14.13 +
+    /// ADR-049 §3a) but their Prepare/Commit dispatch is not yet wired
+    /// — see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`. This
+    /// method drives the FSM generically; specific `SagaInput` arms
+    /// return [`ContextError::NotImplemented`] at the Prepare dispatch
+    /// step until Phase 2C wires them. The coordinator itself — journal
+    /// writes, phase transitions, timeout/retry accounting, terminal
+    /// resolution — is fully implemented.
     ///
     /// # Errors
     ///
     /// - [`ContextError::ActorBusy`] if a saga is already in flight.
     /// - [`ContextError::NotImplemented`] if the
-    ///   [`SagaInput`] variant requires spec-gapped prepare dispatch
-    ///   (all 4 current variants until commit 11.5).
+    ///   [`SagaInput`] variant's prepare dispatch is not yet wired
+    ///   (all 3 current variants, pending Phase 2C).
     /// - [`ContextError::InvalidState`] on journal I/O failure.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
         use std::sync::atomic::Ordering;
@@ -4527,7 +4520,7 @@ impl Supervisor {
         self.append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
             .await?;
 
-        // 2. PreparingA — spec-gapped for every current SagaInput variant.
+        // 2. PreparingA — not yet wired for any current SagaInput variant.
         //    The prepare-dispatch returns NotImplemented and the FSM
         //    transitions directly to Aborted. This preserves the
         //    coordinator's observable behaviour (terminate with a typed
@@ -4589,9 +4582,9 @@ impl Supervisor {
     }
 
     /// Dispatch a single Prepare phase. Returns
-    /// [`ContextError::NotImplemented`] for all 4 current
-    /// [`SagaInput`] variants because prepare-dispatch is
-    /// spec-gapped — see
+    /// [`ContextError::NotImplemented`] for all 3 current
+    /// [`SagaInput`] variants because prepare-dispatch is not yet
+    /// wired (Phase 2C) — see
     /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
     ///
     /// The wrapper enforces the 30s per-phase timeout
@@ -4611,11 +4604,6 @@ impl Supervisor {
                     "saga Prepare{phase:?} — StandingPairCreate wiring deferred to commit 11.5 \
                      per DEFERRED-commit-11-saga-use-cases.md gap 1 (standing-pair 2-phase \
                      decomposition)"
-                ))),
-                SagaInput::ContextMigration { .. } => Err(ContextError::NotImplemented(format!(
-                    "saga Prepare{phase:?} — ContextMigration wiring deferred to commit 11.5 \
-                     per DEFERRED-commit-11-saga-use-cases.md gap 4 (migration CustodyHandover \
-                     envelope)"
                 ))),
                 SagaInput::CrossContextToolInvocation { .. } => {
                     Err(ContextError::NotImplemented(format!(
@@ -4688,10 +4676,9 @@ impl Supervisor {
         let dispatch_fut = async {
             match input {
                 SagaInput::StandingPairCreate { .. }
-                | SagaInput::ContextMigration { .. }
                 | SagaInput::CrossContextToolInvocation { .. }
                 | SagaInput::BroadcastHostingHandshake { .. } => Err(ContextError::NotImplemented(
-                    "saga Commit — all 4 saga types' commit-side wiring deferred to commit \
+                    "saga Commit — all 3 saga types' commit-side wiring deferred to commit \
                          11.5 per DEFERRED-commit-11-saga-use-cases.md"
                         .to_owned(),
                 )),
@@ -6875,13 +6862,6 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
             local_did,
             peer_did,
         } => vec![local_did.to_string(), peer_did.to_string()],
-        SagaInput::ContextMigration {
-            source_context_id,
-            source_identity_did,
-        } => vec![
-            hex::encode(source_context_id),
-            source_identity_did.to_string(),
-        ],
         SagaInput::CrossContextToolInvocation {
             caller_context_id,
             caller_did,
@@ -6904,12 +6884,29 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
 }
 
 /// Classify whether a saga's journal evidence carries bearer bytes
-/// (spec §9.4.3). Only [`SagaInput::ContextMigration`] is
-/// secret-bearing — the others are public-only. Secret-bearing sagas
-/// pass `true` to [`SagaJournal::mark_resolved`] so the journal
-/// synchronously overwrites evidence bytes on terminal resolution.
+/// (spec §9.4.3). No current [`SagaInput`] variant is secret-bearing:
+/// the cross-identity custody handover — the only secret-bearing saga
+/// ever contemplated — was withdrawn (ADR-049 §4, tombstoned; it is a
+/// §5.11A.6 security violation, not a saga). This function therefore
+/// returns `false` for every live input.
+///
+/// It is retained — not inlined to a constant `false` — as the §9.4.3
+/// forward-contract hook: the classification point on the start-saga
+/// path that any *future* secret-bearing saga MUST route through to
+/// pass `true` to [`SagaJournal::mark_resolved`] (which synchronously
+/// overwrites evidence bytes on terminal resolution). The secret-bearing
+/// journal machinery stays dormant behind it; all live callers pass
+/// `false`. NOTE: the crash-recovery path (`recover_saga_entry`)
+/// hardcodes `false` because a replayed [`JournalEntry`] does not carry
+/// its `SagaInput`; a future secret-bearing saga MUST additionally
+/// re-derive secret-bearing status there (e.g. from the persisted saga
+/// type) so recovery resolution also overwrites prior on-disk evidence.
 const fn saga_input_is_secret_bearing(input: &SagaInput) -> bool {
-    matches!(input, SagaInput::ContextMigration { .. })
+    match input {
+        SagaInput::StandingPairCreate { .. }
+        | SagaInput::CrossContextToolInvocation { .. }
+        | SagaInput::BroadcastHostingHandshake { .. } => false,
+    }
 }
 
 /// Shared timestamp helper. Duplicated from `saga_journal.rs` to avoid
@@ -7340,7 +7337,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_saga_returns_not_implemented_for_spec_gapped_input() {
-        // All 4 current SagaInput variants are spec-gapped — the FSM
+        // All 3 current SagaInput variants are not yet wired — the FSM
         // journals Initiated + PreparingA then fails the Prepare
         // dispatch with NotImplemented, rolls back via abort_saga, and
         // returns the typed error. This exercises the coordinator

@@ -5,8 +5,8 @@
 //! # Trait
 //!
 //! [`SagaJournal`] is the supervisor's durable coordinator record for
-//! cross-actor sagas (standing-pair create, migration, cross-context tool
-//! invoke, broadcast hosting handshake). It exposes three operations per
+//! cross-actor sagas (standing-pair create, cross-context tool invoke,
+//! broadcast hosting handshake). It exposes three operations per
 //! spec §17.16.1:
 //!
 //! - [`SagaJournal::append`] — durably persist a state transition. Flushes
@@ -167,8 +167,10 @@ pub struct JournalEntry {
     /// operations they are DIDs. Interpretation is saga-type specific.
     pub participants: Vec<String>,
     /// Saga-type specific evidence — MessagePack-encoded `SagaPreparedState`.
-    /// Wrapped in [`Zeroizing`] so secret-bearing payloads (e.g. migration
-    /// commitments) zero on drop. See spec §9.4.3.
+    /// Wrapped in [`Zeroizing`] so any secret-bearing payload zeroes on drop.
+    /// No current saga is secret-bearing (all three journal public metadata
+    /// only); this is the §9.4.3 forward contract for any future
+    /// secret-bearing saga. See spec §9.4.3.
     pub evidence: Zeroizing<Vec<u8>>,
     /// Milliseconds since the UNIX epoch when the entry was appended.
     pub timestamp_ms: u64,
