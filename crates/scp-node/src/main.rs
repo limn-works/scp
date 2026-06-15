@@ -19,7 +19,6 @@
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use zeroize::Zeroizing;
@@ -27,7 +26,7 @@ use zeroize::Zeroizing;
 use scp_identity::cache::SystemClock;
 use scp_identity::dht::SequenceStore;
 use scp_identity::{DidCache, DidDht, InMemoryDhtClient, InMemorySequenceStore};
-use scp_node::{ApplicationNodeBuilder, TlsProvider};
+use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode};
 use scp_platform::EncryptedStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
@@ -245,33 +244,6 @@ fn resolve_storage_key_or_exit(storage_dir: &std::path::Path) -> Zeroizing<[u8; 
 // ---------------------------------------------------------------------------
 
 // `relay_config_from_env` is provided by `scp_transport::startup::relay_config_from_env`.
-
-// ---------------------------------------------------------------------------
-// Self-signed TLS provider (development mode)
-// ---------------------------------------------------------------------------
-
-/// TLS provider that generates a self-signed certificate for development.
-///
-/// Activated by `SCP_NODE_TLS_SELF_SIGNED=1`. NOT for production use.
-struct SelfSignedTlsProvider {
-    domain: String,
-}
-
-impl TlsProvider for SelfSignedTlsProvider {
-    fn provision(
-        &self,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<scp_node::tls::CertificateData, scp_node::tls::TlsError>,
-                > + Send
-                + '_,
-        >,
-    > {
-        let domain = self.domain.clone();
-        Box::pin(async move { scp_node::tls::generate_self_signed(&domain) })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Health check + shutdown signal
@@ -835,17 +807,21 @@ async fn run_node_with<
         scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
     );
 
-    let mut builder = ApplicationNodeBuilder::new()
-        .storage(storage)
-        .domain(&domain)
-        .generate_identity_with(custody, did_method)
-        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .http_bind_addr(http_addr)
-        .projection_rate_limit(projection_rate);
-
-    if use_dns_provider {
+    // Decide TLS + DNS provider from the two env booleans BEFORE building the
+    // config (ADR-052 Phase B-P2). The three TLS arms map exactly onto the
+    // legacy builder branches:
+    //   - DNS provider on  → headless ACME (`Acme { email: None }`) + a DNS
+    //     subdomain provider. The legacy default supplied no `acme_email`, so
+    //     `None` reproduces it; the DNS provider overrides TLS during build()
+    //     after identity resolution, exactly as before.
+    //   - self-signed       → `TlsMode::SelfSigned` (the same self-signed cert
+    //     the dropped local `SelfSignedTlsProvider` produced).
+    //   - neither           → headless ACME (`Acme { email: None }`), the
+    //     legacy default that falls through to `AcmeProvider::new(domain)` with
+    //     no contact email.
+    let (tls, dns_provider) = if use_dns_provider {
         // DNS subdomain provider: derive domain from DID, register with DNS
-        // API for zero-config TLS (#642). The domain set above is overridden
+        // API for zero-config TLS (#642). The configured domain is overridden
         // during build() after identity resolution.
         let public_ip: std::net::IpAddr = env::var("SCP_NODE_PUBLIC_IP")
             .unwrap_or_else(|_| {
@@ -873,15 +849,39 @@ async fn run_node_with<
             port = port,
             "using DNS subdomain provider for zero-config TLS"
         );
-        builder = builder.dns_provider(dns_config);
+        (TlsMode::Acme { email: None }, Some(dns_config))
     } else if use_self_signed {
         tracing::info!(domain = %domain, "using self-signed TLS certificate (development mode)");
-        builder = builder.tls_provider(Arc::new(SelfSignedTlsProvider {
-            domain: domain.clone(),
-        }));
-    }
+        (TlsMode::SelfSigned, None)
+    } else {
+        // Legacy headless-ACME default (no contact email).
+        (TlsMode::Acme { email: None }, None)
+    };
 
-    let node = match builder.build().await {
+    // `Domain` is a publishing reach, so M2 requires `DhtMode::Production`
+    // (advisory in P1 — dropped before lowering, so no runtime behavior
+    // change). `run_node_with` is generic over `S: EncryptedStorage`, so the
+    // production `Node::start` (not `start_for_testing`) is the correct entry.
+    let node = match Node::start(NodeConfig {
+        tls,
+        dns_provider,
+        dht: DhtMode::Production,
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        http_bind_addr: Some(http_addr),
+        projection_rate_limit: Some(projection_rate),
+        ..NodeConfig::defaults(
+            Reach::Domain {
+                domain: domain.clone(),
+            },
+            IdentitySource::Generate {
+                custody,
+                did_method,
+            },
+            storage,
+        )
+    })
+    .await
+    {
         Ok(n) => n,
         Err(e) => {
             tracing::error!(error = %e, "application node failed to build");
