@@ -370,8 +370,20 @@ struct ConfigTail {
 }
 
 /// Validates the config, returning a loud error for contradictory combinations
-/// (ADR-051 M3 — fail loud, never silent).
-fn validate_config(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
+/// (ADR-051 M2/M3 — fail loud, never silent).
+///
+/// Two contradictions are rejected:
+///
+/// 1. **M3 (TLS):** `Reach::Domain` + `TlsMode::Plaintext` — a public domain
+///    reach cannot serve plaintext.
+/// 2. **M2 (DHT publish):** a *publishing* reach (`Reach::Domain` or
+///    `Reach::NatTraversal`, both of which advertise a routable address) with
+///    `DhtMode::Memory` (which never publishes to the DHT). Per
+///    `.docs/standards/construction.md` M2, this is a precise, loud error — not
+///    a silent publish, not a silent no-op. `Reach::Tunnel` / `Reach::Local`
+///    publish a loopback URL (non-routable) and are therefore non-publishing
+///    reaches, valid with `DhtMode::Memory`.
+fn validate_config(reach: &Reach, tls: &TlsMode, dht: DhtMode) -> Result<(), NodeError> {
     if matches!(reach, Reach::Domain { .. }) && matches!(tls, TlsMode::Plaintext) {
         return Err(NodeError::InvalidConfig(
             "Reach::Domain with TlsMode::Plaintext is contradictory: a public domain reach \
@@ -379,7 +391,79 @@ fn validate_config(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
                 .to_owned(),
         ));
     }
+    // M2: a publishing reach advertises a routable address, which only reaches
+    // the network when the DID document is actually published to the DHT.
+    // `DhtMode::Memory` never publishes, so the routable address would be
+    // unreachable — a contradiction. Fail loud with the contradiction and fix.
+    if dht == DhtMode::Memory {
+        let publishing_reach = match reach {
+            Reach::Domain { .. } => Some("Reach::Domain"),
+            Reach::NatTraversal => Some("Reach::NatTraversal"),
+            Reach::Tunnel { .. } | Reach::Local => None,
+        };
+        if let Some(reach_name) = publishing_reach {
+            return Err(NodeError::InvalidConfig(format!(
+                "{reach_name} publishes a routable address but DhtMode::Memory does not publish \
+                 to the DHT. Select DhtMode::Production to publish, or a non-publishing Reach \
+                 (Tunnel/Local)."
+            )));
+        }
+    }
     Ok(())
+}
+
+/// Splits a [`NodeConfig`] into its three independently-handled parts: the
+/// storage backend, the identity source, and the uniform [`ConfigTail`].
+///
+/// Shared by both entry points ([`Node::start`] / [`Node::start_for_testing`])
+/// so the ~37-line destructure + `ConfigTail` rebuild lives in exactly one place
+/// (DRY). The advisory `dht` / `dht_gateways` fields are dropped here (the
+/// concrete `D` selects Memory vs Production; there is no builder setter yet).
+///
+/// `validate_config` borrows `config.reach` / `config.dht` and so MUST run
+/// **before** this function moves `config` — callers keep that ordering.
+fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
+    config: NodeConfig<K, D, S>,
+) -> (S, IdentitySource<K, D>, ConfigTail) {
+    let NodeConfig {
+        reach,
+        identity,
+        storage,
+        tls,
+        // `dht` and `dht_gateways` are advisory in P1 (the concrete `D`
+        // selects Memory vs Production); they have no builder setter yet.
+        dht: _,
+        dht_gateways: _,
+        bind_addr,
+        local_api,
+        http_bind_addr,
+        cors_origins,
+        projection_rate_limit,
+        dns_provider,
+        #[cfg(feature = "http3")]
+        http3,
+        nat,
+        network_detector,
+        blob_storage,
+    } = config;
+
+    let tail = ConfigTail {
+        reach,
+        tls,
+        bind_addr,
+        local_api,
+        http_bind_addr,
+        cors_origins,
+        projection_rate_limit,
+        dns_provider,
+        #[cfg(feature = "http3")]
+        http3,
+        nat,
+        network_detector,
+        blob_storage,
+    };
+
+    (storage, identity, tail)
 }
 
 /// Applies the [`NatSlot`] to a builder, lowering each tuning override onto the
@@ -512,6 +596,21 @@ where
     apply_tls(b, tail.tls, &tail.reach)
 }
 
+/// Emits a one-time `tracing::warn!` noting that `Reach::Tunnel`'s `public_url`
+/// is carried but not yet threaded in P1 (the node publishes a loopback URL).
+///
+/// This makes the documented deferral observable instead of a silent drop
+/// (addresses the accepted-then-ignored misuse-resistance finding) WITHOUT
+/// inventing wiring. Called from both finishers' Tunnel arm.
+fn warn_tunnel_public_url_deferred(public_url: &str) {
+    tracing::warn!(
+        public_url,
+        "Reach::Tunnel.public_url is carried but not yet threaded in P1; the node \
+         publishes a loopback relay URL. Configure the tunnel to forward to that \
+         loopback listener."
+    );
+}
+
 /// Applies the optional tail, addresses the builder per the reach, and finishes
 /// with the production `build()` (`where S: EncryptedStorage`). The reach
 /// addressing yields either `HasDomain` or `HasNoDomain` — both have `build()`.
@@ -529,7 +628,11 @@ where
     match reach {
         Reach::Domain { domain } => b.domain(&domain).build().await,
         Reach::NatTraversal => b.no_domain().build().await,
-        Reach::Tunnel { .. } | Reach::Local => b.no_domain().skip_nat_probe().build().await,
+        Reach::Tunnel { public_url } => {
+            warn_tunnel_public_url_deferred(&public_url);
+            b.no_domain().skip_nat_probe().build().await
+        }
+        Reach::Local => b.no_domain().skip_nat_probe().build().await,
     }
 }
 
@@ -550,9 +653,11 @@ where
     match reach {
         Reach::Domain { domain } => b.domain(&domain).build_for_testing().await,
         Reach::NatTraversal => b.no_domain().build_for_testing().await,
-        Reach::Tunnel { .. } | Reach::Local => {
+        Reach::Tunnel { public_url } => {
+            warn_tunnel_public_url_deferred(&public_url);
             b.no_domain().skip_nat_probe().build_for_testing().await
         }
+        Reach::Local => b.no_domain().skip_nat_probe().build_for_testing().await,
     }
 }
 
@@ -578,44 +683,10 @@ impl Node {
         D: DidMethod + 'static,
         S: EncryptedStorage + 'static,
     {
-        validate_config(&config.reach, &config.tls)?;
-        let NodeConfig {
-            reach,
-            identity,
-            storage,
-            tls,
-            // `dht` and `dht_gateways` are advisory in P1 (the concrete `D`
-            // selects Memory vs Production); they have no builder setter yet.
-            dht: _,
-            dht_gateways: _,
-            bind_addr,
-            local_api,
-            http_bind_addr,
-            cors_origins,
-            projection_rate_limit,
-            dns_provider,
-            #[cfg(feature = "http3")]
-            http3,
-            nat,
-            network_detector,
-            blob_storage,
-        } = config;
-
-        let tail = ConfigTail {
-            reach,
-            tls,
-            bind_addr,
-            local_api,
-            http_bind_addr,
-            cors_origins,
-            projection_rate_limit,
-            dns_provider,
-            #[cfg(feature = "http3")]
-            http3,
-            nat,
-            network_detector,
-            blob_storage,
-        };
+        // `validate_config` borrows `config.reach` / `config.dht`, so it MUST
+        // run before `split_config` moves `config`.
+        validate_config(&config.reach, &config.tls, config.dht)?;
+        let (storage, identity, tail) = split_config(config);
 
         // Storage first (requires NoOpStorage state), then identity (consuming
         // custody/did_method), then the tail. Each identity arm yields a
@@ -669,42 +740,10 @@ impl Node {
         D: DidMethod + 'static,
         S: Storage + 'static,
     {
-        validate_config(&config.reach, &config.tls)?;
-        let NodeConfig {
-            reach,
-            identity,
-            storage,
-            tls,
-            dht: _,
-            dht_gateways: _,
-            bind_addr,
-            local_api,
-            http_bind_addr,
-            cors_origins,
-            projection_rate_limit,
-            dns_provider,
-            #[cfg(feature = "http3")]
-            http3,
-            nat,
-            network_detector,
-            blob_storage,
-        } = config;
-
-        let tail = ConfigTail {
-            reach,
-            tls,
-            bind_addr,
-            local_api,
-            http_bind_addr,
-            cors_origins,
-            projection_rate_limit,
-            dns_provider,
-            #[cfg(feature = "http3")]
-            http3,
-            nat,
-            network_detector,
-            blob_storage,
-        };
+        // `validate_config` borrows `config.reach` / `config.dht`, so it MUST
+        // run before `split_config` moves `config`.
+        validate_config(&config.reach, &config.tls, config.dht)?;
+        let (storage, identity, tail) = split_config(config);
 
         let base = ApplicationNodeBuilder::new().storage(storage);
         match identity {
@@ -810,6 +849,10 @@ mod tests {
     async fn domain_generate_produces_did_dht_identity() {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            // Domain is a publishing reach; M2 requires Production (advisory in
+            // P1 — the test's TestDidDht uses an in-memory client, so nothing is
+            // actually published offline).
+            dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
                     domain: "config-gen.example.com".to_owned(),
@@ -837,6 +880,8 @@ mod tests {
 
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            // Domain is a publishing reach; M2 requires Production (advisory).
+            dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
                     domain: "config-explicit.example.com".to_owned(),
@@ -862,19 +907,23 @@ mod tests {
         node.shutdown();
     }
 
-    // --- Test 3: domain + Acme lowers to acme_email (offline fallthrough) -----
+    // --- Test 3: Acme lowers without provisioning on a no-domain reach -------
 
     #[tokio::test]
-    async fn domain_acme_lowers_and_falls_through_offline() {
-        // Acme has no real ACME server here, so TLS provisioning fails and
-        // build_with_store falls through to no-domain mode. A MockNatStrategy
-        // keeps that fallthrough offline (no real STUN). The ACME path drives
-        // rustls, so install a process-level crypto provider first (matches the
-        // pattern in the quic_listener / tls tests).
-        let _ = rustls::crypto::ring::default_provider().install_default();
+    async fn acme_lowers_without_provisioning_on_no_domain() {
+        // `TlsMode::Acme` lowers to `.acme_email(...)` on the builder regardless
+        // of reach, but a non-`Domain` reach never provisions ACME TLS (no
+        // challenge listener, no Let's Encrypt contact). On `NatTraversal` the
+        // Acme lowering is therefore fully offline and deterministic: it must
+        // not break the build. A MockNatStrategy keeps the NAT path offline (no
+        // real STUN), and NatTraversal is a publishing reach so M2 requires
+        // Production (advisory in P1 — the TestDidDht uses an in-memory client,
+        // so nothing is published offline). This test NEVER binds port 80 and
+        // NEVER contacts Let's Encrypt.
         let external_addr = SocketAddr::from(([198, 51, 100, 9], 41001));
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
             tls: TlsMode::Acme {
                 email: "admin@example.com".to_owned(),
             },
@@ -882,9 +931,7 @@ mod tests {
                 tier: ReachabilityTier::Stun { external_addr },
             })),
             ..NodeConfig::defaults(
-                Reach::Domain {
-                    domain: "config-acme.example.com".to_owned(),
-                },
+                Reach::NatTraversal,
                 generate_identity(),
                 InMemoryStorage::new(),
             )
@@ -892,10 +939,15 @@ mod tests {
         .await
         .unwrap();
 
-        // Fallthrough to no-domain mode publishes a ws:// relay url.
+        // No-domain build: Acme lowering did not provision and did not break the
+        // build; the node publishes a ws:// relay url with no domain.
+        assert!(
+            node.domain().is_none(),
+            "Acme on a no-domain reach should build a no-domain node"
+        );
         assert!(
             node.relay_url().starts_with("ws://"),
-            "Acme fallthrough should land in no-domain mode (ws:// url), got: {}",
+            "no-domain mode should publish a ws:// url, got: {}",
             node.relay_url()
         );
         node.shutdown();
@@ -908,6 +960,9 @@ mod tests {
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            // NatTraversal is a publishing reach; M2 requires Production
+            // (advisory in P1).
+            dht: DhtMode::Production,
             nat: NatSlot::Custom(Arc::new(MockNatStrategy {
                 tier: ReachabilityTier::Stun { external_addr },
             })),
@@ -986,6 +1041,8 @@ mod tests {
 
         let node1 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            // Domain is a publishing reach; M2 requires Production (advisory).
+            dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
                     domain: "config-persist.example.com".to_owned(),
@@ -1004,6 +1061,8 @@ mod tests {
 
         let node2 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            // Domain is a publishing reach; M2 requires Production (advisory).
+            dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
                     domain: "config-persist.example.com".to_owned(),
@@ -1084,6 +1143,223 @@ mod tests {
         assert!(
             matches!(result, Err(NodeError::InvalidConfig(_))),
             "Reach::Domain + TlsMode::Plaintext must be a loud InvalidConfig error"
+        );
+    }
+
+    // --- Test 11: Domain + DhtMode::Memory is a loud M2 config error ----------
+
+    #[tokio::test]
+    async fn domain_plus_dht_memory_is_invalid_config() {
+        // `NodeConfig::defaults` yields `dht: DhtMode::Memory`. A `Reach::Domain`
+        // publishes a routable address, so Memory (no publish) is the precise,
+        // loud M2 contradiction — not a silent publish, not a silent no-op.
+        let result = Node::start_for_testing(NodeConfig::defaults(
+            Reach::Domain {
+                domain: "config-m2-domain.example.com".to_owned(),
+            },
+            generate_identity(),
+            InMemoryStorage::new(),
+        ))
+        .await;
+
+        let err = match result {
+            Err(NodeError::InvalidConfig(msg)) => msg,
+            Err(other) => {
+                panic!("expected InvalidConfig for Domain + DhtMode::Memory, got: {other}")
+            }
+            Ok(node) => {
+                node.shutdown();
+                panic!("expected InvalidConfig for Domain + DhtMode::Memory, got Ok");
+            }
+        };
+        assert!(
+            err.contains("Reach::Domain") && err.contains("DhtMode::Memory"),
+            "M2 error must name the contradiction, got: {err}"
+        );
+    }
+
+    // --- Test 12: NatTraversal + DhtMode::Memory is a loud M2 config error -----
+
+    #[tokio::test]
+    async fn nat_traversal_plus_dht_memory_is_invalid_config() {
+        // NatTraversal publishes a routable (NAT-traversed) address; Memory (no
+        // publish) is the same precise, loud M2 contradiction as Domain.
+        let result = Node::start_for_testing(NodeConfig::defaults(
+            Reach::NatTraversal,
+            generate_identity(),
+            InMemoryStorage::new(),
+        ))
+        .await;
+
+        let err = match result {
+            Err(NodeError::InvalidConfig(msg)) => msg,
+            Err(other) => {
+                panic!("expected InvalidConfig for NatTraversal + DhtMode::Memory, got: {other}")
+            }
+            Ok(node) => {
+                node.shutdown();
+                panic!("expected InvalidConfig for NatTraversal + DhtMode::Memory, got Ok");
+            }
+        };
+        assert!(
+            err.contains("Reach::NatTraversal") && err.contains("DhtMode::Memory"),
+            "M2 error must name the contradiction, got: {err}"
+        );
+    }
+
+    // --- Test 13: non-publishing reach + DhtMode::Memory is VALID -------------
+
+    #[tokio::test]
+    async fn tunnel_and_local_with_dht_memory_are_valid() {
+        // Tunnel and Local publish a loopback URL (non-routable), so they are
+        // NON-publishing reaches: `DhtMode::Memory` (the defaults' dht) is valid,
+        // no M2 error. This is the positive companion to Tests 11/12 and the
+        // explicit guard that Tests 5/6 (which use default Memory) keep building.
+        let tunnel = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            ..NodeConfig::defaults(
+                Reach::Tunnel {
+                    public_url: "https://tunnel-m2.example.com".to_owned(),
+                },
+                generate_identity(),
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .expect("Tunnel + DhtMode::Memory is a non-publishing reach and must be valid");
+        assert!(tunnel.domain().is_none());
+        tunnel.shutdown();
+
+        let local = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+        })
+        .await
+        .expect("Local + DhtMode::Memory is a non-publishing reach and must be valid");
+        assert!(local.domain().is_none());
+        local.shutdown();
+    }
+
+    // --- Test 14: NatSlot::Tuned overrides lower onto the builder -------------
+
+    #[tokio::test]
+    async fn nat_tuned_overrides_build() {
+        // `NatSlot::Tuned` feeds the DefaultNatStrategy (which probes over STUN),
+        // so to stay offline we use `Reach::Local` (skip_nat_probe): the tuned
+        // strategy is constructed and its four override setters
+        // (stun_server / bridge_relay / port_mapper / reachability_probe) are
+        // applied to the builder, but `select_tier` is never called → no STUN.
+        // A successful build proves all four `apply_nat` Tuned setters lower
+        // without panicking and the builder accepts them. Local is a
+        // non-publishing reach, so DhtMode::Memory (the default) is valid.
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            nat: NatSlot::Tuned {
+                stun_server: Some("127.0.0.1:3478".to_owned()),
+                bridge_relay: Some("wss://bridge.example.test/scp/v1".to_owned()),
+                port_mapper: None,
+                reachability_probe: None,
+            },
+            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+        })
+        .await
+        .expect("NatSlot::Tuned overrides should lower and build offline on a Local reach");
+
+        assert!(
+            node.domain().is_none(),
+            "Local should build a no-domain node even with NatSlot::Tuned overrides"
+        );
+        node.shutdown();
+    }
+
+    // --- Test 15: blob_storage Some overrides, None preserves the default -----
+
+    #[tokio::test]
+    async fn blob_storage_some_overrides_and_none_preserves_default() {
+        // Some(...) overrides the builder's in-memory default; None preserves it
+        // (the builder's `new()` sets `Some(BlobStorageBackend::default())`, so
+        // the None path must NOT clear the relay's blob storage). Both paths
+        // build on a Local (non-publishing) reach, which is the observable proof:
+        // the None path did not break the build by clearing blob storage. We do
+        // not assert the private backend value — only what is observable.
+        let with_some = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            blob_storage: Some(BlobStorageBackend::default()),
+            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+        })
+        .await
+        .expect("blob_storage: Some(default) should override and build");
+        assert!(with_some.domain().is_none());
+        with_some.shutdown();
+
+        let with_none = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            blob_storage: None,
+            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+        })
+        .await
+        .expect("blob_storage: None should preserve the builder default and build");
+        assert!(with_none.domain().is_none());
+        with_none.shutdown();
+    }
+
+    // --- Test 16: Persisted rejects mismatched custody through Node::start -----
+
+    #[tokio::test]
+    async fn persisted_rejects_mismatched_custody_through_node_start() {
+        // First start persists the identity under custodyA. The second start
+        // over the SAME storage but a fresh custodyB (no keys) must be rejected
+        // by the builder's persisted-identity validation, surfaced through the
+        // config-level entry point. Domain is a publishing reach → Production.
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody_a = Arc::new(InMemoryKeyCustody::new());
+        let did_method_a = Arc::new(make_test_dht(&custody_a));
+
+        let node1 = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "config-mismatch.example.com".to_owned(),
+                },
+                IdentitySource::Persisted {
+                    custody: Arc::clone(&custody_a),
+                    did_method: did_method_a,
+                },
+                Arc::clone(&storage),
+            )
+        })
+        .await
+        .expect("first persisted start should succeed and persist the identity");
+        node1.shutdown();
+
+        // Fresh custody with NO keys → load-or-create must fail validation.
+        let custody_b = Arc::new(InMemoryKeyCustody::new());
+        let did_method_b = Arc::new(make_test_dht(&custody_b));
+
+        let result = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "config-mismatch.example.com".to_owned(),
+                },
+                IdentitySource::Persisted {
+                    custody: custody_b,
+                    did_method: did_method_b,
+                },
+                Arc::clone(&storage),
+            )
+        })
+        .await;
+
+        let err = result
+            .err()
+            .expect("second persisted start with mismatched custody should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found in custody"),
+            "expected custody validation error, got: {msg}"
         );
     }
 }
