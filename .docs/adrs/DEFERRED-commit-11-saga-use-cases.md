@@ -229,8 +229,9 @@ downstream PR):
 
 - **Gap 1 — Standing-pair 2-phase decomposition → RESOLVED by
   §5.15.8 (Standing-Pair Creation Saga).** Deterministic
-  `derived_context_id` and length-prefixed `group_id` derivation,
-  Prepare-A/Prepare-B exchange, the `CreationReceipt` canonical JCS
+  `derived_context_id` derivation (which also keys MLS group
+  isolation via the provider's `Entry::Vacant` guard — no separate
+  `group_id`), Prepare-A/Prepare-B exchange, the `CreationReceipt` canonical JCS
   field set (public plan-metadata only — no commitment), the
   Prepare-B consent gate plus KeyPackage reserve-at-Prepare /
   consume-at-Commit discipline, the rollback protocol, and the
