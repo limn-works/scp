@@ -52,9 +52,9 @@ pub use self_host::{
 };
 
 // `IdentitySource` / `ExplicitIdentity` now live in `config` (ADR-052 Phase
-// B-P1 name reconciliation). The typestate builder still references them by
-// name; the `pub use` brings them into crate-root scope for both the builder
-// and external consumers.
+// B-P1 name reconciliation). They are consumed by `Node::start`'s identity
+// lowering in `config`; the `pub use` brings them into crate-root scope for
+// both that path and external consumers.
 pub use config::{ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
 
 // ---------------------------------------------------------------------------
@@ -1587,8 +1587,8 @@ struct PersistedIdentity {
 // ---------------------------------------------------------------------------
 //
 // These now live in `crate::config` (ADR-052 Phase B-P1 name reconciliation)
-// and are re-exported at crate root above. The typestate builder below still
-// constructs and matches on them by name.
+// and are re-exported at crate root above. `Node::start`'s identity lowering
+// in `config` constructs and matches on them by name.
 
 // ---------------------------------------------------------------------------
 // NAT strategy (mockable NAT probing for testability)
@@ -3840,7 +3840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_with_custom_storage() {
+    async fn start_for_testing_with_custom_storage() {
         let node = Node::start_for_testing(domain_config()).await.unwrap();
 
         // Verify the storage handle is accessible.

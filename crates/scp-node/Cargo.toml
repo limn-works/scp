@@ -83,7 +83,7 @@ rcgen = "0.14"
 tempfile = "3"
 
 [features]
-# Gates `ApplicationNodeBuilder::build_for_testing()` — accepts any `Storage`
+# Gates `Node::start_for_testing` — accepts any `Storage`
 # backend without the `EncryptedStorage` bound. See issue #695.
 allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 quic = ["scp-transport/quic", "dep:quinn"]

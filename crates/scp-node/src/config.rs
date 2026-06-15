@@ -4,7 +4,7 @@
 //! B-P1) for the Node entry point. It introduces a single flat config object
 //! ([`NodeConfig`]) plus a single zero-sized entry-point namespace ([`Node`])
 //! exposing [`Node::start`] / [`Node::start_for_testing`], replacing the
-//! LLM-hostile typestate builder surface with a shape an agent can author in
+//! LLM-hostile builder-based surface with a shape an agent can author in
 //! one pass from the type signature plus one example.
 //!
 //! See `.docs/standards/construction.md` (the enforced enactment of the
@@ -15,7 +15,7 @@
 //!
 //! [`Node::start`] / [`Node::start_for_testing`] are the sole front door for
 //! node construction. The build orchestration that formerly lived on the
-//! typestate `ApplicationNodeBuilder` (now deleted, ADR-052 P3a) lives here as
+//! deleted builder (ADR-052 P3a) lives here as
 //! the engine over a flat [`NodeConfig`]: validate the config, resolve the
 //! identity and TLS/NAT capability slots, then run the domain-vs-no-domain
 //! build path (ADR-052 AC-3).
@@ -47,9 +47,9 @@ use crate::{
 ///
 /// All node construction flows through [`Node::start`] (production,
 /// `where S: EncryptedStorage`) or [`Node::start_for_testing`] (feature-gated,
-/// any `Storage`). There is no `NodeBuilder`, no typestate, no `.build()`
-/// terminator — the construction surface is one flat [`NodeConfig`] plus one
-/// entry function.
+/// any `Storage`). There is no `NodeBuilder`, no phantom-state generics, no
+/// `.build()` terminator — the construction surface is one flat [`NodeConfig`]
+/// plus one entry function.
 pub struct Node;
 
 // ---------------------------------------------------------------------------
@@ -108,13 +108,13 @@ pub struct ExplicitIdentity<D: DidMethod> {
 }
 
 // ---------------------------------------------------------------------------
-// Reach — the addressing XOR (M1 enum, replaces typestate + skip_nat bool)
+// Reach — the addressing XOR (M1 enum, replaces phantom-state markers + skip_nat bool)
 // ---------------------------------------------------------------------------
 
 /// How the node is reached from the outside — the addressing choice, as one
 /// required field (ADR-052 M1).
 ///
-/// `Reach` folds the former `HasDomain` / `HasNoDomain` typestate markers and
+/// `Reach` folds the former domain / no-domain phantom-state markers and
 /// the `skip_nat_probe` boolean into a single legible enum.
 #[derive(Debug, Clone)]
 pub enum Reach {
@@ -268,8 +268,8 @@ pub enum NatSlot {
 /// }).await?;
 /// ```
 ///
-/// The `<K, D, S>` generics survive from the former typestate builder, carried
-/// by the config and its selectors; the `Dom`/`Id` typestate markers are gone.
+/// The `<K, D, S>` generics survive from the former builder, carried
+/// by the config and its selectors; the `Dom`/`Id` phantom-state markers are gone.
 pub struct NodeConfig<
     K: KeyCustody = NoOpCustody,
     D: DidMethod = NoOpDidMethod,
@@ -675,12 +675,12 @@ fn warn_tunnel_public_url_deferred(public_url: &str) {
 /// and the domain-vs-no-domain build, given an already-constructed
 /// [`ProtocolRepository`] and a resolved identity.
 ///
-/// This is the real orchestration that formerly lived on the typestate builder's
-/// `build_with_store` methods (one per `Dom` state). It is ported verbatim here:
-/// the `Reach::Domain` arm reproduces the `HasDomain` build path (provision TLS,
+/// This is the real orchestration that formerly lived on the builder's
+/// `build_with_store` methods (one per domain state). It is ported verbatim here:
+/// the `Reach::Domain` arm reproduces the former domain build path (provision TLS,
 /// then either `build_domain_inner` on success or fall through to
 /// `build_no_domain_inner` on TLS failure — the §10.12.8 path), and the
-/// non-`Domain` arms reproduce the `HasNoDomain` build path (skip TLS entirely,
+/// non-`Domain` arms reproduce the former no-domain build path (skip TLS entirely,
 /// go straight to `build_no_domain_inner`).
 ///
 /// The only difference between [`Node::start`] (production) and
@@ -715,8 +715,8 @@ where
     } = tail;
 
     // The Reach selects the build path. `Domain` reproduces the former
-    // `HasDomain` build_with_store (TLS-provisioning + fall-through); the other
-    // reaches reproduce the `HasNoDomain` build_with_store (no TLS).
+    // domain build_with_store (TLS-provisioning + fall-through); the other
+    // reaches reproduce the former no-domain build_with_store (no TLS).
     match reach {
         Reach::Domain { .. } => {
             build_node_domain(
@@ -775,8 +775,8 @@ where
     }
 }
 
-/// Domain-reach engine path: ported verbatim from the former `HasDomain`
-/// `ApplicationNodeBuilder::build_with_store`. Provisions TLS; on success builds
+/// Domain-reach engine path: ported verbatim from the former domain
+/// `build_with_store`. Provisions TLS; on success builds
 /// the domain node, on TLS failure falls through to the NAT-traversed no-domain
 /// build (§10.12.8).
 #[allow(clippy::too_many_arguments)]
@@ -937,8 +937,8 @@ where
     }
 }
 
-/// No-domain-reach engine path: ported verbatim from the former `HasNoDomain`
-/// `ApplicationNodeBuilder::build_with_store`. Skips TLS provisioning entirely
+/// No-domain-reach engine path: ported verbatim from the former no-domain
+/// `build_with_store`. Skips TLS provisioning entirely
 /// and builds the NAT-traversed / loopback node directly.
 #[allow(clippy::too_many_arguments)]
 async fn build_node_no_domain<D, S>(
