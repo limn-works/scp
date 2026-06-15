@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::StreamExt;
 use scp_core::envelope::{self, OuterEnvelope};
 use scp_transport::native::NativeRelayAdapter;
-use scp_transport::native::server::{RelayConfig, RelayServer, ShutdownHandle};
+use scp_transport::native::server::{BridgeRole, RelayConfig, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorage, BlobStorageBackend, InMemoryBlobStorage};
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 use scp_transport::traits::{BlobId, RoutingId, TransportAdapter, TransportEvent};
@@ -191,7 +191,7 @@ async fn relay_config_defaults() {
     assert_eq!(config.rate_limit_subscribes_per_minute, 20);
     assert_eq!(config.delivery_jitter_ms, 50);
     assert!(config.bridge_secret.is_none());
-    assert!(!config.supports_bridge);
+    assert_eq!(config.bridge, BridgeRole::Disabled);
 }
 
 // -----------------------------------------------------------------------

@@ -47,7 +47,8 @@ pub mod code {
     pub const TOO_MANY_SUBSCRIPTIONS: u16 = 4021;
 
     /// The relay does not support the BRIDGE operation (section 10.12.4).
-    /// The client should try a different relay that has `supports_bridge: true`.
+    /// The client should try a different relay configured with
+    /// `bridge: BridgeRole::Enabled`.
     pub const BRIDGE_NOT_SUPPORTED: u16 = 4030;
 
     /// The bridge registration limit has been exceeded for this connection.

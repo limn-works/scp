@@ -7,19 +7,27 @@
 //!
 //! # Usage
 //!
+//! [`Relay::start`] is the SDK-facing entry point: pass a flat [`RelayConfig`]
+//! and a blob storage backend, and it spawns the running relay, returning a
+//! [`ShutdownHandle`] and the bound address.
+//!
 //! ```rust,no_run
-//! use std::sync::Arc;
-//! use scp_transport::native::server::{RelayConfig, RelayServer};
+//! use scp_transport::native::server::{Relay, RelayConfig};
 //! use scp_transport::native::storage::BlobStorageBackend;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = RelayConfig::default();
-//! let storage = Arc::new(BlobStorageBackend::in_memory());
-//! let server = RelayServer::new(config, storage);
-//! server.run().await?;
+//! let (shutdown, addr) =
+//!     Relay::start(RelayConfig::default(), BlobStorageBackend::in_memory()).await?;
+//! // ... serve; later:
+//! shutdown.shutdown();
+//! # let _ = addr;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! For multi-transport or long-running setups that need the [`RelayServer`]
+//! value itself (shared rate limiters, or `run()` instead of `start()`), use
+//! the internal [`RelayServer`] constructors directly.
 //!
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 
@@ -49,6 +57,31 @@ use crate::error::TransportError;
 use crate::relay::bridge::{BRIDGE_AUTH_FAILED_MSG, BridgeRegistration, BridgeRegistry};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
+
+/// Whether a relay brokers BRIDGE traffic for symmetric-NAT fallback
+/// (spec §10.12.4).
+///
+/// Replaces a former boolean broker flag (construction.md M1 — enums,
+/// not booleans, for semantic choices). The default is
+/// [`BridgeRole::Disabled`], the fail-safe value: a relay that brokers
+/// nothing until brokering is explicitly enabled (construction.md M2).
+///
+/// Brokering is authenticated per `BRIDGE_REGISTER` operation by an Ed25519
+/// signature over the DID-to-routing-ID mapping (SCP-247, §10.12.4), so
+/// enabling the broker role requires no shared secret — hence the
+/// payload-free [`Enabled`](BridgeRole::Enabled) variant. This is distinct
+/// from [`RelayConfig::bridge_secret`], the orthogonal internal-relay
+/// connection-admission secret.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BridgeRole {
+    /// The relay rejects `BRIDGE_REGISTER` and brokers no traffic for foreign
+    /// routing IDs. Fail-safe default.
+    #[default]
+    Disabled,
+    /// The relay accepts `BRIDGE_REGISTER` operations (each Ed25519-authenticated
+    /// per SCP-247) and proxies traffic for registered routing IDs.
+    Enabled,
+}
 
 /// Configuration for the relay server.
 ///
@@ -100,11 +133,12 @@ pub struct RelayConfig {
     /// See GitHub issue #85 for the threat model and #225 for the
     /// migration from query parameter to header.
     pub bridge_secret: Option<[u8; 32]>,
-    /// Whether this relay supports the BRIDGE operation for symmetric NAT
-    /// fallback (spec section 10.12.4). When `true`, the relay accepts
-    /// `BRIDGE_REGISTER` operations from self-hosted relays behind NAT
-    /// and proxies traffic for registered routing IDs.
-    pub supports_bridge: bool,
+    /// Whether this relay brokers the BRIDGE operation for symmetric NAT
+    /// fallback (spec section 10.12.4). When [`BridgeRole::Enabled`], the
+    /// relay accepts `BRIDGE_REGISTER` operations from self-hosted relays
+    /// behind NAT and proxies traffic for registered routing IDs. Defaults
+    /// to [`BridgeRole::Disabled`] (the fail-safe — brokers nothing).
+    pub bridge: BridgeRole,
 }
 
 impl Default for RelayConfig {
@@ -122,7 +156,12 @@ impl Default for RelayConfig {
             rate_limit_subscribes_per_minute: 20,
             delivery_jitter_ms: 50,
             bridge_secret: None,
-            supports_bridge: false,
+            // Fail-safe broker default. `RelayConfig` may keep a whole-struct
+            // `Default` (construction.md M4) precisely because its only
+            // security-consequential field, `bridge`, defaults to the fail-safe
+            // `BridgeRole::Disabled` — a relay that brokers nothing until
+            // explicitly enabled.
+            bridge: BridgeRole::Disabled,
         }
     }
 }
@@ -184,7 +223,7 @@ pub struct RelayServer {
     persistence: Option<Arc<dyn RelayPersistence>>,
     /// Bridge relay registry for symmetric NAT fallback (spec §10.12.4).
     ///
-    /// When `config.supports_bridge` is `true`, the relay accepts
+    /// When `config.bridge` is [`BridgeRole::Enabled`], the relay accepts
     /// `BRIDGE_REGISTER` operations and proxies traffic for registered
     /// routing IDs via the `BridgeRegistry`. Initialized unconditionally
     /// (empty registry is zero-cost) so the handler can check it without
@@ -525,6 +564,39 @@ impl RelayServer {
         });
 
         Ok((ShutdownHandle { token }, local_addr))
+    }
+}
+
+/// SDK-facing relay entry point.
+///
+/// `Relay::start` is the single developer-facing construction entry for the
+/// native relay, following the construction-pattern entry-verb rule
+/// (`.docs/standards/construction.md`): a relay spawns a running runtime, so
+/// its verb is `start`. It takes one flat [`RelayConfig`] plus the blob
+/// storage backend and returns the [`ShutdownHandle`] and bound address.
+///
+/// It wraps the low-level [`RelayServer::new`] constructor, which remains the
+/// internal building block (multi-transport setups still use
+/// [`RelayServer::new_shared`] / [`RelayServer::with_persistence`]) and is
+/// therefore exempt from the verb rule.
+pub struct Relay;
+
+impl Relay {
+    /// Starts a native relay from a flat [`RelayConfig`] and blob storage
+    /// backend, returning the [`ShutdownHandle`] and the bound [`SocketAddr`].
+    ///
+    /// Accepts any type that implements `Into<Arc<BlobStorageBackend>>`,
+    /// matching [`RelayServer::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayError::BindFailed`] if the relay cannot bind its
+    /// listener to the configured address.
+    pub async fn start(
+        config: RelayConfig,
+        storage: impl Into<Arc<BlobStorageBackend>>,
+    ) -> Result<(ShutdownHandle, SocketAddr), RelayError> {
+        RelayServer::new(config, storage).start().await
     }
 }
 
@@ -1385,7 +1457,7 @@ async fn handle_bridge_register(
     bridge_forward_tx: &mpsc::Sender<Vec<u8>>,
 ) {
     // Gate: bridging must be enabled on this relay.
-    if !config.supports_bridge {
+    if matches!(config.bridge, BridgeRole::Disabled) {
         let err = RelayMessage::Err {
             ref_id,
             code: code::BRIDGE_NOT_SUPPORTED,
@@ -1477,7 +1549,7 @@ async fn handle_bridge_data(
     bridge_registry: &Arc<BridgeRegistry>,
 ) {
     // Gate: bridging must be enabled on this relay.
-    if !config.supports_bridge {
+    if matches!(config.bridge, BridgeRole::Disabled) {
         let err = RelayMessage::Err {
             ref_id,
             code: code::BRIDGE_NOT_SUPPORTED,
@@ -2977,7 +3049,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            supports_bridge: true,
+            bridge: BridgeRole::Enabled,
             ..RelayConfig::default()
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
@@ -3036,11 +3108,78 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_register_rejected_on_non_bridge_relay() {
-        // Standard test server has supports_bridge = false.
+        // Standard test server has bridge = BridgeRole::Disabled.
         let addr = start_test_server().await;
         let (mut sink, mut stream) = connect_client(addr).await;
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let (register_msg, _routing_id) = make_bridge_registration(&signing_key);
+
+        send_msg(&mut sink, &register_msg).await;
+        let reply = recv_msg(&mut stream).await;
+
+        match reply {
+            RelayMessage::Err { code: c, .. } => {
+                assert_eq!(c, code::BRIDGE_NOT_SUPPORTED);
+            }
+            other => panic!("expected ERR(BRIDGE_NOT_SUPPORTED), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridge_role_default_is_disabled() {
+        // The whole-struct `Default` for `RelayConfig` (construction.md M4) is
+        // sound precisely because its only security-consequential field defaults
+        // to the fail-safe `Disabled`.
+        assert_eq!(BridgeRole::default(), BridgeRole::Disabled);
+        assert_eq!(RelayConfig::default().bridge, BridgeRole::Disabled);
+    }
+
+    #[tokio::test]
+    async fn relay_start_enabled_accepts_bridge() {
+        // `Relay::start` is the SDK-facing entry; with `BridgeRole::Enabled`
+        // the BRIDGE_REGISTER path is reachable.
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            bridge: BridgeRole::Enabled,
+            ..RelayConfig::default()
+        };
+        let (_handle, addr) = Relay::start(config, BlobStorageBackend::in_memory())
+            .await
+            .unwrap();
+
+        let (mut sink, mut stream) = connect_client(addr).await;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let (register_msg, _routing_id) = make_bridge_registration(&signing_key);
+
+        send_msg(&mut sink, &register_msg).await;
+        let reply = recv_msg(&mut stream).await;
+
+        assert!(
+            matches!(reply, RelayMessage::Ok { ref ref_id, .. } if *ref_id == Some("br-1".to_string())),
+            "expected OK from Relay::start bridge-enabled relay, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_start_disabled_default_rejects_bridge() {
+        // `Relay::start` with the fail-safe default config (`BridgeRole::Disabled`)
+        // rejects BRIDGE_REGISTER — brokering is off until explicitly enabled.
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        assert_eq!(config.bridge, BridgeRole::Disabled);
+        let (_handle, addr) = Relay::start(config, BlobStorageBackend::in_memory())
+            .await
+            .unwrap();
+
+        let (mut sink, mut stream) = connect_client(addr).await;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let (register_msg, _routing_id) = make_bridge_registration(&signing_key);
 
         send_msg(&mut sink, &register_msg).await;
