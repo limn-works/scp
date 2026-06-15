@@ -2,14 +2,31 @@
 //! visibility" and spec §9.4.1 four-point criterion.
 //!
 //! `OwnedIdentityDid` is the unforgeable token that proves the bearer's
-//! identity owns a particular [`ContextActor`]. The mechanism uses **module
-//! visibility (`pub(super)`) for actual compile-time enforcement** — not
-//! `pub(crate)`, which would let any handler in `scp-runtime` fabricate a
-//! token. This module is declared `mod identity_capability;` (PRIVATE)
-//! inside `supervisor/mod.rs`; handler code in
-//! `crate::context::actor::handlers/` cannot reach the constructor's path
-//! at all. The compiler refuses; this is real type-system enforcement, not
-//! enforcement-by-CI.
+//! identity owns a particular [`ContextActor`]. The unforgeability
+//! guarantee — *a value of `OwnedIdentityDid` for a given DID can only
+//! come into existence via supervisor-module code* — rides on TWO
+//! mechanisms, both of which are real type-system enforcement, not
+//! enforcement-by-CI:
+//!
+//! 1. **The constructor `issue_for_actor` is `pub(super)`** — only
+//!    supervisor-module code can mint a token from a raw [`DID`]. Handler
+//!    code in `crate::context::actor::handlers/` cannot reach the
+//!    constructor's path at all; the compiler refuses.
+//! 2. **The single field `did` is PRIVATE** (no `pub` / `pub(crate)` /
+//!    `pub(super)`) — so no struct-literal `OwnedIdentityDid { did }` is
+//!    possible outside this module either.
+//!
+//! The struct's *name-visibility* is `pub(in crate::context)`. This is
+//! deliberately wider than the constructor: actor-module code in
+//! `crate::context::actor` must be able to *name* the type so that
+//! [`crate::context::actor::deps::ActorDeps`] can hold the token by-value
+//! and handlers can take `&OwnedIdentityDid`. Widening the name to
+//! `pub(in crate::context)` is SAFE precisely because (1) + (2) + the
+//! non-derives below mean nameable ≠ constructible: actor code can hold a
+//! field or accept a reference, but has NO path to *mint* a token. The
+//! struct MUST NEVER be `pub` or `pub(crate)` — either would let code
+//! outside `crate::context` (or downstream crates) name the type in
+//! places the capability model does not intend.
 //!
 //! # EXPLICIT NON-DERIVES
 //!
@@ -27,9 +44,22 @@
 //! - `Debug` / `Display` — accidental logging of identity tokens.
 //!
 //! Defense-in-depth: the CI gate `scripts/check-owned-identity-did.py`
-//! mechanically enforces every clause above (location, visibility,
-//! forbidden derives, forbidden manual impls, forbidden public fields,
-//! `type` alias ban). Any change here is also audited there.
+//! mechanically enforces every clause above (location, struct
+//! name-visibility, forbidden derives, forbidden manual impls, forbidden
+//! public fields, `type` alias ban). For the inherent API the gate is a
+//! CLOSED ALLOWLIST, not a name-keyed or return-type-keyed classifier: it
+//! asserts the inherent impl contains ONLY the allowlisted methods
+//! `issue_for_actor` (the `pub(super)` raw-`DID` mint), `reissue` and
+//! `as_did` (both `&self`); ANY other inherent fn — regardless of return
+//! type, including an aliased / `impl Trait` / `Result`-wrapped return —
+//! is rejected, and a `type` alias of the capability (e.g. `type OwnedCap
+//! = OwnedIdentityDid;`) is banned. The allowlist-by-name is the security
+//! boundary: a return-type-aliased forgery (`type OwnedCap =
+//! OwnedIdentityDid; fn forge(did: DID) -> OwnedCap`) is caught because
+//! `forge` is not allowlisted, even though it hides the cap type from a
+//! return-type check and the struct is `pub(in crate::context)`. Only
+//! `issue_for_actor` may take a raw `DID`. Any change here is also audited
+//! there.
 //!
 //! See also `#![deny(unsafe_code)]` at `supervisor/mod.rs` — prevents an
 //! unsafe `Send` impl or `transmute` that could fabricate a token.
@@ -38,41 +68,77 @@ use scp_identity::DID;
 
 /// Proof that the bearer's identity owns this actor.
 ///
-/// Construction is `pub(super)` — only supervisor-module code may issue
-/// the token. Handler code in `actor/handlers/` cannot reach the
-/// constructor's path; the compiler refuses.
+/// The struct's name-visibility is `pub(in crate::context)` — nameable
+/// throughout `crate::context` so that
+/// [`crate::context::actor::deps::ActorDeps`] can hold the token by-value
+/// and handlers can take `&OwnedIdentityDid`. It is NOT `pub` or
+/// `pub(crate)`: those would leak the name beyond the capability model's
+/// intended scope.
 ///
-/// The token is held by-value inside `ActorDeps` and passed by reference
+/// The mint guarantee — *a token for a given DID only exists if
+/// supervisor-module code created it* — does NOT rely on the struct's
+/// name-visibility. It rides on two narrower facts:
+///
+/// - `issue_for_actor` is `pub(super)`: only supervisor-module code can
+///   mint a token from a raw [`DID`]. Actor / handler code cannot reach
+///   the constructor's path; the compiler refuses.
+/// - The single field `did` is PRIVATE: no struct-literal
+///   `OwnedIdentityDid { did }` is possible outside this module, so a
+///   wider name-visibility grants the power to *name* the type but not to
+///   *construct* one.
+///
+/// The token is held by-value inside `ActorDeps` (minted fresh at
+/// actor-spawn time in `Supervisor::build_actor_deps`, one per actor for
+/// ITS context's owning identity) and passed by reference
 /// (`&OwnedIdentityDid`) to `SupervisorHandle` methods that touch
 /// per-identity state. There is no `&DID`-keyed surface; the only identity
 /// an actor can read is the one that owns it.
-///
-/// The `dead_code` allow on the field is intentional: commit 5 lands the
-/// type-system shape; commits 6+ wire up `ActorDeps`, `SupervisorHandle`,
-/// and the spawn site that consumes `as_did()`. The unit tests in this
-/// file exercise the constructor and accessor immediately; production
-/// callers come online in subsequent commits without further changes here.
-pub(super) struct OwnedIdentityDid {
-    #[allow(dead_code)] // read via as_did(); spawn-site consumer lands in commit 6
+pub(in crate::context) struct OwnedIdentityDid {
     did: DID,
 }
 
 impl OwnedIdentityDid {
     /// Issue a capability proof for an actor's owning identity. Visible
-    /// only to supervisor-module code (callers in `supervisor/spawn_actor.rs`
-    /// and similar). Future commits add the spawn site that calls this.
-    #[allow(dead_code)] // used by the actor-spawn site landing in commit 6
+    /// only to supervisor-module code (the actor-spawn site in
+    /// `Supervisor::build_actor_deps`). This `pub(super)` constructor is
+    /// the mint: it is the ONLY way a token for a not-already-held DID
+    /// comes into existence. Do NOT widen its visibility — doing so lets
+    /// non-supervisor code fabricate a token for an arbitrary DID and
+    /// defeats cross-identity isolation.
     pub(super) const fn issue_for_actor(did: DID) -> Self {
         Self { did }
+    }
+
+    /// Re-issue a token for the SAME owning identity by cloning `self`'s
+    /// already-attested DID.
+    ///
+    /// Used by [`crate::context::actor::deps::ActorDeps::clone_for_spawn`],
+    /// which structurally must duplicate an existing `&ActorDeps` borrow
+    /// into an owned bundle for the spawned actor task (the borrow stays
+    /// live for post-spawn finalization). Because `clone_for_spawn` holds
+    /// only a `&ActorDeps` — i.e. a token that was ALREADY minted by the
+    /// supervisor for this context's owning identity — it cannot re-derive
+    /// from a raw `DID`; it can only reissue the token it already holds.
+    ///
+    /// This is NOT a forgery vector: possession of `&self` already proves
+    /// the supervisor attested ownership of `self.did`. `reissue` takes no
+    /// `DID` parameter, so it cannot mint a token for a DID the caller
+    /// does not already hold a token for. It is strictly weaker than
+    /// `issue_for_actor` (which can mint from any raw DID and is therefore
+    /// `pub(super)`-gated); `reissue` only clones an existing capability.
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self {
+            did: self.did.clone(),
+        }
     }
 
     /// Read-only access to the inner DID. The returned reference cannot
     /// reconstruct the proof — `OwnedIdentityDid` has no `From<&DID>` and
     /// no public constructor. Handlers may use this to build outgoing
     /// envelopes that need the owning identity's DID string.
-    #[allow(dead_code)] // consumed by SupervisorHandle methods landing in commit 6
+    #[allow(dead_code)] // consumed by SupervisorHandle per-identity methods landing in PR-3b
     #[must_use]
-    pub const fn as_did(&self) -> &DID {
+    pub(in crate::context) const fn as_did(&self) -> &DID {
         &self.did
     }
 }
@@ -87,6 +153,19 @@ mod tests {
         let did = DID("did:example:alice".to_owned());
         let token = OwnedIdentityDid::issue_for_actor(did.clone());
         // `as_did` returns a reference — the token retains ownership.
+        assert_eq!(token.as_did(), &did);
+    }
+
+    #[test]
+    fn reissue_clones_the_same_owning_did() {
+        // `reissue` duplicates the already-attested DID — it cannot
+        // forge a token for a different identity because it takes no
+        // `DID` parameter. The clone is for the SAME owner.
+        let did = DID("did:example:bob".to_owned());
+        let token = OwnedIdentityDid::issue_for_actor(did.clone());
+        let cloned = token.reissue();
+        assert_eq!(cloned.as_did(), &did);
+        // The original is still usable — reissue borrows, not moves.
         assert_eq!(token.as_did(), &did);
     }
 

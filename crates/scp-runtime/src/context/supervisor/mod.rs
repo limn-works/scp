@@ -12,10 +12,19 @@
 //! - [`saga_prepared_state`] — `pub`. Variants are constructed by handler
 //!   code in `actor/handlers/` once Prepare runs, and consumed by the same
 //!   handlers at Commit time.
-//! - [`identity_capability`] — **PRIVATE** (`mod`, not `pub mod`). The
-//!   capability token's constructor must be unreachable from outside this
-//!   module. See ADR-049 §"`OwnedIdentityDid` via module visibility" and
-//!   the CI gate `scripts/check-owned-identity-did.py`.
+//! - [`identity_capability`] — `pub(in crate::context)`. The module path
+//!   is nameable within `crate::context` so that
+//!   [`crate::context::actor::deps::ActorDeps`] can hold an
+//!   `OwnedIdentityDid` by-value and per-identity `SupervisorHandle`
+//!   methods can take `&OwnedIdentityDid`. This does NOT weaken the mint
+//!   guarantee: the token's **constructor `issue_for_actor` stays
+//!   `pub(super)`** (only supervisor-module code can mint from a raw
+//!   `DID`) and the struct's single field stays PRIVATE (no struct-literal
+//!   construction outside the module). Module-path reachability lets
+//!   `crate::context` code *name* the type; it grants no path to
+//!   *construct* one. The module is NOT `pub`/`pub(crate)`. See ADR-049
+//!   §"`OwnedIdentityDid` via module visibility" and the CI gate
+//!   `scripts/check-owned-identity-did.py`.
 //!
 //! # `#![deny(unsafe_code)]`
 //!
@@ -36,7 +45,7 @@
 /// handler, never by external crates or FFI bridges.
 pub(in crate::context) mod creation_receipt;
 pub mod handle;
-mod identity_capability;
+pub(in crate::context) mod identity_capability;
 pub mod key_package_actor;
 pub mod saga_journal;
 pub mod saga_prepared_state;

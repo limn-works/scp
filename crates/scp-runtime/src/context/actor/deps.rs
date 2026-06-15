@@ -99,6 +99,7 @@ use scp_protocol::context::membership::ContextEvent;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::persistence::ContextPersistence;
 use crate::context::supervisor::handle::SupervisorHandle;
+use crate::context::supervisor::identity_capability::OwnedIdentityDid;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::crypto::hpke_backend::HpkeBackend;
 use crate::crypto::mls::backend::MlsBackend;
@@ -202,6 +203,21 @@ pub struct ActorDeps {
     /// handler's `deliver_incoming` body (landing 12b.2b) to resolve
     /// which local DID the incoming envelope addresses.
     pub local_dids: Arc<ArcSwap<HashSet<DID>>>,
+    /// Unforgeable capability token proving which identity owns this
+    /// actor (ADR-049 §5). Minted fresh per-actor at spawn time in
+    /// [`Supervisor::build_actor_deps`](crate::context::supervisor::Supervisor::build_actor_deps)
+    /// via `OwnedIdentityDid::issue_for_actor(owning_did)`, so each
+    /// actor's token is for ITS OWN owning identity — never a shared or
+    /// wrong-owner token.
+    ///
+    /// `pub(in crate::context)` — held here so per-identity
+    /// `SupervisorHandle` methods can take `&OwnedIdentityDid` (the only
+    /// identity an actor can read is the one that owns it). This is the
+    /// NARROWEST visibility that lets the supervisor build site populate
+    /// the field and `crate::context` handlers borrow it; it is NOT
+    /// `pub`, because `OwnedIdentityDid` itself is `pub(in crate::context)`
+    /// and the capability must not escape the `context` module tree.
+    pub(in crate::context) owned_identity: OwnedIdentityDid,
 }
 
 impl ActorDeps {
@@ -238,6 +254,14 @@ impl ActorDeps {
             key_resolver: Arc::clone(&self.key_resolver),
             payment_adapter: self.payment_adapter.as_ref().map(Arc::clone),
             local_dids: Arc::clone(&self.local_dids),
+            // Reissue the capability token for the SAME owning identity.
+            // `clone_for_spawn` holds only `&self` — a token already
+            // minted by the supervisor for this context's owner — so it
+            // cannot (and must not) re-derive from a raw `DID`. `reissue`
+            // clones the held DID; it is not a forgery vector because it
+            // takes no `DID` parameter and possession of `&self` already
+            // proves supervisor attestation. See `OwnedIdentityDid::reissue`.
+            owned_identity: self.owned_identity.reissue(),
         }
     }
 }
