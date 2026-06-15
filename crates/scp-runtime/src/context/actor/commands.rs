@@ -257,6 +257,33 @@ pub enum MessagingCommand {
         reply: DrainEventsReply,
     },
 
+    /// Drain ONLY the [`ContextEvent::EquivocationDetected`](scp_protocol::context::membership::ContextEvent::EquivocationDetected)
+    /// alerts from the per-context receive buffer, leaving every other
+    /// buffered event in place and in order.
+    ///
+    /// The reconnection driver (FFI/SDK layer) needs the equivocation
+    /// alerts surfaced during catch-up to populate its report, but the
+    /// receive buffer is ALSO the SDK's only application-delivery queue.
+    /// Using the total [`DrainEvents`](Self::DrainEvents) for that purpose
+    /// would silently discard every message / `MemberJoined` / etc. that
+    /// arrived during catch-up. This command partitions the buffer in the
+    /// actor turn and returns only the alerts, preserving the application
+    /// stream for the SDK's normal receive polling.
+    ///
+    /// # Mutation classification
+    ///
+    /// Mutating — like [`DrainEvents`](Self::DrainEvents) it edits the
+    /// receive buffer (removes the alert subset). Routed through the
+    /// messaging dispatch alongside the other receive-buffer mutations.
+    DrainEquivocationAlerts {
+        /// Context identifier.
+        context_id: String,
+        /// Oneshot reply channel. See [`DrainEventsReply`] — same type
+        /// (a vector of `ContextEvent`), but the returned events are all
+        /// `EquivocationDetected`.
+        reply: DrainEventsReply,
+    },
+
     /// Send the local member's pseudonym announcement (§9.10.4) to the
     /// other members of a context.
     ///
@@ -335,7 +362,71 @@ pub enum MessagingCommand {
         /// method has no error path.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+
+    /// Build (force) a signed local consistency checkpoint from the
+    /// current event-log state (§9.9.3). Mutating — resets the
+    /// checkpoint-events-since counter and pushes the checkpoint onto the
+    /// retained checkpoint ring.
+    ///
+    /// Delegates to
+    /// [`force_create_checkpoint_fields`](crate::context::queries_helpers::force_create_checkpoint_fields).
+    /// Used by the reconnection driver's Phase 3 (`event_log_sync`) at the
+    /// FFI/SDK layer: the driver builds its local checkpoint, sends it to
+    /// peers via the send path, and compares peer checkpoints against local
+    /// state. The caller supplies `sender_did` + `signing_key` exactly as
+    /// the application send path does (the signing key is not actor-owned
+    /// state — it lives at the FFI boundary).
+    BuildLocalCheckpoint {
+        /// Context identifier.
+        context_id: String,
+        /// Checkpoint author DID (a locally-controlled member).
+        sender_did: scp_identity::DID,
+        /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
+        /// so the private key zeroes on drop (mirrors the
+        /// [`SendMessagePayload`] pattern).
+        signing_key: SigningKeyBytes,
+        /// Oneshot reply channel carrying the freshly-built signed
+        /// checkpoint.
+        reply: BuildLocalCheckpointReply,
+    },
+
+    /// Compare a remote consistency checkpoint against local event-log
+    /// state for equivocation detection (§9.9.3, ADR-011 AC-8). Mutating
+    /// — emits `ContextEvent::EquivocationDetected` into the receive
+    /// buffer and appends an `EquivocationDetected` event to the log when
+    /// the comparison is `Divergent`.
+    ///
+    /// Delegates to
+    /// [`compare_remote_checkpoint`](crate::context::queries_helpers::compare_remote_checkpoint).
+    /// The reply carries the typed
+    /// [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison)
+    /// (`Consistent` / `Behind` / `Ahead` / `Divergent`). The `Behind`
+    /// arm is the post-offline catch-up seam — the consistency-proof
+    /// catch-up integration point, specified separately. Used by the
+    /// reconnection driver's Phase 3.
+    CompareRemoteCheckpoint {
+        /// Context identifier.
+        context_id: String,
+        /// The remote checkpoint to compare (boxed to keep the enum
+        /// variant size uniform under `clippy::large_enum_variant`).
+        remote: Box<scp_event_log::checkpoint::ConsistencyCheckpoint>,
+        /// Oneshot reply channel carrying the comparison result.
+        reply: CompareRemoteCheckpointReply,
+    },
 }
+
+/// Reply-channel type alias for
+/// [`MessagingCommand::BuildLocalCheckpoint`]. Carries the freshly-built
+/// signed checkpoint. Factored out to satisfy `clippy::type_complexity`.
+pub type BuildLocalCheckpointReply =
+    oneshot::Sender<Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError>>;
+
+/// Reply-channel type alias for
+/// [`MessagingCommand::CompareRemoteCheckpoint`]. Carries the typed
+/// [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison).
+/// Factored out to satisfy `clippy::type_complexity`.
+pub type CompareRemoteCheckpointReply =
+    oneshot::Sender<Result<scp_event_log::checkpoint::CheckpointComparison, ContextError>>;
 
 /// Payload for [`MessagingCommand::SendPseudonymAnnouncement`]. Boxed
 /// inside the variant so the enum's variant sizes stay uniform under
@@ -791,6 +882,36 @@ pub enum LifecycleCommand {
         /// Oneshot reply channel carrying this actor's receive-buffer
         /// length.
         reply: oneshot::Sender<usize>,
+    },
+
+    /// Clear the context's `EpochState.needs_reconnect` flag (spec
+    /// §23.11). Mutating. Called by the reconnection driver at the
+    /// FFI/SDK layer after a context completes the six-phase protocol
+    /// successfully, so a subsequent restore does not re-drive the
+    /// already-synced context. Always replies `Ok(())`.
+    ClearNeedsReconnect {
+        /// Context identifier.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Issue an MLS Update proposal + self-Commit for post-compromise
+    /// security (§9.12 step 2). Mutating — ratchets the group to a new
+    /// epoch with fresh key material via
+    /// [`MlsCryptoProvider::advance_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::advance_epoch)
+    /// (which calls `ratchet::propose_update_with_wrapping_key`,
+    /// preserving the `scp_wrapping_key` leaf extension per §9.16.1).
+    ///
+    /// The reply carries the TLS-serialized MLS Commit bytes that the
+    /// caller MUST distribute to all group members. Used by the
+    /// reconnection driver's Phase 5 (`mls_update`).
+    IssueMlsUpdate {
+        /// Context identifier.
+        context_id: String,
+        /// Oneshot reply channel carrying the serialized MLS Commit
+        /// bytes for distribution.
+        reply: oneshot::Sender<Result<Vec<u8>, ContextError>>,
     },
 }
 
@@ -2272,6 +2393,37 @@ pub enum QueriesCommand {
         reply: oneshot::Sender<
             Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>,
         >,
+    },
+
+    /// Local MLS epoch for the context (§9.12). Read-only.
+    ///
+    /// `Ok(Some(epoch))` for an encrypted (MLS) context; `Ok(None)` for a
+    /// broadcast context, which carries no MLS epoch. Consumed by the
+    /// reconnection driver's Phase 2 (`local_epoch`) at the FFI/SDK
+    /// relay-client layer (ADR-029 reconnection-driver addendum) — the
+    /// driver compares this against the target epoch observed from relay
+    /// messages.
+    LocalMlsEpoch {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(Some(epoch))` for MLS contexts,
+        /// `Ok(None)` for broadcast contexts.
+        reply: oneshot::Sender<Result<Option<u64>, ContextError>>,
+    },
+
+    /// Whether the context's `EpochState` is flagged `needs_reconnect`
+    /// (spec §23.11). Read-only.
+    ///
+    /// The flag is set when a context's crypto state could not be restored
+    /// on respawn (`broadcast_helpers`/`trust_recovery_helpers`). The
+    /// reconnection driver consumes it at the FFI/SDK layer to decide which
+    /// contexts to drive through the six-phase protocol, and clears it on
+    /// success via [`LifecycleCommand::ClearNeedsReconnect`].
+    NeedsReconnect {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
     },
 
     // -------------------------------------------------------------------

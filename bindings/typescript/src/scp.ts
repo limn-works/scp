@@ -325,6 +325,59 @@ export interface McpAllowlistState {
   readonly unrestricted: boolean;
 }
 
+/** Offline-tier classification reported per reconnected context (ADR-029). */
+export type ReconnectTier = "short" | "extended" | "long";
+
+/** Per-context reconnection outcome reported by {@link SCP.reconnect}. */
+export type ReconnectOutcome =
+  | "fully_caught_up"
+  | "fast_forwarded"
+  | "reset"
+  | "context_gone"
+  | "failed"
+  | "pending";
+
+/**
+ * Per-context result of {@link SCP.reconnect} (ADR-029).
+ */
+export interface ContextReconnectResult {
+  /** Context that was reconnected. */
+  readonly contextId: string;
+  /** Offline tier classification. */
+  readonly tier: ReconnectTier;
+  /** Per-context reconnection outcome. */
+  readonly outcome: ReconnectOutcome;
+  /** MLS epochs caught up. */
+  readonly epochsCaughtUp: number;
+  /** Event-log events recovered. */
+  readonly eventsRecovered: number;
+  /** Whether an MLS Update was issued (§9.12). */
+  readonly mlsUpdateIssued: boolean;
+  /**
+   * Number of equivocation alerts surfaced during this context's sync
+   * (§9.9.3). Each alert's divergent local/remote Merkle roots are delivered
+   * per-event via the receive stream (`EquivocationDetected` events) and
+   * persisted in the event log; this field is the count only.
+   */
+  readonly equivocationsDetected: number;
+  /** Whether `needsReconnect` was cleared on success. */
+  readonly needsReconnectCleared: boolean;
+}
+
+/**
+ * Aggregate result of {@link SCP.reconnect} (ADR-029).
+ */
+export interface ReconnectReport {
+  /** Per-context results. */
+  readonly contexts: readonly ContextReconnectResult[];
+  /** Total queued messages drained (Phase 6). */
+  readonly messagesDrained: number;
+  /** Total queued messages discarded. */
+  readonly messagesDiscarded: number;
+  /** Total reconnection duration in milliseconds. */
+  readonly totalDurationMs: number;
+}
+
 /**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
@@ -1414,6 +1467,52 @@ export class SCP {
       handle,
       newDurationSecs,
     );
+  }
+
+  /**
+   * Reconnect `identityDid`'s contexts after an offline period.
+   *
+   * Runs the ADR-029 six-phase reconnection protocol for each context in
+   * `contextIds` flagged `needsReconnect` (§23.11). The driver lives at the
+   * FFI relay-client layer: it pulls relay-buffered messages via the
+   * `TransportManager` and reaches actor-owned reconnection state (MLS epoch,
+   * Commit/Welcome processing, checkpoint build/compare, MLS update) through
+   * the `Supervisor`. On success each context's `needsReconnect` flag is
+   * cleared.
+   *
+   * `lastRelayContacts` maps context id to last-relay-contact Unix seconds
+   * (used to classify the offline tier); absent contexts default to the most
+   * conservative tier.
+   *
+   * Requires an active relay connection (call `transportConnect` first).
+   *
+   * Key resolution: this backend (NAPI / Python) takes the `identityDid`
+   * **string** and resolves the local member's signing key from the bridge's
+   * identity registry. The Swift / Kotlin SDKs instead take the opaque
+   * `Identity` object directly (`reconnect(identity:…)`) — same protocol, only
+   * the argument shape differs per the UniFFI object-handle convention.
+   *
+   * Catch-up integrity (§9.9.3, §23.7): equivocation where a peer reports the
+   * **same** event count with a **different** Merkle root IS detected and
+   * surfaced (per-context {@link ContextReconnectResult.equivocationsDetected}).
+   * However, reconnection catch-up does NOT yet verify suffix integrity — the
+   * Merkle consistency proof confirming that fetched events genuinely extend
+   * this member's own history is specified separately. An equivocating relay
+   * that keeps a member perpetually *behind* (never reaching equal count) is
+   * therefore not yet detected on the catch-up path.
+   */
+  async reconnect(
+    identityDid: string,
+    contextIds: readonly string[],
+    lastRelayContacts?: Readonly<Record<string, number>>,
+  ): Promise<ReconnectReport> {
+    return await (
+      this.#native.contextReconnect as (
+        did: string,
+        ids: readonly string[],
+        contacts: Readonly<Record<string, number>> | undefined,
+      ) => Promise<ReconnectReport>
+    )(identityDid, contextIds, lastRelayContacts);
   }
 
   // ───────────────────────────────────────────────────────────────────────

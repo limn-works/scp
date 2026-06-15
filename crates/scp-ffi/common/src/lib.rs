@@ -165,6 +165,17 @@ pub use resolvers::*;
 #[cfg(feature = "resolvers")]
 pub mod discovery;
 
+// Relay-backed reconnection driver (ADR-029 reconnection-driver
+// addendum). Implements SyncPhaseDriver (Tier 1) / SnapshotTransport
+// (Tier 2) / ResetTransport (Tier 3) over a TransportManager (relay-client
+// retrieval) + Supervisor (actor-owned reconnection state). The driver
+// lives at the FFI/SDK layer because the actor's ContextTransportProvider
+// is send-only; buffered-message retrieval is owned by TransportManager.
+// Requires scp-core + scp-transport (behind `resolvers`). WASM reconnects
+// via its own constrained path (ADR-034).
+#[cfg(feature = "resolvers")]
+pub mod reconnect;
+
 // Shared petname/handle/address-resolution helpers (behind the `resolvers` feature).
 // WASM reimplements PetnameMap locally per ADR-034, so these are not available there.
 #[cfg(feature = "resolvers")]

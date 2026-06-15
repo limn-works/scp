@@ -428,6 +428,31 @@ public extension SCP {
         try await inner.contextSend(handle: handle, identity: identity, payload: payload, spendingUcanJwt: spendingUcanJwt)
     }
 
+    /// Reconnects `identity`'s contexts after an offline period, running the
+    /// ADR-029 six-phase reconnection protocol for each of `contextIds`
+    /// flagged `needsReconnect` (§23.11).
+    ///
+    /// The driver lives at the FFI relay-client layer (ADR-029
+    /// reconnection-driver addendum): it pulls relay-buffered messages via the
+    /// `TransportManager` and reaches actor-owned reconnection state through
+    /// the `Supervisor`. On success each context's `needsReconnect` flag is
+    /// cleared. `lastRelayContacts` maps context id to last-relay-contact Unix
+    /// seconds (tier classification); absent contexts default to the most
+    /// conservative tier. Forwards to ``Scp/contextReconnect`` on ``inner``.
+    ///
+    /// Catch-up integrity (§9.9.3, §23.7): equivocation where a peer reports
+    /// the **same** event count with a **different** Merkle root IS detected
+    /// and surfaced (`ReconnectReport.contexts[].equivocationsDetected`).
+    /// However, reconnection catch-up does NOT yet verify suffix integrity —
+    /// the Merkle consistency proof confirming that fetched events genuinely
+    /// extend this member's own history is specified separately. An
+    /// equivocating relay that keeps a member perpetually *behind* (never
+    /// reaching equal count) is therefore not yet detected on the catch-up
+    /// path.
+    func reconnect(identity: Identity, contextIds: [String], lastRelayContacts: [String: UInt64] = [:]) async throws -> ReconnectReport {
+        try await inner.contextReconnect(identity: identity, contextIds: contextIds, lastRelayContacts: lastRelayContacts)
+    }
+
     /// Forwards to ``Scp/contextSubscribe`` on ``inner``.
     func contextSubscribe(handle: ContextHandle, listener: MessageListener) async throws {
         try await inner.contextSubscribe(handle: handle, listener: listener)

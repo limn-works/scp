@@ -193,7 +193,13 @@ export { Node, Relay } from "./server";
 // SCP multi-instance handle (ADR-048)
 // ---------------------------------------------------------------------------
 
-export type { KeyCustodyProvider, ScpOptions, StorageConfig } from "./scp";
+export type {
+  ContextReconnectResult,
+  KeyCustodyProvider,
+  ReconnectReport,
+  ScpOptions,
+  StorageConfig,
+} from "./scp";
 export { SCP } from "./scp";
 
 // ---------------------------------------------------------------------------

@@ -1255,6 +1255,30 @@ pub(crate) struct PseudonymAnnouncement {
 /// with a null byte when deserialized from `MessagePack`).
 pub(crate) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1";
 
+/// Wire wrapper for a consistency-checkpoint exchange message (§9.9.3, §23.7).
+///
+/// Carries the canonical signed [`ConsistencyCheckpoint`] behind a magic tag
+/// so the receive path can positively identify it. Although the inner envelope
+/// already discriminates checkpoints via
+/// [`MessageType::ConsistencyCheckpoint`](scp_protocol::envelope::inner::MessageType::ConsistencyCheckpoint),
+/// the tag is a defense-in-depth guard mirroring [`PseudonymAnnouncement`]:
+/// it makes a payload that fails to deserialize as a tagged checkpoint a
+/// hard error rather than a silently mis-routed application message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointMessage {
+    /// Magic prefix distinguishing checkpoint messages from application data.
+    pub tag: String,
+    /// The signed consistency checkpoint (canonical `scp-event-log` type).
+    pub checkpoint: scp_event_log::checkpoint::ConsistencyCheckpoint,
+}
+
+/// Magic tag identifying consistency-checkpoint messages in the MLS application
+/// message stream. Prefixed with `\0` for the same reason as
+/// [`PSEUDONYM_ANNOUNCEMENT_TAG`]: user content is valid UTF-8 and never starts
+/// with a null byte when `MessagePack`-decoded, so the tag cannot collide.
+pub(crate) const CHECKPOINT_PAYLOAD_TAG: &str = "\0scp:checkpoint:v1";
+
 // ADR-049 Phase 2A finalization keystone (commit 12 phase 2A finalization
 // — type unification, single PerContextState): the legacy
 // `state::PerContextState` struct + its `impl` block are deleted here. The

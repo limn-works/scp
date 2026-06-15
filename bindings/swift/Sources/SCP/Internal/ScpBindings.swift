@@ -596,7 +596,13 @@ public protocol ContextHandleProtocol: AnyObject, Sendable {
      * Returns the context's current lifecycle state as a string.
      *
      * One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
-     * `"migrating_out"`, `"tombstoned"`.
+     * `"migrating_out"`, `"tombstoned"`, `"poisoned"`.
+     *
+     * `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
+     * path wrote `Poisoned` into this cached state; the watchdog poison path
+     * does NOT push into this cache (it is a best-effort cached getter, not a
+     * live supervisor read). The authoritative poison signal is the
+     * `SCP-CTX-2134` error code on the next per-context operation.
      *
      * # Errors
      *
@@ -692,7 +698,13 @@ open func creatorDid() -> String  {
      * Returns the context's current lifecycle state as a string.
      *
      * One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
-     * `"migrating_out"`, `"tombstoned"`.
+     * `"migrating_out"`, `"tombstoned"`, `"poisoned"`.
+     *
+     * `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
+     * path wrote `Poisoned` into this cached state; the watchdog poison path
+     * does NOT push into this cache (it is a best-effort cached getter, not a
+     * live supervisor read). The authoritative poison signal is the
+     * `SCP-CTX-2134` error code on the next per-context operation.
      *
      * # Errors
      *
@@ -794,7 +806,7 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      *
      * Returns `ScpError::Identity` if:
      * - The identity already has an agent key
-     * - No in-memory custody is available (feature-gated)
+     * - No retained key custody is available
      * - Key generation or DHT publishing fails
      *
      * See ADR-039 acceptance criterion 4.
@@ -861,7 +873,7 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      *
      * Returns `ScpError::Identity` if:
      * - The identity has no agent key
-     * - No in-memory custody is available (feature-gated)
+     * - No retained key custody is available
      * - DHT publishing fails
      *
      * See ADR-039 acceptance criterion 4.
@@ -879,7 +891,7 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      *
      * Returns `ScpError::Identity` if:
      * - The identity has no agent key to rotate
-     * - No in-memory custody is available (feature-gated)
+     * - No retained key custody is available
      * - Key generation or DHT publishing fails
      *
      * See ADR-039 acceptance criterion 4.
@@ -1006,7 +1018,7 @@ open class Identity: IdentityProtocol, @unchecked Sendable {
      *
      * Returns `ScpError::Identity` if:
      * - The identity already has an agent key
-     * - No in-memory custody is available (feature-gated)
+     * - No retained key custody is available
      * - Key generation or DHT publishing fails
      *
      * See ADR-039 acceptance criterion 4.
@@ -1108,7 +1120,7 @@ open func hasAgentKey() -> Bool  {
      *
      * Returns `ScpError::Identity` if:
      * - The identity has no agent key
-     * - No in-memory custody is available (feature-gated)
+     * - No retained key custody is available
      * - DHT publishing fails
      *
      * See ADR-039 acceptance criterion 4.
@@ -1141,7 +1153,7 @@ open func removeAgentKey()async throws  -> Identity  {
      *
      * Returns `ScpError::Identity` if:
      * - The identity has no agent key to rotate
-     * - No in-memory custody is available (feature-gated)
+     * - No retained key custody is available
      * - Key generation or DHT publishing fails
      *
      * See ADR-039 acceptance criterion 4.
@@ -2266,6 +2278,21 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `instance_id` does not match this `SCP`'s.
      */
     func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, proposedSeconds: UInt64) async throws  -> Bool
+    
+    /**
+     * Reconnects `identity`'s contexts after an offline period, running
+     * the ADR-029 six-phase reconnection protocol for each of
+     * `context_ids` flagged `needs_reconnect` (§23.11).
+     *
+     * The driver lives at this FFI relay-client layer (ADR-029
+     * reconnection-driver addendum): it pulls relay-buffered messages via
+     * the `TransportManager` and reaches actor-owned reconnection state
+     * through the `Supervisor`. On success each context's `needs_reconnect`
+     * flag is cleared. `last_relay_contacts` maps context id → last-contact
+     * Unix seconds (tier classification); absent contexts default to the
+     * most conservative tier.
+     */
+    func contextReconnect(identity: Identity, contextIds: [String], lastRelayContacts: [String: UInt64]) async throws  -> ReconnectReport
     
     /**
      * Per-instance equivalent of the free-function
@@ -4150,6 +4177,36 @@ open func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, p
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Reconnects `identity`'s contexts after an offline period, running
+     * the ADR-029 six-phase reconnection protocol for each of
+     * `context_ids` flagged `needs_reconnect` (§23.11).
+     *
+     * The driver lives at this FFI relay-client layer (ADR-029
+     * reconnection-driver addendum): it pulls relay-buffered messages via
+     * the `TransportManager` and reaches actor-owned reconnection state
+     * through the `Supervisor`. On success each context's `needs_reconnect`
+     * flag is cleared. `last_relay_contacts` maps context id → last-contact
+     * Unix seconds (tier classification); absent contexts default to the
+     * most conservative tier.
+     */
+open func contextReconnect(identity: Identity, contextIds: [String], lastRelayContacts: [String: UInt64])async throws  -> ReconnectReport  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_reconnect(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity),FfiConverterSequenceString.lower(contextIds),FfiConverterDictionaryStringUInt64.lower(lastRelayContacts)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeReconnectReport_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -7951,6 +8008,177 @@ public func FfiConverterTypeContextParams_lower(_ value: ContextParams) -> RustB
 
 
 /**
+ * Per-context reconnection result (ADR-029).
+ *
+ * Flat mirror of [`scp_ffi_common::reconnect::ContextReconnectResult`].
+ */
+public struct ContextReconnectResult {
+    /**
+     * Context that was reconnected.
+     */
+    public var contextId: String
+    /**
+     * Offline tier: `"short"` / `"extended"` / `"long"`.
+     */
+    public var tier: String
+    /**
+     * Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
+     */
+    public var outcome: String
+    /**
+     * MLS epochs caught up.
+     */
+    public var epochsCaughtUp: UInt64
+    /**
+     * Event-log events recovered.
+     */
+    public var eventsRecovered: UInt64
+    /**
+     * Whether an MLS Update was issued (§9.12).
+     */
+    public var mlsUpdateIssued: Bool
+    /**
+     * Number of equivocation alerts surfaced (§9.9.3).
+     */
+    public var equivocationsDetected: UInt64
+    /**
+     * Whether `needs_reconnect` was cleared on success.
+     */
+    public var needsReconnectCleared: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Context that was reconnected.
+         */contextId: String, 
+        /**
+         * Offline tier: `"short"` / `"extended"` / `"long"`.
+         */tier: String, 
+        /**
+         * Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
+         */outcome: String, 
+        /**
+         * MLS epochs caught up.
+         */epochsCaughtUp: UInt64, 
+        /**
+         * Event-log events recovered.
+         */eventsRecovered: UInt64, 
+        /**
+         * Whether an MLS Update was issued (§9.12).
+         */mlsUpdateIssued: Bool, 
+        /**
+         * Number of equivocation alerts surfaced (§9.9.3).
+         */equivocationsDetected: UInt64, 
+        /**
+         * Whether `needs_reconnect` was cleared on success.
+         */needsReconnectCleared: Bool) {
+        self.contextId = contextId
+        self.tier = tier
+        self.outcome = outcome
+        self.epochsCaughtUp = epochsCaughtUp
+        self.eventsRecovered = eventsRecovered
+        self.mlsUpdateIssued = mlsUpdateIssued
+        self.equivocationsDetected = equivocationsDetected
+        self.needsReconnectCleared = needsReconnectCleared
+    }
+}
+
+#if compiler(>=6)
+extension ContextReconnectResult: Sendable {}
+#endif
+
+
+extension ContextReconnectResult: Equatable, Hashable {
+    public static func ==(lhs: ContextReconnectResult, rhs: ContextReconnectResult) -> Bool {
+        if lhs.contextId != rhs.contextId {
+            return false
+        }
+        if lhs.tier != rhs.tier {
+            return false
+        }
+        if lhs.outcome != rhs.outcome {
+            return false
+        }
+        if lhs.epochsCaughtUp != rhs.epochsCaughtUp {
+            return false
+        }
+        if lhs.eventsRecovered != rhs.eventsRecovered {
+            return false
+        }
+        if lhs.mlsUpdateIssued != rhs.mlsUpdateIssued {
+            return false
+        }
+        if lhs.equivocationsDetected != rhs.equivocationsDetected {
+            return false
+        }
+        if lhs.needsReconnectCleared != rhs.needsReconnectCleared {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(contextId)
+        hasher.combine(tier)
+        hasher.combine(outcome)
+        hasher.combine(epochsCaughtUp)
+        hasher.combine(eventsRecovered)
+        hasher.combine(mlsUpdateIssued)
+        hasher.combine(equivocationsDetected)
+        hasher.combine(needsReconnectCleared)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContextReconnectResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContextReconnectResult {
+        return
+            try ContextReconnectResult(
+                contextId: FfiConverterString.read(from: &buf), 
+                tier: FfiConverterString.read(from: &buf), 
+                outcome: FfiConverterString.read(from: &buf), 
+                epochsCaughtUp: FfiConverterUInt64.read(from: &buf), 
+                eventsRecovered: FfiConverterUInt64.read(from: &buf), 
+                mlsUpdateIssued: FfiConverterBool.read(from: &buf), 
+                equivocationsDetected: FfiConverterUInt64.read(from: &buf), 
+                needsReconnectCleared: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContextReconnectResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.contextId, into: &buf)
+        FfiConverterString.write(value.tier, into: &buf)
+        FfiConverterString.write(value.outcome, into: &buf)
+        FfiConverterUInt64.write(value.epochsCaughtUp, into: &buf)
+        FfiConverterUInt64.write(value.eventsRecovered, into: &buf)
+        FfiConverterBool.write(value.mlsUpdateIssued, into: &buf)
+        FfiConverterUInt64.write(value.equivocationsDetected, into: &buf)
+        FfiConverterBool.write(value.needsReconnectCleared, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContextReconnectResult_lift(_ buf: RustBuffer) throws -> ContextReconnectResult {
+    return try FfiConverterTypeContextReconnectResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContextReconnectResult_lower(_ value: ContextReconnectResult) -> RustBuffer {
+    return FfiConverterTypeContextReconnectResult.lower(value)
+}
+
+
+/**
  * A DID document returned by identity resolution.
  *
  * See ADR-002 (DID) and spec §3 (Identity).
@@ -9239,6 +9467,121 @@ public func FfiConverterTypePublishResult_lift(_ buf: RustBuffer) throws -> Publ
 #endif
 public func FfiConverterTypePublishResult_lower(_ value: PublishResult) -> RustBuffer {
     return FfiConverterTypePublishResult.lower(value)
+}
+
+
+/**
+ * Aggregate reconnection report (ADR-029).
+ *
+ * Flat mirror of [`scp_ffi_common::reconnect::ReconnectReport`].
+ */
+public struct ReconnectReport {
+    /**
+     * Per-context results.
+     */
+    public var contexts: [ContextReconnectResult]
+    /**
+     * Total queued messages drained (Phase 6).
+     */
+    public var messagesDrained: UInt64
+    /**
+     * Total queued messages discarded.
+     */
+    public var messagesDiscarded: UInt64
+    /**
+     * Total reconnection duration in milliseconds.
+     */
+    public var totalDurationMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Per-context results.
+         */contexts: [ContextReconnectResult], 
+        /**
+         * Total queued messages drained (Phase 6).
+         */messagesDrained: UInt64, 
+        /**
+         * Total queued messages discarded.
+         */messagesDiscarded: UInt64, 
+        /**
+         * Total reconnection duration in milliseconds.
+         */totalDurationMs: UInt64) {
+        self.contexts = contexts
+        self.messagesDrained = messagesDrained
+        self.messagesDiscarded = messagesDiscarded
+        self.totalDurationMs = totalDurationMs
+    }
+}
+
+#if compiler(>=6)
+extension ReconnectReport: Sendable {}
+#endif
+
+
+extension ReconnectReport: Equatable, Hashable {
+    public static func ==(lhs: ReconnectReport, rhs: ReconnectReport) -> Bool {
+        if lhs.contexts != rhs.contexts {
+            return false
+        }
+        if lhs.messagesDrained != rhs.messagesDrained {
+            return false
+        }
+        if lhs.messagesDiscarded != rhs.messagesDiscarded {
+            return false
+        }
+        if lhs.totalDurationMs != rhs.totalDurationMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(contexts)
+        hasher.combine(messagesDrained)
+        hasher.combine(messagesDiscarded)
+        hasher.combine(totalDurationMs)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReconnectReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReconnectReport {
+        return
+            try ReconnectReport(
+                contexts: FfiConverterSequenceTypeContextReconnectResult.read(from: &buf), 
+                messagesDrained: FfiConverterUInt64.read(from: &buf), 
+                messagesDiscarded: FfiConverterUInt64.read(from: &buf), 
+                totalDurationMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReconnectReport, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeContextReconnectResult.write(value.contexts, into: &buf)
+        FfiConverterUInt64.write(value.messagesDrained, into: &buf)
+        FfiConverterUInt64.write(value.messagesDiscarded, into: &buf)
+        FfiConverterUInt64.write(value.totalDurationMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReconnectReport_lift(_ buf: RustBuffer) throws -> ReconnectReport {
+    return try FfiConverterTypeReconnectReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReconnectReport_lower(_ value: ReconnectReport) -> RustBuffer {
+    return FfiConverterTypeReconnectReport.lower(value)
 }
 
 
@@ -10758,8 +11101,8 @@ public enum ContextState {
      */
     case tombstoned
     /**
-     * Context actor exceeded the ADR-049 §10 respawn budget and is poisoned —
-     * dormant pending operator recovery (`clear_poison` / process restart).
+     * Context actor exceeded its respawn budget (ADR-049 §10) — dormant
+     * until operator intervention. No actor is serving the context.
      */
     case poisoned
 }
@@ -10792,9 +11135,9 @@ public struct FfiConverterTypeContextState: FfiConverterRustBuffer {
         case 6: return .migratingOut
         
         case 7: return .tombstoned
-
+        
         case 8: return .poisoned
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -10829,11 +11172,11 @@ public struct FfiConverterTypeContextState: FfiConverterRustBuffer {
         
         case .tombstoned:
             writeInt(&buf, Int32(7))
-
-
+        
+        
         case .poisoned:
             writeInt(&buf, Int32(8))
-
+        
         }
     }
 }
@@ -13732,6 +14075,31 @@ fileprivate struct FfiConverterSequenceTypeAssetEntry: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeContextReconnectResult: FfiConverterRustBuffer {
+    typealias SwiftType = [ContextReconnectResult]
+
+    public static func write(_ value: [ContextReconnectResult], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeContextReconnectResult.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ContextReconnectResult] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ContextReconnectResult]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeContextReconnectResult.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeEvent: FfiConverterRustBuffer {
     typealias SwiftType = [Event]
 
@@ -13801,6 +14169,32 @@ fileprivate struct FfiConverterSequenceTypePublishResult: FfiConverterRustBuffer
             seq.append(try FfiConverterTypePublishResult.read(from: &buf))
         }
         return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDictionaryStringUInt64: FfiConverterRustBuffer {
+    public static func write(_ value: [String: UInt64], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterString.write(key, into: &buf)
+            FfiConverterUInt64.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String: UInt64] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [String: UInt64]()
+        dict.reserveCapacity(Int(len))
+        for _ in 0..<len {
+            let key = try FfiConverterString.read(from: &buf)
+            let value = try FfiConverterUInt64.read(from: &buf)
+            dict[key] = value
+        }
+        return dict
     }
 }
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
@@ -14849,10 +15243,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_creator_did() != 33786) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 16843) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 4611) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 41639) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 23309) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 7777) {
@@ -14867,10 +15261,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_has_agent_key() != 16136) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_remove_agent_key() != 20170) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_remove_agent_key() != 64312) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_agent_key() != 65044) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_agent_key() != 8500) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 21897) {
@@ -15051,6 +15445,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_propose_ttl_extension() != 10308) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reconnect() != 23606) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 12217) {

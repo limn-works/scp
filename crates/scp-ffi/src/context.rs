@@ -1053,6 +1053,29 @@ fn convert_context_event(
             .into_bytes(),
             ts,
         ),
+        // Relay equivocation detected (§9.9.3, §23.7). This is a security event
+        // and MUST NOT be silently discarded (§9.9.4) — surface it as a
+        // structured, non-lossy, HTML-escaped record rather than a Debug blob.
+        scp_core::context::membership::ContextEvent::EquivocationDetected {
+            context_id: ctx_id,
+            remote_sender_did,
+            event_count,
+            local_merkle_root,
+            remote_merkle_root,
+        } => (
+            "scp:system".to_owned(),
+            format!(
+                "equivocation_detected:context={},\
+                 remote_sender={},event_count={event_count},\
+                 local_merkle_root={},remote_merkle_root={}",
+                html_escape_event_string(&ctx_id),
+                html_escape_event_string(remote_sender_did.as_ref()),
+                hex::encode(local_merkle_root),
+                hex::encode(remote_merkle_root),
+            )
+            .into_bytes(),
+            ts,
+        ),
         other => (
             "scp:system".to_owned(),
             html_escape_event_string(&format!("{other:?}")).into_bytes(),
@@ -1810,6 +1833,86 @@ fn parse_template_id(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Reconnection report (ADR-029)
+// ---------------------------------------------------------------------------
+
+/// Per-context reconnection result surfaced to Python.
+///
+/// Flat mirror of [`scp_ffi_common::reconnect::ContextReconnectResult`].
+#[pyclass]
+#[derive(Clone)]
+pub struct PyContextReconnectResult {
+    /// Context that was reconnected.
+    #[pyo3(get)]
+    pub context_id: String,
+    /// Offline tier: `"short"` / `"extended"` / `"long"`.
+    #[pyo3(get)]
+    pub tier: String,
+    /// Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
+    #[pyo3(get)]
+    pub outcome: String,
+    /// MLS epochs caught up.
+    #[pyo3(get)]
+    pub epochs_caught_up: u64,
+    /// Event-log events recovered.
+    #[pyo3(get)]
+    pub events_recovered: u64,
+    /// Whether an MLS Update was issued (§9.12).
+    #[pyo3(get)]
+    pub mls_update_issued: bool,
+    /// Number of equivocation alerts surfaced (§9.9.3).
+    #[pyo3(get)]
+    pub equivocations_detected: u64,
+    /// Whether `needs_reconnect` was cleared on success.
+    #[pyo3(get)]
+    pub needs_reconnect_cleared: bool,
+}
+
+/// Aggregate reconnection report surfaced to Python.
+///
+/// Flat mirror of [`scp_ffi_common::reconnect::ReconnectReport`].
+#[pyclass]
+#[derive(Clone)]
+pub struct PyReconnectReport {
+    /// Per-context results.
+    #[pyo3(get)]
+    pub contexts: Vec<PyContextReconnectResult>,
+    /// Total queued messages drained (Phase 6).
+    #[pyo3(get)]
+    pub messages_drained: u64,
+    /// Total queued messages discarded.
+    #[pyo3(get)]
+    pub messages_discarded: u64,
+    /// Total reconnection duration in milliseconds.
+    #[pyo3(get)]
+    pub total_duration_ms: u64,
+}
+
+impl From<scp_ffi_common::reconnect::ReconnectReport> for PyReconnectReport {
+    fn from(report: scp_ffi_common::reconnect::ReconnectReport) -> Self {
+        Self {
+            contexts: report
+                .contexts
+                .into_iter()
+                .map(|c| PyContextReconnectResult {
+                    context_id: c.context_id,
+                    tier: c.tier,
+                    outcome: c.outcome,
+                    epochs_caught_up: c.epochs_caught_up,
+                    events_recovered: c.events_recovered,
+                    mls_update_issued: c.mls_update_issued,
+                    equivocations_detected: c.equivocations_detected,
+                    needs_reconnect_cleared: c.needs_reconnect_cleared,
+                })
+                .collect(),
+            messages_drained: report.messages_drained,
+            messages_discarded: report.messages_discarded,
+            total_duration_ms: report.total_duration_ms,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
 // ---------------------------------------------------------------------------
 
@@ -1961,7 +2064,7 @@ impl crate::scp::PyScp {
         // py_mcp_load_contexts. Reuse the pre-derived pseudonym routing ID
         // (§9.10.4, SCP-214 criterion 4). Falls back to context_routing_id
         // for encrypted contexts or broadcast_routing_id for broadcast contexts.
-        // Bug fix (#1534): broadcast contexts use broadcast_routing_id (plain
+        // Broadcast contexts use broadcast_routing_id (plain
         // SHA-256) matching the send path, not context_routing_id (domain-separated).
         {
             let routing_id = local_pseudonym.unwrap_or_else(|| {
@@ -4642,6 +4745,69 @@ impl crate::scp::PyScp {
         Ok(rt.block_on(sup.member_count(&context_id)).map(|n| n as u64))
     }
 
+    /// Reconnects all of `identity_did`'s contexts after an offline
+    /// period, running the ADR-029 six-phase reconnection protocol for
+    /// each context flagged `needs_reconnect` (§23.11).
+    ///
+    /// The driver lives here at the FFI relay-client layer (ADR-029
+    /// reconnection-driver addendum): it pulls relay-buffered messages via
+    /// the `TransportManager` and reaches actor-owned reconnection state
+    /// (MLS epoch, Commit/Welcome processing, checkpoint build/compare,
+    /// MLS update) through the `Supervisor`. On success each context's
+    /// `needs_reconnect` flag is cleared.
+    ///
+    /// `context_ids` is the set of contexts to consider; each is driven
+    /// through the protocol only if the actor reports it `needs_reconnect`.
+    /// `last_relay_contacts` maps `context_id` → last-relay-contact Unix
+    /// seconds (used to classify the offline tier). Contexts absent from
+    /// the map default to the most conservative tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeError` if no relay is connected, the supervisor is
+    /// not initialized, or the signing key cannot be resolved.
+    #[pyo3(signature = (identity_did, context_ids, last_relay_contacts=None))]
+    pub fn context_reconnect(
+        &self,
+        identity_did: &str,
+        context_ids: Vec<String>,
+        last_relay_contacts: Option<HashMap<String, u64>>,
+    ) -> PyResult<PyReconnectReport> {
+        let bi = &*self.inner;
+        validate::validate_did(identity_did)?;
+        let rt = crate::runtime()?;
+        let sup =
+            crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let transport = bi.core.get_transport_arc().ok().flatten().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "no relay connection — call transport_connect() before reconnecting",
+            )
+        })?;
+
+        // Resolve the local member's Ed25519 signing key (used to sign the
+        // Phase-3 consistency checkpoint). Private key never crosses FFI
+        // beyond this in-process driver call. The 32-byte seed is held in
+        // `Zeroizing` so it is wiped when this call returns rather than
+        // lingering on the stack/heap.
+        let signing_key = resolve_signing_key(bi, identity_did)?;
+        let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
+
+        let contacts = last_relay_contacts.unwrap_or_default();
+        let now = scp_primitives::SystemClock.now_secs();
+
+        let report = rt.block_on(scp_ffi_common::reconnect::reconnect_contexts_no_drain(
+            &transport,
+            sup,
+            scp_identity::DID(identity_did.to_owned()),
+            signing_key_bytes,
+            context_ids,
+            contacts,
+            now,
+            scp_core::sync::SyncPolicy::default(),
+        ));
+        Ok(report.into())
+    }
+
     /// Returns `True` if the given DID is a member of the context.
     #[pyo3(signature = (handle, did))]
     pub fn context_is_member(&self, handle: &PyContextHandle, did: &str) -> PyResult<bool> {
@@ -5147,6 +5313,9 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyContextParams>()?;
     m.add_class::<PyMessage>()?;
     m.add_class::<PyMessageReceiver>()?;
+    // Reconnection report (ADR-029)
+    m.add_class::<PyReconnectReport>()?;
+    m.add_class::<PyContextReconnectResult>()?;
     // Governance (#369)
     // Governance proposal lifecycle (#621)
     // Ceiling modification, close, checkpoint, restore (#559)

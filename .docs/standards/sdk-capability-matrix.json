@@ -232,6 +232,16 @@
           "swift": true
         },
         {
+          "name": "reconnect",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": {
+            "wasm": "ADR-034 divergence: the WASM core has no Supervisor/actor and no relay QUERY-since retrieval surface, so the ADR-029 reconnection driver cannot run in-process. The TypeScript SDK's SCP class is NAPI-only (the browser/WASM build throws on `new SCP()`), so this `typescript: true` entry is satisfied by the NAPI backend. The WASM SDK reconnects via its own constrained JS-driven path: JS retrieves relay-buffered blobs and feeds each to context_decrypt_message (which advances the MLS epoch on Commit), and signs/exchanges checkpoints via the in-process event_log_checkpoint path (#1540 Step 5/WASM)."
+          }
+        },
+        {
           "name": "receive",
           "python": true,
           "typescript": true,

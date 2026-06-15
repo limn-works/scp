@@ -62,6 +62,19 @@ pub enum MessageType {
     /// (trust recovery proposals, key rotation notifications) that must be
     /// readable by all group members regardless of access key state.
     Recovery,
+
+    /// Consistency-checkpoint exchange message (§9.9.3, §23.7).
+    ///
+    /// The payload is a `MessagePack`-serialized
+    /// [`ConsistencyCheckpoint`](scp_event_log::checkpoint::ConsistencyCheckpoint)
+    /// (carrying the checkpoint's own `SCP-CHECKPOINT-V1:` signature) wrapped
+    /// behind the `CHECKPOINT_PAYLOAD_TAG` magic tag. Members broadcast
+    /// checkpoints over the regular encrypted inner-envelope pipeline so peers
+    /// can compare Merkle roots at equal event counts and detect relay
+    /// equivocation. The receive path dispatches on this discriminator BEFORE
+    /// the content sequence tracker, so a checkpoint never advances the
+    /// per-sender application sequence.
+    ConsistencyCheckpoint,
 }
 
 impl MessageType {
@@ -73,6 +86,7 @@ impl MessageType {
             Self::Signaling => 1,
             Self::KeyDistribution => 2,
             Self::Recovery => 3,
+            Self::ConsistencyCheckpoint => 4,
         }
     }
 }

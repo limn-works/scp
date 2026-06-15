@@ -937,6 +937,34 @@ pub struct PerContextState {
     /// `state::PerContextState::checkpoints`.
     pub checkpoints: Vec<ConsistencyCheckpoint>,
 
+    /// Set of distinct divergent checkpoints `(event_count, merkle_root)`
+    /// already recorded per remote checkpoint sender DID (§9.9.3 replay
+    /// defense, secondary guard). A re-presented divergence whose
+    /// `(count, remote_merkle_root)` is already in the sender's set is a
+    /// no-op in `compare_remote_checkpoint`: it neither re-appends an
+    /// `EquivocationDetected` event nor re-bumps `checkpoint_events_since`.
+    /// A NEW root at an already-seen count is treated as fresh evidence —
+    /// two members can equivocate with different forged roots at the same
+    /// height, and each is a distinct §9.9.4 security event.
+    ///
+    /// PRIMARY replay-idempotency does NOT come from this map. Recording a
+    /// divergence appends an `EquivocationDetected` event to the durable
+    /// event log, which advances `local_count` (the `event_log_entries`
+    /// length read in `compare_remote_checkpoint`); a re-delivered
+    /// checkpoint at the same remote count then routes to the Ahead/Behind
+    /// arm and never re-reaches the `Equal`/dedup path. That count-advance
+    /// is durable across respawn (the event log is persisted), so replay
+    /// stays blocked even though this in-memory set resets to empty on
+    /// respawn. This set is the secondary belt-and-suspenders guard against
+    /// an exact-divergence re-record within a single process lifetime.
+    ///
+    /// Bounded per sender at
+    /// [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`] distinct entries:
+    /// once a sender's set is full the alert is still EMITTED (a §9.9.4
+    /// security event is never silently discarded) but no further entry is
+    /// inserted, capping the memory a malicious sender can pin.
+    pub last_seen_remote_checkpoint: HashMap<DID, HashSet<(u64, [u8; 32])>>,
+
     // -----------------------------------------------------------------
     // New actor-shape fields (no legacy equivalent)
     // -----------------------------------------------------------------
@@ -1111,6 +1139,7 @@ impl PerContextState {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             checkpoints: Vec::new(),
+            last_seen_remote_checkpoint: HashMap::new(),
             send_tracker: SendSequenceTracker::new(),
             recv_tracker: RecvSequenceTracker::new(),
             saga_pending: HashMap::new(),
@@ -1322,6 +1351,7 @@ mod tests {
             checkpoint_events_since,
             checkpoint_last_time_secs,
             checkpoints,
+            last_seen_remote_checkpoint,
             send_tracker,
             recv_tracker,
             saga_pending,
@@ -1375,6 +1405,7 @@ mod tests {
         assert_eq!(checkpoint_events_since, 0);
         assert_eq!(checkpoint_last_time_secs, 0);
         assert!(checkpoints.is_empty());
+        assert!(last_seen_remote_checkpoint.is_empty());
 
         // New actor-shape fields.
         assert_eq!(send_tracker.last_issued(), 0);
@@ -1422,6 +1453,7 @@ mod tests {
             checkpoint_events_since: _,
             checkpoint_last_time_secs: _,
             checkpoints: _,
+            last_seen_remote_checkpoint: _,
             send_tracker: _,
             recv_tracker: _,
             saga_pending: _,

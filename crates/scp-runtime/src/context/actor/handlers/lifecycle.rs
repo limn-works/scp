@@ -205,6 +205,12 @@ async fn dispatch_actor_inner(
         }
         LifecycleCommand::ShutdownSelf { reply } => handle_shutdown_self_actor(state, deps, reply),
         LifecycleCommand::ReportBufferLen { reply } => handle_report_buffer_len_actor(state, reply),
+        LifecycleCommand::ClearNeedsReconnect { context_id, reply } => {
+            handle_clear_needs_reconnect_actor(state, &context_id, reply)
+        }
+        LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
+            handle_issue_mls_update_actor(state, deps, &context_id, reply)
+        }
     }
 }
 
@@ -608,4 +614,80 @@ fn handle_report_buffer_len_actor(
 ) -> Outcome<()> {
     let _ = reply.send(state.receive_buffer.len());
     Outcome::ok(())
+}
+
+/// Handle [`LifecycleCommand::ClearNeedsReconnect`] (actor-shape).
+///
+/// Clears the actor-owned `EpochState.needs_reconnect` flag (spec
+/// §23.11) via
+/// [`clear_needs_reconnect`](crate::context::queries_helpers::clear_needs_reconnect).
+/// Called by the reconnection driver after the six-phase protocol
+/// completes for a context. Synchronous; always replies `Ok(())`.
+fn handle_clear_needs_reconnect_actor(
+    state: &mut PerContextState,
+    context_id: &str,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    crate::context::queries_helpers::clear_needs_reconnect(state);
+    tracing::debug!(
+        context_id,
+        "cleared needs_reconnect after reconnection (§23.11)"
+    );
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
+}
+
+/// Handle [`LifecycleCommand::IssueMlsUpdate`] (actor-shape).
+///
+/// Issues an MLS Update proposal + self-Commit for post-compromise
+/// security (§9.12 step 2) via
+/// [`MlsCryptoProvider::advance_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::advance_epoch),
+/// which preserves the `scp_wrapping_key` leaf extension (§9.16.1) and
+/// advances the group epoch locally. Replies with the TLS-serialized MLS
+/// Commit bytes for the caller to distribute to all members. Used by the
+/// reconnection driver's Phase 5.
+fn handle_issue_mls_update_actor(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    reply: oneshot::Sender<Result<Vec<u8>, ContextError>>,
+) -> Outcome<()> {
+    use crate::context::state::context_id_to_bytes;
+
+    // Broadcast contexts have no MLS group — an Update is meaningless.
+    if state.broadcast_context.is_some() {
+        let _ = reply.send(Err(ContextError::CryptoFailed(format!(
+            "IssueMlsUpdate on broadcast context {context_id} — no MLS group to ratchet"
+        ))));
+        return Outcome::ok(());
+    }
+
+    let ctx_id_bytes = context_id_to_bytes(context_id);
+    let result = deps
+        .crypto
+        .advance_epoch(&ctx_id_bytes)
+        .map(|out| out.commit_bytes);
+
+    // advance_epoch ratchets the supervisor-owned MLS group to a new
+    // epoch; mirror the local epoch onto actor-owned state so a
+    // subsequent LocalMlsEpoch query reflects the advance.
+    let mutated = if result.is_ok() {
+        state.epoch.mls_epoch = state.epoch.mls_epoch.saturating_add(1);
+        true
+    } else {
+        false
+    };
+
+    let _ = reply.send(result);
+    if mutated {
+        Outcome::ok_mutated(())
+    } else {
+        // advance_epoch failed — the early `result.is_ok()` branch did NOT
+        // bump the epoch, so no actor-owned state changed. Report an
+        // unmutated error so the actor's post-dispatch persistence does not
+        // treat this turn as dirtying state.
+        Outcome::err(ContextError::CryptoFailed(format!(
+            "IssueMlsUpdate failed for context {context_id}"
+        )))
+    }
 }

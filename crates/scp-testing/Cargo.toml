@@ -45,10 +45,11 @@ scp-event-log = { path = "../scp-event-log" }
 scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-transport = { path = "../scp-transport" }
-scp-ffi-common = { path = "../scp-ffi/common" }
+scp-ffi-common = { path = "../scp-ffi/common", features = ["resolvers"] }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+zeroize = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 hex = { workspace = true }
@@ -207,6 +208,10 @@ path = "tests/integration/pipeline_wiring.rs"
 [[test]]
 name = "tool_economy_wiring"
 path = "tests/integration/tool_economy_wiring.rs"
+
+[[test]]
+name = "reconnect_sync"
+path = "tests/integration/reconnect_sync.rs"
 
 [lints]
 workspace = true

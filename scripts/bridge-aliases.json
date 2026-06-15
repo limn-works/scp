@@ -235,6 +235,21 @@
       ]
     },
     {
+      "canonical": "context_reconnect",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "context_reconnect"
+      ],
+      "uniffi": [
+        "context_reconnect"
+      ],
+      "napi": [
+        "context_reconnect"
+      ],
+      "wasm": []
+    },
+    {
       "canonical": "context_subscribe",
       "category": "context",
       "wasm_required": true,
@@ -3376,6 +3391,10 @@
     "uniffi": [],
     "napi": [],
     "wasm": [
+      {
+        "canonical": "context_reconnect",
+        "reason": "The ADR-029 reconnection driver requires the per-context actor/Supervisor and the relay-client TransportManager's QUERY-since retrieval; WASM has neither (no scp-runtime tokio multi-thread, no in-core relay QUERY) per ADR-034. The WASM SDK reconnects via its own constrained JS-driven path: JS retrieves relay-buffered blobs and feeds each to context_decrypt_message (which advances the MLS epoch on Commit) and signs/exchanges checkpoints via the in-process event_log_checkpoint path."
+      },
       {
         "canonical": "identity_create_with_custody",
         "reason": "Custody-backed DID creation requires DidDht::create from scp-identity, which transitively pulls scp-runtime (tokio multi-thread); wasm32 cannot compile it per ADR-034. WASM identity_create generates keys locally (crates/scp-ffi/wasm/src/identity.rs)."

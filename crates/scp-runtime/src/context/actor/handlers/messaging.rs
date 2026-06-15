@@ -91,6 +91,9 @@ pub async fn dispatch(
         MessagingCommand::DrainEvents { context_id, reply } => {
             handle_drain_events(state, &context_id, reply).await
         }
+        MessagingCommand::DrainEquivocationAlerts { context_id, reply } => {
+            handle_drain_equivocation_alerts(state, &context_id, reply).await
+        }
         MessagingCommand::SendPseudonymAnnouncement { payload, reply } => {
             let p = *payload;
             handle_send_pseudonym_announcement(
@@ -140,6 +143,24 @@ pub async fn dispatch(
             unsupported_features,
             reply,
         ),
+        MessagingCommand::BuildLocalCheckpoint {
+            context_id,
+            sender_did,
+            signing_key,
+            reply,
+        } => handle_build_local_checkpoint(
+            state,
+            deps,
+            &context_id,
+            &sender_did,
+            &signing_key,
+            reply,
+        ),
+        MessagingCommand::CompareRemoteCheckpoint {
+            context_id,
+            remote,
+            reply,
+        } => handle_compare_remote_checkpoint(state, deps, &context_id, &remote, reply),
     }
 }
 
@@ -305,6 +326,36 @@ async fn handle_drain_events(
     outcome
 }
 
+/// Handle [`MessagingCommand::DrainEquivocationAlerts`] (actor-shape).
+///
+/// Extracts only the `EquivocationDetected` alerts from the actor-owned
+/// receive buffer, leaving every other buffered event in place and in
+/// order for the SDK's normal receive polling. This is the targeted
+/// counterpart to [`handle_drain_events`]: the reconnection driver uses
+/// it so catch-up does not destroy buffered application traffic
+/// (messages, membership changes) that arrived during the sync.
+async fn handle_drain_equivocation_alerts(
+    state: &mut PerContextState,
+    context_id: &str,
+    reply: crate::context::actor::commands::DrainEventsReply,
+) -> Outcome<()> {
+    let drain_fut = async { state.receive_buffer.drain_equivocation_alerts() };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
+        Ok(events) => (Outcome::ok_mutated(()), Ok(events)),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "drain_equivocation_alerts exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
 /// Handle [`MessagingCommand::SendPseudonymAnnouncement`] (actor-shape).
 async fn handle_send_pseudonym_announcement(
     state: &mut PerContextState,
@@ -374,6 +425,104 @@ fn handle_report_degraded_mode(
     );
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
+}
+
+/// Handle [`MessagingCommand::BuildLocalCheckpoint`] (actor-shape).
+///
+/// Forces a signed consistency checkpoint from the current event-log
+/// state via
+/// [`force_create_checkpoint_fields`](crate::context::queries_helpers::force_create_checkpoint_fields),
+/// threading disjoint sub-borrows of the actor-owned state exactly as
+/// the periodic broadcast path does, then broadcasts it to peers via
+/// [`send_checkpoint`](crate::context::messaging_helpers::send_checkpoint)
+/// (best-effort — a transport failure is logged but does not fail the
+/// command). The send happens inside the actor turn so the FFI-layer
+/// reconnection driver never needs `send_checkpoint` (a `pub(crate)`
+/// helper) across the crate boundary: Phase 3 (`event_log_sync`) is one
+/// mailbox round-trip — build + broadcast — and the reply carries the
+/// built checkpoint so the driver can record it.
+///
+/// Synchronous (the send body has no awaits); no
+/// `tokio::time::timeout` wrapper required. Always replies
+/// `Ok(checkpoint)`; reports [`Outcome::ok_mutated`] because the
+/// checkpoint ring and counters changed.
+fn handle_build_local_checkpoint(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    sender_did: &scp_identity::DID,
+    signing_key: &crate::context::actor::commands::SigningKeyBytes,
+    reply: crate::context::actor::commands::BuildLocalCheckpointReply,
+) -> Outcome<()> {
+    let sk = signing_key.to_signing_key();
+    let now = deps.clock.now_secs();
+    let broadcast_context_is_none = state.broadcast_context.is_none();
+    let mls_epoch = state.epoch.mls_epoch;
+    let checkpoint = crate::context::queries_helpers::force_create_checkpoint_fields(
+        context_id,
+        broadcast_context_is_none,
+        mls_epoch,
+        &mut state.checkpoint_events_since,
+        &mut state.checkpoint_last_time_secs,
+        &mut state.checkpoints,
+        sender_did,
+        &sk,
+        now,
+        &*deps.event_log,
+    );
+
+    // Broadcast the freshly-built checkpoint to peers over the regular
+    // encrypted inner-envelope pipeline (§9.9.3). Best-effort: a transport
+    // failure is logged but never fails the build (the reconnection driver
+    // still receives + records the local checkpoint). Mirrors the
+    // periodic `create_and_broadcast_checkpoint_if_due` contract.
+    if let Err(e) = crate::context::messaging_helpers::send_checkpoint(
+        deps,
+        state,
+        context_id,
+        sender_did,
+        &sk,
+        &checkpoint,
+    ) {
+        tracing::warn!(
+            context_id,
+            error = %e,
+            "failed to broadcast forced consistency checkpoint to peers \
+             (best-effort; build not rolled back) (§9.9.3)"
+        );
+    }
+
+    let _ = reply.send(Ok(checkpoint));
+    Outcome::ok_mutated(())
+}
+
+/// Handle [`MessagingCommand::CompareRemoteCheckpoint`] (actor-shape).
+///
+/// Compares a remote checkpoint against local event-log state via
+/// [`compare_remote_checkpoint`](crate::context::queries_helpers::compare_remote_checkpoint),
+/// which verifies membership + the checkpoint Ed25519 signature, compares
+/// Merkle roots, and emits `ContextEvent::EquivocationDetected` on a
+/// `Divergent` result (§9.9.3). Synchronous; forwards the typed
+/// `Result<CheckpointComparison, ContextError>` verbatim so the caller
+/// sees the `Behind` (consistency-proof catch-up seam, specified
+/// separately) / `Ahead` / `Consistent` / `Divergent`
+/// classification and any `MemberNotFound` / `CryptoFailed` error.
+fn handle_compare_remote_checkpoint(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    reply: crate::context::actor::commands::CompareRemoteCheckpointReply,
+) -> Outcome<()> {
+    let result =
+        crate::context::queries_helpers::compare_remote_checkpoint(state, deps, context_id, remote);
+    let mutated = result.is_ok();
+    let _ = reply.send(result);
+    if mutated {
+        Outcome::ok_mutated(())
+    } else {
+        Outcome::ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

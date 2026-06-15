@@ -193,6 +193,24 @@ pub(crate) async fn dispatch(
             Outcome::ok(())
         }
 
+        QueriesCommand::LocalMlsEpoch {
+            context_id: _,
+            reply,
+        } => {
+            let answer = queries_helpers::local_mls_epoch(state);
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::NeedsReconnect {
+            context_id: _,
+            reply,
+        } => {
+            let answer = queries_helpers::needs_reconnect(state);
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
         #[cfg(feature = "testing")]
         QueriesCommand::GetAccessKey {
             context_id,

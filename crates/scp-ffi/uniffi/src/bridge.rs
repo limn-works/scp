@@ -1935,6 +1935,68 @@ pub struct TrustInput {
     pub evaluated_at: u64,
 }
 
+/// Per-context reconnection result (ADR-029).
+///
+/// Flat mirror of [`scp_ffi_common::reconnect::ContextReconnectResult`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ContextReconnectResult {
+    /// Context that was reconnected.
+    pub context_id: String,
+    /// Offline tier: `"short"` / `"extended"` / `"long"`.
+    pub tier: String,
+    /// Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
+    pub outcome: String,
+    /// MLS epochs caught up.
+    pub epochs_caught_up: u64,
+    /// Event-log events recovered.
+    pub events_recovered: u64,
+    /// Whether an MLS Update was issued (§9.12).
+    pub mls_update_issued: bool,
+    /// Number of equivocation alerts surfaced (§9.9.3).
+    pub equivocations_detected: u64,
+    /// Whether `needs_reconnect` was cleared on success.
+    pub needs_reconnect_cleared: bool,
+}
+
+/// Aggregate reconnection report (ADR-029).
+///
+/// Flat mirror of [`scp_ffi_common::reconnect::ReconnectReport`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReconnectReport {
+    /// Per-context results.
+    pub contexts: Vec<ContextReconnectResult>,
+    /// Total queued messages drained (Phase 6).
+    pub messages_drained: u64,
+    /// Total queued messages discarded.
+    pub messages_discarded: u64,
+    /// Total reconnection duration in milliseconds.
+    pub total_duration_ms: u64,
+}
+
+impl From<scp_ffi_common::reconnect::ReconnectReport> for ReconnectReport {
+    fn from(report: scp_ffi_common::reconnect::ReconnectReport) -> Self {
+        Self {
+            contexts: report
+                .contexts
+                .into_iter()
+                .map(|c| ContextReconnectResult {
+                    context_id: c.context_id,
+                    tier: c.tier,
+                    outcome: c.outcome,
+                    epochs_caught_up: c.epochs_caught_up,
+                    events_recovered: c.events_recovered,
+                    mls_update_issued: c.mls_update_issued,
+                    equivocations_detected: c.equivocations_detected,
+                    needs_reconnect_cleared: c.needs_reconnect_cleared,
+                })
+                .collect(),
+            messages_drained: report.messages_drained,
+            messages_discarded: report.messages_discarded,
+            total_duration_ms: report.total_duration_ms,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Opaque objects (passed by reference, hold state)
 //
@@ -5099,6 +5161,53 @@ async fn event_log_checkpoint_by_did_impl(
 /// Checks `callback_custody` first (platform/software), then falls back
 /// to `in_memory_custody`. Returns `ScpError::Context` if neither is
 /// available or the key handle is missing.
+/// Resolves the raw Ed25519 signing key from an `Identity`'s retained
+/// custody (platform callback OR in-memory). Used by `context_reconnect`
+/// to sign the Phase-3 consistency checkpoint. The export path mirrors
+/// `announce_pseudonym_best_effort` but surfaces a typed error rather than
+/// swallowing a missing key.
+async fn resolve_identity_signing_key(
+    identity: &Identity,
+) -> Result<ed25519_dalek::SigningKey, ScpError> {
+    let core_id = identity
+        .core_id
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity has no retained key material — reconnect requires a \
+              real local signing key to sign the consistency checkpoint"
+                .to_owned(),
+            code: codes::IDENT_1054.to_owned(),
+        })?;
+    let key_handle = core_id.active_signing_key;
+
+    if let Some(ref cb) = identity.callback_custody {
+        return cb
+            .export_ed25519_signing_key(&key_handle)
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("failed to export signing key from platform custody: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            });
+    }
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    if let Some(ref imc) = identity.in_memory_custody {
+        return imc
+            .0
+            .export_ed25519_signing_key(&key_handle)
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("failed to export signing key from in-memory custody: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            });
+    }
+
+    Err(ScpError::Identity {
+        msg: "identity has no usable custody backend for reconnect signing".to_owned(),
+        code: codes::IDENT_1054.to_owned(),
+    })
+}
+
 async fn resolve_uniffi_signing_key(
     handle: &ContextHandle,
 ) -> Result<ed25519_dalek::SigningKey, ScpError> {
@@ -5432,6 +5541,22 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
              action={action_type},success={success},\
              context={context_id}"
         ),
+        // Relay equivocation detected (§9.9.3, §23.7). Security event — MUST NOT
+        // be silently discarded (§9.9.4); surface as a structured, non-lossy,
+        // HTML-escaped record rather than a Debug blob.
+        scp_core::context::membership::ContextEvent::EquivocationDetected {
+            context_id,
+            remote_sender_did,
+            event_count,
+            local_merkle_root,
+            remote_merkle_root,
+        } => scp_ffi_common::html_escape_event_string(&format!(
+            "equivocation_detected:context={context_id},\
+             remote_sender={remote_sender_did},event_count={event_count},\
+             local_merkle_root={},remote_merkle_root={}",
+            hex::encode(local_merkle_root),
+            hex::encode(remote_merkle_root),
+        )),
         other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
     }
 }
@@ -11081,6 +11206,69 @@ impl Scp {
             .member_count(&handle.context_id)
             .await
             .map(|n| n as u64)
+    }
+
+    /// Reconnects `identity`'s contexts after an offline period, running
+    /// the ADR-029 six-phase reconnection protocol for each of
+    /// `context_ids` flagged `needs_reconnect` (§23.11).
+    ///
+    /// The driver lives at this FFI relay-client layer (ADR-029
+    /// reconnection-driver addendum): it pulls relay-buffered messages via
+    /// the `TransportManager` and reaches actor-owned reconnection state
+    /// through the `Supervisor`. On success each context's `needs_reconnect`
+    /// flag is cleared. `last_relay_contacts` maps context id → last-contact
+    /// Unix seconds (tier classification); absent contexts default to the
+    /// most conservative tier.
+    pub async fn context_reconnect(
+        &self,
+        identity: Arc<Identity>,
+        context_ids: Vec<String>,
+        last_relay_contacts: std::collections::HashMap<String, u64>,
+    ) -> Result<ReconnectReport, ScpError> {
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        validate_did(&identity.did)?;
+
+        let supervisor = self
+            .inner
+            .context_manager_expect()
+            .map_err(|e| ScpError::Context {
+                msg: format!("supervisor not initialized for reconnect: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            })?;
+        let transport = self
+            .inner
+            .core
+            .get_transport_arc()
+            .ok()
+            .flatten()
+            .ok_or_else(|| ScpError::Transport {
+                msg: "no relay connection — call transportConnect() before reconnecting".to_owned(),
+                code: codes::TRANS_5010.to_owned(),
+            })?;
+
+        // Resolve the local member's Ed25519 signing key from the identity's
+        // retained custody (used to sign the Phase-3 consistency checkpoint).
+        // Private key never crosses FFI beyond this in-process driver call.
+        // The 32-byte seed is held in `Zeroizing` so it is wiped after the
+        // driver call rather than lingering in freed memory.
+        let signing_key = resolve_identity_signing_key(&identity).await?;
+        let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
+
+        let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
+            &transport,
+            supervisor,
+            scp_identity::DID(identity.did.clone()),
+            signing_key_bytes,
+            context_ids,
+            last_relay_contacts,
+            scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+            scp_core::sync::SyncPolicy::default(),
+        )
+        .await;
+        Ok(report.into())
     }
 
     /// Per-instance equivalent of the free-function `context_is_member`.
