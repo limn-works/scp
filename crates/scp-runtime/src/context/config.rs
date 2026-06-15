@@ -50,12 +50,20 @@ pub enum ContextCreation {
     ///
     /// The template resolves the full parameter set; the caller supplies only
     /// what varies. The optional `peer` is the bilateral counterparty DID,
-    /// carried for the invitation step (the creation engine itself does not
-    /// consume it — see [`ContextConfig::into_params`]).
+    /// carried for the invitation step. The creation engine itself does not
+    /// consume it (see [`ContextConfig::into_params`], which returns it
+    /// alongside the lowered params). The engine entry
+    /// [`Supervisor::create`](crate::context::supervisor::Supervisor::create)
+    /// does **not** silently drop it: until the invitation/Welcome-delivery
+    /// path is wired, supplying `peer: Some(_)` is a loud
+    /// [`ContextCreationError::BilateralPeerNotSupported`](scp_protocol::context::builder::ContextCreationError::BilateralPeerNotSupported),
+    /// not an ignored field.
     Template {
         /// The well-known template to resolve parameters from.
         template: TemplateId,
-        /// Optional bilateral peer DID, used by the invitation flow.
+        /// Optional bilateral peer DID, used by the invitation flow. Carried
+        /// through [`ContextConfig::into_params`]; rejected loud (never
+        /// dropped) by the engine entry until invitation delivery is wired.
         peer: Option<DID>,
     },
     /// Create the context from explicit parameters (advanced path).

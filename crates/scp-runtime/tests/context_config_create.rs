@@ -172,3 +172,57 @@ async fn create_matches_create_context_for_equivalent_inputs() {
     assert_eq!(via_engine.try_read_state().unwrap(), ContextState::Active);
     assert_eq!(via_create.params(), via_engine.params());
 }
+
+/// A bilateral `peer` cannot be invited at this engine layer (invitation /
+/// Welcome-delivery is a higher SDK layer not yet wired). `Supervisor::create`
+/// must therefore **fail loud** rather than silently drop the peer: a config
+/// carrying `ContextCreation::Template { peer: Some(_), .. }` returns
+/// `ContextCreationError::BilateralPeerNotSupported` and creates no context.
+#[tokio::test]
+async fn create_with_template_peer_fails_loud_not_silent() {
+    let manager = new_manager();
+
+    let bob = DID::from("did:dht:z6MkBob");
+    let config = ContextConfig::defaults(ContextCreation::Template {
+        template: TemplateId::BilateralEphemeral,
+        peer: Some(bob),
+    });
+
+    let result = manager
+        .create("ctx-with-peer".into(), config, alice(), None)
+        .await;
+
+    assert!(
+        matches!(result, Err(ContextCreationError::BilateralPeerNotSupported)),
+        "supplying a bilateral peer must be a loud BilateralPeerNotSupported error, \
+         never a silently-dropped field; got {result:?}"
+    );
+
+    // No context was created: the deterministic id is unknown to the manager.
+    assert!(
+        manager.read_context_state("ctx-with-peer").await.is_none(),
+        "a rejected peer create must not leave a partially-created context behind"
+    );
+}
+
+/// The fail-loud guard is specific to a *present* peer: an explicit-config
+/// create (which carries no peer) and a template create with `peer: None` both
+/// succeed. This pins that the guard rejects only `Some(peer)`, not all
+/// template creation.
+#[tokio::test]
+async fn create_without_peer_succeeds() {
+    let manager = new_manager();
+
+    // BilateralPersistent forbids a TTL, so `peer: None` + no TTL is the valid
+    // minimal form — isolating that the guard rejects only `Some(peer)`.
+    let config = ContextConfig::defaults(ContextCreation::Template {
+        template: TemplateId::BilateralPersistent,
+        peer: None,
+    });
+
+    let handle = manager
+        .create("ctx-no-peer".into(), config, alice(), None)
+        .await
+        .unwrap();
+    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+}
