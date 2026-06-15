@@ -53,8 +53,8 @@ use crate::relay::subscription::{self, SubscriptionRegistry};
 /// Whether a relay brokers BRIDGE traffic for symmetric-NAT fallback
 /// (spec §10.12.4).
 ///
-/// Replaces the former `supports_bridge: bool` (construction.md M1 —
-/// enums, not booleans, for semantic choices). The default is
+/// Replaces a former boolean broker flag (construction.md M1 — enums,
+/// not booleans, for semantic choices). The default is
 /// [`BridgeRole::Disabled`], the fail-safe value: a relay that brokers
 /// nothing until brokering is explicitly enabled (construction.md M2).
 ///
