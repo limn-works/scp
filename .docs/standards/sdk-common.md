@@ -181,7 +181,7 @@ All public handle types (`Identity`, `ContextHandle`/`Context`, `TransportManage
 
 Context creation has two paths: template-based (primary) and explicit params (advanced). Both produce identical `ContextHandle` objects. See spec §5.12 for protocol-level template definitions.
 
-Construction follows the unified config-object pattern (`.docs/standards/construction.md`, ADR-051): all five SDKs — Rust included — pass a single `ContextConfig` whose `creation: ContextCreation` field makes the template-vs-explicit choice a required enum (`Template { template, peer }` | `Explicit { ceiling, roles, governance, memory_scope }`). The previous Rust fluent `create_context().template().build()` builder is replaced so that every language uses the same options-object shape.
+Construction follows the unified config-object pattern (`.docs/standards/construction.md`, ADR-052): all five SDKs — Rust included — pass a single `ContextConfig` whose `creation: ContextCreation` field makes the template-vs-explicit choice a required enum (`Template { template, peer }` | `Explicit { ceiling, roles, governance, memory_scope }`). The previous Rust fluent `create_context().template().build()` builder is replaced so that every language uses the same options-object shape.
 
 ### Template-based creation (primary path)
 

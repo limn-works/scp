@@ -8,7 +8,7 @@
 > own-sake.
 
 This is the **Agent-first API design** builder tenet (CLAUDE.md), enacted by
-`.docs/standards/construction.md` and decided in **ADR-051 (Unified Construction
+`.docs/standards/construction.md` and decided in **ADR-052 (Unified Construction
 Pattern)**. The lesson here is the *why* — so future sessions do not re-derive it,
 and do not drift back toward "but typestate is safer" or "but each language should
 follow its own idiom."
@@ -73,7 +73,7 @@ must be preserved:
    the *one* allowed exception to "one greppable constructor" (M5). It is backed by a
    structural test that the unencrypted path is unreachable from the production
    constructor. Demoting this seal to a runtime check to get a single unconditional
-   `start()` is explicitly rejected (ADR-051 Rejected Alternatives): flatness never
+   `start()` is explicitly rejected (ADR-052 Rejected Alternatives): flatness never
    buys down a compile-time security guarantee.
 
 ## How to apply
@@ -94,7 +94,7 @@ must be preserved:
 
 ## Related artifacts
 
-- **ADR-051 (Unified Construction Pattern)** — `.docs/adrs/phase-2.md`. The decision,
+- **ADR-052 (Unified Construction Pattern)** — `.docs/adrs/phase-2.md`. The decision,
   rationale, and full rejected-alternatives list.
 - **`.docs/standards/construction.md`** — the enforced standard (M1–M5, target
   shapes, five-language equivalence).

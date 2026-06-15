@@ -1,6 +1,6 @@
 # Construction Pattern Standard
 
-This standard **enacts the Agent-first API design builder tenet** (CLAUDE.md) and **ADR-051 (Unified Construction Pattern)**. It is the enforced, mechanical form of the tenet: where the tenet states the goal (every public API optimized for first-pass LLM authorability), this document gives the rules a structural check can verify and an agent can follow without a compile-retry loop.
+This standard **enacts the Agent-first API design builder tenet** (CLAUDE.md) and **ADR-052 (Unified Construction Pattern)**. It is the enforced, mechanical form of the tenet: where the tenet states the goal (every public API optimized for first-pass LLM authorability), this document gives the rules a structural check can verify and an agent can follow without a compile-retry loop.
 
 It governs **every developer-facing construction entry point** in the SDK surface — Node, Relay, `host_site`, Context, Identity — in **all five languages** (Rust core + Python, TypeScript, Swift, Kotlin). It does not govern internal-only constructors that no SDK author calls.
 
@@ -37,7 +37,7 @@ For Relay, the SDK-facing entry is **`Relay::start(config)`**. The existing low-
 
 ## The five mechanical rules
 
-These are enforced by a structural check (`scripts/check-construction-pattern.py`, added per ADR-051 AC-9) over the construction modules, not by documentation alone.
+These are enforced by a structural check (`scripts/check-construction-pattern.py`, added per ADR-052 AC-9) over the construction modules, not by documentation alone.
 
 ### M1 — Enums, not booleans, for semantic choices
 
@@ -110,9 +110,9 @@ impl Node {
 }
 ```
 
-This is the **only** sanctioned two-entry-point split. ADR-051 AC-9 additionally requires a structural test proving the unencrypted-storage path is unreachable from the production identity-persisting constructors — `Node::start` and `Identity::create` (the two paths that persist identity key material).
+This is the **only** sanctioned two-entry-point split. ADR-052 AC-9 additionally requires a structural test proving the unencrypted-storage path is unreachable from the production identity-persisting constructors — `Node::start` and `Identity::create` (the two paths that persist identity key material).
 
-> Rule: the seal stays a compile-time `S: EncryptedStorage` bound, never a runtime check. Rationale: ADR-051 Rejected Alternative #3.
+> Rule: the seal stays a compile-time `S: EncryptedStorage` bound, never a runtime check. Rationale: ADR-052 Rejected Alternative #3.
 
 **The seal covers every identity-key persistence path, not just Node.** Identity key material persists only to an encrypted storage slot. Any `StorageSlot` used to persist identity keys is bound by `EncryptedStorage` exactly as `Node::start` is — on **both** production persistence paths:
 
@@ -127,7 +127,7 @@ Consequently identity key material can **never** persist to plaintext, including
 
 This is consistent with injection-through-initializers (architecture.md §2.5): the config object **is** the initializer through which custody/storage/DID/transport are injected. The flat shape is the vehicle for dependency injection, not a bypass of it.
 
-> Rule: providers are typed enum-selectors / concrete types, never boxed `dyn`. Rationale: ADR-051 Rejected Alternative #2.
+> Rule: providers are typed enum-selectors / concrete types, never boxed `dyn`. Rationale: ADR-052 Rejected Alternative #2.
 
 ## Storage vocabulary
 
@@ -166,7 +166,7 @@ NodeConfig {
 }
 ```
 
-Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted; the `<K, D, S>` generics survive, carried by the config and its selectors. (The `IdentitySource` name-reconciliation against the existing private `scp-node` enum is an implementation-sequencing detail — see the ADR-051 Dependencies bullet, not restated here.)
+Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted; the `<K, D, S>` generics survive, carried by the config and its selectors. (The `IdentitySource` name-reconciliation against the existing private `scp-node` enum is an implementation-sequencing detail — see the ADR-052 Dependencies bullet, not restated here.)
 
 ### Relay — `RelayConfig`
 
@@ -214,7 +214,7 @@ Entry: `Identity::create(IdentityConfig)` (production, `where S: EncryptedStorag
 
 ## Five-language equivalence
 
-The same config object and its enums map identically across all five language SDKs. **This table is the canonical statement of the cross-language mapping** — ADR-051 and the lesson reference it rather than re-listing it.
+The same config object and its enums map identically across all five language SDKs. **This table is the canonical statement of the cross-language mapping** — ADR-052 and the lesson reference it rather than re-listing it.
 
 | Concept | Rust | Python | TypeScript | Swift | Kotlin |
 |---|---|---|---|---|---|
@@ -231,8 +231,8 @@ The same config object and its enums map identically across all five language SD
 
 - **CLAUDE.md → Agent-first API design** (builder tenet) — the goal this standard enacts.
 - **CLAUDE.md → "enforce mechanically"** — why this lives as a structural check, not prose.
-- **ADR-051 (Unified Construction Pattern)** — the worked decision, rationale, and rejected alternatives.
-- **ADR-032 §AC-6** — superseded by ADR-051; the original `ApplicationNode` builder mandate.
+- **ADR-052 (Unified Construction Pattern)** — the worked decision, rationale, and rejected alternatives.
+- **ADR-032 §AC-6** — superseded by ADR-052; the original `ApplicationNode` builder mandate.
 - **ADR-049 (lock-free-read invariant)** — why providers stay enum-selectors, never boxed `dyn`.
 - **architecture.md §2.5** — injection-through-initializers, preserved; the config object is the initializer.
 - **sdk-common.md → Context Creation** — rewritten to the `ContextConfig` options-object form to match this standard.

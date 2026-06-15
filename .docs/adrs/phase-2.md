@@ -1062,7 +1062,7 @@ Implement a complete addressability and deployment layer as specified in §18:
 
 6. **`scp-node` crate** with `ApplicationNode` builder: `.domain()`, `.identity()` / `.generate_identity()`, `.storage()`, `.build()`. Build wires relay server start, DID publication with SCPRelay entries, storage initialization. `node.relay()`, `node.identity()`, `node.storage()` accessors work.
 
-   > **Superseded by ADR-051 (Unified Construction Pattern).** The fluent typestate builder (`.domain()/.identity()/.storage()/.build()`) mandated here is replaced by a flat `NodeConfig` config object constructed via `Node::start(config)` / `Node::start_for_testing(config)`. Only this AC is superseded; the rest of ADR-032 stands. See ADR-051 for the rationale and the full pattern.
+   > **Superseded by ADR-052 (Unified Construction Pattern).** The fluent typestate builder (`.domain()/.identity()/.storage()/.build()`) mandated here is replaced by a flat `NodeConfig` config object constructed via `Node::start(config)` / `Node::start_for_testing(config)`. Only this AC is superseded; the rest of ADR-032 stands. See ADR-052 for the rationale and the full pattern.
 
 7. **TLS provisioning:** ACME HTTP-01 challenge handler. Certificate storage in SqliteStorage. Auto-renewal 30 days before expiry. TLS 1.3 enforced.
 
@@ -1521,9 +1521,9 @@ Key design choices:
 
 ---
 
-## ADR-051: Unified Construction Pattern
+## ADR-052: Unified Construction Pattern
 
-> **Note:** ADR-051 is numbered non-sequentially (same convention as ADR-032/035/042). It lives in the Phase 2 document because its primary worked example is `ApplicationNode` construction (ADR-032, `scp-node`), but its scope is cross-cutting: it governs every developer-facing construction entry point across all five language SDKs.
+> **Note:** ADR-052 is numbered non-sequentially (same convention as ADR-032/035/042). It lives in the Phase 2 document because its primary worked example is `ApplicationNode` construction (ADR-032, `scp-node`), but its scope is cross-cutting: it governs every developer-facing construction entry point across all five language SDKs.
 
 **Status:** Decided
 
