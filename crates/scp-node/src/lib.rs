@@ -53,7 +53,7 @@ pub use self_host::{
     host_site_until, routing_id_hex,
 };
 
-// `IdentitySource` / `ExplicitIdentity` now live in `config` (ADR-051 Phase
+// `IdentitySource` / `ExplicitIdentity` now live in `config` (ADR-052 Phase
 // B-P1 name reconciliation). The typestate builder still references them by
 // name; the `pub use` brings them into crate-root scope for both the builder
 // and external consumers.
@@ -1583,7 +1583,7 @@ struct PersistedIdentity {
 // IdentitySource / ExplicitIdentity
 // ---------------------------------------------------------------------------
 //
-// These now live in `crate::config` (ADR-051 Phase B-P1 name reconciliation)
+// These now live in `crate::config` (ADR-052 Phase B-P1 name reconciliation)
 // and are re-exported at crate root above. The typestate builder below still
 // constructs and matches on them by name.
 

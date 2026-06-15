@@ -1,6 +1,6 @@
 //! Flat-config-object construction surface for [`ApplicationNode`].
 //!
-//! This module implements the **ADR-051 Unified Construction Pattern** (Phase
+//! This module implements the **ADR-052 Unified Construction Pattern** (Phase
 //! B-P1) for the Node entry point. It introduces a single flat config object
 //! ([`NodeConfig`]) plus a single zero-sized entry-point namespace ([`Node`])
 //! exposing [`Node::start`] / [`Node::start_for_testing`], replacing the
@@ -8,7 +8,7 @@
 //! one pass from the type signature plus one example.
 //!
 //! See `.docs/standards/construction.md` (the enforced enactment of the
-//! Agent-first API design builder tenet) and ADR-051 in
+//! Agent-first API design builder tenet) and ADR-052 in
 //! `.docs/adrs/phase-2.md`.
 //!
 //! ## Additive lowering
@@ -17,7 +17,7 @@
 //! existing [`ApplicationNodeBuilder`]. The typestate kernel and every existing
 //! call site are untouched; this surface is the new front door that delegates to
 //! the old machinery. Later phases migrate call sites and then delete the
-//! typestate kernel (ADR-051 AC-3).
+//! typestate kernel (ADR-052 AC-3).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use crate::{
 // Node — zero-sized entry-point namespace
 // ---------------------------------------------------------------------------
 
-/// Zero-sized entry-point namespace for Node construction (ADR-051).
+/// Zero-sized entry-point namespace for Node construction (ADR-052).
 ///
 /// All node construction flows through [`Node::start`] (production,
 /// `where S: EncryptedStorage`) or [`Node::start_for_testing`] (feature-gated,
@@ -48,13 +48,13 @@ use crate::{
 pub struct Node;
 
 // ---------------------------------------------------------------------------
-// IdentitySource — how a node obtains its identity (ADR-051 §AC-3)
+// IdentitySource — how a node obtains its identity (ADR-052 §AC-3)
 // ---------------------------------------------------------------------------
 
 /// Specifies how a node obtains its identity.
 ///
-/// This is the public, ADR-051-shaped reconciliation of the formerly private
-/// `scp-node` `IdentitySource` enum (see the ADR-051 "Name reconciliation"
+/// This is the public, ADR-052-shaped reconciliation of the formerly private
+/// `scp-node` `IdentitySource` enum (see the ADR-052 "Name reconciliation"
 /// Dependencies bullet). It carries three variants:
 ///
 /// - [`Generate`](IdentitySource::Generate) — create a fresh DID identity from
@@ -107,7 +107,7 @@ pub struct ExplicitIdentity<D: DidMethod> {
 // ---------------------------------------------------------------------------
 
 /// How the node is reached from the outside — the addressing choice, as one
-/// required field (ADR-051 M1).
+/// required field (ADR-052 M1).
 ///
 /// `Reach` folds the former `HasDomain` / `HasNoDomain` typestate markers and
 /// the `skip_nat_probe` boolean into a single legible enum.
@@ -140,7 +140,7 @@ pub enum Reach {
 // TlsMode — TLS selection (M1 enum, replaces the `plaintext` bool)
 // ---------------------------------------------------------------------------
 
-/// How the node provisions TLS for its public listener (ADR-051 M1).
+/// How the node provisions TLS for its public listener (ADR-052 M1).
 #[derive(Debug, Clone)]
 pub enum TlsMode {
     /// Generate and serve a self-signed certificate for the reach's domain.
@@ -164,7 +164,7 @@ pub enum TlsMode {
 // NatSlot — NAT strategy selection (typed capability slot, never dyn-erased)
 // ---------------------------------------------------------------------------
 
-/// NAT traversal strategy selection (ADR-051 capability slot).
+/// NAT traversal strategy selection (ADR-052 capability slot).
 ///
 /// `NatSlot` carries an `Arc<dyn NatStrategy>` in its [`Custom`](NatSlot::Custom)
 /// variant, so it intentionally does **not** derive `Debug`.
@@ -190,10 +190,10 @@ pub enum NatSlot {
 }
 
 // ---------------------------------------------------------------------------
-// NodeConfig — the one flat config object (ADR-051 §AC-3)
+// NodeConfig — the one flat config object (ADR-052 §AC-3)
 // ---------------------------------------------------------------------------
 
-/// Flat configuration object for constructing an [`ApplicationNode`] (ADR-051).
+/// Flat configuration object for constructing an [`ApplicationNode`] (ADR-052).
 ///
 /// Every parameter is a named field. There is **no** whole-struct `Default`
 /// (M4) because `reach`, `identity`, and `storage` are irreducible required
@@ -280,7 +280,7 @@ pub struct NodeConfig<
     /// no `dht_gateways` setter, so this field is carried but inert (the actual
     /// gateway wiring lives in the concrete `D` the caller passes). Defaults to
     /// an empty vec.
-    // shape-complete per ADR-051; wired to the DHT method in P3
+    // shape-complete per ADR-052; wired to the DHT method in P3
     pub dht_gateways: Vec<String>,
     /// Per-IP rate limit for broadcast projection endpoints (`None` = default).
     pub projection_rate_limit: Option<u32>,
@@ -302,7 +302,7 @@ pub struct NodeConfig<
 
 impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
     /// Constructs a [`NodeConfig`] from the irreducible required fields, filling
-    /// every other field with its **fail-safe** default (ADR-051 M4).
+    /// every other field with its **fail-safe** default (ADR-052 M4).
     ///
     /// Fail-safe defaults: `tls = TlsMode::SelfSigned`, `dht = DhtMode::Memory`
     /// (no publish), every `Option` = `None`, `dht_gateways = []`,
@@ -396,7 +396,7 @@ struct ConfigTail {
 }
 
 /// Validates the config, returning a loud error for contradictory combinations
-/// (ADR-051 M2/M3 — fail loud, never silent).
+/// (ADR-052 M2/M3 — fail loud, never silent).
 ///
 /// # TLS × Reach validity matrix
 ///
@@ -789,7 +789,7 @@ impl Node {
     /// (production path).
     ///
     /// Requires `S: EncryptedStorage` — compile-time enforcement that the
-    /// storage backend encrypts data at rest (the ADR-051 `EncryptedStorage`
+    /// storage backend encrypts data at rest (the ADR-052 `EncryptedStorage`
     /// seal). For testing with unencrypted backends, use
     /// [`Node::start_for_testing`].
     ///
