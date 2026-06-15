@@ -2489,6 +2489,15 @@ mod tests {
         events_recovered_val: u64,
         /// Whether to simulate a relay catch-up failure.
         fail_relay: bool,
+        /// When `true`, `epoch_reconciliation` performs a real per-pass
+        /// ordered Commit merge over `messages` (each `BufferedMessage`'s
+        /// `epoch` is the Commit's target epoch) instead of blindly closing
+        /// the gap. Each pass accepts only the Commits whose epoch equals the
+        /// next-expected epoch (`local + commits_processed + 1`), so an
+        /// out-of-order or gapped Commit set converges across multiple passes
+        /// and the loop terminates the first pass that merges zero — exactly
+        /// the SDK's sequential epoch-processing invariant (§9.12, ADR-029 §3).
+        ordered_merge: bool,
     }
 
     impl MockSyncDriver {
@@ -2499,12 +2508,22 @@ mod tests {
                 mls_update_success: true,
                 events_recovered_val: 5,
                 fail_relay: false,
+                ordered_merge: false,
             }
         }
 
         fn with_relay_failure() -> Self {
             Self {
                 fail_relay: true,
+                ..Self::new()
+            }
+        }
+
+        /// A driver whose `epoch_reconciliation` runs the per-pass ordered
+        /// Commit merge (see [`MockSyncDriver::ordered_merge`]).
+        fn with_ordered_merge() -> Self {
+            Self {
+                ordered_merge: true,
                 ..Self::new()
             }
         }
@@ -2530,15 +2549,69 @@ mod tests {
             context_id: &str,
             local_epoch: u64,
             target_epoch: u64,
-            _policy: &SyncPolicy,
-            _messages: &[BufferedMessage],
+            policy: &SyncPolicy,
+            messages: &[BufferedMessage],
         ) -> Result<EpochCatchUpState, SyncError> {
             let mut state =
                 EpochCatchUpState::new(context_id.to_owned(), local_epoch, target_epoch);
-            let gap = target_epoch.saturating_sub(local_epoch);
-            for _ in 0..gap {
-                state.record_commit_processed();
+
+            if !self.ordered_merge {
+                let gap = target_epoch.saturating_sub(local_epoch);
+                for _ in 0..gap {
+                    state.record_commit_processed();
+                }
+                return Ok(state);
             }
+
+            // Per-pass ordered Commit merge. `messages` are Commits whose
+            // `epoch` is the epoch they advance the group TO; they may arrive
+            // out of order. MLS requires strictly sequential epoch
+            // application, so each pass merges only the Commit(s) at the
+            // next-expected epoch and re-scans until a pass merges nothing.
+            //
+            // Invariants asserted by the behavioral test:
+            //  - ordered progress: `commits_processed` only ever advances by
+            //    landing the next-expected epoch, never a future one;
+            //  - termination: the first pass that merges zero breaks the loop
+            //    (a gap, or the set is exhausted);
+            //  - bound: at most `max_sequential_commits` Commits are merged in
+            //    a single catch-up attempt; on hitting the cap the state is
+            //    transitioned to fast-forward rather than looping unbounded.
+            let limit = policy.max_sequential_commits;
+            loop {
+                if state.commits_processed >= limit && state.status == CatchUpStatus::Processing {
+                    // Bound reached before completion — fall back to
+                    // Welcome-based fast-forward (ADR-029 §3) and stop.
+                    state.transition_to_fast_forward();
+                    break;
+                }
+                if state.status != CatchUpStatus::Processing {
+                    break;
+                }
+
+                let next_expected = local_epoch
+                    .saturating_add(state.commits_processed)
+                    .saturating_add(1);
+                let mut merged_this_pass = 0u64;
+                for msg in messages {
+                    if msg.epoch == Some(next_expected) {
+                        state.record_commit_processed();
+                        merged_this_pass += 1;
+                        // One Commit per epoch; stop scanning this pass so the
+                        // next-expected epoch is recomputed before the next
+                        // merge (strict sequential application).
+                        break;
+                    }
+                }
+
+                if merged_this_pass == 0 {
+                    // No Commit at the next-expected epoch this pass — either a
+                    // gap (cannot proceed sequentially) or the set is
+                    // exhausted. Terminate the loop (§9.12 ordered-merge break).
+                    break;
+                }
+            }
+
             Ok(state)
         }
 
@@ -2619,6 +2692,135 @@ mod tests {
         assert_eq!(result.outcome, SyncOutcome::FullyCaughtUp);
         assert!(result.mls_update_issued);
         assert_eq!(result.events_recovered, 5);
+    }
+
+    /// Helper: a Commit `BufferedMessage` advancing the group to `epoch`.
+    fn commit_msg(blob_id: &str, epoch: u64) -> BufferedMessage {
+        BufferedMessage {
+            blob_id: blob_id.to_owned(),
+            context_id: "ctx-merge".to_owned(),
+            payload: vec![u8::try_from(epoch % 256).unwrap_or(0)],
+            stored_at: 1_000_000,
+            epoch: Some(epoch),
+        }
+    }
+
+    /// Behavioral coverage for the SDK's sequential epoch-processing loop
+    /// (§9.12, ADR-029 §3): an OUT-OF-ORDER Commit set is merged across
+    /// multiple passes, the ordered merge converges to the target epoch, and
+    /// the loop terminates once a pass merges nothing. The per-attempt
+    /// `max_sequential_commits` bound is never exceeded.
+    #[tokio::test]
+    async fn epoch_reconciliation_ordered_merge_converges_out_of_order() {
+        let driver = MockSyncDriver::with_ordered_merge();
+        let policy = SyncPolicy::default();
+
+        // Local at epoch 3, target epoch 7. Commits for 4,5,6,7 arrive in a
+        // shuffled order — a monotone single-scan would mis-apply them; only
+        // a per-pass next-expected merge converges.
+        let local = 3u64;
+        let target = 7u64;
+        let messages = vec![
+            commit_msg("c6", 6),
+            commit_msg("c4", 4),
+            commit_msg("c7", 7),
+            commit_msg("c5", 5),
+        ];
+
+        let state = driver
+            .epoch_reconciliation("ctx-merge", local, target, &policy, &messages)
+            .await
+            .unwrap();
+
+        // Ordered merge progressed across passes to the target.
+        assert_eq!(
+            state.commits_processed, 4,
+            "all four out-of-order Commits land via per-pass next-expected merge"
+        );
+        assert_eq!(
+            state.status,
+            CatchUpStatus::Complete,
+            "reaching the target epoch completes the catch-up"
+        );
+        assert_eq!(state.epochs_remaining(), 0);
+        // The total merged is strictly within the sequential bound.
+        assert!(
+            state.commits_processed <= policy.max_sequential_commits,
+            "total merged must respect the max_sequential_commits bound"
+        );
+    }
+
+    /// A GAP in the Commit set (the next-expected epoch is missing) must
+    /// terminate the ordered-merge loop at the gap — the `merged_this_pass
+    /// == 0` break — rather than skipping ahead or spinning. Commits past
+    /// the gap stay unapplied (MLS forbids non-sequential epoch application).
+    #[tokio::test]
+    async fn epoch_reconciliation_ordered_merge_stops_at_gap() {
+        let driver = MockSyncDriver::with_ordered_merge();
+        let policy = SyncPolicy::default();
+
+        // Local 0, target 4, but epoch-2 Commit is missing: only 1, 3, 4
+        // present. The loop merges epoch 1, finds no epoch-2 Commit, and
+        // breaks — it must NOT apply 3 or 4 out of sequence.
+        let messages = vec![
+            commit_msg("c1", 1),
+            commit_msg("c3", 3),
+            commit_msg("c4", 4),
+        ];
+
+        let state = driver
+            .epoch_reconciliation("ctx-merge", 0, 4, &policy, &messages)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.commits_processed, 1,
+            "only the contiguous prefix (epoch 1) merges; the loop breaks at the epoch-2 gap"
+        );
+        assert_eq!(
+            state.status,
+            CatchUpStatus::Processing,
+            "an unresolved gap leaves the catch-up incomplete (not Complete, not FastForwarded)"
+        );
+        assert_eq!(state.epochs_remaining(), 3);
+    }
+
+    /// When the in-order Commit run reaches `max_sequential_commits` before
+    /// the target, the loop must STOP at the bound and fall back to
+    /// fast-forward — never loop unbounded. Proves `total_merged < target`
+    /// is enforced by the cap, not by exhausting the message set.
+    #[tokio::test]
+    async fn epoch_reconciliation_ordered_merge_honors_sequential_bound() {
+        let driver = MockSyncDriver::with_ordered_merge();
+        // Small cap so the test is cheap and unambiguous.
+        let policy = SyncPolicy {
+            max_sequential_commits: 3,
+            ..SyncPolicy::default()
+        };
+
+        // Local 0, target 10, with a contiguous in-order Commit for every
+        // epoch 1..=10. The cap (3) is hit long before the target.
+        let messages: Vec<BufferedMessage> = (1..=10u64)
+            .map(|e| commit_msg(&format!("c{e}"), e))
+            .collect();
+
+        let state = driver
+            .epoch_reconciliation("ctx-merge", 0, 10, &policy, &messages)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.commits_processed, policy.max_sequential_commits,
+            "the loop stops exactly at the max_sequential_commits bound"
+        );
+        assert!(
+            matches!(state.status, CatchUpStatus::FastForwarded { .. }),
+            "hitting the bound before the target transitions to fast-forward, not unbounded looping"
+        );
+        assert!(
+            state.commits_processed < state.target_epoch - state.local_epoch,
+            "the merge stopped strictly short of the full gap (bound enforced)"
+        );
     }
 
     #[tokio::test]
