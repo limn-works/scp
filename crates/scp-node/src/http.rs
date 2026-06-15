@@ -1705,7 +1705,7 @@ mod vhost_tests {
 ///
 /// The handler holds an `Arc<NodeState>` so it can build the same
 /// complete document that the HTTP/1.1+HTTP/2 handler serves, including
-/// relay_config, contexts, handles, and transports (SCP-264).
+/// `relay_config`, contexts, handles, and transports (SCP-264).
 #[cfg(feature = "http3")]
 fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: &Arc<NodeState>) {
     use scp_transport::http3::Http3Server;
@@ -1750,12 +1750,17 @@ fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: 
         rt: tokio::runtime::Handle::current(),
     });
 
+    // Share the node's connection tracker so the HTTP/3 listener enforces the
+    // same per-IP connection limits as the WebSocket and QUIC relay listeners
+    // (spec §10.14.3 item 2: uniform cross-transport tracking).
+    let connection_tracker = state.connection_tracker.clone();
+
     tokio::spawn(async move {
         let mut server = Http3Server::new(http3_config, handler);
         match server.bind() {
             Ok(addr) => {
                 tracing::info!(addr = %addr, "HTTP/3 server started");
-                if let Err(e) = server.serve().await {
+                if let Err(e) = server.serve(connection_tracker).await {
                     tracing::error!(error = %e, "HTTP/3 server exited with error");
                 }
             }

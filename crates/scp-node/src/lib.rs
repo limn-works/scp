@@ -13,6 +13,7 @@
 
 pub mod bridge_auth;
 pub mod bridge_handlers;
+pub mod config;
 pub mod dev_api;
 pub mod dns_provider;
 pub(crate) mod error;
@@ -51,6 +52,12 @@ pub use self_host::{
     SelfHostDeployer, SelfHostError, content_type_for, deploy_site, embedded_assets, host_site,
     host_site_until, routing_id_hex,
 };
+
+// `IdentitySource` / `ExplicitIdentity` now live in `config` (ADR-052 Phase
+// B-P1 name reconciliation). The typestate builder still references them by
+// name; the `pub use` brings them into crate-root scope for both the builder
+// and external consumers.
+pub use config::{ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
 
 // ---------------------------------------------------------------------------
 // Default HTTP bind address
@@ -1573,27 +1580,12 @@ struct PersistedIdentity {
 }
 
 // ---------------------------------------------------------------------------
-// IdentitySource
+// IdentitySource / ExplicitIdentity
 // ---------------------------------------------------------------------------
-
-/// Specifies how the builder obtains an identity.
-enum IdentitySource<K: KeyCustody, D: DidMethod> {
-    /// Generate a new identity using the provided key custody and DID method.
-    Generate {
-        key_custody: Arc<K>,
-        did_method: Arc<D>,
-    },
-    /// Use a pre-existing identity and document (boxed to avoid large variant
-    /// size difference).
-    Explicit(Box<ExplicitIdentity<D>>),
-}
-
-/// Data for an explicitly provided identity.
-struct ExplicitIdentity<D: DidMethod> {
-    identity: ScpIdentity,
-    document: DidDocument,
-    did_method: Arc<D>,
-}
+//
+// These now live in `crate::config` (ADR-052 Phase B-P1 name reconciliation)
+// and are re-exported at crate root above. The typestate builder below still
+// constructs and matches on them by name.
 
 // ---------------------------------------------------------------------------
 // Builder type-state markers
@@ -3023,7 +3015,7 @@ impl<S: Storage + 'static, Dom>
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: Some(IdentitySource::Generate {
-                key_custody,
+                custody: key_custody,
                 did_method,
             }),
             storage: self.storage,
@@ -3110,7 +3102,7 @@ impl<S: Storage + 'static, Dom>
         ApplicationNodeBuilder {
             domain: self.domain,
             identity_source: Some(IdentitySource::Generate {
-                key_custody,
+                custody: key_custody,
                 did_method,
             }),
             storage: self.storage,
@@ -3339,7 +3331,7 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
 ) -> Result<(ScpIdentity, DidDocument, Arc<D>), NodeError> {
     match source {
         IdentitySource::Generate {
-            key_custody,
+            custody,
             did_method,
         } => {
             // KNOWN LIMITATION: this path drops the `PreRotationKeyHandle`
@@ -3355,9 +3347,8 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             // the builder to accept a real `PreRotationCustody` is
             // tracked alongside the production custody backends.
             let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
-            let (identity, document, _pre_rotation_handle) = did_method
-                .create(&*key_custody, &pre_rotation_custody)
-                .await?;
+            let (identity, document, _pre_rotation_handle) =
+                did_method.create(&*custody, &pre_rotation_custody).await?;
             tracing::warn!(
                 did = %identity.did,
                 "identity created without a persistent PreRotationCustody — migration \
@@ -3368,6 +3359,13 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             Ok((identity, document, did_method))
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
+        // `Persisted` is lowered by `Node::start` onto `identity_with_storage`
+        // (which sets `persist_identity = true` and stores `Generate`), so it
+        // never reaches the resolvers via the typestate builder.
+        IdentitySource::Persisted { .. } => unreachable!(
+            "IdentitySource::Persisted is lowered onto identity_with_storage by Node::start \
+             and never reaches resolve_identity"
+        ),
     }
 }
 
@@ -3497,7 +3495,7 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
 
     match source {
         IdentitySource::Generate {
-            key_custody,
+            custody,
             did_method,
         } => {
             // 1. Check storage for an existing identity.
@@ -3525,7 +3523,7 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                 let persisted = envelope.data;
 
                 // 2b. Validate custody key handles and DID document consistency.
-                validate_persisted_custody(&persisted, &*key_custody).await?;
+                validate_persisted_custody(&persisted, &*custody).await?;
 
                 tracing::info!(
                     did = %persisted.identity.did,
@@ -3543,9 +3541,8 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                 // the only shipped backend, the handle would be
                 // process-local anyway and lost on restart.
                 let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
-                let (identity, document, _pre_rotation_handle) = did_method
-                    .create(&*key_custody, &pre_rotation_custody)
-                    .await?;
+                let (identity, document, _pre_rotation_handle) =
+                    did_method.create(&*custody, &pre_rotation_custody).await?;
                 tracing::warn!(
                     did = %identity.did,
                     "persisted identity created without a persistent PreRotationCustody — \
@@ -3580,6 +3577,13 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
         }
         // Explicit identities are never persisted — caller already manages them.
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
+        // `Persisted` is lowered by `Node::start` onto `identity_with_storage`
+        // (which sets `persist_identity = true` and stores a `Generate`
+        // source), so it never reaches the resolvers via the typestate builder.
+        IdentitySource::Persisted { .. } => unreachable!(
+            "IdentitySource::Persisted is lowered onto identity_with_storage by Node::start \
+             and never reaches resolve_identity_persistent"
+        ),
     }
 }
 
