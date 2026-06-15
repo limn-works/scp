@@ -61,21 +61,29 @@ fn make_shared_dht(custody: &Arc<InMemoryKeyCustody>) -> (Arc<InMemoryDhtClient>
     (dht_client, did_dht)
 }
 
-/// Helper: builds an `ApplicationNode` and returns it along with the shared
-/// DHT client (for client-side resolution tests).
-async fn build_test_node() -> (
+/// Shared `ApplicationNode` constructor for the integration tests.
+///
+/// The only axis the test nodes vary on is `local_api` (the dev API listener):
+/// the public-server tests leave it `None`, while the dev-API test enables it on
+/// an OS-assigned port. Everything else is identical, so both entry points
+/// delegate here.
+///
+/// Default `TlsMode::SelfSigned` reproduces the dropped local
+/// `SucceedingTlsProvider` (both generate a self-signed cert for the domain).
+/// `Domain` is a publishing reach → `DhtMode::Production` (M2; advisory in P1
+/// — the in-memory DHT client publishes nothing).
+async fn build_test_node_with(
+    local_api: Option<SocketAddr>,
+) -> (
     scp_node::ApplicationNode<InMemoryStorage>,
     Arc<InMemoryDhtClient>,
 ) {
     let custody = Arc::new(InMemoryKeyCustody::new());
     let (dht_client, did_dht) = make_shared_dht(&custody);
 
-    // Default `TlsMode::SelfSigned` reproduces the dropped local
-    // `SucceedingTlsProvider` (both generate a self-signed cert for the domain).
-    // `Domain` is a publishing reach → `DhtMode::Production` (M2; advisory in P1
-    // — the in-memory DHT client publishes nothing).
     let node = Node::start_for_testing(NodeConfig {
         bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        local_api,
         dht: DhtMode::Production,
         ..NodeConfig::defaults(
             Reach::Domain {
@@ -92,6 +100,15 @@ async fn build_test_node() -> (
     .expect("ApplicationNode should build successfully");
 
     (node, dht_client)
+}
+
+/// Helper: builds an `ApplicationNode` and returns it along with the shared
+/// DHT client (for client-side resolution tests).
+async fn build_test_node() -> (
+    scp_node::ApplicationNode<InMemoryStorage>,
+    Arc<InMemoryDhtClient>,
+) {
+    build_test_node_with(None).await
 }
 
 // =========================================================================
@@ -452,31 +469,7 @@ async fn build_test_node_with_dev_api() -> (
     scp_node::ApplicationNode<InMemoryStorage>,
     Arc<InMemoryDhtClient>,
 ) {
-    let custody = Arc::new(InMemoryKeyCustody::new());
-    let (dht_client, did_dht) = make_shared_dht(&custody);
-
-    // Same as `build_test_node` plus the dev API on an OS-assigned port
-    // (`local_api`). Default `TlsMode::SelfSigned` reproduces the dropped
-    // `SucceedingTlsProvider`; `Domain` → `DhtMode::Production` (M2).
-    let node = Node::start_for_testing(NodeConfig {
-        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-        local_api: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-        dht: DhtMode::Production,
-        ..NodeConfig::defaults(
-            Reach::Domain {
-                domain: "test.example.com".to_owned(),
-            },
-            IdentitySource::Generate {
-                custody,
-                did_method: Arc::new(did_dht),
-            },
-            InMemoryStorage::new(),
-        )
-    })
-    .await
-    .expect("ApplicationNode with dev API should build successfully");
-
-    (node, dht_client)
+    build_test_node_with(Some(SocketAddr::from(([127, 0, 0, 1], 0)))).await
 }
 
 /// Sends a raw HTTP/1.1 request to `addr` and returns the full response as a string.

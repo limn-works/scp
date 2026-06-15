@@ -141,6 +141,14 @@ pub enum Reach {
 // ---------------------------------------------------------------------------
 
 /// How the node provisions TLS for its public listener (ADR-052 M1).
+///
+/// `TlsMode` is a **closed** selector: it exposes a fixed set of provisioning
+/// strategies and has no variant for injecting an arbitrary
+/// `Arc<dyn TlsProvider>`. This asymmetry with [`NatSlot`] — which intentionally
+/// offers a [`Custom`](NatSlot::Custom) open slot — is deliberate, per
+/// construction.md's "providers stay typed enum-selectors, never `dyn`" rule:
+/// TLS provisioning is fully covered by the variants below, so the type itself
+/// signals that callers select a strategy rather than supply their own.
 #[derive(Debug, Clone)]
 pub enum TlsMode {
     /// Generate and serve a self-signed certificate for the reach's domain.
