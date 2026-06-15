@@ -107,27 +107,48 @@ impl HeartbeatConfig {
     /// Returns the per-profile heartbeat config (§9.9.2, §10.13), or `None`
     /// when the profile disables heartbeats.
     ///
-    /// Single source of truth for both the receive-side gap monitor
-    /// ([`NativeRelayAdapter`](crate::native::NativeRelayAdapter) connection
-    /// path) and the send-side periodic scheduler (the FFI/SDK subscribe
-    /// loop): both derive their interval here so a send cadence can never
-    /// drift out of step with the threshold a peer's monitor expects.
+    /// The `interval` is **per-node** — it sets the local send cadence and is
+    /// NOT a cross-peer single source of truth: a Mobile node sends every 120s
+    /// while a Server node sends every 60s, and neither sees the other's
+    /// interval. Cross-peer safety is achieved differently — by sizing the
+    /// receive-side `suppression_threshold` to the SLOWEST honest sender's
+    /// cadence so no receiver out-runs any honest sender. The slowest profile
+    /// interval is Mobile's 120s, so the uniform threshold is `120s × 2 = 240s`
+    /// (4× the 60s default interval, 2× the 120s Mobile interval). Without this
+    /// a Mobile sender (120s) at a Server/Desktop receiver would otherwise trip
+    /// a spurious `SuppressionSuspected` and wrongly downgrade a relay that is
+    /// in fact delivering.
     ///
-    /// - **Server / Desktop**: 60s (default) — always-on, latency-sensitive.
-    /// - **Mobile**: 120s — reduced frequency to conserve battery (§10.13.1).
+    /// - **Server / Desktop**: send every 60s; threshold 240s (multiplier 4.0).
+    /// - **Mobile**: send every 120s; threshold 240s (multiplier 2.0) —
+    ///   reduced send frequency to conserve battery (§10.13.1).
     /// - **Constrained**: `None` — poll-based devices send/monitor no
     ///   heartbeats.
     #[must_use]
     pub fn for_profile(profile: crate::profile::TransportProfile) -> Option<Self> {
         use crate::profile::TransportProfile;
+        // Uniform suppression threshold across all sending profiles, sized to
+        // the slowest honest sender (Mobile, 120s) doubled = 240s. The
+        // multiplier is per-profile only because it is expressed relative to
+        // each profile's own send interval; the resulting threshold is
+        // identical (`interval × multiplier == 240s`) for every profile.
         let config = match profile {
-            TransportProfile::Server | TransportProfile::Desktop => Self::default(),
+            TransportProfile::Server | TransportProfile::Desktop => Self {
+                suppression_threshold_multiplier: 4.0,
+                ..Self::default()
+            },
             TransportProfile::Mobile => Self {
                 interval: Duration::from_mins(2),
+                suppression_threshold_multiplier: 2.0,
                 ..Self::default()
             },
             TransportProfile::Constrained => return None,
         };
+        debug_assert_eq!(
+            config.suppression_threshold(),
+            Duration::from_mins(4),
+            "every sending profile must resolve to the uniform 240s suppression threshold"
+        );
         if config.enabled { Some(config) } else { None }
     }
 }
