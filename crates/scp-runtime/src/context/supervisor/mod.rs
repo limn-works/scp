@@ -30,6 +30,11 @@
 
 #![deny(unsafe_code)]
 
+/// Public, A-authored standing-pair creation metadata (spec §5.15.8) plus
+/// its reverse-order best-effort rollback. `pub(in crate::context)` —
+/// reachable by the saga prepared-state wire type and the (later) abort
+/// handler, never by external crates or FFI bridges.
+pub(in crate::context) mod creation_receipt;
 pub mod handle;
 mod identity_capability;
 pub mod key_package_actor;
