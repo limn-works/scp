@@ -1582,7 +1582,7 @@ The following constants are protocol invariants. All implementations MUST use th
 
 #### 9.18.2 Domain Separators
 
-All domain separators are UTF-8 strings used as prefixes in canonical hash, signature-preimage, or key/id-derivation constructions (§9.5.1 governs signature preimages; other constructions — key/id-derivation domains and id-construction prefixes — are noted per row). Most entries are §9.5.1 field-enumerated signature-preimage separators; the table also includes non-§9.5.1 entries (for example the `"scp-standing-group-v1:"` length-prefixed `SHA-256` key/id-derivation domain and the `"standing:"` / `"standing-"` context-id construction prefixes, §5.15.8), and §9.4.3 directs a future secret-bearing saga to register its `"scp/saga-commit/<saga-type>/v1"` commitment separator (a commitment-hash domain, also non-§9.5.1) here. Each separator identifies the struct or derivation being hashed to prevent cross-protocol hash confusion.
+All domain separators are UTF-8 strings used as prefixes in canonical hash, signature-preimage, or key/id-derivation constructions (§9.5.1 governs signature preimages; other constructions — key/id-derivation domains and id-construction prefixes — are noted per row). Most entries are §9.5.1 field-enumerated signature-preimage separators; the table also includes non-§9.5.1 entries (for example the `"standing:"` / `"standing-"` context-id construction prefixes, §5.15.8), and §9.4.3 directs a future secret-bearing saga to register its `"scp/saga-commit/<saga-type>/v1"` commitment separator (a commitment-hash domain, also non-§9.5.1) here. Each separator identifies the struct or derivation being hashed to prevent cross-protocol hash confusion.
 
 | Domain Separator | Used For | Spec Reference |
 |------------------|----------|----------------|
@@ -1624,7 +1624,6 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-XCTX-RECEIPT-V1:"` | Cross-context tool receipt signing | §6.2.4 |
 | `"SCP-BCAST-HOST-REQ-V1:"` | Broadcast hosting request signing | §5.14.13 |
 | `"SCP-BCAST-HOST-GRANT-V1:"` | Broadcast hosting grant signing | §5.14.13 |
-| `"scp-standing-group-v1:"` | Standing-pair MLS group-id derivation — a length-prefixed `SHA-256` key/id-derivation domain, NOT a §9.5.1 field-enumerated signature-preimage separator | §5.15.8 |
 | `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction, NOT a §9.5.1 signature-preimage separator (the colon-join is non-§9.5.1; `"standing-"` is an output id-prefix) | §5.15.8 |
 
 #### 9.18.3 Key Derivation and HPKE Labels
