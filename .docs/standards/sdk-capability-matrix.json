@@ -451,6 +451,9 @@
           "swift": false,
           "exemptions": {
             "swift": "subscribe not yet exposed as public API on Context actor"
+          },
+          "notes": {
+            "napi": "NAPI-only: context_subscribe_on co-spawns the §9.9.2 suppression-detection heartbeat scheduler (run_heartbeat_scheduler) alongside the relay subscribe loop, sharing the per-subscription cancel token so unsubscribe/disconnect/bridge-shutdown tears both down in lockstep. The send cadence is the local node's per-profile interval (HeartbeatConfig::for_profile); the receive-side monitor sizes its suppression threshold to the slowest honest sender (240s uniform). Mirrors the reconnection-driver note: this lives at the NAPI subscribe boundary, not in the WASM SDK."
           }
         },
         {

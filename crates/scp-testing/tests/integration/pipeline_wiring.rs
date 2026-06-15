@@ -1304,6 +1304,25 @@ fn b3_heartbeat_send_receive_loop_wired() {
         ),
         "the napi subscribe loop must call record_heartbeat_received on a received heartbeat"
     );
+
+    // TEARDOWN link — the napi subscribe loop must cancel the per-subscription
+    // token when it exits so the co-scheduled run_heartbeat_scheduler tears
+    // down in lockstep. Without this, every non-unsubscribe exit path (stream
+    // exhaustion, relay Terminated, bridge shutdown) would leave the scheduler
+    // firing Supervisor::send_heartbeat on a dead subscription — leaking the
+    // task, its Arc<Supervisor>, and the exported signing key, and emitting
+    // false liveness. A re-subscribe overwrites the handle's token without
+    // cancelling the old one, so this teardown is the only stop.
+    assert!(
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "context_subscribe_on",
+            "cancel_token.cancel()"
+        ),
+        "context_subscribe_on must cancel_token.cancel() on subscribe-loop exit so the \
+         heartbeat scheduler tears down in lockstep (no orphaned scheduler on a dead \
+         subscription)"
+    );
 }
 
 /// The FFI/SDK reconnection driver must DRIVE the checkpoint exchange, not

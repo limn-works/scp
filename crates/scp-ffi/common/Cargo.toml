@@ -59,6 +59,10 @@ tracing = { workspace = true, optional = true }
 scp-event-log = { path = "../../scp-event-log" }
 scp-identity = { path = "../../scp-identity" }
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+# `test-util` enables tokio's paused-clock test harness (time::pause/advance,
+# #[tokio::test(start_paused = true)]) — not pulled in by the optional runtime
+# `tokio` dep's "full" features, which intentionally excludes it.
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 
 [lints]
 workspace = true
