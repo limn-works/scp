@@ -33,6 +33,8 @@ The entry function's verb is **not** left to per-type discretion. There are exac
 
 This fixes the verb at every entry point: `Node::start`, `Relay::start`, `Identity::create`, `Context::create`. `host_site` keeps its verb-named free-function form as the fail-safe sugar tier over `Node::start`.
 
+> **Context receiver carve-out.** The verb for Context is `create`, but its **receiver** differs from the other value/handle entry. `Identity::create` is a true top-level constructor — an identity is a self-contained value with no dependency on a running manager. A context is not: it is created **within an existing manager runtime** (the Rust-core `Supervisor`, which absorbed the former `ContextManager` per ADR-049 — it owns the MLS group creation, actor spawn, and event-log init that creating a context performs, and is the instance the FFI bridges already drive via `create_context`). There is no manager-free `Context::create(config)` to expose without threading the manager through every caller. The Rust-core context entry is therefore **`<manager>.create(ContextConfig)`** — the verb-`create` method on the `Supervisor`/ContextManager — and the language SDKs surface it as a method on their SDK handle (`sdk.create_context(config)` / `sdk.createContext(opts)`, see sdk-common.md). The verb (`create`) and the flat-config object (`ContextConfig`) are identical to the rest of the pattern; only the receiver is the live manager rather than a bare type.
+
 For Relay, the SDK-facing entry is **`Relay::start(config)`**. The existing low-level `RelayServer::new(config, storage)` is the internal constructor that `Relay::start` wraps; `RelayServer::new` is therefore **not** part of the public construction-pattern surface and is exempt from the verb rule.
 
 ## The five mechanical rules
@@ -200,7 +202,9 @@ ContextConfig {
 }
 ```
 
-`ContextCreation` makes the template-vs-explicit XOR a **required enum**. This replaces the Rust `create_context().template().build()` fluent builder and aligns Rust to the options-object that Python/TS/Swift already use — eliminating the `sdk-common.md` Context-creation divergence. Entry: `Context::create(ContextConfig)`.
+`ContextCreation` makes the template-vs-explicit XOR a **required enum**. This replaces the Rust `create_context().template().build()` fluent builder and aligns Rust to the options-object that Python/TS/Swift already use — eliminating the `sdk-common.md` Context-creation divergence. Entry: `<manager>.create(ContextConfig)` — the verb-`create` method on the live `Supervisor`/ContextManager (see the Context receiver carve-out under the entry-verb rule for why a context is created within an existing manager runtime rather than via a bare `Context::create`); the language SDKs surface it as a method on their SDK handle.
+
+The `peer` carried by `ContextCreation::Template { template, peer }` is the bilateral counterparty for the invitation step. The invitation/Welcome-delivery that actually adds the peer is a higher SDK layer; until it is wired, the core `create` entry **rejects a supplied peer loudly** (a typed `BilateralPeerNotSupported` error) rather than silently dropping it — a config field is never accepted and then ignored (CLAUDE.md "no silent" tenet). `peer: None` is the supported form at this layer.
 
 ### Identity — `IdentityConfig`
 

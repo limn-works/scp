@@ -187,15 +187,16 @@ Construction follows the unified config-object pattern (`.docs/standards/constru
 
 All SDKs expose template-based context creation as the default. The template handles parameter selection; the caller provides only what varies (peer, TTL, tools for templates that allow them).
 
+> **Bilateral `peer` and the invitation step.** Supplying `peer` names the counterparty to invite. The invitation/Welcome-delivery that actually adds the peer is delivered by a higher SDK layer; the core creation entry builds only the creator's local context. Until invitation delivery is wired, a `peer`-bearing config is **rejected loud** at the core entry (a typed `BilateralPeerNotSupported` error) rather than silently accepted-and-ignored — a supplied field is never dropped. The example below shows the target invitation surface; create with `peer` omitted to obtain the creator-local context today.
+
 ```
 // Rust
 let ctx = sdk.create_context(ContextConfig {
-    creation: ContextCreation::Template {
+    ttl: Some(Duration::from_secs(300)),
+    ..ContextConfig::defaults(ContextCreation::Template {
         template: Template::BilateralEphemeral,
         peer: Some(bob_did.clone()),
-    },
-    ttl: Some(Duration::from_secs(300)),
-    ..ContextConfig::defaults()
+    })
 }).await?;
 
 // Python
@@ -227,15 +228,14 @@ For contexts that don't fit a well-known template. The caller specifies all para
 ```
 // Rust
 let ctx = sdk.create_context(ContextConfig {
-    creation: ContextCreation::Explicit {
+    ttl: Some(Duration::from_secs(3600)),
+    tools: vec![recipe_search, nutrition_lookup],
+    ..ContextConfig::defaults(ContextCreation::Explicit {
         ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite, Capability::ToolInvokeAll],
         roles: vec![admin_role, member_role, observer_role],
         governance: Governance::SingleAdmin,
         memory_scope: MemoryScope::Summary,
-    },
-    ttl: Some(Duration::from_secs(3600)),
-    tools: vec![recipe_search, nutrition_lookup],
-    ..ContextConfig::defaults()
+    })
 }).await?;
 ```
 
