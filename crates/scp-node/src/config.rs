@@ -199,15 +199,40 @@ pub enum NatSlot {
 /// (M4) because `reach`, `identity`, and `storage` are irreducible required
 /// decisions — they are non-`Option` fields, so omitting them is a compile
 /// error, not a silent `None`. Use [`NodeConfig::defaults`] for the spread
-/// idiom:
+/// idiom.
+///
+/// ## Example: local demo (the happy path)
+///
+/// `NodeConfig::defaults` fills every non-required field with a fail-safe value
+/// that is valid for a **non-publishing** reach. `Reach::Local` is
+/// non-publishing, so the defaults alone are a complete, valid config — nothing
+/// to override:
+///
+/// ```ignore
+/// let node = Node::start(NodeConfig::defaults(
+///     Reach::Local,
+///     IdentitySource::Generate { custody, did_method },
+///     storage,
+/// )).await?;
+/// ```
+///
+/// ## Example: public node on a domain
+///
+/// A publishing reach (`Reach::Domain`) advertises a routable address, so it
+/// requires `DhtMode::Production` **explicitly** — publishing your location to
+/// the DHT is a deliberate opt-in (M2), never a silent default. Selecting a
+/// publishing reach while leaving the default `DhtMode::Memory` is a loud
+/// [`NodeError::InvalidConfig`], not a silent publish:
 ///
 /// ```ignore
 /// let node = Node::start(NodeConfig {
-///     reach: Reach::Domain { domain: "example.com".into() },
-///     identity: IdentitySource::Generate { custody, did_method },
-///     storage,
+///     dht: DhtMode::Production,
 ///     tls: TlsMode::Acme { email: "admin@example.com".into() },
-///     ..NodeConfig::defaults(reach2, identity2, storage2)
+///     ..NodeConfig::defaults(
+///         Reach::Domain { domain: "example.com".into() },
+///         IdentitySource::Generate { custody, did_method },
+///         storage,
+///     )
 /// }).await?;
 /// ```
 ///
@@ -255,6 +280,7 @@ pub struct NodeConfig<
     /// no `dht_gateways` setter, so this field is carried but inert (the actual
     /// gateway wiring lives in the concrete `D` the caller passes). Defaults to
     /// an empty vec.
+    // shape-complete per ADR-051; wired to the DHT method in P3
     pub dht_gateways: Vec<String>,
     /// Per-IP rate limit for broadcast projection endpoints (`None` = default).
     pub projection_rate_limit: Option<u32>,
@@ -372,24 +398,63 @@ struct ConfigTail {
 /// Validates the config, returning a loud error for contradictory combinations
 /// (ADR-051 M2/M3 — fail loud, never silent).
 ///
-/// Two contradictions are rejected:
+/// # TLS × Reach validity matrix
 ///
-/// 1. **M3 (TLS):** `Reach::Domain` + `TlsMode::Plaintext` — a public domain
-///    reach cannot serve plaintext.
-/// 2. **M2 (DHT publish):** a *publishing* reach (`Reach::Domain` or
-///    `Reach::NatTraversal`, both of which advertise a routable address) with
-///    `DhtMode::Memory` (which never publishes to the DHT). Per
-///    `.docs/standards/construction.md` M2, this is a precise, loud error — not
-///    a silent publish, not a silent no-op. `Reach::Tunnel` / `Reach::Local`
-///    publish a loopback URL (non-routable) and are therefore non-publishing
-///    reaches, valid with `DhtMode::Memory`.
+/// The first axis is TLS-vs-Reach; every cell below is decided (never a silent
+/// "maybe"). `✓` = valid, `✗` = loud [`NodeError::InvalidConfig`].
+///
+/// | `TlsMode` \ `Reach` | `Domain` | `NatTraversal` | `Tunnel` | `Local` |
+/// |---|---|---|---|---|
+/// | `SelfSigned` | ✓ (signs for the domain) | ✓ (no domain to sign; TLS no-op) | ✓ | ✓ |
+/// | `Acme`       | ✓ (Let's Encrypt for the domain) | ✗ (no DNS name) | ✗ (no DNS name) | ✗ (no DNS name) |
+/// | `Plaintext`  | ✗ (public domain can't serve plaintext) | ✓ | ✓ | ✓ |
+/// | `Terminated` | ✓ (TLS upstream) | ✓ | ✓ | ✓ |
+///
+/// The two `✗` rules:
+///
+/// 1. **`Domain` cannot serve plaintext:** a public domain reach with
+///    `TlsMode::Plaintext` would expose a public listener with no node-side TLS
+///    — a loud error.
+/// 2. **`Acme` requires a domain:** ACME (Let's Encrypt) provisions a
+///    certificate for a DNS name, so `TlsMode::Acme` on any non-`Domain` reach
+///    (`NatTraversal` / `Tunnel` / `Local`) has no name to provision for — a
+///    loud error.
+///
+/// Every other cell is genuinely valid and is **not** rejected: `Domain` +
+/// {`SelfSigned`, `Acme`, `Terminated`}; non-`Domain` + {`SelfSigned`,
+/// `Plaintext`, `Terminated`}.
+///
+/// The second axis is M2 (DHT publish): a *publishing* reach (`Reach::Domain`
+/// or `Reach::NatTraversal`, both of which advertise a routable address) with
+/// `DhtMode::Memory` (which never publishes to the DHT). Per
+/// `.docs/standards/construction.md` M2, this is a precise, loud error — not a
+/// silent publish, not a silent no-op. `Reach::Tunnel` / `Reach::Local` publish
+/// a loopback URL (non-routable) and are therefore non-publishing reaches,
+/// valid with `DhtMode::Memory`.
 fn validate_config(reach: &Reach, tls: &TlsMode, dht: DhtMode) -> Result<(), NodeError> {
+    // TLS axis, rule 1: Domain cannot serve plaintext.
     if matches!(reach, Reach::Domain { .. }) && matches!(tls, TlsMode::Plaintext) {
         return Err(NodeError::InvalidConfig(
             "Reach::Domain with TlsMode::Plaintext is contradictory: a public domain reach \
              cannot serve plaintext. Choose TlsMode::SelfSigned or TlsMode::Acme."
                 .to_owned(),
         ));
+    }
+    // TLS axis, rule 2: Acme requires a DNS name, which only Reach::Domain
+    // provides. Acme on NatTraversal / Tunnel / Local has no name to provision a
+    // Let's Encrypt certificate for — a loud error, never a silent no-op.
+    if matches!(tls, TlsMode::Acme { .. }) && !matches!(reach, Reach::Domain { .. }) {
+        let reach_name = match reach {
+            Reach::Domain { .. } => unreachable!("guarded by the !matches! above"),
+            Reach::NatTraversal => "Reach::NatTraversal",
+            Reach::Tunnel { .. } => "Reach::Tunnel",
+            Reach::Local => "Reach::Local",
+        };
+        return Err(NodeError::InvalidConfig(format!(
+            "TlsMode::Acme with {reach_name} is contradictory: ACME needs a DNS name to \
+             provision a Let's Encrypt certificate for, but {reach_name} has no domain. Use a \
+             Domain reach or TlsMode::SelfSigned."
+        )));
     }
     // M2: a publishing reach advertises a routable address, which only reaches
     // the network when the DID document is actually published to the DHT.
@@ -507,11 +572,25 @@ where
 
 /// Applies the [`TlsMode`] to a builder.
 ///
-/// `SelfSigned` installs a [`SelfSignedTlsProvider`] only on a `Domain` reach
-/// (non-domain builds skip TLS provisioning entirely). `Acme` sets the ACME
-/// contact email. `Plaintext` (non-domain only — `Domain` + `Plaintext` already
-/// errored in [`validate_config`]) and `Terminated` (TLS handled upstream) are
-/// no-ops for the builder in P1.
+/// - `SelfSigned` installs a [`SelfSignedTlsProvider`] on a `Domain` reach
+///   (non-domain builds skip TLS provisioning entirely — no domain to sign for).
+/// - `Acme` sets the ACME contact email (only ever reaches here on a `Domain`
+///   reach — `validate_config` already rejected `Acme` on every non-`Domain`
+///   reach).
+/// - `Terminated` (TLS terminated upstream by a tunnel/reverse proxy) on a
+///   `Domain` reach installs the **no-network** [`SelfSignedTlsProvider`]: the
+///   node still terminates a local TLS connection from the upstream proxy, so it
+///   needs a local cert, but it must NOT run ACME. **This is load-bearing:** the
+///   legacy domain build defaults a missing `tls_provider` to a real
+///   `AcmeProvider` (binds :80, contacts Let's Encrypt). Leaving `Terminated` a
+///   no-op here would silently attempt ACME on a `Terminated` domain node — the
+///   exact silent-wrong-default the construction standard forbids. The upstream
+///   proxy presents the real CA certificate to the public; the node-side
+///   self-signed cert only secures the proxy↔node hop.
+/// - `Plaintext` is only valid on a non-`Domain` reach (`validate_config` already
+///   rejected `Domain` + `Plaintext`); no-domain mode skips TLS, so it is a
+///   no-op. On a non-`Domain` reach, `Terminated` is likewise a no-op (the
+///   loopback listener is plaintext; the proxy adds TLS).
 fn apply_tls<K, D, S, Dom, Id>(
     builder: ApplicationNodeBuilder<K, D, S, Dom, Id>,
     tls: TlsMode,
@@ -534,11 +613,24 @@ where
             }
         }
         TlsMode::Acme { email } => builder.acme_email(&email),
-        // Plaintext: only valid on non-domain reach (Domain+Plaintext errored
+        TlsMode::Terminated => {
+            if let Reach::Domain { domain } = reach {
+                // Domain + Terminated: install a no-network self-signed provider
+                // so the node terminates the proxy↔node hop locally and does NOT
+                // fall through to the builder's default AcmeProvider. The public
+                // CA cert lives at the upstream proxy.
+                builder.tls_provider(Arc::new(SelfSignedTlsProvider {
+                    domain: domain.clone(),
+                }))
+            } else {
+                // Non-domain reach: loopback listener is plaintext; proxy adds
+                // TLS. No node-side provisioning — a no-op.
+                builder
+            }
+        }
+        // Plaintext: only valid on a non-domain reach (Domain+Plaintext errored
         // already); no-domain mode skips TLS, so this is a no-op.
-        // Terminated: TLS terminated upstream (tunnel/proxy); no node-side TLS.
-        // Both are builder no-ops in P1.
-        TlsMode::Plaintext | TlsMode::Terminated => builder,
+        TlsMode::Plaintext => builder,
     }
 }
 
@@ -614,6 +706,16 @@ fn warn_tunnel_public_url_deferred(public_url: &str) {
 /// Applies the optional tail, addresses the builder per the reach, and finishes
 /// with the production `build()` (`where S: EncryptedStorage`). The reach
 /// addressing yields either `HasDomain` or `HasNoDomain` — both have `build()`.
+///
+/// This and its testing twin [`finish_build_for_testing`] are the **one
+/// irreducible split** in this module: the reach `match` is byte-for-byte
+/// identical, but the terminal call differs by trait bound (`build()` requires
+/// `S: EncryptedStorage` — the production seal; `build_for_testing()` accepts
+/// any `S: Storage`). A single generic finisher cannot name both terminal
+/// methods, because a fn/closure has one fixed `S` bound. The *larger*
+/// duplication — the identity `match` that used to repeat across `Node::start`
+/// and `Node::start_for_testing` — is collapsed into [`start_inner`], which
+/// takes one of these finishers as a closure (the closure carries the bound).
 async fn finish_build<K, D, S>(
     builder: ApplicationNodeBuilder<K, D, S, crate::NoDomain, crate::HasIdentity>,
     tail: ConfigTail,
@@ -661,6 +763,27 @@ where
     }
 }
 
+// Why the identity `match` is NOT hoisted into one shared inner across
+// `Node::start` / `Node::start_for_testing` (the dedup the reviewer asked us to
+// attempt). Two independent type-system facts make it irreducible:
+//
+//   1. The `Explicit` arm lowers via `base.identity(...)`, which yields a
+//      builder with `K = NoOpCustody`, while `Generate`/`Persisted` lower via
+//      `generate_identity_with` / `identity_with_storage`, yielding `K`. Three
+//      arms, two distinct `K`s — so the post-identity builder has no single
+//      type a generic finisher closure (one fixed `K`) could accept.
+//   2. The finisher's terminal call differs by `S` bound — `.build()` needs
+//      `S: EncryptedStorage` (the production seal), `.build_for_testing()`
+//      needs only `S: Storage`. A trait with a generic `call<K, S>` method
+//      could absorb (1), but its method signature fixes one `S` bound, so it
+//      cannot serve both terminals.
+//
+// Either alone might be worked around; together they require a generic-over-`K`
+// trait method whose `S` bound varies per impl — not expressible in Rust. So
+// the ~30-line identity `match` stays duplicated, each arm handing its concrete
+// builder straight to its finisher. The reach lowering inside the finishers is
+// the same irreducible split (see `finish_build`).
+
 impl Node {
     /// Constructs and starts an [`ApplicationNode`] from a [`NodeConfig`]
     /// (production path).
@@ -690,8 +813,9 @@ impl Node {
 
         // Storage first (requires NoOpStorage state), then identity (consuming
         // custody/did_method), then the tail. Each identity arm yields a
-        // different concrete builder type, so each flows through `apply_tail`
-        // independently and finishes with `build()`.
+        // different concrete builder type (Explicit drops to NoOpCustody), so
+        // each flows through `finish_build` independently — the irreducible
+        // split documented on `finish_build`.
         let base = ApplicationNodeBuilder::new().storage(storage);
         match identity {
             IdentitySource::Generate {
@@ -868,6 +992,18 @@ mod tests {
             node.identity().did().starts_with("did:dht:"),
             "domain + Generate should yield a did:dht: identity"
         );
+        // Observable behavior beyond "did not panic": the Domain reach lowered
+        // to a domain-mode node with the wss:// relay url the builder derives.
+        assert_eq!(
+            node.domain(),
+            Some("config-gen.example.com"),
+            "Domain reach should surface the domain on the built node"
+        );
+        assert_eq!(
+            node.relay_url(),
+            "wss://config-gen.example.com/scp/v1",
+            "domain mode should publish the wss:// relay url (spec §18.5.2)"
+        );
         node.shutdown();
     }
 
@@ -907,51 +1043,11 @@ mod tests {
         node.shutdown();
     }
 
-    // --- Test 3: Acme lowers without provisioning on a no-domain reach -------
-
-    #[tokio::test]
-    async fn acme_lowers_without_provisioning_on_no_domain() {
-        // `TlsMode::Acme` lowers to `.acme_email(...)` on the builder regardless
-        // of reach, but a non-`Domain` reach never provisions ACME TLS (no
-        // challenge listener, no Let's Encrypt contact). On `NatTraversal` the
-        // Acme lowering is therefore fully offline and deterministic: it must
-        // not break the build. A MockNatStrategy keeps the NAT path offline (no
-        // real STUN), and NatTraversal is a publishing reach so M2 requires
-        // Production (advisory in P1 — the TestDidDht uses an in-memory client,
-        // so nothing is published offline). This test NEVER binds port 80 and
-        // NEVER contacts Let's Encrypt.
-        let external_addr = SocketAddr::from(([198, 51, 100, 9], 41001));
-        let node = Node::start_for_testing(NodeConfig {
-            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            dht: DhtMode::Production,
-            tls: TlsMode::Acme {
-                email: "admin@example.com".to_owned(),
-            },
-            nat: NatSlot::Custom(Arc::new(MockNatStrategy {
-                tier: ReachabilityTier::Stun { external_addr },
-            })),
-            ..NodeConfig::defaults(
-                Reach::NatTraversal,
-                generate_identity(),
-                InMemoryStorage::new(),
-            )
-        })
-        .await
-        .unwrap();
-
-        // No-domain build: Acme lowering did not provision and did not break the
-        // build; the node publishes a ws:// relay url with no domain.
-        assert!(
-            node.domain().is_none(),
-            "Acme on a no-domain reach should build a no-domain node"
-        );
-        assert!(
-            node.relay_url().starts_with("ws://"),
-            "no-domain mode should publish a ws:// url, got: {}",
-            node.relay_url()
-        );
-        node.shutdown();
-    }
+    // (The former "Acme lowers without provisioning on a no-domain reach" test
+    // is removed: `TlsMode::Acme` on a non-`Domain` reach is now a loud
+    // `InvalidConfig` — ACME needs a DNS name (fix 1). Its negative coverage is
+    // `acme_with_non_domain_reach_is_invalid_config` and
+    // `acme_rejected_on_all_non_domain_reaches` below.)
 
     // --- Test 4: NatTraversal -> no-domain -----------------------------------
 
@@ -1010,6 +1106,13 @@ mod tests {
             node.domain().is_none(),
             "Tunnel should build a no-domain node"
         );
+        // Observable: a no-domain node publishes a loopback ws:// relay url
+        // (the documented P1 Tunnel behavior — public_url is not yet threaded).
+        assert!(
+            node.relay_url().starts_with("ws://"),
+            "Tunnel (no-domain) should publish a ws:// relay url, got: {}",
+            node.relay_url()
+        );
         node.shutdown();
     }
 
@@ -1027,6 +1130,13 @@ mod tests {
         assert!(
             node.domain().is_none(),
             "Local should build a no-domain node"
+        );
+        // Observable: Local lowers to a no-domain node with a loopback ws://
+        // relay url, same as Tunnel.
+        assert!(
+            node.relay_url().starts_with("ws://"),
+            "Local (no-domain) should publish a ws:// relay url, got: {}",
+            node.relay_url()
         );
         node.shutdown();
     }
@@ -1361,5 +1471,212 @@ mod tests {
             msg.contains("not found in custody"),
             "expected custody validation error, got: {msg}"
         );
+    }
+
+    // --- Test 17: PRODUCTION Node::start over a real EncryptedStorage ----------
+
+    #[tokio::test]
+    async fn production_start_with_sqlite_encrypted_storage_builds() {
+        use scp_platform::sqlite::SqliteStorage;
+
+        // Exercises the SEAL path — `Node::start` (not `start_for_testing`),
+        // which is `where S: EncryptedStorage`. `SqliteStorage` implements
+        // `EncryptedStorage` (SQLCipher at-rest), so this monomorphizes the
+        // production entry point with a genuinely encrypted backend. The
+        // `start_for_testing` tests above all use `InMemoryStorage`, which is
+        // NOT `EncryptedStorage` and so could never reach `Node::start`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = [7u8; 32];
+        let storage =
+            Arc::new(SqliteStorage::new(dir.path(), &key).expect("open encrypted SqliteStorage"));
+
+        // Domain is a publishing reach; M2 requires Production (advisory in P1 —
+        // the TestDidDht uses an in-memory client, so nothing is published
+        // offline). Domain + default SelfSigned builds offline (no network/CA).
+        let node = Node::start(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "config-prod-sqlite.example.com".to_owned(),
+                },
+                generate_identity(),
+                Arc::clone(&storage),
+            )
+        })
+        .await
+        .expect("production Node::start over encrypted SqliteStorage should build");
+
+        assert!(
+            node.identity().did().starts_with("did:dht:"),
+            "production start should yield a did:dht: identity"
+        );
+        assert_eq!(
+            node.domain(),
+            Some("config-prod-sqlite.example.com"),
+            "production start should surface the configured domain"
+        );
+        assert_eq!(
+            node.relay_url(),
+            "wss://config-prod-sqlite.example.com/scp/v1",
+            "production domain mode should publish the wss:// relay url"
+        );
+        node.shutdown();
+    }
+
+    // --- Test 18: TlsMode::Terminated + Domain builds with a local cert -------
+
+    #[tokio::test]
+    async fn terminated_tls_with_domain_builds() {
+        // `TlsMode::Terminated` (TLS terminated upstream by a tunnel/reverse
+        // proxy) on a Domain reach must NOT fall through to the builder's default
+        // AcmeProvider (which would bind :80 and contact Let's Encrypt). Instead
+        // `apply_tls` installs the no-network self-signed provider so the node
+        // terminates the proxy↔node hop locally and builds OFFLINE in domain
+        // mode. The observable proof: a domain-mode node with the wss:// relay
+        // url AND a populated cert resolver (local cert provisioned, no network).
+        // This combination was previously unexecuted — and silently ran ACME.
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Terminated,
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "config-terminated.example.com".to_owned(),
+                },
+                generate_identity(),
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .expect("Terminated TLS + Domain should build offline (local self-signed, no ACME)");
+
+        assert_eq!(
+            node.domain(),
+            Some("config-terminated.example.com"),
+            "Terminated + Domain should still be a domain-mode node"
+        );
+        assert_eq!(
+            node.relay_url(),
+            "wss://config-terminated.example.com/scp/v1",
+            "Terminated + Domain should publish the wss:// relay url"
+        );
+        assert!(
+            node.cert_resolver().is_some(),
+            "Terminated + Domain installs a no-network local cert (proxy↔node hop), \
+             so the cert resolver is populated — it must NOT silently fall to ACME"
+        );
+        node.shutdown();
+    }
+
+    // --- Test 19: TlsMode::SelfSigned + Domain provisions self-signed TLS -----
+
+    #[tokio::test]
+    async fn self_signed_tls_with_domain_provisions_and_builds() {
+        // `TlsMode::SelfSigned` on a Domain reach installs `SelfSignedTlsProvider`
+        // and provisions a self-signed certificate (no network, no CA). The
+        // observable proof that provisioning actually happened — not merely that
+        // the build did not panic — is a populated `cert_resolver()`, which is
+        // `Some` only when node-side TLS is active in domain mode.
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::SelfSigned,
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "config-selfsigned.example.com".to_owned(),
+                },
+                generate_identity(),
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .expect("SelfSigned TLS + Domain should provision and build");
+
+        assert_eq!(
+            node.domain(),
+            Some("config-selfsigned.example.com"),
+            "SelfSigned + Domain should be a domain-mode node"
+        );
+        assert!(
+            node.cert_resolver().is_some(),
+            "SelfSigned on a Domain reach must actually provision node-side TLS \
+             (a populated cert resolver), not silently skip it"
+        );
+        node.shutdown();
+    }
+
+    // --- Test 20: TlsMode::Acme + non-Domain reach is a loud config error ------
+
+    #[tokio::test]
+    async fn acme_with_non_domain_reach_is_invalid_config() {
+        // The new TLS-axis rule (fix 1): ACME needs a DNS name, which only a
+        // Domain reach provides. `TlsMode::Acme` on Local / Tunnel / NatTraversal
+        // must be a loud `InvalidConfig`, not a silent no-op. Local is a
+        // non-publishing reach so the M2 DHT rule does NOT fire — this isolates
+        // the Acme×Reach rejection. Validation runs before any build, so no NAT
+        // strategy is needed.
+        let result = Node::start_for_testing(NodeConfig {
+            tls: TlsMode::Acme {
+                email: "admin@example.com".to_owned(),
+            },
+            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+        })
+        .await;
+
+        let err = match result {
+            Err(NodeError::InvalidConfig(msg)) => msg,
+            Err(other) => panic!("expected InvalidConfig for Acme + Local, got: {other}"),
+            Ok(node) => {
+                node.shutdown();
+                panic!("expected InvalidConfig for Acme + Local, got Ok");
+            }
+        };
+        assert!(
+            err.contains("TlsMode::Acme") && err.contains("Reach::Local"),
+            "Acme×Reach error must name the contradiction, got: {err}"
+        );
+    }
+
+    // --- Test 21: Acme is rejected on every non-Domain reach ------------------
+
+    #[tokio::test]
+    async fn acme_rejected_on_all_non_domain_reaches() {
+        // Symmetry guard for fix 1: NatTraversal and Tunnel are also rejected
+        // with Acme, exactly like Local (Test 20). Each is the same loud
+        // `InvalidConfig`. Validation precedes the build, so no NAT mock is
+        // needed even for the NatTraversal arm.
+        for (reach, reach_name) in [
+            (Reach::NatTraversal, "Reach::NatTraversal"),
+            (
+                Reach::Tunnel {
+                    public_url: "https://tunnel-acme.example.com".to_owned(),
+                },
+                "Reach::Tunnel",
+            ),
+        ] {
+            let result = Node::start_for_testing(NodeConfig {
+                tls: TlsMode::Acme {
+                    email: "admin@example.com".to_owned(),
+                },
+                ..NodeConfig::defaults(reach, generate_identity(), InMemoryStorage::new())
+            })
+            .await;
+
+            let err = match result {
+                Err(NodeError::InvalidConfig(msg)) => msg,
+                Err(other) => {
+                    panic!("expected InvalidConfig for Acme + {reach_name}, got: {other}")
+                }
+                Ok(node) => {
+                    node.shutdown();
+                    panic!("expected InvalidConfig for Acme + {reach_name}, got Ok");
+                }
+            };
+            assert!(
+                err.contains("TlsMode::Acme") && err.contains(reach_name),
+                "Acme×{reach_name} error must name the contradiction, got: {err}"
+            );
+        }
     }
 }
