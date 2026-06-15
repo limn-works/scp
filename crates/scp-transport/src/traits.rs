@@ -237,6 +237,21 @@ pub trait TransportAdapter: Send + Sync {
     /// connection, or [`TransportError::SendFailed`] if the delete request
     /// fails.
     fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>>;
+
+    /// Records that a suppression-detection heartbeat (§9.9.2) was received
+    /// from a peer over this transport.
+    ///
+    /// Called by the relay subscription loop when an inbound envelope decrypts
+    /// to a [`MessageType::Heartbeat`](scp_protocol::envelope::inner::MessageType::Heartbeat).
+    /// Adapters that maintain a `HeartbeatMonitor` (e.g. the native relay
+    /// adapter when connected with a transport profile) refresh their
+    /// gap-detection baseline so suppression is only suspected after a genuine
+    /// silence. Adapters without heartbeat monitoring keep the default no-op:
+    /// recording a heartbeat where nothing tracks gaps is harmless and frees
+    /// callers from branching on adapter capability.
+    fn record_heartbeat_received(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// Blanket impl so a boxed adapter is itself a [`TransportAdapter`].
@@ -275,6 +290,10 @@ impl TransportAdapter for Box<dyn TransportAdapter> {
 
     fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>> {
         (**self).delete(blob_id)
+    }
+
+    fn record_heartbeat_received(&self) -> BoxFuture<'_, ()> {
+        (**self).record_heartbeat_received()
     }
 }
 

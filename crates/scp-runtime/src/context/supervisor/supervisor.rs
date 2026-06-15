@@ -5727,6 +5727,46 @@ impl Supervisor {
         })?
     }
 
+    /// Sends a suppression-detection heartbeat (§9.9.2) to `context_id`'s
+    /// peers. Routes through the actor mailbox via [`Self::dispatch_command`]
+    /// so the send is serialized with the context's other sends.
+    ///
+    /// Driven by the bridge/SDK subscribe-path periodic scheduler (the
+    /// §9.9.2 "the SDK sends heartbeats" boundary): the caller supplies its
+    /// locally-controlled `sender_did` + `signing_key` exactly as the
+    /// application send path does — the signing key is not actor-owned state.
+    /// The heartbeat carries an empty payload; its only purpose is to give
+    /// peers a liveness beacon for suppression detection.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the handler (every fan-out send
+    /// failed); [`ContextError::TransportFailed`] if the reply channel is
+    /// dropped. Callers treat this as best-effort and MUST NOT tear down the
+    /// subscription on a single failure.
+    pub async fn send_heartbeat(
+        &self,
+        context_id: &str,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::SendHeartbeat {
+            context_id: context_id.to_owned(),
+            sender_did: sender_did.clone(),
+            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
+                signing_key,
+            ),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::send_heartbeat — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Compares a remote consistency checkpoint against local event-log
     /// state for equivocation detection (§9.9.3). Routes through the actor
     /// mailbox via [`Self::dispatch_command`].
@@ -5822,9 +5862,16 @@ impl Supervisor {
     /// via [`Self::dispatch_command`].
     ///
     /// Alias over `DeliverIncoming` for the reconnection driver's Phase 2
-    /// (`epoch_reconciliation`). `Ok(None)` for a control message
-    /// (Commit / Proposal); `Ok(Some((plaintext, sender_did)))` for an
-    /// application message.
+    /// (`epoch_reconciliation`). `Ok(None)` for a control / management
+    /// message (Commit / Proposal / checkpoint / §9.9.2 heartbeat);
+    /// `Ok(Some((plaintext, sender_did)))` for an application message.
+    ///
+    /// The driver only distinguishes application content from everything
+    /// else, so the receive-path [`DeliverOutcome`](crate::context::messaging_helpers::DeliverOutcome)
+    /// is collapsed back to `Option` here: a heartbeat encountered during
+    /// catch-up is correctly treated as "no application content" (live
+    /// heartbeat monitoring is the subscribe-loop's responsibility, not the
+    /// reconnection driver's).
     ///
     /// # Errors
     ///
@@ -5836,6 +5883,7 @@ impl Supervisor {
         context_id: &str,
         envelope_bytes: Vec<u8>,
     ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+        use crate::context::messaging_helpers::DeliverOutcome;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::DeliverIncoming {
             context_id: context_id.to_owned(),
@@ -5843,11 +5891,15 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        let outcome = rx.await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::deliver_commit_blob — actor reply channel closed".to_owned(),
             )
-        })?
+        })??;
+        Ok(match outcome {
+            DeliverOutcome::Application(msg) => Some(msg),
+            DeliverOutcome::Heartbeat | DeliverOutcome::Handled => None,
+        })
     }
 
     /// Returns the current member count for `context_id`, or `None` if

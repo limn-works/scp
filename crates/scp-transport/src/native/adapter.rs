@@ -258,21 +258,12 @@ impl NativeRelayAdapter {
             return (None, None);
         };
 
-        // Derive heartbeat config from the transport profile.
-        let heartbeat_config = match profile {
-            // Server and Desktop: default 60s interval.
-            TransportProfile::Server | TransportProfile::Desktop => HeartbeatConfig::default(),
-            // Mobile: 120s interval to reduce battery impact.
-            TransportProfile::Mobile => HeartbeatConfig {
-                interval: std::time::Duration::from_mins(2),
-                ..HeartbeatConfig::default()
-            },
-            // Constrained devices: no heartbeat monitoring (poll-based).
-            TransportProfile::Constrained => return (None, None),
-        };
-        if !heartbeat_config.enabled {
+        // Derive heartbeat config from the transport profile via the single
+        // source of truth shared with the send-side scheduler (§9.9.2). A
+        // `None` here means the profile disables heartbeats (Constrained).
+        let Some(heartbeat_config) = HeartbeatConfig::for_profile(*profile) else {
             return (None, None);
-        }
+        };
 
         let monitor = HeartbeatMonitor::new(heartbeat_config.clone(), relay_url.to_owned());
         let monitor = Arc::new(tokio::sync::Mutex::new(monitor));
@@ -574,6 +565,16 @@ impl TransportAdapter for NativeRelayAdapter {
                 _ => Ok(()),
             }
         })
+    }
+
+    /// Trait-object entry point for the relay subscription loop: forwards to
+    /// the inherent [`NativeRelayAdapter::record_heartbeat_received`], which
+    /// refreshes the [`HeartbeatMonitor`] gap-detection baseline when a
+    /// transport profile is active (§9.9.2). `Self::` path syntax resolves to
+    /// the inherent method (inherent impls take method-resolution priority
+    /// over trait impls), so this is a delegation, not a recursion.
+    fn record_heartbeat_received(&self) -> BoxFuture<'_, ()> {
+        Box::pin(Self::record_heartbeat_received(self))
     }
 }
 

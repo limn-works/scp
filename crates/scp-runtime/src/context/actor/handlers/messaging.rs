@@ -113,23 +113,7 @@ pub async fn dispatch(
             member_did,
             pseudonym,
             reply,
-        } => {
-            // §9.10.4 test seam: record a peer pseudonym exactly as a
-            // delivered `PseudonymAnnouncement` would. Broadcast contexts carry
-            // no peer registry — reject so a mis-targeted test fails loudly.
-            let result = if let Some(reg) = state.routing.peer_registry_mut() {
-                reg.insert(member_did, pseudonym);
-                Ok(())
-            } else {
-                Err(
-                    scp_protocol::context::ContextError::NotPseudonymousContext {
-                        context_id: state.handle.context_id().to_owned(),
-                    },
-                )
-            };
-            let _ = reply.send(result);
-            crate::context::actor::Outcome::ok(())
-        }
+        } => handle_seed_peer_pseudonym(state, member_did, pseudonym, reply),
         MessagingCommand::ReportDegradedMode {
             context_id,
             compat,
@@ -161,7 +145,38 @@ pub async fn dispatch(
             remote,
             reply,
         } => handle_compare_remote_checkpoint(state, deps, &context_id, &remote, reply),
+        MessagingCommand::SendHeartbeat {
+            context_id,
+            sender_did,
+            signing_key,
+            reply,
+        } => handle_send_heartbeat(state, deps, &context_id, &sender_did, &signing_key, reply),
     }
+}
+
+/// Handle [`MessagingCommand::SeedPeerPseudonym`] (actor-shape, test-only).
+///
+/// §9.10.4 test seam: records a peer pseudonym exactly as a delivered
+/// `PseudonymAnnouncement` would. Broadcast contexts carry no peer registry —
+/// rejects so a mis-targeted test fails loudly. Extracted from the dispatch
+/// match so the dispatcher stays a flat one-line-per-arm router.
+#[cfg(feature = "testing")]
+fn handle_seed_peer_pseudonym(
+    state: &mut PerContextState,
+    member_did: scp_identity::DID,
+    pseudonym: [u8; 32],
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let result = if let Some(reg) = state.routing.peer_registry_mut() {
+        reg.insert(member_did, pseudonym);
+        Ok(())
+    } else {
+        Err(ContextError::NotPseudonymousContext {
+            context_id: state.handle.context_id().to_owned(),
+        })
+    };
+    let _ = reply.send(result);
+    Outcome::ok(())
 }
 
 /// Handle [`MessagingCommand::SendMessage`] (actor-shape): reserve a
@@ -522,6 +537,45 @@ fn handle_compare_remote_checkpoint(
         Outcome::ok_mutated(())
     } else {
         Outcome::ok(())
+    }
+}
+
+/// Handle [`MessagingCommand::SendHeartbeat`] (actor-shape).
+///
+/// Sends a suppression-detection heartbeat (§9.9.2) to context peers via
+/// [`send_heartbeat`](crate::context::messaging_helpers::send_heartbeat),
+/// which routes an EMPTY-payload [`MessageType::Heartbeat`](scp_protocol::envelope::inner::MessageType::Heartbeat)
+/// envelope through the regular encrypt-and-send path. The caller (the
+/// bridge/SDK subscribe-path scheduler) supplies `sender_did` + `signing_key`
+/// per-call — the signing key is not actor-owned state. Routing the send
+/// through the actor serializes it with the context's other sends.
+///
+/// Synchronous (the send body has no awaits); no `tokio::time::timeout`
+/// wrapper required. Forwards the `send_heartbeat` result verbatim:
+/// `Ok(())` on success, or the transport error if every fan-out send fails.
+/// The send does not mutate per-context state (it uses sequence `0` and
+/// touches no counters), so this reports [`Outcome::ok`] / [`Outcome::err`].
+fn handle_send_heartbeat(
+    state: &PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    sender_did: &scp_identity::DID,
+    signing_key: &crate::context::actor::commands::SigningKeyBytes,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let sk = signing_key.to_signing_key();
+    let result =
+        crate::context::messaging_helpers::send_heartbeat(deps, state, context_id, sender_did, &sk);
+    match result {
+        Ok(()) => {
+            let _ = reply.send(Ok(()));
+            Outcome::ok(())
+        }
+        Err(e) => {
+            let sketch = outcome_error_sketch(&e);
+            let _ = reply.send(Err(e));
+            Outcome::err(sketch)
+        }
     }
 }
 

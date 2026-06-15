@@ -176,6 +176,15 @@ pub mod discovery;
 #[cfg(feature = "resolvers")]
 pub mod reconnect;
 
+// Shared periodic suppression-detection heartbeat scheduler (§9.9.2). Spawned
+// alongside the relay subscribe loop at the FFI/SDK boundary, where the signing
+// key lives; routes sends through Supervisor::send_heartbeat. Same layer and
+// rationale as the reconnection driver. Requires scp-core + scp-transport +
+// ed25519-dalek (behind `resolvers`). WASM has no native subscribe/custody loop
+// (ADR-034).
+#[cfg(feature = "resolvers")]
+pub mod heartbeat_scheduler;
+
 // Shared petname/handle/address-resolution helpers (behind the `resolvers` feature).
 // WASM reimplements PetnameMap locally per ADR-034, so these are not available there.
 #[cfg(feature = "resolvers")]

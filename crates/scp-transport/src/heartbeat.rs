@@ -103,6 +103,33 @@ impl HeartbeatConfig {
     pub fn suppression_threshold(&self) -> Duration {
         self.interval.mul_f64(self.suppression_threshold_multiplier)
     }
+
+    /// Returns the per-profile heartbeat config (§9.9.2, §10.13), or `None`
+    /// when the profile disables heartbeats.
+    ///
+    /// Single source of truth for both the receive-side gap monitor
+    /// ([`NativeRelayAdapter`](crate::native::NativeRelayAdapter) connection
+    /// path) and the send-side periodic scheduler (the FFI/SDK subscribe
+    /// loop): both derive their interval here so a send cadence can never
+    /// drift out of step with the threshold a peer's monitor expects.
+    ///
+    /// - **Server / Desktop**: 60s (default) — always-on, latency-sensitive.
+    /// - **Mobile**: 120s — reduced frequency to conserve battery (§10.13.1).
+    /// - **Constrained**: `None` — poll-based devices send/monitor no
+    ///   heartbeats.
+    #[must_use]
+    pub fn for_profile(profile: crate::profile::TransportProfile) -> Option<Self> {
+        use crate::profile::TransportProfile;
+        let config = match profile {
+            TransportProfile::Server | TransportProfile::Desktop => Self::default(),
+            TransportProfile::Mobile => Self {
+                interval: Duration::from_mins(2),
+                ..Self::default()
+            },
+            TransportProfile::Constrained => return None,
+        };
+        if config.enabled { Some(config) } else { None }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -75,6 +75,19 @@ pub enum MessageType {
     /// the content sequence tracker, so a checkpoint never advances the
     /// per-sender application sequence.
     ConsistencyCheckpoint,
+
+    /// Suppression-detection heartbeat message (§9.9.2).
+    ///
+    /// A heartbeat is a minimal MLS application message with no user content
+    /// (empty payload). In active contexts the SDK periodically sends a
+    /// heartbeat so that peers can detect relay suppression: if heartbeats
+    /// stop arriving from a recently-active participant, suppression is
+    /// suspected. The receive path classifies a heartbeat on this
+    /// discriminator BEFORE the content sequence tracker, so a heartbeat
+    /// never advances the per-sender application sequence and is never
+    /// surfaced to the application layer as content. The arriving heartbeat
+    /// feeds the transport-layer `HeartbeatMonitor` gap-detection baseline.
+    Heartbeat,
 }
 
 impl MessageType {
@@ -87,6 +100,7 @@ impl MessageType {
             Self::KeyDistribution => 2,
             Self::Recovery => 3,
             Self::ConsistencyCheckpoint => 4,
+            Self::Heartbeat => 5,
         }
     }
 }

@@ -51,12 +51,20 @@ use scp_protocol::context::ContextError;
 /// `clippy::type_complexity`.
 type BroadcastKeyReply = oneshot::Sender<Result<(zeroize::Zeroizing<[u8; 32]>, u64), ContextError>>;
 
+/// Re-export of the receive-path outcome classifier so FFI bridges can name
+/// the [`DeliverIncomingReply`] payload type via
+/// `scp_core::context::actor::commands::DeliverOutcome`.
+pub use crate::context::messaging_helpers::DeliverOutcome;
+
 /// Reply-channel type alias for
-/// [`MessagingCommand::DeliverIncoming`]. The reply carries either
-/// `Some((plaintext, sender_did))` for application messages, or `None`
-/// for MLS control / management messages that were processed
-/// internally. Factored out to satisfy `clippy::type_complexity`.
-pub type DeliverIncomingReply = oneshot::Sender<Result<Option<(Vec<u8>, String)>, ContextError>>;
+/// [`MessagingCommand::DeliverIncoming`]. The reply carries a
+/// [`DeliverOutcome`] classifying the message: [`DeliverOutcome::Application`]
+/// `(plaintext, sender_did)` for user content, [`DeliverOutcome::Heartbeat`]
+/// for a §9.9.2 suppression-detection heartbeat (the bridge records it against
+/// the transport monitor), or [`DeliverOutcome::Handled`] for MLS control /
+/// management messages processed internally. Factored out to satisfy
+/// `clippy::type_complexity`.
+pub type DeliverIncomingReply = oneshot::Sender<Result<DeliverOutcome, ContextError>>;
 
 /// Reply-channel type alias for [`MessagingCommand::DrainEvents`]. The
 /// reply carries the drained `ContextEvent` vector — empty iff the
@@ -206,21 +214,25 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
-    /// Decrypts an incoming envelope from the relay and delivers the
-    /// plaintext + sender DID (or records a control-message side effect
-    /// and returns `None`).
+    /// Decrypts an incoming envelope from the relay and classifies it as
+    /// application content, a §9.9.2 heartbeat, or an internally-handled
+    /// management message.
     ///
     /// Mirrors the legacy
     /// [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
-    /// signature. Used by every FFI bridge's relay subscription loop;
-    /// the return type matches the bridge's per-event dispatch pattern.
+    /// signature. Used by the relay subscription loop; the return type
+    /// matches the bridge's per-event dispatch pattern.
     ///
     /// # Reply
     ///
-    /// `Ok(Some((plaintext, sender_did)))` — application message; caller
-    /// should forward to the language binding's receive channel.
-    /// `Ok(None)` — MLS Commit / Proposal / management message; processed
-    /// internally, no plaintext to surface.
+    /// `Ok(DeliverOutcome::Application((plaintext, sender_did)))` — application
+    /// message; caller should forward to the language binding's receive channel.
+    /// `Ok(DeliverOutcome::Heartbeat)` — §9.9.2 suppression-detection
+    /// heartbeat; caller records it against the transport-layer monitor
+    /// (`record_heartbeat_received`) and surfaces nothing to the application.
+    /// `Ok(DeliverOutcome::Handled)` — MLS Commit / Proposal / checkpoint /
+    /// announcement / buffered out-of-order message; processed internally, no
+    /// plaintext to surface.
     /// `Err(..)` — decryption, signature verification, anti-replay, or
     /// access-key unwrap failure.
     DeliverIncoming {
@@ -412,6 +424,38 @@ pub enum MessagingCommand {
         remote: Box<scp_event_log::checkpoint::ConsistencyCheckpoint>,
         /// Oneshot reply channel carrying the comparison result.
         reply: CompareRemoteCheckpointReply,
+    },
+
+    /// Send a suppression-detection heartbeat (§9.9.2) to context peers.
+    ///
+    /// Delegates to
+    /// [`send_heartbeat`](crate::context::messaging_helpers::send_heartbeat),
+    /// which routes an EMPTY-payload [`MessageType::Heartbeat`](scp_protocol::envelope::inner::MessageType::Heartbeat)
+    /// envelope through the regular encrypt-and-send path. Driven by the
+    /// bridge/SDK subscribe-path scheduler (the §9.9.2 "the SDK sends
+    /// heartbeats" boundary): the caller supplies `sender_did` + `signing_key`
+    /// per-call exactly like [`SendMessage`](Self::SendMessage) and
+    /// [`BuildLocalCheckpoint`](Self::BuildLocalCheckpoint), because the
+    /// signing key is NOT actor-owned state — it lives at the FFI boundary.
+    /// Routing the send through the actor serializes it with the context's
+    /// other sends.
+    ///
+    /// Best-effort: replies `Ok(())` on success or the transport error if every
+    /// fan-out send fails. The bridge scheduler logs failures but never tears
+    /// down the subscription (a missed heartbeat is itself a suppression
+    /// signal, surfaced by the receiver's gap detection).
+    SendHeartbeat {
+        /// Context identifier.
+        context_id: String,
+        /// Heartbeat author DID (a locally-controlled member).
+        sender_did: scp_identity::DID,
+        /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
+        /// the private key zeroes on drop (mirrors the
+        /// [`SendMessagePayload`] pattern).
+        signing_key: SigningKeyBytes,
+        /// Oneshot reply channel. `Ok(())` on success; transport error if
+        /// every fan-out send fails.
+        reply: oneshot::Sender<Result<(), ContextError>>,
     },
 }
 

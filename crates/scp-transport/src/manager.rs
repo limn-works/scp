@@ -765,6 +765,29 @@ impl TransportManager {
         first_error.map_or(Ok(()), Err)
     }
 
+    /// Records that a suppression-detection heartbeat (§9.9.2) was received
+    /// from a peer, refreshing every registered adapter's
+    /// [`HeartbeatMonitor`](crate::heartbeat::HeartbeatMonitor) gap-detection
+    /// baseline.
+    ///
+    /// Called by the relay subscription loop when an inbound envelope decrypts
+    /// to a heartbeat. The merged subscription stream does not attribute a
+    /// received blob to a specific relay, and the security semantics do not
+    /// require it: a heartbeat arriving from a context peer is evidence that
+    /// *some* relay in the active set is delivering, so every monitor's
+    /// "messages are arriving" baseline is refreshed — exactly the
+    /// fan-out-to-all-adapters shape of [`unsubscribe`](Self::unsubscribe) and
+    /// [`delete`](Self::delete). Per-relay suppression attribution remains the
+    /// `MergedStream` multi-relay cross-check's job (§9.9.2), which is
+    /// independent of this liveness baseline. Adapters without an active
+    /// monitor no-op (the trait default), so this is safe to call
+    /// unconditionally. A no-op when no adapters are registered.
+    pub async fn record_heartbeat_received(&self) {
+        for adapter in &self.adapters {
+            adapter.record_heartbeat_received().await;
+        }
+    }
+
     /// Assigns a relay set for a context.
     ///
     /// Selects at least [`TransportProfile::min_relays`] adapters per context
