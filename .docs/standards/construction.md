@@ -47,7 +47,7 @@ A boolean parameter that selects between two named behaviors is a misuse-magnet:
 
 | Replace | With enum |
 |---|---|
-| `plaintext: bool` (site TLS) | `tls: TlsMode { SelfSigned, Acme { email: Option<String> }, Plaintext, Terminated }` |
+| `plaintext: bool` (site TLS) | `tls: TlsMode { SelfSigned, Acme { email: Option<String> }, Plaintext, Terminated, Custom(Arc<dyn TlsProvider>) }` (the `Custom` slot is a **Rust-core-only** capability slot — like `NatSlot::Custom` — for injecting a caller-supplied `TlsProvider`; `TlsProvider` is object-safe, unlike the RPITIT provider traits, so it does not violate the no-`dyn` rule below; the per-FFI `TlsMode` mirror **omits** `Custom`) |
 | `skip_nat: bool` + addressing flags | `reach: Reach { Domain{…}, NatTraversal, Tunnel{…}, Local }` |
 | `supports_bridge: bool` (relay) | `bridge: BridgeRole { Disabled, Enabled }` (`Default = Disabled`) |
 | `in_memory: bool` (DHT publish) | `dht: DhtMode { Memory, Production{…} }` |

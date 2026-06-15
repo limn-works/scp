@@ -97,19 +97,26 @@ struct ErrorResponse {
 
 /// Configuration for deferred [`ScpDnsProvider`] construction.
 ///
-/// The builder stores this config and creates the actual [`ScpDnsProvider`]
-/// during `build()` after the DID is resolved. This solves the chicken-and-egg
-/// problem: the DNS provider needs the DID to derive the subdomain, but the
-/// DID is not known until identity resolution completes.
+/// [`NodeConfig::dns_provider`](crate::NodeConfig::dns_provider) carries this
+/// config and the build engine creates the actual [`ScpDnsProvider`] during
+/// [`Node::start`](crate::Node::start) after the DID is resolved. This solves
+/// the chicken-and-egg problem: the DNS provider needs the DID to derive the
+/// subdomain, but the DID is not known until identity resolution completes.
 ///
 /// # Usage
 ///
 /// ```ignore
 /// let config = DnsProviderConfig::new(public_ip, 8443);
-/// let builder = ApplicationNodeBuilder::new()
-///     .domain("placeholder.scp.ctx.network") // overridden during build
-///     .dns_provider(config)
-///     .generate_identity_with(custody, did_method);
+/// let node = Node::start(NodeConfig {
+///     dns_provider: Some(config),
+///     dht: DhtMode::Production,
+///     ..NodeConfig::defaults(
+///         Reach::Domain { domain: "placeholder.scp.ctx.network".to_owned() },
+///         IdentitySource::Generate { custody, did_method },
+///         storage,
+///     )
+/// })
+/// .await?;
 /// ```
 #[derive(Debug, Clone)]
 pub struct DnsProviderConfig {

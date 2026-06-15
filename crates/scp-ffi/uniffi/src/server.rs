@@ -695,7 +695,7 @@ fn build_node_identity_from_uniffi(_id: &Identity) -> Result<server::NodeIdentit
     Err(ScpError::Identity {
         msg: "node identity portability requires the \"allow_in_memory_custody\" \
               feature — production mobile builds should use platform custody \
-              with identity_with_storage on ApplicationNodeBuilder directly"
+              with IdentitySource::Persisted on NodeConfig directly"
             .to_owned(),
         code: codes::IDENT_1013.to_owned(),
     })

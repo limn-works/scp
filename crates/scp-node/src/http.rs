@@ -81,12 +81,12 @@ pub struct NodeState {
     pub(crate) bridge_secret: Zeroizing<[u8; 32]>,
     /// Bearer token for the dev API (`scp_local_token_<32 hex chars>`).
     ///
-    /// `Some` when `local_api()` was called on the builder, `None` otherwise.
+    /// `Some` when `NodeConfig::local_api` was set, `None` otherwise.
     /// See spec section 18.10.2.
     pub(crate) dev_token: Option<String>,
     /// Bind address for the dev API server.
     ///
-    /// `Some` when `local_api()` was called on the builder, `None` otherwise.
+    /// `Some` when `NodeConfig::local_api` was set, `None` otherwise.
     /// See spec section 18.10.2.
     pub(crate) dev_bind_addr: Option<SocketAddr>,
     /// Registry of broadcast contexts whose messages are projected (decrypted
@@ -153,7 +153,7 @@ pub struct NodeState {
     /// When `None` (no-domain mode or explicit opt-out), the listener serves
     /// plain HTTP/WS (spec section 10.12.8).
     ///
-    /// Built from [`tls::CertificateData`] during [`ApplicationNodeBuilder::build`]
+    /// Built from [`tls::CertificateData`] during [`Node::start`](crate::Node::start)
     /// via [`tls::build_reloadable_tls_config`] (spec section 18.6.3).
     pub(crate) tls_config: Option<Arc<rustls::ServerConfig>>,
     /// The TLS certificate resolver for ACME hot-reload.
@@ -583,8 +583,8 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 
     /// Returns the dev API router if the dev API is enabled.
     ///
-    /// Returns `Some(Router)` when `ApplicationNodeBuilder::local_api` was
-    /// called (i.e., a dev token was generated), `None` otherwise. The
+    /// Returns `Some(Router)` when `NodeConfig::local_api` was set (i.e., a
+    /// dev token was generated), `None` otherwise. The
     /// returned router includes all `/scp/dev/v1/*` routes with bearer token
     /// middleware applied.
     ///
@@ -611,7 +611,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// ## TLS termination
     ///
     /// When a TLS configuration was provisioned during
-    /// `ApplicationNodeBuilder::build` (domain mode with successful ACME or
+    /// `Node::start` (domain mode with successful ACME or
     /// injected TLS provider), `serve()` terminates TLS using
     /// [`tokio_rustls::TlsAcceptor`] and serves HTTPS/WSS. When no TLS
     /// configuration is present (no-domain mode, or TLS provisioning opted
@@ -619,7 +619,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     ///
     /// ## Dev API
     ///
-    /// When the dev API is configured (via `ApplicationNodeBuilder::local_api`),
+    /// When the dev API is configured (via `NodeConfig::local_api`),
     /// a separate tokio task is spawned to serve the dev API on the configured
     /// address. The dev API listener runs concurrently with the public
     /// listener. When the dev API is not configured, `serve()` behaves exactly
@@ -629,7 +629,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// ## HTTP/3
     ///
     /// When the `http3` feature is enabled and an `Http3Config` is provided
-    /// via `ApplicationNodeBuilder::http3`, an HTTP/3 listener is started
+    /// via `NodeConfig::http3`, an HTTP/3 listener is started
     /// on a separate QUIC endpoint. All HTTP/1.1 and HTTP/2 responses include
     /// an `Alt-Svc` header advertising the HTTP/3 endpoint (spec section
     /// 10.15.1).

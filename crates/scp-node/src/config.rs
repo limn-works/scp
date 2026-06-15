@@ -4,34 +4,39 @@
 //! B-P1) for the Node entry point. It introduces a single flat config object
 //! ([`NodeConfig`]) plus a single zero-sized entry-point namespace ([`Node`])
 //! exposing [`Node::start`] / [`Node::start_for_testing`], replacing the
-//! LLM-hostile typestate builder surface with a shape an agent can author in
+//! LLM-hostile builder-based surface with a shape an agent can author in
 //! one pass from the type signature plus one example.
 //!
 //! See `.docs/standards/construction.md` (the enforced enactment of the
 //! Agent-first API design builder tenet) and ADR-052 in
 //! `.docs/adrs/phase-2.md`.
 //!
-//! ## Additive lowering
+//! ## The build engine
 //!
-//! Phase B-P1 is **additive**: [`Node::start`] lowers a [`NodeConfig`] onto the
-//! existing [`ApplicationNodeBuilder`]. The typestate kernel and every existing
-//! call site are untouched; this surface is the new front door that delegates to
-//! the old machinery. Later phases migrate call sites and then delete the
-//! typestate kernel (ADR-052 AC-3).
+//! [`Node::start`] / [`Node::start_for_testing`] are the sole front door for
+//! node construction. The build orchestration that formerly lived on the
+//! deleted builder (ADR-052 P3a) lives here as
+//! the engine over a flat [`NodeConfig`]: validate the config, resolve the
+//! identity and TLS/NAT capability slots, then run the domain-vs-no-domain
+//! build path (ADR-052 AC-3).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use scp_core::store::ProtocolRepository;
 use scp_identity::document::DidDocument;
 use scp_identity::{DidMethod, ScpIdentity};
 use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::NetworkChangeDetector;
+use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
 
 use crate::{
-    ApplicationNode, ApplicationNodeBuilder, DhtMode, NatStrategy, NoOpCustody, NoOpDidMethod,
-    NoOpStorage, NodeError, TlsProvider,
+    ApplicationNode, DEFAULT_HTTP_BIND_ADDR, DEFAULT_PROJECTION_RATE_LIMIT, DhtMode, NatStrategy,
+    NoOpCustody, NoOpDidMethod, NoOpStorage, NodeError, TlsProvider, build_domain_inner,
+    build_no_domain_inner, generate_bridge_secret, generate_dev_token,
+    provision_with_challenge_listener, resolve_identity_persistent, resolve_nat, resolve_tls,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,9 +47,9 @@ use crate::{
 ///
 /// All node construction flows through [`Node::start`] (production,
 /// `where S: EncryptedStorage`) or [`Node::start_for_testing`] (feature-gated,
-/// any `Storage`). There is no `NodeBuilder`, no typestate, no `.build()`
-/// terminator — the construction surface is one flat [`NodeConfig`] plus one
-/// entry function.
+/// any `Storage`). There is no `NodeBuilder`, no phantom-state generics, no
+/// `.build()` terminator — the construction surface is one flat [`NodeConfig`]
+/// plus one entry function.
 pub struct Node;
 
 // ---------------------------------------------------------------------------
@@ -103,13 +108,13 @@ pub struct ExplicitIdentity<D: DidMethod> {
 }
 
 // ---------------------------------------------------------------------------
-// Reach — the addressing XOR (M1 enum, replaces typestate + skip_nat bool)
+// Reach — the addressing XOR (M1 enum, replaces phantom-state markers + skip_nat bool)
 // ---------------------------------------------------------------------------
 
 /// How the node is reached from the outside — the addressing choice, as one
 /// required field (ADR-052 M1).
 ///
-/// `Reach` folds the former `HasDomain` / `HasNoDomain` typestate markers and
+/// `Reach` folds the former domain / no-domain phantom-state markers and
 /// the `skip_nat_probe` boolean into a single legible enum.
 #[derive(Debug, Clone)]
 pub enum Reach {
@@ -142,14 +147,21 @@ pub enum Reach {
 
 /// How the node provisions TLS for its public listener (ADR-052 M1).
 ///
-/// `TlsMode` is a **closed** selector: it exposes a fixed set of provisioning
-/// strategies and has no variant for injecting an arbitrary
-/// `Arc<dyn TlsProvider>`. This asymmetry with [`NatSlot`] — which intentionally
-/// offers a [`Custom`](NatSlot::Custom) open slot — is deliberate, per
-/// construction.md's "providers stay typed enum-selectors, never `dyn`" rule:
-/// TLS provisioning is fully covered by the variants below, so the type itself
-/// signals that callers select a strategy rather than supply their own.
-#[derive(Debug, Clone)]
+/// `TlsMode` exposes a fixed set of named provisioning strategies plus a single
+/// open [`Custom`](TlsMode::Custom) capability slot, exactly mirroring the
+/// [`NatSlot`] shape. The named variants cover every production provisioning
+/// strategy; `Custom` is the typed slot for a caller-supplied
+/// `Arc<dyn TlsProvider>` (testing and advanced wiring — e.g. exercising the
+/// §10.12.8 TLS-failure → NAT-fallthrough path with a deterministically failing
+/// provider). `TlsProvider` is object-safe (the engine already threads
+/// `Option<Arc<dyn TlsProvider>>` through `resolve_tls`), so the slot does not
+/// violate the "no `dyn` for Storage/KeyCustody/DidMethod" rule — those traits
+/// are RPITIT and genuinely not object-safe, `TlsProvider` is not.
+///
+/// `Custom` is **Rust-core-only**: the per-FFI-bridge `TlsMode` mirror omits it,
+/// because a Rust trait object cannot cross the FFI boundary (the same
+/// asymmetry as `StorageSlot::Custom` / `NatSlot::Custom`).
+#[derive(Clone)]
 pub enum TlsMode {
     /// Generate and serve a self-signed certificate for the reach's domain.
     /// This is the fail-safe production default for [`NodeConfig`] — no network,
@@ -170,6 +182,14 @@ pub enum TlsMode {
     /// TLS is terminated upstream (a tunnel or reverse proxy). The node does no
     /// TLS provisioning of its own.
     Terminated,
+    /// Use a caller-supplied [`TlsProvider`] (the open capability slot).
+    ///
+    /// The provided provider is passed as the `resolve_tls` override, so it is
+    /// used in place of the default ACME/self-signed provisioning. This is the
+    /// only way to inject a deterministic TLS provider (e.g. one that always
+    /// fails, to exercise the §10.12.8 TLS-failure → NAT-fallthrough branch on a
+    /// `Domain` reach). Rust-core-only; the FFI `TlsMode` mirror omits it.
+    Custom(Arc<dyn TlsProvider>),
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +268,8 @@ pub enum NatSlot {
 /// }).await?;
 /// ```
 ///
-/// The `<K, D, S>` generics survive from the former typestate builder, carried
-/// by the config and its selectors; the `Dom`/`Id` typestate markers are gone.
+/// The `<K, D, S>` generics survive from the former builder, carried
+/// by the config and its selectors; the `Dom`/`Id` phantom-state markers are gone.
 pub struct NodeConfig<
     K: KeyCustody = NoOpCustody,
     D: DidMethod = NoOpDidMethod,
@@ -383,7 +403,7 @@ impl TlsProvider for SelfSignedTlsProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Lowering: NodeConfig -> ApplicationNodeBuilder
+// Build engine: NodeConfig -> ApplicationNode
 // ---------------------------------------------------------------------------
 
 /// The portion of a [`NodeConfig`] that is **not** identity or storage — the
@@ -543,169 +563,97 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
     (storage, identity, tail)
 }
 
-/// Applies the [`NatSlot`] to a builder, lowering each tuning override onto the
-/// matching builder setter.
-fn apply_nat<K, D, S, Dom, Id>(
-    builder: ApplicationNodeBuilder<K, D, S, Dom, Id>,
-    nat: NatSlot,
-) -> ApplicationNodeBuilder<K, D, S, Dom, Id>
-where
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
-    S: Storage + 'static,
-{
+/// Resolves a [`NatSlot`] into the concrete `Arc<dyn NatStrategy>` the engine
+/// uses, lowering each `Tuned` override onto [`resolve_nat`].
+///
+/// - `Auto` constructs the default strategy (no overrides).
+/// - `Custom(strategy)` uses the caller-supplied strategy verbatim.
+/// - `Tuned { .. }` feeds the STUN / bridge / port-mapper / reachability-probe
+///   overrides into [`resolve_nat`], which builds a `DefaultNatStrategy`.
+fn resolve_nat_slot(nat: NatSlot) -> Arc<dyn NatStrategy> {
     match nat {
-        // Auto: no setters; the builder constructs DefaultNatStrategy internally.
-        NatSlot::Auto => builder,
-        NatSlot::Custom(strategy) => builder.nat_strategy(strategy),
+        NatSlot::Auto => resolve_nat(None, None, None, None, None),
+        NatSlot::Custom(strategy) => resolve_nat(Some(strategy), None, None, None, None),
         NatSlot::Tuned {
             stun_server,
             bridge_relay,
             port_mapper,
             reachability_probe,
-        } => {
-            let mut b = builder;
-            if let Some(s) = stun_server {
-                b = b.stun_server(&s);
-            }
-            if let Some(s) = bridge_relay {
-                b = b.bridge_relay(&s);
-            }
-            if let Some(pm) = port_mapper {
-                b = b.port_mapper(pm);
-            }
-            if let Some(rp) = reachability_probe {
-                b = b.reachability_probe(rp);
-            }
-            b
-        }
+        } => resolve_nat(
+            None,
+            stun_server,
+            bridge_relay,
+            port_mapper,
+            reachability_probe,
+        ),
     }
 }
 
-/// Applies the [`TlsMode`] to a builder.
+/// Resolves a [`TlsMode`] into the optional `Arc<dyn TlsProvider>` override the
+/// engine passes to [`resolve_tls`]. `None` means "no override" — the engine's
+/// default ACME/self-signed provisioning applies.
 ///
-/// - `SelfSigned` installs a [`SelfSignedTlsProvider`] on a `Domain` reach
+/// - `SelfSigned` on a `Domain` reach installs a [`SelfSignedTlsProvider`]
 ///   (non-domain builds skip TLS provisioning entirely — no domain to sign for).
-/// - `Acme` sets the ACME contact email (only ever reaches here on a `Domain`
-///   reach — `validate_config` already rejected `Acme` on every non-`Domain`
-///   reach).
+/// - `Acme` returns `None`: the engine's default `resolve_tls` constructs the
+///   `AcmeProvider` for the domain (only ever reached on a `Domain` reach —
+///   `validate_config` already rejected `Acme` on every non-`Domain` reach). The
+///   ACME contact email is threaded separately via the engine's `acme_email`.
 /// - `Terminated` (TLS terminated upstream by a tunnel/reverse proxy) on a
 ///   `Domain` reach installs the **no-network** [`SelfSignedTlsProvider`]: the
 ///   node still terminates a local TLS connection from the upstream proxy, so it
 ///   needs a local cert, but it must NOT run ACME. **This is load-bearing:** the
-///   legacy domain build defaults a missing `tls_provider` to a real
-///   `AcmeProvider` (binds :80, contacts Let's Encrypt). Leaving `Terminated` a
-///   no-op here would silently attempt ACME on a `Terminated` domain node — the
-///   exact silent-wrong-default the construction standard forbids. The upstream
-///   proxy presents the real CA certificate to the public; the node-side
-///   self-signed cert only secures the proxy↔node hop.
+///   engine's default domain provisioning is a real `AcmeProvider` (binds :80,
+///   contacts Let's Encrypt). Returning `None` for `Terminated` would silently
+///   attempt ACME on a `Terminated` domain node — the exact silent-wrong-default
+///   the construction standard forbids. The upstream proxy presents the real CA
+///   certificate to the public; the node-side self-signed cert only secures the
+///   proxy↔node hop.
 /// - `Plaintext` is only valid on a non-`Domain` reach (`validate_config` already
-///   rejected `Domain` + `Plaintext`); no-domain mode skips TLS, so it is a
-///   no-op. On a non-`Domain` reach, `Terminated` is likewise a no-op (the
-///   loopback listener is plaintext; the proxy adds TLS).
-fn apply_tls<K, D, S, Dom, Id>(
-    builder: ApplicationNodeBuilder<K, D, S, Dom, Id>,
-    tls: TlsMode,
-    reach: &Reach,
-) -> ApplicationNodeBuilder<K, D, S, Dom, Id>
-where
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
-    S: Storage + 'static,
-{
+///   rejected `Domain` + `Plaintext`); no-domain mode skips TLS, so it returns
+///   `None` (no-op). On a non-`Domain` reach, `Terminated` is likewise `None`
+///   (the loopback listener is plaintext; the proxy adds TLS).
+/// - `Custom(provider)` returns the caller-supplied provider verbatim (the open
+///   capability slot — used to inject a deterministic provider, e.g. a failing
+///   one to exercise the §10.12.8 TLS-failure → NAT-fallthrough branch).
+fn tls_override(tls: TlsMode, reach: &Reach) -> Option<Arc<dyn TlsProvider>> {
     match tls {
         TlsMode::SelfSigned => {
             if let Reach::Domain { domain } = reach {
-                builder.tls_provider(Arc::new(SelfSignedTlsProvider {
+                Some(Arc::new(SelfSignedTlsProvider {
                     domain: domain.clone(),
                 }))
             } else {
-                // Non-domain reach: no domain TLS to provision; self-signed is a no-op.
-                builder
+                // Non-domain reach: no domain TLS to provision; self-signed no-op.
+                None
             }
         }
-        TlsMode::Acme { email } => match email {
-            // `Some(e)` registers the ACME account with contact email `e`.
-            Some(e) => builder.acme_email(&e),
-            // `None` applies no email setter: the builder's domain `build()`
-            // falls through to the default `AcmeProvider::new(domain)` with no
-            // contact email — the legacy headless-ACME default, reproduced
-            // exactly.
-            None => builder,
-        },
+        // `Acme` and `Plaintext` both return no override, for distinct reasons:
+        //   - `Acme`: the engine's `resolve_tls` constructs the default
+        //     `AcmeProvider::new(domain)` and threads `acme_email` itself
+        //     (only ever reached on a `Domain` reach — `validate_config` rejects
+        //     `Acme` on every non-`Domain` reach).
+        //   - `Plaintext`: only valid on a non-`Domain` reach (Domain+Plaintext
+        //     errored already); no-domain mode skips TLS, so it is a no-op.
+        TlsMode::Acme { .. } | TlsMode::Plaintext => None,
         TlsMode::Terminated => {
             if let Reach::Domain { domain } = reach {
                 // Domain + Terminated: install a no-network self-signed provider
                 // so the node terminates the proxy↔node hop locally and does NOT
-                // fall through to the builder's default AcmeProvider. The public
+                // fall through to the engine's default AcmeProvider. The public
                 // CA cert lives at the upstream proxy.
-                builder.tls_provider(Arc::new(SelfSignedTlsProvider {
+                Some(Arc::new(SelfSignedTlsProvider {
                     domain: domain.clone(),
                 }))
             } else {
                 // Non-domain reach: loopback listener is plaintext; proxy adds
                 // TLS. No node-side provisioning — a no-op.
-                builder
+                None
             }
         }
-        // Plaintext: only valid on a non-domain reach (Domain+Plaintext errored
-        // already); no-domain mode skips TLS, so this is a no-op.
-        TlsMode::Plaintext => builder,
+        // Custom: the caller-supplied provider is used verbatim as the override.
+        TlsMode::Custom(provider) => Some(provider),
     }
-}
-
-/// Applies the config tail (optionals + nat + tls + reach addressing) to a
-/// builder that already has storage and identity set, applying the optional
-/// setters, NAT slot, and TLS mode — but **not** the reach addressing (which
-/// changes the `Dom` typestate and so is applied by the caller's finisher).
-///
-/// Returns the builder still in `NoDomain` state, ready for addressing. Generic
-/// over the builder's `K`/`D` so all three identity arms reuse it.
-fn apply_tail<K, D, S>(
-    builder: ApplicationNodeBuilder<K, D, S, crate::NoDomain, crate::HasIdentity>,
-    tail: ConfigTail,
-) -> ApplicationNodeBuilder<K, D, S, crate::NoDomain, crate::HasIdentity>
-where
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
-    S: Storage + 'static,
-{
-    // Apply the &mut-self-style optional setters first (they keep Dom generic).
-    let mut b = builder;
-    if let Some(addr) = tail.bind_addr {
-        b = b.bind_addr(addr);
-    }
-    if let Some(addr) = tail.local_api {
-        b = b.local_api(addr);
-    }
-    if let Some(addr) = tail.http_bind_addr {
-        b = b.http_bind_addr(addr);
-    }
-    if let Some(origins) = tail.cors_origins {
-        b = b.cors_origins(origins);
-    }
-    if let Some(rate) = tail.projection_rate_limit {
-        b = b.projection_rate_limit(rate);
-    }
-    if let Some(cfg) = tail.dns_provider {
-        b = b.dns_provider(cfg);
-    }
-    if let Some(detector) = tail.network_detector {
-        b = b.network_detector(detector);
-    }
-    #[cfg(feature = "http3")]
-    if let Some(cfg) = tail.http3 {
-        b = b.http3(cfg);
-    }
-    // blob_storage: only override when Some, so None preserves the builder's
-    // `new()` default (`Some(BlobStorageBackend::default())`).
-    if let Some(blob) = tail.blob_storage {
-        b = b.blob_storage(blob);
-    }
-
-    // NatSlot lowering, then TlsMode lowering (both keep Dom = NoDomain).
-    let b = apply_nat(b, tail.nat);
-    apply_tls(b, tail.tls, &tail.reach)
 }
 
 /// Emits a one-time `tracing::warn!` noting that `Reach::Tunnel`'s `public_url`
@@ -713,7 +661,7 @@ where
 ///
 /// This makes the documented deferral observable instead of a silent drop
 /// (addresses the accepted-then-ignored misuse-resistance finding) WITHOUT
-/// inventing wiring. Called from both finishers' Tunnel arm.
+/// inventing wiring. Called from the engine's Tunnel arm.
 fn warn_tunnel_public_url_deferred(public_url: &str) {
     tracing::warn!(
         public_url,
@@ -723,94 +671,346 @@ fn warn_tunnel_public_url_deferred(public_url: &str) {
     );
 }
 
-/// Applies the optional tail, addresses the builder per the reach, and finishes
-/// with the production `build()` (`where S: EncryptedStorage`). The reach
-/// addressing yields either `HasDomain` or `HasNoDomain` — both have `build()`.
+/// The Node construction engine: orchestrates relay startup, TLS provisioning,
+/// and the domain-vs-no-domain build, given an already-constructed
+/// [`ProtocolRepository`] and a resolved identity.
 ///
-/// This and its testing twin [`finish_build_for_testing`] are the **one split
-/// no generic finisher can collapse** in this module: the reach `match` is
-/// byte-for-byte identical, but the terminal call differs by trait bound
-/// (`build()` requires `S: EncryptedStorage` — the production seal;
-/// `build_for_testing()` accepts any `S: Storage`). A single generic finisher
-/// cannot name both terminal methods, because a fn/closure has one fixed `S`
-/// bound. The *larger* duplication — the identity `match` that repeats across
-/// `Node::start` and `Node::start_for_testing` — is NOT hoisted into a shared
-/// inner either; see the comment block below this fn for why a generic finisher
-/// cannot absorb it.
-async fn finish_build<K, D, S>(
-    builder: ApplicationNodeBuilder<K, D, S, crate::NoDomain, crate::HasIdentity>,
+/// This is the real orchestration that formerly lived on the builder's
+/// `build_with_store` methods (one per domain state). It is ported verbatim here:
+/// the `Reach::Domain` arm reproduces the former domain build path (provision TLS,
+/// then either `build_domain_inner` on success or fall through to
+/// `build_no_domain_inner` on TLS failure — the §10.12.8 path), and the
+/// non-`Domain` arms reproduce the former no-domain build path (skip TLS entirely,
+/// go straight to `build_no_domain_inner`).
+///
+/// The only difference between [`Node::start`] (production) and
+/// [`Node::start_for_testing`] is the `ProtocolRepository` constructor each picks
+/// (`new` vs `new_for_testing`); both then call this one engine, so the
+/// orchestration is not duplicated across the two entry points.
+async fn build_node<D, S>(
+    protocol_repository: Arc<ProtocolRepository<S>>,
+    identity: ScpIdentity,
+    document: DidDocument,
+    did_method: Arc<D>,
     tail: ConfigTail,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
-    K: KeyCustody + 'static,
-    D: DidMethod + 'static,
-    S: EncryptedStorage + 'static,
-{
-    let reach = tail.reach.clone();
-    let b = apply_tail(builder, tail);
-    match reach {
-        Reach::Domain { domain } => b.domain(&domain).build().await,
-        Reach::NatTraversal => b.no_domain().build().await,
-        Reach::Tunnel { public_url } => {
-            warn_tunnel_public_url_deferred(&public_url);
-            b.no_domain().skip_nat_probe().build().await
-        }
-        Reach::Local => b.no_domain().skip_nat_probe().build().await,
-    }
-}
-
-/// Testing twin of [`finish_build`]: finishes with `build_for_testing()`
-/// (`where S: Storage`).
-#[cfg(any(test, feature = "allow_unencrypted_storage"))]
-async fn finish_build_for_testing<K, D, S>(
-    builder: ApplicationNodeBuilder<K, D, S, crate::NoDomain, crate::HasIdentity>,
-    tail: ConfigTail,
-) -> Result<ApplicationNode<S>, NodeError>
-where
-    K: KeyCustody + 'static,
     D: DidMethod + 'static,
     S: Storage + 'static,
 {
-    let reach = tail.reach.clone();
-    let b = apply_tail(builder, tail);
+    let ConfigTail {
+        reach,
+        tls,
+        bind_addr,
+        local_api,
+        http_bind_addr,
+        cors_origins,
+        projection_rate_limit,
+        dns_provider,
+        #[cfg(feature = "http3")]
+        http3,
+        nat,
+        network_detector,
+        blob_storage,
+    } = tail;
+
+    // The Reach selects the build path. `Domain` reproduces the former
+    // domain build_with_store (TLS-provisioning + fall-through); the other
+    // reaches reproduce the former no-domain build_with_store (no TLS).
     match reach {
-        Reach::Domain { domain } => b.domain(&domain).build_for_testing().await,
-        Reach::NatTraversal => b.no_domain().build_for_testing().await,
-        Reach::Tunnel { public_url } => {
-            warn_tunnel_public_url_deferred(&public_url);
-            b.no_domain().skip_nat_probe().build_for_testing().await
+        Reach::Domain { .. } => {
+            build_node_domain(
+                protocol_repository,
+                identity,
+                document,
+                did_method,
+                reach,
+                tls,
+                bind_addr,
+                local_api,
+                http_bind_addr,
+                cors_origins,
+                projection_rate_limit,
+                dns_provider,
+                #[cfg(feature = "http3")]
+                http3,
+                nat,
+                network_detector,
+                blob_storage,
+            )
+            .await
         }
-        Reach::Local => b.no_domain().skip_nat_probe().build_for_testing().await,
+        Reach::NatTraversal | Reach::Tunnel { .. } | Reach::Local => {
+            // skip_nat_probe is set for the tunnel/loopback reaches (Tunnel,
+            // Local); NatTraversal probes NAT. The Tunnel arm also emits the
+            // deferred-public_url warning.
+            let skip_nat_probe = match &reach {
+                Reach::NatTraversal => false,
+                Reach::Tunnel { public_url } => {
+                    warn_tunnel_public_url_deferred(public_url);
+                    true
+                }
+                Reach::Local => true,
+                Reach::Domain { .. } => unreachable!("guarded by the outer match"),
+            };
+            build_node_no_domain(
+                protocol_repository,
+                identity,
+                document,
+                did_method,
+                bind_addr,
+                local_api,
+                http_bind_addr,
+                cors_origins,
+                projection_rate_limit,
+                #[cfg(feature = "http3")]
+                http3,
+                nat,
+                network_detector,
+                blob_storage,
+                skip_nat_probe,
+            )
+            .await
+        }
     }
 }
 
-// Why the identity `match` is NOT hoisted into one shared inner across
-// `Node::start` / `Node::start_for_testing` (the dedup the reviewer asked us to
-// attempt). It is not reducible *via a generic finisher / closure*: two
-// independent type-system facts block that route.
-//
-//   1. The `Explicit` arm lowers via `base.identity(...)`, which yields a
-//      builder with `K = NoOpCustody`, while `Generate`/`Persisted` lower via
-//      `generate_identity_with` / `identity_with_storage`, yielding `K`. Three
-//      arms, two distinct `K`s — so the post-identity builder has no single
-//      type a generic finisher closure (one fixed `K`) could accept.
-//   2. The finisher's terminal call differs by `S` bound — `.build()` needs
-//      `S: EncryptedStorage` (the production seal), `.build_for_testing()`
-//      needs only `S: Storage`. A trait with a generic `call<K, S>` method
-//      could absorb (1), but its method signature fixes one `S` bound, so it
-//      cannot serve both terminals.
-//
-// Either alone might be worked around; together they require a generic-over-`K`
-// trait method whose `S` bound varies per impl — not expressible in Rust. So no
-// value-level finisher collapses it. A token-level `macro_rules!` *could* paste
-// the shared arm bodies (macros expand before type-checking, so they sidestep
-// both bounds), but we deliberately do NOT use one here: it would hide the
-// control flow and the per-terminal trait bounds behind an expansion, working
-// against this module's LLM-legibility goal. So the ~30-line identity `match`
-// stays explicitly duplicated, each arm handing its concrete builder straight
-// to its finisher. The reach lowering inside the finishers is the same split,
-// reducible only by the same macro route, and left explicit for the same reason
-// (see `finish_build`).
+/// Domain-reach engine path: ported verbatim from the former domain
+/// `build_with_store`. Provisions TLS; on success builds
+/// the domain node, on TLS failure falls through to the NAT-traversed no-domain
+/// build (§10.12.8).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+async fn build_node_domain<D, S>(
+    protocol_repository: Arc<ProtocolRepository<S>>,
+    identity: ScpIdentity,
+    document: DidDocument,
+    did_method: Arc<D>,
+    reach: Reach,
+    tls: TlsMode,
+    bind_addr: Option<SocketAddr>,
+    local_api: Option<SocketAddr>,
+    http_bind_addr_opt: Option<SocketAddr>,
+    cors_origins: Option<Vec<String>>,
+    projection_rate_limit_opt: Option<u32>,
+    dns_provider: Option<crate::dns_provider::DnsProviderConfig>,
+    #[cfg(feature = "http3")] http3: Option<scp_transport::http3::Http3Config>,
+    nat: NatSlot,
+    network_detector: Option<Arc<dyn NetworkChangeDetector>>,
+    blob_storage_opt: Option<BlobStorageBackend>,
+) -> Result<ApplicationNode<S>, NodeError>
+where
+    D: DidMethod + 'static,
+    S: Storage + 'static,
+{
+    let Reach::Domain { domain } = reach else {
+        unreachable!("build_node_domain is only called for Reach::Domain");
+    };
+    let mut domain = domain;
+
+    // The `TlsMode::Acme` contact email is threaded into `resolve_tls`; every
+    // other TlsMode returns its provider via `tls_override` (or `None`).
+    let acme_email = match &tls {
+        TlsMode::Acme { email } => email.clone(),
+        _ => None,
+    };
+    let tls_mode_override = tls_override(
+        tls,
+        &Reach::Domain {
+            domain: domain.clone(),
+        },
+    );
+
+    // If DNS provider config is set, derive the subdomain from the DID and
+    // create the ScpDnsProvider as the TLS provider (#642). This override takes
+    // precedence over the TlsMode-derived provider, matching the legacy builder
+    // (`tls_provider_override.or(self.tls_provider)`).
+    let tls_provider_override = if let Some(dns_config) = dns_provider {
+        let (provider, dns_domain) = dns_config.build(&identity.did);
+        tracing::info!(
+            did = %identity.did,
+            dns_domain = %dns_domain,
+            node_id = %provider.node_id(),
+            "using DNS subdomain provider for zero-config TLS"
+        );
+        domain = dns_domain;
+        Some(Arc::new(provider) as Arc<dyn TlsProvider>)
+    } else {
+        tls_mode_override
+    };
+
+    let bridge_secret = generate_bridge_secret();
+    let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+    let relay_config = RelayConfig {
+        bind_addr,
+        bridge_secret: Some(*bridge_secret),
+        ..RelayConfig::default()
+    };
+
+    let blob_storage = Arc::new(blob_storage_opt.unwrap_or_default());
+    let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
+    let connection_tracker = relay_server.connection_tracker();
+    let subscription_registry = relay_server.subscriptions();
+    // Shared PUBLISH rate limiter — the QUIC listener reuses it so PUBLISH
+    // budgets are enforced uniformly across WebSocket and QUIC (ADR-037 AC3).
+    #[cfg(feature = "quic")]
+    let publish_rate_limiter = relay_server.publish_rate_limiter();
+    let (shutdown_handle, bound_addr) = relay_server.start().await?;
+    let dev_token = local_api.map(generate_dev_token);
+    let http_bind_addr = http_bind_addr_opt.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
+
+    let tls_provider = resolve_tls(
+        tls_provider_override,
+        &domain,
+        &protocol_repository,
+        acme_email.as_ref(),
+    );
+
+    let (provision_result, acme_challenges) =
+        provision_with_challenge_listener(&*tls_provider).await?;
+    let rate_limit = projection_rate_limit_opt.unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT);
+
+    match provision_result {
+        Ok(cert_data) => {
+            build_domain_inner(
+                domain,
+                identity,
+                document,
+                did_method,
+                protocol_repository,
+                shutdown_handle,
+                bound_addr,
+                bridge_secret,
+                dev_token,
+                local_api,
+                blob_storage,
+                relay_config,
+                http_bind_addr,
+                cors_origins.clone(),
+                rate_limit,
+                cert_data,
+                connection_tracker.clone(),
+                subscription_registry.clone(),
+                #[cfg(feature = "quic")]
+                publish_rate_limiter.clone(),
+                acme_challenges,
+                #[cfg(feature = "http3")]
+                http3,
+            )
+            .await
+        }
+        Err(tls_err) => {
+            tracing::warn!(
+                domain = %domain, error = %tls_err,
+                "TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
+            );
+            let strategy = resolve_nat_slot(nat);
+            build_no_domain_inner(
+                identity,
+                document,
+                did_method,
+                protocol_repository,
+                shutdown_handle,
+                bound_addr,
+                strategy,
+                bridge_secret,
+                dev_token,
+                local_api,
+                blob_storage,
+                relay_config,
+                Some(http_bind_addr),
+                cors_origins,
+                rate_limit,
+                network_detector,
+                connection_tracker,
+                subscription_registry,
+                #[cfg(feature = "quic")]
+                publish_rate_limiter,
+                // The domain reach's TLS-failure fall-through always probes NAT
+                // (it is the §10.12.8 zero-config path), so it never skips the
+                // probe — matching the legacy `self.skip_nat_probe` which was
+                // `false` on every domain build.
+                false,
+            )
+            .await
+        }
+    }
+}
+
+/// No-domain-reach engine path: ported verbatim from the former no-domain
+/// `build_with_store`. Skips TLS provisioning entirely
+/// and builds the NAT-traversed / loopback node directly.
+#[allow(clippy::too_many_arguments)]
+async fn build_node_no_domain<D, S>(
+    protocol_repository: Arc<ProtocolRepository<S>>,
+    identity: ScpIdentity,
+    document: DidDocument,
+    did_method: Arc<D>,
+    bind_addr: Option<SocketAddr>,
+    local_api: Option<SocketAddr>,
+    http_bind_addr: Option<SocketAddr>,
+    cors_origins: Option<Vec<String>>,
+    projection_rate_limit_opt: Option<u32>,
+    #[cfg(feature = "http3")] _http3: Option<scp_transport::http3::Http3Config>,
+    nat: NatSlot,
+    network_detector: Option<Arc<dyn NetworkChangeDetector>>,
+    blob_storage_opt: Option<BlobStorageBackend>,
+    skip_nat_probe: bool,
+) -> Result<ApplicationNode<S>, NodeError>
+where
+    D: DidMethod + 'static,
+    S: Storage + 'static,
+{
+    // 3. Start relay server.
+    let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+    let bridge_secret = generate_bridge_secret();
+    let relay_config = RelayConfig {
+        bind_addr,
+        bridge_secret: Some(*bridge_secret),
+        ..RelayConfig::default()
+    };
+
+    let blob_storage = Arc::new(blob_storage_opt.unwrap_or_default());
+    let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
+    let connection_tracker = relay_server.connection_tracker();
+    let subscription_registry = relay_server.subscriptions();
+    // Shared PUBLISH rate limiter (unused in no-domain mode because QUIC is
+    // not served without TLS, but kept on NodeState for a uniform struct).
+    #[cfg(feature = "quic")]
+    let publish_rate_limiter = relay_server.publish_rate_limiter();
+    let (shutdown_handle, bound_addr) = relay_server.start().await?;
+
+    // 4. Generate dev API token if local_api was configured.
+    let dev_token = local_api.map(generate_dev_token);
+
+    // 5-8. Delegate to shared no-domain logic.
+    let strategy = resolve_nat_slot(nat);
+
+    build_no_domain_inner(
+        identity,
+        document,
+        did_method,
+        protocol_repository,
+        shutdown_handle,
+        bound_addr,
+        strategy,
+        bridge_secret,
+        dev_token,
+        local_api,
+        blob_storage,
+        relay_config,
+        http_bind_addr,
+        cors_origins,
+        projection_rate_limit_opt.unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
+        network_detector,
+        connection_tracker,
+        subscription_registry,
+        #[cfg(feature = "quic")]
+        publish_rate_limiter,
+        skip_nat_probe,
+    )
+    .await
+}
 
 impl Node {
     /// Constructs and starts an [`ApplicationNode`] from a [`NodeConfig`]
@@ -839,37 +1039,39 @@ impl Node {
         validate_config(&config.reach, &config.tls, config.dht)?;
         let (storage, identity, tail) = split_config(config);
 
-        // Storage first (requires NoOpStorage state), then identity (consuming
-        // custody/did_method), then the tail. Each identity arm yields a
-        // different concrete builder type (Explicit drops to NoOpCustody), so
-        // each flows through `finish_build` independently — the irreducible
-        // split documented on `finish_build`.
-        let base = ApplicationNodeBuilder::new().storage(storage);
-        match identity {
-            IdentitySource::Generate {
-                custody,
-                did_method,
-            } => {
-                let builder = base.generate_identity_with(custody, did_method);
-                finish_build(builder, tail).await
-            }
+        // Production constructor: `ProtocolRepository::new` (the only difference
+        // from `start_for_testing`). Identity is resolved against the storage,
+        // then the one shared engine orchestrates the build.
+        let protocol_repository = Arc::new(ProtocolRepository::new(storage));
+        // `Persisted` is the load-or-create-and-persist source. It normalizes to
+        // a `Generate` source with `persist = true` (exactly as the legacy
+        // builder's `identity_with_storage` did): `resolve_identity_persistent`
+        // checks storage first and only generates+persists on a cache miss.
+        // `Generate` / `Explicit` resolve with `persist = false`.
+        let (resolved_source, persist) = match identity {
             IdentitySource::Persisted {
                 custody,
                 did_method,
-            } => {
-                let builder = base.identity_with_storage(custody, did_method);
-                finish_build(builder, tail).await
-            }
-            IdentitySource::Explicit(e) => {
-                let ExplicitIdentity {
-                    identity,
-                    document,
+            } => (
+                IdentitySource::Generate {
+                    custody,
                     did_method,
-                } = *e;
-                let builder = base.identity(identity, document, did_method);
-                finish_build(builder, tail).await
-            }
-        }
+                },
+                true,
+            ),
+            other => (other, false),
+        };
+        let (scp_identity, document, did_method) =
+            resolve_identity_persistent(resolved_source, persist, protocol_repository.storage())
+                .await?;
+        build_node(
+            protocol_repository,
+            scp_identity,
+            document,
+            did_method,
+            tail,
+        )
+        .await
     }
 
     /// Constructs and starts an [`ApplicationNode`] from a [`NodeConfig`]
@@ -897,32 +1099,38 @@ impl Node {
         validate_config(&config.reach, &config.tls, config.dht)?;
         let (storage, identity, tail) = split_config(config);
 
-        let base = ApplicationNodeBuilder::new().storage(storage);
-        match identity {
-            IdentitySource::Generate {
-                custody,
-                did_method,
-            } => {
-                let builder = base.generate_identity_with(custody, did_method);
-                finish_build_for_testing(builder, tail).await
-            }
+        // Testing constructor: `ProtocolRepository::new_for_testing` (the only
+        // difference from `start`). The build then flows through the same engine.
+        let protocol_repository = Arc::new(ProtocolRepository::new_for_testing(storage));
+        // `Persisted` is the load-or-create-and-persist source. It normalizes to
+        // a `Generate` source with `persist = true` (exactly as the legacy
+        // builder's `identity_with_storage` did): `resolve_identity_persistent`
+        // checks storage first and only generates+persists on a cache miss.
+        // `Generate` / `Explicit` resolve with `persist = false`.
+        let (resolved_source, persist) = match identity {
             IdentitySource::Persisted {
                 custody,
                 did_method,
-            } => {
-                let builder = base.identity_with_storage(custody, did_method);
-                finish_build_for_testing(builder, tail).await
-            }
-            IdentitySource::Explicit(e) => {
-                let ExplicitIdentity {
-                    identity,
-                    document,
+            } => (
+                IdentitySource::Generate {
+                    custody,
                     did_method,
-                } = *e;
-                let builder = base.identity(identity, document, did_method);
-                finish_build_for_testing(builder, tail).await
-            }
-        }
+                },
+                true,
+            ),
+            other => (other, false),
+        };
+        let (scp_identity, document, did_method) =
+            resolve_identity_persistent(resolved_source, persist, protocol_repository.storage())
+                .await?;
+        build_node(
+            protocol_repository,
+            scp_identity,
+            document,
+            did_method,
+            tail,
+        )
+        .await
     }
 }
 
