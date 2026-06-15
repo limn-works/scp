@@ -779,44 +779,11 @@ export interface EventClaim {
 // ---------------------------------------------------------------------------
 // Trust
 // ---------------------------------------------------------------------------
-
-/** Trust evaluation input for a participant. */
-export interface TrustEvaluation {
-  /** The subject DID being evaluated. */
-  readonly subjectDid: string;
-  /** The context ID in which trust is being evaluated. */
-  readonly contextId: string;
-  /** Behavioral record computed from the event log. */
-  readonly behavioralRecord: BehavioralRecord;
-  /** Attestations for the subject. */
-  readonly attestations: readonly AttestationSummary[];
-}
-
-/** Behavioral record computed from a context event log. */
-export interface BehavioralRecord {
-  /** Number of messages sent or actions taken. */
-  readonly participationCount: number;
-  /** Duration of participation in seconds. */
-  readonly participationDurationSeconds: number;
-  /** Tool invocations keyed by tool ID. */
-  readonly toolInvocations: Readonly<Record<string, number>>;
-  /** Governance actions initiated by this participant. */
-  readonly governanceActionsBy: number;
-  /** Governance actions targeting this participant. */
-  readonly governanceActionsAgainst: number;
-}
-
-/** Summary of an attestation. */
-export interface AttestationSummary {
-  /** Attestation type. */
-  readonly type: string;
-  /** Issuer DID. */
-  readonly issuer: string;
-  /** Whether the attestation is currently valid. */
-  readonly valid: boolean;
-  /** Whether the attestation has been revoked. */
-  readonly revoked: boolean;
-}
+//
+// `TrustEvaluation`, `BehavioralRecord`, and `AttestationSummary` moved to
+// `./trust` to mirror the Python SDK's four-layer `TrustEvaluation` model
+// (spec §9.3, ADR-017). The prior stale shapes here had no consumers and did
+// not match the cross-SDK trust contract; `./trust` is now the authority.
 
 // ---------------------------------------------------------------------------
 // Participation (spec §7.3.2.1, SCP-BA-004)

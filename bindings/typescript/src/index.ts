@@ -75,7 +75,18 @@ export { defineToolDefinition } from "./tools";
 // Trust — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type { AggregatedTrustInput, AggregationInput } from "./trust";
+export type {
+  AggregatedTrustInput,
+  AggregationInput,
+  Attestation,
+  BehavioralRecord,
+  CapabilityValidation,
+  ChallengeResult,
+  Endorsement,
+  TrustEvaluation,
+  UcanFailureCategory,
+} from "./trust";
+export { evaluateTrust } from "./trust";
 
 // ---------------------------------------------------------------------------
 // Event Log — types only (entry points moved to SCP)
@@ -111,16 +122,24 @@ export type { AggregatedTrustInput, AggregationInput } from "./trust";
 export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle } from "./mcp";
 
 // ---------------------------------------------------------------------------
-// Bridge Connector — types only (entry points moved to SCP)
+// Bridge Connector — types + bridge-provenance trust tier
 // ---------------------------------------------------------------------------
+//
+// Stateful entry points (`bridgeCreateShadow`, credentials) live on SCP.
+// `evaluateTrust` (exported here as `bridgeEvaluateTrust` to disambiguate
+// from the four-layer `evaluateTrust` in `./trust`, mirroring the Python
+// SDK's `bridge_evaluate_trust` re-export name) is the pure bridge-provenance
+// trust-tier classifier (spec §12).
 
 export type {
   BridgeCredential,
   BridgeMode,
   BridgeRegistration,
+  BridgeTrustOptions,
   ShadowIdentity,
   ShadowStatus,
 } from "./bridge";
+export { evaluateTrust as bridgeEvaluateTrust } from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Discovery — types + pure helpers (entry points for stateful ops moved to SCP)
@@ -233,9 +252,7 @@ export {
 export type {
   AddressResolution,
   AssetEntry,
-  AttestationSummary,
   BatchPublishResult,
-  BehavioralRecord,
   BroadcastAdmissionPolicy,
   Capability,
   Checkpoint,
@@ -268,7 +285,6 @@ export type {
   ToolVerificationResult,
   TransportConfig,
   TransportStatus,
-  TrustEvaluation,
   TrustLevel,
   UcanToken,
   VerificationMethod,

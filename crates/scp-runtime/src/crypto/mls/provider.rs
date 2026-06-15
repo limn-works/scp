@@ -373,9 +373,9 @@ struct PendingJoinState {
 /// # Concurrency
 ///
 /// Each method acquires the internal mutex for the duration of the operation.
-/// The `ContextManager` ensures that concurrent calls for the same context are
-/// serialized at a higher level (via `tokio::sync::Mutex` on the context map),
-/// so contention on these mutexes is minimal.
+/// The per-context actor (ADR-049) serializes calls for the same context —
+/// each context is owned by a single actor task — so contention on these
+/// mutexes is minimal.
 pub struct MlsCryptoProvider {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,
@@ -1072,8 +1072,8 @@ impl MlsCryptoProvider {
             // If the member is not in the MLS group (e.g., they were never
             // MLS-added, or they're the local member under a different DID
             // in a multi-identity test environment), treat as a no-op. The
-            // ContextManager handles membership state authoritatively; the
-            // crypto provider only manages MLS group state (#1294).
+            // context actor handles membership state authoritatively; the
+            // crypto provider only manages MLS group state.
             let Some(leaf_index) = target_index else {
                 tracing::warn!(
                     member_did = %member_did,
@@ -1225,9 +1225,6 @@ impl MlsCryptoProvider {
     /// so that the removed party cannot decrypt future messages encrypted
     /// with the new sender key.
     ///
-    /// The default implementation is a no-op (`Ok(())`) so that mock and
-    /// test providers compile without changes.
-    ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if key generation, HPKE
@@ -1336,10 +1333,8 @@ impl MlsCryptoProvider {
     /// serialized `SenderKeyDistributionMessage::KeyResponse` containing
     /// an HPKE-sealed sender key.
     ///
-    /// The default implementation returns an empty vector (no pending
-    /// distributions). Production providers that HPKE-seal sender keys
-    /// during [`distribute_sender_key`](Self::distribute_sender_key) should
-    /// override this to drain their pending queue.
+    /// Returns an empty vector when there are no pending HPKE-sealed sender
+    /// key distributions to drain for the given context.
     ///
     /// # Errors
     ///
@@ -1362,9 +1357,6 @@ impl MlsCryptoProvider {
     /// Deserializes the message, extracts the sender key, and stores it in
     /// the local sender key store so subsequent messages from `sender_did`
     /// can be decrypted.
-    ///
-    /// The default implementation is a no-op. Production providers that
-    /// support HPKE sender key distribution should override this.
     ///
     /// # Errors
     ///
@@ -1444,8 +1436,8 @@ impl MlsCryptoProvider {
     /// Returns `Some(serialized_response)` if the requester should receive
     /// a key, or `None` if the request was silently dropped (e.g., blocked).
     ///
-    /// The default implementation returns an error indicating the provider
-    /// does not support sender key request handling.
+    /// This is an inherent method on `MlsCryptoProvider`; it performs the
+    /// verify, replay-check, and HPKE-seal steps described above.
     ///
     /// # Errors
     ///
@@ -1556,8 +1548,9 @@ impl MlsCryptoProvider {
     /// the `InnerEnvelope` (including signing); this method handles all
     /// encryption layers.
     ///
-    /// The default implementation returns an error. Production providers
-    /// (`MlsCryptoProvider`) override this with the full envelope pipeline.
+    /// This is an inherent method on `MlsCryptoProvider` (there is no crypto
+    /// trait indirection on the send path): it always runs the full envelope
+    /// pipeline below.
     ///
     /// # Errors
     ///
@@ -1636,11 +1629,12 @@ impl MlsCryptoProvider {
     /// [`OpenResult::Management`](scp_protocol::context::builder::OpenResult::Management) for MLS-wrapped management messages
     /// (identified by the [`MANAGEMENT_MSG_MAGIC`](scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC) prefix).
     ///
-    /// Signature verification is NOT performed here — the caller
-    /// (`ContextManager`) handles it via `key_resolver` after `open` returns.
+    /// Signature verification is NOT performed here — the receive handler
+    /// verifies it via `key_resolver` after `open` returns.
     ///
-    /// The default implementation returns an error. Production providers
-    /// (`MlsCryptoProvider`) override this with the full receive pipeline.
+    /// This is an inherent method on `MlsCryptoProvider` (there is no crypto
+    /// trait indirection on the receive path): it always runs the full receive
+    /// pipeline below.
     ///
     /// # Errors
     ///
@@ -1761,8 +1755,9 @@ impl MlsCryptoProvider {
                         scp_protocol::envelope::inner::InnerEnvelope::from_bytes(&decrypted)
                             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-                    // Signature verification is deferred to ContextManager which
-                    // has access to the key_resolver for resolving sender public keys.
+                    // Signature verification is deferred to the receive handler,
+                    // which has access to the key_resolver for resolving sender
+                    // public keys.
 
                     Ok(scp_protocol::context::builder::OpenResult::Application(
                         Box::new(scp_protocol::context::builder::OpenedEnvelope {
@@ -1790,8 +1785,8 @@ impl MlsCryptoProvider {
     /// and wraps in an outer envelope. Used to send sender key distributions
     /// that are authenticated by MLS membership.
     ///
-    /// The default implementation returns an error. Production providers
-    /// (`MlsCryptoProvider`) override this.
+    /// This is an inherent method on `MlsCryptoProvider`; there is no crypto
+    /// trait indirection on this path.
     ///
     /// # Errors
     ///
@@ -1844,9 +1839,6 @@ impl MlsCryptoProvider {
     /// Returns an [`AdvanceEpochOutput`](scp_protocol::context::builder::AdvanceEpochOutput) containing the TLS-serialized MLS
     /// Commit message that must be distributed to all group members.
     ///
-    /// The default implementation is a no-op returning empty output so that
-    /// mock and test providers compile without changes.
-    ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if the MLS update/commit fails.
@@ -1884,9 +1876,6 @@ impl MlsCryptoProvider {
     ///
     /// Returns an empty `Vec` if no crypto state exists for the given context
     /// (e.g., mock providers or broadcast-only contexts).
-    ///
-    /// The default implementation returns an empty `Vec` (no state to persist).
-    /// Production providers that manage MLS groups MUST override this.
     ///
     /// # Errors
     ///
@@ -2009,12 +1998,9 @@ impl MlsCryptoProvider {
     /// Restores per-context cryptographic state from a previously exported
     /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)).
     ///
-    /// Called during `ContextManager::restore_context` to reinstate MLS
-    /// groups and sender keys after a process restart. If `data` is empty,
+    /// Called during the context restore path (supervisor/actor) to reinstate
+    /// MLS groups and sender keys after a process restart. If `data` is empty,
     /// this is a no-op (the provider was never persisted or is a mock).
-    ///
-    /// The default implementation is a no-op. Production providers that
-    /// manage MLS groups MUST override this.
     ///
     /// # Errors
     ///
@@ -2222,9 +2208,6 @@ impl MlsCryptoProvider {
     /// Returns an empty `Vec` when the context has no epoch state (mock
     /// providers, broadcast-only contexts, or providers that do not track
     /// epochs).
-    ///
-    /// The default implementation returns an empty `Vec`.  Production
-    /// providers that maintain a `SenderKeyStore` MUST override this.
     pub fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
         // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
         let Some(entry) = self.contexts.get(context_id) else {
@@ -4260,7 +4243,7 @@ mod tests {
 
     /// Build a minimal `InnerEnvelope` with a deterministic signing key.
     /// `provider.open()` does not verify signatures (per the comment in
-    /// `open()`, signature verification is deferred to `ContextManager`),
+    /// `open()`, signature verification is deferred to the receive handler),
     /// so an arbitrary key suffices for the H9 receive-ceiling tests.
     fn build_test_inner(
         context_id: &[u8; 32],
