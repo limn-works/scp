@@ -7,19 +7,27 @@
 //!
 //! # Usage
 //!
+//! [`Relay::start`] is the SDK-facing entry point: pass a flat [`RelayConfig`]
+//! and a blob storage backend, and it spawns the running relay, returning a
+//! [`ShutdownHandle`] and the bound address.
+//!
 //! ```rust,no_run
-//! use std::sync::Arc;
-//! use scp_transport::native::server::{RelayConfig, RelayServer};
+//! use scp_transport::native::server::{Relay, RelayConfig};
 //! use scp_transport::native::storage::BlobStorageBackend;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = RelayConfig::default();
-//! let storage = Arc::new(BlobStorageBackend::in_memory());
-//! let server = RelayServer::new(config, storage);
-//! server.run().await?;
+//! let (shutdown, addr) =
+//!     Relay::start(RelayConfig::default(), BlobStorageBackend::in_memory()).await?;
+//! // ... serve; later:
+//! shutdown.shutdown();
+//! # let _ = addr;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! For multi-transport or long-running setups that need the [`RelayServer`]
+//! value itself (shared rate limiters, or `run()` instead of `start()`), use
+//! the internal [`RelayServer`] constructors directly.
 //!
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 
