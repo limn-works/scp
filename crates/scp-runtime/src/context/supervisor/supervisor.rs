@@ -6498,6 +6498,43 @@ impl Supervisor {
         })
     }
 
+    /// Creates a context from a flat [`ContextConfig`](crate::context::config::ContextConfig)
+    /// (ADR-052 / construction.md).
+    ///
+    /// This is the options-object front-end over [`Self::create_context`]: it
+    /// lowers `config` into
+    /// [`ContextParams`](scp_protocol::context::ContextParams) via
+    /// [`ContextConfig::into_params`](crate::context::config::ContextConfig::into_params)
+    /// and calls the existing creation engine. The Rust SDK thereby gains the
+    /// same options-object shape Python/TypeScript/Swift already use. The
+    /// optional bilateral peer carried by
+    /// [`ContextCreation::Template`](crate::context::config::ContextCreation::Template)
+    /// is surfaced to the caller for the invitation step; the engine itself
+    /// does not consume it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates
+    /// [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError)
+    /// from [`Self::create_context`].
+    pub async fn create(
+        self: &Arc<Self>,
+        context_id: String,
+        config: crate::context::config::ContextConfig,
+        creator_did: DID,
+        local_pseudonym: Option<[u8; 32]>,
+    ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
+    {
+        // The bilateral `peer` is intentionally unused at this engine layer:
+        // the invitation/Welcome-delivery step that consumes it lives in a
+        // higher SDK layer outside this phase's scope. `into_params` still
+        // returns it so callers that need it can lower the config themselves
+        // without losing information; here we only need the lowered params.
+        let (params, _peer) = config.into_params();
+        self.create_context(context_id, params, creator_did, local_pseudonym)
+            .await
+    }
+
     /// Adds a new member to an existing context via the actor mailbox.
     ///
     /// Builds a [`LifecycleCommand::JoinContext`] with an embedded

@@ -31,6 +31,7 @@ pub mod actor;
 pub mod app_sandbox;
 pub(crate) mod broadcast_helpers;
 pub mod builder;
+pub mod config;
 pub(crate) mod economy_helpers;
 pub(crate) mod economy_logic;
 pub mod export_import;
@@ -64,6 +65,8 @@ use scp_protocol::context::params;
 use scp_protocol::context::{
     ContextError, ContextParams, ContextState, context_id_bytes, transition,
 };
+
+pub use config::{ContextConfig, ContextCreation};
 
 // ---------------------------------------------------------------------------
 // ContextInner

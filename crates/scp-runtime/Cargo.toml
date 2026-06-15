@@ -138,6 +138,10 @@ required-features = ["testing"]
 name = "pseudonym_routing_integration"
 required-features = ["testing"]
 
+[[test]]
+name = "context_config_create"
+required-features = ["testing"]
+
 [[example]]
 name = "identity"
 
