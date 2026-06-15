@@ -413,8 +413,14 @@ async fn reconnect_detects_forged_divergent_checkpoint() {
 ///    leaving an unrelated buffered application event in place — proving the
 ///    reconnection driver's targeted drain does not destroy the SDK's delivery
 ///    queue (the bug this work fixes).
-/// 3. Replaying the identical signed divergent checkpoint is a no-op (replay
-///    idempotency) — no second alert is emitted.
+/// 3. Replaying the identical signed divergent checkpoint emits no second
+///    alert. In this single-node path the suppression comes from the
+///    PRIMARY count-advance, NOT the per-sender dedup set: the first
+///    detection appended an `EquivocationDetected` event, so `local_count`
+///    advanced past the remote count and the replayed comparison routes to
+///    the Ahead/Behind arm — it never re-reaches the `Equal`/dedup path.
+///    The keyed-on-root dedup gate itself is exercised by the focused unit
+///    tests in `crates/scp-runtime` (stable-count construction), not here.
 ///
 /// The structural wiring that the *decrypt* prefix
 /// (`deliver_incoming → deliver_checkpoint_message → compare_remote_checkpoint`)
@@ -479,11 +485,14 @@ async fn runtime_equivocation_dispatch_and_targeted_drain() {
     );
 
     // Runtime dispatch #2 — REPLAY the identical signed checkpoint. The replay
-    // must NOT emit a second EquivocationDetected alert (idempotency). The
-    // first detection appended an `EquivocationDetected` event to the log,
-    // advancing the local count, so the replayed comparison itself need not be
-    // Divergent — the load-bearing guarantee is "no second alert", asserted by
-    // the exactly-once count below.
+    // must NOT emit a second EquivocationDetected alert. Here the suppression
+    // is the PRIMARY count-advance, not the per-sender dedup set: the first
+    // detection appended an `EquivocationDetected` event to the durable log,
+    // advancing `local_count` past the remote count, so the replayed
+    // comparison routes to Ahead/Behind and never re-reaches the dedup gate.
+    // The load-bearing guarantee is "no second alert", asserted by the
+    // exactly-once count below. (The dedup gate's own keyed-on-root behavior
+    // is covered by the focused runtime unit tests.)
     let _replay = alice
         .manager
         .compare_remote_checkpoint(ctx_id, forged)

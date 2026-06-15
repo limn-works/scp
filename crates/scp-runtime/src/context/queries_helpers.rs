@@ -846,13 +846,30 @@ pub fn compare_remote_checkpoint(
 /// event (receive buffer + event-log append with forensic roots), but
 /// only ONCE per distinct divergent checkpoint per remote sender.
 ///
-/// A malicious relay can replay one signed divergent checkpoint
-/// indefinitely; without idempotency that replay would append an
-/// unbounded run of `EquivocationDetected` events (inflating the Merkle
-/// log and `checkpoint_events_since`) and flood the receive buffer with
-/// duplicate alerts (§9.9.3 replay defense). We track the highest
-/// `(event_count, timestamp)` seen per remote sender DID and treat any
-/// checkpoint not strictly newer than the last-seen pair as a no-op.
+/// Replay-idempotency layering:
+///
+/// - PRIMARY (durable): appending the `EquivocationDetected` event below
+///   advances the durable event-log length, which is exactly the
+///   `local_count` that `compare_remote_checkpoint` reads. So after a
+///   divergence is recorded at remote count `N`, `local_count` becomes
+///   `N + 1`; a re-delivered checkpoint at count `N` then routes to the
+///   Ahead/Behind arm and never re-reaches the `Equal`/dedup path. Because
+///   the event log is persisted, this protection survives respawn even
+///   though the in-memory set below resets to empty.
+/// - SECONDARY (this set, belt-and-suspenders): per remote sender DID we
+///   track the set of distinct `(event_count, remote_merkle_root)`
+///   divergences already recorded. A re-presentation whose
+///   `(count, root)` is already present is a no-op; a NEW root — even at
+///   an already-seen count — is fresh evidence (two members can equivocate
+///   with different forged roots at the same height; each is a distinct
+///   §9.9.4 security event). Keying on the root, not on a `>` timestamp
+///   monotone, is what makes that distinct-root case fire.
+///
+/// The per-sender set is bounded at
+/// [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`] entries. Once full, the
+/// alert is still EMITTED (a §9.9.4 security event is never silently
+/// discarded) but no further `(count, root)` is inserted, so a malicious
+/// sender cannot pin unbounded memory.
 fn record_equivocation_if_fresh(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -861,28 +878,32 @@ fn record_equivocation_if_fresh(
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     local_root: [u8; 32],
 ) {
-    let incoming = (remote.event_count, remote.timestamp);
-    let is_fresh = state
+    let incoming = (remote.event_count, remote.merkle_root);
+    let seen = state
         .last_seen_remote_checkpoint
-        .get(&remote.sender_did)
-        .is_none_or(|last_seen| incoming > *last_seen);
+        .entry(remote.sender_did.clone())
+        .or_default();
 
-    if !is_fresh {
-        // Replay / stale re-presentation of an already-recorded divergent
-        // checkpoint: the signature already verified, so this is an
-        // authentic (but duplicate) artifact — silently absorb it.
+    if seen.contains(&incoming) {
+        // Exact re-presentation of an already-recorded divergent
+        // checkpoint (same count AND same remote root): the signature
+        // already verified, so this is an authentic (but duplicate)
+        // artifact — silently absorb it.
         tracing::debug!(
             context_id,
             remote_sender = %remote.sender_did,
             event_count = remote.event_count,
-            "duplicate/stale divergent checkpoint suppressed (replay defense, §9.9.3)"
+            "duplicate divergent checkpoint suppressed (replay defense, §9.9.3)"
         );
         return;
     }
 
-    state
-        .last_seen_remote_checkpoint
-        .insert(remote.sender_did.clone(), incoming);
+    // Bound the per-sender set: still emit the alert below (never silently
+    // drop a §9.9.4 security event) but stop growing the set once a sender
+    // has pinned MAX_SEQUENTIAL_COMMITS distinct divergences.
+    if (seen.len() as u64) < scp_protocol::sync::MAX_SEQUENTIAL_COMMITS {
+        seen.insert(incoming);
+    }
 
     tracing::warn!(
         context_id,

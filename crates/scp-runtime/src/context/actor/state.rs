@@ -937,15 +937,33 @@ pub struct PerContextState {
     /// `state::PerContextState::checkpoints`.
     pub checkpoints: Vec<ConsistencyCheckpoint>,
 
-    /// Highest `(event_count, timestamp)` observed per remote checkpoint
-    /// sender DID (§9.9.3 replay defense). A remote checkpoint that is not
-    /// strictly newer than the last-seen pair for that sender is a no-op
-    /// in `compare_remote_checkpoint`: it neither re-appends an
+    /// Set of distinct divergent checkpoints `(event_count, merkle_root)`
+    /// already recorded per remote checkpoint sender DID (§9.9.3 replay
+    /// defense, secondary guard). A re-presented divergence whose
+    /// `(count, remote_merkle_root)` is already in the sender's set is a
+    /// no-op in `compare_remote_checkpoint`: it neither re-appends an
     /// `EquivocationDetected` event nor re-bumps `checkpoint_events_since`.
-    /// Without this, a relay can replay one signed divergent checkpoint
-    /// unboundedly to inflate the event log and flood the receive buffer
-    /// with duplicate alerts.
-    pub last_seen_remote_checkpoint: HashMap<DID, (u64, u64)>,
+    /// A NEW root at an already-seen count is treated as fresh evidence —
+    /// two members can equivocate with different forged roots at the same
+    /// height, and each is a distinct §9.9.4 security event.
+    ///
+    /// PRIMARY replay-idempotency does NOT come from this map. Recording a
+    /// divergence appends an `EquivocationDetected` event to the durable
+    /// event log, which advances `local_count` (the `event_log_entries`
+    /// length read in `compare_remote_checkpoint`); a re-delivered
+    /// checkpoint at the same remote count then routes to the Ahead/Behind
+    /// arm and never re-reaches the `Equal`/dedup path. That count-advance
+    /// is durable across respawn (the event log is persisted), so replay
+    /// stays blocked even though this in-memory set resets to empty on
+    /// respawn. This set is the secondary belt-and-suspenders guard against
+    /// an exact-divergence re-record within a single process lifetime.
+    ///
+    /// Bounded per sender at
+    /// [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`] distinct entries:
+    /// once a sender's set is full the alert is still EMITTED (a §9.9.4
+    /// security event is never silently discarded) but no further entry is
+    /// inserted, capping the memory a malicious sender can pin.
+    pub last_seen_remote_checkpoint: HashMap<DID, HashSet<(u64, [u8; 32])>>,
 
     // -----------------------------------------------------------------
     // New actor-shape fields (no legacy equivalent)

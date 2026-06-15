@@ -178,6 +178,11 @@ impl<'a> RelayActorSyncDriver<'a> {
     /// `drain_events`) so catch-up does not destroy buffered application
     /// traffic.
     async fn collect_equivocation_alerts(&self, context_id: &str, now: u64) -> Vec<SyncEvent> {
+        // Resolve the detector's local MLS epoch once for the whole batch so
+        // every alert carries forensic epoch context (§9.12). `None` for a
+        // broadcast context or on mailbox failure, matching the helper's soft
+        // semantics — the divergent roots remain the load-bearing evidence.
+        let local_epoch = self.supervisor.local_mls_epoch(context_id).await;
         self.supervisor
             .drain_equivocation_alerts(context_id)
             .await
@@ -202,7 +207,7 @@ impl<'a> RelayActorSyncDriver<'a> {
                         remote_merkle_root,
                         evidence: None,
                         detected_at: now,
-                        local_epoch: None,
+                        local_epoch,
                     },
                 ))),
                 _ => None,
