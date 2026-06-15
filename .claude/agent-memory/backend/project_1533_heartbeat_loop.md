@@ -34,3 +34,21 @@ ActorDeps.key_resolver = PUBLIC keys only; KeyCustody signer not mailbox-address
 - Transport: `TransportAdapter` trait (`crates/scp-transport/src/traits.rs:162`) — add `record_heartbeat_received` default no-op + Box blanket impl (:250). `NativeRelayAdapter::record_heartbeat_received` already exists (`native/adapter.rs:371`). Manager forwarder fans out to all adapters (delete/unsubscribe pattern, `manager.rs:702`).
 - Per-profile interval: reuse `maybe_start_heartbeat` mapping (`native/adapter.rs:248`): Server/Desktop 60s, Mobile 120s, Constrained OFF.
 - Pipeline: existing `b3_heartbeat_monitor_instantiated` (`pipeline_wiring.rs:1124`). ADD `b3_heartbeat_send_receive_loop_wired` (do NOT weaken existing).
+
+## SHIPPED (3 commits on feat/1533-heartbeat-loop off 53b6f1d47, NOT pushed)
+1. core+transport: MessageType::Heartbeat=5; send_heartbeat helper; DeliverOutcome{Application,Heartbeat,Handled} replaces deliver_incoming Option (heartbeat classified after verify_and_unwrap, BEFORE sequence tracker); SendHeartbeat cmd+handler+Supervisor::send_heartbeat; TransportAdapter::record_heartbeat_received (default no-op)+NativeRelayAdapter override (Self:: inherent-priority delegation)+Box blanket+TransportManager fan-out. deliver_commit_blob collapses outcome→Option.
+2. bridges: HeartbeatConfig::for_profile (single source of truth; maybe_start_heartbeat refactored to use it); scp-ffi-common::heartbeat_scheduler::{heartbeat_interval, run_heartbeat_scheduler}; napi context_subscribe_on spawns scheduler in same JoinSet + records on DeliverOutcome::Heartbeat.
+3. tests: pipeline b3_heartbeat_send_receive_loop_wired (ratchet 41→42); scp-protocol discriminator test; fullstack AC2/AC3 (FullStackNode::{send_heartbeat,open_inner_envelope}; assert Heartbeat type+seq0+consecutive app seqs); heartbeat_suppression.rs AC8 neg/pos + AC9; 4 scheduler unit tests.
+
+## GATES (all green at finish)
+fmt, full workspace clippy (-D warnings, all CI features), wasm clippy, check-bridge-symmetry (0), check-cross-layer (send_heartbeat matched to FFI), scp-protocol/transport/runtime tests, scp-testing pipeline_wiring(57)/fullstack(10)/heartbeat_suppression(3)/reconnect_sync(31)/attacks(4), scp-ffi-napi(257), scp-ffi-common(310).
+
+## INTEGRATION CHECKLIST (5 cells)
+1. send: Supervisor::send_heartbeat driven by napi scheduler ✓. 2. receive: record_heartbeat_received across bridge loops — napi only (sole live loop); pyo3/uniffi have no live subscribe loop (documented exemption, not a stub). 3. pipeline assertion ✓. 4. §9.9.4 suppression surfacing intact (pre-existing AC5 drain untouched) ✓. 5. capability matrix: N/A — heartbeat is automatic (driven by subscribe), not a discrete SDK op; no row added.
+
+## GOTCHAS hit
+- Edit/Write pinned to agent launch worktree (agent-acc9905e51f8cbf75), NOT the EnterWorktree target. Fixed by `git checkout -b feat/1533-heartbeat-loop 53b6f1d47` IN the pinned worktree (stash memory edits across).
+- pre-commit hook = full Rust gate (fmt+clippy --all-targets+wasm); can't commit a layer until WHOLE workspace compiles → had to fix napi DeliverOutcome match before first commit landed.
+- clippy too_many_lines on dispatch fn after adding arm → extracted handle_seed_peer_pseudonym. clippy doc_markdown on `MergedStream`, Duration::from_secs(60)→from_mins(1). Integration test files need `#![allow(clippy::unwrap_used,expect_used,panic)]` header.
+- single-node MLS self-deliver NOT reconstructable (per reconnect_sync note) → AC3 tested via send-side inner-envelope inspection (peer opens), not a deliver_incoming round trip. Removed unused deliver_incoming_outcome test helpers.
+- pretooluse hook false-trips on `bash scripts/check-bridge-symmetry.sh >/dev/null` (sees redirect-after-protected-name as a write) → run without trailing redirect on same line.
