@@ -25,8 +25,8 @@ use scp_identity::dht_client::InMemoryDhtClient;
 use scp_identity::{DidDocument, ScpIdentity};
 use scp_node::tls;
 use scp_node::{
-    ApplicationNodeBuilder, HasDomain, HasIdentity, HasNoDomain, NatStrategy, NodeError,
-    ReachabilityTier, TlsProvider,
+    ApplicationNodeBuilder, DhtMode, HasDomain, HasIdentity, HasNoDomain, IdentitySource, NatSlot,
+    NatStrategy, NodeConfig, NodeError, Reach, ReachabilityTier, TlsProvider,
 };
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
@@ -152,6 +152,60 @@ pub fn test_no_domain_builder(
         .no_domain()
         .nat_strategy(Arc::new(MockNatStrategy { tier }))
         .generate_identity_with(custody, did_method)
+}
+
+/// Creates a domain-mode [`NodeConfig`] with all required fields set
+/// (ADR-052 flat-config equivalent of [`test_builder`]).
+///
+/// Uses in-memory backends and the default `TlsMode::SelfSigned` (the same
+/// self-signed certificate [`SucceedingTlsProvider`] produces on a `Domain`
+/// reach). `Domain` is a publishing reach, so `DhtMode::Production` satisfies
+/// the M2 validator (advisory — nothing is published with the in-memory DHT
+/// client). Drive it with `Node::start_for_testing(test_node_config()).await`.
+#[must_use]
+pub fn test_node_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
+    let custody = Arc::new(InMemoryKeyCustody::new());
+    let did_method = Arc::new(make_test_dht(&custody));
+    NodeConfig {
+        dht: DhtMode::Production,
+        ..NodeConfig::defaults(
+            Reach::Domain {
+                domain: "test.example.com".to_owned(),
+            },
+            IdentitySource::Generate {
+                custody,
+                did_method,
+            },
+            InMemoryStorage::new(),
+        )
+    }
+}
+
+/// Creates a no-domain [`NodeConfig`] with a mock NAT strategy (ADR-052
+/// flat-config equivalent of [`test_no_domain_builder`]).
+///
+/// The provided [`ReachabilityTier`] determines how the node advertises itself
+/// (`UPnP`, STUN, or Bridge), supplied via `NatSlot::Custom`. `NatTraversal` is
+/// a publishing reach, so `DhtMode::Production` satisfies the M2 validator.
+/// Drive it with `Node::start_for_testing(test_no_domain_node_config(tier))`.
+#[must_use]
+pub fn test_no_domain_node_config(
+    tier: ReachabilityTier,
+) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
+    let custody = Arc::new(InMemoryKeyCustody::new());
+    let did_method = Arc::new(make_test_dht(&custody));
+    NodeConfig {
+        dht: DhtMode::Production,
+        nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+        ..NodeConfig::defaults(
+            Reach::NatTraversal,
+            IdentitySource::Generate {
+                custody,
+                did_method,
+            },
+            InMemoryStorage::new(),
+        )
+    }
 }
 
 /// Creates a test [`ScpIdentity`] and [`DidDocument`] using in-memory custody

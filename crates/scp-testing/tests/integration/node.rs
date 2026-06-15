@@ -6,7 +6,7 @@
 //! `SucceedingTlsProvider`, `FailingTlsProvider`, `MockNatStrategy`, `FailingNatStrategy`,
 //! `create_test_identity`, and `ApplicationNode` accessors (relay, identity, storage, shutdown).
 
-use scp_node::ReachabilityTier;
+use scp_node::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, ReachabilityTier};
 use scp_testing::helpers;
 
 // ---------------------------------------------------------------------------
@@ -15,8 +15,7 @@ use scp_testing::helpers;
 
 #[tokio::test]
 async fn domain_mode_builder() {
-    let node = helpers::test_builder()
-        .build_for_testing()
+    let node = Node::start_for_testing(helpers::test_node_config())
         .await
         .expect("domain-mode build should succeed");
 
@@ -43,8 +42,7 @@ async fn no_domain_mode_builder() {
     let tier = ReachabilityTier::Bridge {
         bridge_url: "wss://bridge.example.com/scp/v1".to_owned(),
     };
-    let node = helpers::test_no_domain_builder(tier)
-        .build_for_testing()
+    let node = Node::start_for_testing(helpers::test_no_domain_node_config(tier))
         .await
         .expect("no-domain-mode build should succeed");
 
@@ -70,7 +68,12 @@ async fn failing_tls_falls_through_to_nat() {
     let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let did_method = Arc::new(helpers::make_test_dht(&custody));
 
-    // TLS failure + no NAT strategy → build should fail because both paths fail.
+    // This test intentionally stays on the typestate builder: it injects a
+    // custom `Arc<dyn TlsProvider>` (`FailingTlsProvider`) to exercise the
+    // builder-internal TLS-fail → NAT-fallthrough path. `NodeConfig` has no
+    // representation for an arbitrary failing TLS provider (its `TlsMode` is a
+    // closed enum), so this builder-internal behavior has no flat-config form.
+    // TLS failure + failing NAT → build should fail because both paths fail.
     let result = scp_node::ApplicationNodeBuilder::new()
         .storage(InMemoryStorage::new())
         .domain("fail-tls.example.com")
@@ -105,13 +108,21 @@ async fn failing_nat_strategy() {
     let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let did_method = Arc::new(helpers::make_test_dht(&custody));
 
-    let result = scp_node::ApplicationNodeBuilder::new()
-        .storage(InMemoryStorage::new())
-        .no_domain()
-        .nat_strategy(Arc::new(helpers::FailingNatStrategy))
-        .generate_identity_with(custody, did_method)
-        .build_for_testing()
-        .await;
+    // NatTraversal is a publishing reach → DhtMode::Production (M2). The
+    // `FailingNatStrategy` makes NAT tier selection fail, so the build must err.
+    let result = Node::start_for_testing(NodeConfig {
+        dht: DhtMode::Production,
+        nat: NatSlot::Custom(Arc::new(helpers::FailingNatStrategy)),
+        ..NodeConfig::defaults(
+            Reach::NatTraversal,
+            IdentitySource::Generate {
+                custody,
+                did_method,
+            },
+            InMemoryStorage::new(),
+        )
+    })
+    .await;
 
     match result {
         Ok(_) => panic!("build with FailingNatStrategy should fail"),
@@ -161,8 +172,7 @@ async fn create_test_identity() {
 
 #[tokio::test]
 async fn node_relay_url() {
-    let node = helpers::test_builder()
-        .build_for_testing()
+    let node = Node::start_for_testing(helpers::test_node_config())
         .await
         .expect("domain-mode build should succeed");
 
@@ -181,8 +191,7 @@ async fn node_relay_url() {
 
 #[tokio::test]
 async fn node_storage_access() {
-    let node = helpers::test_builder()
-        .build_for_testing()
+    let node = Node::start_for_testing(helpers::test_node_config())
         .await
         .expect("domain-mode build should succeed");
 
@@ -198,8 +207,7 @@ async fn node_storage_access() {
 
 #[tokio::test]
 async fn node_shutdown() {
-    let node = helpers::test_builder()
-        .build_for_testing()
+    let node = Node::start_for_testing(helpers::test_node_config())
         .await
         .expect("domain-mode build should succeed");
 

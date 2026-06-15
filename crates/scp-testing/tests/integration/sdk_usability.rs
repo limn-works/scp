@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use scp_core::envelope::create_outer_envelope;
-use scp_node::ReachabilityTier;
+use scp_node::{Node, ReachabilityTier};
 use scp_platform::testing::InMemoryStorage;
 use scp_testing::helpers;
 use scp_transport::native::protocol::{ClientMessage, RelayMessage};
@@ -60,16 +60,14 @@ async fn build_no_domain_node() -> scp_node::ApplicationNode<InMemoryStorage> {
     let tier = ReachabilityTier::Bridge {
         bridge_url: "wss://bridge.test.scp/scp/v1".to_owned(),
     };
-    helpers::test_no_domain_builder(tier)
-        .build_for_testing()
+    Node::start_for_testing(helpers::test_no_domain_node_config(tier))
         .await
         .expect("no-domain node should build")
 }
 
 /// Builds a domain-mode `ApplicationNode` with self-signed TLS (no real ACME).
 async fn build_domain_node() -> scp_node::ApplicationNode<InMemoryStorage> {
-    helpers::test_builder()
-        .build_for_testing()
+    Node::start_for_testing(helpers::test_node_config())
         .await
         .expect("domain-mode node should build")
 }
