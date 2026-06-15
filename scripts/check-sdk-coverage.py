@@ -431,6 +431,177 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
 }
 
 
+# Supplementary aliases. Every entry below was verified against actual SDK
+# source: the named symbol exists and implements the capability. These cover
+# the recurring divergence classes the auto-derived candidates miss:
+#   * generic dispatchers — per-action Governance rows ride in the action JSON
+#     of one `governance_execute` / `contextExecuteGovernanceAction` method;
+#     there is no per-variant symbol in ANY SDK (Python reference included).
+#   * cross-domain naming — `Governance/is_member` lives as `context_is_member`.
+#   * idiomatic surface — constructors (`scp_new` -> the `SCP` class),
+#     properties (`scp_instance_id` -> `instanceId`), param-bearing methods
+#     (`shutdown_timeout` -> `shutdown`), and factory names (`with_storage_sqlite`
+#     -> Kotlin `withSqlite`).
+# Merged (not overriding) into ALIASES so existing entries keep their names and
+# these add the missing/corrected ones.
+_EXTRA_ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
+    # Governance: per-action variants dispatch through one generic method.
+    ("Governance", "approve_proposal"): {
+        "python": ["governance_approve"],
+        "typescript": ["contextGovernanceApprove"],
+    },
+    ("Governance", "reject_proposal"): {
+        "python": ["governance_reject"],
+        "typescript": ["contextGovernanceReject"],
+    },
+    ("Governance", "withdraw_vote"): {
+        "python": ["governance_withdraw"],
+        "typescript": ["contextGovernanceWithdraw"],
+    },
+    ("Governance", "propose_action"): {
+        "python": ["governance_propose"],
+        "typescript": ["contextGovernancePropose"],
+    },
+    ("Governance", "propose_governance_action_checked"): {
+        "python": ["governance_propose"],
+        "typescript": ["contextGovernancePropose"],
+    },
+    ("Governance", "execute_action"): {
+        "python": ["governance_execute"],
+        "typescript": ["contextExecuteGovernanceAction"],
+    },
+    ("Governance", "execute_remove_member"): {
+        "python": ["governance_execute"],
+        "typescript": ["contextExecuteGovernanceAction"],
+    },
+    ("Governance", "execute_restore_access"): {
+        "python": ["governance_execute"],
+        "typescript": ["contextExecuteGovernanceAction"],
+    },
+    ("Governance", "execute_revoke_access"): {
+        "python": ["governance_execute"],
+        "typescript": ["contextExecuteGovernanceAction"],
+    },
+    ("Governance", "execute_rotate_content_keys"): {
+        "python": ["governance_execute"],
+        "typescript": ["contextExecuteGovernanceAction"],
+    },
+    ("Governance", "execute_suspend_access"): {
+        "python": ["governance_execute"],
+        "typescript": ["contextExecuteGovernanceAction"],
+    },
+    ("Governance", "execute_suspend_capability"): {
+        "python": ["governance_execute"],
+        "typescript": ["contextExecuteGovernanceAction"],
+    },
+    # Governance rows whose method lives under context_* in Python.
+    ("Governance", "handle_ttl_expiry"): {"python": ["context_handle_ttl_expiry"]},
+    ("Governance", "is_member"): {"python": ["context_is_member"]},
+    ("Governance", "member_count"): {"python": ["context_member_count"]},
+    ("Governance", "propose_ttl_extension"): {
+        "python": ["context_propose_ttl_extension"]
+    },
+    # Identity attestations carry the "Link" infix (corrects stale Swift aliases).
+    ("Identity", "create_attestation"): {
+        "python": ["create_identity_link_attestation"],
+        "typescript": ["identityCreateLinkAttestation"],
+        "swift": ["identityCreateLinkAttestation", "createLinkAttestation"],
+        "kotlin": ["createLinkAttestation"],
+    },
+    ("Identity", "list_attestations"): {
+        "python": ["identity_link_attestations"],
+        "typescript": ["identityLinkAttestations"],
+        "swift": ["identityLinkAttestations", "listLinkAttestations"],
+        "kotlin": ["linkAttestations"],
+    },
+    ("Identity", "remove_attestation"): {
+        "python": ["remove_identity_link_attestation"],
+        "typescript": ["identityRemoveLinkAttestation"],
+        "swift": ["identityRemoveLinkAttestation"],
+        "kotlin": ["removeLinkAttestation"],
+    },
+    # Context.
+    ("Context", "create_with_consequence_rules"): {
+        "python": ["context_create"],
+        "typescript": ["contextCreate"],
+    },
+    ("Context", "receive"): {"typescript": ["contextSubscribe"]},
+    ("Context", "restore_context"): {"typescript": ["contextRestore"]},
+    ("Context", "restore_all_contexts"): {"typescript": ["contextRestoreAll"]},
+    ("Context", "import_context"): {"swift": ["contextImport"]},
+    # Event log.
+    ("EventLog", "checkpoint_by_did"): {"python": ["event_log_checkpoint_by_did"]},
+    ("EventLog", "signed_checkpoint"): {"typescript": ["eventLogCheckpoint"]},
+    # Messaging: spending-UCAN variants ride as optional params on send/join.
+    ("Messaging", "send_message"): {"python": ["context_send"]},
+    ("Messaging", "send_with_spending_ucan"): {
+        "python": ["context_send"],
+        "typescript": ["contextSend"],
+    },
+    ("Messaging", "join_with_spending_ucan"): {
+        "python": ["context_join"],
+        "typescript": ["contextJoin"],
+    },
+    # Tools: Python uses the tool_* prefix (existing entries cover ts/swift).
+    ("Tools", "interface_accept"): {"python": ["tool_interface_accept"]},
+    ("Tools", "interface_expose"): {"python": ["tool_interface_expose"]},
+    ("Tools", "interface_revoke"): {"python": ["tool_interface_revoke"]},
+    ("Tools", "invoke_cross_context"): {"python": ["tool_invoke_cross_context"]},
+    ("Tools", "session_create"): {"python": ["tool_session_create"]},
+    ("Tools", "session_invoke"): {"python": ["tool_session_invoke"]},
+    ("Tools", "session_close"): {"python": ["tool_session_close"]},
+    # MCP: corrects stale `McpClientHandle` alias (the actor is `McpClient`).
+    ("MCP", "connect_client"): {"swift": ["McpClient", "connect"]},
+    # Lifecycle: constructor / property / factory naming across SDKs.
+    ("Lifecycle", "scp_new"): {
+        "python": ["SCP"],
+        "typescript": ["SCP"],
+        "swift": ["SCP"],
+        "kotlin": ["SCP"],
+    },
+    ("Lifecycle", "scp_instance_id"): {
+        "python": ["instance_id"],
+        "typescript": ["instanceId"],
+        "swift": ["instanceId"],
+        "kotlin": ["instanceId"],
+    },
+    ("Lifecycle", "scp_with_storage_in_memory"): {
+        "python": ["SCP"],
+        "typescript": ["SCP"],
+        "swift": ["withStorage", "SCP"],
+        "kotlin": ["withStorage", "SCP"],
+    },
+    ("Lifecycle", "with_storage_sqlite"): {
+        "python": ["SCP"],
+        "typescript": ["SCP"],
+        "swift": ["withStorage"],
+        "kotlin": ["withSqlite"],
+    },
+    ("Lifecycle", "shutdown_timeout"): {
+        "python": ["shutdown"],
+        "typescript": ["shutdown"],
+        "swift": ["shutdown"],
+        "kotlin": ["shutdown"],
+    },
+    ("Lifecycle", "add_relay_url"): {
+        "python": ["transport_add_relay"],
+        "typescript": ["transportAddRelay", "configureRelayTransport"],
+        "swift": ["addRelay"],
+        "kotlin": ["addRelay"],
+    },
+    ("Lifecycle", "suspend"): {"kotlin": ["suspendInstance"]},
+}
+
+# Deep-merge _EXTRA_ALIASES into ALIASES (append names, never override).
+for _key, _sdkmap in _EXTRA_ALIASES.items():
+    _existing = ALIASES.setdefault(_key, {})
+    for _sdk, _names in _sdkmap.items():
+        _slot = _existing.setdefault(_sdk, [])
+        for _name in _names:
+            if _name not in _slot:
+                _slot.append(_name)
+
+
 # ---------------------------------------------------------------------------
 # Name conversion helpers
 # ---------------------------------------------------------------------------
@@ -668,73 +839,69 @@ def _extract_kotlin_symbols(root_node: Node) -> set[str]:
     """
     symbols: set[str] = set()
     exclude_vis = {"private", "internal"}
+    # Kotlin allows backtick-escaped identifiers (`` `addRelay` ``), and
+    # UniFFI-generated bindings backtick-quote every name. Strip the ticks so
+    # the captured symbol matches the plain operation name.
+    id_types = ("identifier", "simple_identifier")
 
-    def _process_class_body(class_name: str, body_node: Node) -> None:
-        """Extract methods from a class_body node."""
-        for member in body_node.children:
-            if member.type == "function_declaration":
-                if _has_kotlin_visibility(member, exclude_vis):
+    def _first_ident(node: Node) -> str | None:
+        for c in node.children:
+            if c.type in id_types:
+                return c.text.decode().strip("`")
+        return None
+
+    def _property_name(prop_node: Node) -> str | None:
+        # `val instanceId: ULong` -> property_declaration > variable_declaration
+        # > (simple_)identifier. Some grammars place the identifier directly.
+        for c in prop_node.children:
+            if c.type == "variable_declaration":
+                name = _first_ident(c)
+                if name:
+                    return name
+            if c.type in id_types:
+                return c.text.decode().strip("`")
+        return None
+
+    type_decls = ("class_declaration", "object_declaration", "interface_declaration")
+
+    def _walk(node: Node, class_name: str | None) -> None:
+        """Recursively collect public function/property names, tracking the
+        nearest enclosing type so methods land as both bare and `Type.method`.
+
+        Recursive (not just top-level + class_body) because UniFFI-generated
+        Kotlin nests the public API on interfaces and override-method bodies
+        whose container node types vary across the grammar; a depth-bounded
+        walk missed them (e.g. `TransportManager.addRelay`). Over-capture is
+        the safe failure mode for a fail-closed coverage gate.
+        """
+        for child in node.children:
+            t = child.type
+            if t == "function_declaration":
+                if not _has_kotlin_visibility(child, exclude_vis):
+                    name = _first_ident(child)
+                    if name:
+                        symbols.add(name)
+                        if class_name:
+                            symbols.add(f"{class_name}.{name}")
+                _walk(child, class_name)
+            elif t == "property_declaration":
+                if not _has_kotlin_visibility(child, exclude_vis):
+                    name = _property_name(child)
+                    if name:
+                        symbols.add(name)
+                        if class_name:
+                            symbols.add(f"{class_name}.{name}")
+            elif t in type_decls:
+                if _has_kotlin_visibility(child, exclude_vis):
                     continue
-                for mc in member.children:
-                    if mc.type == "identifier":
-                        method_name = mc.text.decode()
-                        symbols.add(f"{class_name}.{method_name}")
-                        symbols.add(method_name)
-                        break
+                cname = _first_ident(child)
+                if cname:
+                    symbols.add(cname)
+                _walk(child, cname)
+            else:
+                _walk(child, class_name)
 
-            elif member.type == "companion_object":
-                # companion object { fun create() ... }
-                for co_child in member.children:
-                    if co_child.type == "class_body":
-                        for co_member in co_child.children:
-                            if co_member.type == "function_declaration":
-                                if _has_kotlin_visibility(co_member, exclude_vis):
-                                    continue
-                                for mc in co_member.children:
-                                    if mc.type == "identifier":
-                                        method_name = mc.text.decode()
-                                        symbols.add(f"{class_name}.{method_name}")
-                                        symbols.add(method_name)
-                                        break
-
-            elif member.type in ("class_declaration", "object_declaration"):
-                # Nested class or object
-                if _has_kotlin_visibility(member, exclude_vis):
-                    continue
-                nested_name = None
-                for nc in member.children:
-                    if nc.type == "identifier":
-                        nested_name = nc.text.decode()
-                        break
-                if nested_name:
-                    symbols.add(nested_name)
-                    for nc in member.children:
-                        if nc.type == "class_body":
-                            _process_class_body(nested_name, nc)
-
-    for child in root_node.children:
-        if child.type == "function_declaration":
-            if _has_kotlin_visibility(child, exclude_vis):
-                continue
-            for fc in child.children:
-                if fc.type == "identifier":
-                    symbols.add(fc.text.decode())
-                    break
-
-        elif child.type in ("class_declaration", "object_declaration"):
-            if _has_kotlin_visibility(child, exclude_vis):
-                continue
-            class_name = None
-            for fc in child.children:
-                if fc.type == "identifier":
-                    class_name = fc.text.decode()
-                    break
-            if class_name:
-                symbols.add(class_name)
-                for fc in child.children:
-                    if fc.type == "class_body":
-                        _process_class_body(class_name, fc)
-
+    _walk(root_node, None)
     return symbols
 
 
@@ -989,9 +1156,10 @@ def main() -> int:
             print(f"  WARNING: No symbols extracted for {sdk} SDK at {SDK_PATHS[sdk]}")
 
     total_ops = 0
-    warnings = 0
     errors = 0
     missing_exemptions = 0
+    unmatched_true = 0
+    coverage_exempted = 0
 
     sdks = ("python", "typescript", "kotlin", "swift")
 
@@ -1001,6 +1169,7 @@ def main() -> int:
             op_name = op.get("name", "?")
             total_ops += 1
             exemptions = op.get("exemptions", {})
+            coverage_exemptions = op.get("coverage_exemptions", {})
 
             for sdk in sdks:
                 expected = op.get(sdk)
@@ -1012,12 +1181,33 @@ def main() -> int:
                     found = _check_operation_in_sdk(
                         sdk_symbols[sdk], sdk, domain, op_name
                     )
-                    if not found:
+                    if found:
+                        continue
+                    # Fail-closed: a capability marked present whose SDK symbol
+                    # cannot be located is a real gap (or a stale matrix entry)
+                    # UNLESS it carries an explicit, reasoned coverage exemption.
+                    # The escape hatch is for capabilities that genuinely exist
+                    # but resist static extraction (e.g. methods only in
+                    # generated bindings the AST grammar can't parse) — never a
+                    # silent pass. Resolve a real one of three ways: add the SDK
+                    # wrapper, add an ALIASES entry pointing at the real symbol,
+                    # or add a coverage_exemptions reason citing the symbol.
+                    if sdk in coverage_exemptions:
                         print(
-                            f"  WARNING: {domain}/{op_name} marked true for "
-                            f"{sdk} but AST could not find matching symbol"
+                            f"  NOTE: {domain}/{op_name} ({sdk}) coverage-exempt: "
+                            f"{coverage_exemptions[sdk]}"
                         )
-                        warnings += 1
+                        coverage_exempted += 1
+                    else:
+                        print(
+                            f"  ERROR: {domain}/{op_name} marked true for {sdk} "
+                            f"but no matching SDK symbol was found and no "
+                            f"coverage_exemptions reason is recorded. Add the "
+                            f"wrapper, an ALIASES entry, or a coverage_exemptions "
+                            f"reason."
+                        )
+                        unmatched_true += 1
+                        errors += 1
                 elif expected is False:
                     # Must have an exemption
                     if sdk not in exemptions:
@@ -1033,24 +1223,26 @@ def main() -> int:
     print("=" * 60)
     print("SDK Capability Matrix Coverage Check")
     print("=" * 60)
-    print(f"  Matrix file:       {MATRIX_PATH}")
-    print(f"  Total operations:  {total_ops}")
-    print(f"  Warnings:          {warnings} (true entries with no AST match)")
-    print(f"  Errors:            {errors} (false entries with no exemption)")
+    print(f"  Matrix file:        {MATRIX_PATH}")
+    print(f"  Total operations:   {total_ops}")
+    print(
+        f"  Coverage-exempt:    {coverage_exempted} (present but not statically matchable)"
+    )
+    print(f"  Errors:             {errors}")
+    print(
+        f"    unmatched true:   {unmatched_true} (true but no symbol and no coverage exemption)"
+    )
+    print(f"    false w/o exempt: {missing_exemptions}")
     print("=" * 60)
 
     if errors > 0:
-        print(f"\nFAIL: {missing_exemptions} false entries lack exemptions")
+        print(
+            f"\nFAIL: {errors} error(s) — {unmatched_true} unmatched true entr(ies), "
+            f"{missing_exemptions} false entr(ies) lacking exemptions."
+        )
         return 1
 
-    if warnings > 0:
-        print(
-            f"\nPASS with {warnings} warnings. "
-            f"Review warnings -- they may indicate stale matrix entries."
-        )
-    else:
-        print("\nPASS: All entries validated.")
-
+    print("\nPASS: All matrix entries validated.")
     return 0
 
 
