@@ -33,7 +33,7 @@ use scp_identity::DidCache;
 use scp_identity::InMemoryDhtClient;
 use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
-use scp_node::{ApplicationNode, ApplicationNodeBuilder, SelfSignedTlsProvider};
+use scp_node::{ApplicationNode, DhtMode, IdentitySource, Node, NodeConfig, Reach};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
 type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
@@ -403,15 +403,25 @@ async fn build_tls_node(http_port: u16) -> ApplicationNode<InMemoryStorage> {
         dht_client, cache, sign_fn,
     ));
 
-    ApplicationNodeBuilder::new()
-        .storage(InMemoryStorage::new())
-        .domain("localhost")
-        .http_bind_addr(SocketAddr::from(([127, 0, 0, 1], http_port)))
-        .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
-        .generate_identity_with(custody, did_method)
-        .build_for_testing()
-        .await
-        .expect("node build should succeed")
+    // Default `TlsMode::SelfSigned` reproduces the dropped explicit
+    // `SelfSignedTlsProvider::new("localhost")` (so a QUIC server config is
+    // provisioned). `Domain` → `DhtMode::Production` (M2; advisory in P1).
+    Node::start_for_testing(NodeConfig {
+        http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], http_port))),
+        dht: DhtMode::Production,
+        ..NodeConfig::defaults(
+            Reach::Domain {
+                domain: "localhost".to_owned(),
+            },
+            IdentitySource::Generate {
+                custody,
+                did_method,
+            },
+            InMemoryStorage::new(),
+        )
+    })
+    .await
+    .expect("node build should succeed")
 }
 
 // ---------------------------------------------------------------------------

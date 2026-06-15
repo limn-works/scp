@@ -41,7 +41,8 @@ use scp_platform::KeyCustody;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
 
-use crate::{ApplicationNode, ApplicationNodeBuilder, PublicSurface, projection};
+use crate::config::{IdentitySource, NatSlot, Node, NodeConfig, Reach};
+use crate::{ApplicationNode, PublicSurface, projection};
 
 /// A single static asset to publish: HTTP path, content type, and body bytes.
 ///
@@ -1678,57 +1679,66 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
             ))
         })?;
 
-    // -- NAT strategy with RETAINED mapper handles for clean teardown. When
-    //    `skip_nat`, no mapper is constructed and the builder skips the probe. --
-    #[cfg(feature = "upnp")]
-    let (nat_strategy, upnp_mapper, natpmp_mapper): (
-        Option<Arc<dyn crate::NatStrategy>>,
-        OptionalPortMapper,
-        OptionalPortMapper,
-    ) = if skip_nat {
-        (None, None, None)
+    // -- Reach + DHT from `skip_nat`. A `skip_nat` host reaches only locally
+    //    (non-publishing → DhtMode::Memory); otherwise it NAT-traverses and
+    //    publishes a routable address (DhtMode::Production, M2). --
+    let (reach, dht) = if skip_nat {
+        (Reach::Local, DhtMode::Memory)
     } else {
-        let upnp: Arc<dyn scp_transport::nat::PortMapper> =
-            Arc::new(scp_transport::nat::UpnpPortMapper::new());
-        let natpmp: Arc<dyn scp_transport::nat::PortMapper> =
-            Arc::new(scp_transport::nat::NatPmpPortMapper::new());
-        let strategy = crate::DefaultNatStrategy::new(None, None)
-            .with_port_mapper(Arc::clone(&upnp))
-            .with_fallback_mapper(Arc::clone(&natpmp));
-        (
-            Some(Arc::new(strategy) as Arc<dyn crate::NatStrategy>),
-            Some(upnp),
-            Some(natpmp),
+        (Reach::NatTraversal, DhtMode::Production)
+    };
+
+    // -- NAT slot with RETAINED mapper handles for clean teardown. When
+    //    `skip_nat`, no mapper is constructed and the reach skips the probe;
+    //    `NatSlot::Auto` is correct there. When NOT `skip_nat` (upnp build),
+    //    `NatSlot::Custom(strategy)` carries the strategy and we KEEP the mapper
+    //    handles for teardown — `NatSlot::Auto` would lose them. --
+    #[cfg(feature = "upnp")]
+    let (nat, upnp_mapper, natpmp_mapper): (NatSlot, OptionalPortMapper, OptionalPortMapper) =
+        if skip_nat {
+            (NatSlot::Auto, None, None)
+        } else {
+            let upnp: Arc<dyn scp_transport::nat::PortMapper> =
+                Arc::new(scp_transport::nat::UpnpPortMapper::new());
+            let natpmp: Arc<dyn scp_transport::nat::PortMapper> =
+                Arc::new(scp_transport::nat::NatPmpPortMapper::new());
+            let strategy = crate::DefaultNatStrategy::new(None, None)
+                .with_port_mapper(Arc::clone(&upnp))
+                .with_fallback_mapper(Arc::clone(&natpmp));
+            (
+                NatSlot::Custom(Arc::new(strategy) as Arc<dyn crate::NatStrategy>),
+                Some(upnp),
+                Some(natpmp),
+            )
+        };
+    #[cfg(not(feature = "upnp"))]
+    let (nat, upnp_mapper, natpmp_mapper): (NatSlot, OptionalPortMapper, OptionalPortMapper) =
+        (NatSlot::Auto, None, None);
+
+    // `IdentitySource::Persisted` gives the self-host node a STABLE DID across
+    // restarts: it creates+persists the identity on first boot and reloads it
+    // thereafter from the root `node_storage`. `tls` defaults to
+    // `TlsMode::SelfSigned`, a no-op on a no-domain reach.
+    let config = NodeConfig {
+        dht,
+        nat,
+        http_bind_addr: Some(http_addr),
+        projection_rate_limit: Some(projection_rate_limit),
+        blob_storage: Some(blob_storage),
+        ..NodeConfig::defaults(
+            reach,
+            IdentitySource::Persisted {
+                custody,
+                did_method,
+            },
+            node_storage,
         )
     };
-    #[cfg(not(feature = "upnp"))]
-    let (upnp_mapper, natpmp_mapper): (OptionalPortMapper, OptionalPortMapper) = (None, None);
 
-    // `identity_with_storage` gives the self-host node a STABLE DID across
-    // restarts: it creates+persists the identity on first boot and reloads it
-    // thereafter from the root `node_storage`.
-    let builder = ApplicationNodeBuilder::new()
-        .storage(node_storage)
-        .blob_storage(blob_storage)
-        .identity_with_storage(custody, did_method)
-        .no_domain()
-        .http_bind_addr(http_addr)
-        .projection_rate_limit(projection_rate_limit);
-    #[cfg(feature = "upnp")]
-    let builder = match nat_strategy {
-        Some(strategy) => builder.nat_strategy(strategy),
-        None => builder,
-    };
-    let builder = if skip_nat {
-        builder.skip_nat_probe()
-    } else {
-        builder
-    };
-
-    match builder.build().await {
+    match Node::start(config).await {
         Ok(n) => Ok((Arc::new(n), upnp_mapper, natpmp_mapper)),
         Err(e) => {
-            // `build()` establishes the inbound port mapping during NAT tier
+            // `Node::start` establishes the inbound port mapping during NAT tier
             // selection and CAN still fail afterward, so release best-effort.
             release_self_host_mappings(upnp_mapper, natpmp_mapper, http_addr.port()).await;
             Err(HostSiteError::NodeBuild(e.to_string()))

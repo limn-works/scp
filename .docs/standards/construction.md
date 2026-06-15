@@ -45,12 +45,14 @@ A boolean parameter that selects between two named behaviors is a misuse-magnet:
 
 | Replace | With enum |
 |---|---|
-| `plaintext: bool` (site TLS) | `tls: TlsMode { SelfSigned, Acme { … }, Plaintext, Terminated }` |
+| `plaintext: bool` (site TLS) | `tls: TlsMode { SelfSigned, Acme { email: Option<String> }, Plaintext, Terminated }` |
 | `skip_nat: bool` + addressing flags | `reach: Reach { Domain{…}, NatTraversal, Tunnel{…}, Local }` |
 | `supports_bridge: bool` (relay) | `bridge: BridgeRole { Disabled, Enabled{…} }` (`Default = Disabled`) |
 | `in_memory: bool` (DHT publish) | `dht: DhtMode { Memory, Production{…} }` |
 
 Booleans that are genuinely binary state with no behavioral fork (e.g. `http3: bool` enabling an additional listener) are permitted, but the bar is high: if the choice has security or addressing consequences, it is an enum.
+
+The ACME contact email is optional: `TlsMode::Acme { email: None }` selects headless ACME (no contact email) — the legacy headless-server default for a domain node that sets no TLS options. `Some(e)` registers the ACME account with contact address `e`. The optionality changes no fail-safe property: ACME on any non-`Domain` reach is still a loud error regardless of the email.
 
 ### M2 — The security-critical choice is required or fail-safe-defaulted, never silently unsafe
 

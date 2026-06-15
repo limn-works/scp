@@ -1520,14 +1520,27 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
             dht_client, cache, sign_fn,
         ));
 
-        ApplicationNodeBuilder::new()
-            .storage(InMemoryStorage::new())
-            .domain("localhost")
-            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
-            .tls_provider(Arc::new(SelfSignedTlsProvider::new("localhost")))
-            .generate_identity_with(custody, did_method)
-            .build_for_testing()
-            .await
+        // Migrated to the ADR-052 flat-config front door (Phase B-P2). The
+        // dropped `.tls_provider(SelfSignedTlsProvider::new("localhost"))` is
+        // reproduced by the default `TlsMode::SelfSigned`, which installs a
+        // byte-identical self-signed provider for the `Domain` reach. `Domain`
+        // is a publishing reach, so M2 requires `DhtMode::Production`
+        // (advisory in P1 — the in-memory DHT client publishes nothing).
+        Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], port))),
+            dht: DhtMode::Production,
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "localhost".to_owned(),
+                },
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+            )
+        })
+        .await
     }
 }
 
