@@ -150,7 +150,11 @@ pub enum TlsMode {
     /// Provision a Let's Encrypt certificate via ACME for the reach's domain.
     Acme {
         /// Contact email for the ACME account registration.
-        email: String,
+        ///
+        /// Optional: `None` selects headless ACME (no contact email), the
+        /// legacy default for a domain node that sets no TLS options. `Some(e)`
+        /// registers the ACME account with the contact address `e`.
+        email: Option<String>,
     },
     /// Serve plaintext (no node-side TLS). Only valid on a non-`Domain` reach;
     /// `Reach::Domain` + `TlsMode::Plaintext` is a loud configuration error.
@@ -227,7 +231,7 @@ pub enum NatSlot {
 /// ```ignore
 /// let node = Node::start(NodeConfig {
 ///     dht: DhtMode::Production,
-///     tls: TlsMode::Acme { email: "admin@example.com".into() },
+///     tls: TlsMode::Acme { email: Some("admin@example.com".into()) },
 ///     ..NodeConfig::defaults(
 ///         Reach::Domain { domain: "example.com".into() },
 ///         IdentitySource::Generate { custody, did_method },
@@ -612,7 +616,15 @@ where
                 builder
             }
         }
-        TlsMode::Acme { email } => builder.acme_email(&email),
+        TlsMode::Acme { email } => match email {
+            // `Some(e)` registers the ACME account with contact email `e`.
+            Some(e) => builder.acme_email(&e),
+            // `None` applies no email setter: the builder's domain `build()`
+            // falls through to the default `AcmeProvider::new(domain)` with no
+            // contact email — the legacy headless-ACME default, reproduced
+            // exactly.
+            None => builder,
+        },
         TlsMode::Terminated => {
             if let Reach::Domain { domain } = reach {
                 // Domain + Terminated: install a no-network self-signed provider
@@ -1210,7 +1222,7 @@ mod tests {
         // M4: override one field while spreading defaults from separate values.
         let config = NodeConfig {
             tls: TlsMode::Acme {
-                email: "spread@example.com".to_owned(),
+                email: Some("spread@example.com".to_owned()),
             },
             ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
         };
@@ -1626,7 +1638,7 @@ mod tests {
         // strategy is needed.
         let result = Node::start_for_testing(NodeConfig {
             tls: TlsMode::Acme {
-                email: "admin@example.com".to_owned(),
+                email: Some("admin@example.com".to_owned()),
             },
             ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
         })
@@ -1665,7 +1677,7 @@ mod tests {
         ] {
             let result = Node::start_for_testing(NodeConfig {
                 tls: TlsMode::Acme {
-                    email: "admin@example.com".to_owned(),
+                    email: Some("admin@example.com".to_owned()),
                 },
                 ..NodeConfig::defaults(reach, generate_identity(), InMemoryStorage::new())
             })
@@ -1686,6 +1698,26 @@ mod tests {
                 "Acme×{reach_name} error must name the contradiction, got: {err}"
             );
         }
+    }
+
+    // --- Test: Acme { email: None } on a Domain reach is accepted (headless) ---
+
+    #[test]
+    fn acme_with_none_email_on_domain_is_accepted() {
+        // `TlsMode::Acme { email: None }` selects headless ACME — the legacy
+        // default for a domain node that sets no TLS options (the builder's
+        // domain `build()` falls through to `AcmeProvider::new(domain)` with no
+        // contact email). It must be a VALID config on a `Reach::Domain`
+        // (publishing) reach paired with `DhtMode::Production` — no loud error.
+        // We assert at the `validate_config` layer rather than building, because
+        // a real ACME provision would contact Let's Encrypt over the network;
+        // validation is the observable acceptance gate before any provisioning.
+        let reach = Reach::Domain {
+            domain: "config-acme-headless.example.com".to_owned(),
+        };
+        let tls = TlsMode::Acme { email: None };
+        validate_config(&reach, &tls, DhtMode::Production)
+            .expect("Domain + Acme { email: None } + Production must be a valid config");
     }
 
     // --- Test 21: Plaintext / Terminated on a non-Domain reach are no-op builds
