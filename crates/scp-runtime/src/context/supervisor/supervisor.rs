@@ -6498,6 +6498,60 @@ impl Supervisor {
         })
     }
 
+    /// Creates a context from a flat [`ContextConfig`](crate::context::config::ContextConfig)
+    /// (ADR-052 / construction.md).
+    ///
+    /// This is the options-object front-end over [`Self::create_context`]: it
+    /// lowers `config` into
+    /// [`ContextParams`](scp_protocol::context::ContextParams) via
+    /// [`ContextConfig::into_params`](crate::context::config::ContextConfig::into_params)
+    /// and calls the existing creation engine. The Rust SDK thereby gains the
+    /// same options-object shape Python/TypeScript/Swift already use.
+    ///
+    /// # Bilateral peer
+    ///
+    /// [`ContextCreation::Template`](crate::context::config::ContextCreation::Template)
+    /// may carry an optional bilateral `peer` DID for the invitation step. The
+    /// core creation engine builds only the creator's local context; the
+    /// invitation/Welcome-delivery that actually adds the peer is a higher SDK
+    /// layer not yet wired at this phase. Rather than **silently dropping** a
+    /// supplied peer — which would leave the caller believing an invitation
+    /// happened when none did — this method returns
+    /// [`ContextCreationError::BilateralPeerNotSupported`](scp_protocol::context::builder::ContextCreationError::BilateralPeerNotSupported)
+    /// when `peer` is `Some(_)`. Create the context with `peer: None` and
+    /// invite the counterparty through the (forthcoming) invitation path.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`ContextCreationError::BilateralPeerNotSupported`](scp_protocol::context::builder::ContextCreationError::BilateralPeerNotSupported)
+    /// when the config carries a bilateral peer (see above). Otherwise
+    /// propagates
+    /// [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError)
+    /// from [`Self::create_context`].
+    pub async fn create(
+        self: &Arc<Self>,
+        context_id: String,
+        config: crate::context::config::ContextConfig,
+        creator_did: DID,
+        local_pseudonym: Option<[u8; 32]>,
+    ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
+    {
+        // Fail loud, never silent (CLAUDE.md "no silent" tenet): a supplied
+        // bilateral peer cannot be honored here because invitation/Welcome
+        // delivery lives in a higher SDK layer. `into_params` carries the peer
+        // out so callers that own the invitation path can lower the config
+        // themselves; this engine entry rejects it instead of dropping it.
+        let (params, peer) = config.into_params();
+        if peer.is_some() {
+            return Err(
+                scp_protocol::context::builder::ContextCreationError::BilateralPeerNotSupported,
+            );
+        }
+        self.create_context(context_id, params, creator_did, local_pseudonym)
+            .await
+    }
+
     /// Adds a new member to an existing context via the actor mailbox.
     ///
     /// Builds a [`LifecycleCommand::JoinContext`] with an embedded

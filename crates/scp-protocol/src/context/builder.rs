@@ -217,6 +217,22 @@ pub enum ContextCreationError {
     #[error("template validation failed: {0}")]
     TemplateValidationFailed(String),
 
+    /// A bilateral peer was supplied to a creation entry that cannot deliver
+    /// the invitation at this layer.
+    ///
+    /// The flat-config creation front-end (`ContextConfig` →
+    /// `ContextCreation::Template { peer: Some(_), .. }`) carries a bilateral
+    /// counterparty DID for the invitation step. The core creation engine
+    /// builds only the creator's local context; the invitation/Welcome-delivery
+    /// that actually adds the peer is a higher SDK layer. Rather than silently
+    /// dropping the peer — leaving the caller believing an invitation happened
+    /// when none did — the front-end returns this error so a supplied peer is
+    /// never silently ignored.
+    #[error(
+        "bilateral peer supplied to context creation, but invitation delivery is not available at this layer; create the context without a peer and invite the counterparty explicitly"
+    )]
+    BilateralPeerNotSupported,
+
     /// Generic creation failure with a descriptive message.
     #[error("context creation failed: {0}")]
     CreationFailed(String),
