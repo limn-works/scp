@@ -1,21 +1,24 @@
-//! Integration test for the ADR-049 commit-11 concurrent-saga
-//! serialization guard.
+//! Integration tests for the ADR-049 §3a / spec §5.15.4 per-participant-
+//! context-set saga concurrency gating.
 //!
-//! The supervisor serializes sagas supervisor-wide via a single atomic
-//! bool. A second `start_saga` while one is in flight returns
-//! [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
-//! with a `SagaBusy` reason (plan §"Cross-context saga protocol").
+//! A saga reserves the SET of participant context-actors it spans. Two
+//! sagas whose sets are DISJOINT run concurrently; a second saga whose set
+//! OVERLAPS (shares ≥1 context with) an in-flight saga is rejected with a
+//! typed [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
+//! carrying a `SagaBusy` reason. A `NeedsRepair` outcome RELEASES the
+//! reservation so a stuck saga cannot wedge unrelated, disjoint sagas.
 //!
-//! # Race structure
+//! # Determinism
 //!
-//! Because all 4 current [`SagaInput`] variants are spec-gapped
-//! (NotImplemented at Prepare dispatch), the FSM body is short —
-//! Initiated → PreparingA → Aborting → Aborted — and journal appends
-//! are the only `await` points. To exercise the guard we launch N
-//! concurrent tasks and count: at least one must succeed-to-
-//! NotImplemented (the saga ran to completion), and any others that
-//! observed the guard-set SHOULD return ActorBusy. The strict
-//! invariant we assert: `ok_count + busy_count == N`.
+//! The three production saga variants are spec-gapped (their Prepare
+//! dispatch returns `NotImplemented`), so a real saga over them terminates
+//! instantly via the PreparingA → Aborting → Aborted arm — too fast to hold
+//! "in flight" by racing. To test the gating semantics deterministically we
+//! use `Supervisor::test_reserve_saga_context_set`, which exercises the
+//! SAME `try_reserve_context_set` critical section that `start_saga` uses
+//! (not a parallel mock), and the test-only `SagaInput::TestForceNeedsRepair`
+//! variant, whose Commit always fails so the FSM drives a real `NeedsRepair`
+//! terminal.
 
 #![allow(
     clippy::unwrap_used,
@@ -92,76 +95,222 @@ fn test_supervisor() -> Arc<Supervisor> {
     ))
 }
 
-fn spec_gapped_input() -> SagaInput {
+/// A standing-pair saga between two DIDs. Its participant context set is
+/// the single deterministic standing-pair context id derived from the pair.
+fn standing_pair(a: &str, b: &str) -> SagaInput {
     SagaInput::StandingPairCreate {
-        local_did: DID("did:example:racer-a".to_owned()),
-        peer_did: DID("did:example:racer-b".to_owned()),
+        local_did: DID(a.to_owned()),
+        peer_did: DID(b.to_owned()),
     }
 }
 
-/// Two Prepares on the same supervisor: the guard admits at most one
-/// at a time. With the instantaneous NotImplemented FSM, the second
-/// Prepare MAY observe the guard clear — but across N=16 parallel
-/// tasks the total ok + busy count MUST equal N, and at least one
-/// must be ActorBusy under heavy concurrency.
-const N: usize = 16;
+/// A cross-context tool-invocation saga over the given caller/target
+/// contexts. Its participant context set is `{caller, target}`.
+fn cross_context(caller: [u8; 32], target: [u8; 32]) -> SagaInput {
+    SagaInput::CrossContextToolInvocation {
+        caller_context_id: caller,
+        target_context_id: target,
+        caller_did: DID("did:example:caller".to_owned()),
+        tool_registration_id: "tool-1".to_owned(),
+    }
+}
 
+fn ctx(byte: u8) -> [u8; 32] {
+    [byte; 32]
+}
+
+/// DISJOINT participant sets run concurrently: two sagas spanning entirely
+/// different contexts BOTH reach a terminal — NEITHER returns ActorBusy.
+/// Because the production variants are spec-gapped, "terminal" is the
+/// `NotImplemented` abort; the load-bearing assertion is the ABSENCE of
+/// ActorBusy, proving disjoint sets never serialize.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_sagas_serialize_via_guard() {
+async fn disjoint_participant_sets_run_concurrently() {
     let supervisor = test_supervisor();
 
-    let mut handles = Vec::with_capacity(N);
-    for _ in 0..N {
-        let sup = Arc::clone(&supervisor);
-        handles.push(tokio::spawn(async move {
-            sup.start_saga(spec_gapped_input()).await
-        }));
-    }
+    // Two cross-context sagas over fully disjoint context pairs:
+    //   saga 1: {0x01, 0x02}    saga 2: {0x03, 0x04}
+    let sup1 = Arc::clone(&supervisor);
+    let sup2 = Arc::clone(&supervisor);
+    let h1 = tokio::spawn(async move { sup1.start_saga(cross_context(ctx(1), ctx(2))).await });
+    let h2 = tokio::spawn(async move { sup2.start_saga(cross_context(ctx(3), ctx(4))).await });
 
-    let mut ok_count = 0usize;
-    let mut busy_count = 0usize;
-    for handle in handles {
-        match handle.await.unwrap() {
-            Err(ContextError::NotImplemented(_)) => ok_count += 1,
+    let r1 = h1.await.unwrap();
+    let r2 = h2.await.unwrap();
+
+    for r in [&r1, &r2] {
+        match r {
+            Err(ContextError::NotImplemented(_)) => {}
             Err(ContextError::ActorBusy(msg)) => {
-                assert!(
-                    msg.contains("SagaBusy") || msg.contains("already in flight"),
-                    "ActorBusy must mention SagaBusy or 'already in flight', got: {msg}"
-                );
-                busy_count += 1;
+                panic!("disjoint participant sets must NOT serialize — got ActorBusy: {msg}")
             }
-            other => panic!("unexpected start_saga result: {other:?}"),
+            other => panic!("unexpected disjoint-saga result: {other:?}"),
         }
     }
-    assert_eq!(
-        ok_count + busy_count,
-        N,
-        "every task must terminate as either NotImplemented-on-terminate or ActorBusy"
-    );
-    // Every saga eventually runs to terminate — a second caller's
-    // ActorBusy does NOT mean the saga is dropped; it just means this
-    // caller lost the race.
+}
+
+/// OVERLAPPING participant sets serialize: while one saga's set is held in
+/// flight, a second saga sharing ≥1 context returns ActorBusy with a
+/// `SagaBusy` reason. The in-flight saga is simulated deterministically by
+/// holding the reservation guard (the production gating critical section),
+/// because the spec-gapped FSM terminates too fast to race.
+#[tokio::test]
+async fn overlapping_participant_sets_reject_busy() {
+    let supervisor = test_supervisor();
+
+    // Hold saga 1's set {0x01, 0x02} in flight via the production
+    // reservation primitive.
+    let in_flight = cross_context(ctx(1), ctx(2));
+    let held = supervisor
+        .test_reserve_saga_context_set(&in_flight)
+        .expect("first reservation must succeed on an empty supervisor");
+
+    // Saga 2 shares context 0x02 (its set is {0x02, 0x09}) — must be
+    // rejected as SagaBusy.
+    let overlapping = cross_context(ctx(2), ctx(9));
+    let err = supervisor
+        .start_saga(overlapping)
+        .await
+        .expect_err("overlapping saga must be rejected while the set is held");
+    match err {
+        ContextError::ActorBusy(msg) => assert!(
+            msg.contains("SagaBusy"),
+            "overlap rejection must mention SagaBusy, got: {msg}"
+        ),
+        other => panic!("expected ActorBusy(SagaBusy), got: {other:?}"),
+    }
+
+    // Releasing saga 1's reservation lets the previously-overlapping set
+    // through (proves the rejection was the reservation, not some other
+    // failure).
+    drop(held);
+    let err2 = supervisor
+        .start_saga(cross_context(ctx(2), ctx(9)))
+        .await
+        .expect_err("after release the saga proceeds to its spec-gapped terminal");
     assert!(
-        ok_count >= 1,
-        "at least one saga must run to completion (ok_count >= 1)"
+        matches!(err2, ContextError::NotImplemented(_)),
+        "after release the overlapping set must reserve and run, got: {err2:?}"
     );
 }
 
-/// After the guard trips, a subsequent saga (once the first completes)
-/// must succeed: the guard is cleared on terminal resolution.
+/// A standing-pair saga and a CROSS-CONTEXT saga that touch the SAME context
+/// serialize — overlap detection is purely set-membership, not saga-type.
+///
+/// This is the FIX-1 regression guard: it genuinely crosses saga TYPES. A
+/// `StandingPairCreate` saga reserves the CANONICAL raw-digest hex of its
+/// standing context (spec §5.15.8 — the digest BEFORE the `"standing-"`
+/// prefix), and a `CrossContextToolInvocation` over that SAME raw digest must
+/// collide. If the standing-pair saga reserved the `"standing-"`-prefixed
+/// display id instead (the pre-FIX-1 bug), the cross-context saga's
+/// `hex::encode([u8; 32])` key would never equal the prefixed string, overlap
+/// would NOT be detected, and this assertion would FAIL — exactly the wedge
+/// FIX 1 closes.
 #[tokio::test]
-async fn guard_is_rearmed_after_each_saga_terminates() {
+async fn overlap_is_set_membership_across_saga_types() {
     let supervisor = test_supervisor();
-    // Run 5 sagas sequentially — every one must terminate with
-    // NotImplemented (not ActorBusy).
-    for _ in 0..5 {
+
+    // Hold a STANDING-PAIR saga in flight via the production reservation
+    // primitive. It reserves the canonical raw-digest hex of the pair's
+    // standing context.
+    let alice = DID("did:example:alice".to_owned());
+    let bob = DID("did:example:bob".to_owned());
+    let pair = standing_pair("did:example:alice", "did:example:bob");
+    let held = supervisor
+        .test_reserve_saga_context_set(&pair)
+        .expect("standing-pair reservation must succeed");
+
+    // Compute the EXACT raw 32-byte digest that the held standing-pair saga
+    // reserved (the canonical gating key), then name it as one leg of a
+    // CROSS-CONTEXT saga (a DIFFERENT saga type). The cross-context saga's
+    // `caller_context_id` is the standing context's raw digest; its
+    // `target_context_id` is an unrelated context. The shared raw digest forces
+    // an overlap across saga types.
+    let standing_digest = Supervisor::test_standing_pair_context_digest(&alice, &bob);
+    let err = supervisor
+        .start_saga(cross_context(standing_digest, ctx(9)))
+        .await
+        .expect_err("cross-context saga over the held standing context must collide");
+    match err {
+        ContextError::ActorBusy(msg) => assert!(
+            msg.contains("SagaBusy"),
+            "overlap rejection must mention SagaBusy, got: {msg}"
+        ),
+        other => panic!("expected ActorBusy(SagaBusy), got: {other:?}"),
+    }
+
+    // Releasing the standing-pair reservation lets the previously-overlapping
+    // cross-context saga through — proving the rejection WAS the shared raw
+    // digest (the reservation), not some unrelated failure.
+    drop(held);
+    let err2 = supervisor
+        .start_saga(cross_context(standing_digest, ctx(9)))
+        .await
+        .expect_err("after release the cross-context saga runs to its spec-gapped terminal");
+    assert!(
+        matches!(err2, ContextError::NotImplemented(_)),
+        "after release the cross-type set must reserve and run, got: {err2:?}"
+    );
+}
+
+/// `NeedsRepair` RELEASES the reservation: a saga driven to NeedsRepair
+/// (commit-retry-exhausted) frees its participant context set, so a second
+/// saga sharing that set reserves successfully — it does NOT get ActorBusy.
+/// This proves a stuck saga cannot wedge unrelated sagas (ADR-049 §3a, spec
+/// §5.15.4).
+///
+/// `start_paused` lets the 500ms/1s/2s commit-retry backoffs elapse in
+/// virtual time, so the test does not actually wait 3.5s.
+#[tokio::test(start_paused = true)]
+async fn needs_repair_releases_reservation() {
+    let supervisor = test_supervisor();
+
+    // Drive a saga over context 0x07 to NeedsRepair: its Prepare phases
+    // succeed and its Commit always fails, exhausting the retry budget. The
+    // FSM returns the typed NeedsRepair error to `start_saga`, whose RAII
+    // reservation then drops — releasing context 0x07.
+    let err = supervisor
+        .start_saga(SagaInput::TestForceNeedsRepair { context_id: ctx(7) })
+        .await
+        .expect_err("commit-retry-exhausted saga must return a NeedsRepair error");
+    // The terminal is NeedsRepair (commit failed) — surfaced as the typed
+    // commit error, NOT ActorBusy.
+    assert!(
+        !matches!(err, ContextError::ActorBusy(_)),
+        "a NeedsRepair saga must not surface as ActorBusy, got: {err:?}"
+    );
+
+    // A second saga sharing context 0x07 must now reserve successfully —
+    // proving the NeedsRepair terminal RELEASED the slot. If the slot were
+    // still held, this would return ActorBusy.
+    let err2 = supervisor
+        .start_saga(cross_context(ctx(7), ctx(8)))
+        .await
+        .expect_err("the follow-up saga runs to its spec-gapped terminal");
+    assert!(
+        matches!(err2, ContextError::NotImplemented(_)),
+        "NeedsRepair must release context 0x07 so a sharing saga reserves \
+         (no ActorBusy), got: {err2:?}"
+    );
+}
+
+/// Same-set sequential re-arm: running the SAME participant set N times in
+/// a row must succeed every time — each saga's terminal releases the
+/// reservation so the next over the identical set can reserve. (The prior
+/// supervisor-wide AtomicBool guaranteed this for ALL sagas; the per-set
+/// reservation must still guarantee it for same-set sequences.)
+#[tokio::test]
+async fn same_set_sequential_rearm() {
+    let supervisor = test_supervisor();
+    for i in 0..5 {
         let err = supervisor
-            .start_saga(spec_gapped_input())
+            .start_saga(cross_context(ctx(1), ctx(2)))
             .await
             .unwrap_err();
         assert!(
             matches!(err, ContextError::NotImplemented(_)),
-            "sequential sagas must all terminate — guard re-arm failed: got {err:?}"
+            "sequential same-set saga {i} must terminate (reservation re-arm \
+             failed) — got {err:?}"
         );
     }
 }

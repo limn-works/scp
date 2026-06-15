@@ -110,7 +110,9 @@ Files: pipeline_wiring.rs, ffi_conformance.rs, sdk-capability-matrix.json,
 check-cross-layer.sh, check-protocol-deps.sh, check-protocol-sync.py,
 check-no-bridge-globals.sh, check-no-fallback-registry.sh,
 check-handle-affinity.sh, check_ready_coverage.rs (per-instance handle
-affinity enforcement), check-no-mutable-globals.sh,
+affinity enforcement),
+check-saga-gating-granularity.sh (ADR-049 §3a per-participant-context-set
+saga gating granularity), check-no-mutable-globals.sh,
 check-no-mutable-module-globals.py, check-no-ts-mutable-globals.sh,
 check-no-kotlin-mutable-globals.sh,
 bindings/swift/.swiftlint.yml (no_static_var / no_static_lazy_var rules),

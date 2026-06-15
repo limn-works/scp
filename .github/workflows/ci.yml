@@ -290,6 +290,21 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-class-s-fail-closed.sh
 
+  saga-gating-granularity:
+    needs: check-draft
+    name: Actor / saga gating granularity (ADR-049 §3a)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Self-test MUST run first: it plants an instance-wide AtomicBool saga
+      # guard + a fake FFI saga export (must FAIL), correct per-set gating
+      # (must PASS), and a no-gating-at-all supervisor (must FAIL) — proving
+      # the gate is alive before we trust it on the real tree.
+      - name: Self-test gate
+        run: bash scripts/check-saga-gating-granularity.sh --self-test
+      - name: Real check
+        run: bash scripts/check-saga-gating-granularity.sh
+
   owned-identity-did:
     needs: check-draft
     name: Actor / OwnedIdentityDid capability check
