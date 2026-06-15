@@ -11,8 +11,8 @@
 //! - [`MockNatStrategy`] — returns a pre-configured [`ReachabilityTier`]
 //! - [`FailingNatStrategy`] — NAT strategy that always fails
 //! - [`make_test_dht`] — creates a `DidDht` with in-memory DHT client
-//! - [`test_builder`] — fully-configured domain-mode `ApplicationNodeBuilder`
-//! - [`test_no_domain_builder`] — no-domain mode builder with mock NAT
+//! - [`test_node_config`] — fully-configured domain-mode `NodeConfig`
+//! - [`test_no_domain_node_config`] — no-domain mode `NodeConfig` with mock NAT
 //! - [`create_test_identity`] — creates a test `ScpIdentity` + `DidDocument`
 
 #![forbid(unsafe_code)]
@@ -25,8 +25,8 @@ use scp_identity::dht_client::InMemoryDhtClient;
 use scp_identity::{DidDocument, ScpIdentity};
 use scp_node::tls;
 use scp_node::{
-    ApplicationNodeBuilder, DhtMode, HasDomain, HasIdentity, HasNoDomain, IdentitySource, NatSlot,
-    NatStrategy, NodeConfig, NodeError, Reach, ReachabilityTier, TlsProvider,
+    DhtMode, IdentitySource, NatSlot, NatStrategy, NodeConfig, NodeError, Reach, ReachabilityTier,
+    TlsProvider,
 };
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
@@ -43,8 +43,8 @@ pub fn make_test_dht(custody: &Arc<InMemoryKeyCustody>) -> TestDidDht {
 
 /// Mock TLS provider that succeeds with a self-signed certificate.
 ///
-/// Use this for domain-mode [`ApplicationNodeBuilder`] tests where actual
-/// ACME provisioning is not needed.
+/// Use this for domain-mode [`NodeConfig`] tests where actual ACME
+/// provisioning is not needed.
 pub struct SucceedingTlsProvider {
     /// The domain name for the self-signed certificate.
     pub domain: String,
@@ -118,44 +118,8 @@ impl NatStrategy for FailingNatStrategy {
     }
 }
 
-/// Creates a domain-mode [`ApplicationNodeBuilder`] with all required fields set.
-///
-/// Uses [`SucceedingTlsProvider`] and in-memory backends, suitable for most
-/// integration tests that need a running `ApplicationNode`.
-#[must_use]
-pub fn test_builder()
--> ApplicationNodeBuilder<InMemoryKeyCustody, TestDidDht, InMemoryStorage, HasDomain, HasIdentity> {
-    let custody = Arc::new(InMemoryKeyCustody::new());
-    let did_method = Arc::new(make_test_dht(&custody));
-    ApplicationNodeBuilder::new()
-        .storage(InMemoryStorage::new())
-        .domain("test.example.com")
-        .tls_provider(Arc::new(SucceedingTlsProvider {
-            domain: "test.example.com".to_owned(),
-        }))
-        .generate_identity_with(custody, did_method)
-}
-
-/// Creates a no-domain [`ApplicationNodeBuilder`] with mock NAT strategy.
-///
-/// The provided [`ReachabilityTier`] determines how the node advertises
-/// itself (`UPnP`, STUN, or Bridge).
-#[must_use]
-pub fn test_no_domain_builder(
-    tier: ReachabilityTier,
-) -> ApplicationNodeBuilder<InMemoryKeyCustody, TestDidDht, InMemoryStorage, HasNoDomain, HasIdentity>
-{
-    let custody = Arc::new(InMemoryKeyCustody::new());
-    let did_method = Arc::new(make_test_dht(&custody));
-    ApplicationNodeBuilder::new()
-        .storage(InMemoryStorage::new())
-        .no_domain()
-        .nat_strategy(Arc::new(MockNatStrategy { tier }))
-        .generate_identity_with(custody, did_method)
-}
-
 /// Creates a domain-mode [`NodeConfig`] with all required fields set
-/// (ADR-052 flat-config equivalent of [`test_builder`]).
+/// (ADR-052 flat-config equivalent of the former domain builder).
 ///
 /// Uses in-memory backends and the default `TlsMode::SelfSigned` (the same
 /// self-signed certificate [`SucceedingTlsProvider`] produces on a `Domain`
@@ -182,7 +146,7 @@ pub fn test_node_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemory
 }
 
 /// Creates a no-domain [`NodeConfig`] with a mock NAT strategy (ADR-052
-/// flat-config equivalent of [`test_no_domain_builder`]).
+/// flat-config equivalent of the former no-domain builder).
 ///
 /// The provided [`ReachabilityTier`] determines how the node advertises itself
 /// (`UPnP`, STUN, or Bridge), supplied via `NatSlot::Custom`. `NatTraversal` is

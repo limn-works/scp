@@ -25,7 +25,6 @@ pub mod webhook;
 mod well_known;
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,10 +33,9 @@ use std::time::Duration;
 use scp_core::store::{CURRENT_STORE_VERSION, ProtocolRepository, StoredValue};
 use scp_identity::document::DidDocument;
 use scp_identity::{DidMethod, IdentityError, ScpIdentity};
-use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::{NatTierChange, NetworkChangeDetector};
-use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
+use scp_transport::native::server::{RelayConfig, RelayError, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorage as _, BlobStorageBackend};
 use sha2::Digest;
 use tokio_util::sync::CancellationToken;
@@ -73,7 +71,7 @@ pub use config::{ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, Re
 /// the need for root/elevated privileges required by port 443.
 ///
 /// For development or internal-only deployments, use `127.0.0.1` (loopback
-/// only) via [`ApplicationNodeBuilder::http_bind_addr`] to avoid exposing
+/// only) via [`NodeConfig::http_bind_addr`] to avoid exposing
 /// the server to the network.
 pub const DEFAULT_HTTP_BIND_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8443);
@@ -103,7 +101,7 @@ pub(crate) const MAX_BROADCAST_CONTEXTS: usize = 1024;
 /// Default per-IP rate limit for broadcast projection endpoints (requests per second).
 ///
 /// Configurable via `SCP_NODE_PROJECTION_RATE_LIMIT` env var or
-/// [`ApplicationNodeBuilder::projection_rate_limit`].
+/// [`NodeConfig::projection_rate_limit`].
 ///
 /// See spec section 18.11.6.
 pub const DEFAULT_PROJECTION_RATE_LIMIT: u32 = 60;
@@ -249,7 +247,7 @@ impl IdentityHandle {
 
 /// A complete SCP application node composing relay, identity, and storage.
 ///
-/// Created via [`ApplicationNodeBuilder`] for production use, or via
+/// Created via [`Node::start`](crate::Node::start) for production use, or via
 /// [`ApplicationNode::dev`] for quick development/demo setups (requires the
 /// `allow_unencrypted_storage` feature).
 ///
@@ -474,7 +472,7 @@ impl<S: Storage> ApplicationNode<S> {
 
     /// Returns the dev API bearer token if the dev API is enabled.
     ///
-    /// Returns `Some` when [`ApplicationNodeBuilder::local_api`] was called,
+    /// Returns `Some` when [`NodeConfig::local_api`] was called,
     /// `None` otherwise. The token format is `scp_local_token_<32 hex chars>`.
     ///
     /// See spec section 18.10.2.
@@ -1485,7 +1483,7 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
     /// - Domain set to `localhost`
     ///
     /// This is the zero-friction path for demos, prototyping, and integration
-    /// tests. For production deployments, use [`ApplicationNodeBuilder`] with
+    /// tests. For production deployments, use [`Node::start`](crate::Node::start) with
     /// real key custody, encrypted storage, and ACME TLS.
     ///
     /// # Example
@@ -1544,19 +1542,11 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
     }
 }
 
-/// Returns a new [`ApplicationNodeBuilder`].
-///
-/// Convenience function equivalent to `ApplicationNodeBuilder::new()`.
-#[must_use]
-pub fn builder() -> ApplicationNodeBuilder {
-    ApplicationNodeBuilder::new()
-}
-
 // ---------------------------------------------------------------------------
 // Identity persistence
 // ---------------------------------------------------------------------------
 
-/// Storage key used by [`ApplicationNodeBuilder::identity_with_storage`] to
+/// Storage key used by [`IdentitySource::Persisted`](crate::IdentitySource::Persisted) to
 /// persist and reload the node's identity across restarts.
 ///
 /// The value stored under this key is a MessagePack-serialized
@@ -1567,7 +1557,7 @@ const IDENTITY_STORAGE_KEY: &str = "scp/identity";
 
 /// Serializable snapshot of an [`ScpIdentity`] and its [`DidDocument`].
 ///
-/// Used by [`ApplicationNodeBuilder::identity_with_storage`] to persist a newly
+/// Used by [`IdentitySource::Persisted`](crate::IdentitySource::Persisted) to persist a newly
 /// created identity so that subsequent restarts produce the same DID.
 ///
 /// # Storage format
@@ -1599,22 +1589,6 @@ struct PersistedIdentity {
 // These now live in `crate::config` (ADR-052 Phase B-P1 name reconciliation)
 // and are re-exported at crate root above. The typestate builder below still
 // constructs and matches on them by name.
-
-// ---------------------------------------------------------------------------
-// Builder type-state markers
-// ---------------------------------------------------------------------------
-
-/// Marker: domain has not been set on the builder.
-pub struct NoDomain;
-/// Marker: domain has been set on the builder.
-pub struct HasDomain;
-/// Marker: zero-config (no domain) mode has been explicitly selected (§10.12.8).
-pub struct HasNoDomain;
-
-/// Marker: identity has not been configured on the builder.
-pub struct NoIdentity;
-/// Marker: identity has been configured on the builder.
-pub struct HasIdentity;
 
 // ---------------------------------------------------------------------------
 // NAT strategy (mockable NAT probing for testability)
@@ -2450,890 +2424,6 @@ fn spawn_tier_reevaluation(
 }
 
 // ---------------------------------------------------------------------------
-// ApplicationNodeBuilder
-// ---------------------------------------------------------------------------
-
-/// Builder for [`ApplicationNode`].
-///
-/// Uses a type-state pattern to enforce required fields at compile time.
-/// The builder starts with `Dom = NoDomain, Id = NoIdentity`. Calling
-/// [`domain`](Self::domain) transitions `Dom` to [`HasDomain`], and calling
-/// [`generate_identity_with`](Self::generate_identity_with),
-/// [`identity`](Self::identity), or
-/// [`identity_with_storage`](Self::identity_with_storage) transitions `Id`
-/// to [`HasIdentity`]. [`build`](Self::build) is only available when both
-/// are set.
-///
-/// # Required fields
-///
-/// - [`domain`](Self::domain) -- the domain this node serves.
-/// - Identity -- one of [`generate_identity_with`](Self::generate_identity_with),
-///   [`identity`](Self::identity), or
-///   [`identity_with_storage`](Self::identity_with_storage).
-///
-/// # Optional fields
-///
-/// - [`storage`](Self::storage), [`blob_storage`](Self::blob_storage),
-///   [`bind_addr`](Self::bind_addr), [`acme_email`](Self::acme_email).
-pub struct ApplicationNodeBuilder<
-    K: KeyCustody = NoOpCustody,
-    D: DidMethod = NoOpDidMethod,
-    S: Storage = NoOpStorage,
-    Dom = NoDomain,
-    Id = NoIdentity,
-> {
-    domain: Option<String>,
-    identity_source: Option<IdentitySource<K, D>>,
-    storage: Option<S>,
-    blob_storage: Option<BlobStorageBackend>,
-    bind_addr: Option<SocketAddr>,
-    acme_email: Option<String>,
-    /// Override the STUN endpoint for NAT type probing (§10.12.8).
-    stun_server: Option<String>,
-    /// Override the bridge relay for Tier 3 fallback (§10.12.8).
-    bridge_relay: Option<String>,
-    /// Pluggable NAT strategy for testability.
-    nat_strategy: Option<Arc<dyn NatStrategy>>,
-    /// Optional UPnP/NAT-PMP port mapper for Tier 1 (spec 10.12.2).
-    port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
-    /// Optional reachability probe for self-test (SCP-242, spec 10.12.2 step 4).
-    reachability_probe: Option<Arc<dyn scp_transport::nat::ReachabilityProbe>>,
-    /// Pluggable TLS provider for testability (domain mode only).
-    tls_provider: Option<Arc<dyn TlsProvider>>,
-    /// Network change detector for tier re-evaluation (§10.12.1, SCP-243).
-    /// When present, network change events trigger immediate re-evaluation.
-    network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    /// Bind address for the local dev API server. `None` = dev API disabled.
-    local_api_addr: Option<SocketAddr>,
-    /// Bind address for the public HTTP server. Separate from the relay's
-    /// internal listener to avoid double-binding (#224). Defaults to
-    /// [`DEFAULT_HTTP_BIND_ADDR`] (`0.0.0.0:8443`).
-    http_bind_addr: Option<SocketAddr>,
-    /// CORS allowed origins for public endpoints. `None` = permissive (`*`).
-    /// See issue #231.
-    cors_origins: Option<Vec<String>>,
-    /// Per-IP rate limit for broadcast projection endpoints (req/s).
-    /// `None` uses the default of 60 req/s. Configurable via
-    /// `SCP_NODE_PROJECTION_RATE_LIMIT` env var.
-    projection_rate_limit: Option<u32>,
-    /// HTTP/3 configuration (spec §10.15.1). `None` = HTTP/3 disabled.
-    #[cfg(feature = "http3")]
-    http3_config: Option<scp_transport::http3::Http3Config>,
-    /// When `true`, the builder will check storage for an existing identity
-    /// before generating a new one, and persist newly created identities.
-    /// Set by [`identity_with_storage`](Self::identity_with_storage).
-    persist_identity: bool,
-    /// Optional DNS provider configuration for zero-config TLS via DNS
-    /// subdomain (issue #642). When set, `build()` overrides the domain
-    /// and TLS provider with DNS-derived values after identity resolution.
-    dns_provider_config: Option<dns_provider::DnsProviderConfig>,
-    /// When `true`, the no-domain build path skips the blocking STUN/NAT
-    /// external-address probe entirely, binds and serves immediately, and
-    /// publishes a loopback relay URL. Set via [`skip_nat_probe`](Self::skip_nat_probe).
-    ///
-    /// This is the correct posture when the node is reached through a
-    /// tunnel/proxy (e.g. a Cloudflare tunnel terminating on `localhost`): the
-    /// external reachability discovery is dead weight there, and the discovered
-    /// external IP would only feed the published relay URL and an extra cert SAN
-    /// that the tunnel never uses. Ignored in domain mode (which never probes).
-    skip_nat_probe: bool,
-    _domain_state: PhantomData<Dom>,
-    _identity_state: PhantomData<Id>,
-}
-
-impl ApplicationNodeBuilder {
-    /// Creates a new builder with all fields unset.
-    ///
-    /// The relay uses [`BlobStorageBackend::default()`] (in-memory) by default. Call
-    /// [`blob_storage`](Self::blob_storage) to use a different backend.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            domain: None,
-            identity_source: None,
-            storage: None,
-            blob_storage: Some(BlobStorageBackend::default()),
-            bind_addr: None,
-            acme_email: None,
-            stun_server: None,
-            bridge_relay: None,
-            nat_strategy: None,
-            port_mapper: None,
-            reachability_probe: None,
-            tls_provider: None,
-            network_detector: None,
-            local_api_addr: None,
-            http_bind_addr: None,
-            cors_origins: None,
-            projection_rate_limit: None,
-            #[cfg(feature = "http3")]
-            http3_config: None,
-            persist_identity: false,
-            dns_provider_config: None,
-            skip_nat_probe: false,
-            _domain_state: PhantomData,
-            _identity_state: PhantomData,
-        }
-    }
-}
-
-impl Default
-    for ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, NoOpStorage, NoDomain, NoIdentity>
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
-    ApplicationNodeBuilder<K, D, S, NoDomain, Id>
-{
-    /// Sets the domain this node serves.
-    ///
-    /// The relay URL is derived as `wss://<domain>/scp/v1` (spec section
-    /// 18.5.2). Either `.domain()` or `.no_domain()` must be called —
-    /// the builder cannot be built without one (§10.12.8).
-    #[must_use]
-    pub fn domain(self, domain: &str) -> ApplicationNodeBuilder<K, D, S, HasDomain, Id> {
-        ApplicationNodeBuilder {
-            domain: Some(domain.to_owned()),
-            identity_source: self.identity_source,
-            storage: self.storage,
-            blob_storage: self.blob_storage,
-            bind_addr: self.bind_addr,
-            acme_email: self.acme_email,
-            stun_server: self.stun_server,
-            bridge_relay: self.bridge_relay,
-            nat_strategy: self.nat_strategy,
-            port_mapper: self.port_mapper,
-            reachability_probe: self.reachability_probe,
-            tls_provider: self.tls_provider,
-            network_detector: self.network_detector,
-            local_api_addr: self.local_api_addr,
-            http_bind_addr: self.http_bind_addr,
-            cors_origins: self.cors_origins,
-            projection_rate_limit: self.projection_rate_limit,
-            #[cfg(feature = "http3")]
-            http3_config: self.http3_config,
-            persist_identity: self.persist_identity,
-            dns_provider_config: self.dns_provider_config,
-            skip_nat_probe: self.skip_nat_probe,
-            _domain_state: PhantomData,
-            _identity_state: PhantomData,
-        }
-    }
-
-    /// Zero-config NAT-traversed mode (§10.12.8).
-    ///
-    /// When set: skip ACME TLS provisioning, probe NAT type via STUN,
-    /// attempt `UPnP` (Tier 1), fallback to STUN address (Tier 2),
-    /// register with bridge (Tier 3), publish DID document with `ws://`
-    /// relay URL, do NOT serve `.well-known/scp`.
-    ///
-    /// This is the zero-config deployment path for self-hosted relays
-    /// behind residential NAT.
-    #[must_use]
-    pub fn no_domain(self) -> ApplicationNodeBuilder<K, D, S, HasNoDomain, Id> {
-        ApplicationNodeBuilder {
-            domain: None,
-            identity_source: self.identity_source,
-            storage: self.storage,
-            blob_storage: self.blob_storage,
-            bind_addr: self.bind_addr,
-            acme_email: self.acme_email,
-            stun_server: self.stun_server,
-            bridge_relay: self.bridge_relay,
-            nat_strategy: self.nat_strategy,
-            port_mapper: self.port_mapper,
-            reachability_probe: self.reachability_probe,
-            tls_provider: self.tls_provider,
-            network_detector: self.network_detector,
-            local_api_addr: self.local_api_addr,
-            http_bind_addr: self.http_bind_addr,
-            cors_origins: self.cors_origins,
-            projection_rate_limit: self.projection_rate_limit,
-            #[cfg(feature = "http3")]
-            http3_config: self.http3_config,
-            persist_identity: self.persist_identity,
-            dns_provider_config: self.dns_provider_config,
-            skip_nat_probe: self.skip_nat_probe,
-            _domain_state: PhantomData,
-            _identity_state: PhantomData,
-        }
-    }
-}
-
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom, Id>
-    ApplicationNodeBuilder<K, D, S, Dom, Id>
-{
-    /// Sets the socket address for the relay server to bind to.
-    ///
-    /// Defaults to `127.0.0.1:0` (OS-assigned port) if not specified.
-    #[must_use]
-    pub const fn bind_addr(mut self, addr: SocketAddr) -> Self {
-        self.bind_addr = Some(addr);
-        self
-    }
-
-    /// Sets the ACME email for TLS certificate provisioning.
-    ///
-    /// Used for Let's Encrypt certificate requests (spec section 18.6.3).
-    /// When `.domain()` is set, the email is passed to
-    /// [`AcmeProvider`](tls::AcmeProvider) during `build()` for ACME account
-    /// registration (SCP-246). Optional -- if omitted, the ACME account is
-    /// created without a contact email.
-    #[must_use]
-    pub fn acme_email(mut self, email: &str) -> Self {
-        self.acme_email = Some(email.to_owned());
-        self
-    }
-
-    /// Override the STUN endpoint used for NAT type probing (§10.12.8).
-    ///
-    /// Default: bootstrap relay with STUN support. The value should be a
-    /// socket address (e.g., `"stun.l.google.com:19302"`).
-    #[must_use]
-    pub fn stun_server(mut self, url: &str) -> Self {
-        self.stun_server = Some(url.to_owned());
-        self
-    }
-
-    /// Override the bridge relay used for Tier 3 fallback (§10.12.8).
-    ///
-    /// Default: first bridge-capable relay in the fallback relay list.
-    /// The value should be a `wss://` URL.
-    #[must_use]
-    pub fn bridge_relay(mut self, url: &str) -> Self {
-        self.bridge_relay = Some(url.to_owned());
-        self
-    }
-
-    /// Sets a custom NAT strategy for testability.
-    ///
-    /// Production code uses [`DefaultNatStrategy`] (created automatically
-    /// during `build()`). Tests can inject mock strategies.
-    #[must_use]
-    pub fn nat_strategy(mut self, strategy: Arc<dyn NatStrategy>) -> Self {
-        self.nat_strategy = Some(strategy);
-        self
-    }
-
-    /// Sets a UPnP/NAT-PMP port mapper for Tier 1 NAT traversal (spec 10.12.2).
-    ///
-    /// When set, the [`DefaultNatStrategy`] will attempt `UPnP` port mapping
-    /// before falling through to STUN (Tier 2). Has no effect if a custom
-    /// [`NatStrategy`] is provided via [`nat_strategy`](Self::nat_strategy).
-    #[must_use]
-    pub fn port_mapper(mut self, mapper: Arc<dyn scp_transport::nat::PortMapper>) -> Self {
-        self.port_mapper = Some(mapper);
-        self
-    }
-
-    /// Sets a reachability probe for self-test verification (SCP-242).
-    ///
-    /// The self-test verifies that an external address is actually reachable
-    /// before publishing it in the DID document (spec 10.12.2 step 4). When
-    /// not set, the [`DefaultNatStrategy`] constructs a
-    /// [`DefaultReachabilityProbe`](scp_transport::nat::DefaultReachabilityProbe)
-    /// from the first configured STUN endpoint. Has no effect if a custom
-    /// [`NatStrategy`] is provided via [`nat_strategy`](Self::nat_strategy).
-    #[must_use]
-    pub fn reachability_probe(
-        mut self,
-        probe: Arc<dyn scp_transport::nat::ReachabilityProbe>,
-    ) -> Self {
-        self.reachability_probe = Some(probe);
-        self
-    }
-
-    /// Sets a custom TLS provider for testability.
-    ///
-    /// Production code uses [`AcmeProvider`](tls::AcmeProvider) (created
-    /// automatically during domain `build()`). Tests can inject mock
-    /// providers that succeed or fail deterministically.
-    #[must_use]
-    pub fn tls_provider(mut self, provider: Arc<dyn TlsProvider>) -> Self {
-        self.tls_provider = Some(provider);
-        self
-    }
-
-    /// Configures zero-config TLS via the SCP DNS subdomain service (#642).
-    ///
-    /// When set, `build()` derives a deterministic subdomain from the node's
-    /// DID (after identity resolution) and creates an [`ScpDnsProvider`] that
-    /// registers with the Limn DNS API for automatic Let's Encrypt
-    /// certificate provisioning.
-    ///
-    /// The domain set via `.domain()` is **overridden** during `build()` with
-    /// the DNS-derived subdomain (e.g., `a3f8b2c1.scp.ctx.network`).
-    ///
-    /// Falls back to self-signed if the DNS API is unreachable — the protocol
-    /// still works because MLS provides real confidentiality.
-    ///
-    /// [`ScpDnsProvider`]: dns_provider::ScpDnsProvider
-    #[must_use]
-    pub fn dns_provider(mut self, config: dns_provider::DnsProviderConfig) -> Self {
-        self.dns_provider_config = Some(config);
-        self
-    }
-
-    /// Sets a network change detector for tier re-evaluation (§10.12.1, SCP-243).
-    ///
-    /// When provided, network change events (IP change, interface up/down)
-    /// trigger immediate re-evaluation of the reachability tier. Without a
-    /// detector, only the periodic 30-minute timer triggers re-evaluation.
-    ///
-    /// Use `ChannelNetworkChangeDetector`
-    /// for channel-based event injection, or implement
-    /// [`NetworkChangeDetector`]
-    /// for platform-specific detection.
-    #[must_use]
-    pub fn network_detector(mut self, detector: Arc<dyn NetworkChangeDetector>) -> Self {
-        self.network_detector = Some(detector);
-        self
-    }
-
-    /// Enables the local dev API on the specified address.
-    ///
-    /// When set, a bearer token is generated at build time and logged at
-    /// `INFO` level. The dev API listens on a separate port from the public
-    /// HTTPS listener, typically bound to `127.0.0.1:<port>`.
-    ///
-    /// If not called, the dev API is disabled (production default).
-    ///
-    /// See spec section 18.10.2 and 18.10.5.
-    /// # Panics
-    ///
-    /// Panics if `addr` is not a loopback address (`127.0.0.1` or `::1`).
-    /// The dev API must never be exposed on a non-loopback interface.
-    #[must_use]
-    pub fn local_api(mut self, addr: SocketAddr) -> Self {
-        assert!(
-            addr.ip().is_loopback(),
-            "dev API bind address must be loopback (127.0.0.1 or ::1), got {addr}"
-        );
-        self.local_api_addr = Some(addr);
-        self
-    }
-
-    /// Sets the bind address for the public HTTP server.
-    ///
-    /// This is the address where [`ApplicationNode::serve`] listens for
-    /// incoming HTTP/HTTPS connections (`.well-known/scp`, `/scp/v1`
-    /// WebSocket upgrade, broadcast projection endpoints, and any
-    /// application routes).
-    ///
-    /// This is distinct from the relay's internal bind address (set via
-    /// [`bind_addr`](Self::bind_addr)), which is a localhost-only listener
-    /// used for the internal WebSocket bridge.
-    ///
-    /// Defaults to [`DEFAULT_HTTP_BIND_ADDR`] (`0.0.0.0:8443`) if not specified.
-    #[must_use]
-    pub const fn http_bind_addr(mut self, addr: SocketAddr) -> Self {
-        self.http_bind_addr = Some(addr);
-        self
-    }
-
-    /// Sets the allowed CORS origins for public endpoints.
-    ///
-    /// Public endpoints (`.well-known/scp`, broadcast projection feeds and
-    /// messages) include `Access-Control-Allow-Origin` headers so that
-    /// browser-based JavaScript and WASM clients can read responses
-    /// cross-origin.
-    ///
-    /// - If not called, or called with an empty list: permissive CORS
-    ///   (`Access-Control-Allow-Origin: *`). This is the default because
-    ///   broadcast content is public by design (spec section 18.11.6).
-    /// - If called with a non-empty list: restricts to exactly those
-    ///   origins (e.g., `["https://example.com"]`).
-    ///
-    /// CORS is NOT applied to the WebSocket relay endpoint (`/scp/v1`)
-    /// because WebSocket upgrades have their own origin mechanism, nor to
-    /// the dev API (localhost-only).
-    ///
-    /// See issue #231.
-    #[must_use]
-    pub fn cors_origins(mut self, origins: Vec<String>) -> Self {
-        self.cors_origins = if origins.is_empty() {
-            None
-        } else {
-            Some(origins)
-        };
-        self
-    }
-
-    /// Sets the per-IP rate limit for broadcast projection endpoints.
-    ///
-    /// Controls the maximum number of requests per second from a single IP
-    /// address to the `/scp/broadcast/*` endpoints. Exceeding this rate
-    /// returns HTTP 429 Too Many Requests.
-    ///
-    /// Default: 60 req/s. Also configurable via `SCP_NODE_PROJECTION_RATE_LIMIT`.
-    ///
-    /// See spec section 18.11.6.
-    #[must_use]
-    pub const fn projection_rate_limit(mut self, rate: u32) -> Self {
-        self.projection_rate_limit = Some(rate);
-        self
-    }
-
-    /// Configures HTTP/3 support for the node (spec §10.15.1).
-    ///
-    /// When set, the node starts an HTTP/3 listener on a QUIC endpoint
-    /// alongside the HTTP/1.1+HTTP/2 listener. All HTTP/1.1 and HTTP/2
-    /// responses will include an `Alt-Svc` header advertising the HTTP/3
-    /// endpoint.
-    ///
-    /// Requires the `http3` feature flag.
-    #[cfg(feature = "http3")]
-    #[must_use]
-    pub fn http3(mut self, config: scp_transport::http3::Http3Config) -> Self {
-        self.http3_config = Some(config);
-        self
-    }
-}
-
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
-    ApplicationNodeBuilder<K, D, NoOpStorage, Dom, Id>
-{
-    /// Sets an explicit storage backend.
-    ///
-    /// If not called, `.build()` uses a default no-op storage.
-    pub fn storage<S2: Storage + 'static>(
-        self,
-        storage: S2,
-    ) -> ApplicationNodeBuilder<K, D, S2, Dom, Id> {
-        ApplicationNodeBuilder {
-            domain: self.domain,
-            identity_source: self.identity_source,
-            storage: Some(storage),
-            blob_storage: self.blob_storage,
-            bind_addr: self.bind_addr,
-            acme_email: self.acme_email,
-            stun_server: self.stun_server,
-            bridge_relay: self.bridge_relay,
-            nat_strategy: self.nat_strategy,
-            port_mapper: self.port_mapper,
-            reachability_probe: self.reachability_probe,
-            tls_provider: self.tls_provider,
-            network_detector: self.network_detector,
-            local_api_addr: self.local_api_addr,
-            http_bind_addr: self.http_bind_addr,
-            cors_origins: self.cors_origins,
-            projection_rate_limit: self.projection_rate_limit,
-            #[cfg(feature = "http3")]
-            http3_config: self.http3_config,
-            persist_identity: self.persist_identity,
-            dns_provider_config: self.dns_provider_config,
-            skip_nat_probe: self.skip_nat_probe,
-            _domain_state: PhantomData,
-            _identity_state: PhantomData,
-        }
-    }
-}
-
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom, Id>
-    ApplicationNodeBuilder<K, D, S, Dom, Id>
-{
-    /// Sets a custom blob storage backend for the relay server.
-    ///
-    /// If not called, the relay uses in-memory storage (all blobs lost on restart).
-    /// Accepts any type that converts into [`BlobStorageBackend`].
-    #[must_use]
-    pub fn blob_storage(mut self, blob_storage: impl Into<BlobStorageBackend>) -> Self {
-        self.blob_storage = Some(blob_storage.into());
-        self
-    }
-
-    /// Skips the blocking STUN/NAT external-address probe in no-domain
-    /// (`§10.12.8`) mode.
-    ///
-    /// By default a no-domain build probes NAT type over STUN, attempts a
-    /// UPnP/NAT-PMP port mapping, and runs a reachability self-test before it
-    /// publishes a relay URL — discovery that can add tens of seconds to
-    /// startup. When the node is reached through a tunnel/proxy that terminates
-    /// on `localhost` (e.g. a Cloudflare tunnel), that discovery is dead weight:
-    /// external reachability is provided by the tunnel, and the discovered
-    /// external IP would only feed the published relay URL and an extra
-    /// certificate SAN the tunnel never uses.
-    ///
-    /// When set, the no-domain build path:
-    /// * does NOT call [`NatStrategy::select_tier`] (no STUN, no port mapping);
-    /// * publishes a loopback relay URL (`ws://127.0.0.1:<port>/scp/v1`), so no
-    ///   external IP is disclosed and no external-IP certificate SAN is added;
-    /// * does NOT spawn the periodic tier re-evaluation task (there is no tier
-    ///   to re-evaluate).
-    ///
-    /// Has no effect in domain mode, which never probes NAT.
-    #[must_use]
-    pub const fn skip_nat_probe(mut self) -> Self {
-        self.skip_nat_probe = true;
-        self
-    }
-}
-
-impl<S: Storage + 'static, Dom>
-    ApplicationNodeBuilder<NoOpCustody, NoOpDidMethod, S, Dom, NoIdentity>
-{
-    /// Sets an explicit identity and DID document to use.
-    ///
-    /// The identity will be published to the DHT with `SCPRelay` entries
-    /// pointing to this node's relay URL.
-    pub fn identity<D2: DidMethod + 'static>(
-        self,
-        identity: ScpIdentity,
-        document: DidDocument,
-        did_method: Arc<D2>,
-    ) -> ApplicationNodeBuilder<NoOpCustody, D2, S, Dom, HasIdentity> {
-        ApplicationNodeBuilder {
-            domain: self.domain,
-            identity_source: Some(IdentitySource::Explicit(Box::new(ExplicitIdentity {
-                identity,
-                document,
-                did_method,
-            }))),
-            storage: self.storage,
-            blob_storage: self.blob_storage,
-            bind_addr: self.bind_addr,
-            acme_email: self.acme_email,
-            stun_server: self.stun_server,
-            bridge_relay: self.bridge_relay,
-            nat_strategy: self.nat_strategy,
-            port_mapper: self.port_mapper,
-            reachability_probe: self.reachability_probe,
-            tls_provider: self.tls_provider,
-            network_detector: self.network_detector,
-            local_api_addr: self.local_api_addr,
-            http_bind_addr: self.http_bind_addr,
-            cors_origins: self.cors_origins,
-            projection_rate_limit: self.projection_rate_limit,
-            #[cfg(feature = "http3")]
-            http3_config: self.http3_config,
-            persist_identity: self.persist_identity,
-            dns_provider_config: self.dns_provider_config,
-            skip_nat_probe: self.skip_nat_probe,
-            _domain_state: PhantomData,
-            _identity_state: PhantomData,
-        }
-    }
-
-    /// Configures the builder to generate a new DID identity on `.build()`.
-    ///
-    /// Uses the provided key custody and DID method implementations.
-    pub fn generate_identity_with<K2: KeyCustody + 'static, D2: DidMethod + 'static>(
-        self,
-        key_custody: Arc<K2>,
-        did_method: Arc<D2>,
-    ) -> ApplicationNodeBuilder<K2, D2, S, Dom, HasIdentity> {
-        ApplicationNodeBuilder {
-            domain: self.domain,
-            identity_source: Some(IdentitySource::Generate {
-                custody: key_custody,
-                did_method,
-            }),
-            storage: self.storage,
-            blob_storage: self.blob_storage,
-            bind_addr: self.bind_addr,
-            acme_email: self.acme_email,
-            stun_server: self.stun_server,
-            bridge_relay: self.bridge_relay,
-            nat_strategy: self.nat_strategy,
-            port_mapper: self.port_mapper,
-            reachability_probe: self.reachability_probe,
-            tls_provider: self.tls_provider,
-            network_detector: self.network_detector,
-            local_api_addr: self.local_api_addr,
-            http_bind_addr: self.http_bind_addr,
-            cors_origins: self.cors_origins,
-            projection_rate_limit: self.projection_rate_limit,
-            #[cfg(feature = "http3")]
-            http3_config: self.http3_config,
-            persist_identity: self.persist_identity,
-            dns_provider_config: self.dns_provider_config,
-            skip_nat_probe: self.skip_nat_probe,
-            _domain_state: PhantomData,
-            _identity_state: PhantomData,
-        }
-    }
-
-    /// Configures the builder to automatically persist and reload identity.
-    ///
-    /// This is the recommended way to manage identity for long-lived
-    /// applications. On the first run it behaves like
-    /// [`generate_identity_with`](Self::generate_identity_with): it creates a
-    /// new DID via the provided `key_custody` and `did_method`, then persists
-    /// the resulting [`ScpIdentity`] and [`DidDocument`] to the builder's
-    /// storage backend under the key `"scp/identity"`.
-    ///
-    /// On subsequent runs with the same storage backend, the persisted
-    /// identity is deserialized and reused — no new DID is created. This
-    /// ensures the node keeps the same DID across restarts.
-    ///
-    /// # Lifecycle
-    ///
-    /// 1. At `.build()` time, check storage for key `"scp/identity"`.
-    /// 2. **Found:** Deserialize the stored [`ScpIdentity`] and
-    ///    [`DidDocument`], use the `.identity()` path internally.
-    /// 3. **Not found:** Call `did_method.create(custody)`, persist the
-    ///    result to storage, then continue.
-    ///
-    /// `KeyHandle` indices remain valid across restarts because the custody
-    /// backend (e.g., `FileKeyCustody`) reloads the same keyring from disk.
-    ///
-    /// # Requirements
-    ///
-    /// A real storage backend must be set via [`.storage()`](Self::storage)
-    /// before calling `.build()`. The default no-op storage will not persist
-    /// anything.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use std::sync::Arc;
-    /// # use scp_node::ApplicationNodeBuilder;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// // let custody = Arc::new(FileKeyCustody::open("keys.db")?);
-    /// // let did_method = Arc::new(DidDht::new(...));
-    /// // let storage = SqliteStorage::open("node.db")?;
-    /// //
-    /// // let node = ApplicationNodeBuilder::new()
-    /// //     .storage(storage)
-    /// //     .domain("example.com")
-    /// //     .identity_with_storage(custody, did_method)
-    /// //     .build()
-    /// //     .await?;
-    /// // // First run: creates new DID, persists to storage.
-    /// // // Subsequent runs: reloads same DID from storage.
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn identity_with_storage<K2: KeyCustody + 'static, D2: DidMethod + 'static>(
-        self,
-        key_custody: Arc<K2>,
-        did_method: Arc<D2>,
-    ) -> ApplicationNodeBuilder<K2, D2, S, Dom, HasIdentity> {
-        ApplicationNodeBuilder {
-            domain: self.domain,
-            identity_source: Some(IdentitySource::Generate {
-                custody: key_custody,
-                did_method,
-            }),
-            storage: self.storage,
-            blob_storage: self.blob_storage,
-            bind_addr: self.bind_addr,
-            acme_email: self.acme_email,
-            stun_server: self.stun_server,
-            bridge_relay: self.bridge_relay,
-            nat_strategy: self.nat_strategy,
-            port_mapper: self.port_mapper,
-            reachability_probe: self.reachability_probe,
-            tls_provider: self.tls_provider,
-            network_detector: self.network_detector,
-            local_api_addr: self.local_api_addr,
-            http_bind_addr: self.http_bind_addr,
-            cors_origins: self.cors_origins,
-            projection_rate_limit: self.projection_rate_limit,
-            #[cfg(feature = "http3")]
-            http3_config: self.http3_config,
-            persist_identity: true,
-            dns_provider_config: self.dns_provider_config,
-            skip_nat_probe: self.skip_nat_probe,
-            _domain_state: PhantomData,
-            _identity_state: PhantomData,
-        }
-    }
-}
-
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: EncryptedStorage + 'static>
-    ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
-{
-    /// Builds the [`ApplicationNode`].
-    ///
-    /// Requires `S: EncryptedStorage` — compile-time enforcement that
-    /// the storage backend encrypts data at rest. For testing with
-    /// unencrypted backends, use [`build_for_testing`](Self::build_for_testing).
-    ///
-    /// See issue #695.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NodeError`] if storage, identity, relay, or TLS setup fails.
-    pub async fn build(mut self) -> Result<ApplicationNode<S>, NodeError> {
-        let storage = self
-            .storage
-            .take()
-            .ok_or(NodeError::MissingField("storage"))?;
-        let protocol_repository = Arc::new(ProtocolRepository::new(storage));
-        self.build_with_store(protocol_repository).await
-    }
-}
-
-/// Testing variant of `build()` — accepts any `Storage` backend.
-#[cfg(any(test, feature = "allow_unencrypted_storage"))]
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
-    ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
-{
-    /// Builds the [`ApplicationNode`] without requiring encrypted storage.
-    ///
-    /// **Testing only.** Production code must use [`build`](Self::build).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NodeError`] if storage, identity, relay, or TLS setup fails.
-    pub async fn build_for_testing(mut self) -> Result<ApplicationNode<S>, NodeError> {
-        let storage = self
-            .storage
-            .take()
-            .ok_or(NodeError::MissingField("storage"))?;
-        let protocol_repository = Arc::new(ProtocolRepository::new_for_testing(storage));
-        self.build_with_store(protocol_repository).await
-    }
-}
-
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
-    ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
-{
-    /// Shared build logic after `ProtocolRepository` has been constructed.
-    #[allow(clippy::too_many_lines)] // builder with many config steps
-    async fn build_with_store(
-        self,
-        protocol_repository: Arc<ProtocolRepository<S>>,
-    ) -> Result<ApplicationNode<S>, NodeError> {
-        let mut domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
-        let identity_source = self
-            .identity_source
-            .ok_or(NodeError::MissingField("identity"))?;
-        let persist = self.persist_identity;
-
-        let (identity, document, did_method) =
-            resolve_identity_persistent(identity_source, persist, protocol_repository.storage())
-                .await?;
-
-        // If DNS provider config is set, derive the subdomain from the DID
-        // and create the ScpDnsProvider as the TLS provider (#642).
-        let tls_provider_override = if let Some(dns_config) = self.dns_provider_config {
-            let (provider, dns_domain) = dns_config.build(&identity.did);
-            tracing::info!(
-                did = %identity.did,
-                dns_domain = %dns_domain,
-                node_id = %provider.node_id(),
-                "using DNS subdomain provider for zero-config TLS"
-            );
-            domain = dns_domain;
-            Some(Arc::new(provider) as Arc<dyn TlsProvider>)
-        } else {
-            None
-        };
-
-        let bridge_secret = generate_bridge_secret();
-        let bind_addr = self
-            .bind_addr
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
-        let relay_config = RelayConfig {
-            bind_addr,
-            bridge_secret: Some(*bridge_secret),
-            ..RelayConfig::default()
-        };
-
-        let blob_storage = Arc::new(
-            self.blob_storage
-                .ok_or(NodeError::MissingField("blob_storage"))?,
-        );
-        let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
-        let connection_tracker = relay_server.connection_tracker();
-        let subscription_registry = relay_server.subscriptions();
-        // Shared PUBLISH rate limiter — the QUIC listener reuses it so PUBLISH
-        // budgets are enforced uniformly across WebSocket and QUIC (ADR-037 AC3).
-        #[cfg(feature = "quic")]
-        let publish_rate_limiter = relay_server.publish_rate_limiter();
-        let (shutdown_handle, bound_addr) = relay_server.start().await?;
-        let dev_token = self.local_api_addr.map(generate_dev_token);
-        let http_bind_addr = self.http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
-
-        let tls_provider = resolve_tls(
-            tls_provider_override.or(self.tls_provider),
-            &domain,
-            &protocol_repository,
-            self.acme_email.as_ref(),
-        );
-
-        let (provision_result, acme_challenges) =
-            provision_with_challenge_listener(&*tls_provider).await?;
-        let rate_limit = self
-            .projection_rate_limit
-            .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT);
-
-        match provision_result {
-            Ok(cert_data) => {
-                build_domain_inner(
-                    domain,
-                    identity,
-                    document,
-                    did_method,
-                    protocol_repository,
-                    shutdown_handle,
-                    bound_addr,
-                    bridge_secret,
-                    dev_token,
-                    self.local_api_addr,
-                    blob_storage,
-                    relay_config,
-                    http_bind_addr,
-                    self.cors_origins.clone(),
-                    rate_limit,
-                    cert_data,
-                    connection_tracker.clone(),
-                    subscription_registry.clone(),
-                    #[cfg(feature = "quic")]
-                    publish_rate_limiter.clone(),
-                    acme_challenges,
-                    #[cfg(feature = "http3")]
-                    self.http3_config,
-                )
-                .await
-            }
-            Err(tls_err) => {
-                tracing::warn!(
-                    domain = %domain, error = %tls_err,
-                    "TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
-                );
-                let strategy = resolve_nat(
-                    self.nat_strategy,
-                    self.stun_server,
-                    self.bridge_relay,
-                    self.port_mapper,
-                    self.reachability_probe,
-                );
-                build_no_domain_inner(
-                    identity,
-                    document,
-                    did_method,
-                    protocol_repository,
-                    shutdown_handle,
-                    bound_addr,
-                    strategy,
-                    bridge_secret,
-                    dev_token,
-                    self.local_api_addr,
-                    blob_storage,
-                    relay_config,
-                    Some(http_bind_addr),
-                    self.cors_origins,
-                    rate_limit,
-                    self.network_detector,
-                    connection_tracker,
-                    subscription_registry,
-                    #[cfg(feature = "quic")]
-                    publish_rate_limiter,
-                    self.skip_nat_probe,
-                )
-                .await
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Bridge secret generation
 // ---------------------------------------------------------------------------
 
@@ -3372,11 +2462,11 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             Ok((identity, document, did_method))
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
-        // `Persisted` is lowered by `Node::start` onto `identity_with_storage`
-        // (which sets `persist_identity = true` and stores `Generate`), so it
-        // never reaches the resolvers via the typestate builder.
+        // `Node::start` normalizes `Persisted` to a `Generate` source with
+        // `persist = true` before calling the resolvers, so a `Persisted`
+        // variant never reaches `resolve_identity`.
         IdentitySource::Persisted { .. } => unreachable!(
-            "IdentitySource::Persisted is lowered onto identity_with_storage by Node::start \
+            "IdentitySource::Persisted is normalized to Generate by Node::start \
              and never reaches resolve_identity"
         ),
     }
@@ -3497,7 +2587,7 @@ fn verify_vm_match(
 ///      storage, then return the new identity.
 ///
 /// When `persist` is `false`, delegates to [`resolve_identity`].
-async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
+pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
     source: IdentitySource<K, D>,
     persist: bool,
     storage: &S,
@@ -3590,11 +2680,11 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
         }
         // Explicit identities are never persisted — caller already manages them.
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
-        // `Persisted` is lowered by `Node::start` onto `identity_with_storage`
-        // (which sets `persist_identity = true` and stores a `Generate`
-        // source), so it never reaches the resolvers via the typestate builder.
+        // `Node::start` normalizes `Persisted` to a `Generate` source with
+        // `persist = true` before calling this resolver, so a `Persisted`
+        // variant never reaches `resolve_identity_persistent`.
         IdentitySource::Persisted { .. } => unreachable!(
-            "IdentitySource::Persisted is lowered onto identity_with_storage by Node::start \
+            "IdentitySource::Persisted is normalized to Generate by Node::start \
              and never reaches resolve_identity_persistent"
         ),
     }
@@ -3603,7 +2693,7 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
 /// Generates a 32-byte bridge secret using `OsRng`.
 ///
 /// Wrapped in `Zeroizing` so the secret is zeroed on drop.
-fn generate_bridge_secret() -> Zeroizing<[u8; 32]> {
+pub(crate) fn generate_bridge_secret() -> Zeroizing<[u8; 32]> {
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     Zeroizing::new(bytes)
@@ -3617,7 +2707,7 @@ fn generate_bridge_secret() -> Zeroizing<[u8; 32]> {
 ///
 /// 16 random bytes from `OsRng` → 32 hex chars (spec §18.10.2).
 /// Logs a masked prefix — never the full token.
-fn generate_dev_token(addr: SocketAddr) -> String {
+pub(crate) fn generate_dev_token(addr: SocketAddr) -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -3638,7 +2728,7 @@ fn generate_dev_token(addr: SocketAddr) -> String {
 
 /// Resolves the TLS provider: uses the explicitly provided one, or constructs
 /// a default [`AcmeProvider`](tls::AcmeProvider) for the given domain.
-fn resolve_tls<S: Storage + 'static>(
+pub(crate) fn resolve_tls<S: Storage + 'static>(
     provider: Option<Arc<dyn TlsProvider>>,
     domain: &str,
     storage: &Arc<ProtocolRepository<S>>,
@@ -3730,7 +2820,7 @@ async fn start_acme_challenge_listener(
 /// # Errors
 ///
 /// Returns [`NodeError::Serve`] if the ACME listener cannot bind.
-async fn provision_with_challenge_listener(
+pub(crate) async fn provision_with_challenge_listener(
     provider: &dyn TlsProvider,
 ) -> Result<
     (
@@ -3767,7 +2857,7 @@ async fn provision_with_challenge_listener(
 
 /// Resolves the NAT traversal strategy: uses the explicitly provided one, or
 /// constructs a [`DefaultNatStrategy`] from the STUN/bridge/port-mapper configuration.
-fn resolve_nat(
+pub(crate) fn resolve_nat(
     strategy: Option<Arc<dyn NatStrategy>>,
     stun_server: Option<String>,
     bridge_relay: Option<String>,
@@ -3814,7 +2904,7 @@ fn resolve_nat(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
+pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     domain: String,
     identity: ScpIdentity,
     mut document: DidDocument,
@@ -3946,7 +3036,8 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
 }
 
 // ---------------------------------------------------------------------------
-// Shared no-domain build logic (used by HasNoDomain::build and domain fallthrough)
+// Shared no-domain build logic (used by the non-domain reaches and the
+// Reach::Domain ACME-failure fallthrough in config.rs's build engine)
 // ---------------------------------------------------------------------------
 
 /// Appends an `SCPRelay` service entry to the DID document for `relay_url`.
@@ -3968,7 +3059,7 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 
 // Node builder internal: all parameters are required for server construction.
 #[allow(clippy::too_many_arguments)]
-async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
+pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
@@ -4117,141 +3208,13 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
 }
 
 // ---------------------------------------------------------------------------
-// Build for HasNoDomain — zero-config NAT-traversed mode (§10.12.8)
-// ---------------------------------------------------------------------------
-
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: EncryptedStorage + 'static>
-    ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
-{
-    /// Builds the [`ApplicationNode`] in zero-config no-domain mode (§10.12.8).
-    ///
-    /// Requires `S: EncryptedStorage`. For testing, use
-    /// [`build_for_testing`](Self::build_for_testing).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NodeError`] if storage, identity, relay, or NAT setup fails.
-    pub async fn build(mut self) -> Result<ApplicationNode<S>, NodeError> {
-        let storage = self
-            .storage
-            .take()
-            .ok_or(NodeError::MissingField("storage"))?;
-        let protocol_repository = Arc::new(ProtocolRepository::new(storage));
-        self.build_with_store(protocol_repository).await
-    }
-}
-
-/// Testing variant of no-domain `build()`.
-#[cfg(any(test, feature = "allow_unencrypted_storage"))]
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
-    ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
-{
-    /// Builds the [`ApplicationNode`] in no-domain mode without requiring
-    /// encrypted storage. **Testing only.**
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NodeError`] if storage, identity, relay, or NAT setup fails.
-    pub async fn build_for_testing(mut self) -> Result<ApplicationNode<S>, NodeError> {
-        let storage = self
-            .storage
-            .take()
-            .ok_or(NodeError::MissingField("storage"))?;
-        let protocol_repository = Arc::new(ProtocolRepository::new_for_testing(storage));
-        self.build_with_store(protocol_repository).await
-    }
-}
-
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
-    ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
-{
-    /// Shared build logic for no-domain mode after `ProtocolRepository` creation.
-    async fn build_with_store(
-        self,
-        protocol_repository: Arc<ProtocolRepository<S>>,
-    ) -> Result<ApplicationNode<S>, NodeError> {
-        let identity_source = self
-            .identity_source
-            .ok_or(NodeError::MissingField("identity"))?;
-        let persist = self.persist_identity;
-        let skip_nat_probe = self.skip_nat_probe;
-
-        let (identity, document, did_method) =
-            resolve_identity_persistent(identity_source, persist, protocol_repository.storage())
-                .await?;
-
-        // 3. Start relay server.
-        let bind_addr = self
-            .bind_addr
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
-        let bridge_secret = generate_bridge_secret();
-        let relay_config = RelayConfig {
-            bind_addr,
-            bridge_secret: Some(*bridge_secret),
-            ..RelayConfig::default()
-        };
-
-        let blob_storage = Arc::new(
-            self.blob_storage
-                .ok_or(NodeError::MissingField("blob_storage"))?,
-        );
-        let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
-        let connection_tracker = relay_server.connection_tracker();
-        let subscription_registry = relay_server.subscriptions();
-        // Shared PUBLISH rate limiter (unused in no-domain mode because QUIC is
-        // not served without TLS, but kept on NodeState for a uniform struct).
-        #[cfg(feature = "quic")]
-        let publish_rate_limiter = relay_server.publish_rate_limiter();
-        let (shutdown_handle, bound_addr) = relay_server.start().await?;
-
-        // 4. Generate dev API token if local_api was configured.
-        let dev_token = self.local_api_addr.map(generate_dev_token);
-
-        // 5-8. Delegate to shared no-domain logic.
-        let strategy = resolve_nat(
-            self.nat_strategy,
-            self.stun_server,
-            self.bridge_relay,
-            self.port_mapper,
-            self.reachability_probe,
-        );
-
-        build_no_domain_inner(
-            identity,
-            document,
-            did_method,
-            protocol_repository,
-            shutdown_handle,
-            bound_addr,
-            strategy,
-            bridge_secret,
-            dev_token,
-            self.local_api_addr,
-            blob_storage,
-            relay_config,
-            self.http_bind_addr,
-            self.cors_origins,
-            self.projection_rate_limit
-                .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
-            self.network_detector,
-            connection_tracker,
-            subscription_registry,
-            #[cfg(feature = "quic")]
-            publish_rate_limiter,
-            skip_nat_probe,
-        )
-        .await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// NoOp placeholder types for the default builder state
+// NoOp placeholder types for the default NodeConfig type parameters
 // ---------------------------------------------------------------------------
 
 /// Placeholder key custody used as the default type parameter for
-/// [`ApplicationNodeBuilder`]. All methods return errors -- callers must
-/// provide a real implementation via [`generate_identity_with`] or
-/// [`identity`].
+/// [`NodeConfig`](crate::NodeConfig). All methods return errors -- callers must
+/// provide a real implementation via the config's
+/// [`IdentitySource`](crate::IdentitySource).
 #[doc(hidden)]
 pub struct NoOpCustody;
 
@@ -4354,7 +3317,7 @@ impl KeyCustody for NoOpCustody {
 }
 
 /// Placeholder DID method used as the default type parameter for
-/// [`ApplicationNodeBuilder`]. All methods return errors -- callers must
+/// [`NodeConfig`](crate::NodeConfig). All methods return errors -- callers must
 /// provide a real implementation.
 #[doc(hidden)]
 pub struct NoOpDidMethod;
@@ -4411,7 +3374,7 @@ impl DidMethod for NoOpDidMethod {
 }
 
 /// Placeholder storage used as the default type parameter for
-/// [`ApplicationNodeBuilder`].
+/// [`NodeConfig`](crate::NodeConfig).
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct NoOpStorage;
@@ -4531,26 +3494,30 @@ mod tests {
         }
     }
 
-    /// Helper: creates a builder with domain and `generate_identity` configured.
-    ///
-    /// Uses a [`SucceedingTlsProvider`] so domain-mode tests proceed without
-    /// contacting a real ACME server.
-    fn test_builder() -> ApplicationNodeBuilder<
-        InMemoryKeyCustody,
-        TestDidDht,
-        InMemoryStorage,
-        HasDomain,
-        HasIdentity,
-    > {
+    /// Builds a domain-mode `NodeConfig` for `test.example.com` with a
+    /// succeeding self-signed TLS provider and a fresh generated identity.
+    /// `Reach::Domain` is a publishing reach, so `DhtMode::Production` is set
+    /// (M2); the in-memory `TestDidDht` publishes nothing offline.
+    fn domain_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
-        ApplicationNodeBuilder::new()
-            .storage(InMemoryStorage::new())
-            .domain("test.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
+        NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "test.example.com".to_owned(),
-            }))
-            .generate_identity_with(custody, did_method)
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "test.example.com".to_owned(),
+                },
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+            )
+        }
     }
 
     /// Helper: creates an identity and document for explicit identity tests.
@@ -4565,62 +3532,9 @@ mod tests {
         (identity, document, custody)
     }
 
-    /// Verifies the type-state builder compiles when all required fields
-    /// are set. Missing domain or identity would be a compile error:
-    ///
-    /// ```compile_fail
-    /// // Missing domain — NoDomain has no build():
-    /// ApplicationNodeBuilder::new()
-    ///     .generate_identity_with(custody, did_method)
-    ///     .build().await;
-    /// ```
-    ///
-    /// ```compile_fail
-    /// // Missing identity — NoIdentity has no build():
-    /// ApplicationNodeBuilder::new()
-    ///     .domain("example.com")
-    ///     .build().await;
-    /// ```
-    #[tokio::test]
-    async fn type_state_builder_compiles_with_all_required_fields() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let did_method = Arc::new(make_test_dht(&custody));
-
-        // This compiles because domain + identity are both set.
-        let _builder = ApplicationNodeBuilder::new()
-            .domain("test.example.com")
-            .generate_identity_with(custody, did_method);
-
-        // build() is available on the result type.
-        // We don't call .build().await here to avoid starting a server,
-        // but the fact that it compiles proves the type state works.
-    }
-
-    #[test]
-    fn type_state_optional_fields_at_any_point() {
-        // Optional fields (bind_addr, acme_email) can be called at any
-        // point in the chain — before or after required fields.
-        let _builder = ApplicationNodeBuilder::new()
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .acme_email("test@example.com");
-
-        // And after setting required fields too.
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let did_method = Arc::new(make_test_dht(&custody));
-        let _builder = ApplicationNodeBuilder::new()
-            .domain("test.example.com")
-            .generate_identity_with(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .acme_email("test@example.com");
-    }
-
     #[tokio::test]
     async fn build_with_generate_identity_creates_new_did() {
-        let node = test_builder()
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+        let node = Node::start_for_testing(domain_config()).await.unwrap();
 
         // Verify the identity was created.
         assert!(
@@ -4649,17 +3563,28 @@ mod tests {
         let original_did = identity.did.clone();
         let did_method = Arc::new(make_test_dht(&custody));
 
-        let node = ApplicationNodeBuilder::new()
-            .storage(InMemoryStorage::new())
-            .domain("explicit.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "explicit.example.com".to_owned(),
-            }))
-            .identity(identity, document, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "explicit.example.com".to_owned(),
+                },
+                IdentitySource::<InMemoryKeyCustody, TestDidDht>::Explicit(Box::new(
+                    ExplicitIdentity {
+                        identity,
+                        document,
+                        did_method,
+                    },
+                )),
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .unwrap();
 
         // Verify the original DID is preserved.
         assert_eq!(node.identity().did(), original_did);
@@ -4735,17 +3660,25 @@ mod tests {
             publish_count: Arc::clone(&publish_count),
         });
 
-        let _node = ApplicationNodeBuilder::new()
-            .storage(InMemoryStorage::new())
-            .domain("counting.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
+        let _node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "counting.example.com".to_owned(),
-            }))
-            .generate_identity_with(custody, counting_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "counting.example.com".to_owned(),
+                },
+                IdentitySource::Generate {
+                    custody,
+                    did_method: counting_method,
+                },
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .unwrap();
 
         // Verify publish was called exactly once during build.
         assert_eq!(
@@ -4759,11 +3692,7 @@ mod tests {
     async fn relay_accepts_connections_with_valid_bridge_token() {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-        let node = test_builder()
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+        let node = Node::start_for_testing(domain_config()).await.unwrap();
 
         let addr = node.relay().bound_addr();
         let token = node.bridge_token_hex();
@@ -4786,11 +3715,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_rejects_connections_without_bridge_token() {
-        let node = test_builder()
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+        let node = Node::start_for_testing(domain_config()).await.unwrap();
 
         let addr = node.relay().bound_addr();
 
@@ -4874,7 +3799,7 @@ mod tests {
         // We need to know the bind address ahead of time so the DID method
         // can probe it.  Bind to port 0 and let the OS pick a port — but the
         // relay picks the port, so we pre-bind a listener, record its address,
-        // then drop it and hand the same address to the builder.
+        // then drop it and hand the same address to the config.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind_addr = listener.local_addr().unwrap();
         drop(listener); // free the port for the relay
@@ -4888,17 +3813,25 @@ mod tests {
             bind_addr,
         });
 
-        let _node = ApplicationNodeBuilder::new()
-            .storage(InMemoryStorage::new())
-            .domain("relay-order.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
+        let _node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(bind_addr),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "relay-order.example.com".to_owned(),
-            }))
-            .generate_identity_with(custody, check_method)
-            .bind_addr(bind_addr)
-            .build_for_testing()
-            .await
-            .unwrap();
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "relay-order.example.com".to_owned(),
+                },
+                IdentitySource::Generate {
+                    custody,
+                    did_method: check_method,
+                },
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .unwrap();
 
         assert!(
             relay_was_listening.load(Ordering::SeqCst),
@@ -4907,52 +3840,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_domain_sets_relay_url() {
-        let node = test_builder()
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
-
-        assert_eq!(node.relay_url(), "wss://test.example.com/scp/v1");
-    }
-
-    #[tokio::test]
     async fn builder_with_custom_storage() {
-        let custom_storage = InMemoryStorage::new();
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let did_method = Arc::new(make_test_dht(&custody));
-
-        let node = ApplicationNodeBuilder::new()
-            .storage(custom_storage)
-            .domain("storage.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
-                domain: "storage.example.com".to_owned(),
-            }))
-            .generate_identity_with(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+        let node = Node::start_for_testing(domain_config()).await.unwrap();
 
         // Verify the storage handle is accessible.
         let _storage = node.storage();
-    }
-
-    #[tokio::test]
-    async fn builder_with_acme_email() {
-        // acme_email is accepted and does not affect build.
-        let node = test_builder()
-            .acme_email("admin@example.com")
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
-
-        assert!(
-            node.identity().did().starts_with("did:dht:"),
-            "node should build successfully with acme_email set"
-        );
     }
 
     // -- No-domain / NAT traversal tests (SCP-235) ---------------------------
@@ -4988,69 +3880,36 @@ mod tests {
         }
     }
 
-    /// Helper: creates a builder with `no_domain` and `generate_identity` configured,
-    /// using a mock NAT strategy that returns a STUN tier.
-    fn test_no_domain_builder(
+    /// Builds a no-domain (`Reach::NatTraversal`) `NodeConfig` whose NAT probe
+    /// is a `MockNatStrategy` returning `tier` (no real STUN). `NatTraversal` is a
+    /// publishing reach → `DhtMode::Production` (M2).
+    fn no_domain_config(
         tier: ReachabilityTier,
-    ) -> ApplicationNodeBuilder<
-        InMemoryKeyCustody,
-        TestDidDht,
-        InMemoryStorage,
-        HasNoDomain,
-        HasIdentity,
-    > {
+    ) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
-        ApplicationNodeBuilder::new()
-            .storage(InMemoryStorage::new())
-            .no_domain()
-            .nat_strategy(Arc::new(MockNatStrategy { tier }))
-            .generate_identity_with(custody, did_method)
-    }
-
-    #[test]
-    fn no_domain_method_exists_and_transitions_type_state() {
-        // .no_domain() should compile and transition Dom to HasNoDomain.
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let did_method = Arc::new(make_test_dht(&custody));
-
-        let _builder = ApplicationNodeBuilder::new()
-            .no_domain()
-            .generate_identity_with(custody, did_method);
-
-        // The fact that this compiles proves HasNoDomain enables build().
-    }
-
-    #[test]
-    fn stun_server_method_exists_on_builder() {
-        // .stun_server() should compile at any Dom state.
-        let _builder = ApplicationNodeBuilder::new().stun_server("stun.example.com:3478");
-
-        // Also after setting domain.
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let did_method = Arc::new(make_test_dht(&custody));
-        let _builder = ApplicationNodeBuilder::new()
-            .stun_server("stun.example.com:3478")
-            .no_domain()
-            .generate_identity_with(custody, did_method);
-    }
-
-    #[test]
-    fn bridge_relay_method_exists_on_builder() {
-        // .bridge_relay() should compile at any Dom state.
-        let _builder =
-            ApplicationNodeBuilder::new().bridge_relay("wss://bridge.example.com/scp/v1");
+        NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+            )
+        }
     }
 
     #[tokio::test]
     async fn no_domain_build_skips_tls_and_publishes_ws_url() {
-        // AC: .no_domain() build skips TLS and publishes ws:// URL.
+        // AC: Reach::NatTraversal build skips TLS and publishes ws:// URL.
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
         let tier = ReachabilityTier::Stun { external_addr };
 
-        let node = test_no_domain_builder(tier)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
+        let node = Node::start_for_testing(no_domain_config(tier))
             .await
             .unwrap();
 
@@ -5090,9 +3949,7 @@ mod tests {
             bridge_url: "wss://bridge.example.com/scp/v1?bridge_target=deadbeef".to_owned(),
         };
 
-        let node = test_no_domain_builder(tier)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
+        let node = Node::start_for_testing(no_domain_config(tier))
             .await
             .unwrap();
 
@@ -5119,9 +3976,7 @@ mod tests {
         let external_addr = SocketAddr::from(([203, 0, 113, 42], 8443));
         let tier = ReachabilityTier::Upnp { external_addr };
 
-        let node = test_no_domain_builder(tier)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
+        let node = Node::start_for_testing(no_domain_config(tier))
             .await
             .unwrap();
 
@@ -5141,9 +3996,7 @@ mod tests {
             external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
         };
 
-        let node = test_no_domain_builder(tier)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
+        let node = Node::start_for_testing(no_domain_config(tier))
             .await
             .unwrap();
 
@@ -5154,26 +4007,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn domain_build_uses_wss_no_regression() {
-        // AC: When .domain() is set and succeeds, wss:// is used.
-        let node = test_builder()
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
-
-        assert!(
-            node.relay_url().starts_with("wss://"),
-            "domain mode should use wss://, got: {}",
-            node.relay_url()
-        );
-        assert_eq!(node.relay_url(), "wss://test.example.com/scp/v1");
-        assert_eq!(node.domain(), Some("test.example.com"));
-    }
-
-    #[tokio::test]
     async fn domain_fallthrough_on_acme_failure_probes_nat() {
-        // AC9: When .domain() is set and TLS provisioning fails (ACME),
+        // AC9: When Reach::Domain is set and TLS provisioning fails (ACME),
         // automatic fallthrough to Tiers 1-3 (§10.12.8 step 4).
         // AC11: Verify that NAT is probed on fallthrough.
         use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -5210,20 +4045,28 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
 
-        let node = ApplicationNodeBuilder::new()
-            .storage(InMemoryStorage::new())
-            .domain("fail.example.com")
-            .tls_provider(Arc::new(FailingTlsProvider))
-            .nat_strategy(Arc::new(RecordingNatStrategy {
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(FailingTlsProvider)),
+            nat: NatSlot::Custom(Arc::new(RecordingNatStrategy {
                 called: Arc::clone(&nat_called),
                 received_port: Arc::clone(&nat_port),
                 tier: ReachabilityTier::Stun { external_addr },
-            }))
-            .generate_identity_with(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "fail.example.com".to_owned(),
+                },
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .unwrap();
 
         // Verify fallthrough happened: domain should be None.
         assert!(
@@ -5273,14 +4116,20 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
 
-        let result = ApplicationNodeBuilder::new()
-            .storage(InMemoryStorage::new())
-            .no_domain()
-            .nat_strategy(Arc::new(FailingNatStrategy))
-            .generate_identity_with(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await;
+        let result = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            nat: NatSlot::Custom(Arc::new(FailingNatStrategy)),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+            )
+        })
+        .await;
 
         let Err(err) = result else {
             panic!("build() should fail when all NAT tiers fail");
@@ -5357,15 +4206,21 @@ mod tests {
             external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
         };
 
-        let _node = ApplicationNodeBuilder::new()
-            .storage(InMemoryStorage::new())
-            .no_domain()
-            .nat_strategy(Arc::new(MockNatStrategy { tier }))
-            .generate_identity_with(custody, counting_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+        let _node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method: counting_method,
+                },
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .unwrap();
 
         assert_eq!(
             publish_count.load(Ordering::SeqCst),
@@ -5773,11 +4628,7 @@ mod tests {
         /// Builds a node and returns it along with the well-known router
         /// for direct testing via `tower::ServiceExt`.
         async fn build_test_node() -> ApplicationNode<InMemoryStorage> {
-            test_builder()
-                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .build_for_testing()
-                .await
-                .unwrap()
+            Node::start_for_testing(domain_config()).await.unwrap()
         }
 
         #[tokio::test]
@@ -6400,9 +5251,7 @@ mod tests {
             external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
         };
 
-        let node = test_no_domain_builder(tier)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
+        let node = Node::start_for_testing(no_domain_config(tier))
             .await
             .unwrap();
 
@@ -6422,11 +5271,7 @@ mod tests {
     async fn domain_build_does_not_spawn_tier_reevaluation_task() {
         // Verify that the domain build path does NOT spawn re-evaluation
         // (Tier 4 doesn't need NAT re-eval).
-        let node = test_builder()
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+        let node = Node::start_for_testing(domain_config()).await.unwrap();
 
         assert!(
             node.tier_reeval.is_none(),
@@ -6451,17 +5296,25 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
 
-        let node = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .domain("persist.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "persist.example.com".to_owned(),
-            }))
-            .identity_with_storage(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "persist.example.com".to_owned(),
+                },
+                IdentitySource::Persisted {
+                    custody,
+                    did_method,
+                },
+                Arc::clone(&storage),
+            )
+        })
+        .await
+        .unwrap();
 
         let did = node.identity().did().to_owned();
         assert!(
@@ -6484,96 +5337,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_with_storage_reloads_on_subsequent_run() {
-        // First run: create identity and persist.
-        let storage = Arc::new(InMemoryStorage::new());
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let did_method = Arc::new(make_test_dht(&custody));
-
-        let node1 = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .domain("reload.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
-                domain: "reload.example.com".to_owned(),
-            }))
-            .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
-
-        let first_did = node1.identity().did().to_owned();
-        node1.shutdown();
-
-        // Second run: same storage → should reload the same DID (no new creation).
-        let node2 = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .domain("reload.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
-                domain: "reload.example.com".to_owned(),
-            }))
-            .identity_with_storage(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
-
-        assert_eq!(
-            node2.identity().did(),
-            first_did,
-            "second run should produce the same DID"
-        );
-
-        node2.shutdown();
-    }
-
-    #[tokio::test]
-    async fn identity_with_storage_rejects_mismatched_custody() {
-        // First run: create identity with one custody instance.
-        let storage = Arc::new(InMemoryStorage::new());
-        let custody1 = Arc::new(InMemoryKeyCustody::new());
-        let did_method = Arc::new(make_test_dht(&custody1));
-
-        let node1 = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .domain("mismatch.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
-                domain: "mismatch.example.com".to_owned(),
-            }))
-            .identity_with_storage(custody1, Arc::clone(&did_method))
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
-
-        node1.shutdown();
-
-        // Second run: fresh custody with NO keys → should fail validation.
-        let custody2 = Arc::new(InMemoryKeyCustody::new());
-        let did_method2 = Arc::new(make_test_dht(&custody2));
-
-        let result = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .domain("mismatch.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
-                domain: "mismatch.example.com".to_owned(),
-            }))
-            .identity_with_storage(custody2, did_method2)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await;
-
-        let err = result
-            .err()
-            .expect("build should fail with mismatched custody");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not found in custody"),
-            "expected custody validation error, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
     async fn persisted_identity_with_tampered_did_is_rejected() {
         // The did:dht identifier is self-certifying: it is derived directly
         // from the `#0` identity key. A stored DID string that no longer
@@ -6587,17 +5350,25 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
 
-        let node1 = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .domain("tampered-did.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
+        let node1 = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "tampered-did.example.com".to_owned(),
-            }))
-            .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "tampered-did.example.com".to_owned(),
+                },
+                IdentitySource::Persisted {
+                    custody: Arc::clone(&custody),
+                    did_method: Arc::clone(&did_method),
+                },
+                Arc::clone(&storage),
+            )
+        })
+        .await
+        .unwrap();
 
         let original_did = node1.identity().did().to_owned();
         node1.shutdown();
@@ -6627,16 +5398,24 @@ mod tests {
 
         // Second run: same custody (so VMs still match) but the stored DID no
         // longer re-derives from the `#0` key → load MUST be rejected.
-        let result = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .domain("tampered-did.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
+        let result = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "tampered-did.example.com".to_owned(),
-            }))
-            .identity_with_storage(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await;
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "tampered-did.example.com".to_owned(),
+                },
+                IdentitySource::Persisted {
+                    custody,
+                    did_method,
+                },
+                Arc::clone(&storage),
+            )
+        })
+        .await;
 
         match result {
             Err(err) => {
@@ -6792,16 +5571,24 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
 
-        let result = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .domain("future-ver.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
+        let result = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "future-ver.example.com".to_owned(),
-            }))
-            .identity_with_storage(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await;
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "future-ver.example.com".to_owned(),
+                },
+                IdentitySource::Persisted {
+                    custody,
+                    did_method,
+                },
+                Arc::clone(&storage),
+            )
+        })
+        .await;
 
         match result {
             Err(err) => {
@@ -6825,17 +5612,25 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
 
-        let node = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .domain("nopersist.example.com")
-            .tls_provider(Arc::new(SucceedingTlsProvider {
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                 domain: "nopersist.example.com".to_owned(),
-            }))
-            .generate_identity_with(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "nopersist.example.com".to_owned(),
+                },
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                Arc::clone(&storage),
+            )
+        })
+        .await
+        .unwrap();
 
         assert!(node.identity().did().starts_with("did:dht:"));
 
@@ -6859,29 +5654,41 @@ mod tests {
         let tier = ReachabilityTier::Upnp {
             external_addr: SocketAddr::from(([1, 2, 3, 4], 9090)),
         };
-        let node = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .no_domain()
-            .nat_strategy(Arc::new(MockNatStrategy { tier: tier.clone() }))
-            .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier: tier.clone() })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Persisted {
+                    custody: Arc::clone(&custody),
+                    did_method: Arc::clone(&did_method),
+                },
+                Arc::clone(&storage),
+            )
+        })
+        .await
+        .unwrap();
 
         let first_did = node.identity().did().to_owned();
         node.shutdown();
 
         // Second run: same storage → same DID.
-        let node2 = ApplicationNodeBuilder::new()
-            .storage(Arc::clone(&storage))
-            .no_domain()
-            .nat_strategy(Arc::new(MockNatStrategy { tier }))
-            .identity_with_storage(custody, did_method)
-            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build_for_testing()
-            .await
-            .unwrap();
+        let node2 = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Production,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Persisted {
+                    custody,
+                    did_method,
+                },
+                Arc::clone(&storage),
+            )
+        })
+        .await
+        .unwrap();
 
         assert_eq!(
             node2.identity().did(),

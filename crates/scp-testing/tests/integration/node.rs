@@ -2,11 +2,15 @@
 
 //! B10: `ApplicationNode` integration tests.
 //!
-//! Tests `ApplicationNodeBuilder` type-state pattern (domain mode, no-domain mode),
-//! `SucceedingTlsProvider`, `FailingTlsProvider`, `MockNatStrategy`, `FailingNatStrategy`,
-//! `create_test_identity`, and `ApplicationNode` accessors (relay, identity, storage, shutdown).
+//! Tests `Node::start_for_testing` over a flat [`NodeConfig`] (domain mode,
+//! no-domain mode, the §10.12.8 TLS-failure → NAT-fallthrough path via
+//! `TlsMode::Custom`), `SucceedingTlsProvider`, `FailingTlsProvider`,
+//! `MockNatStrategy`, `FailingNatStrategy`, `create_test_identity`, and
+//! `ApplicationNode` accessors (relay, identity, storage, shutdown).
 
-use scp_node::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, ReachabilityTier};
+use scp_node::{
+    DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, ReachabilityTier, TlsMode,
+};
 use scp_testing::helpers;
 
 // ---------------------------------------------------------------------------
@@ -68,20 +72,30 @@ async fn failing_tls_falls_through_to_nat() {
     let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let did_method = Arc::new(helpers::make_test_dht(&custody));
 
-    // This test intentionally stays on the typestate builder: it injects a
-    // custom `Arc<dyn TlsProvider>` (`FailingTlsProvider`) to exercise the
-    // builder-internal TLS-fail → NAT-fallthrough path. `NodeConfig` has no
-    // representation for an arbitrary failing TLS provider (its `TlsMode` is a
-    // closed enum), so this builder-internal behavior has no flat-config form.
-    // TLS failure + failing NAT → build should fail because both paths fail.
-    let result = scp_node::ApplicationNodeBuilder::new()
-        .storage(InMemoryStorage::new())
-        .domain("fail-tls.example.com")
-        .tls_provider(Arc::new(helpers::FailingTlsProvider))
-        .nat_strategy(Arc::new(helpers::FailingNatStrategy))
-        .generate_identity_with(custody, did_method)
-        .build_for_testing()
-        .await;
+    // The §10.12.8 path: a `Domain` reach whose TLS provisioning fails falls
+    // through to NAT traversal. `TlsMode::Custom` injects the deterministically
+    // failing `FailingTlsProvider` (the Rust-core-only capability slot — the
+    // flat-config representation of an arbitrary `Arc<dyn TlsProvider>` that the
+    // closed named `TlsMode` variants do not cover), and `NatSlot::Custom`
+    // injects a `FailingNatStrategy`. With both the TLS and NAT paths failing,
+    // the build must error. Domain is a publishing reach → `DhtMode::Production`
+    // (M2).
+    let result = Node::start_for_testing(NodeConfig {
+        dht: DhtMode::Production,
+        tls: TlsMode::Custom(Arc::new(helpers::FailingTlsProvider)),
+        nat: NatSlot::Custom(Arc::new(helpers::FailingNatStrategy)),
+        ..NodeConfig::defaults(
+            Reach::Domain {
+                domain: "fail-tls.example.com".to_owned(),
+            },
+            IdentitySource::Generate {
+                custody,
+                did_method,
+            },
+            InMemoryStorage::new(),
+        )
+    })
+    .await;
 
     match result {
         Ok(_) => panic!("build with both failing TLS and failing NAT should fail"),
