@@ -1538,6 +1538,15 @@ pub(crate) async fn context_subscribe_on(
                     use scp_core::context::actor::commands::DeliverOutcome;
                     match deliver_result {
                         Ok(DeliverOutcome::Application((plaintext, sender_did))) => {
+                            // §9.9.2 defense-in-depth: a delivered application
+                            // message is equally strong evidence the relay set
+                            // is alive as a dedicated heartbeat. Refresh the
+                            // monitor baseline so a quiet-but-active peer's
+                            // normal traffic keeps suppression detection fresh
+                            // and a busy context never trips a spurious
+                            // suspicion just because heartbeats were preempted
+                            // by real sends.
+                            transport_mgr.record_heartbeat_received().await;
                             sequence_counter += 1.0;
                             #[allow(clippy::cast_precision_loss)]
                             let ts = scp_primitives::SystemClock.now_secs() as f64;
@@ -1605,6 +1614,22 @@ pub(crate) async fn context_subscribe_on(
                 _ => {}
             }
         }
+
+        // Tear down the co-scheduled heartbeat scheduler in lockstep with the
+        // subscribe loop. Every loop exit path lands here — explicit
+        // unsubscribe (`cancel_token` already fired), bridge shutdown
+        // (`bridge_cancel` fired), stream exhaustion (`None`), and relay
+        // `Terminated`. Only the explicit-unsubscribe path cancelled
+        // `cancel_token`; the other three did not, so without this the
+        // `run_heartbeat_scheduler` task (which shares this `cancel_token`)
+        // would keep firing `Supervisor::send_heartbeat` on a dead
+        // subscription — leaking the task plus its owned `Arc<Supervisor>`
+        // and exported signing key, and emitting false liveness. A later
+        // re-subscribe overwrites the handle's cancel token without cancelling
+        // the old one, so this teardown is the only thing that stops the
+        // orphaned scheduler. Cancelling an already-cancelled token (the
+        // unsubscribe path) is a harmless idempotent no-op.
+        cancel_token.cancel();
 
         // Signal stream completion.
         on_message.call(
