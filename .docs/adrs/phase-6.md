@@ -1464,27 +1464,8 @@ The Merkle event log (ADR-011) is the authoritative state record. After relay ca
 
 1. **Exchange checkpoints.** The reconnecting member generates a `ConsistencyCheckpoint` (ADR-011 criterion 8) from their local log state and sends it to the context. Online members compare and respond with their own checkpoints.
 2. **Compare Merkle roots.** If roots match at the same event count, the logs are consistent — no further action.
-3. **Behind.** If the reconnecting member's event count is less than the group's (the expected case after offline), the member requests the missing events via `CommitRangeRequest`-style event range requests. Events are verified by recomputing the Merkle path from each event to the known root.
-4. **Divergent.** If Merkle roots differ at the same event count, equivocation has occurred (a relay showed different histories to different members, per §9.9.3). The reconnecting member raises a `EquivocationDetected` alert. Resolution follows the relay consistency protocol: identify the divergent relay, flag it in reliability scoring (ADR-012), and prefer the event chain signed by more members.
-
-```rust
-pub struct EventSyncRequest {
-    pub context_id: ContextId,
-    pub local_event_count: u64,
-    pub local_merkle_root: [u8; 32],
-    pub requester_did: DID,
-    pub signature: Ed25519Signature,
-}
-
-pub struct EventSyncResponse {
-    pub context_id: ContextId,
-    pub remote_event_count: u64,
-    pub remote_merkle_root: [u8; 32],
-    pub events: Option<Vec<Event>>,  // Missing events if requester is behind
-    pub responder_did: DID,
-    pub signature: Ed25519Signature,
-}
-```
+3. **Behind.** If the reconnecting member's event count is less than the group's (the expected case after offline), the member obtains the missing events through the Phase 1 relay backfill (`SUBSCRIBE` with `since`, ADR-004) — relays are untrusted dumb pipes, so there is no distinct event-range request/response wire message and no peer-supplied proof. The backfilled suffix events are independently authenticated by the normal MLS receive path (per-event signature, sequence ordering, and `prev_hash` chain; spec §23.13). The member then verifies catch-up integrity **locally**: it computes a Merkle consistency proof (RFC 6962 §2.1.2; ADR-011) via `verify_consistency` that its pre-gap last-known checkpoint root is a prefix of the root it reaches by replaying the backfilled events, and gates that reached root (constant-time `ct_eq`) against the single already-authenticated signed `ConsistencyCheckpoint` target root (membership + Ed25519, spec §23.12 / §9.9.3). This is the same-log catch-up integrity check, distinct from cross-member equivocation detection (spec §23.7 step 3, §9.9.3). Note: `CommitRangeRequest` (above) is the MLS *Commit* epoch catch-up mechanism (§23.16.2) and is unrelated to event-log event recovery — the two MUST NOT be conflated.
+4. **Divergent.** If Merkle roots differ at the same event count, equivocation has occurred (a relay showed different histories to different members, per §9.9.3). The reconnecting member raises a `EquivocationDetected` alert. Resolution follows the relay consistency protocol (§9.9.3): identify the divergent relay, flag it in reliability scoring (ADR-012), and exchange Merkle **inclusion** proofs to attribute the divergence. This is NOT a majority vote — any divergence between any two honest members detects equivocation regardless of how many peers agree with the attacker.
 
 #### 7. Multi-Device Coordination
 
@@ -1635,10 +1616,10 @@ pub enum SyncOutcome {
 
 5. **`sync_event_log(context_id) -> Result<EventSyncResult, SyncError>`**
 
-   - Exchanges `ConsistencyCheckpoint` with online members.
-   - Requests missing events if behind.
-   - Verifies each recovered event against the Merkle tree.
-   - Raises `EquivocationDetected` if Merkle roots diverge at the same event count.
+   - Exchanges `ConsistencyCheckpoint` with online members (signature-verified per spec §23.12).
+   - If behind, recovers missing events through the Phase 1 relay backfill (`SUBSCRIBE` with `since`, ADR-004) — no peer-supplied event-range wire message.
+   - Authenticates each backfilled event via the normal MLS receive path (signature, sequence ordering, `prev_hash` chain; spec §23.13), then verifies catch-up integrity locally with a Merkle consistency proof (`verify_consistency`) gated against the signed `ConsistencyCheckpoint` target root.
+   - Raises `EquivocationDetected` if Merkle roots diverge at the same event count (cross-member; spec §9.9.3).
 
 6. **Offline tier classification:**
 
@@ -1724,7 +1705,7 @@ QueueDrained {
 | `reconnect.rs` | `ReconnectionCoordinator`, six-phase reconnection protocol, `ReconnectionReport` |
 | `epoch_catch_up.rs` | `EpochCatchUpState`, three-source catch-up, `CommitRangeRequest`/`Response`, Welcome-based fast-forward |
 | `reset.rs` | `ResetRequest`, `ResetReason`, group state reset protocol, `MemberReset` event |
-| `event_sync.rs` | `EventSyncRequest`/`Response`, Merkle root comparison, event range recovery, equivocation detection |
+| `event_sync.rs` | Merkle root comparison, local consistency-proof verification (`verify_consistency`) of relay-backfilled events against the signed `ConsistencyCheckpoint` target, equivocation detection |
 | `conflict.rs` | Conflict classification, resolution strategies, governance conflict handling |
 
 **Estimated functions:** ~20-25 public functions, ~15-20 internal helpers.
