@@ -37,13 +37,23 @@ use crate::context::actor::deps::ActorDeps;
 // generate_standing_context_id (pure helper)
 // ---------------------------------------------------------------------------
 
-/// Generates a deterministic context ID for a standing context between two DIDs.
+/// Derives the **raw 32-byte digest** for a standing context between two DIDs.
 ///
-/// The ID is derived from both DIDs sorted lexicographically, ensuring the same
-/// context ID is generated regardless of which peer initiates. Uses a
-/// `standing:` prefix for namespace isolation and a truncated SHA-256 hash of
-/// the sorted DID pair for the unique portion.
-pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
+/// This is the canonical saga-evidence / wire form of the standing-pair
+/// identity (spec §5.15.8: "the 32-byte `derived_context_id` used in saga
+/// evidence is the raw digest before prefix and hex"). The digest is computed
+/// over both DIDs sorted lexicographically, so it is symmetric:
+/// `derive(A, B) == derive(B, A)`.
+///
+/// [`generate_standing_context_id`] wraps this digest with the `"standing-"`
+/// display prefix + hex for the actor-registry key; the saga concurrency
+/// gating (ADR-049 §3a, spec §5.15.4) reserves the RAW-digest hex
+/// (`hex::encode(derive_standing_context_digest(..))`) so a standing-pair saga
+/// and a cross-context / broadcast saga that share the same standing context
+/// reserve the SAME canonical key and therefore overlap. Keeping the prefixed
+/// id and the raw digest derived from one shared body guarantees they cannot
+/// drift apart.
+pub fn derive_standing_context_digest(local_did: &DID, peer_did: &DID) -> [u8; 32] {
     let (a, b) = if local_did.as_ref() <= peer_did.as_ref() {
         (local_did.as_ref(), peer_did.as_ref())
     } else {
@@ -54,8 +64,23 @@ pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
     hasher.update(a.as_bytes());
     hasher.update(b":");
     hasher.update(b.as_bytes());
-    let hash = hasher.finalize();
-    format!("standing-{}", hex::encode(hash))
+    hasher.finalize().into()
+}
+
+/// Generates a deterministic context ID for a standing context between two DIDs.
+///
+/// The ID is derived from both DIDs sorted lexicographically, ensuring the same
+/// context ID is generated regardless of which peer initiates. Uses a
+/// `standing-` prefix for namespace isolation and the lowercase hex of the
+/// 32-byte SHA-256 digest ([`derive_standing_context_digest`]) of the sorted
+/// DID pair for the unique portion. The prefixed string is the actor-registry
+/// key; the unprefixed raw digest is the saga-evidence / gating form
+/// (spec §5.15.8).
+pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
+    format!(
+        "standing-{}",
+        hex::encode(derive_standing_context_digest(local_did, peer_did))
+    )
 }
 
 // ---------------------------------------------------------------------------

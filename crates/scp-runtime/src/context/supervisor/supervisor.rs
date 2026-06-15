@@ -93,6 +93,11 @@ pub enum SagaInput {
     CrossContextToolInvocation {
         /// Calling context.
         caller_context_id: [u8; 32],
+        /// Target context that hosts the tool registration being invoked.
+        /// The saga spans BOTH the caller and the target context-actors, so
+        /// the gating reservation (ADR-049 §3a) needs the real 2-context set;
+        /// spec §6.2.4's cross-context tool-invoke transport needs it too.
+        target_context_id: [u8; 32],
         /// Calling identity.
         caller_did: DID,
         /// Tool registration to invoke.
@@ -106,6 +111,20 @@ pub enum SagaInput {
         broadcast_context_id: [u8; 32],
         /// Subscriber requesting hosting.
         subscriber_did: DID,
+    },
+    /// Test-only saga whose Prepare phases succeed and whose Commit phase
+    /// ALWAYS fails, so the FSM runs all the way to Committing, exhausts the
+    /// commit-retry budget, and lands in `NeedsRepair`. This is the ONLY way
+    /// to drive `start_saga` to a real `NeedsRepair` terminal while the three
+    /// production saga variants' Prepare/Commit dispatch is still spec-gapped
+    /// (Phase 2C) — it lets the gating tests assert that `NeedsRepair`
+    /// RELEASES the participant-context-set reservation (ADR-049 §3a, spec
+    /// §5.15.4). Gated behind `test`/`testing` so a production FFI build can
+    /// never construct or dispatch it.
+    #[cfg(any(test, feature = "testing"))]
+    TestForceNeedsRepair {
+        /// The single participant context this test saga reserves.
+        context_id: [u8; 32],
     },
 }
 
@@ -519,16 +538,69 @@ pub struct Supervisor {
     // supervisor now owns them directly; eagerly initialized in
     // [`Self::new`].
     // -----------------------------------------------------------------
-    /// Concurrent-saga guard. `true` iff a saga is currently in flight
-    /// (Initiated / PreparingA / PreparingB / Committing). A second
-    /// concurrent `start_saga` while the flag is `true` returns
+    /// Per-participant-context-set saga reservation (ADR-049 §3a, spec
+    /// §5.15.4). Holds the union of the participant-context IDs currently
+    /// reserved by all in-flight sagas. A saga reserves the WHOLE of its
+    /// participant context set ([`saga_participant_context_set`]) atomically
+    /// at [`Self::start_saga`] entry: if ANY id in the new set is already
+    /// present, the new saga's set OVERLAPS an in-flight saga and the start
+    /// returns
     /// [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
-    /// via the `SagaBusy` reason — the supervisor serializes sagas
-    /// supervisor-wide so the per-actor `saga_pending` slot never
-    /// contends. The atomic is set on `start_saga` entry (if currently
-    /// `false`) and cleared when the saga reaches a terminal state
-    /// (Committed, Aborted, NeedsRepair).
-    saga_pending_guard: std::sync::atomic::AtomicBool,
+    /// with a `SagaBusy` reason; otherwise the whole set is inserted and the
+    /// FSM runs. Two sagas with DISJOINT sets never contend and run
+    /// concurrently — replacing the prior supervisor-wide `AtomicBool` so one
+    /// slow or stuck saga can no longer deny the whole instance. The
+    /// reservation is released by the [`SagaSetReservation`] RAII guard on
+    /// EVERY terminal (Committed, Aborted, NeedsRepair) AND panic-unwind;
+    /// crucially, `NeedsRepair` RELEASES the slot (the divergence still
+    /// awaits operator repair, but a stuck saga must not wedge unrelated
+    /// ones — spec §5.15.4).
+    ///
+    /// In-memory only: this set is NOT rebuilt on restart, exactly matching
+    /// the prior `AtomicBool`'s restart behavior (a restarted supervisor
+    /// starts with no reservations). When PR-7/2D wires
+    /// [`Self::replay_unresolved_sagas`] at startup, it MUST rebuild
+    /// reservations for non-terminal unresolved journal entries — EXCLUDING
+    /// `NeedsRepair` entries, whose slots are deliberately released — so a
+    /// replay-driven re-drive of an in-flight saga re-takes its set before
+    /// the first post-restart `start_saga` can race it.
+    ///
+    /// CONCRETE REPLAY GAP PR-2D MUST CLOSE — the journal record for a
+    /// `CrossContextToolInvocation` (built by [`saga_input_participants`])
+    /// deliberately does NOT persist `target_context_id` ("Leave the journal
+    /// shape UNCHANGED"): it records only `{caller_context_id, caller_did,
+    /// tool_registration_id}`. But the gating set
+    /// ([`saga_participant_context_set`]) is `{caller, target}`. So a naïve
+    /// replay that rebuilds reservations from the journal record alone could
+    /// only re-reserve `{caller}`, NOT `{caller, target}` — leaving the
+    /// `target` context slot free and letting a fresh post-restart saga touch
+    /// it concurrently, defeating the §5.15.4 cross-context serialization for
+    /// the entire recovery window. PR-2D MUST therefore either (a) persist
+    /// `target_context_id` in the journal entry / the
+    /// `CrossContextToolInvocationPrepared` evidence so the full set is
+    /// reconstructible, OR (b) rehydrate the complete [`SagaInput`] on replay
+    /// and re-derive the set via [`saga_participant_context_set`] (the same
+    /// extractor `start_saga` calls) so the rebuilt reservation is the
+    /// COMPLETE `{caller, target}` set, not a caller-only subset. Whichever
+    /// PR-2D chooses, the rebuilt reservation MUST equal what `start_saga`
+    /// would have taken for that in-flight saga.
+    ///
+    /// The type is `std::sync::Mutex` (banned by `clippy.toml` for the
+    /// await-deadlock hazard) with a narrowly-scoped allow: the critical
+    /// section is purely synchronous (`lock()` → check-disjoint → insert /
+    /// remove → drop), and the guard is PROVABLY NEVER held across an
+    /// `.await` (see [`Self::try_reserve_context_set`] and
+    /// [`SagaSetReservation::drop`], neither of which awaits while holding
+    /// the guard). The clippy ban targets the suspend-thread-across-await
+    /// deadlock, which cannot occur here.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Synchronous critical section only; the guard is provably \
+                  never held across an .await (check-disjoint + insert, or \
+                  remove-on-drop, are all sync). The clippy ban targets \
+                  await-deadlock, which cannot occur here. ADR-049 §3a."
+    )]
+    reserved_saga_contexts: std::sync::Mutex<HashSet<String>>,
 
     // -----------------------------------------------------------------
     /// Monotonic spawn-generation counter. Incremented once per
@@ -586,6 +658,16 @@ impl Supervisor {
         saga_journal: Arc<dyn SagaJournal>,
         health_config: SupervisorConfig,
     ) -> Self {
+        // Synchronous critical section only; the guard is provably never held
+        // across an `.await` (check-disjoint + insert, or remove-on-drop, are
+        // all sync). The clippy ban targets await-deadlock, which cannot occur
+        // here. ADR-049 §3a. (Matches the `reserved_saga_contexts` field allow.)
+        #[allow(
+            clippy::disallowed_types,
+            reason = "Synchronous critical section only; the guard is provably \
+                      never held across an .await. ADR-049 §3a."
+        )]
+        let reserved_saga_contexts = std::sync::Mutex::new(HashSet::new());
         Self {
             actors: DashMap::new(),
             standing_contexts: ArcSwap::new(Arc::new(HashMap::new())),
@@ -611,7 +693,7 @@ impl Supervisor {
             event_tx: OnceLock::new(),
             task_set: OnceLock::new(),
             mls_storage: OnceLock::new(),
-            saga_pending_guard: std::sync::atomic::AtomicBool::new(false),
+            reserved_saga_contexts,
             // Generation 0 is never stamped onto a live actor (the first
             // spawn increments to 1 before stamping), so a default
             // `PerContextState::generation == 0` can never collide with a
@@ -4324,14 +4406,19 @@ impl Supervisor {
     /// entries on supervisor startup via
     /// [`Self::replay_unresolved_sagas`].
     ///
-    /// # Concurrent saga serialization
+    /// # Concurrent saga serialization (per participant-context set)
     ///
-    /// The supervisor serializes sagas supervisor-wide: a second
-    /// `start_saga` while one is in flight returns
+    /// Sagas are serialized at the granularity of their **participant
+    /// context set**, NOT supervisor-wide (ADR-049 §3a, spec §5.15.4). A
+    /// saga reserves the set of contexts it spans (computed by
+    /// `saga_participant_context_set`); a second `start_saga` whose set is
+    /// **disjoint** runs concurrently, while one whose set **overlaps**
+    /// (shares ≥1 context) returns
     /// [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
-    /// with a `SagaBusy` reason. The guard is a single atomic bool
-    /// (plan §"Cross-context saga protocol" step Prepare — concurrent
-    /// Prepare against the same supervisor is rejected).
+    /// with a `SagaBusy` reason. The reservation (`reserved_saga_contexts`)
+    /// is held by an RAII guard for the saga's lifetime and released on
+    /// EVERY terminal — Committed, Aborted, AND NeedsRepair — plus
+    /// panic-unwind, so a stuck saga never wedges unrelated disjoint sagas.
     ///
     /// # Unwired saga use cases (pending Phase 2C)
     ///
@@ -4346,36 +4433,43 @@ impl Supervisor {
     /// writes, phase transitions, timeout/retry accounting, terminal
     /// resolution — is fully implemented.
     ///
+    /// # Forward obligation — authorize the initiator BEFORE reserving (Phase 2C)
+    ///
+    /// Today every production [`SagaInput`] variant's Prepare dispatch returns
+    /// [`ContextError::NotImplemented`], and `start_saga` is reachable only from
+    /// in-process callers — never from attacker-influenceable FFI input — so the
+    /// reservation cannot be weaponized. That changes in Phase 2C, which wires
+    /// the real saga inputs and the block-until-terminal `start_*_saga` FFI
+    /// exports. At that point the reservation becomes attacker-reachable: a
+    /// malicious participant could name a VICTIM'S context id in a saga input and
+    /// reserve it (the overlap check would then deny the victim's own legitimate
+    /// saga — a targeted availability attack). Phase 2C MUST therefore verify
+    /// the initiator is authorized over EACH context id the saga names — a member
+    /// of, or capable on, that context — BEFORE
+    /// [`Self::try_reserve_context_set`] runs. This is a forward obligation, not
+    /// a runtime gap: it is unreachable until the FFI saga surface ships.
+    ///
     /// # Errors
     ///
-    /// - [`ContextError::ActorBusy`] if a saga is already in flight.
+    /// - [`ContextError::ActorBusy`] (a `SagaBusy` reason) if the new saga's
+    ///   participant context set overlaps an in-flight saga's reserved set.
+    ///   Disjoint sets run concurrently (ADR-049 §3a, spec §5.15.4).
     /// - [`ContextError::NotImplemented`] if the
     ///   [`SagaInput`] variant's prepare dispatch is not yet wired
     ///   (all 3 current variants, pending Phase 2C).
     /// - [`ContextError::InvalidState`] on journal I/O failure.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
-        use std::sync::atomic::Ordering;
-
-        // Concurrent-saga guard: CAS from false → true. If already
-        // true, the caller races an in-flight saga.
-        if self
-            .saga_pending_guard
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(ContextError::ActorBusy(
-                "Supervisor::start_saga — another saga is already in flight (SagaBusy)".to_owned(),
-            ));
-        }
-
-        // RAII guard: ensure the pending flag clears even if `run_saga_fsm`
-        // panics or unwinds. The prior implementation cleared the flag with
-        // a line of code after `.await` — a panic anywhere inside the FSM
-        // would leave the guard set, blocking every subsequent `start_saga`
-        // until process restart. Phase 1 fix-up of ADR-049
-        // (post-review-round-1). The guard type is defined at module
-        // scope below ([`SagaGuardReset`]).
-        let _guard = SagaGuardReset(&self.saga_pending_guard);
+        // Per-participant-context-set reservation (ADR-049 §3a, spec
+        // §5.15.4). Atomically reserve the saga's WHOLE participant context
+        // set: if it overlaps an in-flight saga's set, reject with a typed
+        // SagaBusy; otherwise insert the whole set and hold the RAII
+        // reservation for the FSM scope. The reservation Drop releases the
+        // set on EVERY terminal (Committed, Aborted, NeedsRepair) AND on a
+        // panic-unwind through `run_saga_fsm` — including the NeedsRepair arm,
+        // which returns control here so `_reservation` drops and the stuck
+        // saga does NOT wedge unrelated, disjoint sagas.
+        let context_set = saga_participant_context_set(&input);
+        let _reservation = self.try_reserve_context_set(&context_set)?;
 
         let saga_id = SagaId::new();
         let participants = saga_input_participants(&input);
@@ -4390,10 +4484,106 @@ impl Supervisor {
             )
             .await;
 
-        // `_guard` clears the flag on scope exit — including on the
-        // panic-unwind path through `run_saga_fsm`.
+        // `_reservation` releases the reserved context set on scope exit —
+        // including on the panic-unwind path through `run_saga_fsm`.
 
         fsm_result.map(|()| SagaOutput { saga_id })
+    }
+
+    /// Atomically reserve a saga's participant context set (ADR-049 §3a).
+    ///
+    /// One synchronous critical section over `reserved_saga_contexts`:
+    /// 1. If ANY id in `context_set` is already reserved, the new saga
+    ///    OVERLAPS an in-flight saga — return [`ContextError::ActorBusy`]
+    ///    with a `SagaBusy` reason WITHOUT mutating the reservation set.
+    /// 2. Otherwise insert the WHOLE set and return a [`SagaSetReservation`]
+    ///    RAII guard that removes exactly THESE ids on drop.
+    ///
+    /// The lock is acquired and released entirely within this synchronous
+    /// function (no `.await` while holding the guard), so it cannot suspend
+    /// a tokio worker thread across a yield point — the reason the
+    /// `std::sync::Mutex` use is sound despite the `clippy.toml` ban (see the
+    /// `reserved_saga_contexts` field's narrowly-scoped allow).
+    ///
+    /// A poisoned lock (a prior holder panicked mid-critical-section, which
+    /// the purely-synchronous body makes effectively impossible) is recovered
+    /// via `into_inner` rather than propagated, so a single panic elsewhere
+    /// cannot permanently wedge every future saga.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ActorBusy`] if the participant set overlaps an
+    /// in-flight saga's reserved set.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "The lock guard intentionally spans the overlap check AND the \
+                  insert loop — that atomic check-and-reserve IS the correctness \
+                  property (shortening it reintroduces a TOCTOU). ADR-049 §3a."
+    )]
+    fn try_reserve_context_set(
+        &self,
+        context_set: &[String],
+    ) -> Result<SagaSetReservation<'_>, ContextError> {
+        let mut reserved = self
+            .reserved_saga_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Overlap check: a non-empty intersection with the in-flight set
+        // means a shared participant context — serialize (spec §5.15.4:
+        // "sharing a single context is sufficient to conflict").
+        if let Some(contended) = context_set.iter().find(|id| reserved.contains(*id)) {
+            return Err(ContextError::ActorBusy(format!(
+                "Supervisor::start_saga — participant context set overlaps an in-flight saga \
+                 at context {contended} (SagaBusy)"
+            )));
+        }
+
+        // Disjoint: reserve the whole set atomically under the same lock.
+        for id in context_set {
+            reserved.insert(id.clone());
+        }
+
+        Ok(SagaSetReservation {
+            reserved: &self.reserved_saga_contexts,
+            ids: context_set.to_vec(),
+        })
+    }
+
+    /// Test-only: deterministically reserve a saga's participant context set
+    /// and return the RAII reservation, so a test can hold a saga's slots
+    /// "in flight" without racing the (instantaneous, spec-gapped) FSM. This
+    /// exercises the SAME `try_reserve_context_set` critical section that
+    /// [`Self::start_saga`] uses, so the overlap / disjoint / release
+    /// semantics under test are the production ones, not a parallel mock.
+    ///
+    /// Returning the borrow-scoped [`SagaSetReservation`] lets the caller
+    /// drop it to release (mirroring a saga reaching a terminal state).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ActorBusy`] if the set overlaps an already-held set.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_reserve_saga_context_set(
+        &self,
+        input: &SagaInput,
+    ) -> Result<SagaSetReservation<'_>, ContextError> {
+        let set = saga_participant_context_set(input);
+        self.try_reserve_context_set(&set)
+    }
+
+    /// Test-only: the CANONICAL gating reservation key a standing-pair saga
+    /// over `(local_did, peer_did)` reserves — the raw-digest hex
+    /// (`hex::encode(derive_standing_context_digest(..))`), NOT the
+    /// `"standing-"`-prefixed actor-registry id. Lets a cross-saga-type
+    /// overlap test feed the EXACT key a `StandingPairCreate` saga reserves
+    /// into a `CrossContextToolInvocation` saga's `[u8; 32]` context field,
+    /// proving overlap detection is pure set-membership across saga types
+    /// (ADR-049 §3a, spec §5.15.4 / §5.15.8).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn test_standing_pair_context_digest(local_did: &DID, peer_did: &DID) -> [u8; 32] {
+        crate::context::standing_helpers::derive_standing_context_digest(local_did, peer_did)
     }
 
     /// Replay unresolved sagas from the journal on supervisor startup
@@ -4619,6 +4809,11 @@ impl Supervisor {
                          hosting handshake protocol)"
                     )))
                 }
+                // Test-only: Prepare always SUCCEEDS so the FSM advances to
+                // Committing (where the test variant's Commit then fails,
+                // driving NeedsRepair).
+                #[cfg(any(test, feature = "testing"))]
+                SagaInput::TestForceNeedsRepair { .. } => Ok(()),
             }
         };
 
@@ -4680,6 +4875,13 @@ impl Supervisor {
                 | SagaInput::BroadcastHostingHandshake { .. } => Err(ContextError::NotImplemented(
                     "saga Commit — all 3 saga types' commit-side wiring deferred to commit \
                          11.5 per DEFERRED-commit-11-saga-use-cases.md"
+                        .to_owned(),
+                )),
+                // Test-only: Commit ALWAYS fails so `commit_with_retry`
+                // exhausts its budget and the FSM transitions to NeedsRepair.
+                #[cfg(any(test, feature = "testing"))]
+                SagaInput::TestForceNeedsRepair { .. } => Err(ContextError::InvalidState(
+                    "saga Commit — TestForceNeedsRepair always fails to drive NeedsRepair"
                         .to_owned(),
                 )),
             }
@@ -6829,16 +7031,43 @@ fn standing_outcome_error_sketch(err: &ContextError) -> ContextError {
 // Saga FSM helpers
 // ---------------------------------------------------------------------------
 
-/// RAII reset for [`Supervisor::saga_pending_guard`]. Ensures the pending
-/// flag clears on scope exit even if the FSM body panics. Phase 1 fix-up
-/// of ADR-049 (post-review-round-1) — the prior implementation cleared
-/// the flag with a line of code after `.await`, leaving the guard set on
-/// any unwind path.
-struct SagaGuardReset<'a>(&'a std::sync::atomic::AtomicBool);
+/// RAII release for a saga's per-participant-context-set reservation
+/// (ADR-049 §3a, spec §5.15.4). Holds the exact set of context IDs THIS
+/// saga reserved; on drop it synchronously re-locks
+/// [`Supervisor::reserved_saga_contexts`] and removes precisely those ids.
+///
+/// Drop fires on EVERY terminal path out of [`Supervisor::start_saga`] —
+/// Committed, Aborted, and NeedsRepair — AND on a panic-unwind through the
+/// FSM body. This is what makes `NeedsRepair` RELEASE the reservation: the
+/// FSM's NeedsRepair arm returns control to `start_saga`, so `_reservation`
+/// drops and the stuck saga's slots free immediately, even though the saga
+/// is not yet operator-resolved. A stuck saga therefore never wedges
+/// unrelated, disjoint sagas.
+///
+/// The drop body is purely synchronous (`lock()` → `remove` → unlock) and
+/// never awaits, so the `std::sync::Mutex` guard is never held across a
+/// yield point (see the `reserved_saga_contexts` field's allow). A poisoned
+/// lock is recovered via `into_inner` so a panic elsewhere cannot strand a
+/// reservation forever.
+#[allow(
+    clippy::disallowed_types,
+    reason = "Synchronous drop-time release only; the guard is never held \
+              across an .await. ADR-049 §3a."
+)]
+pub struct SagaSetReservation<'a> {
+    reserved: &'a std::sync::Mutex<HashSet<String>>,
+    ids: Vec<String>,
+}
 
-impl Drop for SagaGuardReset<'_> {
+impl Drop for SagaSetReservation<'_> {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in &self.ids {
+            reserved.remove(id);
+        }
     }
 }
 
@@ -6864,6 +7093,12 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
         } => vec![local_did.to_string(), peer_did.to_string()],
         SagaInput::CrossContextToolInvocation {
             caller_context_id,
+            // `target_context_id` is part of the gating participant set
+            // (see `saga_participant_context_set`), NOT the journal
+            // provenance record: this extractor intentionally records only
+            // the caller side plus the DID + tool id. Leave the journal
+            // shape UNCHANGED.
+            target_context_id: _,
             caller_did,
             tool_registration_id,
         } => vec![
@@ -6880,7 +7115,83 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
             hex::encode(broadcast_context_id),
             subscriber_did.to_string(),
         ],
+        #[cfg(any(test, feature = "testing"))]
+        SagaInput::TestForceNeedsRepair { context_id } => vec![hex::encode(context_id)],
     }
+}
+
+/// The set of **participant context-actor IDs** a saga reserves for
+/// concurrency gating (ADR-049 §3a, spec §5.15.4).
+///
+/// This is a SIBLING of [`saga_input_participants`], NOT a replacement:
+/// `saga_input_participants` produces the journal-provenance record (a
+/// mixed bag of DIDs, context IDs, and tool IDs — the durable evidence of
+/// who took part). THIS function produces the strict set of *context
+/// actors* the saga spans, which is what the disjoint-vs-overlap
+/// reservation reasons over. A saga reserves the WHOLE set atomically;
+/// two sagas whose sets are disjoint run concurrently, while two whose
+/// sets share ≥1 context serialize (the shared context's slot is held).
+///
+/// Each variant's set is de-duplicated through a [`HashSet`] before being
+/// returned so a saga can never self-conflict (e.g. a degenerate
+/// cross-context invocation whose caller and target resolve to the same
+/// context id reserves that id ONCE, not twice).
+///
+/// # Canonical reservation key
+///
+/// Every variant reserves the **raw-digest hex** of each context it spans —
+/// `hex::encode([u8; 32])` — which is the canonical saga-evidence / wire form
+/// (spec §5.15.8: the `derived_context_id` is "the raw digest before prefix
+/// and hex"; §6.2.4 / §5.14.13 for the cross-context / broadcast wire ids).
+/// In particular `StandingPairCreate` reserves
+/// `hex::encode(derive_standing_context_digest(local, peer))` — the RAW digest,
+/// NOT the `"standing-"`-prefixed actor-registry id. The standing context still
+/// LIVES under the prefixed id in the actor registry; only the gating
+/// reservation key is canonicalized to the raw-digest hex so that a
+/// cross-context or broadcast saga which shares that same standing context
+/// reserves the IDENTICAL key and therefore OVERLAPS (defeating it otherwise
+/// would let two sagas touch the shared context concurrently, breaking the
+/// §5.15.4 serialization the §5.15.8 anti-griefing and §5.14.13 aggregate-cap
+/// arguments depend on).
+///
+/// - `StandingPairCreate` → the single deterministic standing-pair raw-digest
+///   hex (`derive_standing_context_digest`, the hex of spec §5.15.8's
+///   `derived_context_id`).
+/// - `CrossContextToolInvocation` → `{caller, target}` context ids.
+/// - `BroadcastHostingHandshake` → `{host, broadcast}` context ids.
+fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
+    let raw: Vec<String> = match input {
+        SagaInput::StandingPairCreate {
+            local_did,
+            peer_did,
+        } => vec![hex::encode(
+            crate::context::standing_helpers::derive_standing_context_digest(local_did, peer_did),
+        )],
+        SagaInput::CrossContextToolInvocation {
+            caller_context_id,
+            target_context_id,
+            ..
+        } => vec![
+            hex::encode(caller_context_id),
+            hex::encode(target_context_id),
+        ],
+        SagaInput::BroadcastHostingHandshake {
+            host_context_id,
+            broadcast_context_id,
+            ..
+        } => vec![
+            hex::encode(host_context_id),
+            hex::encode(broadcast_context_id),
+        ],
+        #[cfg(any(test, feature = "testing"))]
+        SagaInput::TestForceNeedsRepair { context_id } => vec![hex::encode(context_id)],
+    };
+    // De-dup: a saga must never self-conflict. Two ids that collapse to one
+    // (caller == target, host == broadcast) reserve a single slot.
+    let mut seen = HashSet::with_capacity(raw.len());
+    raw.into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
 }
 
 /// Classify whether a saga's journal evidence carries bearer bytes
@@ -6906,6 +7217,9 @@ const fn saga_input_is_secret_bearing(input: &SagaInput) -> bool {
         SagaInput::StandingPairCreate { .. }
         | SagaInput::CrossContextToolInvocation { .. }
         | SagaInput::BroadcastHostingHandshake { .. } => false,
+        // The test-only NeedsRepair driver carries no bearer material.
+        #[cfg(any(test, feature = "testing"))]
+        SagaInput::TestForceNeedsRepair { .. } => false,
     }
 }
 
@@ -7353,8 +7667,11 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ContextError::NotImplemented(_)));
 
-        // Guard must be cleared after a saga terminates (even on
-        // NotImplemented abort) so a subsequent saga can start.
+        // The participant-context-set reservation must be RELEASED after a
+        // saga terminates (even on a NotImplemented abort) so a subsequent
+        // saga over the SAME set can reserve and start. This is the
+        // same-set sequential re-arm property: the RAII `SagaSetReservation`
+        // drop frees the slots on every terminal.
         let err2 = s
             .start_saga(SagaInput::StandingPairCreate {
                 local_did: DID("did:example:a".to_owned()),

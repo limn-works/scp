@@ -51,6 +51,11 @@ pub use saga_prepared_state::{
     BroadcastHostingHandshakePrepared, CrossContextToolInvocationPrepared, SagaPreparedState,
     StandingPairCreatePrepared,
 };
+/// The per-saga participant-context-set reservation RAII guard. Exposed only
+/// under `test`/`testing` so integration tests can deterministically hold a
+/// saga's slots in flight (see `Supervisor::test_reserve_saga_context_set`).
+#[cfg(any(test, feature = "testing"))]
+pub use supervisor::SagaSetReservation;
 pub use supervisor::{
     ACTOR_MAILBOX_CAPACITY, CrashWindow, PendingSagaProjection, SagaInput, SagaOutput, Supervisor,
     SupervisorConfig,
