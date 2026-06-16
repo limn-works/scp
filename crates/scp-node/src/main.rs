@@ -10,7 +10,7 @@
 //! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
 //!    subsystems — nothing persists across restarts.
 //! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
-//!    (`no_domain` mode) — opens an inbound public port, publishes the host's
+//!    (no DNS name required) — opens an inbound public port, publishes the host's
 //!    IP to the DHT, and serves the site over self-signed HTTPS by default
 //!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP).
 //!
@@ -139,7 +139,7 @@ USAGE:
 OPTIONS:
     --relay-only            Run as a bare relay server only (no identity, no HTTP)
     --ephemeral             Use in-memory storage for all subsystems (no persistence)
-    --self-host             Host a static site entirely on SCP (no_domain mode).
+    --self-host             Host a static site entirely on SCP (no DNS name required).
                             Opens an inbound port to the PUBLIC INTERNET and
                             publishes the host's IP to the DHT.
                             Self-signed HTTPS by default (SCP_NODE_SELF_HOST_PLAINTEXT=1

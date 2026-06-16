@@ -1042,7 +1042,7 @@ where
         bind_addr = %http_addr,
         storage_path = %storage_dir.display(),
         mode = "self-host",
-        "hosting site (SQLite storage, no_domain)"
+        "hosting site (SQLite storage, self-host)"
     );
 
     // -- Root storage + custody. The single root `SqliteStorage` handle owns the
