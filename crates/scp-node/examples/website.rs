@@ -8,8 +8,8 @@
 //! `Reach::Local` (no NAT/UPnP probe, loopback-only addressing), and
 //! `DhtMode::Memory` — so NO router port is opened and NOTHING is published to
 //! the network. (The listener binds `0.0.0.0`, so it is also reachable on the
-//! LAN at the host's local IP, but never beyond it.) For PUBLIC hosting, switch
-//! `reach` to `Reach::NatTraversal` or `Reach::Tunnel { public_url }`, set
+//! LAN at the host's local IP, but never beyond it.) For PUBLIC hosting, pass
+//! `Reach::NatTraversal` or `Reach::Tunnel { public_url }` to `defaults(...)`, set
 //! `tls: TlsMode::SelfSigned` (the default), and opt into `DhtMode::Production`
 //! (which publishes the host's address bound to its DID to the DHT — a location
 //! disclosure). See the guide: `.docs/guides/self-hosting-a-website-on-scp.md`.
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `CARGO_MANIFEST_DIR` makes the sample-site path independent of the
         // directory `cargo run` is invoked from.
         site_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/website-site").into()),
-        // Defaults to 8080 (not 8443) to avoid colliding with a real node.
+        // This example uses 8080 (the HostSiteConfig default is 8443) to avoid colliding with a real node.
         port: std::env::var("PORT").map_or(8080, |raw| {
             raw.parse::<u16>().unwrap_or_else(|_| {
                 eprintln!("PORT={raw:?} is not a valid u16 port number; using 8080");

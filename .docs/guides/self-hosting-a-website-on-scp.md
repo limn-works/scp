@@ -125,8 +125,7 @@ Three addressing paths, none requiring DNS-as-central-authority:
 
 A node behind a home NAT can make *itself* inbound-reachable using SCP's own
 stack. The reachability strategy `DefaultNatStrategy::select_tier`
-(`crates/scp-node/src/lib.rs:1485`/`:1640`) runs in the **SDK
-`ApplicationNodeBuilder::no_domain()` path** (`lib.rs:3504`) and — critically —
+(`crates/scp-node/src/lib.rs:1485`/`:1640`) runs in the **`host_site` / `--self-host` path** and — critically —
 operates on **`http_bind_addr.port()`, the public HTTP/site port (default 8443)**,
 not the internal relay port (`lib.rs:3526`).
 
@@ -189,9 +188,8 @@ future work.
    with `--features upnp`.*
 2. ~~The shipped `scp-node` binary mandates `SCP_NODE_DOMAIN` and never calls
    `no_domain()`.~~ **Fixed:** the binary now has an opt-in `--self-host` run mode
-   (`SCP_NODE_SELF_HOST=1`) that selects the `no_domain()` deployment path
-   (`crates/scp-node/src/main.rs` `run_self_host` → `.no_domain()`; the
-   publish/projection wiring lives in `crates/scp-node/src/self_host.rs`). In
+   (`SCP_NODE_SELF_HOST=1`) (`crates/scp-node/src/main.rs` `run_self_host` calls `host_site_until(HostSiteConfig::defaults(Reach::NatTraversal) { … })`;
+   the publish/projection wiring lives in `crates/scp-node/src/self_host.rs`). In
    self-host mode the binary does its own NAT traversal on the public HTTP/site
    port. Domain is only mandated on the default (non-self-host) path. NAT
    port-mapping still requires building with `--features upnp` (§3.1).
@@ -200,12 +198,12 @@ future work.
 4. ~~No NAT-PMP/UPnP lease renewal wired into the node path.~~ **Fixed:** the
    `--self-host` path now renews the NAT port-mapping lease at 50% of the
    gateway-reported TTL (spec §10.12.2) via a contained renewal task tied to the
-   node's shutdown. The mapping created during `build()` is re-issued before
+   node's shutdown. The mapping created during startup is re-issued before
    expiry (NAT-PMP re-send / UPnP re-add, both idempotent), so the site stays
    publicly reachable indefinitely while the node runs. Renewal failures log a
    warning and retry after a short backoff rather than dropping the mapping; the
    loop is cancelled and awaited before the mapping is released on shutdown.
-5. **`no_domain()` self-host path serves self-signed HTTPS (TLS 1.3) by
+5. **Self-host path (`host_site` / `--self-host`) serves self-signed HTTPS (TLS 1.3) by
    default** (spec §10.12.11 "Transport security (website surface)"). The node is
    its own CA ("be your own CA"): the cert is self-signed with no DNS name and no
    CA authority, presenting SANs for `localhost`, `127.0.0.1`, and — when known at
@@ -245,8 +243,7 @@ UPnP-IGD (SSDP): no response (macOS multicast quirk; non-fatal — NAT-PMP suffi
 `71.249.150.234` with **no manual port-forward**, because (a) the NAT is cone, so
 Tier-2's hole-stays-open assumption holds, and (b) the gateway speaks **NAT-PMP**,
 so Tier-1 can auto-open the HTTP port. The only required engineering is enabling
-the `upnp` feature and running `scp-node --self-host` (which selects the
-`no_domain()` builder path). This path serves **self-signed HTTPS (TLS 1.3) by
+the `upnp` feature and running `scp-node --self-host` (which uses `HostSiteConfig::defaults` + `host_site_until`). This path serves **self-signed HTTPS (TLS 1.3) by
 default** (§10.12.11) — browsers show a one-time cert warning over raw-IP; set
 `SCP_NODE_SELF_HOST_PLAINTEXT=1` to fall back to plaintext `http://` for a DNS-free
 stress test (the content is public broadcast anyway).
@@ -268,7 +265,7 @@ reusable diagnostic — see §6.)*
 mechanism *and* the "node opens a router port" security consideration (§10.12.2).
 The only upstream edit artifact-flow requires: **one clarifying sentence** in
 §10.12.8 / §18.6 that the `scp-node` reference binary exposes a `--self-host` mode
-selecting `no_domain`, plus **PRD stories** (validate with
+via `host_site_until`, plus **PRD stories** (validate with
 `scripts/validate-prd.py`). That spec sentence + PRD is execution step 1.
 
 **Security posture = implementation requirements (not optional):**
@@ -289,7 +286,7 @@ home line doesn't have. Honest, not fixable from here.
 
 **Phase 1 — Minimal viable self-host (cone-NAT, this machine):** ✅ implemented
 - Build path with `production-dht` + `upnp` features.
-- The `scp-node --self-host` binary mode uses `ApplicationNodeBuilder::no_domain()`:
+- The `scp-node --self-host` binary mode calls `host_site_until(HostSiteConfig::defaults(Reach::NatTraversal) { … })`:
   probes NAT → NAT-PMP-maps the HTTP port → STUN-confirms → publishes `did:dht` to
   Mainline. Serves self-signed HTTPS by default (§10.12.11);
   `SCP_NODE_SELF_HOST_PLAINTEXT=1` opts out to plaintext for a DNS-free stress test.
@@ -310,7 +307,7 @@ home line doesn't have. Honest, not fixable from here.
 - (Optional) cert-fingerprint-over-DID for CA-less self-signed TLS verification.
 
 **Phase 4 — TLS without a central CA:**
-- ✅ Self-signed TLS (TLS 1.3) on the `no_domain()`/self-host path is the default
+- ✅ Self-signed TLS (TLS 1.3) on the self-host path is the default
   (§10.12.11); the node is its own CA, with SANs for `localhost`/`127.0.0.1`/the
   external IP. Plaintext is the explicit `SCP_NODE_SELF_HOST_PLAINTEXT=1` opt-out.
 - (Future) DID-fingerprint pinning over the self-signed cert (bind the cert
@@ -322,10 +319,10 @@ home line doesn't have. Honest, not fixable from here.
 ## 6. Open items / gaps to close (tracked here, not as throwaway issues)
 
 - [ ] `upnp` feature not enabled by default for `scp-node` (§3.1).
-- [x] `scp-node` binary now has a `no_domain()`/NAT-traversal serving mode (§3.2) —
-      the opt-in `--self-host` run mode selects `no_domain()` and does its own NAT
-      traversal on the public site port; serves self-signed HTTPS by default
-      (§10.12.11).
+- [x] `scp-node` binary now has a `--self-host`/NAT-traversal serving mode (§3.2) —
+      the opt-in `--self-host` run mode uses `HostSiteConfig` + `host_site_until` and
+      does its own NAT traversal on the public site port; serves self-signed HTTPS by
+      default (§10.12.11).
 - [x] NAT-PMP/UPnP lease renewal wired into the `--self-host` node path (§3.4) —
       renews at 50% of the gateway-reported TTL, retries on failure, released on
       shutdown.
@@ -396,3 +393,4 @@ home line doesn't have. Honest, not fixable from here.
   identity disclosure the binary gates behind `--self-host` + its banner). No new
   protocol logic, specs, ADRs, or enforcement/capability-matrix changes — a
   packaging/ergonomics refactor of the already-shipped self-host flow.
+- **2026-06-16 (ADR-052 P3a/P5)** — `ApplicationNodeBuilder` and its `.no_domain()` / `.identity_with_storage()` methods were deleted in ADR-052 Phase B-P3a (PR #1815). The `--self-host` binary path now calls `host_site_until(HostSiteConfig::defaults(Reach::NatTraversal) { … })` directly (`crates/scp-node/src/main.rs` `run_self_host`). Updated §3, §4, §5, and §6 to reflect the current API. Running log entries from 2026-06-13/2026-06-14 referenced the former typestate builder and are preserved as historical record.
