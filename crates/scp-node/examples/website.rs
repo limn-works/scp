@@ -4,12 +4,14 @@
 //! Override the port with the `PORT` env var, e.g.
 //! `PORT=9000 cargo run -p scp-node --example website`.
 //!
-//! This is a safe LOCAL demo: it serves plain HTTP, skips all NAT/UPnP port
-//! mapping, and uses an in-memory DHT — so NO router port is opened and NOTHING
-//! is published to the network. (The listener binds `0.0.0.0`, so it is also
-//! reachable on the LAN at the host's local IP, but never beyond it.) For PUBLIC
-//! hosting, drop `plaintext`/`skip_nat` and opt into `DhtMode::Production` (which
-//! publishes the host's address bound to its DID to the DHT — a location
+//! This is a safe LOCAL demo: it uses `TlsMode::Plaintext` (plain HTTP),
+//! `Reach::Local` (no NAT/UPnP probe, loopback-only addressing), and
+//! `DhtMode::Memory` — so NO router port is opened and NOTHING is published to
+//! the network. (The listener binds `0.0.0.0`, so it is also reachable on the
+//! LAN at the host's local IP, but never beyond it.) For PUBLIC hosting, switch
+//! `reach` to `Reach::NatTraversal` or `Reach::Tunnel { public_url }`, set
+//! `tls: TlsMode::SelfSigned` (the default), and opt into `DhtMode::Production`
+//! (which publishes the host's address bound to its DID to the DHT — a location
 //! disclosure). See the guide: `.docs/guides/self-hosting-a-website-on-scp.md`.
 
 use scp_node::{DhtMode, HostSiteConfig, Reach, TlsMode, host_site};

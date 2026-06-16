@@ -383,8 +383,8 @@ home line doesn't have. Honest, not fixable from here.
   `crates/scp-node/src/main.rs`); `SCP_NODE_SELF_HOST_NO_NAT=1` skips the STUN
   probe behind a tunnel/proxy; NAT-PMP/UPnP lease renews at 50% TTL.
 - **2026-06-14 (library entrypoint)** — the self-host deploy+serve core is now
-  also exposed as a public library API, `scp_node::host_site(HostSiteOptions)` /
-  `host_site_until(opts, shutdown)` (`crates/scp-node/src/self_host.rs`), so
+  also exposed as a public library API, `scp_node::host_site(HostSiteConfig)` /
+  `host_site_until(config, shutdown)` (`crates/scp-node/src/self_host.rs`), so
   "host a website on SCP" is usable as a normal async Rust call in addition to
   the turnkey `scp-node --self-host` binary. The binary is now a thin wrapper
   over `host_site_until` (env/CLI parsing, the loud banner, and the live-URL

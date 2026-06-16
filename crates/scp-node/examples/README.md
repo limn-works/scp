@@ -26,24 +26,24 @@ traditional web server and no DNS.
 
 The example is a **LOCAL demo**. It sets:
 
-- `plaintext: true` — serve plain HTTP (no self-signed-cert dance);
-- `skip_nat: true` — skip all NAT/UPnP port mapping, so **no router port is
-  opened**;
-- `dht_mode: DhtMode::Memory` — use an in-memory DHT, so **nothing is published
+- `tls: TlsMode::Plaintext` — serve plain HTTP (no self-signed-cert dance);
+- `reach: Reach::Local` — no NAT/UPnP probing and loopback-only addressing, so
+  **no router port is opened**;
+- `dht: DhtMode::Memory` — use an in-memory DHT, so **nothing is published
   to the network**.
 
 The listener binds `0.0.0.0`, so it is reachable on your LAN at the host's local
-IP — but with `skip_nat` and the in-memory DHT, it is never exposed beyond the
-local network and the node's address is never published.
+IP — but with `Reach::Local` and the in-memory DHT, it is never exposed beyond
+the local network and the node's address is never published.
 
-For **public hosting**, drop `plaintext`/`skip_nat` and opt into
-`dht_mode: DhtMode::Production`. That selects the production Mainline DHT, which
-**publishes the host's public address bound to the node's DID** — an
-IP-to-identity / approximate-location disclosure. Make that choice
-deliberately. The other defaults are public-ready: self-signed HTTPS (the "be
-your own CA" no-DNS model) and NAT probing (NAT-PMP/UPnP, built with
-`--features upnp`). If your node sits behind a tunnel/proxy (e.g. a Cloudflare
-tunnel) keep `skip_nat: true` and let the tunnel provide external reachability.
+For **public hosting**, switch `reach` and opt into `dht: DhtMode::Production`.
+That selects the production Mainline DHT, which **publishes the host's public
+address bound to the node's DID** — an IP-to-identity / approximate-location
+disclosure. Make that choice deliberately. The other defaults are public-ready:
+`tls: TlsMode::SelfSigned` (the "be your own CA" no-DNS model) and
+`reach: Reach::NatTraversal` (NAT-PMP/UPnP, built with `--features upnp`). If
+your node sits behind a tunnel/proxy (e.g. a Cloudflare tunnel) use
+`Reach::Tunnel { public_url }` and let the tunnel provide external reachability.
 
 See the full guide: [`.docs/guides/self-hosting-a-website-on-scp.md`](../../../.docs/guides/self-hosting-a-website-on-scp.md).
 
