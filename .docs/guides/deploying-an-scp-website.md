@@ -15,8 +15,8 @@ The three knobs that matter:
 
 | Field | Meaning |
 |---|---|
-| `reach: Reach` | `Reach::NatTraversal` = probe the external address (STUN) and open a router port via NAT-PMP/UPnP (needs `--features upnp`). `Reach::Tunnel { public_url }` = the tunnel provides external reachability; skip NAT probing entirely. `Reach::Local` = no probing; loopback only (dev/demo). |
-| `tls: TlsMode` | `TlsMode::SelfSigned` (default) = serve self-signed HTTPS (be-your-own-CA, no DNS). `TlsMode::Plaintext` = serve plain HTTP (for when a tunnel or proxy terminates TLS in front). |
+| `reach: Reach` | `Reach::NatTraversal` = probe the external address (STUN) and open a router port via NAT-PMP/UPnP (needs `--features upnp`). `Reach::Tunnel { public_url }` = the tunnel provides external reachability; skip NAT probing entirely. `Reach::Local` = no probing; loopback only (dev/demo). *(Only these three variants are valid for `host_site`. `Reach::Domain` is valid in `NodeConfig` but returns `HostSiteError::InvalidConfig` here.)* |
+| `tls: TlsMode` | `TlsMode::SelfSigned` (default) = serve self-signed HTTPS (be-your-own-CA, no DNS). `TlsMode::Plaintext` = serve plain HTTP (for when a tunnel or proxy terminates TLS in front). *(Only these two variants are valid for `host_site`. `Acme`/`Terminated`/`Custom` are valid in `NodeConfig` but return `HostSiteError::InvalidConfig` here.)* |
 | `dht: DhtMode` | `DhtMode::Memory` (default) = never publish this node's address (fail-safe default). `DhtMode::Production` = publish the node's public address bound to its DID to the global Mainline DHT — an IP-to-identity / approximate-location disclosure, and a deliberate opt-in. |
 
 ---
@@ -57,8 +57,8 @@ External infrastructure:
 
 Trade-offs:
 
-- **IP exposure:** every visitor sees your machine's public IP. With `dht_mode: Production` that
-  IP is additionally bound to your node's DID in the global DHT. Use `dht_mode: Memory` to keep
+- **IP exposure:** every visitor sees your machine's public IP. With `dht: DhtMode::Production` that
+  IP is additionally bound to your node's DID in the global DHT. Use `dht: DhtMode::Memory` to keep
   the address out of the DHT and share the raw IP out-of-band instead.
 - **Certificate:** self-signed, so browsers show a warning. A browser-trusted cert without a CA
   dependency requires a DNS name + ACME, which reintroduces DNS — out of scope for the pure path.
