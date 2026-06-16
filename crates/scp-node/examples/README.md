@@ -36,18 +36,12 @@ The listener binds `0.0.0.0`, so it is reachable on your LAN at the host's local
 IP — but with `Reach::Local` and the in-memory DHT, it is never exposed beyond
 the local network and the node's address is never published.
 
-For **public hosting**, switch `reach` and opt into `dht: DhtMode::Production`.
-That selects the production Mainline DHT, which **publishes the host's public
-address bound to the node's DID** — an IP-to-identity / approximate-location
-disclosure. Make that choice deliberately. The other defaults are public-ready:
-`tls: TlsMode::SelfSigned` (the "be your own CA" no-DNS model) and
-`reach: Reach::NatTraversal` (NAT-PMP/UPnP, built with `--features upnp`). If
-your node sits behind a tunnel/proxy (e.g. a Cloudflare tunnel) use
-`Reach::Tunnel { public_url }` and let the tunnel provide external reachability.
-
-See the full guide: [`.docs/guides/self-hosting-a-website-on-scp.md`](../../../.docs/guides/self-hosting-a-website-on-scp.md).
-
-For the three ways to expose a site publicly (direct IP, outbound tunnel, reverse proxy), see the [deployment recipes guide](../../../.docs/guides/deploying-an-scp-website.md).
+For **public hosting** (direct IP, outbound tunnel, or reverse proxy), see the
+[deployment recipes](../../../.docs/guides/deploying-an-scp-website.md) — the
+`reach`/`tls`/`dht` knob table and step-by-step recipes are there, including the
+DHT location-disclosure trade-off that `DhtMode::Production` opts into. The
+[background guide](../../../.docs/guides/self-hosting-a-website-on-scp.md) covers
+addressing, NAT traversal, and the full self-host architecture in depth.
 
 ### Turnkey alternative
 
