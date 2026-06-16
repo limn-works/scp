@@ -160,6 +160,18 @@ jobs:
       - run: pip install tree-sitter tree-sitter-rust
       - run: python3.12 scripts/check-protocol-sync.py
 
+  # ── Construction pattern (ADR-052) ──────────────────────────────────────
+  construction-pattern:
+    needs: check-draft
+    name: Construction pattern (ADR-052)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3.12 scripts/check-construction-pattern.py
+
   protocol-deps:
     needs: check-draft
     name: Protocol deps check
