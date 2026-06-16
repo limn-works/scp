@@ -176,12 +176,12 @@ Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `No
 
 Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled }` (M1). `BridgeRole::Enabled` is payload-free — the broker authenticates each `BRIDGE_REGISTER` by Ed25519 signature (SCP-247, §10.12.4), so it needs no config secret. The relay's `bridge_secret: Option<[u8;32]>` stays a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret, set independently of the broker role — and is therefore out of the construction-pattern surface (not folded into `BridgeRole`). Entry: `Relay::start(RelayConfig, storage)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire), an exception that holds **precisely because** `BridgeRole::default() == Disabled` (its sole security-consequential field has a fail-safe default).
 
-### host_site — `SiteConfig`
+### host_site — `HostSiteConfig`
 
-Fold `HostSiteOptions` into `SiteConfig`:
+Fold `HostSiteOptions` into `HostSiteConfig`:
 
 ```
-SiteConfig {
+HostSiteConfig {
     reach: Reach,        // required
     tls: TlsMode,        // folds the `plaintext` bool (M1); the same enum as NodeConfig.tls
     dht: DhtMode,        // M2
@@ -189,9 +189,11 @@ SiteConfig {
 }
 ```
 
-`SiteConfig` carries **both** a `tls: TlsMode` and a `dht: DhtMode`, and inherits the **same M2 DHT-publish rule as `NodeConfig`**: a publishing `Reach` (one that advertises a routable address) requires `DhtMode::Production`, and `DhtMode::Memory` (no publish) is the fail-safe default. M2 therefore fires for Site on **both** axes — Site TLS *and* Site DHT — not TLS alone: omitting TLS never silently serves plaintext on a public reach, and selecting a publishing `Reach` with `DhtMode::Memory` is the same precise, loud error it is for `NodeConfig`, not a silent publish or silent no-op.
+> **Why `HostSiteConfig`, not `SiteConfig`.** The bare name `SiteConfig` is already taken by the FFI-exported `crates/scp-node/src/projection.rs` `SiteConfig` (the virtual-host deploy-limits type: hostname / index path / max assets / retention / CSP), which the four bridges export and the SDK capability matrix tracks. Renaming that type is a bridge-parity hazard out of scope here, so the construction host config takes the distinct name `HostSiteConfig` — a compiler-level constraint, the one legitimate reason to deviate from the otherwise-`<Thing>Config` naming.
 
-`host_site` (today `host_site(opts: HostSiteOptions)`, `crates/scp-node/src/self_host.rs`) remains the fail-safe **sugar** tier: it constructs a full `SiteConfig` and delegates to `Node::start` — never a parallel construction path (matches `start_local` / `start_in_memory`).
+`HostSiteConfig` carries **both** a `tls: TlsMode` and a `dht: DhtMode`, and inherits the **same M2 DHT-publish rule as `NodeConfig`**: a publishing `Reach` (one that advertises a routable address) requires `DhtMode::Production`, and `DhtMode::Memory` (no publish) is the fail-safe default. M2 therefore fires for Site on **both** axes — Site TLS *and* Site DHT — not TLS alone: omitting TLS never silently serves plaintext on a public reach, and selecting a publishing `Reach` with `DhtMode::Memory` is the same precise, loud error it is for `NodeConfig`, not a silent publish or silent no-op.
+
+`host_site` (today `host_site(opts: HostSiteConfig)`, `crates/scp-node/src/self_host.rs`) remains the fail-safe **sugar** tier: it constructs a full `HostSiteConfig` and delegates to `Node::start` — never a parallel construction path (matches `start_local` / `start_in_memory`).
 
 ### Context — `ContextConfig`
 
