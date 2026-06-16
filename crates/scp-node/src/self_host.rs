@@ -691,9 +691,10 @@ pub struct HostSiteReady {
 /// router port is opened and the listener serves plain HTTP. For PUBLIC hosting,
 /// pass [`Reach::NatTraversal`] and opt into [`DhtMode::Production`]
 /// deliberately (it publishes the host's address bound to its DID to the global
-/// Mainline DHT — a location disclosure). A publishing reach with
-/// [`DhtMode::Memory`] is a loud [`HostSiteError::InvalidConfig`] (M2), never a
-/// silent publish or silent no-op.
+/// Mainline DHT — a location disclosure). [`DhtMode::Memory`] (no publish) is
+/// the fail-safe direction and is valid for every reach — including
+/// [`Reach::NatTraversal`], the "reachable but not DHT-discoverable" config
+/// (share the address out-of-band) — never an error.
 ///
 /// See the runnable example at `crates/scp-node/examples/website.rs` and the
 /// guide `.docs/guides/self-hosting-a-website-on-scp.md`.
@@ -722,9 +723,12 @@ pub struct HostSiteConfig {
     /// public hosting — it publishes the host's public address bound to the node
     /// DID to the global Mainline DHT (an IP-to-identity / location disclosure).
     ///
-    /// A publishing [`reach`](Self::reach) (one that advertises a routable
-    /// address) with [`DhtMode::Memory`] is a loud [`HostSiteError::InvalidConfig`]
-    /// (the same M2 rule as [`NodeConfig`](crate::NodeConfig)).
+    /// [`DhtMode::Memory`] (no publish) is the fail-safe, non-disclosing
+    /// direction and is valid with **any** [`reach`](Self::reach), including the
+    /// publishing-capable [`Reach::NatTraversal`]: that pairing is the
+    /// reachable-but-unpublished config (share the address out-of-band), never an
+    /// error — the same M2 stance as [`NodeConfig`](crate::NodeConfig). Only
+    /// [`DhtMode::Production`] discloses, so only it is an explicit opt-in.
     pub dht: DhtMode,
 
     // --- Defaulted fields ---
@@ -831,11 +835,15 @@ const fn tls_mode_label(tls: &TlsMode) -> &'static str {
 /// failure.
 #[derive(Debug, thiserror::Error)]
 pub enum HostSiteError {
-    /// The [`HostSiteConfig`] is internally contradictory (ADR-052 M2): a
-    /// publishing [`Reach`] (one that advertises a routable address) was paired
-    /// with [`DhtMode::Memory`] (which never publishes the DID document to the
-    /// DHT), so the routable address would be unreachable. Fail loud, never a
-    /// silent publish or silent no-op.
+    /// The [`HostSiteConfig`] names something this deployment driver cannot serve
+    /// (ADR-052 M3 — fail loud, never a silent no-op). The cases: a
+    /// [`Reach::Domain`] (a hosted site builds a no-domain node, reached via its
+    /// routing-id path, not a DNS domain), or a [`TlsMode`] the no-domain
+    /// listener does not provision ([`TlsMode::Acme`] — no DNS name to provision
+    /// for; [`TlsMode::Terminated`] / [`TlsMode::Custom`] — no upstream
+    /// terminator here). The DHT axis is NOT a source of this error:
+    /// [`DhtMode::Memory`] (no publish) is the fail-safe direction and valid for
+    /// every reach.
     #[error("invalid host-site config: {0}")]
     InvalidConfig(String),
     /// The storage directory could not be resolved, created, or written.
@@ -894,17 +902,16 @@ pub enum HostSiteError {
 ///   is a loud error: `host_site` builds a no-domain node, so a domain reach has
 ///   no meaning here.
 ///
-/// M2 (DHT publish): [`Reach::NatTraversal`] advertises a routable address, so it
-/// requires [`DhtMode::Production`]; pairing it with [`DhtMode::Memory`] (no
-/// publish) is a loud [`HostSiteError::InvalidConfig`], the same rule
-/// [`NodeConfig`](crate::NodeConfig) enforces. [`Reach::Local`] / [`Reach::Tunnel`]
-/// publish a loopback (non-routable) URL and are non-publishing, valid with
-/// either DHT mode.
-fn lower_host_site_reach_tls(
-    reach: &Reach,
-    tls: &TlsMode,
-    dht: DhtMode,
-) -> Result<(bool, bool), HostSiteError> {
+/// This lowering does NOT validate the DHT axis: [`DhtMode::Memory`] (do not
+/// publish the DID document) is the fail-safe, non-disclosing direction and is
+/// valid for every [`Reach`], including the publishing-capable
+/// [`Reach::NatTraversal`] — the reachable-but-unpublished self-host case
+/// ("publicly reachable, address shared out-of-band, not published to the DHT").
+/// Only [`DhtMode::Production`] discloses, and it is already a deliberate opt-in
+/// (Memory is the default), so there is nothing to reject — the same rule
+/// [`NodeConfig`](crate::NodeConfig) enforces. `dht` is therefore not an input
+/// here; it selects the DHT client downstream, not validity.
+fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool), HostSiteError> {
     let plaintext = match tls {
         TlsMode::Plaintext => true,
         TlsMode::SelfSigned => false,
@@ -947,19 +954,6 @@ fn lower_host_site_reach_tls(
         }
     };
 
-    // M2: a publishing reach advertises a routable address, which only reaches
-    // the network when the DID document is actually published. `Reach::NatTraversal`
-    // is the publishing reach here; `DhtMode::Memory` never publishes, so the
-    // routable address would be unreachable — a contradiction. Fail loud.
-    if matches!(reach, Reach::NatTraversal) && dht == DhtMode::Memory {
-        return Err(HostSiteError::InvalidConfig(
-            "Reach::NatTraversal publishes a routable address but DhtMode::Memory does not \
-             publish to the DHT, so the site would be unreachable. Select DhtMode::Production to \
-             publish, or a non-publishing Reach (Local/Tunnel)."
-                .to_owned(),
-        ));
-    }
-
     Ok((plaintext, skip_nat))
 }
 
@@ -988,9 +982,11 @@ fn lower_host_site_reach_tls(
 ///
 /// # Errors
 ///
-/// Returns a [`HostSiteError`] if the config is contradictory
-/// ([`HostSiteError::InvalidConfig`] — a publishing `reach` with
-/// [`DhtMode::Memory`], M2) or any stage fails: storage path/key resolution,
+/// Returns a [`HostSiteError`] if the config names something this deployment
+/// driver cannot serve ([`HostSiteError::InvalidConfig`] — a [`Reach::Domain`]
+/// or a non-self-host [`TlsMode`]; the DHT axis is never an error since
+/// [`DhtMode::Memory`] is valid for every reach) or any stage fails: storage
+/// path/key resolution,
 /// storage/custody/blob open, DID method construction, node build, asset load,
 /// TLS config, deploy, or serve. Returns `Ok(())` on clean shutdown.
 pub async fn host_site(config: HostSiteConfig) -> Result<(), HostSiteError> {
@@ -1027,11 +1023,13 @@ where
         on_ready,
     } = config;
 
-    // -- Validate (M2) and lower the construction-pattern enums onto the
-    //    internal `plaintext` / `skip_nat` booleans the build path threads.
-    //    `tls` folds `plaintext`; `reach` folds `skip_nat`. A publishing reach
-    //    with `DhtMode::Memory` is a loud error, never a silent publish. --
-    let (plaintext, skip_nat) = lower_host_site_reach_tls(&reach, &tls, dht_mode)?;
+    // -- Validate (TLS×Reach) and lower the construction-pattern enums onto
+    //    the internal `plaintext` / `skip_nat` booleans the build path threads.
+    //    `tls` folds `plaintext`; `reach` folds `skip_nat`. `DhtMode::Memory`
+    //    (no publish) is the fail-safe direction and valid for every reach, so
+    //    the DHT axis needs no validation — `dht_mode` selects the DHT client
+    //    downstream (the match below). --
+    let (plaintext, skip_nat) = lower_host_site_reach_tls(&reach, &tls)?;
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
 
@@ -2108,8 +2106,10 @@ mod tests {
     //
     // These cover the ADR-052 P3c folds: `HostSiteConfig::defaults` is fail-safe
     // (M4 — no whole-struct Default, a reach-keyed factory instead), `plaintext`
-    // is folded into `TlsMode`, `skip_nat` into `Reach`, and a publishing reach
-    // with `DhtMode::Memory` is a loud error (M2).
+    // is folded into `TlsMode`, `skip_nat` into `Reach`. `DhtMode::Memory` (no
+    // publish) is the fail-safe direction and valid for every reach, so the
+    // lowering does not validate the DHT axis (M2: only `Production` discloses,
+    // and it is the explicit opt-in).
     // -----------------------------------------------------------------------
 
     /// `HostSiteConfig::defaults(reach)` fills every non-required field with the
@@ -2141,17 +2141,15 @@ mod tests {
     /// a non-publishing `Reach::Local`, so neither trips the M2 rule.
     #[test]
     fn tls_mode_folds_plaintext_bool() {
-        let (plaintext, _skip_nat) =
-            lower_host_site_reach_tls(&Reach::Local, &TlsMode::Plaintext, DhtMode::Memory)
-                .expect("Local + Plaintext + Memory is a valid local-demo config");
+        let (plaintext, _skip_nat) = lower_host_site_reach_tls(&Reach::Local, &TlsMode::Plaintext)
+            .expect("Local + Plaintext is a valid local-demo config");
         assert!(
             plaintext,
             "TlsMode::Plaintext must lower to a plaintext listener"
         );
 
-        let (plaintext, _skip_nat) =
-            lower_host_site_reach_tls(&Reach::Local, &TlsMode::SelfSigned, DhtMode::Memory)
-                .expect("Local + SelfSigned + Memory is valid");
+        let (plaintext, _skip_nat) = lower_host_site_reach_tls(&Reach::Local, &TlsMode::SelfSigned)
+            .expect("Local + SelfSigned is valid");
         assert!(
             !plaintext,
             "TlsMode::SelfSigned must lower to a (self-signed HTTPS) non-plaintext listener"
@@ -2163,8 +2161,7 @@ mod tests {
     #[test]
     fn reach_folds_skip_nat_bool() {
         let (_p, skip_nat) =
-            lower_host_site_reach_tls(&Reach::Local, &TlsMode::Plaintext, DhtMode::Memory)
-                .expect("Local is valid");
+            lower_host_site_reach_tls(&Reach::Local, &TlsMode::Plaintext).expect("Local is valid");
         assert!(skip_nat, "Reach::Local must skip the NAT probe");
 
         let (_p, skip_nat) = lower_host_site_reach_tls(
@@ -2172,48 +2169,31 @@ mod tests {
                 public_url: "https://tunnel.example".to_owned(),
             },
             &TlsMode::Plaintext,
-            DhtMode::Memory,
         )
-        .expect("Tunnel is a non-publishing reach, valid with Memory");
+        .expect("Tunnel lowers to skip_nat");
         assert!(skip_nat, "Reach::Tunnel must skip the NAT probe");
 
-        let (_p, skip_nat) = lower_host_site_reach_tls(
-            &Reach::NatTraversal,
-            &TlsMode::SelfSigned,
-            DhtMode::Production,
-        )
-        .expect("NatTraversal + Production is the public-hosting config");
+        let (_p, skip_nat) = lower_host_site_reach_tls(&Reach::NatTraversal, &TlsMode::SelfSigned)
+            .expect("NatTraversal lowers to probe NAT");
         assert!(!skip_nat, "Reach::NatTraversal must probe NAT");
     }
 
-    /// M2: a publishing reach (`Reach::NatTraversal`) with `DhtMode::Memory` is a
-    /// loud `InvalidConfig`, never a silent publish or silent no-op.
+    /// `Reach::NatTraversal` lowers cleanly regardless of DHT mode: the lowering
+    /// validates only the TLS×Reach axis, never the DHT axis. `DhtMode::Memory`
+    /// (no publish) is the fail-safe direction and valid for every reach — the
+    /// reachable-but-unpublished self-host case (publicly reachable via NAT
+    /// traversal, address shared out-of-band, not published to the DHT). It is
+    /// never an error; only `DhtMode::Production` discloses, and it is the
+    /// explicit opt-in (M2).
     #[test]
-    fn publishing_reach_with_memory_dht_is_loud_error() {
-        let err =
-            lower_host_site_reach_tls(&Reach::NatTraversal, &TlsMode::SelfSigned, DhtMode::Memory)
-                .expect_err("NatTraversal + Memory must be rejected (M2)");
-        match err {
-            HostSiteError::InvalidConfig(msg) => {
-                assert!(
-                    msg.contains("Reach::NatTraversal") && msg.contains("DhtMode::Memory"),
-                    "the error must name both halves of the contradiction, got: {msg}"
-                );
-            }
-            other => panic!("expected HostSiteError::InvalidConfig, got: {other}"),
-        }
-    }
-
-    /// A publishing reach with `DhtMode::Production` is the intended public
-    /// config and must lower cleanly.
-    #[test]
-    fn publishing_reach_with_production_dht_is_valid() {
-        lower_host_site_reach_tls(
-            &Reach::NatTraversal,
-            &TlsMode::SelfSigned,
-            DhtMode::Production,
-        )
-        .expect("NatTraversal + Production is the public-hosting config and must be valid");
+    fn nat_traversal_lowers_for_both_dht_modes() {
+        // `lower_host_site_reach_tls` no longer takes a `dht` arg — the DHT mode
+        // does not affect reach/TLS lowering. The successful lowering is the
+        // proof that a publishing-capable reach is accepted with the default
+        // (Memory) DHT mode (the old, inverted rule rejected NatTraversal+Memory).
+        let (_p, skip_nat) = lower_host_site_reach_tls(&Reach::NatTraversal, &TlsMode::SelfSigned)
+            .expect("NatTraversal lowers cleanly; DHT mode does not gate validity");
+        assert!(!skip_nat, "Reach::NatTraversal must probe NAT");
     }
 
     /// `Reach::Domain` has no meaning for the no-domain `host_site` deployment
@@ -2225,7 +2205,6 @@ mod tests {
                 domain: "example.com".to_owned(),
             },
             &TlsMode::SelfSigned,
-            DhtMode::Production,
         )
         .expect_err("Reach::Domain is not valid for host_site");
         assert!(
@@ -2239,7 +2218,7 @@ mod tests {
     #[test]
     fn non_self_host_tls_modes_are_rejected() {
         for tls in [TlsMode::Acme { email: None }, TlsMode::Terminated] {
-            let err = lower_host_site_reach_tls(&Reach::Local, &tls, DhtMode::Memory)
+            let err = lower_host_site_reach_tls(&Reach::Local, &tls)
                 .expect_err("Acme/Terminated are not valid for host_site");
             assert!(
                 matches!(err, HostSiteError::InvalidConfig(_)),

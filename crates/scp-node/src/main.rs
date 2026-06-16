@@ -169,7 +169,11 @@ ENVIRONMENT VARIABLES:
     SCP_NODE_BIND_ADDR          HTTP bind address (default: 0.0.0.0:9000)
     SCP_NODE_TLS_SELF_SIGNED    Set to '1' for self-signed TLS (development only)
     SCP_NODE_PROJECTION_RATE_LIMIT  Per-IP rate limit for projection endpoints (default: 60)
-    SCP_NODE_DHT_MODE           DHT client: 'production' (default) or 'memory'
+    SCP_NODE_DHT_MODE           DHT client: 'production' (default) publishes this
+                                node's address to the Mainline DHT; 'memory' does
+                                NOT publish (reachable but not DHT-discoverable —
+                                share the address out-of-band). Works with or
+                                without NAT probing.
     SCP_NODE_DHT_GATEWAYS       Comma-separated DHT HTTP gateway URLs
     SCP_STORAGE_PATH            SQLite database directory (same as --storage-path)
     SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
@@ -538,16 +542,22 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
 /// is opened.
 ///
 /// States, in plain language, the consequences the operator is opting into
-/// (public-port exposure, public-IP<->DID DHT disclosure, and the transport
-/// security posture) plus the Finding-D NAT self-test note so a Tier-2 line in
-/// the logs is not mistaken for a hosting failure.
+/// (public-port exposure, the public-IP<->DID DHT disclosure — only when DHT
+/// publishing is actually on — and the transport security posture) plus the
+/// Finding-D NAT self-test note so a Tier-2 line in the logs is not mistaken for
+/// a hosting failure.
 ///
 /// `plaintext` reflects whether the operator opted OUT of TLS via
 /// `SCP_NODE_SELF_HOST_PLAINTEXT=1`. By default self-host serves a self-signed
 /// (no-CA) HTTPS certificate, so the transport line describes the expected
 /// one-time browser untrusted-cert warning; under the plaintext opt-out it
 /// describes the cleartext exposure instead.
-fn self_host_banner(port: u16, plaintext: bool) -> String {
+///
+/// `publishes_dht` reflects whether `SCP_NODE_DHT_MODE` resolves to `production`
+/// (publish) vs `memory` (no publish). Under `memory` the host's address is NOT
+/// published to the DHT, so the IP<->DID disclosure line is replaced with a line
+/// stating the node is reachable but not DHT-discoverable.
+fn self_host_banner(port: u16, plaintext: bool, publishes_dht: bool) -> String {
     let transport_line = if plaintext {
         "  * Transport is PLAINTEXT HTTP (SCP_NODE_SELF_HOST_PLAINTEXT=1): traffic is\n\
          \x20    readable and tamper-able in transit. The hosted content is public broadcast\n\
@@ -558,12 +568,22 @@ fn self_host_banner(port: u16, plaintext: bool) -> String {
          \x20    DNS name and no certificate authority. This is EXPECTED for the no-DNS model.\n\
          \x20    Set SCP_NODE_SELF_HOST_PLAINTEXT=1 to serve plain HTTP instead."
     };
+    let dht_line = if publishes_dht {
+        "  * Your host's PUBLIC IP will be published to the global Mainline DHT, bound to
+\
+         \x20    this node's DID. This is an IP<->identity disclosure (approximate-location dox)."
+    } else {
+        "  * DHT publishing is OFF (SCP_NODE_DHT_MODE=memory): your host's address is NOT
+\
+         \x20    published to the Mainline DHT. The node is reachable on the opened port but is
+\
+         \x20    NOT DHT-discoverable -- share its address out-of-band."
+    };
     format!(
         "================================ SELF-HOST MODE ================================\n\
          scp-node is about to open inbound TCP port {port} to the PUBLIC INTERNET via\n\
          NAT-PMP/UPnP (when built with --features upnp). Consequences you are opting into:\n\
-           * Your host's PUBLIC IP will be published to the global Mainline DHT, bound to\n\
-             this node's DID. This is an IP<->identity disclosure (approximate-location dox).\n\
+         {dht_line}\n\
          {transport_line}\n\
            * A residential uplink cannot absorb a volumetric/distributed DDoS; per-IP rate\n\
              limiting protects CPU/keys but not raw bandwidth.\n\
@@ -621,31 +641,22 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
 /// banner (printed via the `on_ready` callback). On error the process exits 1.
 ///
 /// Opens an inbound TCP port to the public internet (via NAT-PMP/UPnP when the
-/// `upnp` feature is built) and publishes the host's address to the Mainline
-/// DHT (unless `SCP_NODE_DHT_MODE=memory`). See the startup banner.
+/// `upnp` feature is built). Whether the host's address is published to the
+/// Mainline DHT is governed independently by `SCP_NODE_DHT_MODE`:
+/// `production` (the default) publishes; `memory` does NOT publish — the node is
+/// still reachable on the opened port, the address is just not DHT-discoverable
+/// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
+/// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
 
-    // -- Loud startup banner BEFORE opening any socket --
-    eprintln!("{}", self_host_banner(port, plaintext));
-    if skip_nat {
-        eprintln!(
-            "NAT probe skipped (SCP_NODE_SELF_HOST_NO_NAT) — assuming reachability via a \
-             proxy/tunnel. Relay URL falls back to loopback; certificate SANs are \
-             localhost + 127.0.0.1 only."
-        );
-    }
-    tracing::warn!(
-        port,
-        skip_nat,
-        "self-host mode enabled — opening inbound port to the public internet"
-    );
-
-    // -- DHT mode: production pkarr by default; memory for offline testing. An
-    //    unrecognized value must NOT silently fall through to the production
-    //    DHT (which would publish the host's address). --
+    // -- DHT mode: production pkarr by default; memory for "reachable but not
+    //    DHT-discoverable" hosting. An unrecognized value must NOT silently fall
+    //    through to the production DHT (which would publish the host's address).
+    //    Parsed BEFORE the banner so the banner can state the actual disclosure
+    //    posture (memory = address NOT published). --
     let dht_mode = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
     let dht_mode = match dht_mode.as_str() {
         "memory" => scp_node::DhtMode::Memory,
@@ -659,6 +670,23 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
             std::process::exit(1);
         }
     };
+    let publishes_dht = matches!(dht_mode, scp_node::DhtMode::Production);
+
+    // -- Loud startup banner BEFORE opening any socket --
+    eprintln!("{}", self_host_banner(port, plaintext, publishes_dht));
+    if skip_nat {
+        eprintln!(
+            "NAT probe skipped (SCP_NODE_SELF_HOST_NO_NAT) — assuming reachability via a \
+             proxy/tunnel. Relay URL falls back to loopback; certificate SANs are \
+             localhost + 127.0.0.1 only."
+        );
+    }
+    tracing::warn!(
+        port,
+        skip_nat,
+        publishes_dht,
+        "self-host mode enabled — opening inbound port to the public internet"
+    );
 
     let refresh_secs: u64 = startup::env_or(
         "SCP_NODE_SELF_HOST_REFRESH_SECS",
@@ -1216,17 +1244,17 @@ mod tests {
     // ordering invariant here.
     // -----------------------------------------------------------------------
 
-    /// The HTTPS-default banner states every disclosure the operator opts into
-    /// (public-internet port exposure, public-IP<->identity DHT disclosure, and
-    /// the self-signed-HTTPS transport posture) and never claims plaintext; the
-    /// plaintext-opt-out banner instead states the cleartext exposure and names
-    /// the opt-out variable.
+    /// The HTTPS-default banner (with DHT publishing ON) states every disclosure
+    /// the operator opts into (public-internet port exposure, public-IP<->identity
+    /// DHT disclosure, and the self-signed-HTTPS transport posture) and never
+    /// claims plaintext; the plaintext-opt-out banner instead states the cleartext
+    /// exposure and names the opt-out variable.
     #[test]
     fn self_host_banner_states_disclosures() {
         let port = 8443u16;
 
-        // -- HTTPS default (plaintext = false). --
-        let https = self_host_banner(port, false);
+        // -- HTTPS default (plaintext = false), DHT publishing ON. --
+        let https = self_host_banner(port, false, true);
         assert!(
             https.contains(&port.to_string()),
             "banner must name the port being opened"
@@ -1241,15 +1269,15 @@ mod tests {
         );
         assert!(
             https.contains("PUBLIC IP"),
-            "banner must disclose public-IP publication"
+            "the publishing banner must disclose public-IP publication"
         );
         assert!(
             https.contains("DHT"),
-            "banner must disclose DHT publication of the address"
+            "the publishing banner must disclose DHT publication of the address"
         );
         assert!(
             https.contains("IP<->identity"),
-            "banner must disclose the IP<->identity binding"
+            "the publishing banner must disclose the IP<->identity binding"
         );
         assert!(
             https.contains("self-signed HTTPS"),
@@ -1260,8 +1288,8 @@ mod tests {
             "the HTTPS-default banner must NOT claim plaintext transport"
         );
 
-        // -- Plaintext opt-out (plaintext = true). --
-        let plain = self_host_banner(port, true);
+        // -- Plaintext opt-out (plaintext = true), DHT publishing ON. --
+        let plain = self_host_banner(port, true, true);
         assert!(
             plain.contains("PLAINTEXT HTTP"),
             "the plaintext banner must disclose cleartext transport"
@@ -1269,6 +1297,37 @@ mod tests {
         assert!(
             plain.contains("SCP_NODE_SELF_HOST_PLAINTEXT"),
             "the plaintext banner must name the opt-out environment variable"
+        );
+    }
+
+    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=memory`), the banner must NOT
+    /// claim the host's IP is published — it must instead state the node is
+    /// reachable but not DHT-discoverable. This is the banner half of the M2
+    /// correction: `memory` (no publish) is a valid self-host mode that opens the
+    /// port without disclosing the address to the DHT.
+    #[test]
+    fn self_host_banner_memory_mode_states_no_publish() {
+        let port = 8443u16;
+        let memory = self_host_banner(port, false, false);
+
+        // The port is still opened, so the public-internet exposure stands.
+        assert!(
+            memory.contains("PUBLIC INTERNET"),
+            "memory-mode banner must still disclose public-internet port exposure"
+        );
+        // But the IP<->identity DHT publication line must be GONE.
+        assert!(
+            !memory.contains("PUBLIC IP will be published"),
+            "memory-mode banner must NOT claim the public IP is published to the DHT"
+        );
+        assert!(
+            !memory.contains("IP<->identity disclosure"),
+            "memory-mode banner must NOT claim an IP<->identity disclosure"
+        );
+        // And it must state the no-publish / not-discoverable posture.
+        assert!(
+            memory.contains("DHT publishing is OFF") && memory.contains("NOT DHT-discoverable"),
+            "memory-mode banner must state the address is not published and not DHT-discoverable"
         );
     }
 }
