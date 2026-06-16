@@ -11,7 +11,7 @@
 //!    subsystems — nothing persists across restarts.
 //! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
 //!    (no DNS name required) — opens an inbound public port, publishes the host's
-//!    IP to the DHT, and serves the site over self-signed HTTPS by default
+//!    IP to the DHT by default, and serves the site over self-signed HTTPS by default
 //!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP).
 //!
 //! Configuration is read from CLI flags and environment variables.
@@ -141,7 +141,8 @@ OPTIONS:
     --ephemeral             Use in-memory storage for all subsystems (no persistence)
     --self-host             Host a static site entirely on SCP (no DNS name required).
                             Opens an inbound port to the PUBLIC INTERNET and
-                            publishes the host's IP to the DHT.
+                            publishes the host's IP to the DHT by default
+                            (`SCP_NODE_DHT_MODE=memory` skips publication).
                             Self-signed HTTPS by default (SCP_NODE_SELF_HOST_PLAINTEXT=1
                             for plain HTTP). See the loud startup banner for the full warning.
     --site-dir <PATH>       Directory of static files to host in --self-host mode
