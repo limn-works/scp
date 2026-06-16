@@ -1410,6 +1410,17 @@ impl Supervisor {
         );
         let key_package_store = self.key_package_store_for(owning_did).await?;
         let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(Arc::clone(self));
+        // Mint the actor's capability token here, at the supervisor build
+        // site, for THIS actor's owning identity (ADR-049 §5). This is the
+        // only mint path — `issue_for_actor` is `pub(super)`, reachable
+        // only from supervisor-module code. Each actor receives a token
+        // for its own `owning_did`; a wrong-owner token is impossible
+        // because the mint argument is the very DID the rest of the bundle
+        // (KP-store, crypto scope) is built for.
+        let owned_identity =
+            crate::context::supervisor::identity_capability::OwnedIdentityDid::issue_for_actor(
+                owning_did.clone(),
+            );
 
         Ok(crate::context::actor::deps::ActorDeps {
             crypto,
@@ -1426,6 +1437,7 @@ impl Supervisor {
             key_resolver,
             payment_adapter: self.payment_adapter_ref().map(Arc::clone),
             local_dids: self.local_dids_shared(),
+            owned_identity,
         })
     }
 

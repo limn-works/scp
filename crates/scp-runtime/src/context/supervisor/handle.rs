@@ -18,11 +18,17 @@
 //!
 //! Methods that touch per-identity state take `&OwnedIdentityDid`, not
 //! `&DID`. [`OwnedIdentityDid`](super::identity_capability::OwnedIdentityDid)
-//! is `pub(super)` inside the `supervisor/` module — this file is inside
-//! that module so it CAN name the type. Handler code in
-//! `actor/handlers/` cannot reach the type's constructor path and
-//! therefore cannot call these methods with a fabricated token. See
-//! plan §"`OwnedIdentityDid` capability tag".
+//! is `pub(in crate::context)` — the SAME name-visibility as these
+//! methods — so naming the type is not what gates these calls. The mint
+//! guarantee rides on two narrower mechanisms: the `pub(super)`
+//! constructor `issue_for_actor` (only supervisor-module code can mint a
+//! token from a raw `DID`) and the private `did` field (no struct-literal
+//! construction outside `identity_capability`). Handlers in
+//! `actor/handlers/` receive `&OwnedIdentityDid` references through
+//! [`ActorDeps`](crate::context::actor::deps::ActorDeps) and can call
+//! these methods, but they cannot CONSTRUCT a token — so they cannot
+//! fabricate one for an identity they do not own. See plan
+//! §"`OwnedIdentityDid` capability tag".
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -260,22 +266,20 @@ impl SupervisorHandle {
     ///
     /// Takes `&OwnedIdentityDid` — not `&DID` — so the caller must hold
     /// the capability proof that they are the actor for this identity.
-    /// The token is constructed only in `supervisor/` code
-    /// (`pub(super)` constructor); handler code cannot fabricate it.
+    /// The token is minted only in `supervisor/` code (the `pub(super)`
+    /// `issue_for_actor` constructor) and its `did` field is private;
+    /// handler code can hold and pass a token but cannot fabricate one.
     ///
-    /// Visibility is `pub(in crate::context)` rather than `pub` because
-    /// `OwnedIdentityDid` is `pub(super)` inside `supervisor/`.
-    /// The narrower visibility scopes call-site reachability to handler
-    /// code under `crate::context::actor::handlers/`.
-    ///
-    /// `private_interfaces` is allowed: the deliberate-by-design
-    /// asymmetry (the type is more private than the method) is the
-    /// capability discipline. Handlers receive `&OwnedIdentityDid`
-    /// references through `ActorDeps`; they cannot construct one
-    /// because `OwnedIdentityDid::issue_for_actor` is `pub(super)`
-    /// inside `supervisor/`.
+    /// Visibility is `pub(in crate::context)` — the SAME visibility as
+    /// `OwnedIdentityDid` itself. The token-by-value lives in
+    /// `ActorDeps`; this method is reachable from handler code under
+    /// `crate::context::actor::handlers/` that holds an `&OwnedIdentityDid`
+    /// borrow. Because the type and the method share visibility, there is
+    /// no `private_interfaces` asymmetry to allow — the mint guarantee is
+    /// carried entirely by the `pub(super)` constructor and the private
+    /// field, not by any visibility gap here.
     #[must_use]
-    #[allow(private_interfaces, dead_code)]
+    #[allow(dead_code)]
     pub(in crate::context) fn my_wrapping_public_key(
         &self,
         identity: &OwnedIdentityDid,
@@ -290,12 +294,13 @@ impl SupervisorHandle {
     /// Look up this identity's `KeyPackageStoreActor` handle. Returns
     /// `None` if no KeyPackage actor has been spawned for the identity.
     ///
-    /// Same capability discipline as [`Self::my_wrapping_public_key`].
-    /// Visibility is `pub(in crate::context)` for the same reason.
-    /// `private_interfaces` is allowed for the same deliberate
-    /// asymmetry documented there.
+    /// Same capability discipline as [`Self::my_wrapping_public_key`]:
+    /// `&OwnedIdentityDid` proves ownership, the token cannot be minted
+    /// outside `supervisor/`, and the method shares the type's
+    /// `pub(in crate::context)` visibility — so no `private_interfaces`
+    /// asymmetry exists to allow.
     #[must_use]
-    #[allow(private_interfaces, dead_code)]
+    #[allow(dead_code)]
     pub(in crate::context) fn my_key_package_store(
         &self,
         identity: &OwnedIdentityDid,
