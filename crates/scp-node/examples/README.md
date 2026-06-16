@@ -24,17 +24,9 @@ traditional web server and no DNS.
 
 ### Local demo vs public hosting
 
-The example is a **LOCAL demo**. It sets:
-
-- `tls: TlsMode::Plaintext` — serve plain HTTP (no self-signed-cert dance);
-- `reach: Reach::Local` — no NAT/UPnP probing and loopback-only addressing, so
-  **no router port is opened**;
-- `dht: DhtMode::Memory` — use an in-memory DHT, so **nothing is published
-  to the network**.
-
-The listener binds `0.0.0.0`, so it is reachable on your LAN at the host's local
-IP — but with `Reach::Local` and the in-memory DHT, it is never exposed beyond
-the local network and the node's address is never published.
+The example is a **LOCAL demo**: `HostSiteConfig::defaults(Reach::Local)` with
+`tls: TlsMode::Plaintext` and `dht: DhtMode::Memory` — no NAT probe, no router
+port opened, nothing published. (The source doc-comment explains each choice.)
 
 For **public hosting** (direct IP, outbound tunnel, or reverse proxy), see the
 [deployment recipes](../../../.docs/guides/deploying-an-scp-website.md) — the
