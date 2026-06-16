@@ -33,7 +33,7 @@ use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
 
 use crate::{
-    ApplicationNode, DEFAULT_HTTP_BIND_ADDR, DEFAULT_PROJECTION_RATE_LIMIT, DhtMode, NatStrategy,
+    ApplicationNode, DEFAULT_HTTP_BIND_ADDR, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy,
     NoOpCustody, NoOpDidMethod, NoOpStorage, NodeError, TlsProvider, build_domain_inner,
     build_no_domain_inner, generate_bridge_secret, generate_dev_token,
     provision_with_challenge_listener, resolve_identity_persistent, resolve_nat, resolve_tls,
@@ -190,6 +190,39 @@ pub enum TlsMode {
     /// fails, to exercise the §10.12.8 TLS-failure → NAT-fallthrough branch on a
     /// `Domain` reach). Rust-core-only; the FFI `TlsMode` mirror omits it.
     Custom(Arc<dyn TlsProvider>),
+}
+
+// ---------------------------------------------------------------------------
+// DhtMode — DID-document publication selection (M1 enum, shared by Node + Site)
+// ---------------------------------------------------------------------------
+
+/// Which DHT client a node (or hosted site) uses to publish (or not publish) its
+/// DID document.
+///
+/// The default is [`Memory`](DhtMode::Memory) (fail-safe — nothing is
+/// published). Selecting [`Production`](DhtMode::Production) is a deliberate,
+/// explicit opt-in to publishing the node's public address bound to its DID, so
+/// the privacy-worst behavior is never the path of least resistance (ADR-052
+/// M2). Promoted here from `self_host.rs` so the Node ([`NodeConfig`]) and the
+/// hosted-site ([`crate::HostSiteConfig`]) construction surfaces share **one**
+/// definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DhtMode {
+    /// In-memory DHT client: the DID document is NEVER published to the
+    /// network. The fail-safe default — used for local development and offline
+    /// testing, and whenever the caller has not consciously opted into
+    /// publishing.
+    #[default]
+    Memory,
+    /// Production pkarr client: publishes the node's DID document (and thus its
+    /// address) to the global Mainline DHT. This is the correct mode for a
+    /// publicly reachable node or site.
+    ///
+    /// Production mode publishes the host's public address bound to the node DID
+    /// to the global Mainline DHT — an approximate-location / IP-to-identity
+    /// disclosure. Select it only as a deliberate opt-in to public hosting; use
+    /// [`Memory`](DhtMode::Memory) for local/dev so nothing is published.
+    Production,
 }
 
 // ---------------------------------------------------------------------------

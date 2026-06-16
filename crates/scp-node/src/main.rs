@@ -530,7 +530,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
 // (`scp_node::host_site_until`). This binary keeps ONLY the binary-only
 // concerns: env/CLI parsing of the self-host knobs, the loud startup banner,
 // and the live-URL banner (printed via the `on_ready` callback). `run_self_host`
-// reads the env, builds a `HostSiteOptions`, and drives `host_site_until` with
+// reads the env, builds a `HostSiteConfig`, and drives `host_site_until` with
 // the binary's own platform shutdown signal.
 // ---------------------------------------------------------------------------
 
@@ -662,7 +662,9 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
 
     let refresh_secs: u64 = startup::env_or(
         "SCP_NODE_SELF_HOST_REFRESH_SECS",
-        scp_node::HostSiteOptions::default()
+        // The default refresh interval is reach-independent; read it off a
+        // throwaway `defaults(...)` (there is no whole-struct `Default` — M4).
+        scp_node::HostSiteConfig::defaults(Reach::Local)
             .refresh_interval
             .as_secs(),
     )
@@ -673,13 +675,28 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
     );
 
-    let opts = scp_node::HostSiteOptions {
+    // -- Lower the binary's `plaintext` / `skip_nat` booleans onto the
+    //    construction-pattern enums (ADR-052 M1): `plaintext` → `TlsMode`,
+    //    `skip_nat` → `Reach`. The booleans survive only for the banners above
+    //    and the live-URL banner below; the config carries the enums. --
+    let tls = if plaintext {
+        TlsMode::Plaintext
+    } else {
+        TlsMode::SelfSigned
+    };
+    let reach = if skip_nat {
+        Reach::Local
+    } else {
+        Reach::NatTraversal
+    };
+
+    let config = scp_node::HostSiteConfig {
+        reach,
+        tls,
+        dht: dht_mode,
         site_dir: site_dir.cloned(),
         port,
         storage_path: storage_path.cloned(),
-        plaintext,
-        skip_nat,
-        dht_mode,
         dht_gateways: dht_gateways_from_env(),
         projection_rate_limit,
         refresh_interval: std::time::Duration::from_secs(refresh_secs),
@@ -690,7 +707,7 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         })),
     };
 
-    if let Err(e) = scp_node::host_site_until(opts, startup::shutdown_signal()).await {
+    if let Err(e) = scp_node::host_site_until(config, startup::shutdown_signal()).await {
         tracing::error!(error = %e, "self-host mode failed");
         std::process::exit(1);
     }
@@ -763,7 +780,7 @@ fn node_http_addr() -> SocketAddr {
 /// trimmed, non-empty gateway URLs (empty when unset).
 ///
 /// Threaded into [`scp_node::self_host::build_production_did_method`] (full-node) and
-/// [`scp_node::HostSiteOptions::dht_gateways`] (self-host) so both paths share
+/// [`scp_node::HostSiteConfig::dht_gateways`] (self-host) so both paths share
 /// the library's pkarr client construction.
 fn dht_gateways_from_env() -> Vec<String> {
     env::var("SCP_NODE_DHT_GATEWAYS").map_or_else(
