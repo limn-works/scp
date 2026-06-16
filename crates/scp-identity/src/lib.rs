@@ -35,6 +35,7 @@
 
 pub mod attestation;
 pub mod cache;
+pub mod config;
 pub mod dht;
 pub mod dht_client;
 pub mod document;
@@ -47,6 +48,7 @@ pub use attestation::{
     PlatformAttestation, ScpKeyCustodyAttestation, ServiceRevocationStatus, UnknownPlatformError,
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
+pub use config::{CreatedIdentity, Identity, IdentityConfig, NoPersistence};
 pub use dht::{
     DidDht, InMemorySequenceStore, MigrationOutcome, MigrationPartialState, MigrationResumePhase,
     PostResolveHook, SequenceStore, decode_multibase_key, did_from_ed25519_public_key,

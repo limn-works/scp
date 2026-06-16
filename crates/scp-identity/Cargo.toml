@@ -12,7 +12,13 @@ categories = ["authentication", "cryptography"]
 
 [dependencies]
 scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1" }
+# `testing` is enabled non-optionally because the standalone identity
+# construction front-end (`config.rs`, ADR-052 Phase B-P3e) mints an
+# `InMemoryPreRotationCustody` on its production `Identity::create` path —
+# the only `PreRotationCustody` backend that exists today. This mirrors
+# `scp-node`, which enables `scp-platform/testing` non-optionally for the
+# identical reason on its production `Node::start` path.
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1", features = ["testing"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -37,7 +43,9 @@ testing = ["scp-platform/testing"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-scp-platform = { path = "../scp-platform", features = ["testing"] }
+# `encrypting` provides `EncryptingAdapter`, the `EncryptedStorage` test backend
+# used by the persisted-`Identity::create` round-trip test in `config.rs`.
+scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] }
 ed25519-dalek = { workspace = true }
 
 [lints]

@@ -33,33 +33,23 @@ pub mod trust;
 pub mod ucan;
 pub mod wrapping_key;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 use zeroize::Zeroize;
 
 use scp_platform::EncryptedStorage;
+use scp_platform::store_value::StoreValueError;
 use scp_platform::traits::Storage;
 
 // ---------------------------------------------------------------------------
 // Key sanitization
 // ---------------------------------------------------------------------------
 
-/// Validates a storage key component, rejecting path traversal characters.
-///
-/// Rejects strings containing `/`, `\`, `..`, or null bytes to prevent
-/// storage path traversal attacks.
-///
-/// # Errors
-///
-/// Returns [`StoreError::SerializationFailed`] if the input contains
-/// forbidden characters (`/`, `\`, `..`, or null bytes).
-pub fn sanitize_key_component(s: &str) -> Result<&str, StoreError> {
-    if s.contains('/') || s.contains('\\') || s.contains("..") || s.contains('\0') {
-        return Err(StoreError::SerializationFailed(format!(
-            "invalid key component: contains forbidden characters: {s:?}"
-        )));
-    }
-    Ok(s)
-}
+// `sanitize_key_component`, `StoredValue`, and `CURRENT_STORE_VERSION` are
+// defined once in `scp_platform::store_value` (the storage layer both
+// `scp-runtime` and `scp-identity` depend on) so every writer of a given key
+// produces byte-identical output. They are re-exported here so existing
+// `crate::store::*` paths continue to resolve.
+pub use scp_platform::store_value::{CURRENT_STORE_VERSION, StoredValue, sanitize_key_component};
 
 // ---------------------------------------------------------------------------
 // StoreError
@@ -93,31 +83,26 @@ pub enum StoreError {
     },
 }
 
-// ---------------------------------------------------------------------------
-// StoredValue
-// ---------------------------------------------------------------------------
-
-/// Version envelope for all values persisted by `ProtocolRepository`.
-///
-/// Every value written by `ProtocolRepository` is wrapped in `StoredValue`.
-/// On read, `version` is checked before deserializing `data`. This enables
-/// lazy on-read migration (spec section 17.10) without requiring
-/// schema-level versioning in the storage backend.
-///
-/// See spec section 17.5.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredValue<T> {
-    /// Schema version for the contained data type.
-    pub version: u16,
-    /// The serialized domain value.
-    pub data: T,
+impl From<StoreValueError> for StoreError {
+    /// Lifts a shared `store_value` error into the runtime's richer
+    /// `StoreError`, preserving the variant semantics so existing callers that
+    /// match on `SerializationFailed` / `DeserializationFailed` /
+    /// `IncompatibleVersion` keep working. An invalid key component is a
+    /// serialization-class failure (the key could not be formed), matching the
+    /// historical behaviour of the runtime's own `sanitize_key_component`.
+    fn from(err: StoreValueError) -> Self {
+        match err {
+            StoreValueError::SerializationFailed(m) => Self::SerializationFailed(m),
+            StoreValueError::DeserializationFailed(m) => Self::DeserializationFailed(m),
+            StoreValueError::IncompatibleVersion { stored, current } => {
+                Self::IncompatibleVersion { stored, current }
+            }
+            StoreValueError::InvalidKeyComponent(s) => Self::SerializationFailed(format!(
+                "invalid key component: contains forbidden characters: {s:?}"
+            )),
+        }
+    }
 }
-
-/// Current schema version for all `StoredValue` envelopes.
-///
-/// Incremented when the serialized format of any domain type changes.
-/// Migration logic (spec section 17.10) uses this to detect stale data.
-pub const CURRENT_STORE_VERSION: u16 = 2;
 
 /// Current key-space schema version.
 ///
@@ -237,12 +222,9 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Named format encodes struct field names, making the format resilient
     /// to field additions and reordering.
     fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
-        let envelope = StoredValue {
-            version: CURRENT_STORE_VERSION,
-            data: value,
-        };
-        rmp_serde::to_vec_named(&envelope)
-            .map_err(|e| StoreError::SerializationFailed(e.to_string()))
+        // Delegates to the shared `store_value` helper so the runtime and
+        // `scp-identity` produce byte-identical envelopes (spec §17.5).
+        Ok(scp_platform::store_value::to_stored_value_bytes(value)?)
     }
 
     /// Deserializes a `StoredValue` envelope from `MessagePack` bytes.
@@ -250,20 +232,10 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Checks the version field: if the stored version exceeds the current
     /// version, returns `StoreError::IncompatibleVersion`. Otherwise
     /// deserializes and returns the inner data.
-    ///
-    /// Handles both named (map) and positional (array) `MessagePack` formats
-    /// for backward compatibility with data serialized before the switch
-    /// to `rmp_serde::to_vec_named`.
     fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
-        let envelope: StoredValue<T> = rmp_serde::from_slice(bytes)
-            .map_err(|e| StoreError::DeserializationFailed(e.to_string()))?;
-        if envelope.version > CURRENT_STORE_VERSION {
-            return Err(StoreError::IncompatibleVersion {
-                stored: envelope.version,
-                current: CURRENT_STORE_VERSION,
-            });
-        }
-        Ok(envelope.data)
+        // Delegates to the shared `store_value` helper (single source of the
+        // envelope format and version check, spec §17.5).
+        Ok(scp_platform::store_value::from_stored_value_bytes(bytes)?)
     }
 
     /// Stores a serialized value under the given key.
@@ -492,6 +464,8 @@ impl<S: Storage> ProtocolRepository<S> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use serde::Deserialize;
+
     use super::*;
 
     /// `CURRENT_STORE_VERSION` must be 2 — the v1-to-v2 migration introduced

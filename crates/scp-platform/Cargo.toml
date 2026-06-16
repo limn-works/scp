@@ -44,7 +44,7 @@ filesystem = []
 encrypting = ["dep:aes-gcm", "dep:rand"]
 # SyncableStorage wrapper for P2P state synchronization (SCP-PERSIST-064).
 # Adds mutation tracking via a write-ahead changelog stored in the inner storage.
-sync = ["dep:rmp-serde"]
+sync = []
 
 [dependencies]
 serde = { workspace = true }
@@ -53,8 +53,11 @@ thiserror.workspace = true
 tracing = { workspace = true }
 zeroize = { workspace = true }
 
-# sync dependencies, gated behind the `sync` feature flag.
-rmp-serde = { workspace = true, optional = true }
+# Named-`MessagePack` envelope serialization for the shared `store_value` module
+# (the canonical `StoredValue` on-disk format, spec §17.5). Unconditional because
+# `store_value` is a core storage primitive every consumer of this crate needs,
+# and the `SyncableStorage` changelog (`sync` feature) also serializes with it.
+rmp-serde = { workspace = true }
 
 # file dependencies, gated behind the `file` feature flag.
 aes-gcm = { workspace = true, optional = true }

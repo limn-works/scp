@@ -12,7 +12,7 @@ use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Salt for HKDF-SHA-256 pseudonym secret derivation (§9.10.4.A).
 const PSEUDONYM_SECRET_SALT: &[u8] = b"scp-pseudonym-secret-v1";
@@ -99,8 +99,15 @@ pub fn derive_pseudonym_keypair(
                 mac.update(PSEUDONYM_V2_DOMAIN);
             }
         }
-        let hmac_bytes = Zeroizing::new(mac.finalize().into_bytes());
+        // HMAC-SHA256 output is a `GenericArray<u8, U32>`. Copy it into the
+        // already-`Zeroizing` `context_seed`, then wipe the intermediate via the
+        // always-available `[u8]: Zeroize` impl. Wrapping the `GenericArray`
+        // itself in `Zeroizing` would require `GenericArray: Zeroize`, which is
+        // only present when `generic-array`'s `zeroize` feature is unified in by
+        // another crate — so this path is robust to that feature not being on.
+        let mut hmac_bytes = mac.finalize().into_bytes();
         context_seed.copy_from_slice(&hmac_bytes[..32]);
+        hmac_bytes.as_mut_slice().zeroize();
     }
     SigningKey::from_bytes(&context_seed)
 }
