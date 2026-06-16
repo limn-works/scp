@@ -33,7 +33,7 @@ use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
 
 use crate::{
-    ApplicationNode, DEFAULT_HTTP_BIND_ADDR, DEFAULT_PROJECTION_RATE_LIMIT, DhtMode, NatStrategy,
+    ApplicationNode, DEFAULT_HTTP_BIND_ADDR, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy,
     NoOpCustody, NoOpDidMethod, NoOpStorage, NodeError, TlsProvider, build_domain_inner,
     build_no_domain_inner, generate_bridge_secret, generate_dev_token,
     provision_with_challenge_listener, resolve_identity_persistent, resolve_nat, resolve_tls,
@@ -193,6 +193,39 @@ pub enum TlsMode {
 }
 
 // ---------------------------------------------------------------------------
+// DhtMode — DID-document publication selection (M1 enum, shared by Node + Site)
+// ---------------------------------------------------------------------------
+
+/// Which DHT client a node (or hosted site) uses to publish (or not publish) its
+/// DID document.
+///
+/// The default is [`Memory`](DhtMode::Memory) (fail-safe — nothing is
+/// published). Selecting [`Production`](DhtMode::Production) is a deliberate,
+/// explicit opt-in to publishing the node's public address bound to its DID, so
+/// the privacy-worst behavior is never the path of least resistance (ADR-052
+/// M2). Promoted here from `self_host.rs` so the Node ([`NodeConfig`]) and the
+/// hosted-site ([`crate::HostSiteConfig`]) construction surfaces share **one**
+/// definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DhtMode {
+    /// In-memory DHT client: the DID document is NEVER published to the
+    /// network. The fail-safe default — used for local development and offline
+    /// testing, and whenever the caller has not consciously opted into
+    /// publishing.
+    #[default]
+    Memory,
+    /// Production pkarr client: publishes the node's DID document (and thus its
+    /// address) to the global Mainline DHT. This is the correct mode for a
+    /// publicly reachable node or site.
+    ///
+    /// Production mode publishes the host's public address bound to the node DID
+    /// to the global Mainline DHT — an approximate-location / IP-to-identity
+    /// disclosure. Select it only as a deliberate opt-in to public hosting; use
+    /// [`Memory`](DhtMode::Memory) for local/dev so nothing is published.
+    Production,
+}
+
+// ---------------------------------------------------------------------------
 // NatSlot — NAT strategy selection (typed capability slot, never dyn-erased)
 // ---------------------------------------------------------------------------
 
@@ -250,11 +283,12 @@ pub enum NatSlot {
 ///
 /// ## Example: public node on a domain
 ///
-/// A publishing reach (`Reach::Domain`) advertises a routable address, so it
-/// requires `DhtMode::Production` **explicitly** — publishing your location to
-/// the DHT is a deliberate opt-in (M2), never a silent default. Selecting a
-/// publishing reach while leaving the default `DhtMode::Memory` is a loud
-/// [`NodeError::InvalidConfig`], not a silent publish:
+/// A publicly reachable node on a domain should publish its address so peers can
+/// discover it via `did:dht`, which means opting into `DhtMode::Production`
+/// **explicitly** — publishing your location to the DHT is a deliberate opt-in
+/// (M2), never a silent default. (Leaving the default `DhtMode::Memory` is still
+/// valid — it just means "reachable, but not published to the DHT; share the
+/// address out-of-band" — the more-private choice, never an error.)
 ///
 /// ```ignore
 /// let node = Node::start(NodeConfig {
@@ -456,14 +490,17 @@ struct ConfigTail {
 /// {`SelfSigned`, `Acme`, `Terminated`}; non-`Domain` + {`SelfSigned`,
 /// `Plaintext`, `Terminated`}.
 ///
-/// The second axis is M2 (DHT publish): a *publishing* reach (`Reach::Domain`
-/// or `Reach::NatTraversal`, both of which advertise a routable address) with
-/// `DhtMode::Memory` (which never publishes to the DHT). Per
-/// `.docs/standards/construction.md` M2, this is a precise, loud error — not a
-/// silent publish, not a silent no-op. `Reach::Tunnel` / `Reach::Local` publish
-/// a loopback URL (non-routable) and are therefore non-publishing reaches,
-/// valid with `DhtMode::Memory`.
-fn validate_config(reach: &Reach, tls: &TlsMode, dht: DhtMode) -> Result<(), NodeError> {
+/// There is **no** second (DHT) validity axis. `DhtMode::Memory` (do not publish
+/// the DID document to the DHT) is the fail-safe, non-disclosing direction and
+/// is therefore valid for **every** `Reach`, including a publishing-capable
+/// reach (`Reach::Domain` / `Reach::NatTraversal`): "publicly reachable, but the
+/// address is not published to the DHT; share it out-of-band" is a legitimate,
+/// more-private config. Per `.docs/standards/construction.md` M2, the
+/// security-critical direction is *disclosure*, and only `DhtMode::Production`
+/// discloses — which is already a deliberate, explicit opt-in (`Memory` is the
+/// default). Erroring on `Memory` would reject the safe direction and nudge
+/// callers toward the disclosing one, so it is never rejected here.
+fn validate_config(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
     // TLS axis, rule 1: Domain cannot serve plaintext.
     if matches!(reach, Reach::Domain { .. }) && matches!(tls, TlsMode::Plaintext) {
         return Err(NodeError::InvalidConfig(
@@ -488,24 +525,6 @@ fn validate_config(reach: &Reach, tls: &TlsMode, dht: DhtMode) -> Result<(), Nod
              Domain reach or TlsMode::SelfSigned."
         )));
     }
-    // M2: a publishing reach advertises a routable address, which only reaches
-    // the network when the DID document is actually published to the DHT.
-    // `DhtMode::Memory` never publishes, so the routable address would be
-    // unreachable — a contradiction. Fail loud with the contradiction and fix.
-    if dht == DhtMode::Memory {
-        let publishing_reach = match reach {
-            Reach::Domain { .. } => Some("Reach::Domain"),
-            Reach::NatTraversal => Some("Reach::NatTraversal"),
-            Reach::Tunnel { .. } | Reach::Local => None,
-        };
-        if let Some(reach_name) = publishing_reach {
-            return Err(NodeError::InvalidConfig(format!(
-                "{reach_name} publishes a routable address but DhtMode::Memory does not publish \
-                 to the DHT. Select DhtMode::Production to publish, or a non-publishing Reach \
-                 (Tunnel/Local)."
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -517,7 +536,7 @@ fn validate_config(reach: &Reach, tls: &TlsMode, dht: DhtMode) -> Result<(), Nod
 /// (DRY). The advisory `dht` / `dht_gateways` fields are dropped here (the
 /// concrete `D` selects Memory vs Production; there is no builder setter yet).
 ///
-/// `validate_config` borrows `config.reach` / `config.dht` and so MUST run
+/// `validate_config` borrows `config.reach` / `config.tls` and so MUST run
 /// **before** this function moves `config` — callers keep that ordering.
 fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
     config: NodeConfig<K, D, S>,
@@ -1034,9 +1053,9 @@ impl Node {
         D: DidMethod + 'static,
         S: EncryptedStorage + 'static,
     {
-        // `validate_config` borrows `config.reach` / `config.dht`, so it MUST
+        // `validate_config` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
-        validate_config(&config.reach, &config.tls, config.dht)?;
+        validate_config(&config.reach, &config.tls)?;
         let (storage, identity, tail) = split_config(config);
 
         // Production constructor: `ProtocolRepository::new` (the only difference
@@ -1094,9 +1113,9 @@ impl Node {
         D: DidMethod + 'static,
         S: Storage + 'static,
     {
-        // `validate_config` borrows `config.reach` / `config.dht`, so it MUST
+        // `validate_config` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
-        validate_config(&config.reach, &config.tls, config.dht)?;
+        validate_config(&config.reach, &config.tls)?;
         let (storage, identity, tail) = split_config(config);
 
         // Testing constructor: `ProtocolRepository::new_for_testing` (the only
@@ -1209,9 +1228,10 @@ mod tests {
     async fn domain_generate_produces_did_dht_identity() {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is a publishing reach; M2 requires Production (advisory in
-            // P1 — the test's TestDidDht uses an in-memory client, so nothing is
-            // actually published offline).
+            // Domain is publishing-capable; this test opts into Production to
+            // exercise the public-hosting path (advisory in P1 — the test's
+            // TestDidDht uses an in-memory client, so nothing is published
+            // offline). `DhtMode::Memory` would be equally valid (see Test 11).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1252,7 +1272,8 @@ mod tests {
 
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is a publishing reach; M2 requires Production (advisory).
+            // Domain is publishing-capable; this test opts into Production for the
+            // public-hosting path (advisory; Memory is equally valid).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1292,8 +1313,9 @@ mod tests {
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // NatTraversal is a publishing reach; M2 requires Production
-            // (advisory in P1).
+            // NatTraversal is publishing-capable; this test opts into Production
+            // to exercise the public path (advisory in P1; Memory is equally
+            // valid — see Test 12).
             dht: DhtMode::Production,
             nat: NatSlot::Custom(Arc::new(MockNatStrategy {
                 tier: ReachabilityTier::Stun { external_addr },
@@ -1387,7 +1409,8 @@ mod tests {
 
         let node1 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is a publishing reach; M2 requires Production (advisory).
+            // Domain is publishing-capable; this test opts into Production for the
+            // public-hosting path (advisory; Memory is equally valid).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1407,7 +1430,8 @@ mod tests {
 
         let node2 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is a publishing reach; M2 requires Production (advisory).
+            // Domain is publishing-capable; this test opts into Production for the
+            // public-hosting path (advisory; Memory is equally valid).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1492,75 +1516,86 @@ mod tests {
         );
     }
 
-    // --- Test 11: Domain + DhtMode::Memory is a loud M2 config error ----------
+    // --- Test 11: Domain + DhtMode::Memory is VALID (the fail-safe direction) --
 
     #[tokio::test]
-    async fn domain_plus_dht_memory_is_invalid_config() {
-        // `NodeConfig::defaults` yields `dht: DhtMode::Memory`. A `Reach::Domain`
-        // publishes a routable address, so Memory (no publish) is the precise,
-        // loud M2 contradiction — not a silent publish, not a silent no-op.
-        let result = Node::start_for_testing(NodeConfig::defaults(
-            Reach::Domain {
-                domain: "config-m2-domain.example.com".to_owned(),
-            },
-            generate_identity(),
-            InMemoryStorage::new(),
-        ))
-        .await;
+    async fn domain_plus_dht_memory_is_valid() {
+        // `NodeConfig::defaults` yields `dht: DhtMode::Memory`. `DhtMode::Memory`
+        // (do not publish the address to the DHT) is the fail-safe, non-disclosing
+        // direction and is valid for EVERY reach, including a publishing-capable
+        // `Reach::Domain`: "reachable on the domain, but the address is not
+        // published to the DHT; share it out-of-band" — the more-private config.
+        // Only `DhtMode::Production` discloses, so only it is an explicit opt-in
+        // (M2); `Memory` is never an error. This is the positive companion to
+        // Test 12 (NatTraversal + Memory).
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "config-m2-domain.example.com".to_owned(),
+                },
+                generate_identity(),
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .expect("Domain + DhtMode::Memory is the fail-safe direction and must be valid");
 
-        let err = match result {
-            Err(NodeError::InvalidConfig(msg)) => msg,
-            Err(other) => {
-                panic!("expected InvalidConfig for Domain + DhtMode::Memory, got: {other}")
-            }
-            Ok(node) => {
-                node.shutdown();
-                panic!("expected InvalidConfig for Domain + DhtMode::Memory, got Ok");
-            }
-        };
-        assert!(
-            err.contains("Reach::Domain") && err.contains("DhtMode::Memory"),
-            "M2 error must name the contradiction, got: {err}"
+        // The successful build IS the proof that `DhtMode::Memory` is accepted on
+        // a publishing-capable `Reach::Domain` (it would have returned
+        // `InvalidConfig` under the old, inverted rule). The domain still lowers.
+        assert_eq!(
+            node.domain(),
+            Some("config-m2-domain.example.com"),
+            "Domain reach should still surface the domain on the built node"
         );
+        node.shutdown();
     }
 
-    // --- Test 12: NatTraversal + DhtMode::Memory is a loud M2 config error -----
+    // --- Test 12: NatTraversal + DhtMode::Memory is VALID --------------------
 
     #[tokio::test]
-    async fn nat_traversal_plus_dht_memory_is_invalid_config() {
-        // NatTraversal publishes a routable (NAT-traversed) address; Memory (no
-        // publish) is the same precise, loud M2 contradiction as Domain.
-        let result = Node::start_for_testing(NodeConfig::defaults(
-            Reach::NatTraversal,
-            generate_identity(),
-            InMemoryStorage::new(),
-        ))
-        .await;
+    async fn nat_traversal_plus_dht_memory_is_valid() {
+        // `Reach::NatTraversal` + `DhtMode::Memory` is the first-class
+        // "reachable-but-not-DHT-discoverable" config: publicly reachable via NAT
+        // traversal, but the address is NOT published to the DHT (share it
+        // out-of-band). `Memory` is the fail-safe, non-disclosing direction and
+        // must never be rejected; only `DhtMode::Production` discloses (M2). This
+        // is exactly the `SCP_NODE_DHT_MODE=memory` capability the binary exposes.
+        let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
+        let node = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy {
+                tier: ReachabilityTier::Stun { external_addr },
+            })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                generate_identity(),
+                InMemoryStorage::new(),
+            )
+        })
+        .await
+        .expect("NatTraversal + DhtMode::Memory is the reachable-but-unpublished config and must be valid");
 
-        let err = match result {
-            Err(NodeError::InvalidConfig(msg)) => msg,
-            Err(other) => {
-                panic!("expected InvalidConfig for NatTraversal + DhtMode::Memory, got: {other}")
-            }
-            Ok(node) => {
-                node.shutdown();
-                panic!("expected InvalidConfig for NatTraversal + DhtMode::Memory, got Ok");
-            }
-        };
+        // The successful build IS the proof that `DhtMode::Memory` is accepted on
+        // the publishing-capable `Reach::NatTraversal` (the old, inverted rule
+        // returned `InvalidConfig` here).
         assert!(
-            err.contains("Reach::NatTraversal") && err.contains("DhtMode::Memory"),
-            "M2 error must name the contradiction, got: {err}"
+            node.domain().is_none(),
+            "NatTraversal should build a no-domain node"
         );
+        node.shutdown();
     }
 
-    // --- Test 13: non-publishing reach + DhtMode::Memory is VALID -------------
+    // --- Test 13: Tunnel / Local + DhtMode::Memory is VALID -------------------
 
     #[tokio::test]
     async fn tunnel_and_local_with_dht_memory_are_valid() {
-        // Tunnel and Local publish a loopback URL (non-routable), so they are
-        // NON-publishing reaches: `DhtMode::Memory` (the defaults' dht) is valid,
-        // no M2 error. This is the positive companion to Tests 11/12 and the
-        // explicit guard that Tests 5/6 (which use default Memory) keep building.
+        // `DhtMode::Memory` (the defaults' dht) is the fail-safe, non-disclosing
+        // direction and is valid for every reach. Tunnel and Local publish a
+        // loopback URL, so Memory is the natural choice there. Together with
+        // Tests 11/12 (Domain / NatTraversal + Memory) this covers Memory across
+        // all four reaches; it also guards that Tests 5/6 (default Memory) build.
         let tunnel = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             ..NodeConfig::defaults(
@@ -1596,8 +1631,8 @@ mod tests {
         // (stun_server / bridge_relay / port_mapper / reachability_probe) are
         // applied to the builder, but `select_tier` is never called → no STUN.
         // A successful build proves all four `apply_nat` Tuned setters lower
-        // without panicking and the builder accepts them. Local is a
-        // non-publishing reach, so DhtMode::Memory (the default) is valid.
+        // without panicking and the builder accepts them. DhtMode::Memory (the
+        // default) is valid for every reach, including Local.
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             nat: NatSlot::Tuned {
@@ -1656,7 +1691,8 @@ mod tests {
         // First start persists the identity under custodyA. The second start
         // over the SAME storage but a fresh custodyB (no keys) must be rejected
         // by the builder's persisted-identity validation, surfaced through the
-        // config-level entry point. Domain is a publishing reach → Production.
+        // config-level entry point. Domain is publishing-capable; opt into
+        // Production to exercise the public path (Memory is equally valid).
         let storage = Arc::new(InMemoryStorage::new());
         let custody_a = Arc::new(InMemoryKeyCustody::new());
         let did_method_a = Arc::new(make_test_dht(&custody_a));
@@ -1726,9 +1762,10 @@ mod tests {
         let storage =
             Arc::new(SqliteStorage::new(dir.path(), &key).expect("open encrypted SqliteStorage"));
 
-        // Domain is a publishing reach; M2 requires Production (advisory in P1 —
-        // the TestDidDht uses an in-memory client, so nothing is published
-        // offline). Domain + default SelfSigned builds offline (no network/CA).
+        // Domain is publishing-capable; this test opts into Production to exercise
+        // the public-hosting path (advisory in P1 — the TestDidDht uses an
+        // in-memory client, so nothing is published offline). Domain + default
+        // SelfSigned builds offline (no network/CA).
         let node = Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Production,
@@ -1848,9 +1885,10 @@ mod tests {
     async fn acme_with_non_domain_reach_is_invalid_config() {
         // The new TLS-axis rule (fix 1): ACME needs a DNS name, which only a
         // Domain reach provides. `TlsMode::Acme` on Local / Tunnel / NatTraversal
-        // must be a loud `InvalidConfig`, not a silent no-op. Local is a
-        // non-publishing reach so the M2 DHT rule does NOT fire — this isolates
-        // the Acme×Reach rejection. Validation runs before any build, so no NAT
+        // must be a loud `InvalidConfig`, not a silent no-op. There is no DHT
+        // validity rule to interfere (Memory is valid for every reach), so this
+        // cleanly isolates the Acme×Reach rejection. Validation runs before any
+        // build, so no NAT
         // strategy is needed.
         let result = Node::start_for_testing(NodeConfig {
             tls: TlsMode::Acme {
@@ -1923,8 +1961,8 @@ mod tests {
         // `TlsMode::Acme { email: None }` selects headless ACME — the legacy
         // default for a domain node that sets no TLS options (the builder's
         // domain `build()` falls through to `AcmeProvider::new(domain)` with no
-        // contact email). It must be a VALID config on a `Reach::Domain`
-        // (publishing) reach paired with `DhtMode::Production` — no loud error.
+        // contact email). It must be a VALID config on a `Reach::Domain` reach —
+        // no loud error (the DHT mode does not affect TLS×Reach validity).
         // We assert at the `validate_config` layer rather than building, because
         // a real ACME provision would contact Let's Encrypt over the network;
         // validation is the observable acceptance gate before any provisioning.
@@ -1932,8 +1970,8 @@ mod tests {
             domain: "config-acme-headless.example.com".to_owned(),
         };
         let tls = TlsMode::Acme { email: None };
-        validate_config(&reach, &tls, DhtMode::Production)
-            .expect("Domain + Acme { email: None } + Production must be a valid config");
+        validate_config(&reach, &tls)
+            .expect("Domain + Acme { email: None } must be a valid config");
     }
 
     // --- Test 21: Plaintext / Terminated on a non-Domain reach are no-op builds

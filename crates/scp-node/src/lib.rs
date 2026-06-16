@@ -46,16 +46,18 @@ pub use projection::{
     DeployManifest, DeployManifestEntry, PathEntry, ProjectedContext, SiteConfig,
 };
 pub use self_host::{
-    Asset, DeploySiteParams, DhtMode, HostSiteError, HostSiteOptions, HostSiteReady,
-    SelfHostDeployer, SelfHostError, content_type_for, deploy_site, embedded_assets, host_site,
-    host_site_until, routing_id_hex,
+    Asset, DeploySiteParams, HostSiteConfig, HostSiteError, HostSiteReady, SelfHostDeployer,
+    SelfHostError, content_type_for, deploy_site, embedded_assets, host_site, host_site_until,
+    routing_id_hex,
 };
 
 // `IdentitySource` / `ExplicitIdentity` now live in `config` (ADR-052 Phase
 // B-P1 name reconciliation). They are consumed by `Node::start`'s identity
 // lowering in `config`; the `pub use` brings them into crate-root scope for
 // both that path and external consumers.
-pub use config::{ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
+pub use config::{
+    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode,
+};
 
 // ---------------------------------------------------------------------------
 // Default HTTP bind address

@@ -41,7 +41,7 @@ use scp_platform::KeyCustody;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
 
-use crate::config::{IdentitySource, NatSlot, Node, NodeConfig, Reach};
+use crate::config::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
 use crate::{ApplicationNode, PublicSurface, projection};
 
 /// A single static asset to publish: HTTP path, content type, and body bytes.
@@ -602,7 +602,7 @@ pub fn routing_id_hex(context_id: &str) -> String {
 // shared, Result-returning implementation instead of duplicating exit-on-error
 // logic. Storage location is read from the same env conventions
 // (`XDG_DATA_HOME`, `HOME`, `SCP_STORAGE_KEY`) as before; self-host *policy*
-// (port, plaintext, NAT, DHT mode) is supplied entirely via [`HostSiteOptions`].
+// (port, TLS, reach/NAT, DHT mode) is supplied entirely via [`HostSiteConfig`].
 // ===========================================================================
 
 /// Default interval, in seconds, between self-host site re-deploys.
@@ -638,32 +638,6 @@ pub type SeqInitFn = Box<
     dyn FnOnce(String) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send>> + Send,
 >;
 
-/// Which DHT client a hosted site uses to publish (or not publish) its DID
-/// document.
-///
-/// The default is [`Memory`](DhtMode::Memory) (fail-safe — nothing is
-/// published). Selecting [`Production`](DhtMode::Production) is a deliberate,
-/// explicit opt-in to publishing the host's public address bound to its DID,
-/// so the privacy-worst behavior is never the path of least resistance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DhtMode {
-    /// In-memory DHT client: the DID document is NEVER published to the
-    /// network. The fail-safe default — used for local development and offline
-    /// testing, and whenever the caller has not consciously opted into
-    /// publishing.
-    #[default]
-    Memory,
-    /// Production pkarr client: publishes the node's DID document (and thus its
-    /// address) to the global Mainline DHT. This is the correct mode for a
-    /// publicly reachable site.
-    ///
-    /// Production mode publishes the host's public address bound to the node DID
-    /// to the global Mainline DHT — an approximate-location / IP-to-identity
-    /// disclosure. Select it only as a deliberate opt-in to public hosting; use
-    /// [`Memory`](DhtMode::Memory) for local/dev so nothing is published.
-    Production,
-}
-
 /// Reports the live site details to the caller once the site is deployed and
 /// the public listener is about to open.
 ///
@@ -688,23 +662,76 @@ pub struct HostSiteReady {
     pub routing_id_hex: String,
 }
 
-/// Configuration for [`host_site`] / [`host_site_until`].
+/// Flat configuration object for [`host_site`] / [`host_site_until`] (ADR-052
+/// Phase B-P3c).
 ///
-/// All fields have sensible defaults via [`Default`]; override only what you
-/// need. See the runnable example at `crates/scp-node/examples/website.rs` and
-/// the guide `.docs/guides/self-hosting-a-website-on-scp.md`.
+/// This is the construction-pattern shape for the hosted-site entry point,
+/// folding the former host-options booleans into the same enums
+/// [`NodeConfig`](crate::NodeConfig) uses (M1): `plaintext` → [`tls: TlsMode`](TlsMode),
+/// `skip_nat` → [`reach: Reach`](Reach), and the DHT client selection into an
+/// explicit [`dht: DhtMode`](DhtMode).
+///
+/// It takes the name `HostSiteConfig`, not the bare `SiteConfig`, because that
+/// name is already the FFI-exported [`crate::SiteConfig`] (virtual-host deploy
+/// limits) — a compiler-level constraint, the one legitimate naming deviation
+/// (see ADR-052 `§host_site` and `.docs/standards/construction.md`).
+///
+/// # No whole-struct `Default` (M4)
+///
+/// [`reach`](Self::reach) is an irreducible required decision (it is non-`Option`),
+/// so there is **no** whole-struct `Default`. Use [`HostSiteConfig::defaults`]
+/// for the spread idiom over a chosen `reach`.
 ///
 /// # Local demo vs public hosting
 ///
-/// The defaults are fail-safe: [`DhtMode::Memory`] means the DID document is
-/// NOT published to the DHT, so a bare `host_site(HostSiteOptions::default())`
-/// never discloses the host's address. Self-signed HTTPS and NAT probing are
-/// still on by default. For PUBLIC hosting — opt in deliberately — set
-/// `dht_mode: DhtMode::Production` (publishes the host's address bound to its
-/// DID to the global Mainline DHT, a location disclosure). For a fully local
-/// demo also set `plaintext: true` and `skip_nat: true` so no router port is
-/// opened.
-pub struct HostSiteOptions {
+/// [`HostSiteConfig::defaults`] is fail-safe: [`DhtMode::Memory`] means the DID
+/// document is NOT published to the DHT, [`TlsMode::SelfSigned`] serves HTTPS,
+/// and the reach is whatever you pass. For a fully local demo, pass
+/// [`Reach::Local`] (skips NAT probing) and set `tls: TlsMode::Plaintext` so no
+/// router port is opened and the listener serves plain HTTP. For PUBLIC hosting,
+/// pass [`Reach::NatTraversal`] and opt into [`DhtMode::Production`]
+/// deliberately (it publishes the host's address bound to its DID to the global
+/// Mainline DHT — a location disclosure). [`DhtMode::Memory`] (no publish) is
+/// the fail-safe direction and is valid for every reach — including
+/// [`Reach::NatTraversal`], the "reachable but not DHT-discoverable" config
+/// (share the address out-of-band) — never an error.
+///
+/// See the runnable example at `crates/scp-node/examples/website.rs` and the
+/// guide `.docs/guides/self-hosting-a-website-on-scp.md`.
+pub struct HostSiteConfig {
+    // --- Required (irreducible; no whole-struct Default — M4) ---
+    /// How the hosted site is reached from the outside (addressing XOR).
+    ///
+    /// Folds the former `skip_nat` bool (M1): [`Reach::Local`] skips the
+    /// STUN/NAT external-address probe and UPnP/NAT-PMP port mapping entirely
+    /// (binding a loopback relay URL — correct behind a tunnel/proxy that
+    /// terminates externally), while [`Reach::NatTraversal`] probes NAT and
+    /// publishes a routable address.
+    pub reach: Reach,
+
+    // --- Enums (M1) ---
+    /// How TLS is provisioned for the public listener — the SAME enum as
+    /// [`NodeConfig::tls`](crate::NodeConfig).
+    ///
+    /// Folds the former `plaintext` bool (M1): [`TlsMode::Plaintext`] serves
+    /// plain HTTP (the hosted content is public broadcast content anyway, but
+    /// HTTPS-Only browsers refuse `http://`); [`TlsMode::SelfSigned`] serves
+    /// self-signed HTTPS.
+    pub tls: TlsMode,
+    /// Which DHT client to use. Defaults to the fail-safe [`DhtMode::Memory`],
+    /// which never touches the network. Set [`DhtMode::Production`] to opt into
+    /// public hosting — it publishes the host's public address bound to the node
+    /// DID to the global Mainline DHT (an IP-to-identity / location disclosure).
+    ///
+    /// [`DhtMode::Memory`] (no publish) is the fail-safe, non-disclosing
+    /// direction and is valid with **any** [`reach`](Self::reach), including the
+    /// publishing-capable [`Reach::NatTraversal`]: that pairing is the
+    /// reachable-but-unpublished config (share the address out-of-band), never an
+    /// error — the same M2 stance as [`NodeConfig`](crate::NodeConfig). Only
+    /// [`DhtMode::Production`] discloses, so only it is an explicit opt-in.
+    pub dht: DhtMode,
+
+    // --- Defaulted fields ---
     /// Directory of static site files to host. `None` uses the embedded default
     /// site (with the node DID injected into `index.html`). When `Some`, the
     /// directory must contain an `index.html` at its root; every file under it
@@ -716,21 +743,8 @@ pub struct HostSiteOptions {
     /// `SQLite` storage directory. `None` resolves to the XDG default
     /// (`$XDG_DATA_HOME/scp/node`, falling back to `$HOME/.local/share/scp/node`).
     pub storage_path: Option<PathBuf>,
-    /// When `true`, serve plain HTTP instead of self-signed HTTPS. Traffic is
-    /// then unencrypted (the hosted content is public broadcast content anyway,
-    /// but HTTPS-Only browsers refuse `http://`).
-    pub plaintext: bool,
-    /// When `true`, skip the STUN/NAT external-address probe and UPnP/NAT-PMP
-    /// port mapping entirely, binding a loopback relay URL. Correct behind a
-    /// tunnel/proxy that terminates externally.
-    pub skip_nat: bool,
-    /// Which DHT client to use. Defaults to the fail-safe [`DhtMode::Memory`],
-    /// which never touches the network. Set [`DhtMode::Production`] to opt into
-    /// public hosting — it publishes the host's public address bound to the node
-    /// DID to the global Mainline DHT (an IP-to-identity / location disclosure).
-    pub dht_mode: DhtMode,
     /// DHT HTTP gateway URLs threaded into the production pkarr client. Empty by
-    /// default (Mainline DHT only). Ignored when `dht_mode` is
+    /// default (Mainline DHT only). Ignored when [`dht`](Self::dht) is
     /// [`DhtMode::Memory`].
     pub dht_gateways: Vec<String>,
     /// Per-IP rate limit for the projection endpoints. Defaults to
@@ -746,15 +760,36 @@ pub struct HostSiteOptions {
     pub on_ready: Option<Box<dyn FnOnce(HostSiteReady) + Send>>,
 }
 
-impl Default for HostSiteOptions {
-    fn default() -> Self {
+impl HostSiteConfig {
+    /// Constructs a [`HostSiteConfig`] from the irreducible required field
+    /// (`reach`), filling every other field with its **fail-safe** default
+    /// (ADR-052 M4).
+    ///
+    /// Fail-safe defaults: `tls = TlsMode::SelfSigned`, `dht = DhtMode::Memory`
+    /// (no publish), `site_dir = None` (embedded site), `port =
+    /// DEFAULT_HTTP_BIND_ADDR.port()`, `storage_path = None` (XDG default),
+    /// `dht_gateways = []`, `projection_rate_limit = DEFAULT_PROJECTION_RATE_LIMIT`,
+    /// `refresh_interval = 1800s`, `on_ready = None`.
+    ///
+    /// This enables the spread idiom. Because `reach` is moved into the returned
+    /// struct, the caller passes a `reach` value to `defaults(...)` separate
+    /// from any field it overrides:
+    ///
+    /// ```ignore
+    /// HostSiteConfig {
+    ///     tls: TlsMode::Plaintext,
+    ///     ..HostSiteConfig::defaults(Reach::Local)
+    /// }
+    /// ```
+    #[must_use]
+    pub fn defaults(reach: Reach) -> Self {
         Self {
+            reach,
+            tls: TlsMode::SelfSigned,
+            dht: DhtMode::Memory,
             site_dir: None,
             port: crate::DEFAULT_HTTP_BIND_ADDR.port(),
             storage_path: None,
-            plaintext: false,
-            skip_nat: false,
-            dht_mode: DhtMode::Memory,
             dht_gateways: Vec::new(),
             projection_rate_limit: crate::DEFAULT_PROJECTION_RATE_LIMIT,
             refresh_interval: Duration::from_secs(SELF_HOST_DEPLOY_REFRESH_SECS),
@@ -763,15 +798,15 @@ impl Default for HostSiteOptions {
     }
 }
 
-impl std::fmt::Debug for HostSiteOptions {
+impl std::fmt::Debug for HostSiteConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostSiteOptions")
+        f.debug_struct("HostSiteConfig")
+            .field("reach", &self.reach)
+            .field("tls", &tls_mode_label(&self.tls))
+            .field("dht", &self.dht)
             .field("site_dir", &self.site_dir)
             .field("port", &self.port)
             .field("storage_path", &self.storage_path)
-            .field("plaintext", &self.plaintext)
-            .field("skip_nat", &self.skip_nat)
-            .field("dht_mode", &self.dht_mode)
             .field("dht_gateways", &self.dht_gateways)
             .field("projection_rate_limit", &self.projection_rate_limit)
             .field("refresh_interval", &self.refresh_interval)
@@ -780,11 +815,37 @@ impl std::fmt::Debug for HostSiteOptions {
     }
 }
 
+/// A short, non-secret label for a [`TlsMode`] for `Debug` output.
+///
+/// [`TlsMode`] is not `Debug` (its `Custom` variant carries an
+/// `Arc<dyn TlsProvider>`), so [`HostSiteConfig`]'s `Debug` impl renders the
+/// mode via this stable label instead.
+const fn tls_mode_label(tls: &TlsMode) -> &'static str {
+    match tls {
+        TlsMode::SelfSigned => "SelfSigned",
+        TlsMode::Acme { .. } => "Acme",
+        TlsMode::Plaintext => "Plaintext",
+        TlsMode::Terminated => "Terminated",
+        TlsMode::Custom(_) => "Custom",
+    }
+}
+
 /// Errors produced by [`host_site`] / [`host_site_until`], granular per stage so
 /// a caller can distinguish (e.g.) a storage-permission failure from a deploy
 /// failure.
 #[derive(Debug, thiserror::Error)]
 pub enum HostSiteError {
+    /// The [`HostSiteConfig`] names something this deployment driver cannot serve
+    /// (ADR-052 M3 — fail loud, never a silent no-op). The cases: a
+    /// [`Reach::Domain`] (a hosted site builds a no-domain node, reached via its
+    /// routing-id path, not a DNS domain), or a [`TlsMode`] the no-domain
+    /// listener does not provision ([`TlsMode::Acme`] — no DNS name to provision
+    /// for; [`TlsMode::Terminated`] / [`TlsMode::Custom`] — no upstream
+    /// terminator here). The DHT axis is NOT a source of this error:
+    /// [`DhtMode::Memory`] (no publish) is the fail-safe direction and valid for
+    /// every reach.
+    #[error("invalid host-site config: {0}")]
+    InvalidConfig(String),
     /// The storage directory could not be resolved, created, or written.
     #[error("storage path error: {0}")]
     StoragePath(String),
@@ -823,6 +884,79 @@ pub enum HostSiteError {
     Serve(String),
 }
 
+/// Validates a [`HostSiteConfig`]'s `reach` / `tls` / `dht` triple and lowers
+/// the construction-pattern enums onto the internal `(plaintext, skip_nat)`
+/// booleans the no-domain self-host build path threads.
+///
+/// The fold (ADR-052 M1):
+/// - `tls`: [`TlsMode::Plaintext`] ⇒ `plaintext = true` (plain HTTP listener);
+///   [`TlsMode::SelfSigned`] ⇒ `plaintext = false` (self-signed HTTPS). The
+///   no-domain self-host listener only provisions those two modes
+///   ([`build_self_host_tls_config`]); [`TlsMode::Acme`], [`TlsMode::Terminated`],
+///   and [`TlsMode::Custom`] are a loud [`HostSiteError::InvalidConfig`] (there
+///   is no DNS name to provision for and no upstream terminator in this
+///   deployment driver).
+/// - `reach`: [`Reach::NatTraversal`] ⇒ `skip_nat = false` (probe NAT, publish a
+///   routable address); [`Reach::Local`] and [`Reach::Tunnel`] ⇒ `skip_nat =
+///   true` (loopback relay URL — correct behind a tunnel/proxy). [`Reach::Domain`]
+///   is a loud error: `host_site` builds a no-domain node, so a domain reach has
+///   no meaning here.
+///
+/// This lowering does NOT validate the DHT axis: [`DhtMode::Memory`] (do not
+/// publish the DID document) is the fail-safe, non-disclosing direction and is
+/// valid for every [`Reach`], including the publishing-capable
+/// [`Reach::NatTraversal`] — the reachable-but-unpublished self-host case
+/// ("publicly reachable, address shared out-of-band, not published to the DHT").
+/// Only [`DhtMode::Production`] discloses, and it is already a deliberate opt-in
+/// (Memory is the default), so there is nothing to reject — the same rule
+/// [`NodeConfig`](crate::NodeConfig) enforces. `dht` is therefore not an input
+/// here; it selects the DHT client downstream, not validity.
+fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool), HostSiteError> {
+    let plaintext = match tls {
+        TlsMode::Plaintext => true,
+        TlsMode::SelfSigned => false,
+        TlsMode::Acme { .. } => {
+            return Err(HostSiteError::InvalidConfig(
+                "TlsMode::Acme is not valid for host_site: a hosted site builds a no-domain node \
+                 with no DNS name to provision a Let's Encrypt certificate for. Use \
+                 TlsMode::SelfSigned or TlsMode::Plaintext."
+                    .to_owned(),
+            ));
+        }
+        TlsMode::Terminated => {
+            return Err(HostSiteError::InvalidConfig(
+                "TlsMode::Terminated is not valid for host_site: this deployment driver has no \
+                 upstream TLS terminator. Use TlsMode::SelfSigned (self-signed HTTPS) or \
+                 TlsMode::Plaintext (a tunnel/proxy adds TLS in front)."
+                    .to_owned(),
+            ));
+        }
+        TlsMode::Custom(_) => {
+            return Err(HostSiteError::InvalidConfig(
+                "TlsMode::Custom is not valid for host_site: the no-domain self-host listener \
+                 provisions only self-signed or plaintext. Use TlsMode::SelfSigned or \
+                 TlsMode::Plaintext."
+                    .to_owned(),
+            ));
+        }
+    };
+
+    let skip_nat = match reach {
+        Reach::NatTraversal => false,
+        Reach::Local | Reach::Tunnel { .. } => true,
+        Reach::Domain { .. } => {
+            return Err(HostSiteError::InvalidConfig(
+                "Reach::Domain is not valid for host_site: a hosted site builds a no-domain node \
+                 reached via its routing-id path, not a DNS domain. Use Reach::NatTraversal \
+                 (public), Reach::Local, or Reach::Tunnel."
+                    .to_owned(),
+            ));
+        }
+    };
+
+    Ok((plaintext, skip_nat))
+}
+
 /// Hosts a static website on SCP, serving until the process receives a Ctrl-C
 /// (or platform shutdown) signal.
 ///
@@ -833,7 +967,7 @@ pub enum HostSiteError {
 /// interval (to beat the blob TTL), and tears everything down cleanly on
 /// shutdown.
 ///
-/// See [`HostSiteOptions`] for configuration (including the local-demo vs
+/// See [`HostSiteConfig`] for configuration (including the local-demo vs
 /// public-hosting distinction), the runnable example at
 /// `crates/scp-node/examples/website.rs`, and the guide
 /// `.docs/guides/self-hosting-a-website-on-scp.md`.
@@ -848,11 +982,15 @@ pub enum HostSiteError {
 ///
 /// # Errors
 ///
-/// Returns a [`HostSiteError`] if any stage fails: storage path/key resolution,
+/// Returns a [`HostSiteError`] if the config names something this deployment
+/// driver cannot serve ([`HostSiteError::InvalidConfig`] — a [`Reach::Domain`]
+/// or a non-self-host [`TlsMode`]; the DHT axis is never an error since
+/// [`DhtMode::Memory`] is valid for every reach) or any stage fails: storage
+/// path/key resolution,
 /// storage/custody/blob open, DID method construction, node build, asset load,
 /// TLS config, deploy, or serve. Returns `Ok(())` on clean shutdown.
-pub async fn host_site(opts: HostSiteOptions) -> Result<(), HostSiteError> {
-    host_site_until(opts, async {
+pub async fn host_site(config: HostSiteConfig) -> Result<(), HostSiteError> {
+    host_site_until(config, async {
         scp_transport::startup::shutdown_signal().await;
     })
     .await
@@ -868,22 +1006,30 @@ pub async fn host_site(opts: HostSiteOptions) -> Result<(), HostSiteError> {
 /// # Errors
 ///
 /// See [`host_site`].
-pub async fn host_site_until<F>(opts: HostSiteOptions, shutdown: F) -> Result<(), HostSiteError>
+pub async fn host_site_until<F>(config: HostSiteConfig, shutdown: F) -> Result<(), HostSiteError>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let HostSiteOptions {
+    let HostSiteConfig {
+        reach,
+        tls,
+        dht: dht_mode,
         site_dir,
         port,
         storage_path,
-        plaintext,
-        skip_nat,
-        dht_mode,
         dht_gateways,
         projection_rate_limit,
         refresh_interval,
         on_ready,
-    } = opts;
+    } = config;
+
+    // -- Validate (TLS×Reach) and lower the construction-pattern enums onto
+    //    the internal `plaintext` / `skip_nat` booleans the build path threads.
+    //    `tls` folds `plaintext`; `reach` folds `skip_nat`. `DhtMode::Memory`
+    //    (no publish) is the fail-safe direction and valid for every reach, so
+    //    the DHT axis needs no validation — `dht_mode` selects the DHT client
+    //    downstream (the match below). --
+    let (plaintext, skip_nat) = lower_host_site_reach_tls(&reach, &tls)?;
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
 
@@ -1951,8 +2097,136 @@ pub fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // HostSiteConfig shape + reach/tls lowering (`lower_host_site_reach_tls`)
+    //
+    // These cover the ADR-052 P3c folds: `HostSiteConfig::defaults` is fail-safe
+    // (M4 — no whole-struct Default, a reach-keyed factory instead), `plaintext`
+    // is folded into `TlsMode`, `skip_nat` into `Reach`. `DhtMode::Memory` (no
+    // publish) is the fail-safe direction and valid for every reach, so the
+    // lowering does not validate the DHT axis (M2: only `Production` discloses,
+    // and it is the explicit opt-in).
+    // -----------------------------------------------------------------------
+
+    /// `HostSiteConfig::defaults(reach)` fills every non-required field with the
+    /// fail-safe value: self-signed TLS, no-publish DHT, embedded site.
+    #[test]
+    fn defaults_are_fail_safe() {
+        let config = HostSiteConfig::defaults(Reach::Local);
+        assert!(
+            matches!(config.tls, TlsMode::SelfSigned),
+            "defaults must serve self-signed HTTPS, not plaintext"
+        );
+        assert_eq!(
+            config.dht,
+            DhtMode::Memory,
+            "defaults must NOT publish to the DHT (fail-safe, M2)"
+        );
+        assert!(
+            config.site_dir.is_none(),
+            "defaults must use the embedded site"
+        );
+        assert!(
+            matches!(config.reach, Reach::Local),
+            "defaults must carry the reach it was keyed on"
+        );
+    }
+
+    /// `TlsMode::Plaintext` folds to `plaintext = true` (the former `plaintext`
+    /// bool); `TlsMode::SelfSigned` folds to `plaintext = false`. Both pair with
+    /// a non-publishing `Reach::Local`, so neither trips the M2 rule.
+    #[test]
+    fn tls_mode_folds_plaintext_bool() {
+        let (plaintext, _skip_nat) = lower_host_site_reach_tls(&Reach::Local, &TlsMode::Plaintext)
+            .expect("Local + Plaintext is a valid local-demo config");
+        assert!(
+            plaintext,
+            "TlsMode::Plaintext must lower to a plaintext listener"
+        );
+
+        let (plaintext, _skip_nat) = lower_host_site_reach_tls(&Reach::Local, &TlsMode::SelfSigned)
+            .expect("Local + SelfSigned is valid");
+        assert!(
+            !plaintext,
+            "TlsMode::SelfSigned must lower to a (self-signed HTTPS) non-plaintext listener"
+        );
+    }
+
+    /// `Reach::Local` / `Reach::Tunnel` fold to `skip_nat = true` (the former
+    /// `skip_nat` bool); `Reach::NatTraversal` folds to `skip_nat = false`.
+    #[test]
+    fn reach_folds_skip_nat_bool() {
+        let (_p, skip_nat) =
+            lower_host_site_reach_tls(&Reach::Local, &TlsMode::Plaintext).expect("Local is valid");
+        assert!(skip_nat, "Reach::Local must skip the NAT probe");
+
+        let (_p, skip_nat) = lower_host_site_reach_tls(
+            &Reach::Tunnel {
+                public_url: "https://tunnel.example".to_owned(),
+            },
+            &TlsMode::Plaintext,
+        )
+        .expect("Tunnel lowers to skip_nat");
+        assert!(skip_nat, "Reach::Tunnel must skip the NAT probe");
+
+        let (_p, skip_nat) = lower_host_site_reach_tls(&Reach::NatTraversal, &TlsMode::SelfSigned)
+            .expect("NatTraversal lowers to probe NAT");
+        assert!(!skip_nat, "Reach::NatTraversal must probe NAT");
+    }
+
+    /// `Reach::NatTraversal` lowers cleanly regardless of DHT mode: the lowering
+    /// validates only the TLS×Reach axis, never the DHT axis. `DhtMode::Memory`
+    /// (no publish) is the fail-safe direction and valid for every reach — the
+    /// reachable-but-unpublished self-host case (publicly reachable via NAT
+    /// traversal, address shared out-of-band, not published to the DHT). It is
+    /// never an error; only `DhtMode::Production` discloses, and it is the
+    /// explicit opt-in (M2).
+    #[test]
+    fn nat_traversal_lowers_for_both_dht_modes() {
+        // `lower_host_site_reach_tls` no longer takes a `dht` arg — the DHT mode
+        // does not affect reach/TLS lowering. The successful lowering is the
+        // proof that a publishing-capable reach is accepted with the default
+        // (Memory) DHT mode (the old, inverted rule rejected NatTraversal+Memory).
+        let (_p, skip_nat) = lower_host_site_reach_tls(&Reach::NatTraversal, &TlsMode::SelfSigned)
+            .expect("NatTraversal lowers cleanly; DHT mode does not gate validity");
+        assert!(!skip_nat, "Reach::NatTraversal must probe NAT");
+    }
+
+    /// `Reach::Domain` has no meaning for the no-domain `host_site` deployment
+    /// driver — a loud `InvalidConfig`.
+    #[test]
+    fn domain_reach_is_rejected_for_host_site() {
+        let err = lower_host_site_reach_tls(
+            &Reach::Domain {
+                domain: "example.com".to_owned(),
+            },
+            &TlsMode::SelfSigned,
+        )
+        .expect_err("Reach::Domain is not valid for host_site");
+        assert!(
+            matches!(err, HostSiteError::InvalidConfig(_)),
+            "Reach::Domain must be a loud InvalidConfig for host_site"
+        );
+    }
+
+    /// `TlsMode::Acme` / `Terminated` / `Custom` are not provisionable by the
+    /// no-domain self-host listener — each is a loud `InvalidConfig`.
+    #[test]
+    fn non_self_host_tls_modes_are_rejected() {
+        for tls in [TlsMode::Acme { email: None }, TlsMode::Terminated] {
+            let err = lower_host_site_reach_tls(&Reach::Local, &tls)
+                .expect_err("Acme/Terminated are not valid for host_site");
+            assert!(
+                matches!(err, HostSiteError::InvalidConfig(_)),
+                "{} must be a loud InvalidConfig",
+                tls_mode_label(&tls)
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // NAT mapping release on shutdown (`release_self_host_mappings`)

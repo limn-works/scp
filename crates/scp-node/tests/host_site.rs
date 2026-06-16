@@ -18,7 +18,7 @@
 use std::net::TcpListener;
 use std::time::Duration;
 
-use scp_node::{DhtMode, HostSiteOptions, HostSiteReady, host_site_until};
+use scp_node::{HostSiteConfig, HostSiteReady, Reach, TlsMode, host_site_until};
 
 /// Reserves an OS-assigned free port on loopback by binding a `TcpListener`,
 /// reading its port, then dropping the listener so `host_site` can rebind it.
@@ -80,25 +80,24 @@ async fn host_site_serves_a_deployed_site_over_http_and_shuts_down() {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<HostSiteReady>();
     let mut ready_tx = Some(ready_tx);
 
-    let opts = HostSiteOptions {
+    let config = HostSiteConfig {
+        // Hermetic + offline: plaintext (no TLS dance), Reach::Local (skip NAT,
+        // no router port), in-memory DHT (nothing published; Local is a
+        // non-publishing reach so Memory is valid).
+        tls: TlsMode::Plaintext,
         site_dir: Some(site_dir.clone()),
         port,
         storage_path: Some(storage_dir.clone()),
-        // Hermetic + offline: plaintext (no TLS dance), skip NAT (no router
-        // port), in-memory DHT (nothing published).
-        plaintext: true,
-        skip_nat: true,
-        dht_mode: DhtMode::Memory,
         on_ready: Some(Box::new(move |ready: HostSiteReady| {
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(ready);
             }
         })),
-        ..Default::default()
+        ..HostSiteConfig::defaults(Reach::Local)
     };
 
     // -- Spawn the hosted site as a task; it serves until `shutdown` resolves. --
-    let handle = tokio::spawn(async move { host_site_until(opts, shutdown).await });
+    let handle = tokio::spawn(async move { host_site_until(config, shutdown).await });
 
     // -- Wait for the ready signal (deploy complete, serving imminent). --
     let ready = tokio::time::timeout(Duration::from_mins(1), ready_rx)

@@ -1,5 +1,7 @@
 # Backend Agent Memory (scoped)
 
+- [project-adr052-p3c-hostsiteconfig](project_adr052_p3c_hostsiteconfig.md) — ADR-052 P3c: HostSiteOptions→HostSiteConfig (name dodges FFI projection::SiteConfig collision); fold plaintext→TlsMode/skip_nat→Reach; promote DhtMode to shared config.rs; sugar=host_site(HostSiteConfig); no FFI touch
+
 - [project-ticket-1540-checkpoint-equivocation-sync](project_ticket_1540_checkpoint_equivocation_sync.md) — #1540 wire checkpoint+equivocation into sync/reconnect; Step-1 dup-type=MERGE (scp-protocol already deps scp-event-log, no tokio); full 7-step seam map
 - [project-adr049-main-merge-pyo3](project_adr049_main_merge_pyo3.md) — origin/main→actor MERGE, conflict-resolution recipe + 19-op dispatch MAP. PyO3 GREEN + NAPI GREEN (cargo check -p scp-ffi-napi = 0 err/warn; context.rs 77 hunks + runtime.rs:563 + bridge_runtime.rs variant fix, git-add'd, mid-merge). NAPI gotchas: HEAD free-fn → main `_on(bi,...)` shape (public #[napi] live in scp.rs); custody.as_ref() not &custody.0; ProtocolRepoVariant::InMemory→Arc<BridgeInMemoryRepo> (UniFFI needs same fix). Remaining: UniFFI bridge. SOLE upstream gate blocker = scp-platform/src/sqlite/mod.rs (passphrase-vs-fs2 union).
 
