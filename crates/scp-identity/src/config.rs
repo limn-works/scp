@@ -52,8 +52,6 @@
 //!     .await?;
 //! ```
 
-use serde::Serialize;
-
 use scp_platform::EncryptedStorage;
 use scp_platform::testing::InMemoryPreRotationCustody;
 use scp_platform::traits::{KeyCustody, PreRotationKeyHandle, Storage};
@@ -360,7 +358,7 @@ async fn persist_document<S>(
 where
     S: EncryptedStorage,
 {
-    let key = identity_document_key(did);
+    let key = identity_document_key(did)?;
     let data = serialize_document(document)?;
     storage
         .store(&key, &data)
@@ -370,13 +368,41 @@ where
 
 /// Storage key for an identity's persisted DID document (spec §17.3:
 /// `identity/{did}/document`).
-fn identity_document_key(did: &str) -> String {
-    format!("identity/{did}/document")
+///
+/// Delegates to the shared `scp_platform::store_value` key builder — the single
+/// source of the `identity/{did}/document` convention used by both this path
+/// and `ProtocolRepository::store_identity_document`. The shared builder runs
+/// `sanitize_key_component`, rejecting a `did` containing `/`, `\`, `..`, or a
+/// null byte (storage path-traversal guard), exactly as the canonical runtime
+/// path does.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::DocumentSerializationError`] if `did` contains
+/// path-traversal characters.
+fn identity_document_key(did: &str) -> Result<String, IdentityError> {
+    scp_platform::store_value::identity_document_key(did)
+        .map_err(|e| IdentityError::DocumentSerializationError(e.to_string()))
 }
 
-/// Serializes a DID document to JSON bytes for persistence.
-fn serialize_document(document: &impl Serialize) -> Result<Vec<u8>, IdentityError> {
-    serde_json::to_vec(document)
+/// Serializes a DID document into the canonical on-disk form for the spec §17.3
+/// `identity/{did}/document` slot.
+///
+/// This must be **byte-identical** to what
+/// `ProtocolRepository::store_identity_document` writes, otherwise an identity
+/// persisted here is unreadable by the canonical loader (and vice-versa). That
+/// canonical path wraps the raw document bytes in a `StoredValue` version
+/// envelope serialized with named `MessagePack`
+/// (`scp_platform::store_value::to_stored_value_bytes`). We reproduce exactly
+/// that shape: the inner `data` is the document's JSON bytes
+/// (`serde_json::to_vec`, the `DidDocument`'s own serialization), wrapped in the
+/// shared envelope. A cross-path round-trip test in `scp-runtime`
+/// (`identity_create_persisted_document_loads_via_protocol_repository`)
+/// mechanically enforces this compatibility so it cannot silently drift.
+fn serialize_document(document: &DidDocument) -> Result<Vec<u8>, IdentityError> {
+    let document_bytes = serde_json::to_vec(document)
+        .map_err(|e| IdentityError::DocumentSerializationError(e.to_string()))?;
+    scp_platform::store_value::to_stored_value_bytes(&document_bytes)
         .map_err(|e| IdentityError::DocumentSerializationError(e.to_string()))
 }
 
@@ -457,15 +483,21 @@ mod tests {
 
         // The document persisted under the spec §17.3 key round-trips back to
         // the same document the call returned. Reading through the same
-        // `EncryptingAdapter` decrypts transparently.
-        let key = identity_document_key(&identity.did);
+        // `EncryptingAdapter` decrypts transparently. The on-disk form is the
+        // canonical `StoredValue` named-`MessagePack` envelope wrapping the
+        // document's JSON bytes — identical to what
+        // `ProtocolRepository::store_identity_document` writes — so it is
+        // decoded via the shared `store_value` helper, NOT bare JSON.
+        let key = identity_document_key(&identity.did).expect("key build should succeed");
         let stored = storage
             .retrieve(&key)
             .await
             .expect("storage retrieve should succeed")
             .expect("a document should be persisted at identity/{did}/document");
-        let reloaded: DidDocument =
-            serde_json::from_slice(&stored).expect("persisted document should deserialize");
+        let document_bytes: Vec<u8> = scp_platform::store_value::from_stored_value_bytes(&stored)
+            .expect("persisted envelope should deserialize");
+        let reloaded: DidDocument = serde_json::from_slice(&document_bytes)
+            .expect("inner document JSON should deserialize");
         assert_eq!(reloaded.id, document.id);
         assert_eq!(reloaded.id, identity.did);
     }
@@ -482,7 +514,7 @@ mod tests {
         .await
         .expect("ephemeral identity creation should succeed");
 
-        let key = identity_document_key(&identity.did);
+        let key = identity_document_key(&identity.did).expect("key build should succeed");
         assert!(
             untouched
                 .retrieve(&key)
@@ -504,5 +536,65 @@ mod tests {
             config.persistence.is_none(),
             "ephemeral config must carry no persistence"
         );
+    }
+
+    /// The persistence key builder must route the DID through the shared
+    /// `sanitize_key_component` gate, rejecting path-traversal characters
+    /// (`/`, `\`, `..`, null) before formatting — the same guard the canonical
+    /// `ProtocolRepository` path applies. A raw `format!` would let a malformed
+    /// DID escape its `identity/{did}/` namespace.
+    #[test]
+    fn identity_document_key_rejects_malformed_dids() {
+        assert!(
+            identity_document_key("../context/victim").is_err(),
+            "a `..`/`/` DID must be rejected"
+        );
+        assert!(
+            identity_document_key("evil\\did").is_err(),
+            "a backslash DID must be rejected"
+        );
+        assert!(
+            identity_document_key("a/b").is_err(),
+            "a slashed DID must be rejected"
+        );
+        assert!(
+            identity_document_key("nul\0did").is_err(),
+            "a null-byte DID must be rejected"
+        );
+        // A well-formed DID is accepted and follows the spec §17.3 convention.
+        assert_eq!(
+            identity_document_key("did:dht:z6MkTest").expect("well-formed DID must be accepted"),
+            "identity/did:dht:z6MkTest/document"
+        );
+    }
+
+    /// The serialized on-disk form is the canonical `StoredValue` named-
+    /// `MessagePack` envelope (NOT bare JSON): its inner `data` is the
+    /// document's JSON bytes, and it carries the shared
+    /// `CURRENT_STORE_VERSION`. This local guard catches drift away from the
+    /// envelope shape even before the cross-crate round-trip test runs.
+    #[tokio::test]
+    async fn serialize_document_produces_stored_value_envelope() {
+        let (_identity, document, _pre_rotation) = Identity::create_ephemeral(
+            IdentityConfig::ephemeral(crate::DidDht::new(), InMemoryKeyCustody::new()),
+        )
+        .await
+        .expect("ephemeral identity creation should succeed");
+
+        let bytes = serialize_document(&document).expect("serialization should succeed");
+
+        // It is NOT bare JSON of the document.
+        assert!(
+            serde_json::from_slice::<DidDocument>(&bytes).is_err(),
+            "persisted bytes must be the MessagePack envelope, not bare JSON"
+        );
+
+        // It IS a StoredValue<Vec<u8>> envelope whose inner data is the
+        // document's JSON, deserializable via the shared helper.
+        let inner: Vec<u8> = scp_platform::store_value::from_stored_value_bytes(&bytes)
+            .expect("envelope should deserialize via the shared helper");
+        let reloaded: DidDocument =
+            serde_json::from_slice(&inner).expect("inner bytes should be the document JSON");
+        assert_eq!(reloaded.id, document.id);
     }
 }

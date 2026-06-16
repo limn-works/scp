@@ -142,6 +142,10 @@ required-features = ["testing"]
 name = "context_config_create"
 required-features = ["testing"]
 
+[[test]]
+name = "identity_config_cross_path"
+required-features = ["testing"]
+
 [[example]]
 name = "identity"
 

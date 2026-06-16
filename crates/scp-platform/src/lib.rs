@@ -69,6 +69,11 @@ pub mod kdf;
 pub(crate) mod pseudonym;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+// Versioned storage envelope + spec §17.3 key conventions. The single source of
+// the `StoredValue` format and `identity/{did}/document` key convention shared
+// by `scp-runtime`'s `ProtocolRepository` and `scp-identity`'s `Identity::create`
+// persistence path, so both produce byte-identical storage writes.
+pub mod store_value;
 #[cfg(feature = "sync")]
 pub mod syncable;
 pub mod traits;
@@ -76,6 +81,10 @@ pub mod traits;
 // Re-export all public types for ergonomic access.
 pub use encrypted::EncryptedStorage;
 pub use error::PlatformError;
+pub use store_value::{
+    CURRENT_STORE_VERSION, StoreValueError, StoredValue, from_stored_value_bytes,
+    identity_document_key, sanitize_key_component, to_stored_value_bytes,
+};
 pub use traits::{
     CustodyType, DeviceAttestation, DeviceAttestationToken, KeyCustody, KeyHandle, KeyType,
     PreRotationCustody, PreRotationCustodyError, PreRotationCustodyKind, PreRotationKeyHandle,
