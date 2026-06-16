@@ -16,6 +16,7 @@
 # Dedicated subranges:
 #   SCP-GOV-     11000-11999
 #   SCP-ECON-    12000-12999
+#   SCP-SAGA-    13000-13999
 #
 # Exit 0 on success, 1 on any violation.
 # Usage: ./scripts/check-error-codes.sh
@@ -65,6 +66,11 @@ check_code() {
         SCP-ECON)
             if [[ $num -ge 1000 ]]; then
                 [[ $num -ge 12000 && $num -le 12999 ]] || { echo "VIOLATION: $file:$line_num: $code — ECON range is 12000-12999"; VIOLATIONS=$((VIOLATIONS + 1)); }
+            fi
+            ;;
+        SCP-SAGA)
+            if [[ $num -ge 1000 ]]; then
+                [[ $num -ge 13000 && $num -le 13999 ]] || { echo "VIOLATION: $file:$line_num: $code — SAGA range is 13000-13999"; VIOLATIONS=$((VIOLATIONS + 1)); }
             fi
             ;;
         SCP-UNKNOWN)  ;; # Sentinel for unmapped bridge errors — allowed
@@ -179,7 +185,7 @@ while IFS=: read -r file line_num content; do
         *) continue ;;
     esac
 
-    while [[ "$content" =~ SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON)-([0-9]+) ]]; do
+    while [[ "$content" =~ SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-([0-9]+) ]]; do
         prefix="${BASH_REMATCH[1]}"
         number="${BASH_REMATCH[2]}"
         full_code="SCP-${prefix}-${number}"
@@ -243,7 +249,7 @@ while IFS=: read -r file line_num content; do
         content="${content#*"$full_code"}"
     done
 done < <(
-    grep -rnE 'SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON)-[0-9]+' \
+    grep -rnE 'SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-[0-9]+' \
         --include='*.rs' \
         --include='*.kt' \
         --include='*.swift' \

@@ -42,6 +42,7 @@ ScpError (root)
 | `SCP-MCP-` | 10000-10999 |
 | `SCP-GOV-` | 11000-11999 |
 | `SCP-ECON-` | 12000-12999 |
+| `SCP-SAGA-` | 13000-13999 |
 
 ### Registered SCP-ATTEST- codes
 
