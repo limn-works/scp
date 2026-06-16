@@ -23,7 +23,7 @@
 //!   construction outside the module). Module-path reachability lets
 //!   `crate::context` code *name* the type; it grants no path to
 //!   *construct* one. The module is NOT `pub`/`pub(crate)`. See ADR-049
-//!   §"`OwnedIdentityDid` via module visibility" and the CI gate
+//!   §5 and the CI gate
 //!   `scripts/check-owned-identity-did.py`.
 //!
 //! # `#![deny(unsafe_code)]`

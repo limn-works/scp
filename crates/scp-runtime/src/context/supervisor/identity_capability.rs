@@ -1,5 +1,5 @@
-//! Capability proof type — see ADR-049 §"`OwnedIdentityDid` via module
-//! visibility" and spec §9.4.1 four-point criterion.
+//! Capability proof type — see ADR-049 §5 (`OwnedIdentityDid`: unforgeable
+//! by constructor visibility + private field) and spec §9.4.1 four-point criterion.
 //!
 //! `OwnedIdentityDid` is the unforgeable token that proves the bearer's
 //! identity owns a particular [`ContextActor`]. The unforgeability

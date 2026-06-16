@@ -199,6 +199,42 @@ fn production_any_test_macro_user() {
     forge_via_any_test_macro!();
 }
 
+// BYPASS H1 (FIX-1 / BLACK-G07) — FREE-FUNCTION CONSTRUCTION in the DECLARING
+// file. Rust field privacy is MODULE-scoped, not impl-scoped: the private
+// `inner`/`did` field is reachable from ANY item in the declaring module, so
+// a FREE FN can mint a token via a struct literal `OwnedIdentityDid { … }`
+// WITHOUT going through an allowlisted inherent constructor. This PASSES rules
+// (A)-(G) (they only inspect `impl OwnedIdentityDid` blocks + decls), COMPILES
+// (the field is in-module-reachable), and is callable from handler code in
+// `crate::context::actor::handlers` → forges a token for ANY DID, defeating
+// cross-identity isolation. Rule H scans EVERY cap-constructing
+// `struct_expression` in the declaring file and HARD FAILs this one because
+// its enclosing fn `forge_token` is NOT in {issue_for_actor, reissue}.
+// Diagnostic names the fn: `… in fn `forge_token` …`. (The block's correct
+// `issue_for_actor` inherent constructor — whose `Self { … }` literal IS
+// allowlisted — keeps rule H from false-failing the legitimate mint, proving
+// rule H allows the two inherent constructors while rejecting the free fn.)
+#[allow(dead_code)]
+pub(in crate::context) fn forge_token(_did: Did) -> OwnedIdentityDid {
+    OwnedIdentityDid { inner: [0; 32] }
+}
+
+// BYPASS H2 (FIX-1 / BLACK-G07) — HELPER-STRUCT METHOD CONSTRUCTION in the
+// DECLARING file. A method on a DIFFERENT (helper) struct constructs the cap
+// via a struct literal. Same module-scoped-privacy bypass: rule G's inherent
+// allowlist inspects only `impl OwnedIdentityDid` blocks, so a method in
+// `impl TokenForger { … }` is invisible to it. Rule H catches it because the
+// constructing `struct_expression`'s enclosing fn `mint_via_helper` is not an
+// allowlisted constructor AND its enclosing impl does not target the cap.
+// Diagnostic names the fn: `… in fn `mint_via_helper` …`.
+struct TokenForger;
+#[allow(dead_code)]
+impl TokenForger {
+    fn mint_via_helper(&self, _did: Did) -> OwnedIdentityDid {
+        OwnedIdentityDid { inner: [0; 32] }
+    }
+}
+
 // @file: context/actor/forge_metavar_macro.rs
 // FIX-1 (BLACK-G05) — METAVARIABLE MACRO MINT in a NON-declaring file. The
 // macro DEFINITION synthesizes `impl $t { … }` on a passed-in type
@@ -575,5 +611,122 @@ impl OwnedIdentityDid {
     #[allow(dead_code)]
     pub(super) fn issue_for_actor(_: &Did) -> Self {
         Self { inner: [0; 32] }
+    }
+}
+
+// @file: context/supervisor/enum_form.rs
+// FIX-1 (BLACK-G05 follow-up) — ENUM FORM is REJECTED. The capability type
+// MUST be a `struct`. An `enum OwnedIdentityDid { Owned(DID) }` is a HARD
+// FAIL (rule F.3) because the mint guarantee rests on the single field being
+// PRIVATE — a Rust enum's variants AND their fields are ALWAYS exactly as
+// visible as the enum itself, so a `pub(in crate::context)` enum lets ANY
+// `crate::context` code write `OwnedIdentityDid::Owned(attacker_did)` — a
+// mint with NO `issue_for_actor`. The OLD field-privacy check (E) did
+// `if kind != "struct": continue` and SKIPPED enums entirely, so this enum
+// (with the 3 allowlisted fns and no public struct field) PASSED the gate.
+// Rule F.3 now FAILs it. Diagnostic: `is declared as an `enum``. A correct
+// inherent `issue_for_actor` is present so the mint-absent check (G.4) does
+// not also fire — isolating the enum-form diagnostic. (The enum form CANNOT
+// actually honor the private-field invariant; the mint here is cosmetic, to
+// prove the gate rejects the enum on shape alone, before any mint analysis.)
+#[allow(dead_code)]
+pub(in crate::context) enum OwnedIdentityDid {
+    Owned(Did),
+}
+struct Did([u8; 32]);
+impl OwnedIdentityDid {
+    #[allow(dead_code)]
+    pub(super) fn issue_for_actor(d: &Did) -> Self {
+        Self::Owned(Did(d.0))
+    }
+}
+
+// @file: context/supervisor/reissue_wrong_vis.rs
+// FIX-2 — `reissue` / `as_did` VISIBILITY is bounded. The accessor/clone fns
+// are allowlisted by NAME (rule G) and shape-checked (`&self`, no raw-DID),
+// but their VISIBILITY was previously unvalidated: a `pub fn reissue(&self)
+// -> Self` PASSED. Such a fn over-exposes the clone beyond the
+// `pub(in crate::context)` boundary the struct itself is held to (a `pub`
+// clone would leak to downstream crates; `pub(crate)` past the context
+// module tree). Rule G now asserts `reissue`/`as_did` visibility is
+// inherited-private or `pub(in crate::context)` — rejecting `pub` and
+// `pub(crate)`. Here `reissue` is `pub` (too broad). Diagnostic:
+// `allowlisted fn `reissue` visibility is`. A correct `pub(super)
+// issue_for_actor` keeps G.4 quiet and passes the allowlist gate, isolating
+// the reissue-visibility diagnostic.
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    inner: [u8; 32],
+}
+struct Did([u8; 32]);
+impl OwnedIdentityDid {
+    #[allow(dead_code)]
+    pub(super) fn issue_for_actor(_: &Did) -> Self {
+        Self { inner: [0; 32] }
+    }
+    // Over-exposed clone: `pub` lets downstream crates clone a held token.
+    // Allowlisted by name + correct `&self` + no raw-DID, but the VISIBILITY
+    // is what rule G now damns.
+    #[allow(dead_code)]
+    pub fn reissue(&self) -> Self {
+        Self { inner: self.inner }
+    }
+}
+
+// @file: context/supervisor/union_form.rs
+// FIX-1 (union follow-up) — UNION FORM is REJECTED (rule F.4). The capability
+// type MUST be a `struct`. A `union OwnedIdentityDid { did: ManuallyDrop<DID> }`
+// is a HARD FAIL: a union field's visibility cannot be made private
+// INDEPENDENT of the union, and union construction (`OwnedIdentityDid { did:
+// … }`) is SAFE Rust — so ANY `crate::context` handler could forge the cap
+// with NO `issue_for_actor`, exactly the bypass F.3 closes for enums. Before
+// rule F.4 a `union_item` was NEVER collected by the decl walk (the walk took
+// only struct/enum/type kinds), so EVERY decl-keyed check (B/E/F.3/G) silently
+// SKIPPED the union while its inherent fns still passed the name allowlist —
+// the gate waved a forgeable mint through. Diagnostic: `is declared as a
+// `union``. A cosmetic `pub(super) issue_for_actor` is present so the
+// mint-absent check (G.4) does not also fire — isolating the union-form
+// diagnostic on shape alone, before any mint analysis. (The union form CANNOT
+// honor the private-field invariant; the mint is cosmetic.)
+#[allow(dead_code)]
+pub(in crate::context) union OwnedIdentityDid {
+    did: std::mem::ManuallyDrop<Did>,
+}
+struct Did([u8; 32]);
+impl OwnedIdentityDid {
+    #[allow(dead_code)]
+    pub(super) fn issue_for_actor(d: &Did) -> Self {
+        Self {
+            did: std::mem::ManuallyDrop::new(Did(d.0)),
+        }
+    }
+}
+
+// @file: context/supervisor/generic_form.rs
+// FIX-1 (GEN-01) — GENERIC FORM is REJECTED (rule F.5). The capability type
+// MUST be a NON-GENERIC `struct`. A `struct OwnedIdentityDid<T = DID> { did: T }`
+// PASSED the old gate: the decl walk keyed on the type NAME and never inspected
+// `type_parameters`, so the generic struct satisfied location (A), struct
+// name-visibility (B), no-forbidden-derives (C), private-field (E), and the
+// inherent allowlist (G) — every check — while the generic parameter loosens
+// the private-field TYPE (`did: T`, defaulting to `DID`) and invites a
+// reviewer-introduced refactor that erodes the private-field invariant the
+// `pub(super)` mint guarantee rests on. It is not an ACTIVE forgery (the field
+// stays private, the mint stays `pub(super)`), but the struct-only assertion is
+// supposed to be airtight. Rule F.5 now HARD FAILs the generic form on shape
+// alone — tree-sitter exposes the `<…>` as the `type_parameters` field on the
+// `struct_item`. Diagnostic: `MUST be a non-generic`. A cosmetic `pub(super)
+// issue_for_actor` is present so the mint-absent check (G.4) does not also fire,
+// isolating the generic-form diagnostic. The `issue_for_actor` is shaped to
+// satisfy the allowlist (raw-DID param, no `&self`, returns `Self`).
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid<T = Did> {
+    did: T,
+}
+struct Did([u8; 32]);
+impl OwnedIdentityDid {
+    #[allow(dead_code)]
+    pub(super) fn issue_for_actor(d: &Did) -> Self {
+        Self { did: Did(d.0) }
     }
 }

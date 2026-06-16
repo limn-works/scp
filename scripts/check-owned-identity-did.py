@@ -29,7 +29,7 @@ If the `OwnedIdentityDid` type exists anywhere in `crates/scp-runtime/src/`:
       intend); `pub` leaks it to downstream crates. Both are rejected.
       The mint guarantee is enforced by check (G) on the constructor and
       check (E) on the field, NOT by this name-visibility. See ADR-049
-      §"`OwnedIdentityDid` via module visibility".
+      §5.
 
   (G) CLOSED ALLOWLIST over the inherent API (NOT an open
       classify-by-return-type rule). The capability type has a tiny FIXED
@@ -42,9 +42,17 @@ If the `OwnedIdentityDid` type exists anywhere in `crates/scp-runtime/src/`:
           `&self`. (Its return SHOULD be `Self`/`OwnedIdentityDid` — a
           sanity check, NOT the security boundary.)
         - `reissue` — clone path. MUST take `&self`. MUST NOT take a
-          raw-DID parameter. (Returns `Self`.)
+          raw-DID parameter. Its VISIBILITY MUST be inherited-private or
+          exactly `pub(in crate::context)` — never `pub`, `pub(crate)`, or
+          any narrower path-restricted form (`pub(super)` / `pub(in
+          crate::context::supervisor)`): exactly `pub(in crate::context)` is
+          required so `ActorDeps::clone_for_spawn` in the sibling `actor`
+          module can call it, and no wider. (Returns `Self`.)
         - `as_did` — accessor. MUST take `&self`. MUST NOT take a raw-DID
-          parameter. (Returns `&DID`.)
+          parameter. Its VISIBILITY MUST be inherited-private or exactly
+          `pub(in crate::context)` — never `pub`, `pub(crate)`, or any
+          narrower path-restricted form — matching the capability struct's
+          own name-visibility. (Returns `&DID`.)
         - ANY OTHER inherent fn — any name, ANY return type (including an
           aliased / `impl Trait` / `Result`-wrapped return that hides the
           capability type from a return-type-text check) — is a HARD FAIL:
@@ -75,6 +83,51 @@ If the `OwnedIdentityDid` type exists anywhere in `crates/scp-runtime/src/`:
       `#[cfg(test)] mod tests` in the declaring file does — it calls
       `OwnedIdentityDid::issue_for_actor(...)` and `token.as_did()`, adding
       NO inherent fn), never add a new inherent fn under a `cfg(test)` gate.
+
+  (H) CONSTRUCTION ALLOWLIST over struct LITERALS (the module-private-field
+      closure). Rust field privacy is MODULE-scoped, NOT impl-scoped. Rules
+      (A)-(G) all key on `impl OwnedIdentityDid` blocks and on the decl
+      itself, so a struct literal of the cap placed OUTSIDE an allowlisted
+      inherent fn — e.g. a FREE FN in the declaring file
+        `pub(in crate::context) fn forge_token(did: DID) -> OwnedIdentityDid
+             { OwnedIdentityDid { did } }`
+      — PASSES rules (A)-(G) AND COMPILES (the private `did` field is
+      reachable anywhere in the declaring module) AND is callable from handler
+      code → forges a token for any DID, defeating cross-identity isolation.
+      Variants: a method on a HELPER struct (`impl Forger { fn make(&self, did:
+      DID) -> OwnedIdentityDid { OwnedIdentityDid { did } } }`), a closure, a
+      nested fn, a trait-impl body — all in the declaring file, all
+      (A)-(G)-blind, all type-system-permitted (in-module).
+
+      Rule H finds EVERY tree-sitter `struct_expression` in the DECLARING FILE
+      (`REQUIRED_PATH`) that CONSTRUCTS the cap and HARD FAILs any not
+      lexically inside the body of an allowlisted constructor. A
+      `struct_expression` "constructs the cap" if its type/name tail is
+      `OwnedIdentityDid` (incl. a scoped `…::OwnedIdentityDid`), OR it is a
+      `Self { … }` literal whose nearest enclosing `impl_item` targets
+      `OwnedIdentityDid` (the real `issue_for_actor`/`reissue` use `Self { did
+      … }`). For each, the gate walks UP to the nearest enclosing
+      `function_item`; if that fn's name is NOT in {`issue_for_actor`,
+      `reissue`} OR the fn is not inside an INHERENT `impl OwnedIdentityDid`
+      block (a helper-type method, a trait-impl method, or a differently-named
+      fn) → HARD FAIL. (`as_did` is NOT a constructor — it returns
+      `&self.did` — so it is deliberately excluded from the construction
+      allowlist.)
+
+      This is the airtight closure: every Rust construction of the struct
+      goes through a `struct_expression` (or a macro — already banned by rule
+      B; or an unsafe transmute — banned by `#![forbid(unsafe_code)]`), so
+      scanning all cap struct_expressions and allowing only the two inherent
+      constructors covers free fns, helper-type methods, closures, nested
+      fns, and trait-impl bodies UNIFORMLY. Applied REGARDLESS of
+      `#[cfg(test)]` (the real test module constructs via the
+      `issue_for_actor` CALL, not a struct literal, so this does not
+      false-fail production). SCOPED to the declaring file: in any OTHER file
+      the private-field literal would not COMPILE (not a forgery vector
+      there), and a `Self { … }` in a foreign-file impl is already covered by
+      location check (A) / trait-mint rule (D). The production file's only cap
+      struct-literals are `Self { did }` inside `issue_for_actor` and
+      `reissue`, both allowlisted, so production PASSES.
 
   (C) The declaration MUST NOT carry a `derive(...)` — plain
       `#[derive(...)]` OR conditional `#[cfg_attr(..., derive(...))]` —
@@ -122,7 +175,15 @@ If the `OwnedIdentityDid` type exists anywhere in `crates/scp-runtime/src/`:
       like `struct OwnedIdentityDid(pub(crate) DidId)` lets handlers
       reach into the inner type and bypass the capability boundary.
 
-  (F) The type MUST be a `struct` (or `enum`).
+  (F) The type MUST be a NON-GENERIC `struct` — NOT a `type` alias, NOT an
+      `enum`, NOT a `union`, and NOT a generic struct. This is a POSITIVE
+      struct-only assertion: the declared nominal kind is checked to be
+      exactly `struct`, the declaration is checked to carry NO type/lifetime
+      parameters, and every other form is rejected. The whole capability
+      rests on the private-field mint invariant (check E), which is ONLY
+      expressible for a `struct` — an enum's variant fields and a union's
+      fields are always as visible as the type itself, and a type alias has
+      no field at all.
         - (F.1) a `type OwnedIdentityDid = Did` alias — the cap NAME used
           as an alias — erases the nominal distinction and gives every
           consumer of `Did` equivalent power, defeating the capability.
@@ -137,6 +198,46 @@ If the `OwnedIdentityDid` type exists anywhere in `crates/scp-runtime/src/`:
           `impl Carrier for u8 { type Out = OwnedIdentityDid; }` — is NOT a
           standalone nameable alias and is excluded: it creates no `-> Out`
           forgery vector, so it is not collected.)
+        - (F.3) an `enum OwnedIdentityDid { … }` is REJECTED. The whole
+          mint guarantee rests on check (E) — the single field is PRIVATE,
+          so the type cannot be constructed outside the declaring module
+          and the ONLY construction path is the `pub(super)`
+          `issue_for_actor` mint. That invariant is INEXPRESSIBLE for an
+          enum: a Rust enum's variants AND their fields are ALWAYS exactly
+          as visible as the enum itself. A
+          `pub(in crate::context) enum OwnedIdentityDid { Owned(DID) }`
+          would let ANY `crate::context` code write
+          `OwnedIdentityDid::Owned(attacker_did)` — a mint with no
+          `issue_for_actor` — while the field-privacy check (E) skips it
+          (E does `if kind != "struct": continue`). Because the
+          private-field invariant only holds for structs, the gate HARD
+          FAILs the enum form.
+        - (F.4) a `union OwnedIdentityDid { … }` is REJECTED for the same
+          reason. A union field's visibility cannot be made private
+          INDEPENDENT of the union, and union construction
+          (`OwnedIdentityDid { did: … }`) is SAFE Rust — so any
+          `crate::context` handler could forge the cap with no
+          `issue_for_actor`, exactly the bypass (F.3) closes for enums.
+          Without (F.4) a `union_item` was never even COLLECTED by the
+          decl walk, so EVERY decl-keyed check (B/E/F.3/G) silently skipped
+          it while the inherent-fn allowlist still passed — a forgeable
+          mint that the gate waved through. The private-field invariant is
+          inexpressible for a union, so the gate HARD FAILs it.
+        - (F.5) a GENERIC `struct OwnedIdentityDid<T = DID> { did: T }` (or a
+          lifetime-parameterized `struct OwnedIdentityDid<'a> { did: DID, _p:
+          PhantomData<&'a ()> }`) is REJECTED. The decl walk keys on the type
+          NAME and, before this rule, never inspected `type_parameters`, so a
+          generic form PASSED every other check. It is not an ACTIVE forgery
+          (the field stays private, the mint stays `pub(super)`,
+          `#![forbid(unsafe_code)]` holds), but the struct-only assertion is
+          supposed to be airtight: a generic parameter loosens the
+          private-field TYPE (a defaulted `did: T` lets a reviewer instantiate
+          the cap over an arbitrary inner type) and invites a
+          reviewer-introduced refactor that erodes the private-field invariant
+          the `pub(super)` mint guarantee rests on. tree-sitter exposes the
+          `<…>` list as the `type_parameters` field on the `struct_item`; the
+          gate HARD FAILs any cap decl that carries one. Applied ONLY to the
+          capability type's own decl — unrelated helper types are unaffected.
 
   (B-macro) The capability module and its neighbours MUST be macro-clean
       where the cap type is concerned. tree-sitter does NOT expand macros,
@@ -198,11 +299,16 @@ SOURCE-TEXT surface, catching regressions in review before they compile.
 
 COVERS (source-text surface, via tree-sitter AST):
   - inherent fns (closed allowlist: issue_for_actor / reissue / as_did)
+  - struct-literal constructions of the cap in the declaring file
+    (H — construction allowlist: only issue_for_actor / reissue may build it;
+    closes the module-scoped-privacy forgery — free fn / helper-type method /
+    closure / nested fn / trait-impl body minting via the private field)
   - trait-impl mints (D, extended — any trait method returning the cap type)
   - macros touching the cap type (B-macro)
   - `#[path]` escapes out of src/ (C-path)
   - forbidden derives / forbidden manual trait impls (C / D)
   - `type` aliases of the cap (F.1 / F.2)
+  - non-struct nominal forms: `enum` (F.3) and `union` (F.4)
   - struct location, name-visibility, and field visibility (A / B / E)
 
 OUT OF REMIT (NOT this AST gate — covered by the type system + human review):
@@ -218,8 +324,10 @@ OUT OF REMIT (NOT this AST gate — covered by the type system + human review):
 SCOPE
 ---------------------------------------------------------------------------
 Walks every `.rs` file under `crates/scp-runtime/src/` (including tests
-and submodules). Finds every `struct OwnedIdentityDid` or `enum
-OwnedIdentityDid` declaration, every `impl ... for OwnedIdentityDid`
+and submodules). Finds every `struct OwnedIdentityDid` declaration (the
+ONLY permitted form), every `enum OwnedIdentityDid` and `union
+OwnedIdentityDid` declaration (which it REJECTS — rules F.3 / F.4), every
+`impl ... for OwnedIdentityDid`
 block (collecting INHERENT fns for the allowlist and TRAIT-impl methods
 for the extended trait-mint check), every `type OwnedIdentityDid = ...`
 alias AND every top-level `type X = OwnedIdentityDid` alias of the
@@ -341,6 +449,27 @@ def node_text(node, source: bytes) -> str:
     return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
 
+_CONTEXT_VIS_RE = re.compile(r"^pub\s*\(\s*in\s+crate\s*::\s*context\s*\)$")
+
+
+def _is_context_visibility(vis: str) -> bool:
+    """True if `vis` is the `pub(in crate::context)` modifier, tolerant of
+    INTERNAL whitespace variation.
+
+    A raw byte-slice extraction of a `visibility_modifier` node yields the
+    source text verbatim, so the semantically-identical valid-Rust forms
+    `pub(in crate::context)` and `pub(in crate :: context)` (extra spaces
+    around `::` or inside the parens) produce DIFFERENT strings. An exact
+    `vis != "pub(in crate::context)"` compare false-FAILs the spaced form.
+    rustfmt normalizes the spacing and the fail is fail-closed (no security
+    risk — it only rejects a valid declaration), but the gate must not flag
+    correct code, so we normalize internal whitespace before comparing.
+    Leading/trailing whitespace is already stripped by the callers; this
+    regex collapses the interior spacing.
+    """
+    return _CONTEXT_VIS_RE.match(vis.strip()) is not None
+
+
 def _visibility_of(node, source: bytes) -> str:
     """Return the visibility modifier of a struct/enum node as a string.
 
@@ -352,6 +481,24 @@ def _visibility_of(node, source: bytes) -> str:
         if c.type == "visibility_modifier":
             return node_text(c, source).strip()
     return ""
+
+
+def _is_generic_decl(node) -> bool:
+    """True if a `struct_item` / `enum_item` / `union_item` node carries a
+    `type_parameters` child — i.e. it is declared GENERIC (type parameters
+    OR lifetime parameters).
+
+    tree-sitter-rust exposes the `<…>` parameter list as the
+    `type_parameters` field on the item node for BOTH generic type params
+    (`<T = DID>`) and lifetime params (`<'a>`); its ABSENCE means the
+    declaration is non-generic. Rule (F) requires the capability type be a
+    NON-GENERIC `struct`: a generic parameter loosens the private-field type
+    (`struct OwnedIdentityDid<T = DID> { did: T }`) or invites a
+    reviewer-introduced refactor that weakens the private-field invariant the
+    `pub(super)` mint guarantee rests on. The cap's field type is fixed
+    (`DID`); there is no legitimate reason for the declaration to be generic.
+    """
+    return node.child_by_field_name("type_parameters") is not None
 
 
 def _strip_string_literals(s: str) -> str:
@@ -712,6 +859,167 @@ def _impl_for_owned_identity_did(
         if name is not None:
             trait_name = node_text(name, source)
     return (trait_name, impl_node.start_point[0] + 1)
+
+
+# -----------------------------------------------------------------------------
+# Struct-literal construction allowlist (rule H — close the module-private
+# field forgery: Rust field privacy is MODULE-scoped, not impl-scoped, so a
+# free fn / helper-type method / closure / nested fn in the DECLARING FILE can
+# mint via the private `did` field without going through an allowlisted
+# inherent constructor. Rules A-G key on `impl OwnedIdentityDid` blocks and
+# decls and would WAVE THROUGH such a construction. Rule H scans EVERY
+# `struct_expression` that builds the cap type in the declaring file and HARD
+# FAILs any not lexically inside an allowlisted constructor body.)
+# -----------------------------------------------------------------------------
+
+
+# The ONLY two fns that may CONSTRUCT the capability via a struct literal.
+# `as_did` is excluded — it is an accessor (`&self.did`), it does NOT build a
+# token. Both MUST be inherent fns on `OwnedIdentityDid` (enforced by rule H
+# walking the construction's enclosing impl target + inherent-ness, NOT just
+# the fn name — a `fn reissue` on a HELPER type, or in a TRAIT impl, does not
+# count).
+CONSTRUCTING_FNS: frozenset[str] = frozenset({"issue_for_actor", "reissue"})
+
+
+def _type_tail_identifier(type_node, source: bytes) -> str | None:
+    """Return the tail identifier of a type node — the bare type name with any
+    leading `path::` segments dropped. Handles `type_identifier`
+    (`OwnedIdentityDid`), `scoped_type_identifier`
+    (`crate::…::OwnedIdentityDid` → `OwnedIdentityDid`), and `generic_type`
+    (`OwnedIdentityDid<T>` → `OwnedIdentityDid`). Returns None for any other
+    node shape.
+    """
+    if type_node is None:
+        return None
+    if type_node.type == "type_identifier":
+        return node_text(type_node, source)
+    if type_node.type == "scoped_type_identifier":
+        name = type_node.child_by_field_name("name")
+        return node_text(name, source) if name is not None else None
+    if type_node.type == "generic_type":
+        return _type_tail_identifier(
+            type_node.child_by_field_name("type"), source
+        )
+    return None
+
+
+def _nearest_enclosing(node, kinds: tuple[str, ...]):
+    """Walk PARENTS (not `node` itself) and return the first ancestor whose
+    `.type` is in `kinds`, else None.
+    """
+    cur = node.parent
+    while cur is not None:
+        if cur.type in kinds:
+            return cur
+        cur = cur.parent
+    return None
+
+
+def _impl_targets_cap(impl_node, source: bytes) -> bool:
+    """True if an `impl_item` node's target type (its `type` field) is the
+    capability type — i.e. `impl … OwnedIdentityDid { … }` (inherent OR trait
+    impl). Used by rule H to decide whether a `Self { … }` literal inside the
+    impl constructs the cap, and whether a construction's enclosing impl is an
+    inherent cap impl.
+    """
+    if impl_node is None:
+        return False
+    return _type_tail_identifier(
+        impl_node.child_by_field_name("type"), source
+    ) == TYPE_NAME
+
+
+def _impl_is_inherent(impl_node) -> bool:
+    """True if an `impl_item` is an INHERENT impl (`impl Ty { … }`), i.e. it
+    has NO `trait` field. A trait impl (`impl Trait for Ty`) has a `trait`
+    field. Rule H requires the allowlisted constructor live in an INHERENT
+    `impl OwnedIdentityDid` block — a `fn reissue` smuggled into a TRAIT impl
+    on the cap (or any trait impl) is NOT an allowlisted construction site.
+    """
+    return (
+        impl_node is not None
+        and impl_node.child_by_field_name("trait") is None
+    )
+
+
+def _struct_expr_constructs_cap(struct_expr_node, source: bytes) -> bool:
+    """True if a `struct_expression` node CONSTRUCTS the capability type:
+
+      - its `name` tail identifier is `OwnedIdentityDid` (covers
+        `OwnedIdentityDid { … }` AND a scoped `…::OwnedIdentityDid { … }`), OR
+      - its `name` is the literal `Self` AND its nearest enclosing `impl_item`
+        targets `OwnedIdentityDid` (the real `issue_for_actor` / `reissue` use
+        `Self { did … }`).
+
+    A `Self { … }` whose enclosing impl targets some OTHER type, or a literal
+    named after a different type (incl. an ALIAS like `OwnedCap { … }`, which
+    is independently banned by rule F.2), is NOT collected here.
+    """
+    name_node = struct_expr_node.child_by_field_name("name")
+    if name_node is None:
+        return False
+    tail = _type_tail_identifier(name_node, source)
+    if tail == TYPE_NAME:
+        return True
+    if tail == "Self":
+        impl_node = _nearest_enclosing(struct_expr_node, ("impl_item",))
+        return _impl_targets_cap(impl_node, source)
+    return False
+
+
+def _construction_hit_reason(struct_expr_node, source: bytes) -> str | None:
+    """Return a rule-H diagnostic reason if this cap-constructing
+    `struct_expression` is NOT lexically inside the body of an allowlisted
+    INHERENT constructor (`issue_for_actor` / `reissue` on
+    `OwnedIdentityDid`), else None.
+
+    The check walks UP to the construction's nearest enclosing `function_item`
+    and FAILs when EITHER:
+      - that fn's name is not in CONSTRUCTING_FNS (a free fn / helper method /
+        differently-named fn — `forge_token`, `make`, `clone`, `from`, …), OR
+      - the fn is not inside an INHERENT `impl OwnedIdentityDid` block (a
+        method on a HELPER struct, or a TRAIT-impl method, even one NAMED
+        `reissue`).
+    A construction NOT inside any `function_item` at all (a free-standing
+    module-level `OwnedIdentityDid { … }`, or one inside a closure / nested fn
+    that itself sits outside an allowlisted fn) also FAILs.
+
+    Rust field privacy is MODULE-scoped: the private `did` field is reachable
+    from ANY item in the declaring module, so the type system does NOT block an
+    in-module literal. Only the two allowlisted inherent constructors may build
+    the capability; this rule is the source-text closure over that invariant.
+    """
+    label = node_text(struct_expr_node.child_by_field_name("name"), source).strip()
+    fn_node = _nearest_enclosing(struct_expr_node, ("function_item",))
+    if fn_node is not None:
+        name_node = fn_node.child_by_field_name("name")
+        fn_name = node_text(name_node, source) if name_node is not None else "<anon>"
+        impl_node = _nearest_enclosing(fn_node, ("impl_item",))
+        in_allowlisted = (
+            fn_name in CONSTRUCTING_FNS
+            and _impl_targets_cap(impl_node, source)
+            and _impl_is_inherent(impl_node)
+        )
+        if in_allowlisted:
+            return None
+        return (
+            f"`{label} {{ … }}` constructed in fn `{fn_name}` outside the "
+            f"allowlisted constructors `issue_for_actor`/`reissue`; a free fn "
+            f"/ other-type method / closure / trait-impl method in the "
+            f"declaring module can mint via the module-private field (Rust "
+            f"field privacy is module-scoped, so the type system does NOT "
+            f"block an in-module literal). Only the two allowlisted INHERENT "
+            f"constructors `issue_for_actor`/`reissue` may build the "
+            f"capability"
+        )
+    return (
+        f"`{label} {{ … }}` constructed outside any function (free-standing / "
+        f"closure / nested-fn module-level construction); only the allowlisted "
+        f"INHERENT constructors `issue_for_actor`/`reissue` may build the "
+        f"capability — Rust field privacy is module-scoped, so an in-module "
+        f"literal is type-system-permitted and must be gate-blocked"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1159,18 +1467,24 @@ def _is_under(path: Path, root: Path) -> bool:
 
 
 def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
-    list[tuple[str, int, str, list[str], list[tuple[int, str]], str]],
+    list[tuple[str, int, str, list[str], list[tuple[int, str]], str, bool]],
     list[tuple[str, int, str | None]],
     list[tuple[str, int, str, str, str, str]],
     list[tuple[str, int, str]],
     list[tuple[str, int, str, str, str, str, str]],
     list[tuple[str, int, str]],
+    list[tuple[str, int, str]],
 ]:
     """Walk scan_dir and return (decls, impls, ctor_fns, cap_aliases,
-    trait_fns, macro_hits).
+    trait_fns, macro_hits, construction_hits).
 
     decls: list of (rel_path, line, visibility, derives, public_fields,
-                    kind) where kind is 'struct' | 'enum' | 'type_alias'.
+                    kind, generic) where kind is
+                    'struct' | 'enum' | 'union' | 'type_alias' and `generic`
+                    is True iff the declaration carries `type_parameters`
+                    (generic type OR lifetime params). Rule (F) requires the
+                    cap be a NON-GENERIC struct, so a generic struct decl is
+                    HARD-FAILed even though every other check passes.
     impls: list of (rel_path, line, trait_name) where trait_name is None
            for inherent impls (which are permitted) and non-None for
            trait impls (which are rejected if the trait is forbidden).
@@ -1223,20 +1537,39 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                  synthesizes an `impl …OwnedIdentityDid`). An ordinary
                  `tracing::warn!("…")` does NOT reference the cap type, so it
                  is not collected.
+    construction_hits: every `struct_expression` in the DECLARING FILE that
+           CONSTRUCTS the capability type (`OwnedIdentityDid { … }`, a scoped
+           `…::OwnedIdentityDid { … }`, or a `Self { … }` whose enclosing impl
+           targets the cap) but is NOT lexically inside an allowlisted INHERENT
+           constructor (`issue_for_actor` / `reissue`). Rust field privacy is
+           MODULE-scoped, not impl-scoped: the private `did` field is reachable
+           from ANY item in the declaring module, so a free fn / helper-type
+           method / closure / nested fn / trait-impl method can mint via a
+           struct literal while passing every impl-keyed rule (A-G). Rule H
+           closes this by scanning ALL cap-constructing struct literals and
+           failing any outside the two allowlisted inherent constructors.
+           SCOPED to the declaring file (`required_rel`) because in any OTHER
+           file the private-field literal would not COMPILE (so it is not a
+           forgery vector there), and a `Self { … }` in a foreign-file impl is
+           already covered by location check (A) / trait-mint rule (D).
+           Element shape: (rel_path, line, reason).
     """
-    decls: list[tuple[str, int, str, list[str], list[tuple[int, str]], str]] = []
+    decls: list[
+        tuple[str, int, str, list[str], list[tuple[int, str]], str, bool]
+    ] = []
     impls: list[tuple[str, int, str | None]] = []
     ctor_fns: list[tuple[str, int, str, str, str, str]] = []
     cap_aliases: list[tuple[str, int, str]] = []
     trait_fns: list[tuple[str, int, str, str, str, str, str]] = []
     macro_hits: list[tuple[str, int, str]] = []
+    construction_hits: list[tuple[str, int, str]] = []
     # Rel path of the ONE file allowed to declare the cap type. The same
     # relative path holds under both the real repo_root and the self-test's
     # temp staging root, so the declaring-file macro rule (B, sub-case 1)
     # keys on it identically in both.
     required_rel = REQUIRED_PATH
     if not scan_dir.is_dir():
-        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits
+        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits
     for root, _, files in os.walk(scan_dir):
         for fname in files:
             if not fname.endswith(".rs"):
@@ -1247,7 +1580,12 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
             tree = PARSER.parse(source)
 
             def walk(node) -> None:
-                if node.type in ("struct_item", "enum_item", "type_item"):
+                if node.type in (
+                    "struct_item",
+                    "enum_item",
+                    "union_item",
+                    "type_item",
+                ):
                     name_node = node.child_by_field_name("name")
                     if name_node is not None:
                         name = node_text(name_node, source)
@@ -1258,8 +1596,17 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                             kind = {
                                 "struct_item": "struct",
                                 "enum_item": "enum",
+                                "union_item": "union",
                                 "type_item": "type_alias",
                             }[node.type]
+                            # Generic-arity check applies ONLY to the cap
+                            # type's OWN declaration (this branch keys on the
+                            # decl NAME == TYPE_NAME). A `type_parameters`
+                            # child marks a generic type/lifetime param list;
+                            # `type_item` aliases never carry one (and are
+                            # rejected as aliases regardless), so the flag is
+                            # meaningful for struct/enum/union forms.
+                            generic = _is_generic_decl(node)
                             decls.append(
                                 (
                                     rel,
@@ -1268,6 +1615,7 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                                     derives,
                                     pubs,
                                     kind,
+                                    generic,
                                 )
                             )
                         elif node.type == "type_item":
@@ -1347,6 +1695,23 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                         macro_hits.append(
                             (rel, node.start_point[0] + 1, macro_hit)
                         )
+                # (H) Construction allowlist over struct LITERALS. Scoped to
+                # the DECLARING FILE only: the cap's `did` field is
+                # module-private, so a struct literal that reaches it is
+                # type-system-permitted ONLY inside the declaring module — in
+                # any OTHER file `OwnedIdentityDid { did }` would not compile,
+                # so it is not a forgery vector there and a `Self { … }` in an
+                # impl in another file is already covered by location check (A)
+                # / trait-mint rule (D). Inside the declaring module a free fn
+                # / helper-type method / closure / nested fn can mint via the
+                # private field while passing every impl-keyed rule (A-G).
+                if rel == required_rel and node.type == "struct_expression":
+                    if _struct_expr_constructs_cap(node, source):
+                        reason = _construction_hit_reason(node, source)
+                        if reason is not None:
+                            construction_hits.append(
+                                (rel, node.start_point[0] + 1, reason)
+                            )
                 if node.type == "attribute_item":
                     path_hit = _path_attr_escape(node, source, full, scan_dir)
                     if path_hit is not None:
@@ -1357,7 +1722,7 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                     walk(c)
 
             walk(tree.root_node)
-    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits
+    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits
 
 
 def find_declarations():
@@ -1511,12 +1876,15 @@ SAFE_CONSTRUCTING_TRAITS: frozenset[str] = frozenset()
 
 
 def _enforce(
-    decls: list[tuple[str, int, str, list[str], list[tuple[int, str]], str]],
+    decls: list[
+        tuple[str, int, str, list[str], list[tuple[int, str]], str, bool]
+    ],
     impls: list[tuple[str, int, str | None]],
     ctor_fns: list[tuple[str, int, str, str, str, str]],
     cap_aliases: list[tuple[str, int, str]],
     trait_fns: list[tuple[str, int, str, str, str, str, str]],
     macro_hits: list[tuple[str, int, str]],
+    construction_hits: list[tuple[str, int, str]],
     required_path: str,
     stream=sys.stderr,
 ) -> bool:
@@ -1531,14 +1899,14 @@ def _enforce(
     #
     # (F.1) A `type OwnedIdentityDid = …;` alias — the cap NAME used as an
     # alias — erases the nominal distinction outright.
-    for rel, line, _, _, _, kind in decls:
+    for rel, line, _, _, _, kind, _ in decls:
         if kind == "type_alias":
             stream.write(
                 f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
                 f"{TYPE_NAME} is declared as a `type` alias; it MUST be "
-                f"a `struct` (or `enum`). A type alias erases the nominal "
-                f"distinction and defeats the capability. "
-                f"See ADR-049 §'Cross-identity isolation'.\n"
+                f"a `struct` (NOT an `enum`). A type alias erases the "
+                f"nominal distinction and defeats the capability. "
+                f"See ADR-049 §5.\n"
             )
             fail = True
 
@@ -1554,17 +1922,100 @@ def _enforce(
             f"capability type. Such an alias lets a mint fn declare "
             f"`-> {alias_name}` to hide the capability return type from a "
             f"return-type check; it is banned outright. Use {TYPE_NAME} "
-            f"directly. See ADR-049 §'Cross-identity isolation'.\n"
+            f"directly. See ADR-049 §5.\n"
         )
         fail = True
 
+    # (F.3) The capability type MUST be a `struct` — an `enum` is REJECTED.
+    #
+    # The entire mint guarantee rests on check (E): the single field is
+    # PRIVATE, so the type cannot be struct-literal-constructed outside the
+    # declaring module, and the ONLY construction path is the `pub(super)`
+    # `issue_for_actor` mint. That invariant is INEXPRESSIBLE for an enum: a
+    # Rust enum's variants and their fields are ALWAYS exactly as visible as
+    # the enum itself. A `pub(in crate::context) enum OwnedIdentityDid {
+    # Owned(DID) }` therefore lets ANY `crate::context` code write
+    # `OwnedIdentityDid::Owned(attacker_did)` — a mint with NO
+    # `issue_for_actor`, defeating cross-identity isolation — while still
+    # satisfying every other check (the field-privacy check E does
+    # `if kind != "struct": continue` and would SKIP the enum entirely). The
+    # gate requires the struct form precisely because the private-field
+    # invariant only holds for structs. See ADR-049 §5.
+    #
+    # (F.3) is one half of the POSITIVE struct-only assertion: the cap's
+    # declared nominal kind MUST be `struct`. Any non-struct nominal form
+    # is rejected — `enum` here, `union` immediately below, `type` alias
+    # via (F.1)/(F.2) above. Only `struct` falls through clean.
+    for rel, line, _, _, _, kind, _ in decls:
+        if kind == "enum":
+            stream.write(
+                f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
+                f"{TYPE_NAME} is declared as an `enum`; it MUST be a "
+                f"`struct`. The mint guarantee rests on the single field "
+                f"being PRIVATE (no construction outside the declaring "
+                f"module), but a Rust enum's variants and their fields are "
+                f"ALWAYS as visible as the enum itself — so any "
+                f"`crate::context` code could write "
+                f"`{TYPE_NAME}::Owned(attacker_did)`, a mint with no "
+                f"`issue_for_actor`. The private-field invariant is "
+                f"inexpressible for enums. See ADR-049 §5.\n"
+            )
+            fail = True
+
+    # (F.4) The capability type MUST NOT be a `union`. A union's field
+    # visibility cannot be made private INDEPENDENT of the union, and
+    # union construction (`OwnedIdentityDid { did: … }`) is SAFE Rust — so
+    # any `crate::context` handler could forge the cap with no
+    # `issue_for_actor`, exactly the bypass (F.3) closes for enums. The
+    # private-field mint invariant is therefore inexpressible for a union.
+    # This is the second half of the positive struct-only assertion (see
+    # F.3 comment): with enum (F.3), union (here), and type-alias (F.1/F.2)
+    # all rejected, ONLY a `struct` declaration passes.
+    for rel, line, _, _, _, kind, _ in decls:
+        if kind == "union":
+            stream.write(
+                f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
+                f"{TYPE_NAME} is declared as a `union`; it MUST be a "
+                f"`struct`. A union field's visibility cannot be made "
+                f"private independent of the union, and union construction "
+                f"is safe Rust, so the private-field mint invariant is "
+                f"inexpressible. See ADR-049 §5.\n"
+            )
+            fail = True
+
+    # (F.5) The capability type MUST be a NON-GENERIC `struct`. A generic
+    # declaration — type parameters (`struct OwnedIdentityDid<T = DID> { did:
+    # T }`) OR lifetime parameters (`struct OwnedIdentityDid<'a> { did: DID,
+    # _p: PhantomData<&'a ()> }`) — currently satisfies every other check
+    # (the field stays private, the mint stays `pub(super)`,
+    # `#![forbid(unsafe_code)]` holds), so it is not an ACTIVE forgery. But
+    # the struct-only assertion is supposed to be airtight: a generic
+    # parameter loosens the private-field TYPE (defaulting `did: T` lets a
+    # reviewer instantiate the cap over an arbitrary inner type) and invites a
+    # reviewer-introduced refactor that erodes the private-field invariant the
+    # `pub(super)` mint guarantee rests on. The cap's field type is fixed
+    # (`DID`); there is no legitimate reason for the declaration to be
+    # generic. HARD FAIL any generic cap decl. The flag is set ONLY on the
+    # cap type's own decl (see `_scan_root`), so unrelated helper types are
+    # unaffected.
+    for rel, line, _, _, _, kind, generic in decls:
+        if generic and kind in ("struct", "enum", "union"):
+            stream.write(
+                f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
+                f"{TYPE_NAME} MUST be a non-generic `struct`; type/lifetime "
+                f"parameters loosen the private-field invariant the mint "
+                f"guarantee rests on. Remove the `<…>` parameter list. "
+                f"See ADR-049 §5.\n"
+            )
+            fail = True
+
     # (A) Location: every decl must live at REQUIRED_PATH.
-    for rel, line, _, _, _, _ in decls:
+    for rel, line, _, _, _, _, _ in decls:
         if rel != required_path:
             stream.write(
                 f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
                 f"{TYPE_NAME} must be declared in {required_path}, "
-                f"not {rel}. See ADR-049 §'Cross-identity isolation'.\n"
+                f"not {rel}. See ADR-049 §5.\n"
             )
             fail = True
 
@@ -1577,8 +2028,8 @@ def _enforce(
     # G) and the private field (check E). `pub(super)` here would be too
     # NARROW now: `ActorDeps` lives in `crate::context::actor`, a sibling
     # of `supervisor`, and could not name a `pub(super)` type.
-    for rel, line, vis, _, _, _ in decls:
-        if vis != "pub(in crate::context)":
+    for rel, line, vis, _, _, _, _ in decls:
+        if not _is_context_visibility(vis):
             stream.write(
                 f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
                 f"{TYPE_NAME} struct visibility is {vis or 'private'!r}; "
@@ -1592,14 +2043,14 @@ def _enforce(
             fail = True
 
     # (C) Forbidden derives.
-    for rel, line, _, derives, _, _ in decls:
+    for rel, line, _, derives, _, _, _ in decls:
         bad = [d for d in derives if d in FORBIDDEN_DERIVES]
         if bad:
             stream.write(
                 f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
                 f"{TYPE_NAME} has forbidden derive(s): {', '.join(sorted(set(bad)))}.\n"
                 f"       Forbidden: {', '.join(sorted(FORBIDDEN_DERIVES))}.\n"
-                f"       See ADR-049 §'Cross-identity isolation'.\n"
+                f"       See ADR-049 §5.\n"
             )
             fail = True
 
@@ -1615,7 +2066,7 @@ def _enforce(
                 f"manual `impl {trait_name} for {TYPE_NAME}` — this trait "
                 f"is forbidden (same semantics as a banned derive). "
                 f"Forbidden: {', '.join(sorted(FORBIDDEN_IMPL_TRAITS))}. "
-                f"See ADR-049 §'Cross-identity isolation'.\n"
+                f"See ADR-049 §5.\n"
             )
             fail = True
 
@@ -1656,7 +2107,7 @@ def _enforce(
                 f"inspects only inherent impls). The ONLY mint is the inherent "
                 f"`pub(super) issue_for_actor`; no trait method on this type "
                 f"may construct it or consume a raw DID. "
-                f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+                f"See ADR-049 §5.\n"
             )
             fail = True
 
@@ -1668,12 +2119,38 @@ def _enforce(
     for rel, line, reason in macro_hits:
         stream.write(
             f"{C_RED}FAIL{C_RESET}: {rel}:{line}: {reason}. "
-            f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+            f"See ADR-049 §5.\n"
+        )
+        fail = True
+
+    # (H) CONSTRUCTION ALLOWLIST over struct LITERALS (BLACK-G07). Rust field
+    # privacy is MODULE-scoped, not impl-scoped: the cap's private `did` field
+    # is reachable from ANY item in the declaring module, so a free fn /
+    # helper-type method / closure / nested fn / trait-impl method in the
+    # DECLARING FILE can mint a token via a struct literal —
+    # `OwnedIdentityDid { did }` or a `Self { … }` inside an impl on the cap —
+    # while passing EVERY impl-keyed rule (A-G), which only inspect
+    # `impl OwnedIdentityDid` blocks and decls. Such a construction COMPILES
+    # (the field is in-module-reachable) and is callable from handler code,
+    # forging a token for any DID and defeating cross-identity isolation. Rule
+    # H is the airtight closure: every Rust construction of the struct goes
+    # through a `struct_expression` (or a macro — banned by rule B; or unsafe
+    # transmute — banned by `#![forbid(unsafe_code)]`), so scanning ALL
+    # cap-constructing struct literals in the declaring file and allowing only
+    # the two inherent constructors `issue_for_actor`/`reissue` covers free
+    # fns, helper-type methods, closures, nested fns, and trait-impl bodies
+    # uniformly. `construction_hits` is already SCOPED to the declaring file
+    # by `_scan_root` (the private-field literal cannot compile in any other
+    # module). FAIL each.
+    for rel, line, reason in construction_hits:
+        stream.write(
+            f"{C_RED}FAIL{C_RESET}: {rel}:{line}: {reason}. "
+            f"See ADR-049 §5.\n"
         )
         fail = True
 
     # (E) Public fields on struct.
-    for rel, line, _, _, pubs, kind in decls:
+    for rel, line, _, _, pubs, kind, _ in decls:
         if kind != "struct":
             continue
         for field_line, vis in pubs:
@@ -1683,7 +2160,7 @@ def _enforce(
                 f"{vis!r}. All fields MUST be private. A {vis} field on "
                 f"this type lets handlers reach the inner DidId and "
                 f"bypass the capability boundary. "
-                f"See ADR-049 §'Cross-identity isolation'.\n"
+                f"See ADR-049 §5.\n"
             )
             fail = True
 
@@ -1761,7 +2238,7 @@ def _enforce(
                     f"Trait` / `Result`-wrapped) or params, which closes the "
                     f"aliased-return forgery (`-> OwnedCap`, `-> impl "
                     f"Sized`). "
-                    f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+                    f"See ADR-049 §5.\n"
                 )
                 fail = True
                 continue
@@ -1779,7 +2256,7 @@ def _enforce(
                         f"lets non-supervisor code fabricate a token for an "
                         f"arbitrary DID and defeats cross-identity "
                         f"isolation. "
-                        f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+                        f"See ADR-049 §5.\n"
                     )
                     fail = True
                 if not takes_did:
@@ -1790,7 +2267,7 @@ def _enforce(
                         f"allowlisted mint MUST mint from a raw `DID`; a "
                         f"name-squat of `issue_for_actor` that takes no DID "
                         f"is a shape forgery. "
-                        f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+                        f"See ADR-049 §5.\n"
                     )
                     fail = True
                 if takes_self:
@@ -1800,7 +2277,7 @@ def _enforce(
                         f"{params.strip()!r}); the mint is an ASSOCIATED fn "
                         f"that constructs from a raw `DID`, not a method on "
                         f"an existing token. "
-                        f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+                        f"See ADR-049 §5.\n"
                     )
                     fail = True
                 # Sanity check only — NOT the security boundary: the mint
@@ -1814,15 +2291,56 @@ def _enforce(
                         f"{ret_ty.strip()!r}; it SHOULD return "
                         f"Self/{TYPE_NAME}. (Sanity check — the allowlist, "
                         f"not the return text, is the boundary.) "
-                        f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+                        f"See ADR-049 §5.\n"
                     )
                     fail = True
 
             # (G.2 & G.3) `reissue` / `as_did` — clone path and accessor.
             # Both MUST take `&self` and MUST NOT take a raw-DID param. Only
             # the mint may take a raw DID ("exactly one raw-DID mint", folded
-            # into the allowlist).
+            # into the allowlist). Their VISIBILITY is also bounded to the
+            # gate's EXACT allowed-set: a `&self` clone/accessor MUST be
+            # inherited-private (`""`) or EXACTLY `pub(in crate::context)`
+            # (the same name-visibility as the struct, so the by-value clone /
+            # `&DID` accessor is reachable exactly where the token itself is
+            # and no wider) — never `pub`, `pub(crate)`, OR any narrower
+            # path-restricted form (`pub(super)`, `pub(in crate::context::
+            # supervisor)`, …). A `pub fn reissue(&self) -> Self` would let
+            # downstream crates clone a held token, and a `pub(crate)` one
+            # would over-expose it beyond the context module tree; a NARROWER
+            # form (`pub(super)`) is ALSO rejected because `reissue` must stay
+            # callable by `ActorDeps::clone_for_spawn` in the sibling `actor`
+            # module, which a `pub(super)` (supervisor-only) bound would break.
+            # All widen-OR-narrow the accessor/clone surface away from the
+            # exact `pub(in crate::context)` boundary the struct itself is held
+            # to. This
+            # is inert today (the struct is `pub(in crate::context)` so a
+            # wider fn vis cannot actually escape the crate), but it is a
+            # defence-in-depth gap the gate must close so a future struct
+            # re-export cannot silently widen these accessors.
+            # Allowed accessor visibilities (the gate's EXACT allowed-set):
+            # inherited-private (`""`) or EXACTLY `pub(in crate::context)`
+            # (whitespace-tolerant via the same normalizer the struct-vis
+            # check B uses). Every other modifier — `pub`, `pub(crate)`, AND
+            # narrower path-restricted forms like `pub(super)` /
+            # `pub(in crate::context::supervisor)` — is rejected.
+            accessor_vis_ok = vis == "" or _is_context_visibility(vis)
             if fn_name in ("reissue", "as_did"):
+                if not accessor_vis_ok:
+                    stream.write(
+                        f"{C_RED}FAIL{C_RESET}: {r}:{fn_line}: "
+                        f"allowlisted fn `{fn_name}` visibility is "
+                        f"{vis or 'private'!r}; a `&self` clone/accessor "
+                        f"MUST be inherited-private or exactly "
+                        f"'pub(in crate::context)', never 'pub', "
+                        f"'pub(crate)', or any narrower path-restricted form. "
+                        f"A wider visibility over-exposes the "
+                        f"clone (`reissue`) / inner-DID accessor (`as_did`) "
+                        f"beyond the context module tree the capability is "
+                        f"held to. "
+                        f"See ADR-049 §5.\n"
+                    )
+                    fail = True
                 if not takes_self:
                     stream.write(
                         f"{C_RED}FAIL{C_RESET}: {r}:{fn_line}: "
@@ -1831,7 +2349,7 @@ def _enforce(
                         f"`as_did` (accessor) MUST be `&self` methods on an "
                         f"already-held token, never associated fabrication "
                         f"paths. "
-                        f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+                        f"See ADR-049 §5.\n"
                     )
                     fail = True
                 if takes_did:
@@ -1843,7 +2361,7 @@ def _enforce(
                         f"raw-`DID` argument on `{fn_name}` would make it a "
                         f"second mint path that forges tokens for "
                         f"not-already-held identities. "
-                        f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+                        f"See ADR-049 §5.\n"
                     )
                     fail = True
 
@@ -1865,7 +2383,7 @@ def _enforce(
                 f"absence means the capability type can no longer be minted "
                 f"under the supervisor-only guarantee (renamed / gutted "
                 f"mint). "
-                f"See ADR-049 §'OwnedIdentityDid via module visibility'.\n"
+                f"See ADR-049 §5.\n"
             )
             fail = True
 
@@ -2023,6 +2541,54 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     # immediately after `derive(s): ` is impossible to produce without
     # real cfg_attr-inside-derive extraction.
     ("cfg_attr_derive", "forbidden derive(s): Deserialize"),
+    # FIX-1 — ENUM FORM rejected (rule F.3). A
+    # `pub(in crate::context) enum OwnedIdentityDid { Owned(DID) }` PASSED the
+    # old gate (the field-privacy check E did `if kind != "struct": continue`
+    # and skipped enums), yet it lets any `crate::context` code mint via
+    # `OwnedIdentityDid::Owned(attacker_did)` — a Rust enum's variant fields
+    # are always as visible as the enum. Rule F.3 HARD FAILs the enum form.
+    ("enum_form", "is declared as an `enum`"),
+    # FIX-1 (union follow-up) — UNION FORM rejected (rule F.4). A
+    # `pub(in crate::context) union OwnedIdentityDid { did: ManuallyDrop<DID> }`
+    # PASSED the old gate: a `union_item` was never even COLLECTED by the decl
+    # walk (which took only struct/enum/type kinds), so EVERY decl-keyed check
+    # (B/E/F.3/G) silently SKIPPED it while its inherent fns still passed the
+    # name allowlist — a forgeable mint waved through. A union field's
+    # visibility cannot be made private independent of the union, and union
+    # construction is safe Rust, so the private-field mint invariant is
+    # inexpressible. Rule F.4 HARD FAILs the union form on shape alone.
+    ("union_form", "is declared as a `union`"),
+    # FIX-2 — `reissue` / `as_did` VISIBILITY bound. A `pub fn reissue(&self)
+    # -> Self` is allowlisted by name and correctly shaped (`&self`, no
+    # raw-DID) but over-exposes the clone past the
+    # `pub(in crate::context)` boundary. Rule G now rejects `pub` / `pub(crate)`
+    # on `reissue`/`as_did`. The substring is unique to the accessor-vis arm.
+    ("reissue_wrong_visibility", "allowlisted fn `reissue` visibility is"),
+    # FIX-1 (GEN-01) — GENERIC FORM. A `struct OwnedIdentityDid<T = DID>` passed
+    # the old gate (the decl walk keyed on the type NAME, never inspecting
+    # `type_parameters`). Rule F.5 now HARD-FAILs the generic form on shape
+    # alone; the substring is unique to the non-generic-struct arm.
+    ("generic_form", "MUST be a non-generic"),
+    # FIX-1 (BLACK-G07) — FREE-FUNCTION CONSTRUCTION. Rust field privacy is
+    # MODULE-scoped, not impl-scoped, so a free fn in the DECLARING file
+    # (`fn forge_token(did) -> OwnedIdentityDid { OwnedIdentityDid { … } }`)
+    # mints via the module-private field WITHOUT an allowlisted inherent
+    # constructor — and PASSES rules (A)-(G), which only inspect
+    # `impl OwnedIdentityDid` blocks + decls. Rule H scans every
+    # cap-constructing `struct_expression` in the declaring file and HARD FAILs
+    # this one; the diagnostic names the enclosing fn. The substring
+    # `in fn `forge_token`` is unique to this free-fn case.
+    ("free_fn_construction", "in fn `forge_token`"),
+    # FIX-1 (BLACK-G07) — HELPER-STRUCT METHOD CONSTRUCTION. A method on a
+    # DIFFERENT struct (`impl TokenForger { fn mint_via_helper(&self, did) ->
+    # OwnedIdentityDid { OwnedIdentityDid { … } } }`) constructs the cap via a
+    # struct literal in the declaring file. Rule G's inherent allowlist
+    # inspects only `impl OwnedIdentityDid` blocks, so a helper-type method is
+    # invisible to it; rule H catches the construction. The substring
+    # `in fn `mint_via_helper`` is unique to this helper-method case. Both H1
+    # and H2 also carry the shared phrase `constructed in fn` / `outside the
+    # allowlisted constructors`, but the fn name disambiguates them.
+    ("helper_method_construction", "in fn `mint_via_helper`"),
 ]
 
 
@@ -2086,9 +2652,15 @@ def do_self_test() -> int:
         # Reconfigure to point at the fixture temp root.
         fx_scan = src_root
         fx_required = "crates/scp-runtime/src/context/supervisor/identity_capability.rs"
-        decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits = _scan_root(
-            fx_scan, tmp_root
-        )
+        (
+            decls,
+            impls,
+            ctor_fns,
+            cap_aliases,
+            trait_fns,
+            macro_hits,
+            construction_hits,
+        ) = _scan_root(fx_scan, tmp_root)
         # Capture stderr to inspect.
         buf = io.StringIO()
         fail = _enforce(
@@ -2098,6 +2670,7 @@ def do_self_test() -> int:
             cap_aliases,
             trait_fns,
             macro_hits,
+            construction_hits,
             fx_required,
             stream=buf,
         )
@@ -2127,20 +2700,13 @@ def do_self_test() -> int:
         sys.stderr.write(diag)
         return 1
 
+    # Enumerate modes dynamically from the fixture labels so this message can
+    # never drift from the actual enforcement set as new modes are added.
+    mode_labels = ", ".join(label for label, _ in REQUIRED_FIXTURE_FAILURES)
     print(
         f"{C_GREEN}owned-identity-did self-test PASSED{C_RESET}: "
         f"fixture triggered {len(REQUIRED_FIXTURE_FAILURES)} distinct "
-        f"enforcement modes (derive, manual-impl Clone + From, "
-        f"public named field, public tuple field, type alias, "
-        f"wrong struct visibility, allowlist: second mint `issue_again`, "
-        f"alternately-named mint `forge`, wrong mint visibility, "
-        f"non-allowlisted assoc fn `dup`, aliased-return forgery "
-        f"`forge_aliased`, `impl Sized`-return forgery `forge2`, "
-        f"`DidId`-param mint `mint_didid`, `type` alias OF the cap type, "
-        f"custom-trait mint `forge`/`Forger`, macro-hidden mint, "
-        f"declaring-file macro category ban, metavariable impl-synthesizer "
-        f"macro, alias-return trait mint via raw-DID param, "
-        f"`#[path]` escape, wrong location, cfg_attr conditional derive)."
+        f"enforcement modes ({mode_labels})."
     )
     return 0
 
@@ -2163,13 +2729,22 @@ def main() -> int:
     if args.self_test:
         return do_self_test()
 
-    decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits = find_declarations()
+    (
+        decls,
+        impls,
+        ctor_fns,
+        cap_aliases,
+        trait_fns,
+        macro_hits,
+        construction_hits,
+    ) = find_declarations()
     if (
         not decls
         and not impls
         and not cap_aliases
         and not trait_fns
         and not macro_hits
+        and not construction_hits
     ):
         # Type does not yet exist AND nothing references it — this is the
         # pre-commit-5 state. (A macro touching the cap type or a trait impl
@@ -2189,6 +2764,7 @@ def main() -> int:
         cap_aliases,
         trait_fns,
         macro_hits,
+        construction_hits,
         REQUIRED_PATH,
         stream=sys.stderr,
     )
