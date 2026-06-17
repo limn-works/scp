@@ -381,7 +381,7 @@ pub fn verify_compact_proof(proof: &CompactProof) -> bool {
 /// structural-evolution events are structural; high-frequency operational
 /// records are operational.
 ///
-/// Classification note (pending cryptographer confirmation):
+/// Classification note:
 /// [`EventType::ContentKeysRotated`] and [`EventType::RecoveryEpochAdvanced`]
 /// are classified **structural** here. The existing related
 /// [`EventType::KeyEpochAdvance`] (ADR-007 sender-key epoch rotation) is
@@ -389,8 +389,7 @@ pub fn verify_compact_proof(proof: &CompactProof) -> bool {
 /// `ContentKeysRotated`/`RecoveryEpochAdvanced` record content-key rotation and
 /// a trust-recovery MLS group-epoch advance, which are structural-evolution /
 /// accountability events, whereas `KeyEpochAdvance` is a higher-frequency
-/// sender-key rotation record. This split is pending cryptographer
-/// confirmation.
+/// sender-key rotation record.
 #[must_use]
 pub const fn is_structural_event(event_type: &EventType) -> bool {
     // Two arms (one `true`, one `false`) with inline comment groupings, kept as

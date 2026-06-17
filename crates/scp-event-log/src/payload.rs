@@ -79,7 +79,7 @@ pub fn decode_payload<T: for<'de> Deserialize<'de>>(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextTombstonedPayload {
     /// The context the migration tombstone points to.
-    pub destination_context_id: String,
+    pub destination_id: String,
     /// The migration proposal that authorized the tombstone.
     pub migration_proposal_id: [u8; 32],
 }
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn context_tombstoned_round_trip() {
         let p = ContextTombstonedPayload {
-            destination_context_id: "ctx-dest-1".to_owned(),
+            destination_id: "ctx-dest-1".to_owned(),
             migration_proposal_id: [7u8; 32],
         };
         let encoded = encode_payload(&p).unwrap();

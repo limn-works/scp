@@ -408,7 +408,7 @@ fn kat_events() -> Vec<Event> {
             EventType::ContextTombstoned,
             1_700_000_004,
             enc(&payload::ContextTombstonedPayload {
-                destination_context_id: "ctx-dest".to_owned(),
+                destination_id: "ctx-dest".to_owned(),
                 migration_proposal_id: [0xCDu8; 32],
             }),
         ),

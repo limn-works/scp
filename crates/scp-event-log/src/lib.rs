@@ -289,7 +289,7 @@ pub enum EventType {
     /// A context was tombstoned at the terminal stage of migration
     /// (§5.11A.5; `actor_did = "system"`).
     ///
-    /// Payload (positional `MessagePack`): `destination_context_id: String`,
+    /// Payload (positional `MessagePack`): `destination_id: String`,
     /// `migration_proposal_id: [u8; 32]`. See [`crate::payload`].
     ContextTombstoned,
     /// A context migration was cancelled (§5.11A; pairs with
