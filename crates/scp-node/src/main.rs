@@ -570,14 +570,11 @@ fn self_host_banner(port: u16, plaintext: bool, publishes_dht: bool) -> String {
          \x20    Set SCP_NODE_SELF_HOST_PLAINTEXT=1 to serve plain HTTP instead."
     };
     let dht_line = if publishes_dht {
-        "  * Your host's PUBLIC IP will be published to the global Mainline DHT, bound to
-\
+        "  * Your host's PUBLIC IP will be published to the global Mainline DHT, bound to\n\
          \x20    this node's DID. This is an IP<->identity disclosure (approximate-location dox)."
     } else {
-        "  * DHT publishing is OFF (SCP_NODE_DHT_MODE=memory): your host's address is NOT
-\
-         \x20    published to the Mainline DHT. The node is reachable on the opened port but is
-\
+        "  * DHT publishing is OFF (SCP_NODE_DHT_MODE=memory): your host's address is NOT\n\
+         \x20    published to the Mainline DHT. The node is reachable on the opened port but is\n\
          \x20    NOT DHT-discoverable -- share its address out-of-band."
     };
     format!(
