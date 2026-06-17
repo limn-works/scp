@@ -70,28 +70,6 @@ fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
     format!("did:key:{hex}").into()
 }
 
-/// Computes the canonical hash for signing an event.
-///
-/// This mirrors the production `tree::compute_event_canonical_hash` exactly.
-/// Integration tests (`tests/`) cannot access `pub(crate)` items, so this
-/// copy is necessary. See issue #79 for context.
-fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EVENT-V1:");
-    #[allow(clippy::cast_possible_truncation)]
-    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
-        hasher.update((bytes.len() as u32).to_be_bytes());
-        hasher.update(bytes);
-    };
-    hasher.update(tree::event_type_tag(&event.event_type).to_be_bytes());
-    length_prefix(&mut hasher, event.actor_did.as_bytes());
-    hasher.update(event.timestamp.to_be_bytes());
-    hasher.update(event.sequence.to_be_bytes());
-    length_prefix(&mut hasher, &event.payload.data);
-    hasher.update(event.prev_hash);
-    hasher.finalize().to_vec()
-}
-
 /// Signs an event and returns it with the signature populated.
 fn sign_event(
     event_type: EventType,
@@ -111,7 +89,7 @@ fn sign_event(
         prev_hash,
         signature: Vec::new(),
     };
-    let canonical_hash = compute_event_canonical_hash(&event);
+    let canonical_hash = tree::compute_event_canonical_hash(&event);
     let signature = signing_key.sign(&canonical_hash);
     event.signature = signature.to_bytes().to_vec();
     event
