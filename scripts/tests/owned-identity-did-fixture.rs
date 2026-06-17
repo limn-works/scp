@@ -1860,6 +1860,144 @@ fn body_local_did_alias_ok(owning_did: DID) -> DID {
     _local
 }
 
+// BYPASS FIX-1-TRAIT (TRAIT-IMPL `build_actor_deps` — parallel-path asymmetry) —
+// a TRAIT impl `impl BuildTrait for Supervisor { fn build_actor_deps(&self,
+// owning_did: &DID) -> OwnedIdentityDid { …issue_for_actor(owning_did.clone()) } }`
+// planted in the build-site file. Pre-fix the mint-call exemption checked the
+// enclosing impl's type-tail == `Supervisor` but did NOT check the impl was
+// INHERENT, so this trait-impl mint string-tail-matched `Supervisor`, passed the
+// file pin + name + single-`&DID`-param + bare-`owning_did` checks, and was
+// WRONGLY EXEMPT (verified exempt=True pre-fix) — yet `build_actor_deps` here is
+// an arbitrary insider-defined TRAIT method whose contract the gate does NOT
+// control, not the canonical supervisor-supplied build path. The construction
+// path (`_construction_hit_reason`) already ANDs `_impl_is_inherent(impl_node)`;
+// fix 1 makes the mint-call exemption SYMMETRIC — `if not
+// _impl_is_inherent(impl_node): return False` after the type-tail check — so the
+// trait-impl mint is NOT exempt → rule K flags it. The real production
+// `build_actor_deps` lives in an INHERENT `impl Supervisor` (no `trait` field) →
+// stays exempt (K-NEG-1). The mint spelling
+// `trait_impl_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE to this fixture.
+trait BuildActorDepsTrait {
+    fn build_actor_deps(&self, owning_did: &DID) -> OwnedIdentityDid;
+}
+mod trait_impl_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl BuildActorDepsTrait for Supervisor {
+    #[allow(dead_code)]
+    fn build_actor_deps(&self, owning_did: &DID) -> OwnedIdentityDid {
+        trait_impl_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone())
+    }
+}
+
+// BYPASS FIX-2-CONST (ITEM-LEVEL VALUE-SHADOW — `const`) — the real
+// `Supervisor::build_actor_deps` declares a body-level `const owning_did: &DID =
+// &DID([0; 32]);` BEFORE the mint, then mints the bare (now const-shadowed)
+// `owning_did`. Pre-fix `_shadows_before` walked only `let`/assignment/pattern-
+// binders and MISSED item-level value-namespace bindings, so the bare
+// `owning_did` resolved to the attacker-controlled const and the mint was
+// WRONGLY EXEMPT (a compiling forgery; verified exempt=True pre-fix). Fix 2 treats
+// a `const_item` whose `name` == the owning param as a shadow → not exempt → rule
+// K flags the mint. The mint spelling
+// `const_shadow_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE to this
+// fixture.
+mod const_shadow_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: &DID) -> ActorDeps {
+        const owning_did: &DID = &DID([0; 32]);
+        let owned_identity =
+            const_shadow_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS FIX-2-STATIC (ITEM-LEVEL VALUE-SHADOW — `static`) — the `static` spelling
+// of the same item-level value-shadow: a body-level `static owning_did: DID =
+// DID([0; 32]);` before the mint shadows the owning param. Fix 2 treats a
+// `static_item` whose `name` == the owning param as a shadow → not exempt →
+// flagged. The mint spelling
+// `static_shadow_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE.
+mod static_shadow_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: &DID) -> ActorDeps {
+        static owning_did: DID = DID([0; 32]);
+        let owned_identity =
+            static_shadow_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS FIX-2-USE-ALIAS (ITEM-LEVEL VALUE-SHADOW — `use … as`) — the real
+// `Supervisor::build_actor_deps` imports a value-namespace item under the owning
+// param name via `use evil::thing as owning_did;` before the mint, shadowing the
+// param. Fix 2 treats a `use_declaration` whose `use_as_clause` alias == the
+// owning param (via `_use_tree_binds`) as a shadow → not exempt → flagged. The
+// mint spelling `use_alias_shadow_mint::OwnedIdentityDid::issue_for_actor` is
+// UNIQUE.
+mod evil {
+    pub(in crate::context) use super::DID as thing;
+}
+mod use_alias_shadow_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: &DID) -> ActorDeps {
+        use evil::thing as owning_did;
+        let owned_identity =
+            use_alias_shadow_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS FIX-2-NESTED-FN (ITEM-LEVEL VALUE-SHADOW — nested `fn`) — a nested
+// `fn owning_did() {}` declared before the mint shadows the owning param in the
+// VALUE namespace. Fix 2 treats a `function_item` whose `name` == the owning
+// param as a shadow → not exempt → flagged. The mint spelling
+// `nested_fn_shadow_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE.
+mod nested_fn_shadow_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: &DID) -> ActorDeps {
+        fn owning_did() {}
+        let owned_identity =
+            nested_fn_shadow_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS FIX-2-USE-LIST (ITEM-LEVEL VALUE-SHADOW — `use_list` member) — a
+// `use evil::{thing, owning_did};` whose LIST member tail is the owning param
+// name imports it under that name. Fix 2's `_use_tree_binds` recurses the
+// `scoped_use_list`/`use_list` and matches the member tail → shadow → not exempt
+// → flagged. The mint spelling
+// `use_list_shadow_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE.
+mod use_list_src {
+    pub(in crate::context) use super::DID as thing;
+    pub(in crate::context) use super::DID as owning_did;
+}
+mod use_list_shadow_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: &DID) -> ActorDeps {
+        use use_list_src::{owning_did, thing};
+        let _ = thing;
+        let owned_identity =
+            use_list_shadow_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
 // @file: context/supervisor/k02_static_sink.rs
 // BYPASS K02-SINK (KEYSTONE — `static`/`const` by-value sink) — a module-level
 // `static mut` holding the cap BY VALUE in an `Option<…>`. Pre-keystone a static

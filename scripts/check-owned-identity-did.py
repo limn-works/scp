@@ -356,6 +356,15 @@ The PRIMARY unforgeability boundary is the Rust TYPE SYSTEM, not this gate:
 These hold in ALL cases. This gate is MECHANICAL DEFENSE-IN-DEPTH over the
 SOURCE-TEXT surface, catching regressions in review before they compile.
 
+As a (fix 3) SELF-ASSERTION on that boundary, the REAL scan also verifies the
+two unsafe-prevention lints above are STILL PRESENT (structurally, via the AST:
+a real `#![forbid(unsafe_code)]` inner attribute in `lib.rs` and a real
+`#![deny(unsafe_code)]` inner attribute in `supervisor/mod.rs` — a doc comment
+that merely mentions the lint text does NOT satisfy it). If either lint is
+removed, the type system's unsafe-forge boundary is gone and an `unsafe`
+forge path the AST scan cannot see would reopen, so the gate FAILS. This runs
+only in the real scan, not the synthetic per-fixture self-test.
+
 COVERS (source-text surface, via tree-sitter AST):
   - inherent fns (closed allowlist: issue_for_actor / reissue / as_did)
   - struct-literal constructions of the cap in the declaring file
@@ -1386,14 +1395,82 @@ def _param_binding_name(param_node, source: bytes) -> str | None:
     return None
 
 
+def _use_tree_binds(use_arg, name: str, source: bytes) -> bool:
+    """True if a `use_declaration`'s `argument` subtree imports a
+    VALUE-NAMESPACE item under the local binding `name`. The local name a use
+    tree introduces is the TAIL of each leaf path / the `as` alias:
+
+      - `identifier`        (`use name;`)               -> the identifier itself
+      - `scoped_identifier` (`use a::b::name;`)         -> its `name` field (tail)
+      - `use_as_clause`     (`use a::b as name;`)       -> its `alias` field
+      - `scoped_use_list` / `use_list`
+            (`use a::{x, name, y as name};`)            -> recurse each member
+      - `use_wildcard`      (`use a::*;`)               -> binds NO fixed name
+        (a glob CANNOT be statically known to bind `name`; conservatively it is
+        NOT treated as a definite rebind here — the let/assignment/pattern and
+        explicit-item forms already cover every DEFINITE rebind, and a glob that
+        happens to re-export `name` is not a construct an insider can use to
+        deterministically point the bare mint arg at attacker data, since the
+        glob's contents are external)
+
+    Field/node names confirmed empirically against the loaded tree-sitter-rust
+    grammar. Recurses `scoped_use_list`/`use_list` so a single nested member
+    (`use a::{b, owning_did}` or `use a::{b as owning_did}`) is caught.
+    """
+    if use_arg is None:
+        return False
+    t = use_arg.type
+    if t == "identifier":
+        return node_text(use_arg, source) == name
+    if t == "scoped_identifier":
+        tail = use_arg.child_by_field_name("name")
+        return tail is not None and node_text(tail, source) == name
+    if t == "use_as_clause":
+        alias = use_arg.child_by_field_name("alias")
+        return alias is not None and node_text(alias, source) == name
+    if t in ("scoped_use_list", "use_list"):
+        # `scoped_use_list` wraps a `use_list`; `use_list` holds the members.
+        # Recurse every child member (members are themselves `identifier` /
+        # `scoped_identifier` / `use_as_clause` / nested lists).
+        for child in use_arg.children:
+            if child.type in (
+                "identifier",
+                "scoped_identifier",
+                "use_as_clause",
+                "scoped_use_list",
+                "use_list",
+            ) and _use_tree_binds(child, name, source):
+                return True
+        return False
+    return False
+
+
 def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool:
     """True if, anywhere inside `fn_node`'s body, the identifier `name` is
     RE-BOUND in a way that defeats name-matching of the bare mint argument — by
     a `let` declaration whose pattern binds `name`, an assignment whose
-    left-hand side is the bare identifier `name`, OR a NON-`let` PATTERN BINDER
+    left-hand side is the bare identifier `name`, a NON-`let` PATTERN BINDER
     (`match` arm, `if let`/`while let`/`let else` condition, `for` loop, closure
-    parameter) whose pattern binds `name` and which ENCLOSES or LEXICALLY
+    parameter) whose pattern binds `name`, OR an ITEM-LEVEL VALUE-NAMESPACE
+    binding introduced inside the fn body — a `const`/`static` item named
+    `name`, a NESTED `fn` named `name`, or a `use` declaration that imports a
+    value-namespace item under `name` (`use … as name`, a `use_list` member
+    whose tail is `name`, or `use …::name`) — and which ENCLOSES or LEXICALLY
     PRECEDES the mint.
+
+    The let/assignment/pattern-binder forms cover EXPRESSION-position rebinds.
+    The const/static/nested-fn/use forms cover ITEM-position rebinds: Rust
+    allows items (`const`, `static`, `fn`, `use`) as statements inside a fn
+    body, and each introduces a VALUE-NAMESPACE name visible to the rest of the
+    body. A `const owning_did: &DID = &DID(String::new());` placed before the
+    mint makes the bare `owning_did` at `issue_for_actor(owning_did.clone())`
+    resolve to the attacker-controlled const, NOT the caller-supplied parameter.
+    The same is true for a `static owning_did`, a nested `fn owning_did`, or a
+    `use evil::thing as owning_did;` — every value-namespace fn-body construct
+    that can bind the owning param name. Together with the let/assignment/
+    pattern-binder forms above, these are the COMPLETE set of fn-body constructs
+    that introduce a value-namespace binding under a given name; any of them,
+    positioned before the mint, dissolves the exemption.
 
     A shadow/rebind defeats name-matching: `let owning_did = make_evil();`
     before the mint makes the bare argument `owning_did` resolve to an
@@ -1509,6 +1586,30 @@ def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool
             elif n.type in _PATTERN_BINDER_FIELDS:
                 pat = n.child_by_field_name(_PATTERN_BINDER_FIELDS[n.type])
                 if pat is not None and _pattern_binds(pat):
+                    found = True
+                    return
+            elif n.type in ("const_item", "static_item", "function_item"):
+                # ITEM-LEVEL value-namespace binding inside the fn body:
+                # `const owning_did …`, `static owning_did …`, or a NESTED
+                # `fn owning_did(…)`. Each carries a `name` field (an
+                # `identifier`); a match shadows the owning param in the value
+                # namespace for the rest of the body. (A nested `function_item`
+                # is also walked into below, so an inner fn that itself contains
+                # the mint is still scanned — but the mint inside the exempt
+                # `build_actor_deps` lives in THIS fn's body, and an intervening
+                # nested fn is independently blocked by the escapable-scope
+                # guard; here we only treat the nested fn's NAME as a shadow of
+                # the owning param.)
+                nm = n.child_by_field_name("name")
+                if nm is not None and node_text(nm, source) == name:
+                    found = True
+                    return
+            elif n.type == "use_declaration":
+                # A `use` item imports a value-namespace name into the body:
+                # `use evil::thing as owning_did;`, `use evil::{a, owning_did};`,
+                # or `use evil::owning_did;`. Any of these makes the bare
+                # `owning_did` at the mint resolve to the imported item.
+                if _use_tree_binds(n.child_by_field_name("argument"), name, source):
                     found = True
                     return
         for c in n.children:
@@ -1780,6 +1881,23 @@ def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
         != SUPERVISOR_IMPL_TYPE
     ):
         return False
+    # (fix 1) INHERENT-IMPL BAN — PARALLEL-PATH SYMMETRY with the construction
+    # path. The construction path (`_construction_hit_reason`) ANDs
+    # `_impl_is_inherent(impl_node)` into `in_allowlisted`, so a `fn reissue`
+    # smuggled into a TRAIT impl on the cap is NOT an allowlisted construction
+    # site. The mint-call exemption is the PARALLEL trust decision and MUST make
+    # the same check: without it, a TRAIT impl `impl SomeTrait for Supervisor {
+    # fn build_actor_deps(&self, d: &DID) -> OwnedIdentityDid {
+    # OwnedIdentityDid::issue_for_actor(d.clone()) } }` planted in supervisor.rs
+    # passes the type-tail check (target type tail == `Supervisor`) and every
+    # other guard, yet its `build_actor_deps` is an arbitrary insider-defined
+    # trait method whose contract the gate does NOT control — it is NOT the
+    # canonical supervisor-supplied build path. The real production
+    # `build_actor_deps` lives in `impl Supervisor { … }` (INHERENT, no `trait`
+    # field) → `_impl_is_inherent` is True → stays exempt. Strictly ADDITIVE: it
+    # can only make the exemption MORE restrictive.
+    if not _impl_is_inherent(impl_node):
+        return False
     # (fix 2) NESTED-MOD-SHADOW BAN. A `mod evil { struct Supervisor; impl
     # Supervisor { fn build_actor_deps(…) { …issue_for_actor… } } }` planted in
     # supervisor.rs string-tail-matches `Supervisor` and passes the file pin —
@@ -1945,6 +2063,109 @@ def _impl_is_inherent(impl_node) -> bool:
         impl_node is not None
         and impl_node.child_by_field_name("trait") is None
     )
+
+
+def _file_has_inner_unsafe_lint(path: Path, lint_kind: str) -> bool:
+    """True if `path` contains a CRATE/MODULE-level inner attribute
+    `#![<lint_kind>(unsafe_code)]` (`lint_kind` is `forbid` or `deny`).
+
+    This is the (fix 3) DEFENSE-IN-DEPTH self-assertion: the gate's docstring
+    names `#![forbid(unsafe_code)]` (crate `lib.rs`) and `#![deny(unsafe_code)]`
+    (`supervisor/mod.rs`) as the TYPE-SYSTEM invariant that blocks a
+    `transmute`/unsafe-`Send` forgery of the capability token. The AST gate
+    covers only the SAFE source-text surface; if the unsafe-prevention lint is
+    silently removed, that primary boundary is gone and an `unsafe` forge path
+    reopens with NO source-text trace the AST scan can see. So the gate verifies
+    the lint is still present.
+
+    MATCHED STRUCTURALLY via tree-sitter (NOT a substring scan): an
+    `inner_attribute_item` (`#![ … ]`) whose `attribute` identifier is
+    `<lint_kind>` and whose `token_tree` mentions `unsafe_code`. A DOC COMMENT
+    that merely TEXTUALLY contains `#![deny(unsafe_code)]` (as `mod.rs`'s own
+    explanatory header does) parses as a `line_comment`/`doc_comment`, NOT an
+    `inner_attribute_item`, so it is correctly NOT counted — only a REAL inner
+    attribute satisfies the check.
+    """
+    try:
+        source = path.read_bytes()
+    except OSError:
+        return False
+    root = PARSER.parse(source).root_node
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "inner_attribute_item":
+            # The `attribute` node is a POSITIONAL child of
+            # `inner_attribute_item` in the loaded grammar (NOT exposed via a
+            # `child_by_field_name("attribute")` field — that returns None), so
+            # locate it by TYPE among the children.
+            attr = next((c for c in n.children if c.type == "attribute"), None)
+            if attr is not None:
+                ident = None
+                tok = None
+                for c in attr.children:
+                    if c.type == "identifier" and ident is None:
+                        ident = node_text(c, source)
+                    elif c.type == "token_tree":
+                        tok = c
+                if (
+                    ident == lint_kind
+                    and tok is not None
+                    and any(
+                        tc.type == "identifier"
+                        and node_text(tc, source) == "unsafe_code"
+                        for tc in tok.children
+                    )
+                ):
+                    return True
+        stack.extend(n.children)
+    return False
+
+
+def _assert_unsafe_lints_present(stream) -> bool:
+    """REAL-SCAN-ONLY (fix 3) assertion that the unsafe-prevention lints the
+    gate's coverage boundary relies on are still present in production. Returns
+    True on FAILURE (a required lint is missing), False when both are present.
+
+    Checks exactly the two invariants the docstring cites:
+      - `crates/scp-runtime/src/lib.rs` carries `#![forbid(unsafe_code)]`
+      - `crates/scp-runtime/src/context/supervisor/mod.rs` carries
+        `#![deny(unsafe_code)]`
+
+    Run ONLY in the real scan (never in the synthetic per-fixture self-test,
+    whose temp trees have no real crate root). The primary boundary is the type
+    system; this is mechanical defense-in-depth over its unsafe-prevention.
+    """
+    fail = False
+    lib_rs = REPO_ROOT / "crates" / "scp-runtime" / "src" / "lib.rs"
+    mod_rs = (
+        REPO_ROOT
+        / "crates"
+        / "scp-runtime"
+        / "src"
+        / "context"
+        / "supervisor"
+        / "mod.rs"
+    )
+    if not _file_has_inner_unsafe_lint(lib_rs, "forbid"):
+        stream.write(
+            f"{C_RED}[unsafe-lint]{C_RESET} "
+            f"crates/scp-runtime/src/lib.rs is MISSING "
+            f"`#![forbid(unsafe_code)]` — the type-system's primary "
+            f"unsafe-prevention boundary (a `transmute`/unsafe-`Send` forge of "
+            f"the capability token) has been removed; this AST gate cannot see "
+            f"an `unsafe` forge path.\n"
+        )
+        fail = True
+    if not _file_has_inner_unsafe_lint(mod_rs, "deny"):
+        stream.write(
+            f"{C_RED}[unsafe-lint]{C_RESET} "
+            f"crates/scp-runtime/src/context/supervisor/mod.rs is MISSING "
+            f"`#![deny(unsafe_code)]` — the supervisor module's reinforcing "
+            f"unsafe-prevention lint has been removed.\n"
+        )
+        fail = True
+    return fail
 
 
 def _nested_mod_ancestor(node):
@@ -5069,6 +5290,65 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
         "build_site_second_self_param",
         "'second_self_param_mint::OwnedIdentityDid::issue_for_actor'",
     ),
+    # FIX 1 (TRAIT-IMPL BAN — parallel-path asymmetry) — a TRAIT impl
+    # `impl BuildActorDepsTrait for Supervisor { fn build_actor_deps(&self,
+    # owning_did: &DID) -> OwnedIdentityDid { …issue_for_actor(owning_did.clone())
+    # } }` in the build-site file. Pre-fix the mint-call exemption checked the
+    # enclosing impl's type-tail == `Supervisor` but NOT that the impl was
+    # INHERENT, so this trait-impl mint was WRONGLY EXEMPT (verified exempt=True);
+    # the construction path already ANDed `_impl_is_inherent`. Fix 1 makes the
+    # mint-call exemption symmetric (`if not _impl_is_inherent(impl_node): return
+    # False`) → the trait-impl mint is NOT exempt → rule K flags it. The mint
+    # spelling `trait_impl_mint::…` is UNIQUE to this fixture.
+    (
+        "build_site_trait_impl",
+        "'trait_impl_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 2 (ITEM-LEVEL VALUE-SHADOW — `const`) — the real
+    # `Supervisor::build_actor_deps` declares `const owning_did: &DID = &DID([0;
+    # 32]);` before the mint. Pre-fix `_shadows_before` walked only
+    # `let`/assignment/pattern-binders and MISSED item-level value bindings, so
+    # the bare `owning_did` resolved to the attacker const and the mint was
+    # WRONGLY EXEMPT (compiling forgery; verified exempt=True). Fix 2 treats a
+    # `const_item` whose `name` == the owning param as a shadow → not exempt →
+    # flagged. Spelling `const_shadow_mint::…` is UNIQUE.
+    (
+        "build_site_const_shadow",
+        "'const_shadow_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 2 (ITEM-LEVEL VALUE-SHADOW — `static`) — the `static` spelling of the
+    # same shadow: `static owning_did: DID = DID([0; 32]);` before the mint. Fix 2
+    # treats a `static_item` whose `name` == the owning param as a shadow → not
+    # exempt → flagged. Spelling `static_shadow_mint::…` is UNIQUE.
+    (
+        "build_site_static_shadow",
+        "'static_shadow_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 2 (ITEM-LEVEL VALUE-SHADOW — `use … as`) — a `use evil::thing as
+    # owning_did;` before the mint imports a value-namespace item under the owning
+    # param name. Fix 2's `_use_tree_binds` matches the `use_as_clause` alias →
+    # shadow → not exempt → flagged. Spelling `use_alias_shadow_mint::…` is UNIQUE.
+    (
+        "build_site_use_alias_shadow",
+        "'use_alias_shadow_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 2 (ITEM-LEVEL VALUE-SHADOW — nested `fn`) — a nested `fn owning_did()
+    # {}` before the mint shadows the owning param in the value namespace. Fix 2
+    # treats a `function_item` whose `name` == the owning param as a shadow → not
+    # exempt → flagged. Spelling `nested_fn_shadow_mint::…` is UNIQUE.
+    (
+        "build_site_nested_fn_shadow",
+        "'nested_fn_shadow_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 2 (ITEM-LEVEL VALUE-SHADOW — `use_list` member) — a `use
+    # use_list_src::{owning_did, thing};` whose LIST member tail is the owning
+    # param name. Fix 2's `_use_tree_binds` recurses the `use_list` and matches
+    # the member tail → shadow → not exempt → flagged. Spelling
+    # `use_list_shadow_mint::…` is UNIQUE.
+    (
+        "build_site_use_list_shadow",
+        "'use_list_shadow_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
 ]
 
 # Negative-control fn / reference markers that MUST NEVER appear in the
@@ -5348,6 +5628,17 @@ def main() -> int:
         REQUIRED_PATH,
         stream=sys.stderr,
     )
+
+    # (fix 3) DEFENSE-IN-DEPTH: the gate's coverage boundary cites
+    # `#![forbid(unsafe_code)]` (lib.rs) + `#![deny(unsafe_code)]`
+    # (supervisor/mod.rs) as the TYPE-SYSTEM invariant that blocks an
+    # `unsafe`/`transmute` forge of the capability token — a path the AST scan
+    # of SAFE source text cannot see. Verify those lints are still present in
+    # the REAL crate (real scan only; the synthetic self-test has no crate
+    # root). A missing lint is a gate FAILURE. The gate is already ACTIVE here
+    # (the pre-commit-5 early return ran above), so the runtime crate exists.
+    if _assert_unsafe_lints_present(sys.stderr):
+        fail = True
 
     if fail:
         sys.stderr.write(
