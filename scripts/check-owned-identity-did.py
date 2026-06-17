@@ -169,6 +169,25 @@ If the `OwnedIdentityDid` type exists anywhere in `crates/scp-runtime/src/`:
       not in the return type), `as_did` returns `&DID` (a borrow), and the
       handle.rs test mints are `#[cfg(test)]`-gated.
 
+  (K) MINT-CALL CONTAINMENT (whole supervisor subtree). The CATEGORICAL
+      closer for rule (J): instead of recognizing the cap in the EVADABLE
+      return-type text — which type-level indirection (associated-type
+      projection `<T as Tr>::O`, opaque `-> impl Sized`, etc.) hides from a
+      syntactic match — rule K gates the dangerous OPERATION: a CALL to the
+      sole arbitrary-DID mint `issue_for_actor`. Every arbitrary-DID forgery
+      MUST call the mint (`reissue` only clones an already-held token), so
+      banning every code reference to `issue_for_actor` across the subtree
+      closes the projection/opaque return-disguise forgeries rule (J) cannot
+      see. Flags any `call_expression` / value-path / `use … as` reference to
+      `issue_for_actor` under `crates/scp-runtime/src/context/supervisor/`,
+      EXCEPT (a) the mint's own DEFINITION, (b) the ONE legitimate call inside
+      `Supervisor::build_actor_deps` — pinned to the real build-site FILE
+      (`supervisor.rs`) so a fake `impl Supervisor` planted in another subtree
+      file is NOT exempt — and (c) `#[cfg(test)]` code. Keys on AST identifier
+      nodes, so doc-comments / string literals are never matched. Production
+      PASSES: the only non-test, non-definition reference is the real
+      `Supervisor::build_actor_deps` call in `supervisor.rs`.
+
   (C) The declaration MUST NOT carry a `derive(...)` — plain
       `#[derive(...)]` OR conditional `#[cfg_attr(..., derive(...))]` —
       listing ANY of:
@@ -353,6 +372,10 @@ COVERS (source-text surface, via tree-sitter AST):
     (I — the in-file analogue of the `#[path]` include escape)
   - by-value cap returns anywhere under the supervisor subtree (J — a
     literal-free re-export of the `pub(super)` mint that H and G both miss)
+  - mint-call references anywhere under the supervisor subtree (K — the
+    categorical closer: any call / value-path / `use … as` reference to
+    `issue_for_actor` outside the build site, immune to the return-type
+    disguises — projection, opaque `impl Trait` — that rule J cannot see)
   - struct location, name-visibility, and field visibility (A / B / E)
 
 OUT OF REMIT (NOT this AST gate — covered by the type system + human review):
@@ -409,7 +432,12 @@ Exit codes:
          taking `&self`; reissue/as_did missing `&self` or taking a raw
          DID), with an absent mint, with a forbidden derive / manual impl
          / public field, or as a `type` alias (of OR named after the cap
-         type); OR --self-test did not catch all bypasses
+         type); with a cap construction or impl nested in an in-file
+         `mod` (I); with a by-value cap return anywhere in the supervisor
+         subtree (J); with a `use … as` alias of the cap or of the mint
+         fn; with a reference to the `issue_for_actor` mint anywhere in the
+         supervisor subtree outside `Supervisor::build_actor_deps` /
+         `#[cfg(test)]` (K); OR --self-test did not catch all bypasses
     2  — invocation error
 
 See ADR-049 for design context.
@@ -955,6 +983,13 @@ MINT_FN_NAME: str = "issue_for_actor"
 # targets `Supervisor`.
 BUILD_ACTOR_DEPS_FN: str = "build_actor_deps"
 SUPERVISOR_IMPL_TYPE: str = "Supervisor"
+# Rule K exemption (b) is additionally PINNED to the real build-site FILE, so a
+# forger cannot plant a local `struct Supervisor; impl Supervisor { fn
+# build_actor_deps(..) { ..issue_for_actor(..) } }` in ANOTHER subtree file and
+# inherit the exemption (which — combined with a projection/opaque return that
+# rule J cannot see — would otherwise re-open the mint surface). The real
+# `Supervisor::build_actor_deps` lives here and nowhere else.
+BUILD_SITE_REL: str = "crates/scp-runtime/src/context/supervisor/supervisor.rs"
 
 
 def _type_tail_identifier(type_node, source: bytes) -> str | None:
@@ -1083,10 +1118,17 @@ def _is_mint_reference(node, source: bytes) -> bool:
         (matching the scoped case would double-count, and a non-tail segment
         like the `a` in `a::issue_for_actor` is irrelevant anyway). We match the
         scoped node by its `name` field instead.
-      - a bare `identifier` inside a `use` path (`use … issue_for_actor …`) —
-        an import is governed by the `use … as` alias ban (`use_aliases`), not
-        the call-reference rule. The `use_as_clause` path-segment / `use_list`
-        membership is detected by walking ancestors for a `use_declaration`.
+      - a bare-segment `identifier` inside a `use_list` / `scoped_use_list`
+        (e.g. the `issue_for_actor` in `use a::b::{X, issue_for_actor}`) — a
+        bare list member is deferred to the `use … as` alias ban
+        (`use_aliases`); the membership is detected by walking ancestors for a
+        `use_declaration`. NOTE: a *qualified* plain import
+        (`use a::b::issue_for_actor;`) is NOT excluded — its path tail is a
+        `scoped_identifier` whose `name` is the mint, so the scoped-identifier
+        arm flags it as a reference (intended and correct: such an import
+        enables a later bare `issue_for_actor(d)` call, so banning the import
+        itself is strictly safer — and a non-aliased bare import has no
+        legitimate use in the subtree).
       - a `field_identifier` (`x.issue_for_actor`) — tree-sitter spells a
         method/field access tail as `field_identifier`, a DISTINCT node type
         from `identifier`, so it is never matched here. (Moot in practice: the
@@ -1120,18 +1162,24 @@ def _is_mint_reference(node, source: bytes) -> bool:
     return False
 
 
-def _mint_ref_exempt_build_actor_deps(node, source: bytes) -> bool:
+def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
     """True if a mint reference `node` is the ONE legitimate mint CALL site
-    (rule K exemption b): its nearest enclosing `function_item` is named
-    `build_actor_deps` AND that fn's enclosing `impl_item` targets `Supervisor`.
+    (rule K exemption b): it lives in the real build-site FILE
+    (`BUILD_SITE_REL`), AND its nearest enclosing `function_item` is named
+    `build_actor_deps`, AND that fn's enclosing `impl_item` targets `Supervisor`.
 
-    Structural, NOT name-text-on-the-line: a reference is exempt ONLY when it
-    lexically lives inside `Supervisor::build_actor_deps`'s body. A mint call in
-    any OTHER fn — even one a reviewer named `build_actor_deps` on a DIFFERENT
-    impl — is exempt ONLY if that impl's target type is literally `Supervisor`.
-    Verified against the real call at `supervisor.rs` (the `build_actor_deps`
-    method of `impl Supervisor`).
+    Structural AND file-pinned, NOT name-text-on-the-line: a reference is exempt
+    ONLY when it lexically lives inside `Supervisor::build_actor_deps`'s body in
+    `supervisor.rs`. A mint call in any OTHER fn — even one a reviewer named
+    `build_actor_deps` on a DIFFERENT impl, OR a real `impl Supervisor` planted
+    in a DIFFERENT subtree file — is NOT exempt. The file pin closes the
+    fake-`struct Supervisor`-in-another-file evasion (which, paired with a
+    projection/opaque return rule J cannot see, would otherwise re-open the
+    mint surface). Verified against the real call at `supervisor.rs` (the
+    `build_actor_deps` method of `impl Supervisor`).
     """
+    if rel != BUILD_SITE_REL:
+        return False
     fn_node = _nearest_enclosing(node, ("function_item",))
     if fn_node is None:
         return False
@@ -2506,7 +2554,7 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                     node, source
                 ):
                     if not (
-                        _mint_ref_exempt_build_actor_deps(node, source)
+                        _mint_ref_exempt_build_actor_deps(node, source, rel)
                         or _inside_cfg_test(node, source)
                         or _has_preceding_cfg_test(node, source)
                     ):

@@ -1111,18 +1111,20 @@ pub(in crate::context) fn forge4(d: Did) -> OwnedIdentityDid {
     MintRename(d)
 }
 
-// @file: context/supervisor/k_neg_build_actor_deps_ok.rs
+// @file: context/supervisor/supervisor.rs
 // NEGATIVE CONTROL K-NEG-1 (FIX — rule K exemption b) — the ONE legitimate mint
 // call site. A `build_actor_deps` method on `impl Supervisor` that calls
 // `issue_for_actor` MUST PASS: this mirrors the real
 // `Supervisor::build_actor_deps` (the actor-spawn mint site). Rule K exempts a
-// mint reference whose nearest enclosing `function_item` is named
-// `build_actor_deps` AND whose enclosing `impl_item` targets `Supervisor`. This
+// mint reference ONLY when it lives in the real build-site FILE
+// (`BUILD_SITE_REL` = `…/supervisor/supervisor.rs`, which this `@file:` block
+// deliberately targets) AND its nearest enclosing `function_item` is named
+// `build_actor_deps` AND its enclosing `impl_item` targets `Supervisor`. This
 // fn MUST NOT contribute any rule-K diagnostic; the out-of-band forbidden-
 // substring check (FORBIDDEN_FIXTURE_SUBSTRINGS) greps the self-test diagnostics
-// and FAILS if `build_actor_deps_mint_ok` ever appears — i.e. if the exemption
-// regressed. (Distinct from the cfg(test) exemptions: this is PRODUCTION code
-// that legitimately mints.)
+// and FAILS if `bsite_mint_ok::OwnedIdentityDid::issue_for_actor` ever appears —
+// i.e. if the exemption regressed. (Distinct from the cfg(test) exemptions: this
+// is PRODUCTION code that legitimately mints.)
 struct Did([u8; 32]);
 #[allow(dead_code)]
 pub(in crate::context) struct OwnedIdentityDid {
