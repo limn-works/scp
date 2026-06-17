@@ -27,8 +27,9 @@
 //! `actor/handlers/` receive `&OwnedIdentityDid` references through
 //! [`ActorDeps`](crate::context::actor::deps::ActorDeps) and can call
 //! these methods, but they cannot CONSTRUCT a token — so they cannot
-//! fabricate one for an identity they do not own. See plan
-//! §"`OwnedIdentityDid` capability tag".
+//! fabricate one for an identity they do not own. See ADR-049 §5
+//! (`OwnedIdentityDid`: unforgeable by constructor visibility + private
+//! field).
 
 use std::collections::HashSet;
 use std::sync::Arc;

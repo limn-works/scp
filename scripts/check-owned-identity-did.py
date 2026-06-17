@@ -916,6 +916,93 @@ def _nearest_enclosing(node, kinds: tuple[str, ...]):
     return None
 
 
+# Tree-sitter-rust node types that introduce an ESCAPABLE / DEFERRED-execution
+# scope: a body that can be MOVED out of its lexically-enclosing fn and invoked
+# later, elsewhere, with attacker-chosen arguments. A cap struct literal nested
+# inside one of these — even when the literal's NEAREST `function_item` ancestor
+# is an allowlisted constructor — is NOT a legitimate inline construction: the
+# scope can capture the module-private `did` field legally (Rust field privacy
+# is module-scoped) and hand a forging callable to handler code, so the
+# allowlisted fn's name is no longer the boundary on WHO mints.
+#
+# Determined EMPIRICALLY against the loaded grammar (do not trust this list as a
+# guess — it was confirmed by parsing each form and printing node types):
+#   `|x| …`        / `move |x| …`        -> `closure_expression`
+#   `async { … }`  / `async move { … }`  -> `async_block`
+#   `gen { … }`    / `gen move { … }`    -> `gen_block`   (present in grammar)
+#   a nested `fn inner(){ … }`           -> `function_item`
+# A plain `block`, `if_expression`, `match`/arm, `let_declaration`,
+# `call_expression`/`arguments`, `return_expression`, etc. are INLINE-executed
+# (run as part of the enclosing fn's single invocation) and are deliberately
+# NOT in this set — `Some(Self { did })` and `{ let t = Self { did }; t }` must
+# still PASS.
+#
+# Belt-and-suspenders: should a future grammar revision spell an async/gen body
+# as a plain `block` carrying an `async`/`gen` child TOKEN rather than a
+# distinct `async_block`/`gen_block` node, `_escapable_scope_between` ALSO
+# detects that shape, so the class stays closed even if the node name drifts.
+ESCAPABLE_SCOPE_TYPES: frozenset[str] = frozenset(
+    {
+        "closure_expression",
+        "async_block",
+        "gen_block",
+        # A nested `function_item` between the literal and the OUTER allowlisted
+        # fn is itself an escapable scope. (`_nearest_enclosing(..., function_item)`
+        # already stops at the nearest fn, so the inner fn usually becomes
+        # `fn_node` and fails the NAME check; this entry hardens the case where
+        # an inner fn is itself named `issue_for_actor`/`reissue` and nested
+        # inside the real one.)
+        "function_item",
+    }
+)
+
+# Block-introducing tokens that, if they appear as a direct child of a plain
+# `block` node between the literal and the enclosing fn, mark that block as a
+# deferred async/gen body (grammar-drift fallback for the case where the
+# grammar does NOT emit a distinct `async_block` / `gen_block` node).
+_DEFERRED_BLOCK_TOKENS: frozenset[str] = frozenset({"async", "gen"})
+
+
+def _escapable_scope_between(struct_expr_node, fn_node) -> str | None:
+    """Return the node-type name of the FIRST escapable / deferred-execution
+    scope found on the parent chain from `struct_expr_node` UP TO (but not
+    including) `fn_node`, or None if the path is all inline scopes.
+
+    `fn_node` is the literal's nearest enclosing `function_item` (the candidate
+    allowlisted constructor). Rule H is otherwise blind to a literal nested in a
+    `closure_expression` / `async_block` / `gen_block` / nested `function_item`
+    that sits between the literal and `fn_node`: a closure/async/gen body is a
+    distinct expression node, NOT a `function_item`, so the nearest-`function_item`
+    walk STEPS PAST it to the allowlisted fn and the construction PASSES — a real,
+    compiling, handler-reachable forgery (e.g. a `reissue` that returns
+    `Box<dyn Fn(DID) -> OwnedIdentityDid>` whose closure body forges any DID).
+    This closes the WHOLE escapable-scope class, not just the closure spelling.
+    """
+    # NOTE: identity is compared via the stable `.id` attribute, NOT Python
+    # `is`. tree-sitter-python returns a FRESH wrapper object on every `.parent`
+    # access, so `cur is not fn_node` is unreliable (two wrappers for the SAME
+    # underlying node compare unequal under `is`). Each node's `.id` is stable
+    # across accesses, so `cur.id != fn_node.id` is the correct stop condition;
+    # using `is` here false-FAILED the production `issue_for_actor`/`reissue`
+    # (their own enclosing `function_item` was re-wrapped, never matched `is
+    # fn_node`, and was then mis-flagged as an intervening escapable
+    # `function_item`).
+    fn_id = fn_node.id
+    cur = struct_expr_node.parent
+    while cur is not None and cur.id != fn_id:
+        if cur.type in ESCAPABLE_SCOPE_TYPES:
+            return cur.type
+        # Grammar-drift fallback: a plain `block` whose immediate children
+        # include an `async`/`gen` keyword token is a deferred body even if the
+        # grammar did not wrap it in a distinct `async_block`/`gen_block`.
+        if cur.type == "block":
+            for child in cur.children:
+                if child.type in _DEFERRED_BLOCK_TOKENS:
+                    return f"{child.type} {cur.type}"
+        cur = cur.parent
+    return None
+
+
 def _impl_targets_cap(impl_node, source: bytes) -> bool:
     """True if an `impl_item` node's target type (its `type` field) is the
     capability type — i.e. `impl … OwnedIdentityDid { … }` (inherent OR trait
@@ -1002,7 +1089,30 @@ def _construction_hit_reason(struct_expr_node, source: bytes) -> str | None:
             and _impl_is_inherent(impl_node)
         )
         if in_allowlisted:
-            return None
+            # The literal's nearest `function_item` is an allowlisted INHERENT
+            # constructor — but rule H must ALSO verify the literal is INLINE in
+            # that fn's body, not nested in an escapable / deferred-execution
+            # scope (closure / async block / gen block / nested fn) that sits
+            # between the literal and the allowlisted fn. Such a scope can be
+            # MOVED out and invoked later by handler code with an attacker-chosen
+            # DID, captures the module-private `did` field legally, and forges a
+            # token — defeating cross-identity isolation — while the
+            # nearest-`function_item` walk steps PAST it and would otherwise PASS.
+            escaped = _escapable_scope_between(struct_expr_node, fn_node)
+            if escaped is None:
+                return None
+            return (
+                f"`{label} {{ … }}` constructed inside a `{escaped}` nested "
+                f"within the allowlisted constructor `{fn_name}`; an escapable "
+                f"/ deferred-execution scope (closure / async block / gen block "
+                f"/ nested fn) can be moved out of `{fn_name}` and invoked later "
+                f"by handler code with an attacker-chosen DID — it captures the "
+                f"module-private `did` field legally (Rust field privacy is "
+                f"module-scoped) and forges a token, so the allowlisted fn name "
+                f"is no longer the boundary on WHO mints. The cap literal MUST be "
+                f"constructed INLINE in the body of `issue_for_actor`/`reissue`, "
+                f"never inside a closure / async / gen / nested-fn scope"
+            )
         return (
             f"`{label} {{ … }}` constructed in fn `{fn_name}` outside the "
             f"allowlisted constructors `issue_for_actor`/`reissue`; a free fn "
@@ -2093,7 +2203,7 @@ def _enforce(
     #     text is the alias), but `_takes_raw_did` catches it independently of
     #     the F.2 alias backstop. Skipped only for the (currently EMPTY)
     #     SAFE_CONSTRUCTING_TRAITS allowlist.
-    for rel, fn_line, fn_name, _vis, params, ret_ty, t_name in trait_fns:
+    for rel, fn_line, fn_name, _, params, ret_ty, t_name in trait_fns:
         if t_name in SAFE_CONSTRUCTING_TRAITS:
             continue
         if _returns_self(ret_ty) or _takes_raw_did(params):
@@ -2589,6 +2699,42 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     # and H2 also carry the shared phrase `constructed in fn` / `outside the
     # allowlisted constructors`, but the fn name disambiguates them.
     ("helper_method_construction", "in fn `mint_via_helper`"),
+    # FIX-1 (escapable-scope class) — CLOSURE INSIDE THE MINT. The cap literal
+    # is built inside a `closure_expression` whose nearest enclosing
+    # `function_item` is the EXACTLY-correct allowlisted `issue_for_actor` (so
+    # rule G passes it and `in_allowlisted` is True — isolating the new
+    # escapable-scope arm from the name arm). Pre-fix, the nearest-`function_item`
+    # walk stepped PAST the closure to the allowlisted fn and the literal PASSED;
+    # the closure captures the module-private field legally and can be moved out
+    # and invoked later by handler code with an attacker-chosen DID. Rule H now
+    # detects the intervening `closure_expression` and HARD FAILs. The substring
+    # pins BOTH the escapable node type AND the enclosing-fn name so it can ONLY
+    # be produced by the closure-in-`issue_for_actor` case.
+    (
+        "closure_in_mint",
+        "`closure_expression` nested within the allowlisted constructor `issue_for_actor`",
+    ),
+    # FIX-1 (escapable-scope class) — REISSUE CLOSURE FACTORY (the finding's real
+    # shape). `reissue` returns `Box<dyn Fn(Did) -> OwnedIdentityDid>`; the cap
+    # literal lives in the returned closure. Rule G passes the outer `reissue`
+    # (it does not constrain reissue's return type), so `in_allowlisted` is True;
+    # rule H catches the intervening `closure_expression`. The `reissue`
+    # enclosing-fn name disambiguates this from the mint case above.
+    (
+        "reissue_closure_factory",
+        "`closure_expression` nested within the allowlisted constructor `reissue`",
+    ),
+    # FIX-1 (escapable-scope class) — ASYNC BLOCK IN CONSTRUCTOR. The cap literal
+    # is built inside an `async { … }` block (an `async_block` node, NOT a
+    # `function_item`) inside an allowlisted `reissue`. The future can be returned
+    # / spawned and polled later — a deferred-execution forgery in the same class
+    # as the closure case. Pre-fix the nearest-`function_item` walk stepped past
+    # the `async_block`; rule H now detects it. The `async_block` node type
+    # disambiguates this from the closure cases.
+    (
+        "async_block_in_constructor",
+        "`async_block` nested within the allowlisted constructor `reissue`",
+    ),
 ]
 
 

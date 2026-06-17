@@ -235,6 +235,68 @@ impl TokenForger {
     }
 }
 
+// BYPASS H3 (FIX-1 escapable-scope class) — CLOSURE-INSIDE-MINT. The cap
+// literal is constructed inside a CLOSURE whose nearest enclosing
+// `function_item` is the allowlisted inherent `issue_for_actor`. The fn's OUTER
+// shape is the EXACTLY-CORRECT mint (`pub(super)`, raw-`Did` param, returns
+// `Self`), so rule G PASSES it and `in_allowlisted` is True — isolating the new
+// escapable-scope arm. Rule H walks from the literal to its nearest
+// `function_item` and — before this fix — stepped PAST the `closure_expression`
+// (a distinct expression node, NOT a `function_item`) to land on the allowlisted
+// `issue_for_actor`, so the construction PASSED. But the closure captures the
+// module-private `inner`/`did` field legally (Rust field privacy is
+// module-scoped) and can be RETURNED / stored and invoked LATER by handler code
+// with an attacker-chosen DID — forging a token and defeating cross-identity
+// isolation. The enclosing fn name is no longer the boundary on WHO mints. Rule
+// H now HARD FAILs when an escapable scope (here `closure_expression`) sits
+// between the literal and the allowlisted fn. Diagnostic substring `inside a
+// `closure_expression`` is unique to this closure-in-constructor case.
+#[allow(dead_code)]
+impl OwnedIdentityDid {
+    pub(super) fn issue_for_actor(_d: &Did) -> Self {
+        let mint = |inner| Self { inner };
+        mint([0; 32])
+    }
+}
+
+// BYPASS H4 (FIX-1 escapable-scope class) — REISSUE CLOSURE FACTORY. The real
+// forgery shape from the finding: `reissue` returns a `Box<dyn Fn(Did) ->
+// OwnedIdentityDid>` whose closure body constructs the cap from an
+// attacker-supplied DID. The fn's OUTER shape is a CORRECT `reissue` (`&self`,
+// no raw-`DID` param, `pub(in crate::context)`), so rule G PASSES it (rule G
+// does not constrain `reissue`'s return type) and `in_allowlisted` is True. The
+// struct literal sits inside a `closure_expression` inside a `Box::new(...)`
+// call inside the allowlisted `reissue`; the nearest-`function_item` walk steps
+// past the closure to `reissue` and (pre-fix) PASSED — handing handler code a
+// callable that mints a token for ANY DID. Rule H now detects the intervening
+// `closure_expression` and HARD FAILs. The diagnostic carries `within the
+// allowlisted constructor `reissue`` which is unique to this reissue-factory
+// case.
+#[allow(dead_code)]
+impl OwnedIdentityDid {
+    pub(in crate::context) fn reissue(&self) -> Box<dyn Fn(Did) -> OwnedIdentityDid> {
+        Box::new(|_d: Did| OwnedIdentityDid { inner: [0; 32] })
+    }
+}
+
+// BYPASS H5 (FIX-1 escapable-scope class) — ASYNC BLOCK IN CONSTRUCTOR. The cap
+// literal is constructed inside an `async { … }` block whose nearest enclosing
+// `function_item` is the allowlisted inherent `reissue` (correct `&self` /
+// no-raw-DID / `pub(in crate::context)` shape, so rule G PASSES it and
+// `in_allowlisted` is True). An async block is an `async_block` node, NOT a
+// `function_item`, so the nearest-`function_item` walk stepped PAST it (pre-fix)
+// and the construction PASSED. The async future can be RETURNED / spawned and
+// polled later by handler code — a deferred-execution forgery in the same class
+// as the closure case. Rule H now detects the intervening `async_block` and HARD
+// FAILs. The diagnostic substring `inside a `async_block`` is unique to this
+// async-block-in-constructor case.
+#[allow(dead_code)]
+impl OwnedIdentityDid {
+    pub(in crate::context) fn reissue(&self) -> impl core::future::Future<Output = Self> {
+        async { Self { inner: [0; 32] } }
+    }
+}
+
 // @file: context/actor/forge_metavar_macro.rs
 // FIX-1 (BLACK-G05) — METAVARIABLE MACRO MINT in a NON-declaring file. The
 // macro DEFINITION synthesizes `impl $t { … }` on a passed-in type
