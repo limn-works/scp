@@ -121,6 +121,7 @@ check-call-invariants.py, call-invariants-baseline.json,
 check-pure-helpers.sh, pure-helpers-allowlist.txt,
 bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 pretooluse-enforcement-files.sh,
+check-owned-identity-did.py,
 CLAUDE.md (enforcement sections).
 If a check fails, fix the code. The only legitimate modifications are:
 - Adding NEW assertions/operations (expanding coverage)
@@ -185,6 +186,8 @@ Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (ag
 **Reviews are not rubber stamps.** Read every finding. If a reviewer flags something, understand the concern fully before dismissing it. Assume reviewers are right until you can prove otherwise with evidence from specs or code. Act on review feedback — don't acknowledge and move on. When a review surfaces a real issue, fix it and update the relevant artifacts.
 
 **Take every finding seriously.** Only dismiss things that are categorically, objectively false or truly non-issues. Even slight suggestions — defense in depth, cleanup, clarity, incorrect comments, spec gaps, learnings — if there's any merit to them at all, whether in literal content or in spirit, take them seriously and use them to improve the code. Don't dismiss things because they seem out of scope, are nits, or appear generally not actionable. Only dismiss things that are absolutely not actionable because they are wrong.
+
+**Guard against over-engineering and non-convergent enforcement.** Mechanical checks (gates, validators, linters) are defense-in-depth, not the primary guarantee. Before adding or growing one, confirm: (a) it is *sound and bounded* — closed by construction (a positive whitelist of permitted shapes), not an ever-expanding denylist chasing "one more spelling"; (b) it does not redundantly re-check, in weaker source-text/AST/runtime form, a property the type system or another compile-time/cryptographic mechanism already enforces soundly — such redundancy is negative value, not defense-in-depth; (c) its cost (lines, complexity, review cycles) is proportionate to its marginal benefit. **Review-pass count is a convergence signal:** if more than ~3 review passes on one artifact keep surfacing "a new spelling of the same bypass," the *approach* is non-convergent — stop and reframe, do not grind. The @"simplifier (agent)" is charged with flagging this class as a BLOCKER; take it as seriously as a correctness finding. See `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md`.
 
 ### Orchestration protocol (MANDATORY)
 
