@@ -67,8 +67,14 @@ COMPLETE CHECK SET (definition shape only), scanning identity_capability.rs:
       `Self`/`OwnedIdentityDid`; `as_did` is `pub(in crate::context)`, params
       EXACTLY `&self`, returns `&DID`. Each method's attributes must be inert
       built-ins (`allow` / `must_use` / `cfg` / `inline` / `doc`).
-  A4. No construction outside the allowlisted method bodies (belt-and-braces
-      on top of A1's ban on free fns / aliases).
+  A4. No construction outside the allowlisted method bodies — LOCATION-BASED
+      and NAME-AGNOSTIC: ANY `struct_expression` whose lexical position is
+      neither inside one of the three allowlisted method bodies NOR inside the
+      non-production `#[cfg(test)] mod tests` is rejected, regardless of the
+      constructed type's name. The literal's type name is never matched, so an
+      alias-named literal (`Aka {..}` after `use OwnedIdentityDid as Aka;`) is
+      caught by LOCATION. Belt-and-braces on top of A1's ban on free fns /
+      aliases (which already makes a stray literal's enclosing item moot).
   A5. `deny(unsafe_code)` / `forbid(unsafe_code)` present in `supervisor/mod.rs`
       via REAL inner-attribute parse — a commented-out or string occurrence
       does NOT satisfy it; extra lints (`deny(unsafe_code, missing_docs)`) DO.
@@ -291,11 +297,13 @@ def _attr_path_is_bare(attr: Node) -> tuple[bool, str]:
     """
     for c in attr.children:
         if c.type == "identifier":
-            return True, c.text.decode("utf-8", "replace")
+            return True, (c.text or b"").decode("utf-8", "replace")
         if c.type in ("scoped_identifier", "scoped_type_identifier"):
-            return False, c.text.decode("utf-8", "replace")
+            return False, (c.text or b"").decode("utf-8", "replace")
     # Unknown / unexpected meta shape — treat as not-bare (reject).
-    return False, "".join(ch.text.decode("utf-8", "replace") for ch in attr.children)
+    return False, "".join(
+        (ch.text or b"").decode("utf-8", "replace") for ch in attr.children
+    )
 
 
 def _attr_token_tree(attr: Node) -> Node | None:
@@ -315,7 +323,9 @@ def _attr_args(attr: Node) -> list[str]:
     if tt is None:
         return []
     return [
-        c.text.decode("utf-8", "replace") for c in tt.children if c.type == "identifier"
+        (c.text or b"").decode("utf-8", "replace")
+        for c in tt.children
+        if c.type == "identifier"
     ]
 
 
@@ -421,7 +431,7 @@ _IGNORED_MODULE_KINDS = frozenset(
 )
 
 
-def _mod_has_cfg_test(mod: Node, src: bytes) -> bool:
+def _mod_has_cfg_test(mod: Node) -> bool:
     for attr_item in _preceding_attr_items(mod):
         attr = _attr_node(attr_item)
         if attr is None:
@@ -487,7 +497,7 @@ def _enforce(cap_src_path: Path, mod_src_path: Path) -> list[str]:
                     f"module-level `mod {name}` is not permitted — the only "
                     f"`mod` may be `tests` (and it must carry `#[cfg(test)]`)"
                 )
-            elif not _mod_has_cfg_test(item, src):
+            elif not _mod_has_cfg_test(item):
                 failures.append(
                     "`mod tests` is present but does NOT carry `#[cfg(test)]`; "
                     "only a cfg(test) test module is permitted"
@@ -665,9 +675,18 @@ def _enforce(cap_src_path: Path, mod_src_path: Path) -> list[str]:
         )
 
     # === A4: no construction outside the three allowlisted method bodies ===
-    # (Largely subsumed by A1 banning free fns / aliases; kept as a belt. The
-    # cfg(test) `mod tests` is non-production and may CALL issue_for_actor — but
-    # struct-LITERAL construction is still confined to the allowlisted bodies.)
+    # Location-based, NAME-AGNOSTIC: in this file the only legitimate struct
+    # literals are the `Self {..}` / `OwnedIdentityDid {..}` mints inside the
+    # three allowlisted methods, so ANY `struct_expression` whose location is
+    # neither inside one of those method bodies NOR inside the non-production
+    # `#[cfg(test)] mod tests` is illegitimate — regardless of the constructed
+    # type's name. We therefore do NOT match on the literal's type name at all;
+    # the criterion is purely lexical position. This closes the last name-based
+    # residual: an alias-named literal (`Aka {..}` after
+    # `use OwnedIdentityDid as Aka;`) or any other stray literal outside the
+    # allowlisted bodies is rejected by LOCATION. (Largely subsumed by A1
+    # banning free fns / extra impls — the only place a stray literal could even
+    # appear is moot — but this makes the rule categorical regardless.)
     allowlisted_bodies = []
     for fn in inherent_fns:
         if _fn_name(fn, src) in ALLOWED_METHODS:
@@ -675,26 +694,33 @@ def _enforce(cap_src_path: Path, mod_src_path: Path) -> list[str]:
             if blk is not None:
                 allowlisted_bodies.append((blk.start_byte, blk.end_byte))
 
-    def _inside_allowlisted(node: Node) -> bool:
+    # The `#[cfg(test)] mod tests` body is non-production: struct literals inside
+    # it (test construction via the allowlisted API or otherwise) are exempt.
+    test_mod_spans = []
+    for tmod in test_mods:
+        tbody = tmod.child_by_field_name("body")
+        if tbody is not None:
+            test_mod_spans.append((tbody.start_byte, tbody.end_byte))
+
+    def _inside_any(node: Node, spans: list[tuple[int, int]]) -> bool:
         return any(
-            start <= node.start_byte and node.end_byte <= end
-            for (start, end) in allowlisted_bodies
+            start <= node.start_byte and node.end_byte <= end for (start, end) in spans
         )
 
     for n in _walk(root):
         if n.type != "struct_expression":
             continue
+        if _inside_any(n, allowlisted_bodies):
+            continue
+        if _inside_any(n, test_mod_spans):
+            continue
         ty = n.child_by_field_name("name")
-        if ty is None:
-            continue
-        ty_text = _final_type_segment(_text(ty, src))
-        if ty_text not in (TYPE_NAME, "Self"):
-            continue
-        if _inside_allowlisted(n):
-            continue
+        ty_text = _final_type_segment(_text(ty, src)) if ty is not None else "?"
         failures.append(
             f"struct-literal construction `{ty_text} {{ .. }}` outside the "
-            f"allowlisted methods of `{TYPE_NAME}`; the only constructors are "
+            f"allowlisted methods of `{TYPE_NAME}` (and outside "
+            f"`#[cfg(test)] mod tests`); by LOCATION the only legitimate struct "
+            f"literals are the mints inside "
             f"{{{', '.join(ALLOWED_METHODS)}}}"
         )
 

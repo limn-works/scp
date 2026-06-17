@@ -105,6 +105,44 @@ impl OwnedIdentityDid {
     }
 }
 
+// @file: positive_test_mod_struct_literal [ACCEPT]
+// A4 location-exemption positive: the `#[cfg(test)] mod tests` body itself
+// struct-literal-constructs `OwnedIdentityDid { .. }`. The construction check is
+// LOCATION-BASED and NAME-AGNOSTIC — a struct literal inside the non-production
+// cfg(test) module is exempt by LOCATION (not by its type name), so this MUST be
+// accepted. Pairs with the production rule: the same literal outside any
+// allowlisted method body or the test module would be rejected by location.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_construction_in_cfg_test_is_exempt() {
+        let token = OwnedIdentityDid {
+            did: DID("did:example:test".to_owned()),
+        };
+        assert_eq!(token.as_did(), &DID("did:example:test".to_owned()));
+    }
+}
+
 // @file: pub_struct_visibility [REJECT]
 // Struct name-visibility is `pub` — too broad. MUST be exactly
 // `pub(in crate::context)`.
