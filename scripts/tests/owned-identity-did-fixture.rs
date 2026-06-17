@@ -692,7 +692,7 @@ pub(crate) struct OwnedIdentityDid {
 pub(super) type OwnedIdentityDid = [u8; 32];
 
 // @file: context/supervisor/forge_trait.rs
-// COVERAGE GAP G03 (FIX-A) — CUSTOM-TRAIT MINT. A custom trait whose method
+// COVERAGE GAP CTM-1 (custom-trait mint) — A custom trait whose method
 // CONSTRUCTS the cap evades BOTH the forbidden-trait blocklist (rule D —
 // `Forger` is not Clone/From/etc.) AND the inherent-impl allowlist (rule G
 // inspects only INHERENT impls, where trait_name is None). The extended
@@ -724,7 +724,7 @@ impl OwnedIdentityDid {
 }
 
 // @file: context/supervisor/forge_macro.rs
-// COVERAGE GAP G02 (FIX-B) — MACRO-HIDDEN MINT. tree-sitter does NOT expand
+// COVERAGE GAP MHM-1 (macro-hidden mint) — tree-sitter does NOT expand
 // macros, so a `macro_rules!` that emits an `impl OwnedIdentityDid { fn
 // forge(did: DID) -> Self {…} }` hides the mint from the AST walk. Rule B
 // FAILs (1) the macro_rules DEFINITION in any file because it touches the

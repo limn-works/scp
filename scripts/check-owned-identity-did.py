@@ -1038,6 +1038,13 @@ SUPERVISOR_IMPL_TYPE: str = "Supervisor"
 # dissolves the exemption (G03); a `let`/assignment shadow of that param's name
 # before the mint dissolves it too (G02). Both forgeries leave the mint
 # consuming an attacker-controlled value, so neither may be exempt.
+# Exact-match type-tail for the raw-identity parameter type. Deliberately exact
+# (not the case-insensitive `Did`/`DidId` future-proofing rule G uses for the cap
+# mint param): if the `DID` type were ever renamed, `_param_type_tail` would stop
+# recognizing the owning param, the sole-DID-param count would drop to zero, and
+# the LEGIT build-site exemption would dissolve → the gate FAILS the build (it
+# never silently exempts a forgery). That is the safe (fail-closed) direction; a
+# future renamer must update this constant alongside the cap `DID` references.
 DID_PARAM_TYPE: str = "DID"
 # Rule K exemption (b) is additionally PINNED to the real build-site FILE, so a
 # forger cannot plant a local `struct Supervisor; impl Supervisor { fn
