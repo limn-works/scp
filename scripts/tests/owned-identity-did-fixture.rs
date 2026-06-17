@@ -1609,24 +1609,147 @@ impl Supervisor {
     }
 }
 
+// BYPASS TI-IMPL (FIX — owning-param TYPE INDIRECTION via `impl Trait`) — a
+// top-level `impl Supervisor` whose `build_actor_deps` spells the OWNING param as
+// `impl Into<DID> + Clone` (anonymous-generic `impl Trait` in argument position,
+// a `bounded_type` whose `_param_type_tail` is None — NO `type_parameters` node,
+// so the generic-`<D>` ban CANNOT see it) and adds a literal-`DID` `attacker`
+// param, minting `attacker`. Pre-fix the build-site exemption counted params
+// whose TYPE tail was literally `DID` and required that count == 1: the owning
+// `impl Into<DID>` was NOT counted (tail None), so the ATTACKER became the sole
+// counted `DID` param and was wrongly pinned as the owning binding — minting the
+// attacker. The POSITIVE assertion requires EXACTLY ONE non-`self` parameter
+// whose tail is literally `DID`; the `attacker` param makes the non-`self` count
+// 2 (and the owning tail is None ≠ `DID`), so the exemption is refused → rule K
+// flags the mint. Spelling `ti_impl_mint::…` is UNIQUE.
+mod ti_impl_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(
+        &self,
+        owning_did: impl Into<DID> + Clone,
+        attacker: DID,
+    ) -> ActorDeps {
+        let _keep = owning_did;
+        let owned_identity =
+            ti_impl_mint::OwnedIdentityDid::issue_for_actor(attacker.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS TI-DYN (FIX — owning-param TYPE INDIRECTION via `&dyn Trait`) — the
+// trait-object spelling of the same indirection: the OWNING param is
+// `&dyn AsRef<DID>` (a `reference_type` wrapping a trait object; after the `&`
+// peel its `_param_type_tail` is None), plus a literal-`DID` `attacker` param,
+// minting `attacker`. Same pre-fix defeat (owning tail None → attacker is the
+// sole counted `DID`). The positive assertion refuses it (non-`self` count 2,
+// owning tail ≠ `DID`) → rule K flags the mint. Spelling `ti_dyn_mint::…` is
+// UNIQUE.
+mod ti_dyn_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(
+        &self,
+        owning_did: &dyn AsRef<DID>,
+        attacker: DID,
+    ) -> ActorDeps {
+        let _keep = owning_did;
+        let owned_identity =
+            ti_dyn_mint::OwnedIdentityDid::issue_for_actor(attacker.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS TI-PROJ (FIX — owning-param TYPE INDIRECTION via ASSOC-TYPE PROJECTION)
+// — the OWNING param is an associated-type projection `<Self as OwnId>::T` (a
+// `scoped_type_identifier` whose tail is `T` ≠ `DID`), plus a literal-`DID`
+// `attacker` param, minting `attacker`. Pre-fix the owning param's tail `T` was
+// not counted as `DID`, so the attacker became the sole counted `DID` param. The
+// positive assertion refuses it (non-`self` count 2, owning tail `T` ≠ `DID`) →
+// rule K flags the mint. Spelling `ti_proj_mint::…` is UNIQUE. (`OwnId` is an
+// undeclared trait in the fixture — irrelevant: the gate is a STRUCTURAL scan,
+// not a type-checker, so the projection's tail-identifier is all that matters.)
+mod ti_proj_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+trait OwnId {
+    type T;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(
+        &self,
+        owning_did: <Self as OwnId>::T,
+        attacker: DID,
+    ) -> ActorDeps {
+        let _keep = owning_did;
+        let owned_identity =
+            ti_proj_mint::OwnedIdentityDid::issue_for_actor(attacker.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS TI-WRAP (FIX — owning-param TYPE INDIRECTION via NEWTYPE WRAPPER) — the
+// OWNING param is `&DidWrap` where `DidWrap` is a plain NEWTYPE `struct
+// DidWrap(DID)` (after the `&` peel, tail `DidWrap` ≠ `DID`), plus a literal-`DID`
+// `attacker` param, minting `attacker`. The wrapper is spelled as a NEWTYPE (NOT
+// a `type DidWrap = DID;` alias): a module-level `type … = DID` alias is
+// INDEPENDENTLY banned by the DID-type-alias rule, so using a newtype here
+// ISOLATES the type-indirection rule under test (the failure must come from the
+// owning-param positive assertion, not the alias ban). Pre-fix the owning tail
+// `DidWrap` was not counted as `DID`, so the attacker became the sole counted
+// `DID` param. The positive assertion refuses it (non-`self` count 2, owning tail
+// `DidWrap` ≠ `DID`) → rule K flags the mint. Spelling `ti_wrap_mint::…` is
+// UNIQUE.
+struct DidWrap(DID);
+mod ti_wrap_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(
+        &self,
+        owning_did: &DidWrap,
+        attacker: DID,
+    ) -> ActorDeps {
+        let _keep = owning_did;
+        let owned_identity =
+            ti_wrap_mint::OwnedIdentityDid::issue_for_actor(attacker.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
 // NEGATIVE CONTROL RENAMED-FIELD-OK (FIX 1) — a top-level `impl Supervisor`
 // whose `build_actor_deps` destructures an UNRELATED struct via a RENAMED field
-// `let RenamedSrc { f: other } = …;` (binding the local `other`, via an
-// `identifier` node — NOT a shadow of `owning_did`), then mints the genuine
-// bare `owning_did` parameter. The renamed-field form binds via `identifier`,
-// which fix 1 leaves untouched; because the bound local is `other` (≠
-// `owning_did`), it is NOT a shadow, so the exempt mint of the un-shadowed
-// `owning_did` MUST stay EXEMPT (PASS). Proves fix 1 added NO false positive on
-// the renamed-field spelling. The UNIQUE exempt mint spelling
+// whose field NAME is LITERALLY `owning_did`: `let RenamedSrc { owning_did: other
+// } = …;`. This deliberately places the token `owning_did` in the FIELD-NAME
+// position (a `field_identifier` node) while the actually-bound local is `other`
+// (an `identifier` node). The distinction is the whole point of fix 1: a binder
+// is spelled either `identifier` (`Foo(x)` / `Foo { f: x }` renamed field) or
+// `shorthand_field_identifier` (`Foo { owning_did }` shorthand, where the field
+// NAME is ALSO the bound local). A RENAMED field's NAME is a `field_identifier`,
+// which is NEITHER binder leaf type, so it binds NOTHING — only the renamed-to
+// `other` (`identifier`) is bound. An over-broad matcher that wrongly treated
+// `field_identifier` as a binder would see `owning_did` "shadowed" here and
+// wrongly dissolve the exemption. Because `_pattern_binds` matches ONLY
+// `identifier`/`shorthand_field_identifier`, the field-name `owning_did` binds
+// nothing, the genuine `owning_did` PARAMETER stays un-shadowed, and the exempt
+// mint MUST stay EXEMPT (PASS). Proves fix 1 added NO false positive on the
+// renamed-field spelling even when the field NAME collides with the owning
+// param's name. The UNIQUE exempt mint spelling
 // `renamed_field_ok::OwnedIdentityDid::issue_for_actor` is in
 // FORBIDDEN_FIXTURE_SUBSTRINGS — it appears in a diagnostic ONLY if the renamed-
 // field destructure wrongly dissolved the legit build-site exemption.
 struct RenamedSrc {
-    f: u8,
+    owning_did: u8,
 }
 #[allow(dead_code)]
 fn make_renamed_src() -> RenamedSrc {
-    RenamedSrc { f: 0 }
+    RenamedSrc { owning_did: 0 }
 }
 mod renamed_field_ok {
     pub(in crate::context) use super::OwnedIdentityDid;
@@ -1634,7 +1757,7 @@ mod renamed_field_ok {
 impl Supervisor {
     #[allow(dead_code)]
     pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> ActorDeps {
-        let RenamedSrc { f: other } = make_renamed_src();
+        let RenamedSrc { owning_did: other } = make_renamed_src();
         let _ = other;
         let owned_identity =
             renamed_field_ok::OwnedIdentityDid::issue_for_actor(owning_did);

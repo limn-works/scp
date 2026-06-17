@@ -1528,15 +1528,31 @@ def _mint_call_arg_is_owning_did(node, fn_node, source: bytes) -> bool:
     value the exempt mint may consume is the very DID the actor was built for.
     The guarantee rests on three conjoined conditions:
 
-      (1) EXACTLY ONE DID-typed parameter. Collect `build_actor_deps`'s
-          parameters; the sole non-`self` parameter whose TYPE tail-identifier
-          is `DID` (covers `owning_did: &DID` and `owning_did: DID`) is the
-          owning binding. If ZERO or ≥2 such DID params exist, the exemption
-          does NOT apply — the mint reference is flagged by rule K. This kills
-          G03 (`fn build_actor_deps(&self, owning_did: &DID, attacker: DID)`
-          then `issue_for_actor(attacker.clone())`): a second `DID` param makes
-          the owning binding ambiguous, so no body mint can be trusted. Other
-          (non-DID) parameters are ignored — they cannot carry a DID.
+      (1) EXACTLY ONE NON-`self` PARAMETER, SPELLED `DID`. A POSITIVE structural
+          assertion (NOT a loose "count of literal-`DID`-tail params"): collect
+          `build_actor_deps`'s parameters, drop the `self` parameter (a bare
+          `&self`/`self` `self_parameter`, OR a typed-`self` `parameter` whose
+          pattern is the `self` keyword), and require the REMAINING list to have
+          length EXACTLY 1, with that sole parameter's TYPE tail-identifier the
+          literal `DID` (covers `owning_did: &DID`, `owning_did: DID`,
+          `owning_did: crate::…::DID`). If the non-`self` count is ZERO or ≥2,
+          OR the sole non-`self` param's tail ≠ `DID`, the exemption does NOT
+          apply — the mint reference is flagged by rule K.
+
+          The OLD premise counted only params whose tail was literally `DID`
+          and required that count == 1. That count was UNSOUND under owning-param
+          TYPE INDIRECTION: when the owning type was spelled `impl Into<DID>`
+          (`bounded_type` → tail None), `&dyn AsRef<DID>` (None), `<Self as
+          OwnId>::T` (tail `T`), `&DidWrap` (tail `DidWrap`), `Box<DID>` (tail
+          `Box`), or a `<D>`-generic (tail `D`), the owning param was NOT counted,
+          so an added `attacker: DID` became the SOLE counted DID param and was
+          wrongly pinned as the owning binding — minting the attacker DID. The
+          positive form closes ALL such indirection at once: it refuses the extra
+          `attacker: DID` param (non-`self` count ≥2) AND refuses any indirected
+          owning type (sole param's tail ≠ `DID`). This subsumes the old G03
+          two-`DID`-param case (`fn build_actor_deps(&self, owning_did: &DID,
+          attacker: DID)` → non-`self` count 2 → refused) and the whole
+          type-indirection family. The owning param MUST be spelled `DID`.
 
       (2) THE ARG IS PINNED TO THAT SOLE DID PARAM'S BINDING NAME. The call's
           single argument must be a bare `<owning>` or `<owning>.clone()` where
@@ -1595,28 +1611,56 @@ def _mint_call_arg_is_owning_did(node, fn_node, source: bytes) -> bool:
                 ident_name = node_text(value, source)
     if ident_name is None:
         return False
-    # (1) Collect the SOLE non-`self` DID-typed parameter's binding name. Zero
-    # or ≥2 DID-typed params → ambiguous owning binding → not exempt.
+    # (1) POSITIVE STRUCTURAL ASSERTION on the owning parameter. The exemption is
+    # granted ONLY when `build_actor_deps` has EXACTLY ONE non-`self` parameter
+    # AND that parameter's TYPE tail-identifier is the literal `DID`. This is the
+    # POSITIVE form of the rule (fix — type-indirected owning param): it does NOT
+    # count "how many literal-`DID`-tail params exist" (that loose count let an
+    # added `attacker: DID` become the SOLE counted DID param whenever the OWNING
+    # param's type was type-indirected so its tail was not `DID` — `impl
+    # Into<DID>`/`bounded_type`→None, `&dyn AsRef<DID>`→None, `<Self as
+    # OwnId>::T`→`T`, `&DidWrap`→`DidWrap`, `Box<DID>`→`Box`, `<D>`-generic→`D`).
+    # Instead it requires the SINGLE non-`self` param to itself be spelled `DID`
+    # (`DID`, `&DID`, `crate::…::DID`), refusing BOTH the laundering vehicle (the
+    # extra `attacker: DID` param makes the non-`self` count ≥2) AND any indirected
+    # owning type (tail ≠ `DID`).
+    #
+    # A `self` parameter is excluded two ways: a bare `&self`/`self`/`&mut self`
+    # is a `self_parameter` node (no `type`/`pattern` fields); a typed-`self`
+    # (`self: &Arc<Self>`) is a `parameter` whose `pattern` is the `self` keyword
+    # node (not an `identifier`), so `_param_binding_name` returns None for it.
+    # We drop both from the non-`self` list.
     params_node = fn_node.child_by_field_name("parameters")
     if params_node is None:
         return False
-    did_param_names: list[str] = []
+    non_self_params = []
     for p in params_node.children:
         if p.type != "parameter":
-            # `self_parameter` (bare `&self`) and punctuation are skipped; only
-            # real `parameter` nodes carry types. A typed-`self` param
-            # (`self: &Arc<Self>`) IS a `parameter` but its binding name is
-            # `self` (not an `identifier`), and its type tail is `Arc`, so it
-            # never counts as a DID param below.
+            # `self_parameter` (bare `&self` / `&mut self` / `self`) and
+            # punctuation are not real value parameters — skipped.
             continue
-        if _param_type_tail(p, source) != DID_PARAM_TYPE:
+        pat = p.child_by_field_name("pattern")
+        if pat is not None and pat.type == "self":
+            # Typed-`self` (`self: &Arc<Self>`): a `parameter` whose binding is
+            # the `self` keyword. It is NOT a value parameter — excluded.
             continue
-        binding = _param_binding_name(p, source)
-        if binding is not None:
-            did_param_names.append(binding)
-    if len(did_param_names) != 1:
+        non_self_params.append(p)
+    # EXACTLY ONE non-`self` parameter. A second parameter (the `attacker: DID`
+    # laundering vehicle) makes the count 2 → refused. Zero → no owning binding
+    # → refused.
+    if len(non_self_params) != 1:
         return False
-    owning_param = did_param_names[0]
+    owning_p = non_self_params[0]
+    # ITS TYPE TAIL must be literally `DID`. An indirected owning type
+    # (`impl Into<DID>`, `&dyn AsRef<DID>`, `<Self as Tr>::T`, `&DidWrap`,
+    # `Box<DID>`, a `<D>`-generic param) has a tail ≠ `DID` → refused. The owning
+    # param MUST be spelled `DID` / `&DID` / `crate::…::DID` (all yield tail
+    # `DID` via `_param_type_tail`'s reference-peel + path-qualified handling).
+    if _param_type_tail(owning_p, source) != DID_PARAM_TYPE:
+        return False
+    owning_param = _param_binding_name(owning_p, source)
+    if owning_param is None:
+        return False
     # (2) The mint arg must be pinned to THAT sole DID param's binding name.
     if ident_name != owning_param:
         return False
@@ -4904,6 +4948,42 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     (
         "build_site_generic_param_mint",
         "'f5_generic_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX (OWNING-PARAM TYPE INDIRECTION — `impl Trait` in arg position) — the
+    # owning param is `impl Into<DID> + Clone` (a `bounded_type` with NO
+    # `type_parameters` node, so the generic-`<D>` ban misses it; its
+    # `_param_type_tail` is None). With a literal-`DID` `attacker` added, the old
+    # literal-`DID` count pinned the attacker. The POSITIVE assertion (EXACTLY ONE
+    # non-`self` param spelled `DID`) refuses it → rule K flags the mint. Spelling
+    # `ti_impl_mint::…` is UNIQUE.
+    (
+        "build_site_impl_trait_owning_param",
+        "'ti_impl_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX (OWNING-PARAM TYPE INDIRECTION — `&dyn Trait`) — the owning param is
+    # `&dyn AsRef<DID>` (tail None after the `&` peel). Same defeat as the
+    # `impl Trait` case; the positive assertion refuses it → rule K flags the
+    # mint. Spelling `ti_dyn_mint::…` is UNIQUE.
+    (
+        "build_site_dyn_owning_param",
+        "'ti_dyn_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX (OWNING-PARAM TYPE INDIRECTION — ASSOC-TYPE PROJECTION) — the owning
+    # param is `<Self as OwnId>::T` (a `scoped_type_identifier` tail `T` ≠ `DID`).
+    # The positive assertion refuses it (non-`self` count 2 / owning tail ≠ `DID`)
+    # → rule K flags the mint. Spelling `ti_proj_mint::…` is UNIQUE.
+    (
+        "build_site_projection_owning_param",
+        "'ti_proj_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX (OWNING-PARAM TYPE INDIRECTION — NEWTYPE WRAPPER) — the owning param is
+    # `&DidWrap` where `struct DidWrap(DID)` is a plain newtype (tail `DidWrap` ≠
+    # `DID`; spelled a newtype, NOT a `type … = DID` alias, to isolate THIS rule
+    # from the independently-enforced DID-type-alias ban). The positive assertion
+    # refuses it → rule K flags the mint. Spelling `ti_wrap_mint::…` is UNIQUE.
+    (
+        "build_site_wrapper_owning_param",
+        "'ti_wrap_mint::OwnedIdentityDid::issue_for_actor'",
     ),
 ]
 
