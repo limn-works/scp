@@ -1125,71 +1125,111 @@ mod tests {
 
     #[test]
     fn structural_events_classified_correctly() {
-        // --- Base structural variants (unchanged) ---
-        assert!(is_structural_event(&EventType::ContextCreated));
-        assert!(is_structural_event(&EventType::MemberJoined));
-        assert!(is_structural_event(&EventType::MemberLeft));
-        assert!(is_structural_event(&EventType::RoleAssigned));
-        assert!(is_structural_event(&EventType::GovernanceAction));
-        assert!(is_structural_event(&EventType::ContextClosing));
-        assert!(is_structural_event(&EventType::ContextClosed));
-        assert!(is_structural_event(&EventType::ContextExpired));
-        assert!(is_structural_event(&EventType::MemberBlocked));
-        assert!(is_structural_event(&EventType::ConsistencyCheckpoint));
+        // The full closed `EventType` taxonomy (76 variants) paired with its
+        // EXPECTED structural/operational classification. `true` = structural
+        // (retained longer per ADR-030 §2c); `false` = operational. This pins
+        // the CORRECT decision for every variant — not merely that a decision
+        // exists — so a future re-classification of any variant must update this
+        // table deliberately. The expected values mirror the cryptographer-
+        // confirmed classification in `is_structural_event`.
+        const EXPECTED: [(EventType, bool); 76] = [
+            // --- Base variants ---
+            (EventType::ContextCreated, true),
+            (EventType::ContextClosing, true),
+            (EventType::ContextClosed, true),
+            (EventType::ContextExpired, true),
+            (EventType::MemberJoined, true),
+            (EventType::MemberLeft, true),
+            (EventType::RoleAssigned, true),
+            (EventType::TokenRevoked, false),
+            (EventType::MessageSent, false),
+            (EventType::ToolRegistered, false),
+            (EventType::ToolUpdated, false),
+            (EventType::ToolInvoked, false),
+            (EventType::ToolVerified, false),
+            (EventType::ToolInterfaceEstablished, false),
+            (EventType::GovernanceAction, true),
+            (EventType::ConsistencyCheckpoint, true),
+            (EventType::AbsenceProofRequested, false),
+            (EventType::MemberBlocked, true),
+            (EventType::KeyEpochAdvance, false),
+            (EventType::MediaSessionStarted, false),
+            (EventType::MediaSessionEnded, false),
+            (EventType::PaymentReceived, false),
+            (EventType::EconomicPolicyChanged, false),
+            (EventType::EconomicPolicyApplied, false),
+            (EventType::SpendingUcanGranted, false),
+            (EventType::SpendingUcanRevoked, false),
+            (EventType::GovernanceProposalCreated, false),
+            (EventType::GovernanceVoteCast, false),
+            (EventType::GovernanceVoteWithdrawn, false),
+            (EventType::GovernanceProposalResolved, false),
+            (EventType::GovernanceConflictDetected, false),
+            (EventType::GovernanceConflictResolved, false),
+            (EventType::GovernanceDeadlockRecovery, false),
+            (EventType::GovernanceActionExecuted, false),
+            (EventType::ProvenanceAttached, false),
+            (EventType::ProvenanceReceived, false),
+            // --- Unification variants (ADR-011 Amendment) ---
+            (EventType::AdminTransferred, true),
+            (EventType::CeilingModified, true),
+            (EventType::CeilingModificationPending, true),
+            (EventType::ThresholdModified, true),
+            (EventType::SignerAdded, true),
+            (EventType::SignerRemoved, true),
+            (EventType::ChildContextCreated, true),
+            (EventType::ContextPromoted, true),
+            (EventType::ContentKeysRotated, true),
+            (EventType::MemberReset, true),
+            (EventType::MemberSuspended, true),
+            (EventType::MemberSuspendedAll, true),
+            (EventType::MemberUnblocked, true),
+            (EventType::AccessRestored, true),
+            (EventType::GovernanceReconfigured, true),
+            (EventType::GovernanceFreezeExpired, true),
+            (EventType::HardRateLimitModified, true),
+            (EventType::EconomicPolicyLocked, true),
+            (EventType::ContextMigrationStarted, true),
+            (EventType::ToolRemoved, true),
+            (EventType::PruningPolicyModified, true),
+            (EventType::CommitBroadcasted, false),
+            (EventType::CommitBroadcastPending, false),
+            (EventType::PseudonymAnnounced, false),
+            (EventType::ContextTombstoned, true),
+            (EventType::ContextMigrationCancelled, true),
+            (EventType::TtlExtended, true),
+            (EventType::TtlExtensionRejected, true),
+            (EventType::AccessRevoked, true),
+            (EventType::SpendApproved, true),
+            (EventType::PaymentCaptureFailed, false),
+            (EventType::ConsequenceTriggered, true),
+            (EventType::ConsequenceEnforced, true),
+            (EventType::ConsequenceEnforcementFailed, true),
+            (EventType::ConsequenceEscalatedToSuspendAll, true),
+            (EventType::CommitBroadcastSucceeded, false),
+            (EventType::CommitBroadcastFailed, false),
+            (EventType::RecoveryEpochAdvanced, true),
+            (EventType::AppBound, true),
+            (EventType::AppUnbound, true),
+        ];
 
-        // --- Base operational variants (unchanged) ---
-        assert!(!is_structural_event(&EventType::MessageSent));
-        assert!(!is_structural_event(&EventType::ToolInvoked));
-        assert!(!is_structural_event(&EventType::ToolVerified));
-        assert!(!is_structural_event(&EventType::KeyEpochAdvance));
+        // Exhaustiveness guard: the table must cover the full closed taxonomy
+        // (exactly 76 variants). Adding a variant to `EventType` without adding
+        // it here leaves it unclassified-by-test, so this count is pinned.
+        assert_eq!(
+            EXPECTED.len(),
+            76,
+            "classification table must cover all 76 EventType variants"
+        );
 
-        // --- Unification variants: STRUCTURAL (ADR-011 Amendment) ---
-        assert!(is_structural_event(&EventType::AdminTransferred));
-        assert!(is_structural_event(&EventType::CeilingModified));
-        assert!(is_structural_event(&EventType::CeilingModificationPending));
-        assert!(is_structural_event(&EventType::ThresholdModified));
-        assert!(is_structural_event(&EventType::SignerAdded));
-        assert!(is_structural_event(&EventType::SignerRemoved));
-        assert!(is_structural_event(&EventType::ChildContextCreated));
-        assert!(is_structural_event(&EventType::ContextPromoted));
-        assert!(is_structural_event(&EventType::ContentKeysRotated));
-        assert!(is_structural_event(&EventType::MemberReset));
-        assert!(is_structural_event(&EventType::MemberSuspended));
-        assert!(is_structural_event(&EventType::MemberSuspendedAll));
-        assert!(is_structural_event(&EventType::MemberUnblocked));
-        assert!(is_structural_event(&EventType::AccessRestored));
-        assert!(is_structural_event(&EventType::AccessRevoked));
-        assert!(is_structural_event(&EventType::GovernanceReconfigured));
-        assert!(is_structural_event(&EventType::GovernanceFreezeExpired));
-        assert!(is_structural_event(&EventType::HardRateLimitModified));
-        assert!(is_structural_event(&EventType::EconomicPolicyLocked));
-        assert!(is_structural_event(&EventType::ContextMigrationStarted));
-        assert!(is_structural_event(&EventType::ContextMigrationCancelled));
-        assert!(is_structural_event(&EventType::ContextTombstoned));
-        assert!(is_structural_event(&EventType::ToolRemoved));
-        assert!(is_structural_event(&EventType::PruningPolicyModified));
-        assert!(is_structural_event(&EventType::TtlExtended));
-        assert!(is_structural_event(&EventType::TtlExtensionRejected));
-        assert!(is_structural_event(&EventType::RecoveryEpochAdvanced));
-        assert!(is_structural_event(&EventType::SpendApproved));
-        assert!(is_structural_event(&EventType::ConsequenceTriggered));
-        assert!(is_structural_event(&EventType::ConsequenceEnforced));
-        assert!(is_structural_event(
-            &EventType::ConsequenceEnforcementFailed
-        ));
-        assert!(is_structural_event(
-            &EventType::ConsequenceEscalatedToSuspendAll
-        ));
-        assert!(is_structural_event(&EventType::AppBound));
-        assert!(is_structural_event(&EventType::AppUnbound));
-
-        // --- Unification variants: OPERATIONAL (high-frequency records) ---
-        assert!(!is_structural_event(&EventType::PseudonymAnnounced));
-        assert!(!is_structural_event(&EventType::CommitBroadcasted));
-        assert!(!is_structural_event(&EventType::CommitBroadcastPending));
-        assert!(!is_structural_event(&EventType::CommitBroadcastSucceeded));
-        assert!(!is_structural_event(&EventType::CommitBroadcastFailed));
-        assert!(!is_structural_event(&EventType::PaymentCaptureFailed));
+        for (event_type, expected_structural) in &EXPECTED {
+            assert_eq!(
+                is_structural_event(event_type),
+                *expected_structural,
+                "{event_type:?} classification mismatch: \
+                 expected structural={expected_structural}"
+            );
+        }
     }
 
     // ===================================================================

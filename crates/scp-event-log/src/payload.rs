@@ -12,8 +12,10 @@
 //! whose parameters live in [`EventPayload`](crate::EventPayload).
 //!
 //! This module is the **single source** of the payload bytes for those
-//! structured variants. Both the native runtime (`scp-runtime`) and the WASM
-//! bridge MUST call these functions so that native↔WASM Merkle roots match:
+//! structured variants. As the emit sites are wired (in later phases of the
+//! native↔WASM unification — Phase 1 establishes the types; production callers
+//! land later), both the native runtime (`scp-runtime`) and the WASM bridge
+//! MUST route through these functions so that native↔WASM Merkle roots match:
 //! the leaf preimage is `SHA-256(0x00 ‖ rmp_serde(Event))`, and `Event.payload`
 //! is `EventPayload { data: <bytes from this module> }`. If two implementations
 //! encoded the same logical payload differently, the leaf hashes would diverge
