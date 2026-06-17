@@ -1496,6 +1496,49 @@ fn wasm_event_type_tag_exhaustiveness() {
             "GovernanceActionExecuted" | "GovernanceExecuted" => 32,
             "ProvenanceAttached" => 34,
             "ProvenanceReceived" => 35,
+            // Native↔WASM unification variants (ADR-011 Amendment). Tags
+            // 36..=75 mirror the canonical assignment in
+            // `scp_event_log::tree::event_type_tag` in ADR declaration order.
+            "AdminTransferred" => 36,
+            "CeilingModified" => 37,
+            "CeilingModificationPending" => 38,
+            "ThresholdModified" => 39,
+            "SignerAdded" => 40,
+            "SignerRemoved" => 41,
+            "ChildContextCreated" => 42,
+            "ContextPromoted" => 43,
+            "ContentKeysRotated" => 44,
+            "MemberReset" => 45,
+            "MemberSuspended" => 46,
+            "MemberSuspendedAll" => 47,
+            "MemberUnblocked" => 48,
+            "AccessRestored" => 49,
+            "GovernanceReconfigured" => 50,
+            "GovernanceFreezeExpired" => 51,
+            "HardRateLimitModified" => 52,
+            "EconomicPolicyLocked" => 53,
+            "ContextMigrationStarted" => 54,
+            "ToolRemoved" => 55,
+            "PruningPolicyModified" => 56,
+            "CommitBroadcasted" => 57,
+            "CommitBroadcastPending" => 58,
+            "PseudonymAnnounced" => 59,
+            "ContextTombstoned" => 60,
+            "ContextMigrationCancelled" => 61,
+            "TtlExtended" => 62,
+            "TtlExtensionRejected" => 63,
+            "AccessRevoked" => 64,
+            "SpendApproved" => 65,
+            "PaymentCaptureFailed" => 66,
+            "ConsequenceTriggered" => 67,
+            "ConsequenceEnforced" => 68,
+            "ConsequenceEnforcementFailed" => 69,
+            "ConsequenceEscalatedToSuspendAll" => 70,
+            "CommitBroadcastSucceeded" => 71,
+            "CommitBroadcastFailed" => 72,
+            "RecoveryEpochAdvanced" => 73,
+            "AppBound" => 74,
+            "AppUnbound" => 75,
             _ => 0xFFFF,
         }
     }
@@ -1539,6 +1582,46 @@ fn wasm_event_type_tag_exhaustiveness() {
         "GovernanceConflictResolved",
         "GovernanceDeadlockRecovery",
         "GovernanceActionExecuted",
+        "AdminTransferred",
+        "CeilingModified",
+        "CeilingModificationPending",
+        "ThresholdModified",
+        "SignerAdded",
+        "SignerRemoved",
+        "ChildContextCreated",
+        "ContextPromoted",
+        "ContentKeysRotated",
+        "MemberReset",
+        "MemberSuspended",
+        "MemberSuspendedAll",
+        "MemberUnblocked",
+        "AccessRestored",
+        "GovernanceReconfigured",
+        "GovernanceFreezeExpired",
+        "HardRateLimitModified",
+        "EconomicPolicyLocked",
+        "ContextMigrationStarted",
+        "ToolRemoved",
+        "PruningPolicyModified",
+        "CommitBroadcasted",
+        "CommitBroadcastPending",
+        "PseudonymAnnounced",
+        "ContextTombstoned",
+        "ContextMigrationCancelled",
+        "TtlExtended",
+        "TtlExtensionRejected",
+        "AccessRevoked",
+        "SpendApproved",
+        "PaymentCaptureFailed",
+        "ConsequenceTriggered",
+        "ConsequenceEnforced",
+        "ConsequenceEnforcementFailed",
+        "ConsequenceEscalatedToSuspendAll",
+        "CommitBroadcastSucceeded",
+        "CommitBroadcastFailed",
+        "RecoveryEpochAdvanced",
+        "AppBound",
+        "AppUnbound",
     ];
 
     for event_type in &all_event_type_strings {
@@ -1611,7 +1694,88 @@ fn wasm_event_type_tag_exhaustiveness() {
         ),
         (EventType::ProvenanceAttached, "ProvenanceAttached"),
         (EventType::ProvenanceReceived, "ProvenanceReceived"),
+        (EventType::AdminTransferred, "AdminTransferred"),
+        (EventType::CeilingModified, "CeilingModified"),
+        (
+            EventType::CeilingModificationPending,
+            "CeilingModificationPending",
+        ),
+        (EventType::ThresholdModified, "ThresholdModified"),
+        (EventType::SignerAdded, "SignerAdded"),
+        (EventType::SignerRemoved, "SignerRemoved"),
+        (EventType::ChildContextCreated, "ChildContextCreated"),
+        (EventType::ContextPromoted, "ContextPromoted"),
+        (EventType::ContentKeysRotated, "ContentKeysRotated"),
+        (EventType::MemberReset, "MemberReset"),
+        (EventType::MemberSuspended, "MemberSuspended"),
+        (EventType::MemberSuspendedAll, "MemberSuspendedAll"),
+        (EventType::MemberUnblocked, "MemberUnblocked"),
+        (EventType::AccessRestored, "AccessRestored"),
+        (EventType::GovernanceReconfigured, "GovernanceReconfigured"),
+        (
+            EventType::GovernanceFreezeExpired,
+            "GovernanceFreezeExpired",
+        ),
+        (EventType::HardRateLimitModified, "HardRateLimitModified"),
+        (EventType::EconomicPolicyLocked, "EconomicPolicyLocked"),
+        (
+            EventType::ContextMigrationStarted,
+            "ContextMigrationStarted",
+        ),
+        (EventType::ToolRemoved, "ToolRemoved"),
+        (EventType::PruningPolicyModified, "PruningPolicyModified"),
+        (EventType::CommitBroadcasted, "CommitBroadcasted"),
+        (EventType::CommitBroadcastPending, "CommitBroadcastPending"),
+        (EventType::PseudonymAnnounced, "PseudonymAnnounced"),
+        (EventType::ContextTombstoned, "ContextTombstoned"),
+        (
+            EventType::ContextMigrationCancelled,
+            "ContextMigrationCancelled",
+        ),
+        (EventType::TtlExtended, "TtlExtended"),
+        (EventType::TtlExtensionRejected, "TtlExtensionRejected"),
+        (EventType::AccessRevoked, "AccessRevoked"),
+        (EventType::SpendApproved, "SpendApproved"),
+        (EventType::PaymentCaptureFailed, "PaymentCaptureFailed"),
+        (EventType::ConsequenceTriggered, "ConsequenceTriggered"),
+        (EventType::ConsequenceEnforced, "ConsequenceEnforced"),
+        (
+            EventType::ConsequenceEnforcementFailed,
+            "ConsequenceEnforcementFailed",
+        ),
+        (
+            EventType::ConsequenceEscalatedToSuspendAll,
+            "ConsequenceEscalatedToSuspendAll",
+        ),
+        (
+            EventType::CommitBroadcastSucceeded,
+            "CommitBroadcastSucceeded",
+        ),
+        (EventType::CommitBroadcastFailed, "CommitBroadcastFailed"),
+        (EventType::RecoveryEpochAdvanced, "RecoveryEpochAdvanced"),
+        (EventType::AppBound, "AppBound"),
+        (EventType::AppUnbound, "AppUnbound"),
     ];
+
+    // The closed EventType taxonomy has exactly 76 variants
+    // (`scp_event_log::tree::event_type_tag`, tags 0..=75). Assert the
+    // native↔WASM parity table enumerates the full set, so a future variant
+    // cannot silently slip past this gate. `all_event_type_strings` additionally
+    // carries WASM alias strings (e.g. "UcanRevoked", "GovernanceExecuted"), so
+    // we require it to be a superset that covers every canonical variant name
+    // rather than pinning an exact count.
+    assert_eq!(
+        all_variants.len(),
+        76,
+        "all_variants must enumerate the full closed 76-variant EventType taxonomy"
+    );
+    for (_, name) in &all_variants {
+        assert!(
+            all_event_type_strings.contains(name),
+            "all_event_type_strings is missing canonical variant '{name}' — \
+             every EventType variant must be exercised against the 0xFFFF sentinel"
+        );
+    }
 
     for (variant, name) in &all_variants {
         let native_tag = event_type_tag(variant);
