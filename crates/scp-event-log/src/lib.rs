@@ -20,7 +20,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 35 event type variants.
+//! - [`EventType`] -- The 76 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //! - [`EventLogSigner`] -- Trait abstracting signing for checkpoint generation.
@@ -34,6 +34,7 @@
 pub mod checkpoint;
 pub mod crypto;
 pub mod metrics;
+pub mod payload;
 pub mod proof;
 pub mod pruning;
 pub mod tiered_storage;
@@ -89,11 +90,17 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 35 event type variants for SCP context event logs.
+/// The 76 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
-/// the 8 governance-specific event types.
+/// the 8 governance-specific event types. The native↔WASM event-log
+/// unification amendment (ADR-011, `.docs/adrs/phase-2.md`) added the 40
+/// governance-action-coverage, lifecycle/migration, content-access, economic,
+/// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
+/// and app-sandbox-binding variants. This is a CLOSED set with no catch-all
+/// variant: every protocol action that produces a verifiable Merkle-log entry
+/// is one of these variants.
 ///
 /// Governance event payloads are serialized into [`EventPayload`]. The
 /// payload fields for each governance event type are documented below;
@@ -211,6 +218,174 @@ pub enum EventType {
     ///
     /// Payload: SHA-256 hash of JSON-serialized provenance record (32 bytes).
     ProvenanceReceived,
+
+    // -------------------------------------------------------------------
+    // Governance-action-coverage event types (native↔WASM unification;
+    // ADR-011 Amendment in `.docs/adrs/phase-2.md`). Each traces to a
+    // GovernanceAction (ADR-031 §2) or a §19 / §5.11A / §9.9 / §9.10
+    // protocol action. Parameters live in [`EventPayload`], never in the
+    // type name.
+    // -------------------------------------------------------------------
+    /// Admin role was transferred (`TransferAdmin`).
+    AdminTransferred,
+    /// A spending ceiling modification was applied (`ModifyCeiling`).
+    CeilingModified,
+    /// A spending ceiling modification entered its delay window
+    /// (`ModifyCeiling` delay-window start).
+    CeilingModificationPending,
+    /// A governance threshold was modified (`ModifyThreshold` §4b).
+    ThresholdModified,
+    /// A governance signer was added (`AddSigner` §4b).
+    SignerAdded,
+    /// A governance signer was removed (`RemoveSigner` §4b).
+    SignerRemoved,
+    /// A child context was created (`CreateChildContext` §5.13); consumed
+    /// by §7 trust.
+    ChildContextCreated,
+    /// A context was promoted (`PromoteContext` §5.10).
+    ContextPromoted,
+    /// Content keys were rotated (`RotateContentKeys` §9.17 / ADR-038).
+    ContentKeysRotated,
+    /// A member was reset (`ResetMember` ADR-029 Tier-3; §23 reset).
+    MemberReset,
+    /// A member's capability was suspended (`SuspendCapability`).
+    MemberSuspended,
+    /// A member's full access was suspended (`SuspendAccess`).
+    MemberSuspendedAll,
+    /// A member was unblocked (ADR-007 block reversal; pairs with
+    /// [`EventType::MemberBlocked`]).
+    MemberUnblocked,
+    /// Read access was restored (`RestoreAccess` §5 `ReadAccessRestored`).
+    AccessRestored,
+    /// Governance configuration was changed (`ReconfigureGovernance` §10).
+    GovernanceReconfigured,
+    /// A §7 conflict-freeze period expired.
+    GovernanceFreezeExpired,
+    /// A hard rate limit was modified (`ModifyHardRateLimit` §19.7 D4).
+    HardRateLimitModified,
+    /// The economic policy was locked (`LockEconomicPolicy` §19.3).
+    EconomicPolicyLocked,
+    /// A context migration started (`ProposeContextMigration` §5.11A grace
+    /// start).
+    ContextMigrationStarted,
+    /// A tool was removed (`RemoveTool`; pairs with
+    /// [`EventType::ToolRegistered`]).
+    ToolRemoved,
+    /// The pruning policy was modified (`ModifyPruningPolicy` ADR-030 §6).
+    PruningPolicyModified,
+    /// An MLS commit was broadcast (commit broadcast record §9.9
+    /// reconciliation).
+    CommitBroadcasted,
+    /// A commit broadcast was deferred to the queue (deferred-commit queue
+    /// record).
+    CommitBroadcastPending,
+    /// A per-context pseudonym was announced (§9.10.4).
+    PseudonymAnnounced,
+
+    // -------------------------------------------------------------------
+    // Lifecycle / migration event types (ADR-049 §9; §5.11A). Parameters
+    // live in [`EventPayload`], never in the type name.
+    // -------------------------------------------------------------------
+    /// A context was tombstoned at the terminal stage of migration
+    /// (§5.11A.5; `actor_did = "system"`).
+    ///
+    /// Payload (positional `MessagePack`): `destination_context_id: String`,
+    /// `migration_proposal_id: [u8; 32]`. See [`crate::payload`].
+    ContextTombstoned,
+    /// A context migration was cancelled (§5.11A; pairs with
+    /// [`EventType::ContextMigrationStarted`]).
+    ///
+    /// Payload (positional `MessagePack`): `original_proposal_id: [u8; 32]`.
+    /// See [`crate::payload`].
+    ContextMigrationCancelled,
+    /// A context TTL was unanimously extended (§5.10).
+    ///
+    /// Payload (positional `MessagePack`): `old_deadline_unix: u64`,
+    /// `new_deadline_unix: u64`, `proposal_id: [u8; 32]`,
+    /// `consenting_members: Vec<String>`. See [`crate::payload`].
+    TtlExtended,
+    /// A context TTL extension was denied (§5.10).
+    ///
+    /// Payload (positional `MessagePack`): `proposal_id: [u8; 32]`,
+    /// `rejecting_members: Vec<String>`. See [`crate::payload`].
+    TtlExtensionRejected,
+
+    // -------------------------------------------------------------------
+    // Content-access governance event types (ADR-031 §3; §5). Pairs with
+    // the existing [`EventType::AccessRestored`] variant.
+    // -------------------------------------------------------------------
+    /// Read or write access was revoked (`RevokeReadAccess` /
+    /// `RevokeWriteAccess`; payload: `target_did`, `scope`).
+    AccessRevoked,
+
+    // -------------------------------------------------------------------
+    // Economic event types (§19.6.1; ADR-031 §3).
+    // -------------------------------------------------------------------
+    /// A spend was approved (`ApproveSpend` governance action).
+    ///
+    /// Payload (positional `MessagePack`): `spender: String`,
+    /// `amount: u64`, `purpose: String`. See [`crate::payload`].
+    SpendApproved,
+    /// A payment capture failed (§19.6.1; payload: cost and capture-failure
+    /// detail).
+    PaymentCaptureFailed,
+
+    // -------------------------------------------------------------------
+    // Consequence-enforcement event types (phase-4 trust engine; §7.3.7).
+    // `actor_did` = the consequence-enforcement system actor.
+    // -------------------------------------------------------------------
+    /// A consequence-enforcement rule trigger fired (§7.3.7; payload:
+    /// `member_did`, `rule_index`, `trigger_kind`, `action_type`).
+    ConsequenceTriggered,
+    /// A consequence action was applied (§7.3.7; payload as above).
+    ConsequenceEnforced,
+    /// Consequence enforcement failed, e.g. member departed mid-flight
+    /// (§7.3.7; payload as above).
+    ConsequenceEnforcementFailed,
+    /// A consequence-enforcement failure escalated to `SuspendAll`
+    /// (§7.3.7; payload as above).
+    ConsequenceEscalatedToSuspendAll,
+
+    // -------------------------------------------------------------------
+    // MLS commit-broadcast reconciliation outcomes (§9.9.4). Pairs with
+    // [`EventType::CommitBroadcasted`] / [`EventType::CommitBroadcastPending`].
+    // -------------------------------------------------------------------
+    /// A deferred commit broadcast succeeded (§9.9.4; payload: `operation`,
+    /// `attempts`).
+    CommitBroadcastSucceeded,
+    /// A deferred commit broadcast permanently failed (§9.9.4; payload:
+    /// `operation`, `reason`, `attempts`).
+    CommitBroadcastFailed,
+
+    // -------------------------------------------------------------------
+    // Compromise-recovery event type (§9.12 step 2 "MLS Update in all
+    // active contexts"). Distinct from the ADR-007 sender-key
+    // [`EventType::KeyEpochAdvance`]: this records an MLS *group*-epoch
+    // advance (Update + self-Commit, broadcast to members) performed during
+    // trust recovery. `actor_did = "system:recovery"`.
+    // -------------------------------------------------------------------
+    /// An MLS group-epoch advance was performed during trust recovery
+    /// (§9.12 step 2).
+    ///
+    /// Payload (positional `MessagePack`): `old_epoch: u64`,
+    /// `new_epoch: u64`. See [`crate::payload`].
+    RecoveryEpochAdvanced,
+
+    // -------------------------------------------------------------------
+    // App-sandbox binding lifecycle (§8; "App binding and unbinding events
+    // are visible in the event log"). Parameters live in [`EventPayload`].
+    // -------------------------------------------------------------------
+    /// An app was bound to a context (§8).
+    ///
+    /// Payload (positional `MessagePack`): `app_did: String`,
+    /// `app_name: String`, `app_version: String`,
+    /// `capabilities: Vec<String>`. See [`crate::payload`].
+    AppBound,
+    /// An app was unbound from a context (§8).
+    ///
+    /// Payload (positional `MessagePack`): `app_did: String`. See
+    /// [`crate::payload`].
+    AppUnbound,
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +649,22 @@ mod tests {
 
     #[test]
     fn event_type_serialization_roundtrip_all_variants() {
-        let event_types = vec![
+        // Round-trips every variant of the closed taxonomy through serde JSON.
+        // The 76-variant count and wire-distinctness are pinned separately in
+        // `event_type_taxonomy_is_closed_at_76_distinct_variants`.
+        for event_type in all_event_types() {
+            let json = serde_json::to_string(&event_type).expect("serialize");
+            let deserialized: EventType = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(
+                event_type, deserialized,
+                "round-trip mismatch for {event_type:?}"
+            );
+        }
+    }
+    /// Returns the complete closed `EventType` taxonomy in ADR declaration
+    /// order. Used by the round-trip and distinctness coverage tests.
+    fn all_event_types() -> Vec<EventType> {
+        vec![
             EventType::ContextCreated,
             EventType::ContextClosing,
             EventType::ContextClosed,
@@ -501,7 +691,6 @@ mod tests {
             EventType::EconomicPolicyApplied,
             EventType::SpendingUcanGranted,
             EventType::SpendingUcanRevoked,
-            // Governance event types (ADR-031 §8)
             EventType::GovernanceProposalCreated,
             EventType::GovernanceVoteCast,
             EventType::GovernanceVoteWithdrawn,
@@ -510,26 +699,74 @@ mod tests {
             EventType::GovernanceConflictResolved,
             EventType::GovernanceDeadlockRecovery,
             EventType::GovernanceActionExecuted,
-            // Provenance event types (issue #586)
             EventType::ProvenanceAttached,
             EventType::ProvenanceReceived,
-        ];
+            EventType::AdminTransferred,
+            EventType::CeilingModified,
+            EventType::CeilingModificationPending,
+            EventType::ThresholdModified,
+            EventType::SignerAdded,
+            EventType::SignerRemoved,
+            EventType::ChildContextCreated,
+            EventType::ContextPromoted,
+            EventType::ContentKeysRotated,
+            EventType::MemberReset,
+            EventType::MemberSuspended,
+            EventType::MemberSuspendedAll,
+            EventType::MemberUnblocked,
+            EventType::AccessRestored,
+            EventType::GovernanceReconfigured,
+            EventType::GovernanceFreezeExpired,
+            EventType::HardRateLimitModified,
+            EventType::EconomicPolicyLocked,
+            EventType::ContextMigrationStarted,
+            EventType::ToolRemoved,
+            EventType::PruningPolicyModified,
+            EventType::CommitBroadcasted,
+            EventType::CommitBroadcastPending,
+            EventType::PseudonymAnnounced,
+            EventType::ContextTombstoned,
+            EventType::ContextMigrationCancelled,
+            EventType::TtlExtended,
+            EventType::TtlExtensionRejected,
+            EventType::AccessRevoked,
+            EventType::SpendApproved,
+            EventType::PaymentCaptureFailed,
+            EventType::ConsequenceTriggered,
+            EventType::ConsequenceEnforced,
+            EventType::ConsequenceEnforcementFailed,
+            EventType::ConsequenceEscalatedToSuspendAll,
+            EventType::CommitBroadcastSucceeded,
+            EventType::CommitBroadcastFailed,
+            EventType::RecoveryEpochAdvanced,
+            EventType::AppBound,
+            EventType::AppUnbound,
+        ]
+    }
 
-        // Verify all 36 variants are covered.
+    #[test]
+    fn event_type_taxonomy_is_closed_at_76_distinct_variants() {
+        // Pins the closed-set count and asserts wire-distinctness, independent
+        // of the round-trip test (which would otherwise exceed the function
+        // line limit).
+        let event_types = all_event_types();
         assert_eq!(
             event_types.len(),
-            36,
-            "all EventType variants must be tested"
+            76,
+            "closed EventType taxonomy must enumerate exactly 76 variants"
         );
 
-        for event_type in &event_types {
-            let json = serde_json::to_string(event_type).expect("serialize");
-            let deserialized: EventType = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(
-                event_type, &deserialized,
-                "round-trip mismatch for {event_type:?}"
-            );
-        }
+        let mut serialized: Vec<String> = event_types
+            .iter()
+            .map(|et| serde_json::to_string(et).expect("serialize"))
+            .collect();
+        serialized.sort();
+        serialized.dedup();
+        assert_eq!(
+            serialized.len(),
+            76,
+            "all 76 EventType variants must serialize to distinct values"
+        );
     }
 
     #[test]

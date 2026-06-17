@@ -427,6 +427,49 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         // Provenance event types (issue #586)
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
+        // Native↔WASM unification variants (ADR-011 Amendment). Tags 36..=75
+        // are assigned in ADR declaration order. Tags 0-35 above are protocol
+        // constants and MUST NOT change.
+        EventType::AdminTransferred => 36,
+        EventType::CeilingModified => 37,
+        EventType::CeilingModificationPending => 38,
+        EventType::ThresholdModified => 39,
+        EventType::SignerAdded => 40,
+        EventType::SignerRemoved => 41,
+        EventType::ChildContextCreated => 42,
+        EventType::ContextPromoted => 43,
+        EventType::ContentKeysRotated => 44,
+        EventType::MemberReset => 45,
+        EventType::MemberSuspended => 46,
+        EventType::MemberSuspendedAll => 47,
+        EventType::MemberUnblocked => 48,
+        EventType::AccessRestored => 49,
+        EventType::GovernanceReconfigured => 50,
+        EventType::GovernanceFreezeExpired => 51,
+        EventType::HardRateLimitModified => 52,
+        EventType::EconomicPolicyLocked => 53,
+        EventType::ContextMigrationStarted => 54,
+        EventType::ToolRemoved => 55,
+        EventType::PruningPolicyModified => 56,
+        EventType::CommitBroadcasted => 57,
+        EventType::CommitBroadcastPending => 58,
+        EventType::PseudonymAnnounced => 59,
+        EventType::ContextTombstoned => 60,
+        EventType::ContextMigrationCancelled => 61,
+        EventType::TtlExtended => 62,
+        EventType::TtlExtensionRejected => 63,
+        EventType::AccessRevoked => 64,
+        EventType::SpendApproved => 65,
+        EventType::PaymentCaptureFailed => 66,
+        EventType::ConsequenceTriggered => 67,
+        EventType::ConsequenceEnforced => 68,
+        EventType::ConsequenceEnforcementFailed => 69,
+        EventType::ConsequenceEscalatedToSuspendAll => 70,
+        EventType::CommitBroadcastSucceeded => 71,
+        EventType::CommitBroadcastFailed => 72,
+        EventType::RecoveryEpochAdvanced => 73,
+        EventType::AppBound => 74,
+        EventType::AppUnbound => 75,
     }
 }
 
@@ -1237,6 +1280,200 @@ mod tests {
     fn provenance_event_type_tags_are_correct() {
         assert_eq!(event_type_tag(&EventType::ProvenanceAttached), 34);
         assert_eq!(event_type_tag(&EventType::ProvenanceReceived), 35);
+    }
+
+    // -----------------------------------------------------------------------
+    // Closed-taxonomy tag invariants (ADR-011 native↔WASM unification):
+    //   - tags 0-35 are protocol constants and MUST NOT change;
+    //   - the 40 unification variants occupy tags 36..=75;
+    //   - all 76 tags are distinct.
+    // -----------------------------------------------------------------------
+
+    /// The complete `EventType` taxonomy in ADR declaration order, used to
+    /// cross-check against `event_type_tag`.
+    const ALL_EVENT_TYPES: [EventType; 76] = [
+        EventType::ContextCreated,
+        EventType::ContextClosing,
+        EventType::ContextClosed,
+        EventType::ContextExpired,
+        EventType::MemberJoined,
+        EventType::MemberLeft,
+        EventType::RoleAssigned,
+        EventType::TokenRevoked,
+        EventType::MessageSent,
+        EventType::ToolRegistered,
+        EventType::ToolUpdated,
+        EventType::ToolInvoked,
+        EventType::ToolVerified,
+        EventType::ToolInterfaceEstablished,
+        EventType::GovernanceAction,
+        EventType::ConsistencyCheckpoint,
+        EventType::AbsenceProofRequested,
+        EventType::MemberBlocked,
+        EventType::KeyEpochAdvance,
+        EventType::MediaSessionStarted,
+        EventType::MediaSessionEnded,
+        EventType::PaymentReceived,
+        EventType::EconomicPolicyChanged,
+        EventType::EconomicPolicyApplied,
+        EventType::SpendingUcanGranted,
+        EventType::SpendingUcanRevoked,
+        EventType::GovernanceProposalCreated,
+        EventType::GovernanceVoteCast,
+        EventType::GovernanceVoteWithdrawn,
+        EventType::GovernanceProposalResolved,
+        EventType::GovernanceConflictDetected,
+        EventType::GovernanceConflictResolved,
+        EventType::GovernanceDeadlockRecovery,
+        EventType::GovernanceActionExecuted,
+        EventType::ProvenanceAttached,
+        EventType::ProvenanceReceived,
+        EventType::AdminTransferred,
+        EventType::CeilingModified,
+        EventType::CeilingModificationPending,
+        EventType::ThresholdModified,
+        EventType::SignerAdded,
+        EventType::SignerRemoved,
+        EventType::ChildContextCreated,
+        EventType::ContextPromoted,
+        EventType::ContentKeysRotated,
+        EventType::MemberReset,
+        EventType::MemberSuspended,
+        EventType::MemberSuspendedAll,
+        EventType::MemberUnblocked,
+        EventType::AccessRestored,
+        EventType::GovernanceReconfigured,
+        EventType::GovernanceFreezeExpired,
+        EventType::HardRateLimitModified,
+        EventType::EconomicPolicyLocked,
+        EventType::ContextMigrationStarted,
+        EventType::ToolRemoved,
+        EventType::PruningPolicyModified,
+        EventType::CommitBroadcasted,
+        EventType::CommitBroadcastPending,
+        EventType::PseudonymAnnounced,
+        EventType::ContextTombstoned,
+        EventType::ContextMigrationCancelled,
+        EventType::TtlExtended,
+        EventType::TtlExtensionRejected,
+        EventType::AccessRevoked,
+        EventType::SpendApproved,
+        EventType::PaymentCaptureFailed,
+        EventType::ConsequenceTriggered,
+        EventType::ConsequenceEnforced,
+        EventType::ConsequenceEnforcementFailed,
+        EventType::ConsequenceEscalatedToSuspendAll,
+        EventType::CommitBroadcastSucceeded,
+        EventType::CommitBroadcastFailed,
+        EventType::RecoveryEpochAdvanced,
+        EventType::AppBound,
+        EventType::AppUnbound,
+    ];
+
+    #[test]
+    fn all_event_type_tags_are_distinct() {
+        let mut tags: Vec<u16> = ALL_EVENT_TYPES.iter().map(event_type_tag).collect();
+        assert_eq!(tags.len(), 76, "taxonomy must enumerate all 76 variants");
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(
+            tags.len(),
+            76,
+            "all 76 EventType tags must be distinct (no two variants share a tag)"
+        );
+    }
+
+    #[test]
+    fn protocol_constant_tags_0_through_35_are_unchanged() {
+        // These tags are wire-protocol constants. Changing any of them breaks
+        // canonical hash compatibility with already-signed leaves. The
+        // out-of-order assignments (EconomicPolicyApplied=33) are deliberate
+        // historical gap fills and are pinned here.
+        assert_eq!(event_type_tag(&EventType::ContextCreated), 0);
+        assert_eq!(event_type_tag(&EventType::ContextClosing), 1);
+        assert_eq!(event_type_tag(&EventType::ContextClosed), 2);
+        assert_eq!(event_type_tag(&EventType::ContextExpired), 3);
+        assert_eq!(event_type_tag(&EventType::MemberJoined), 4);
+        assert_eq!(event_type_tag(&EventType::MemberLeft), 5);
+        assert_eq!(event_type_tag(&EventType::RoleAssigned), 6);
+        assert_eq!(event_type_tag(&EventType::TokenRevoked), 7);
+        assert_eq!(event_type_tag(&EventType::MessageSent), 8);
+        assert_eq!(event_type_tag(&EventType::ToolRegistered), 9);
+        assert_eq!(event_type_tag(&EventType::ToolUpdated), 10);
+        assert_eq!(event_type_tag(&EventType::ToolInvoked), 11);
+        assert_eq!(event_type_tag(&EventType::ToolVerified), 12);
+        assert_eq!(event_type_tag(&EventType::ToolInterfaceEstablished), 13);
+        assert_eq!(event_type_tag(&EventType::GovernanceAction), 14);
+        assert_eq!(event_type_tag(&EventType::ConsistencyCheckpoint), 15);
+        assert_eq!(event_type_tag(&EventType::AbsenceProofRequested), 16);
+        assert_eq!(event_type_tag(&EventType::MemberBlocked), 17);
+        assert_eq!(event_type_tag(&EventType::KeyEpochAdvance), 18);
+        assert_eq!(event_type_tag(&EventType::MediaSessionStarted), 19);
+        assert_eq!(event_type_tag(&EventType::MediaSessionEnded), 20);
+        assert_eq!(event_type_tag(&EventType::PaymentReceived), 21);
+        assert_eq!(event_type_tag(&EventType::EconomicPolicyChanged), 22);
+        assert_eq!(event_type_tag(&EventType::SpendingUcanGranted), 23);
+        assert_eq!(event_type_tag(&EventType::SpendingUcanRevoked), 24);
+        assert_eq!(event_type_tag(&EventType::GovernanceProposalCreated), 25);
+        assert_eq!(event_type_tag(&EventType::GovernanceVoteCast), 26);
+        assert_eq!(event_type_tag(&EventType::GovernanceVoteWithdrawn), 27);
+        assert_eq!(event_type_tag(&EventType::GovernanceProposalResolved), 28);
+        assert_eq!(event_type_tag(&EventType::GovernanceConflictDetected), 29);
+        assert_eq!(event_type_tag(&EventType::GovernanceConflictResolved), 30);
+        assert_eq!(event_type_tag(&EventType::GovernanceDeadlockRecovery), 31);
+        assert_eq!(event_type_tag(&EventType::GovernanceActionExecuted), 32);
+        assert_eq!(event_type_tag(&EventType::EconomicPolicyApplied), 33);
+        assert_eq!(event_type_tag(&EventType::ProvenanceAttached), 34);
+        assert_eq!(event_type_tag(&EventType::ProvenanceReceived), 35);
+    }
+
+    #[test]
+    fn unification_variant_tags_occupy_36_through_75() {
+        // The 40 native↔WASM unification variants occupy tags 36..=75 in ADR
+        // declaration order.
+        assert_eq!(event_type_tag(&EventType::AdminTransferred), 36);
+        assert_eq!(event_type_tag(&EventType::CeilingModified), 37);
+        assert_eq!(event_type_tag(&EventType::CeilingModificationPending), 38);
+        assert_eq!(event_type_tag(&EventType::ThresholdModified), 39);
+        assert_eq!(event_type_tag(&EventType::SignerAdded), 40);
+        assert_eq!(event_type_tag(&EventType::SignerRemoved), 41);
+        assert_eq!(event_type_tag(&EventType::ChildContextCreated), 42);
+        assert_eq!(event_type_tag(&EventType::ContextPromoted), 43);
+        assert_eq!(event_type_tag(&EventType::ContentKeysRotated), 44);
+        assert_eq!(event_type_tag(&EventType::MemberReset), 45);
+        assert_eq!(event_type_tag(&EventType::MemberSuspended), 46);
+        assert_eq!(event_type_tag(&EventType::MemberSuspendedAll), 47);
+        assert_eq!(event_type_tag(&EventType::MemberUnblocked), 48);
+        assert_eq!(event_type_tag(&EventType::AccessRestored), 49);
+        assert_eq!(event_type_tag(&EventType::GovernanceReconfigured), 50);
+        assert_eq!(event_type_tag(&EventType::GovernanceFreezeExpired), 51);
+        assert_eq!(event_type_tag(&EventType::HardRateLimitModified), 52);
+        assert_eq!(event_type_tag(&EventType::EconomicPolicyLocked), 53);
+        assert_eq!(event_type_tag(&EventType::ContextMigrationStarted), 54);
+        assert_eq!(event_type_tag(&EventType::ToolRemoved), 55);
+        assert_eq!(event_type_tag(&EventType::PruningPolicyModified), 56);
+        assert_eq!(event_type_tag(&EventType::CommitBroadcasted), 57);
+        assert_eq!(event_type_tag(&EventType::CommitBroadcastPending), 58);
+        assert_eq!(event_type_tag(&EventType::PseudonymAnnounced), 59);
+        assert_eq!(event_type_tag(&EventType::ContextTombstoned), 60);
+        assert_eq!(event_type_tag(&EventType::ContextMigrationCancelled), 61);
+        assert_eq!(event_type_tag(&EventType::TtlExtended), 62);
+        assert_eq!(event_type_tag(&EventType::TtlExtensionRejected), 63);
+        assert_eq!(event_type_tag(&EventType::AccessRevoked), 64);
+        assert_eq!(event_type_tag(&EventType::SpendApproved), 65);
+        assert_eq!(event_type_tag(&EventType::PaymentCaptureFailed), 66);
+        assert_eq!(event_type_tag(&EventType::ConsequenceTriggered), 67);
+        assert_eq!(event_type_tag(&EventType::ConsequenceEnforced), 68);
+        assert_eq!(event_type_tag(&EventType::ConsequenceEnforcementFailed), 69);
+        assert_eq!(
+            event_type_tag(&EventType::ConsequenceEscalatedToSuspendAll),
+            70
+        );
+        assert_eq!(event_type_tag(&EventType::CommitBroadcastSucceeded), 71);
+        assert_eq!(event_type_tag(&EventType::CommitBroadcastFailed), 72);
+        assert_eq!(event_type_tag(&EventType::RecoveryEpochAdvanced), 73);
+        assert_eq!(event_type_tag(&EventType::AppBound), 74);
+        assert_eq!(event_type_tag(&EventType::AppUnbound), 75);
     }
 
     #[test]
