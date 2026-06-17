@@ -330,7 +330,7 @@ Proposed on the grounds that the rest of the supervisor's mutable state lives be
 
 **Bindings.** Every FFI bridge and language SDK rewires from `ContextManager` (deleted) to `Supervisor` (new). SCP class surface (post-ADR-048) is unchanged — the refactor is internal to `scp-runtime`.
 
-**Dependencies.** Adds `shuttle` (model checker, dev-only) and `tree-sitter-rust` (AST check tooling, dev-only) to the dev-dependencies.
+**Dependencies.** Adds `shuttle` (model checker, dev-only) to the dev-dependencies. (An earlier draft also added `tree-sitter-rust` for the source-text scanner; that scanner was dropped — see "Why no scanner" in §5 — so no AST-check dependency is introduced.)
 
 **Performance.** Baseline measurement is mandatory per Decision 14 — pre-merge baseline + post-merge measurement on six operations (`handshake`, `send_message`, `deliver_incoming`, `governance_propose`, `broadcast_publish`, `broadcast_subscribe`) at N=1/4/16. A regression of >15% on any (operation, N) pair triggers §Rollback strategy trigger #4. The baseline harness lands as `cargo test -p scp-runtime --test perf_baseline` in commit 13.
 
