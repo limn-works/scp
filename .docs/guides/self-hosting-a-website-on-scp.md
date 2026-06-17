@@ -55,11 +55,11 @@ site projection** machinery:
 
    `routing_id = SHA-256(context_id)` (no domain separator —
    `crates/scp-protocol/src/context/mod.rs:122` `broadcast_routing_id`).
-   `site_handler` (`crates/scp-node/src/projection.rs:2020`) fetches the encrypted
+   `site_handler` (`crates/scp-node/src/projection.rs`, `fn site_handler`) fetches the encrypted
    blob, **decrypts it server-side** with the broadcast key the node holds
-   (`open_broadcast_trusted`, `projection.rs:2138`), and returns **plaintext**
+   (`open_broadcast_trusted`, `projection.rs`), and returns **plaintext**
    bytes with the right `Content-Type`, `ETag`, `Cache-Control`, CSP, and CORS
-   headers (`projection.rs:2212`). A browser fetches and renders it normally; it
+   headers. A browser fetches and renders it normally; it
    never sees MessagePack, MLS, or ciphertext.
 
 Encryption is therefore **at rest and on the wire to the relay** — the relay is a
@@ -76,12 +76,12 @@ pull+decrypt:
 - `open_broadcast` (the signature-verifying *client* decryptor,
   `broadcast.rs:615`) has **zero production callers** — only the host-side
   `open_broadcast_trusted` is wired, inside `scp-node`'s HTTP projection.
-- `broadcast_subscribe` (FFI `crates/scp-ffi/src/context.rs:3949` →
+- `broadcast_subscribe` (FFI `crates/scp-ffi/src/context.rs:4052` →
   `subscribe_broadcast` `crates/scp-runtime/src/context/broadcast_helpers.rs:58`)
   is **local roster membership bookkeeping only** — it opens no socket and
   decrypts nothing.
 - The generic transport-receive path `deliver_incoming`
-  (`crates/scp-runtime/src/context/messaging_helpers.rs:999`) is **MLS-only**; it
+  (`crates/scp-runtime/src/context/messaging_helpers.rs:1002`) is **MLS-only**; it
   has no `BroadcastEnvelope` branch.
 - WASM (browser) has **no transport at all** — `scp-ffi-wasm` doesn't depend on
   `scp-transport`/`scp-runtime`, and its `web-sys` features don't even include
@@ -99,7 +99,7 @@ Three addressing paths, none requiring DNS-as-central-authority:
 
 | Path | Who can use it | DNS? | Notes |
 |------|----------------|------|-------|
-| **Raw public IP:port** | any browser, today | none | `https://<public-ip>:<port>/` (origin-root mount; the canonical `…/scp/broadcast/<rid>/site/<path>` route also works). The self-host surface serves **self-signed HTTPS (TLS 1.3) by default** (§10.12.11) with a SAN for the external IP, so raw-IP HTTPS matches; browsers show a one-time cert warning. The routing_id route is registered unconditionally and ignores the `Host` header (`projection.rs:2256`). Plaintext `http://` is an opt-out via `SCP_NODE_SELF_HOST_PLAINTEXT=1`. |
+| **Raw public IP:port** | any browser, today | none | `https://<public-ip>:<port>/` (origin-root mount; the canonical `…/scp/broadcast/<rid>/site/<path>` route also works). The self-host surface serves **self-signed HTTPS (TLS 1.3) by default** (§10.12.11) with a SAN for the external IP, so raw-IP HTTPS matches; browsers show a one-time cert warning. The routing_id route is registered unconditionally and ignores the `Host` header. Plaintext `http://` is an opt-out via `SCP_NODE_SELF_HOST_PLAINTEXT=1`. |
 | **`did:dht`** | SCP-aware clients | none | Real BitTorrent **Mainline DHT** publish via the `mainline` v6 crate, BEP44 signed mutable items (`crates/scp-identity/src/dht_client/pkarr_client.rs:271` publish / `:303` resolve). Gated behind the `production-dht` feature. No central authority in the publish path; the optional HTTP gateway is a signature-verified resolve-only fallback, empty by default. |
 | **Virtual host** (`Host:` header → routing_id) | any browser | needs DNS | Convenience only; out of scope for the DNS-free goal. |
 
@@ -130,8 +130,7 @@ operates on **`http_bind_addr.port()`, the public HTTP/site port (default 8443)*
 not the internal relay port (see `lib.rs:3193` comment).
 
 - **Tier 1 — UPnP-IGD (`igd-next`) / NAT-PMP (`natpmp`)**: real implementations
-  (`crates/scp-transport/src/nat/upnp.rs:636` `AddPortMapping`, `:809` NAT-PMP
-  request). One-shot `map_port` opens an inbound **TCP** mapping on the router for
+  (see `crates/scp-transport/src/nat/upnp.rs`, `fn map_port`). One-shot `map_port` opens an inbound **TCP** mapping on the router for
   the HTTP port → the website becomes reachable, no manual port-forward.
 - **Tier 2 — STUN** (RFC 8489, `crates/scp-transport/src/nat/mod.rs`): discovers
   the external `IP:port`, classifies NAT type, self-tests reachability, then
@@ -153,13 +152,13 @@ override).
 
 On startup the Tier-1 path opens the TCP mapping **then runs a reachability
 self-test that sends a STUN binding over a *UDP* socket** and asserts the reply's
-mapped address equals the *TCP* mapping (`crates/scp-node/src/lib.rs:1607`,
-`crates/scp-transport/src/nat/mod.rs:380`). On this host the UDP external port
+mapped address equals the *TCP* mapping (`crates/scp-node/src/lib.rs`, `fn try_tier1_upnp`;
+`crates/scp-transport/src/nat/mod.rs`, `fn probe_reachability`). On this host the UDP external port
 (measured 64503) won't equal the TCP mapped port (8443), so the **self-test fails
-and Tier 1 is "rejected," falling through to Tier 2 (STUN)** (`lib.rs:1635`).
+and Tier 1 is "rejected," falling through to Tier 2 (STUN)** (`lib.rs`, `fn try_tier1_upnp`).
 
 **This does not break hosting.** The NAT-PMP TCP mapping is created *before* the
-self-test and is **not released** on failure (`lib.rs:1621`) — so port 8443 stays
+self-test and is **not released** on failure (see `lib.rs:1865` comment) — so port 8443 stays
 forwarded regardless of which tier "wins." The website is reachable over raw-IP
 TCP, which is exactly what's mapped. The only consequence is cosmetic: the
 published `ws://` relay URL carries the Tier-2 (UDP) address — irrelevant to the
