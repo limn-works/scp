@@ -375,7 +375,35 @@ COVERS (source-text surface, via tree-sitter AST):
   - mint-call references anywhere under the supervisor subtree (K — the
     categorical closer: any call / value-path / `use … as` reference to
     `issue_for_actor` outside the build site, immune to the return-type
-    disguises — projection, opaque `impl Trait` — that rule J cannot see)
+    disguises — projection, opaque `impl Trait` — that rule J cannot see).
+    The K build-site exemption is hardened against THREE forgeries that the
+    bare type-tail + file pin left open:
+      * a NESTED-MOD SHADOW `impl Supervisor` in `supervisor.rs` — the exempt
+        `impl Supervisor` must be TOP-LEVEL (not under any in-file `mod`), so a
+        shadow's mint is NOT exempt (fix 2, mirrors rule I);
+      * a SECOND / ATTACKER-DID mint inside the real `build_actor_deps` — the
+        exempt mint's sole argument must be a bare `owning_did` parameter (or
+        `<p>.clone()`), NOT a constructed `DID("…")` literal, AND there may be
+        AT MOST ONE exempt mint call per `build_actor_deps` (fix 3);
+    plus a bare `use_list` member of the mint (`use self::{issue_for_actor};`,
+    no `as`) is now flagged as a mint reference (fix 5).
+  - the KEYSTONE escape-position ban (whole supervisor subtree): the cap in a
+    by-value escape channel OTHER than a plain return / plain struct field —
+    a `&mut`/`*mut` OUT-PARAM (incl. `&mut Option<…Cap…>` / `&mut Vec<…Cap…>`),
+    a `static`/`const` SINK holding the cap by value, or an INTERIOR-MUTABILITY
+    wrapper (`Cell`/`RefCell`/`OnceCell`/`OnceLock`/`Mutex`/`RwLock`/
+    `UnsafeCell`/…<…Cap…>) handed out behind a shared `&`. This single rule
+    kills the out-param exfil (K01), the static sink (K02 variant), and any
+    interior-mut cell — channels rules J (return) and K (mint call) do not
+    cover. It does NOT flag a plain `&OwnedIdentityDid` shared borrow, the legit
+    `ActorDeps { owned_identity: OwnedIdentityDid }` plain field, or `as_did`'s
+    `&DID` return. cfg(test) exempt.
+  - subtree GLOB import of the capability module (`use …identity_capability::*`)
+    and subtree token-REASSEMBLING macro invocations (`paste!`/`concat_idents!`)
+    are banned (fix 4) — a glob hides the cap/mint name from explicit-name
+    recognition, and a token-pasting macro can synthesize the mint identifier
+    from split tokens the AST walk never reassembles (kills K03). cfg(test)
+    exempt.
   - struct location, name-visibility, and field visibility (A / B / E)
 
 OUT OF REMIT (NOT this AST gate — covered by the type system + human review):
@@ -991,6 +1019,24 @@ SUPERVISOR_IMPL_TYPE: str = "Supervisor"
 # `Supervisor::build_actor_deps` lives here and nowhere else.
 BUILD_SITE_REL: str = "crates/scp-runtime/src/context/supervisor/supervisor.rs"
 
+# The declaring MODULE name. A glob `use …identity_capability::*;` (fix 4) drags
+# EVERY item of the capability module — including the cap type and (transitively)
+# any future re-exported mint name — into the importing module under its bare
+# name, defeating the gate's explicit-NAME recognition (rules G/H/K key on the
+# literal `OwnedIdentityDid` / `issue_for_actor` tail; a glob makes those names
+# reachable WITHOUT a nameable `use … as` / scoped path the gate can see). The
+# subtree must name what it imports EXPLICITLY so every other rule can see the
+# cap/mint, so a glob whose path tail is the capability module is banned.
+CAP_MODULE_NAME: str = "identity_capability"
+
+# Token-REASSEMBLING / token-PASTING macros whose INVOCATION in the subtree can
+# synthesize the mint or cap identifier from split tokens (`paste! { [<issue
+# _for_actor>] }`, `concat_idents!(issue_, for_actor)`) — defeating every
+# identifier-keyed rule (tree-sitter never reassembles the split tokens). Mirror
+# the declaring-file macro CATEGORY ban (which is payload-agnostic): ban the
+# INVOCATION of a reassembly macro anywhere in the subtree, cfg(test)-exempt.
+REASSEMBLY_MACROS: frozenset[str] = frozenset({"paste", "concat_idents"})
+
 
 def _type_tail_identifier(type_node, source: bytes) -> str | None:
     """Return the tail identifier of a type node — the bare type name with any
@@ -1097,6 +1143,30 @@ def _use_alias_mint_tail(use_as_clause_node, source: bytes) -> str | None:
     return node_text(alias_node, source) if alias_node is not None else "<?>"
 
 
+def _use_wildcard_is_cap_module(use_wildcard_node, source: bytes) -> bool:
+    """For a `use_wildcard` node (the `…::*` glob of a `use_declaration`),
+    return True iff the glob's PATH (the segment(s) before `::*`) ends in the
+    capability module `identity_capability` — i.e. `use …identity_capability::*;`
+    (fix 4).
+
+    tree-sitter shapes a glob `use a::b::*;` as a `use_wildcard` whose child is
+    a `scoped_identifier` (`a::b`) followed by `::` and `*`; for `use foo::*;`
+    the child is a bare `identifier` (`foo`); for `use *;` (degenerate) there is
+    no path child. We take the path child's TAIL identifier and match it
+    word-exactly against the cap module name. A glob whose tail is some OTHER
+    module is NOT flagged (only the capability module's glob defeats
+    explicit-name recognition).
+    """
+    path_tail: str | None = None
+    for c in use_wildcard_node.children:
+        if c.type == "scoped_identifier":
+            name = c.child_by_field_name("name")
+            path_tail = node_text(name, source) if name is not None else None
+        elif c.type == "identifier":
+            path_tail = node_text(c, source)
+    return path_tail == CAP_MODULE_NAME
+
+
 def _is_mint_reference(node, source: bytes) -> bool:
     """True if `node` is a CODE REFERENCE to the mint fn `issue_for_actor` —
     a `call_expression`/value-path reference whose tail identifier is the mint
@@ -1119,16 +1189,23 @@ def _is_mint_reference(node, source: bytes) -> bool:
         like the `a` in `a::issue_for_actor` is irrelevant anyway). We match the
         scoped node by its `name` field instead.
       - a bare-segment `identifier` inside a `use_list` / `scoped_use_list`
-        (e.g. the `issue_for_actor` in `use a::b::{X, issue_for_actor}`) — a
-        bare list member is deferred to the `use … as` alias ban
-        (`use_aliases`); the membership is detected by walking ancestors for a
-        `use_declaration`. NOTE: a *qualified* plain import
-        (`use a::b::issue_for_actor;`) is NOT excluded — its path tail is a
-        `scoped_identifier` whose `name` is the mint, so the scoped-identifier
-        arm flags it as a reference (intended and correct: such an import
-        enables a later bare `issue_for_actor(d)` call, so banning the import
-        itself is strictly safer — and a non-aliased bare import has no
-        legitimate use in the subtree).
+        that is itself part of an `as`-rename clause — the `use … as X` form is
+        deferred to the `use_aliases` / mint-rename ban. NOTE: a *qualified*
+        plain import (`use a::b::issue_for_actor;`) is NOT excluded — its path
+        tail is a `scoped_identifier` whose `name` is the mint, so the
+        scoped-identifier arm flags it as a reference (intended and correct:
+        such an import enables a later bare `issue_for_actor(d)` call, so banning
+        the import itself is strictly safer — and a non-aliased bare import has
+        no legitimate use in the subtree).
+        (fix 5) A BARE `use_list`/`scoped_use_list` MEMBER of the mint with NO
+        `as` rename — `use self::{issue_for_actor};` / `use a::b::{X,
+        issue_for_actor}` — IS now flagged as a reference (NOT deferred): the
+        bare member re-exports the mint name into the importing module, enabling
+        a later bare `issue_for_actor(d)` call exactly like the qualified plain
+        import above. The `as`-rename clause (which wraps the member in a
+        `use_as_clause`) is still deferred to the rename ban; a bare member's
+        parent is the `use_list` / `scoped_use_list` directly, so it is
+        distinguishable from the `as` form.
       - a `field_identifier` (`x.issue_for_actor`) — tree-sitter spells a
         method/field access tail as `field_identifier`, a DISTINCT node type
         from `identifier`, so it is never matched here. (Moot in practice: the
@@ -1155,28 +1232,122 @@ def _is_mint_reference(node, source: bytes) -> bool:
         # handles the tail; a leading segment is not a mint reference.
         if parent.type == "scoped_identifier":
             return False
-        # Inside a `use` path / alias clause — governed by the use-alias ban.
+        # (fix 5) BARE `use_list` / `scoped_use_list` MEMBER of the mint with NO
+        # `as` rename — `use self::{issue_for_actor};` / `use a::b::{X,
+        # issue_for_actor};`. The bare member's DIRECT parent is the
+        # use-list node (an `as`-renamed member would be wrapped in a
+        # `use_as_clause` instead, which is deferred to the rename ban). Such a
+        # bare member re-exports the mint name into the importing module — a
+        # reference, flagged symmetric to the qualified plain import.
+        if parent.type in ("use_list", "scoped_use_list"):
+            return True
+        # Inside any OTHER `use` path / alias clause (`use … as`, a
+        # `use_as_clause` path segment) — governed by the use-alias / rename
+        # ban, not here.
         if _nearest_enclosing(node, ("use_declaration",)) is not None:
             return False
         return True
     return False
 
 
+def _mint_call_arg_is_owning_did(node, fn_node, source: bytes) -> bool:
+    """True if the mint reference `node` is the FUNCTION of a `call_expression`
+    whose SOLE argument is a bare identifier `<p>` or `<p>.clone()` where `<p>`
+    is a PARAMETER name of the enclosing `build_actor_deps` fn (`fn_node`) — the
+    actor's own `owning_did`.
+
+    Rule K exemption-(b) tightening (fix 3, per-call mint-arg check). The
+    build-site exemption otherwise trusts the ENTIRE BODY of any
+    `Supervisor::build_actor_deps` in `supervisor.rs`, so a SECOND mint call in
+    that body — e.g. `issue_for_actor(DID("attacker"))` minting an ATTACKER DID
+    rather than the actor's own identity — would inherit the exemption (K02).
+    Constraining the exempt call's argument to a bare parameter (or its
+    `.clone()`) of `build_actor_deps` means the ONLY value the exempt mint may
+    consume is the very DID the actor was built for: a constructed `DID("…")`
+    literal, a field access, a different local, or any non-parameter expression
+    is NOT exempt and surfaces as a rule-K mint reference. The real production
+    call is `issue_for_actor(owning_did.clone())` where `owning_did` is the sole
+    `&DID` parameter — exactly this shape.
+
+    Only a mint reference that is the `function` field of a `call_expression`
+    can be exempted (a bare value-path `let f = …::issue_for_actor;` re-exports
+    the mint without calling it and is never exempt). The argument list must
+    contain EXACTLY ONE argument.
+    """
+    parent = node.parent
+    if parent is None or parent.type != "call_expression":
+        return False
+    # `node` must be the CALL's `function` (the callee), not an argument. Compare
+    # by the stable `.id` attribute — tree-sitter returns a FRESH wrapper on
+    # every field access, so Python `is` is unreliable across wrappers.
+    fn_field = parent.child_by_field_name("function")
+    if fn_field is None or fn_field.id != node.id:
+        return False
+    args_node = parent.child_by_field_name("arguments")
+    if args_node is None:
+        return False
+    arg_exprs = [c for c in args_node.children if c.is_named]
+    if len(arg_exprs) != 1:
+        return False
+    arg = arg_exprs[0]
+    # Accept `<ident>` (bare) or `<ident>.clone()` (a method call whose
+    # receiver is a bare identifier and whose method is `clone`).
+    ident_name: str | None = None
+    if arg.type == "identifier":
+        ident_name = node_text(arg, source)
+    elif arg.type == "call_expression":
+        fn = arg.child_by_field_name("function")
+        if fn is not None and fn.type == "field_expression":
+            value = fn.child_by_field_name("value")
+            field = fn.child_by_field_name("field")
+            if (
+                value is not None
+                and value.type == "identifier"
+                and field is not None
+                and node_text(field, source) == "clone"
+            ):
+                ident_name = node_text(value, source)
+    if ident_name is None:
+        return False
+    # The identifier must be a PARAMETER of `fn_node` (the owning_did), not an
+    # arbitrary local / constructed value. Walk the fn's `parameters` node for a
+    # `parameter` whose binding pattern identifier matches.
+    params_node = fn_node.child_by_field_name("parameters")
+    if params_node is None:
+        return False
+    param_names: set[str] = set()
+    for p in params_node.children:
+        if p.type != "parameter":
+            continue
+        pat = p.child_by_field_name("pattern")
+        if pat is not None and pat.type == "identifier":
+            param_names.add(node_text(pat, source))
+    return ident_name in param_names
+
+
 def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
     """True if a mint reference `node` is the ONE legitimate mint CALL site
     (rule K exemption b): it lives in the real build-site FILE
     (`BUILD_SITE_REL`), AND its nearest enclosing `function_item` is named
-    `build_actor_deps`, AND that fn's enclosing `impl_item` targets `Supervisor`.
+    `build_actor_deps`, AND that fn's enclosing `impl_item` targets `Supervisor`,
+    AND that `impl Supervisor` is NOT nested under any in-file `mod` (a
+    nested-mod `impl Supervisor` is a SHADOW that string-tail-matches the real
+    type — fix 2), AND the mint CALL's sole argument is the fn's own
+    `owning_did` parameter (a bare `<p>` or `<p>.clone()`, NOT a constructed
+    `DID("…")` literal — fix 3 per-call mint-arg check).
 
     Structural AND file-pinned, NOT name-text-on-the-line: a reference is exempt
-    ONLY when it lexically lives inside `Supervisor::build_actor_deps`'s body in
-    `supervisor.rs`. A mint call in any OTHER fn — even one a reviewer named
-    `build_actor_deps` on a DIFFERENT impl, OR a real `impl Supervisor` planted
-    in a DIFFERENT subtree file — is NOT exempt. The file pin closes the
-    fake-`struct Supervisor`-in-another-file evasion (which, paired with a
-    projection/opaque return rule J cannot see, would otherwise re-open the
-    mint surface). Verified against the real call at `supervisor.rs` (the
-    `build_actor_deps` method of `impl Supervisor`).
+    ONLY when it lexically lives inside the REAL `Supervisor::build_actor_deps`'s
+    body in `supervisor.rs` AND mints the actor's own identity. A mint call in
+    any OTHER fn — even one a reviewer named `build_actor_deps` on a DIFFERENT
+    impl, a real `impl Supervisor` planted in a DIFFERENT subtree file, a
+    nested-mod SHADOW `impl Supervisor` in `supervisor.rs`, or a SECOND
+    attacker-DID mint inside the real body — is NOT exempt. These three
+    tightenings close the build-site trust hole (K01 nested-mod shadow, K02
+    second/attacker-DID mint) that the bare type-tail + file pin left open.
+    Verified against the real call at `supervisor.rs`:
+    `issue_for_actor(owning_did.clone())` in `Supervisor::build_actor_deps`,
+    whose `impl Supervisor` is top-level.
     """
     if rel != BUILD_SITE_REL:
         return False
@@ -1189,10 +1360,25 @@ def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
     impl_node = _nearest_enclosing(fn_node, ("impl_item",))
     if impl_node is None:
         return False
-    return (
+    if (
         _type_tail_identifier(impl_node.child_by_field_name("type"), source)
-        == SUPERVISOR_IMPL_TYPE
-    )
+        != SUPERVISOR_IMPL_TYPE
+    ):
+        return False
+    # (fix 2) NESTED-MOD-SHADOW BAN. A `mod evil { struct Supervisor; impl
+    # Supervisor { fn build_actor_deps(…) { …issue_for_actor… } } }` planted in
+    # supervisor.rs string-tail-matches `Supervisor` and passes the file pin —
+    # but it is a SHADOW type, not the real `Supervisor`. The canonical
+    # `impl Supervisor` is TOP-LEVEL, so an enclosing `mod` means a shadow:
+    # NOT exempt (its mint reference is then flagged by rule K). Mirrors rule I.
+    if _nested_mod_ancestor(impl_node) is not None:
+        return False
+    # (fix 3) PER-CALL MINT-ARG CHECK. The exempt mint may only mint the actor's
+    # OWN identity: its sole argument must be a bare `owning_did` parameter (or
+    # `owning_did.clone()`), never a constructed `DID("attacker")` literal, a
+    # field access, or another local. A second mint call in the same body that
+    # forges an attacker DID is therefore NOT exempt (K02).
+    return _mint_call_arg_is_owning_did(node, fn_node, source)
 
 
 def _nearest_enclosing(node, kinds: tuple[str, ...]):
@@ -1432,6 +1618,153 @@ def _return_mentions_cap_by_value(return_node, source: bytes, in_cap_impl: bool)
 
     _rec(return_node, False)
     return found[0]
+
+
+# Interior-mutability / shared-cell wrapper generics that hand out an OWNED cap
+# token to anyone holding a SHARED `&` reference to the wrapper — defeating the
+# `&OwnedIdentityDid` shared-borrow contract (a shared borrow must be read-only,
+# unable to mint). A `RefCell<…Cap…>` / `Mutex<…Cap…>` / `OnceLock<…Cap…>` etc.
+# behind a `&` lets a handler `.borrow_mut()` / `.lock()` / `.take()` an owned
+# token out, so the cap reaching one of these wrappers ANYWHERE (param, return,
+# struct field, static) is a by-value escape channel. Determined against the
+# common std interior-mutability surface; matched by the wrapper type's TAIL
+# identifier so `core::cell::RefCell` / `std::sync::Mutex` are caught too.
+_INTERIOR_MUT_WRAPPERS: frozenset[str] = frozenset(
+    {
+        "Cell",
+        "RefCell",
+        "OnceCell",
+        "OnceLock",
+        "LazyCell",
+        "LazyLock",
+        "Mutex",
+        "RwLock",
+        "UnsafeCell",
+        "SyncUnsafeCell",
+    }
+)
+
+
+def _type_escape_cap_reason(
+    type_node, source: bytes, flag_by_value: bool = False
+) -> str | None:
+    """If `type_node` is a type in which the capability appears in an ESCAPE
+    CHANNEL — behind a MUTABLE reference/pointer (`&mut`/`*mut`), inside an
+    interior-mutability wrapper (`Cell`/`RefCell`/`OnceCell`/`OnceLock`/
+    `Mutex`/`RwLock`/`UnsafeCell`/…<…Cap…>), or (when `flag_by_value` is True)
+    PLAIN BY VALUE not behind a shared `&` — return a human reason string, else
+    None.
+
+    This is the matcher for the KEYSTONE escape-position rule (fix 1). The cap
+    appearing in such a position lets a holder MINT/EXTRACT an owned token from a
+    channel that rule J (plain by-value RETURN scan) and rule K (mint-CALL scan)
+    do not cover: an out-param (`&mut OwnedIdentityDid`, `&mut Option<…Cap…>`),
+    a `static`/`const` sink (`static …: Option<Cap>`), or an interior-mut cell
+    handed out behind a SHARED `&` borrow.
+
+    `flag_by_value` SELECTS the context:
+      - False (fn param / fn return / struct field): a PLAIN by-value cap is NOT
+        an escape here — a by-value param consumes the token, a by-value return
+        is rule J's channel (with its constructor exemption), and a plain owning
+        struct field (`ActorDeps { owned_identity: OwnedIdentityDid }`) is the
+        legit by-value home. Only `&mut`/`*mut`/interior-mut occurrences flag.
+      - True (`static`/`const` item): a `static`/`const` holding the cap BY
+        VALUE (e.g. `static …: Option<OwnedIdentityDid>`) is itself a global
+        SINK from which an owned token can be `.take()`n / moved out — flag ANY
+        cap occurrence not solely behind a SHARED `&` (incl. plain by-value,
+        `&mut`, `*mut`, interior-mut). A `static …: &OwnedIdentityDid` shared
+        ref would be read-only and is not flagged.
+
+    It MUST NOT flag a plain `&OwnedIdentityDid` SHARED borrow (read-only — the
+    legit `SupervisorHandle` per-identity param / handle field), nor `as_did`'s
+    `&DID` accessor.
+
+    Walk the type subtree tracking, for each cap occurrence: whether it is under
+    a SHARED `&` (read-only, never an escape), behind a `&mut`/`*mut`, or inside
+    an interior-mut wrapper. A cap under ONLY a shared `&` and no wrapper is NOT
+    an escape. A plain by-value cap is an escape ONLY when `flag_by_value`.
+    """
+    if type_node is None:
+        return None
+    hit: list[str | None] = [None]
+
+    def _rec(n, under_shared_ref: bool, mut_escape: bool, wrapper: str | None) -> None:
+        if hit[0] is not None:
+            return
+        if n.type == "reference_type":
+            # `&T` (shared) vs `&mut T` (mutable). A `mutable_specifier` child
+            # marks `&mut`. A SHARED `&` makes its descendants read-only (sets
+            # under_shared_ref True, clears mut_escape/wrapper); a `&mut` sets
+            # mut_escape. Either way, an enclosing-reference CLEARS any prior
+            # wrapper (the reference is the new outermost indirection).
+            is_mut = any(c.type == "mutable_specifier" for c in n.children)
+            for c in n.children:
+                if c.type == "mutable_specifier":
+                    continue
+                if is_mut:
+                    _rec(c, False, True, None)
+                else:
+                    _rec(c, True, False, None)
+            return
+        if n.type == "pointer_type":
+            # `*const T` vs `*mut T`. A `mutable_specifier` marks `*mut`.
+            is_mut = any(c.type == "mutable_specifier" for c in n.children)
+            for c in n.children:
+                if c.type == "mutable_specifier":
+                    continue
+                if is_mut:
+                    _rec(c, False, True, None)
+                else:
+                    # `*const Cap` is read-pointer; treat like a shared borrow.
+                    _rec(c, True, False, None)
+            return
+        if n.type == "generic_type":
+            head = _type_tail_identifier(
+                n.child_by_field_name("type"), source
+            )
+            args = n.child_by_field_name("type_arguments")
+            if head in _INTERIOR_MUT_WRAPPERS:
+                # The cap inside this wrapper escapes regardless of any
+                # enclosing shared `&` — a `&RefCell<Cap>` still yields an
+                # owned token via `.borrow_mut()`. Mark wrapper, clear
+                # under_shared_ref (the wrapper re-grants mutable access).
+                if args is not None:
+                    for c in args.children:
+                        _rec(c, False, mut_escape, head)
+                # The wrapper head identifier itself is not a cap occurrence.
+                return
+            # Non-interior-mut generic (`Option<…>`, `Vec<…>`, `Box<…>`,
+            # tuple-ish): propagate the current escape context into the args so
+            # `&mut Option<Cap>` / `&mut Vec<Cap>` / `Mutex<Box<Cap>>` /
+            # `static …: Option<Cap>` are caught. The head is not the cap.
+            if args is not None:
+                for c in args.children:
+                    _rec(c, under_shared_ref, mut_escape, wrapper)
+            return
+        if n.type in ("type_identifier", "scoped_type_identifier"):
+            tail = _type_tail_identifier(n, source)
+            if tail == TYPE_NAME:
+                if wrapper is not None:
+                    hit[0] = (
+                        f"{TYPE_NAME} appears inside an interior-mutability "
+                        f"wrapper `{wrapper}<…>`"
+                    )
+                elif mut_escape:
+                    hit[0] = (
+                        f"{TYPE_NAME} appears behind a `&mut`/`*mut` (an "
+                        f"out-parameter / mutable-escape position)"
+                    )
+                elif flag_by_value and not under_shared_ref:
+                    hit[0] = (
+                        f"{TYPE_NAME} appears BY VALUE in a `static`/`const` "
+                        f"item (a global sink an owned token can be moved out of)"
+                    )
+            return
+        for c in n.children:
+            _rec(c, under_shared_ref, mut_escape, wrapper)
+
+    _rec(type_node, False, False, None)
+    return hit[0]
 
 
 def _struct_expr_constructs_cap(struct_expr_node, source: bytes) -> bool:
@@ -2015,6 +2348,7 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
     list[tuple[str, int, str]],
     list[tuple[str, int, str]],
     list[tuple[str, int, str]],
+    list[tuple[str, int, str]],
 ]:
     """Walk scan_dir and return (decls, impls, ctor_fns, cap_aliases,
     trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits,
@@ -2180,13 +2514,20 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
     nested_mod_hits: list[tuple[str, int, str]] = []
     by_value_return_hits: list[tuple[str, int, str]] = []
     mint_ref_hits: list[tuple[str, int, str]] = []
+    escape_position_hits: list[tuple[str, int, str]] = []
+    # (fix 3) Set of (rel, fn_node_id) for `build_actor_deps` fns that have
+    # ALREADY had ONE exempt mint call. A second exempt-shaped mint reference in
+    # the SAME fn is flagged (AT-MOST-ONE mint per build site). Persists across
+    # files in the scan so the count is per-fn (fn ids are unique per parse, and
+    # the rel disambiguates identical ids across files).
+    seen_exempt_mint_fns: set[tuple[str, int]] = set()
     # Rel path of the ONE file allowed to declare the cap type. The same
     # relative path holds under both the real repo_root and the self-test's
     # temp staging root, so the declaring-file macro rule (B, sub-case 1)
     # keys on it identically in both.
     required_rel = REQUIRED_PATH
     if not scan_dir.is_dir():
-        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits, mint_ref_hits
+        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits, mint_ref_hits, escape_position_hits
     for root, _, files in os.walk(scan_dir):
         for fname in files:
             if not fname.endswith(".rs"):
@@ -2478,6 +2819,103 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                                         f"is not handed out by value",
                                     )
                                 )
+                # (KEYSTONE — escape-position ban). Across the SUPERVISOR
+                # SUBTREE, flag the capability appearing BY VALUE in an escape
+                # channel OTHER than a plain return / plain struct field:
+                #   - an OUT-PARAM: a fn `parameter` (or `return_type`) whose
+                #     type puts the cap behind a `&mut`/`*mut` (incl.
+                #     `&mut Option<…Cap…>` / `&mut Vec<…Cap…>`), OR
+                #   - an INTERIOR-MUT WRAPPER (`Cell`/`RefCell`/`OnceCell`/
+                #     `OnceLock`/`Mutex`/`RwLock`/`UnsafeCell`/…<…Cap…>) anywhere
+                #     a type appears — fn param/return, `static`/`const` item, or
+                #     struct `field_declaration`.
+                # This single rule kills the out-param exfil (K01), the `static`
+                # sink (K02 variant), and any interior-mut cell handed out behind
+                # a shared `&`. It MUST NOT flag a plain `&OwnedIdentityDid`
+                # shared borrow (read-only), the `ActorDeps { owned_identity:
+                # OwnedIdentityDid }` plain field, or `issue_for_actor`/`reissue`
+                # returning `Self` (those are rule-J / legit-owning channels).
+                # `#[cfg(test)]` items are exempt (not in the production binary).
+                if rel.startswith(SUPERVISOR_SUBTREE_REL) and node.type in (
+                    "parameter",
+                    "static_item",
+                    "const_item",
+                    "field_declaration",
+                ):
+                    type_node = node.child_by_field_name("type")
+                    # `static`/`const` items flag a PLAIN by-value cap too (a
+                    # global sink a token can be moved out of); fn params /
+                    # struct fields flag ONLY mut/wrapper escapes (a by-value
+                    # param consumes, a plain owning field is the legit home).
+                    flag_by_value = node.type in ("static_item", "const_item")
+                    esc_reason = _type_escape_cap_reason(
+                        type_node, source, flag_by_value=flag_by_value
+                    )
+                    if esc_reason is not None and not (
+                        _inside_cfg_test(node, source)
+                        or _has_preceding_cfg_test(node, source)
+                    ):
+                        kind_label = {
+                            "parameter": "fn parameter",
+                            "static_item": "`static` item",
+                            "const_item": "`const` item",
+                            "field_declaration": "struct field",
+                        }[node.type]
+                        escape_position_hits.append(
+                            (
+                                rel,
+                                node.start_point[0] + 1,
+                                f"{kind_label} puts the capability in a by-value "
+                                f"ESCAPE position: {esc_reason}. A `&mut`/`*mut` "
+                                f"out-param, a `static`/`const` sink, or an "
+                                f"interior-mutability wrapper (`Cell`/`RefCell`/"
+                                f"`OnceCell`/`OnceLock`/`Mutex`/`RwLock`/"
+                                f"`UnsafeCell`) handed out behind a shared `&` all "
+                                f"let a holder MINT or EXTRACT an owned "
+                                f"{TYPE_NAME} token — a channel the by-value "
+                                f"return ban (J) and the mint-call ban (K) do not "
+                                f"cover. The capability may only be a plain "
+                                f"return, a plain owning struct field "
+                                f"(`ActorDeps.owned_identity`), or a SHARED "
+                                f"`&{TYPE_NAME}` borrow (read-only). Restructure "
+                                f"so no `&mut`/`*mut`/interior-mut/static channel "
+                                f"carries the cap by value",
+                            )
+                        )
+                # A fn's RETURN TYPE can ALSO be an escape position (`&mut Cap`,
+                # `*mut Cap`, or an interior-mut wrapper return). Rule J already
+                # bans a PLAIN by-value cap return EXCEPT the two constructors;
+                # this catches the `&mut`/`*mut`/wrapper RETURN shapes (which
+                # rule J's `_return_mentions_cap_by_value` deliberately treats as
+                # behind-a-reference / does not classify as the wrapper escape),
+                # with NO constructor exemption — a constructor has no reason to
+                # return `&mut`/`*mut`/`Cell<Cap>`. cfg(test) exempt.
+                if (
+                    rel.startswith(SUPERVISOR_SUBTREE_REL)
+                    and node.type == "function_item"
+                ):
+                    ret_node2 = node.child_by_field_name("return_type")
+                    esc_ret = _type_escape_cap_reason(ret_node2, source)
+                    if esc_ret is not None and not (
+                        _inside_cfg_test(node, source)
+                        or _has_preceding_cfg_test(node, source)
+                    ):
+                        nm = node.child_by_field_name("name")
+                        fnm = node_text(nm, source) if nm is not None else "<anon>"
+                        escape_position_hits.append(
+                            (
+                                rel,
+                                node.start_point[0] + 1,
+                                f"fn `{fnm}` return type puts the capability in a "
+                                f"by-value ESCAPE position: {esc_ret}. A "
+                                f"`&mut`/`*mut` or interior-mutability-wrapper "
+                                f"return lets the caller MINT or EXTRACT an owned "
+                                f"{TYPE_NAME} token (a channel rules J/K do not "
+                                f"cover). Return a plain `{TYPE_NAME}` (only the "
+                                f"constructors), `&{TYPE_NAME}` (a shared borrow), "
+                                f"or restructure",
+                            )
+                        )
                 if node.type == "attribute_item":
                     path_hit = _path_attr_escape(node, source, full, scan_dir)
                     if path_hit is not None:
@@ -2533,6 +2971,71 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                                 f"(only in `Supervisor::{BUILD_ACTOR_DEPS_FN}`)",
                             )
                         )
+                # (fix 4 — GLOB-IMPORT BAN). A `use …identity_capability::*;`
+                # glob in the subtree drags the cap type and any future
+                # re-exported mint into the importing module under their bare
+                # names WITHOUT a nameable scoped path / `use … as` the gate can
+                # see, defeating the explicit-NAME recognition rules G/H/K rely
+                # on. Force the subtree to name what it imports explicitly. The
+                # `use_wildcard` is found wherever it nests. cfg(test) exempt.
+                if (
+                    rel.startswith(SUPERVISOR_SUBTREE_REL)
+                    and node.type == "use_wildcard"
+                    and _use_wildcard_is_cap_module(node, source)
+                    and not (
+                        _inside_cfg_test(node, source)
+                        or _has_preceding_cfg_test(node, source)
+                    )
+                ):
+                    mint_ref_hits.append(
+                        (
+                            rel,
+                            node.start_point[0] + 1,
+                            f"glob import `use …{CAP_MODULE_NAME}::*` drags the "
+                            f"capability module's items (incl. {TYPE_NAME} and "
+                            f"any re-exported mint) into this module under bare "
+                            f"names, WITHOUT a nameable scoped path / `use … as` "
+                            f"the gate can see — defeating the explicit-NAME "
+                            f"recognition that rules G/H/K rely on. Import "
+                            f"{TYPE_NAME} (and nothing mint-bearing) EXPLICITLY "
+                            f"by name, never via a `::*` glob of the capability "
+                            f"module",
+                        )
+                    )
+                # (fix 4 — REASSEMBLY-MACRO BAN). A `paste!` / `concat_idents!`
+                # INVOCATION in the subtree can synthesize the mint / cap
+                # identifier from split tokens (`paste! { [<issue _for_actor>] }`),
+                # which tree-sitter never reassembles — so an identifier-keyed
+                # rule (G/H/K) cannot see the resulting mint. Mirror the
+                # declaring-file payload-agnostic macro CATEGORY ban: reject the
+                # INVOCATION of a token-reassembling macro anywhere in the
+                # subtree. cfg(test) exempt.
+                if (
+                    rel.startswith(SUPERVISOR_SUBTREE_REL)
+                    and node.type == "macro_invocation"
+                    and _macro_name(node, source).split("::")[-1]
+                    in REASSEMBLY_MACROS
+                    and not (
+                        _inside_cfg_test(node, source)
+                        or _has_preceding_cfg_test(node, source)
+                    )
+                ):
+                    mint_ref_hits.append(
+                        (
+                            rel,
+                            node.start_point[0] + 1,
+                            f"token-reassembling macro "
+                            f"`{_macro_name(node, source)}!` invoked in the "
+                            f"supervisor subtree; a token-pasting / "
+                            f"identifier-concatenating macro can synthesize the "
+                            f"mint `{MINT_FN_NAME}` or the cap `{TYPE_NAME}` "
+                            f"identifier from split tokens that tree-sitter never "
+                            f"reassembles, hiding the resulting mint/construction "
+                            f"from every identifier-keyed rule. Such macros are "
+                            f"banned in the subtree (payload-agnostic category "
+                            f"ban, mirroring the declaring-file macro ban)",
+                        )
+                    )
                 # (K) MINT-CALL CONTAINMENT. Scans EVERY code reference to the
                 # sole arbitrary-DID minter `issue_for_actor` ANYWHERE under the
                 # SUPERVISOR SUBTREE (where the `pub(super)` mint is reachable),
@@ -2553,8 +3056,43 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                 if rel.startswith(SUPERVISOR_SUBTREE_REL) and _is_mint_reference(
                     node, source
                 ):
+                    is_build_site_exempt = _mint_ref_exempt_build_actor_deps(
+                        node, source, rel
+                    )
+                    if is_build_site_exempt:
+                        # (fix 3) AT-MOST-ONE exempt mint call per
+                        # `build_actor_deps`. The exemption is per-FUNCTION;
+                        # without a count, the real `Supervisor::build_actor_deps`
+                        # body could host a SECOND exempt-shaped mint (a second
+                        # `issue_for_actor(owning_did)` re-minting / leaking the
+                        # token). Track exempt refs by the enclosing fn node id;
+                        # the FIRST is exempt, any SUBSEQUENT exempt-shaped ref in
+                        # the SAME fn is FLAGGED. (K02 with an attacker-DID literal
+                        # arg is already non-exempt via the per-call arg check, so
+                        # this guards the residual: a second mint of the SAME
+                        # owning_did — still a needless extra mint surface.)
+                        fn_node = _nearest_enclosing(node, ("function_item",))
+                        fn_key = (rel, fn_node.id if fn_node is not None else -1)
+                        if fn_key in seen_exempt_mint_fns:
+                            ref_text = node_text(node, source).strip()
+                            mint_ref_hits.append(
+                                (
+                                    rel,
+                                    node.start_point[0] + 1,
+                                    f"SECOND exempt-shaped reference to the mint "
+                                    f"`{MINT_FN_NAME}` ({ref_text!r}) inside the "
+                                    f"same `{BUILD_ACTOR_DEPS_FN}`; the build-site "
+                                    f"exemption permits AT MOST ONE mint call per "
+                                    f"`{BUILD_ACTOR_DEPS_FN}` (the actor's own "
+                                    f"`owning_did`). A second mint — even of the "
+                                    f"same identity — is an extra mint surface. "
+                                    f"Mint exactly once",
+                                )
+                            )
+                        else:
+                            seen_exempt_mint_fns.add(fn_key)
                     if not (
-                        _mint_ref_exempt_build_actor_deps(node, source, rel)
+                        is_build_site_exempt
                         or _inside_cfg_test(node, source)
                         or _has_preceding_cfg_test(node, source)
                     ):
@@ -2586,7 +3124,7 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                     walk(c)
 
             walk(tree.root_node)
-    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits, mint_ref_hits
+    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits, mint_ref_hits, escape_position_hits
 
 
 def find_declarations():
@@ -2753,12 +3291,13 @@ def _enforce(
     nested_mod_hits: list[tuple[str, int, str]],
     by_value_return_hits: list[tuple[str, int, str]],
     mint_ref_hits: list[tuple[str, int, str]],
+    escape_position_hits: list[tuple[str, int, str]],
     required_path: str,
     stream=sys.stderr,
 ) -> bool:
-    """Apply checks A-K. Returns True on FAIL, False on PASS. Writes
-    diagnostics to `stream`. Caller must decide exit code and final
-    messaging.
+    """Apply checks A-K plus the escape-position keystone. Returns True on
+    FAIL, False on PASS. Writes diagnostics to `stream`. Caller must decide
+    exit code and final messaging.
     """
     fail = False
 
@@ -3090,6 +3629,22 @@ def _enforce(
     # dodge an identifier-keyed call scan). Rule J is retained as additive
     # defense-in-depth; rule K is strictly additive. FAIL each.
     for rel, line, reason in mint_ref_hits:
+        stream.write(
+            f"{C_RED}FAIL{C_RESET}: {rel}:{line}: {reason}. "
+            f"See ADR-049 §5.\n"
+        )
+        fail = True
+
+    # (KEYSTONE) ESCAPE-POSITION BAN. Across the supervisor subtree, the cap
+    # appearing BY VALUE in a `&mut`/`*mut` out-param / return, a `static`/
+    # `const` sink, or an interior-mutability wrapper (`Cell`/`RefCell`/
+    # `OnceCell`/`OnceLock`/`Mutex`/`RwLock`/`UnsafeCell`<…Cap…>) lets a holder
+    # MINT or EXTRACT an owned token through a channel the by-value return ban
+    # (J) and the mint-call ban (K) do not cover. `_scan_root` already exempted
+    # `#[cfg(test)]` items and verified production has none (only shared
+    # `&OwnedIdentityDid` borrows, the plain `ActorDeps.owned_identity` field,
+    # and `as_did`'s `&DID` return — all permitted). FAIL each.
+    for rel, line, reason in escape_position_hits:
         stream.write(
             f"{C_RED}FAIL{C_RESET}: {rel}:{line}: {reason}. "
             f"See ADR-049 §5.\n"
@@ -3702,6 +4257,98 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
         "rule_k_use_rename",
         "`use … as MintRename` renames the mint fn `issue_for_actor`",
     ),
+    # FIX 2 (NESTED-MOD-SHADOW build-site) — K01. A nested `mod` hosting a SHADOW
+    # `struct Supervisor` whose `build_actor_deps` mints via an out-param. The
+    # shadow's `impl Supervisor` string-tail-matches `Supervisor` and lives in
+    # `supervisor.rs`, so PRE-FIX the build-site exemption trusted its body and
+    # the mint PASSED. Fix 2 requires the exempt `impl Supervisor` be TOP-LEVEL,
+    # so the nested-mod shadow is NOT exempt → rule K flags it. The mint spelling
+    # `k01_shadow_mint::…` is UNIQUE to this fixture.
+    (
+        "build_site_nested_mod_shadow",
+        "'k01_shadow_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 3 (PER-CALL MINT-ARG) — K02. The real `Supervisor::build_actor_deps`
+    # in `supervisor.rs` mints an ATTACKER DID from a CONSTRUCTED `Did(…)`
+    # literal, not its `owning_did` parameter. Pre-fix the exemption trusted the
+    # whole body; fix 3 constrains the exempt arg to a bare param (or `.clone()`),
+    # so the literal-arg mint is NOT exempt → flagged. Spelling
+    # `k02_attacker_mint::…` is UNIQUE to this fixture.
+    (
+        "build_site_attacker_did_arg",
+        "'k02_attacker_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 3 (AT-MOST-ONE mint call) — K02b. A `Supervisor::build_actor_deps`
+    # mints the SAME `owning_did` TWICE; the FIRST is exempt, the SECOND is
+    # flagged by the single-call check. The diagnostic phrase
+    # `SECOND exempt-shaped reference` is UNIQUE to this case.
+    (
+        "build_site_second_mint",
+        "SECOND exempt-shaped reference to the mint `issue_for_actor`",
+    ),
+    # KEYSTONE (static/const by-value sink) — K02-SINK. A module-level
+    # `static mut …: Option<OwnedIdentityDid>` is a global exfil sink rules J/K
+    # never scan. The static/const arm flags the by-value cap. The phrase
+    # `BY VALUE in a `static`/`const` item` is UNIQUE to the static arm.
+    (
+        "keystone_static_sink",
+        "BY VALUE in a `static`/`const` item",
+    ),
+    # KEYSTONE (`&mut` out-param) — ESC1. A `&mut OwnedIdentityDid` fn parameter.
+    # Pinned to the fixture FILE+line so it cannot be satisfied by another file's
+    # identical escape phrase.
+    (
+        "keystone_mut_out_param",
+        "keystone_mut_param.rs:12: fn parameter puts the capability in a by-value ESCAPE position",
+    ),
+    # KEYSTONE (interior-mutability wrapper) — ESC2. A struct field
+    # `Mutex<OwnedIdentityDid>`. The wrapper phrase `interior-mutability wrapper
+    # `Mutex<…>`` is UNIQUE (only this fixture uses `Mutex`).
+    (
+        "keystone_interior_mut_wrapper",
+        "interior-mutability wrapper `Mutex<…>`",
+    ),
+    # KEYSTONE (`&mut Vec<…Cap…>` out-param) — ESC3. The cap behind a `&mut`
+    # inside a collection generic, in the interior-mut fixture file. Pinned to
+    # FILE+line (the `mut_vec_out_param` fn at line 22) to isolate the
+    # `&mut`-wrapping-a-`Vec` propagation path.
+    (
+        "keystone_mut_vec_out_param",
+        "keystone_interior_mut.rs:22: fn parameter puts the capability in a by-value ESCAPE position",
+    ),
+    # FIX 4 (GLOB-IMPORT ban) — K03 part. A `use …identity_capability::*;` glob
+    # in the subtree. The phrase `glob import `use …identity_capability::*`` is
+    # UNIQUE to this rule.
+    (
+        "glob_import_cap_module",
+        "glob import `use …identity_capability::*`",
+    ),
+    # FIX 4 (REASSEMBLY-MACRO ban) — K03 part. A `paste::paste!` invocation in
+    # the subtree. The phrase `token-reassembling macro `paste::paste!`` is
+    # UNIQUE to this rule.
+    (
+        "reassembly_macro_paste",
+        "token-reassembling macro `paste::paste!`",
+    ),
+    # FIX 5 (BARE use-list mint member) — a bare `use bare_list_src::{
+    # issue_for_actor};` (no `as`). Pre-fix `_is_mint_reference` deferred EVERY
+    # use-path member to the `as`-rename ban; fix 5 flags a BARE list member as a
+    # mint reference. Pinned to the fixture FILE+line (the bare-list `use` at
+    # line 19) so it is satisfied ONLY by the bare-member arm, not the qualified
+    # re-export above it.
+    (
+        "bare_list_mint_member",
+        "bare_list_mint_use.rs:19: reference to the sole arbitrary-DID mint `issue_for_actor`",
+    ),
+    # FIX 6 (POSITIVE FILE-PIN) — a fake `Supervisor::build_actor_deps` in a
+    # supervisor-SUBTREE file that is NOT the real build-site `supervisor.rs`.
+    # The build-site exemption is pinned to `BUILD_SITE_REL`, so this same-named
+    # fn in a DIFFERENT subtree file is NOT exempt → rule K flags it. Locks the
+    # file pin against a silent regression. Spelling `file_pin_mint::…` is UNIQUE.
+    (
+        "file_pin_non_build_site",
+        "'file_pin_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
 ]
 
 # Negative-control fn / reference markers that MUST NEVER appear in the
@@ -3722,11 +4369,23 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
 # `do_self_test` asserts NONE of these appear on the pass path, giving the
 # otherwise-silent negative controls real regression teeth (an over-eager
 # scanner that flags an EXEMPT mint would be caught, not shipped green).
+#   - `shared_borrow_ok` — the keystone's shared-borrow negative control. A
+#     `fn shared_borrow_ok(_identity: &OwnedIdentityDid)` is a READ-ONLY shared
+#     borrow (the legit `SupervisorHandle` per-identity shape) and MUST NOT be
+#     flagged as an escape position. Its fn name appears in a diagnostic ONLY if
+#     the keystone over-flagged a plain `&` shared borrow.
+#   - `PlainFieldOk` — the keystone's plain-owning-field negative control. A
+#     `struct PlainFieldOk { owned_identity: OwnedIdentityDid }` plain by-value
+#     field is the cap's legit home (`ActorDeps.owned_identity`), NOT an escape.
+#     The struct marker appears in a diagnostic ONLY if the keystone over-flagged
+#     a plain by-value struct field.
 FORBIDDEN_FIXTURE_SUBSTRINGS: tuple[str, ...] = (
     "test_only_by_value_mint",
     "test_only_fn_by_value_mint",
     "bsite_mint_ok::OwnedIdentityDid::issue_for_actor",
     "cfgtest_mint_ok::OwnedIdentityDid::issue_for_actor",
+    "shared_borrow_ok",
+    "PlainFieldOk",
 )
 
 
@@ -3802,6 +4461,7 @@ def do_self_test() -> int:
             nested_mod_hits,
             by_value_return_hits,
             mint_ref_hits,
+            escape_position_hits,
         ) = _scan_root(fx_scan, tmp_root)
         # Capture stderr to inspect.
         buf = io.StringIO()
@@ -3817,6 +4477,7 @@ def do_self_test() -> int:
             nested_mod_hits,
             by_value_return_hits,
             mint_ref_hits,
+            escape_position_hits,
             fx_required,
             stream=buf,
         )
@@ -3908,6 +4569,7 @@ def main() -> int:
         nested_mod_hits,
         by_value_return_hits,
         mint_ref_hits,
+        escape_position_hits,
     ) = find_declarations()
     if (
         not decls
@@ -3920,6 +4582,7 @@ def main() -> int:
         and not nested_mod_hits
         and not by_value_return_hits
         and not mint_ref_hits
+        and not escape_position_hits
     ):
         # Type does not yet exist AND nothing references it — this is the
         # pre-commit-5 state. (A macro touching the cap type or a trait impl
@@ -3944,6 +4607,7 @@ def main() -> int:
         nested_mod_hits,
         by_value_return_hits,
         mint_ref_hits,
+        escape_position_hits,
         REQUIRED_PATH,
         stream=sys.stderr,
     )

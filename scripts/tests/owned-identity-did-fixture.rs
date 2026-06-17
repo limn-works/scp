@@ -1157,6 +1157,127 @@ impl Supervisor {
     }
 }
 
+// NEGATIVE CONTROL ESC-NEG-1 (KEYSTONE) — a SHARED `&OwnedIdentityDid` borrow
+// parameter (read-only) MUST PASS. This is the legit `SupervisorHandle`
+// per-identity shape (`fn …(identity: &OwnedIdentityDid)`). The keystone
+// escape-position rule flags `&mut`/`*mut`/interior-mut, NOT a plain shared `&`,
+// so this fn MUST NOT contribute any escape-position diagnostic. Its UNIQUE fn
+// name `shared_borrow_ok` is in FORBIDDEN_FIXTURE_SUBSTRINGS — it appears in a
+// diagnostic ONLY if the keystone over-flagged a read-only shared borrow.
+#[allow(dead_code)]
+pub(in crate::context) fn shared_borrow_ok(_identity: &OwnedIdentityDid) {}
+
+// NEGATIVE CONTROL ESC-NEG-2 (KEYSTONE) — the legit `ActorDeps { owned_identity:
+// OwnedIdentityDid }` PLAIN by-value owning struct field MUST PASS. A plain
+// (non-`&mut`, non-wrapper) struct field is the capability's legit home (rule J
+// / the keystone's by-value channel), NOT an escape. The `ActorDeps` struct
+// above already has this field; this is asserted via the forbidden-substring
+// negative control on the field-bearing struct's UNIQUE marker `PlainFieldOk`.
+#[allow(dead_code)]
+pub(in crate::context) struct PlainFieldOk {
+    owned_identity: OwnedIdentityDid,
+}
+
+// BYPASS K01 (FIX 2 nested-mod-shadow + KEYSTONE out-param) — a nested `mod`
+// hosting a SHADOW `struct Supervisor` whose `build_actor_deps` mints via an
+// out-param. Pre-fix the shadow's `impl Supervisor` string-tail-matched
+// `Supervisor` and lived in `supervisor.rs`, so the build-site exemption (b)
+// trusted its body and the mint call PASSED (exit 0); the cap exfiltrated via
+// the `&mut Option<…>` out-param (rule J sees only return types). Fix 2 requires
+// the exempt `impl Supervisor` be TOP-LEVEL (not nested under a `mod`), so the
+// shadow is NOT exempt → the mint reference is flagged by rule K. Fix 1
+// (keystone) INDEPENDENTLY flags the `&mut Option<…Cap…>` out-param. The mint
+// reference spelling `k01_shadow_mint::OwnedIdentityDid::issue_for_actor` is
+// UNIQUE to this fixture, pinning the rule-K nested-mod-shadow assertion.
+#[allow(dead_code)]
+mod k01_shadow {
+    use super::Did;
+    mod k01_shadow_mint {
+        pub(in crate::context) use super::super::OwnedIdentityDid;
+    }
+    struct Supervisor;
+    impl Supervisor {
+        fn build_actor_deps(
+            &self,
+            out: &mut Option<super::OwnedIdentityDid>,
+            d: Did,
+        ) {
+            *out = Some(k01_shadow_mint::OwnedIdentityDid::issue_for_actor(d));
+        }
+    }
+}
+
+// BYPASS K02 (FIX 3 per-call mint-arg) — a SECOND top-level `impl Supervisor`
+// whose `build_actor_deps` mints an ATTACKER DID from a CONSTRUCTED `Did(…)`
+// LITERAL, not its own `owning_did` parameter. Pre-fix the build-site exemption
+// trusted the ENTIRE BODY of any `Supervisor::build_actor_deps` in
+// `supervisor.rs`, so this attacker-DID mint inherited the exemption (exit 0).
+// Fix 3 constrains the exempt mint's sole argument to a bare parameter (or its
+// `.clone()`); a constructed `Did(…)` literal is NOT a parameter, so the call is
+// NOT exempt → rule K flags it. The mint spelling
+// `k02_attacker_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE to this
+// fixture, pinning the per-call-arg assertion.
+mod k02_attacker_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    // On `Supervisor::build_actor_deps` in `supervisor.rs`, top-level — so it
+    // REACHES the per-call mint-arg check (fix 3). The mint's sole argument is a
+    // CONSTRUCTED `Did(…)` literal, NOT the `_owning_did` parameter, so the arg
+    // check returns False → the call is NOT exempt → rule K flags it. This is
+    // the assertion that the build-site exemption no longer trusts the WHOLE
+    // body: an attacker-DID mint in the real fn is rejected.
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, _owning_did: Did) {
+        // Mints an ATTACKER DID literal, not `_owning_did`.
+        let _ =
+            k02_attacker_mint::OwnedIdentityDid::issue_for_actor(Did([9; 32]));
+    }
+}
+
+// BYPASS K02b (FIX 3 at-most-one mint call) — a third `impl Supervisor`-shaped
+// `build_actor_deps` that mints the SAME `owning_did` parameter TWICE. The FIRST
+// mint is exempt (bare-param arg, build-site, top-level impl); the SECOND
+// exempt-shaped mint in the SAME fn is flagged because the build-site exemption
+// permits AT MOST ONE mint call per `build_actor_deps`. The diagnostic carries
+// the UNIQUE phrase `SECOND exempt-shaped reference`, pinning the single-call
+// assertion. (The impl target is `Supervisor` and the fn is `build_actor_deps`
+// in `supervisor.rs`, top-level — so the FIRST call is genuinely exempt and the
+// at-most-one count is what catches the second.)
+mod k02b_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    // Named `build_actor_deps` on a `Supervisor`-tail impl in `supervisor.rs`,
+    // top-level — so the FIRST mint of the bare `owning_did` param is genuinely
+    // exempt (build-site exemption b). The SECOND mint of the SAME param in the
+    // SAME fn is flagged by the AT-MOST-ONE check (fix 3). Uses the DISTINCT
+    // `k02b_mint::…` spelling so the flagged second mint's diagnostic does NOT
+    // collide with the K-NEG-1 `bsite_mint_ok::…` forbidden substring.
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: Did) -> ActorDeps {
+        let _first = k02b_mint::OwnedIdentityDid::issue_for_actor(owning_did);
+        let owned_identity =
+            k02b_mint::OwnedIdentityDid::issue_for_actor(owning_did);
+        ActorDeps { owned_identity }
+    }
+}
+
+// @file: context/supervisor/k02_static_sink.rs
+// BYPASS K02-SINK (KEYSTONE — `static`/`const` by-value sink) — a module-level
+// `static mut` holding the cap BY VALUE in an `Option<…>`. Pre-keystone a static
+// sink was an exfil channel rules J (return) and K (mint call) never scanned: a
+// handler could `mem::take(&mut SINK)` an owned token out. The keystone's
+// static/const arm flags ANY cap occurrence in a `static`/`const` not solely
+// behind a SHARED `&`. The UNIQUE marker `K02_STATIC_SINK` pins this case.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+#[allow(dead_code)]
+static mut K02_STATIC_SINK: Option<OwnedIdentityDid> = None;
+
 // @file: context/supervisor/k_neg_cfg_test_ok.rs
 // NEGATIVE CONTROL K-NEG-2 (FIX — rule K exemption c) — a `#[cfg(test)]` fn that
 // CALLS `issue_for_actor`. A test-only mint reference is not in the production
@@ -1182,5 +1303,116 @@ mod fixture_tests_mint_ref {
     #[allow(dead_code)]
     pub(in crate::context) fn cfg_test_mint_ref_ok(d: Did) -> OwnedIdentityDid {
         cfgtest_mint_ok::OwnedIdentityDid::issue_for_actor(d)
+    }
+}
+
+// @file: context/supervisor/k03_paste_glob.rs
+// BYPASS K03 (FIX 4 glob + reassembly-macro + KEYSTONE out-param) — the
+// token-split mint forgery. A glob `use …identity_capability::*;` drags the cap
+// into the module under its bare name, a `paste!` macro INVOCATION reassembles
+// the mint identifier `[<issue _for_actor>]` from split tokens (which
+// tree-sitter never rejoins), and the result is exfiltrated via a `&mut
+// Option<…Cap…>` out-param. Pre-fix all three slipped: the glob hid the cap name
+// from rule G/H/K recognition, the split tokens hid the mint from the
+// identifier-keyed scan, and the out-param hid the cap from rule J (return-only).
+// Fix 4 INDEPENDENTLY flags (a) the glob import `use …identity_capability::*`
+// and (b) the `paste!` reassembly-macro invocation; fix 1 (keystone) flags the
+// `&mut Option<…>` out-param. The glob/macro/out-param all carry distinct
+// diagnostics asserted below.
+struct Did([u8; 32]);
+use crate::context::supervisor::identity_capability::*;
+#[allow(dead_code)]
+fn k03_leak(out: &mut Option<OwnedIdentityDid>, d: Did) {
+    paste::paste! {
+        *out = Some(OwnedIdentityDid::[<issue _for_actor>](d));
+    }
+}
+
+// @file: context/supervisor/keystone_mut_param.rs
+// BYPASS ESC1 (KEYSTONE — `&mut OwnedIdentityDid` out-param). The plainest
+// escape: a fn parameter typed `&mut OwnedIdentityDid`. A holder of the `&mut`
+// can overwrite / move out an owned token. Rule J (return-only) and rule K
+// (mint-call) never see it. The keystone flags the `&mut Cap` param. The UNIQUE
+// fn name `mut_out_param_escape` pins this shape.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+#[allow(dead_code)]
+pub(in crate::context) fn mut_out_param_escape(_out: &mut OwnedIdentityDid) {}
+
+// @file: context/supervisor/keystone_interior_mut.rs
+// BYPASS ESC2 (KEYSTONE — interior-mutability wrapper field). A struct field
+// `Mutex<OwnedIdentityDid>` hands out an owned token to anyone holding a SHARED
+// `&` to the struct (via `.lock()`), defeating the `&OwnedIdentityDid`
+// read-only-borrow contract. The keystone flags the cap inside an interior-mut
+// wrapper ANYWHERE (here a struct field). The UNIQUE field-bearing struct marker
+// `InteriorMutHolder` pins this shape; the `&mut Vec<…Cap…>` param below
+// (ESC3) exercises the `&mut`-wrapping-a-collection path in the SAME file.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+#[allow(dead_code)]
+pub(in crate::context) struct InteriorMutHolder {
+    cell: std::sync::Mutex<OwnedIdentityDid>,
+}
+// BYPASS ESC3 (KEYSTONE — `&mut Vec<…Cap…>` out-param). The cap behind a `&mut`
+// INSIDE a collection generic — a holder can `.push()` / drain owned tokens. The
+// keystone propagates the `&mut` escape context into the `Vec<…>` args. The
+// UNIQUE fn name `mut_vec_out_param` pins this shape.
+#[allow(dead_code)]
+pub(in crate::context) fn mut_vec_out_param(_out: &mut Vec<OwnedIdentityDid>) {}
+
+// @file: context/supervisor/bare_list_mint_use.rs
+// BYPASS FIX5 (bare `use_list` member of the mint, no `as`). A
+// `use self::{issue_for_actor};` imports the mint under its bare name with NO
+// `as` rename — enabling a later bare `issue_for_actor(d)` call. Pre-fix
+// `_is_mint_reference` deferred EVERY use-path member to the `as`-rename ban
+// (which only catches `as`), so a bare list member slipped through. Fix 5 now
+// flags a BARE `use_list`/`scoped_use_list` member of the mint as a reference
+// (the `as` form is still deferred to the rename ban). The diagnostic is the
+// standard rule-K mint-reference; the UNIQUE module path
+// `bare_list_src::issue_for_actor` (the imported path) and the surrounding
+// context make this assertion isolable via the `issue_for_actor` reference text.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+mod bare_list_src {
+    pub(in crate::context) use super::OwnedIdentityDid::issue_for_actor;
+}
+use bare_list_src::{issue_for_actor};
+
+// @file: context/supervisor/file_pin_forgery_in_subtree.rs
+// BYPASS FIX6 (POSITIVE FILE-PIN, in-subtree) — a fake `impl Supervisor { fn
+// build_actor_deps { …issue_for_actor… } }` planted in a supervisor-SUBTREE file
+// that is NOT the real build-site `supervisor.rs`. The build-site exemption is
+// pinned to `BUILD_SITE_REL` (= `…/supervisor/supervisor.rs`); a same-named
+// `Supervisor::build_actor_deps` in this DIFFERENT subtree file is NOT exempt,
+// so rule K flags its mint reference. This is the POSITIVE assertion that the
+// file pin holds: drop the pin and this forgery PASSES. The mint spelling
+// `file_pin_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE to this fixture.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+mod file_pin_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+struct Supervisor;
+struct ActorDeps {
+    owned_identity: OwnedIdentityDid,
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, d: Did) -> ActorDeps {
+        // NOT exempt: this is not the real `supervisor.rs` build-site file.
+        let owned_identity = file_pin_mint::OwnedIdentityDid::issue_for_actor(d);
+        ActorDeps { owned_identity }
     }
 }
