@@ -24,30 +24,16 @@ traditional web server and no DNS.
 
 ### Local demo vs public hosting
 
-The example is a **LOCAL demo**. It sets:
+The example is a **LOCAL demo**: `HostSiteConfig::defaults(Reach::Local)` with
+`tls: TlsMode::Plaintext` and `dht: DhtMode::Memory` — no NAT probe, no router
+port opened, nothing published. (The source doc-comment explains each choice.)
 
-- `plaintext: true` — serve plain HTTP (no self-signed-cert dance);
-- `skip_nat: true` — skip all NAT/UPnP port mapping, so **no router port is
-  opened**;
-- `dht_mode: DhtMode::Memory` — use an in-memory DHT, so **nothing is published
-  to the network**.
-
-The listener binds `0.0.0.0`, so it is reachable on your LAN at the host's local
-IP — but with `skip_nat` and the in-memory DHT, it is never exposed beyond the
-local network and the node's address is never published.
-
-For **public hosting**, drop `plaintext`/`skip_nat` and opt into
-`dht_mode: DhtMode::Production`. That selects the production Mainline DHT, which
-**publishes the host's public address bound to the node's DID** — an
-IP-to-identity / approximate-location disclosure. Make that choice
-deliberately. The other defaults are public-ready: self-signed HTTPS (the "be
-your own CA" no-DNS model) and NAT probing (NAT-PMP/UPnP, built with
-`--features upnp`). If your node sits behind a tunnel/proxy (e.g. a Cloudflare
-tunnel) keep `skip_nat: true` and let the tunnel provide external reachability.
-
-See the full guide: [`.docs/guides/self-hosting-a-website-on-scp.md`](../../../.docs/guides/self-hosting-a-website-on-scp.md).
-
-For the three ways to expose a site publicly (direct IP, outbound tunnel, reverse proxy), see the [deployment recipes guide](../../../.docs/guides/deploying-an-scp-website.md).
+For **public hosting** (direct IP, outbound tunnel, or reverse proxy), see the
+[deployment recipes](../../../.docs/guides/deploying-an-scp-website.md) — the
+`reach`/`tls`/`dht` knob table and step-by-step recipes are there, including the
+DHT location-disclosure trade-off that `DhtMode::Production` opts into. The
+[background guide](../../../.docs/guides/self-hosting-a-website-on-scp.md) covers
+addressing, NAT traversal, and the full self-host architecture in depth.
 
 ### Turnkey alternative
 

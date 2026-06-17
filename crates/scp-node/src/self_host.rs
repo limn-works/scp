@@ -897,10 +897,11 @@ pub enum HostSiteError {
 ///   is no DNS name to provision for and no upstream terminator in this
 ///   deployment driver).
 /// - `reach`: [`Reach::NatTraversal`] ⇒ `skip_nat = false` (probe NAT, publish a
-///   routable address); [`Reach::Local`] and [`Reach::Tunnel`] ⇒ `skip_nat =
-///   true` (loopback relay URL — correct behind a tunnel/proxy). [`Reach::Domain`]
-///   is a loud error: `host_site` builds a no-domain node, so a domain reach has
-///   no meaning here.
+///   routable address); [`Reach::Local`] ⇒ `skip_nat = true` (loopback relay URL).
+///   [`Reach::Tunnel`] ⇒ `skip_nat = true` (loopback relay URL — correct behind a
+///   tunnel/proxy) *and* emits a `tracing::warn!` that `public_url` is not yet
+///   threaded in `host_site`. [`Reach::Domain`] is a loud error: `host_site` builds
+///   a no-domain node, so a domain reach has no meaning here.
 ///
 /// This lowering does NOT validate the DHT axis: [`DhtMode::Memory`] (do not
 /// publish the DID document) is the fail-safe, non-disclosing direction and is
@@ -943,7 +944,16 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 
     let skip_nat = match reach {
         Reach::NatTraversal => false,
-        Reach::Local | Reach::Tunnel { .. } => true,
+        Reach::Local => true,
+        Reach::Tunnel { public_url } => {
+            tracing::warn!(
+                public_url,
+                "Reach::Tunnel.public_url is carried but not yet threaded in host_site; \
+                 the node publishes a loopback relay URL. Configure the tunnel to forward \
+                 to that loopback listener."
+            );
+            true
+        }
         Reach::Domain { .. } => {
             return Err(HostSiteError::InvalidConfig(
                 "Reach::Domain is not valid for host_site: a hosted site builds a no-domain node \
@@ -1042,7 +1052,7 @@ where
         bind_addr = %http_addr,
         storage_path = %storage_dir.display(),
         mode = "self-host",
-        "hosting site (SQLite storage, no_domain)"
+        "hosting site (SQLite storage, self-host)"
     );
 
     // -- Root storage + custody. The single root `SqliteStorage` handle owns the

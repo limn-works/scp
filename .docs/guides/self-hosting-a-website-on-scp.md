@@ -55,11 +55,11 @@ site projection** machinery:
 
    `routing_id = SHA-256(context_id)` (no domain separator —
    `crates/scp-protocol/src/context/mod.rs:122` `broadcast_routing_id`).
-   `site_handler` (`crates/scp-node/src/projection.rs:2020`) fetches the encrypted
+   `site_handler` (`crates/scp-node/src/projection.rs`, `fn site_handler`) fetches the encrypted
    blob, **decrypts it server-side** with the broadcast key the node holds
-   (`open_broadcast_trusted`, `projection.rs:2138`), and returns **plaintext**
+   (`open_broadcast_trusted`, `projection.rs`), and returns **plaintext**
    bytes with the right `Content-Type`, `ETag`, `Cache-Control`, CSP, and CORS
-   headers (`projection.rs:2212`). A browser fetches and renders it normally; it
+   headers. A browser fetches and renders it normally; it
    never sees MessagePack, MLS, or ciphertext.
 
 Encryption is therefore **at rest and on the wire to the relay** — the relay is a
@@ -76,12 +76,12 @@ pull+decrypt:
 - `open_broadcast` (the signature-verifying *client* decryptor,
   `broadcast.rs:615`) has **zero production callers** — only the host-side
   `open_broadcast_trusted` is wired, inside `scp-node`'s HTTP projection.
-- `broadcast_subscribe` (FFI `crates/scp-ffi/src/context.rs:3949` →
+- `broadcast_subscribe` (FFI `crates/scp-ffi/src/context.rs:4052` →
   `subscribe_broadcast` `crates/scp-runtime/src/context/broadcast_helpers.rs:58`)
   is **local roster membership bookkeeping only** — it opens no socket and
   decrypts nothing.
 - The generic transport-receive path `deliver_incoming`
-  (`crates/scp-runtime/src/context/messaging_helpers.rs:999`) is **MLS-only**; it
+  (`crates/scp-runtime/src/context/messaging_helpers.rs:1002`) is **MLS-only**; it
   has no `BroadcastEnvelope` branch.
 - WASM (browser) has **no transport at all** — `scp-ffi-wasm` doesn't depend on
   `scp-transport`/`scp-runtime`, and its `web-sys` features don't even include
@@ -99,16 +99,17 @@ Three addressing paths, none requiring DNS-as-central-authority:
 
 | Path | Who can use it | DNS? | Notes |
 |------|----------------|------|-------|
-| **Raw public IP:port** | any browser, today | none | `https://<public-ip>:<port>/` (origin-root mount; the canonical `…/scp/broadcast/<rid>/site/<path>` route also works). The self-host surface serves **self-signed HTTPS (TLS 1.3) by default** (§10.12.11) with a SAN for the external IP, so raw-IP HTTPS matches; browsers show a one-time cert warning. The routing_id route is registered unconditionally and ignores the `Host` header (`projection.rs:2256`). Plaintext `http://` is an opt-out via `SCP_NODE_SELF_HOST_PLAINTEXT=1`. |
+| **Raw public IP:port** | any browser, today | none | `https://<public-ip>:<port>/` (origin-root mount; the canonical `…/scp/broadcast/<rid>/site/<path>` route also works). The self-host surface serves **self-signed HTTPS (TLS 1.3) by default** (§10.12.11) with a SAN for the external IP, so raw-IP HTTPS matches; browsers show a one-time cert warning. The routing_id route is registered unconditionally and ignores the `Host` header. Plaintext `http://` is an opt-out via `SCP_NODE_SELF_HOST_PLAINTEXT=1`. |
 | **`did:dht`** | SCP-aware clients | none | Real BitTorrent **Mainline DHT** publish via the `mainline` v6 crate, BEP44 signed mutable items (`crates/scp-identity/src/dht_client/pkarr_client.rs:271` publish / `:303` resolve). Gated behind the `production-dht` feature. No central authority in the publish path; the optional HTTP gateway is a signature-verified resolve-only fallback, empty by default. |
 | **Virtual host** (`Host:` header → routing_id) | any browser | needs DNS | Convenience only; out of scope for the DNS-free goal. |
 
 ### Known addressing gaps (honest)
 
-- **The published DID document carries only the relay (`wss://…/scp/v1`)
-  endpoint — there is *no* HTTP/site service-endpoint type** (`SCPRelay` is the
-  only network endpoint in the closed set at
-  `crates/scp-identity/src/document.rs:203`; no `SCPSite`/`SCPHttp`). So a client
+- **The published DID document carries only relay endpoints — there is *no*
+  HTTP/site service-endpoint type** (`SCPRelay` and `SCPBroadcastContext` are the
+  network endpoint types in the closed set at
+  `crates/scp-identity/src/document.rs`; both point at relay URLs, not an origin
+  HTTP `IP:port`; no `SCPSite`/`SCPHttp` exists). So a client
   **cannot today discover the website's `IP:port` from `did:dht` alone** — it
   learns the relay, not the site. Closing the loop needs a new service-endpoint
   type. *(Tracked in §6.)*
@@ -125,14 +126,12 @@ Three addressing paths, none requiring DNS-as-central-authority:
 
 A node behind a home NAT can make *itself* inbound-reachable using SCP's own
 stack. The reachability strategy `DefaultNatStrategy::select_tier`
-(`crates/scp-node/src/lib.rs:1485`/`:1640`) runs in the **SDK
-`ApplicationNodeBuilder::no_domain()` path** (`lib.rs:3504`) and — critically —
+(`crates/scp-node/src/lib.rs`, `impl NatStrategy for DefaultNatStrategy`) runs in the **`host_site` / `--self-host` path** and — critically —
 operates on **`http_bind_addr.port()`, the public HTTP/site port (default 8443)**,
-not the internal relay port (`lib.rs:3526`).
+not the internal relay port (see `fn build_no_domain_inner`, `crates/scp-node/src/lib.rs`).
 
 - **Tier 1 — UPnP-IGD (`igd-next`) / NAT-PMP (`natpmp`)**: real implementations
-  (`crates/scp-transport/src/nat/upnp.rs:636` `AddPortMapping`, `:809` NAT-PMP
-  request). One-shot `map_port` opens an inbound **TCP** mapping on the router for
+  (see `crates/scp-transport/src/nat/upnp.rs`, `fn map_port`). One-shot `map_port` opens an inbound **TCP** mapping on the router for
   the HTTP port → the website becomes reachable, no manual port-forward.
 - **Tier 2 — STUN** (RFC 8489, `crates/scp-transport/src/nat/mod.rs`): discovers
   the external `IP:port`, classifies NAT type, self-tests reachability, then
@@ -154,13 +153,13 @@ override).
 
 On startup the Tier-1 path opens the TCP mapping **then runs a reachability
 self-test that sends a STUN binding over a *UDP* socket** and asserts the reply's
-mapped address equals the *TCP* mapping (`crates/scp-node/src/lib.rs:1607`,
-`crates/scp-transport/src/nat/mod.rs:380`). On this host the UDP external port
+mapped address equals the *TCP* mapping (`crates/scp-node/src/lib.rs`, `fn try_tier1_upnp`;
+`crates/scp-transport/src/nat/mod.rs`, `fn probe_reachability`). On this host the UDP external port
 (measured 64503) won't equal the TCP mapped port (8443), so the **self-test fails
-and Tier 1 is "rejected," falling through to Tier 2 (STUN)** (`lib.rs:1635`).
+and Tier 1 is "rejected," falling through to Tier 2 (STUN)** (`lib.rs`, `fn try_tier1_upnp`).
 
 **This does not break hosting.** The NAT-PMP TCP mapping is created *before* the
-self-test and is **not released** on failure (`lib.rs:1621`) — so port 8443 stays
+self-test and is **not released** on failure (see the no-release fall-through in `fn try_tier1_upnp`, `crates/scp-node/src/lib.rs`) — so port 8443 stays
 forwarded regardless of which tier "wins." The website is reachable over raw-IP
 TCP, which is exactly what's mapped. The only consequence is cosmetic: the
 published `ws://` relay URL carries the Tier-2 (UDP) address — irrelevant to the
@@ -189,9 +188,8 @@ future work.
    with `--features upnp`.*
 2. ~~The shipped `scp-node` binary mandates `SCP_NODE_DOMAIN` and never calls
    `no_domain()`.~~ **Fixed:** the binary now has an opt-in `--self-host` run mode
-   (`SCP_NODE_SELF_HOST=1`) that selects the `no_domain()` deployment path
-   (`crates/scp-node/src/main.rs` `run_self_host` → `.no_domain()`; the
-   publish/projection wiring lives in `crates/scp-node/src/self_host.rs`). In
+   (`SCP_NODE_SELF_HOST=1`) (`crates/scp-node/src/main.rs` `run_self_host` builds `HostSiteConfig { reach, tls, dht, … }` and calls `host_site_until`;
+   the publish/projection wiring lives in `crates/scp-node/src/self_host.rs`). In
    self-host mode the binary does its own NAT traversal on the public HTTP/site
    port. Domain is only mandated on the default (non-self-host) path. NAT
    port-mapping still requires building with `--features upnp` (§3.1).
@@ -200,12 +198,12 @@ future work.
 4. ~~No NAT-PMP/UPnP lease renewal wired into the node path.~~ **Fixed:** the
    `--self-host` path now renews the NAT port-mapping lease at 50% of the
    gateway-reported TTL (spec §10.12.2) via a contained renewal task tied to the
-   node's shutdown. The mapping created during `build()` is re-issued before
+   node's shutdown. The mapping created during startup is re-issued before
    expiry (NAT-PMP re-send / UPnP re-add, both idempotent), so the site stays
    publicly reachable indefinitely while the node runs. Renewal failures log a
    warning and retry after a short backoff rather than dropping the mapping; the
    loop is cancelled and awaited before the mapping is released on shutdown.
-5. **`no_domain()` self-host path serves self-signed HTTPS (TLS 1.3) by
+5. **Self-host path (`host_site` / `--self-host`) serves self-signed HTTPS (TLS 1.3) by
    default** (spec §10.12.11 "Transport security (website surface)"). The node is
    its own CA ("be your own CA"): the cert is self-signed with no DNS name and no
    CA authority, presenting SANs for `localhost`, `127.0.0.1`, and — when known at
@@ -245,8 +243,7 @@ UPnP-IGD (SSDP): no response (macOS multicast quirk; non-fatal — NAT-PMP suffi
 `71.249.150.234` with **no manual port-forward**, because (a) the NAT is cone, so
 Tier-2's hole-stays-open assumption holds, and (b) the gateway speaks **NAT-PMP**,
 so Tier-1 can auto-open the HTTP port. The only required engineering is enabling
-the `upnp` feature and running `scp-node --self-host` (which selects the
-`no_domain()` builder path). This path serves **self-signed HTTPS (TLS 1.3) by
+the `upnp` feature and running `scp-node --self-host` (which uses `HostSiteConfig::defaults` + `host_site_until`). This path serves **self-signed HTTPS (TLS 1.3) by
 default** (§10.12.11) — browsers show a one-time cert warning over raw-IP; set
 `SCP_NODE_SELF_HOST_PLAINTEXT=1` to fall back to plaintext `http://` for a DNS-free
 stress test (the content is public broadcast anyway).
@@ -268,7 +265,7 @@ reusable diagnostic — see §6.)*
 mechanism *and* the "node opens a router port" security consideration (§10.12.2).
 The only upstream edit artifact-flow requires: **one clarifying sentence** in
 §10.12.8 / §18.6 that the `scp-node` reference binary exposes a `--self-host` mode
-selecting `no_domain`, plus **PRD stories** (validate with
+via `host_site_until`, plus **PRD stories** (validate with
 `scripts/validate-prd.py`). That spec sentence + PRD is execution step 1.
 
 **Security posture = implementation requirements (not optional):**
@@ -289,7 +286,7 @@ home line doesn't have. Honest, not fixable from here.
 
 **Phase 1 — Minimal viable self-host (cone-NAT, this machine):** ✅ implemented
 - Build path with `production-dht` + `upnp` features.
-- The `scp-node --self-host` binary mode uses `ApplicationNodeBuilder::no_domain()`:
+- The `scp-node --self-host` binary mode builds `HostSiteConfig { reach: Reach::NatTraversal, tls, dht, … }` and calls `host_site_until`:
   probes NAT → NAT-PMP-maps the HTTP port → STUN-confirms → publishes `did:dht` to
   Mainline. Serves self-signed HTTPS by default (§10.12.11);
   `SCP_NODE_SELF_HOST_PLAINTEXT=1` opts out to plaintext for a DNS-free stress test.
@@ -310,7 +307,7 @@ home line doesn't have. Honest, not fixable from here.
 - (Optional) cert-fingerprint-over-DID for CA-less self-signed TLS verification.
 
 **Phase 4 — TLS without a central CA:**
-- ✅ Self-signed TLS (TLS 1.3) on the `no_domain()`/self-host path is the default
+- ✅ Self-signed TLS (TLS 1.3) on the self-host path is the default
   (§10.12.11); the node is its own CA, with SANs for `localhost`/`127.0.0.1`/the
   external IP. Plaintext is the explicit `SCP_NODE_SELF_HOST_PLAINTEXT=1` opt-out.
 - (Future) DID-fingerprint pinning over the self-signed cert (bind the cert
@@ -322,10 +319,10 @@ home line doesn't have. Honest, not fixable from here.
 ## 6. Open items / gaps to close (tracked here, not as throwaway issues)
 
 - [ ] `upnp` feature not enabled by default for `scp-node` (§3.1).
-- [x] `scp-node` binary now has a `no_domain()`/NAT-traversal serving mode (§3.2) —
-      the opt-in `--self-host` run mode selects `no_domain()` and does its own NAT
-      traversal on the public site port; serves self-signed HTTPS by default
-      (§10.12.11).
+- [x] `scp-node` binary now has a `--self-host`/NAT-traversal serving mode (§3.2) —
+      the opt-in `--self-host` run mode uses `HostSiteConfig` + `host_site_until` and
+      does its own NAT traversal on the public site port; serves self-signed HTTPS by
+      default (§10.12.11).
 - [x] NAT-PMP/UPnP lease renewal wired into the `--self-host` node path (§3.4) —
       renews at 50% of the gateway-reported TTL, retries on failure, released on
       shutdown.
@@ -374,7 +371,7 @@ home line doesn't have. Honest, not fixable from here.
   publishes sealed `BroadcastContent` envelopes onto that relay, the relay stores
   the encrypted blobs, and `commit_deploy` scans **that same relay's blob storage**
   to build the `path → blob_id` index. Supervisor↔node communication is via the
-  relay, not a shared backend. **Other as-built facts now reflected above:**
+  relay, not a shared backend. **Other as-built facts verified at this date:**
   self-host serves self-signed HTTPS (TLS 1.3) by default with plaintext opt-out
   (`SCP_NODE_SELF_HOST_PLAINTEXT=1`) per §10.12.11; the `scp-node --self-host`
   binary mode selects `no_domain()` (§3 gap #2 / §6 resolved); origin-root mount
@@ -383,8 +380,8 @@ home line doesn't have. Honest, not fixable from here.
   `crates/scp-node/src/main.rs`); `SCP_NODE_SELF_HOST_NO_NAT=1` skips the STUN
   probe behind a tunnel/proxy; NAT-PMP/UPnP lease renews at 50% TTL.
 - **2026-06-14 (library entrypoint)** — the self-host deploy+serve core is now
-  also exposed as a public library API, `scp_node::host_site(HostSiteOptions)` /
-  `host_site_until(opts, shutdown)` (`crates/scp-node/src/self_host.rs`), so
+  also exposed as a public library API, `scp_node::host_site(HostSiteConfig)` /
+  `host_site_until(config, shutdown)` (`crates/scp-node/src/self_host.rs`), so
   "host a website on SCP" is usable as a normal async Rust call in addition to
   the turnkey `scp-node --self-host` binary. The binary is now a thin wrapper
   over `host_site_until` (env/CLI parsing, the loud banner, and the live-URL
@@ -396,3 +393,4 @@ home line doesn't have. Honest, not fixable from here.
   identity disclosure the binary gates behind `--self-host` + its banner). No new
   protocol logic, specs, ADRs, or enforcement/capability-matrix changes — a
   packaging/ergonomics refactor of the already-shipped self-host flow.
+- **2026-06-16 (ADR-052 P3a/P5)** — `ApplicationNodeBuilder` and its `.no_domain()` / `.identity_with_storage()` methods were deleted in ADR-052 Phase B-P3a (PR #1815). The `--self-host` binary path now builds `HostSiteConfig { reach: Reach::NatTraversal, tls, dht, … }` and calls `host_site_until` directly (`crates/scp-node/src/main.rs` `run_self_host`). Updated §3, §4, §5, and §6 to reflect the current API. Running log entries from 2026-06-13/2026-06-14 referenced the former typestate builder and are preserved as historical record.

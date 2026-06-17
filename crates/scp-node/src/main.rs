@@ -10,8 +10,8 @@
 //! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
 //!    subsystems — nothing persists across restarts.
 //! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
-//!    (`no_domain` mode) — opens an inbound public port, publishes the host's
-//!    IP to the DHT, and serves the site over self-signed HTTPS by default
+//!    (no DNS name required) — opens an inbound public port, publishes the host's
+//!    IP to the DHT by default, and serves the site over self-signed HTTPS by default
 //!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP).
 //!
 //! Configuration is read from CLI flags and environment variables.
@@ -139,9 +139,10 @@ USAGE:
 OPTIONS:
     --relay-only            Run as a bare relay server only (no identity, no HTTP)
     --ephemeral             Use in-memory storage for all subsystems (no persistence)
-    --self-host             Host a static site entirely on SCP (no_domain mode).
+    --self-host             Host a static site entirely on SCP (no DNS name required).
                             Opens an inbound port to the PUBLIC INTERNET and
-                            publishes the host's IP to the DHT.
+                            publishes the host's IP to the DHT by default
+                            (`SCP_NODE_DHT_MODE=memory` skips publication).
                             Self-signed HTTPS by default (SCP_NODE_SELF_HOST_PLAINTEXT=1
                             for plain HTTP). See the loud startup banner for the full warning.
     --site-dir <PATH>       Directory of static files to host in --self-host mode
@@ -462,12 +463,10 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
         scp_node::self_host::StorageSequenceStore::new(Arc::clone(&node_storage_arc)),
     );
 
-    let dht_mode = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
-
-    // Explicit match: a typo (e.g. "memroy") must NOT silently fall through to
+    // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
     // the production DHT, which would publish the host's address to the network.
-    match dht_mode.as_str() {
-        "memory" => {
+    match parse_dht_mode_or_exit() {
+        scp_node::DhtMode::Memory => {
             tracing::warn!(
                 "using InMemoryDhtClient — DID documents will NOT be published to the network"
             );
@@ -488,7 +487,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
             )
             .await;
         }
-        "production" => {
+        scp_node::DhtMode::Production => {
             // DHT HTTP gateways come from the same env var the self-host path
             // reads; the library helper threads them into the pkarr client.
             let dht_gateways = dht_gateways_from_env();
@@ -516,6 +515,20 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
             )
             .await;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+
+/// Parses `SCP_NODE_DHT_MODE` from the environment and exits on unrecognised
+/// values. The fail-closed exit prevents a typo (e.g. "memroy") from silently
+/// falling through to the production DHT and publishing the host's address.
+fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
+    let raw = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
+    match raw.as_str() {
+        "memory" => scp_node::DhtMode::Memory,
+        "production" => scp_node::DhtMode::Production,
         other => {
             tracing::error!(
                 value = %other,
@@ -569,14 +582,11 @@ fn self_host_banner(port: u16, plaintext: bool, publishes_dht: bool) -> String {
          \x20    Set SCP_NODE_SELF_HOST_PLAINTEXT=1 to serve plain HTTP instead."
     };
     let dht_line = if publishes_dht {
-        "  * Your host's PUBLIC IP will be published to the global Mainline DHT, bound to
-\
+        "  * Your host's PUBLIC IP will be published to the global Mainline DHT, bound to\n\
          \x20    this node's DID. This is an IP<->identity disclosure (approximate-location dox)."
     } else {
-        "  * DHT publishing is OFF (SCP_NODE_DHT_MODE=memory): your host's address is NOT
-\
-         \x20    published to the Mainline DHT. The node is reachable on the opened port but is
-\
+        "  * DHT publishing is OFF (SCP_NODE_DHT_MODE=memory): your host's address is NOT\n\
+         \x20    published to the Mainline DHT. The node is reachable on the opened port but is\n\
          \x20    NOT DHT-discoverable -- share its address out-of-band."
     };
     format!(
@@ -653,23 +663,9 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
     let skip_nat = self_host_skip_nat();
 
     // -- DHT mode: production pkarr by default; memory for "reachable but not
-    //    DHT-discoverable" hosting. An unrecognized value must NOT silently fall
-    //    through to the production DHT (which would publish the host's address).
-    //    Parsed BEFORE the banner so the banner can state the actual disclosure
-    //    posture (memory = address NOT published). --
-    let dht_mode = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
-    let dht_mode = match dht_mode.as_str() {
-        "memory" => scp_node::DhtMode::Memory,
-        "production" => scp_node::DhtMode::Production,
-        other => {
-            tracing::error!(
-                value = %other,
-                "unrecognized SCP_NODE_DHT_MODE (expected 'memory' or 'production'); \
-                 refusing to default to production DHT to avoid unintended IP publication"
-            );
-            std::process::exit(1);
-        }
-    };
+    //    DHT-discoverable" hosting. Parsed BEFORE the banner so the banner can
+    //    state the actual disclosure posture (memory = address NOT published). --
+    let dht_mode = parse_dht_mode_or_exit();
     let publishes_dht = matches!(dht_mode, scp_node::DhtMode::Production);
 
     // -- Loud startup banner BEFORE opening any socket --
