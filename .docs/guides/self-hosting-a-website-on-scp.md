@@ -125,9 +125,9 @@ Three addressing paths, none requiring DNS-as-central-authority:
 
 A node behind a home NAT can make *itself* inbound-reachable using SCP's own
 stack. The reachability strategy `DefaultNatStrategy::select_tier`
-(`crates/scp-node/src/lib.rs:1485`/`:1640`) runs in the **`host_site` / `--self-host` path** and — critically —
+(`crates/scp-node/src/lib.rs`, `impl NatStrategy for DefaultNatStrategy`) runs in the **`host_site` / `--self-host` path** and — critically —
 operates on **`http_bind_addr.port()`, the public HTTP/site port (default 8443)**,
-not the internal relay port (`lib.rs:3526`).
+not the internal relay port (see `lib.rs:3193` comment).
 
 - **Tier 1 — UPnP-IGD (`igd-next`) / NAT-PMP (`natpmp`)**: real implementations
   (`crates/scp-transport/src/nat/upnp.rs:636` `AddPortMapping`, `:809` NAT-PMP
@@ -188,7 +188,7 @@ future work.
    with `--features upnp`.*
 2. ~~The shipped `scp-node` binary mandates `SCP_NODE_DOMAIN` and never calls
    `no_domain()`.~~ **Fixed:** the binary now has an opt-in `--self-host` run mode
-   (`SCP_NODE_SELF_HOST=1`) (`crates/scp-node/src/main.rs` `run_self_host` calls `host_site_until(HostSiteConfig::defaults(Reach::NatTraversal) { … })`;
+   (`SCP_NODE_SELF_HOST=1`) (`crates/scp-node/src/main.rs` `run_self_host` builds `HostSiteConfig { reach, tls, dht, … }` and calls `host_site_until`;
    the publish/projection wiring lives in `crates/scp-node/src/self_host.rs`). In
    self-host mode the binary does its own NAT traversal on the public HTTP/site
    port. Domain is only mandated on the default (non-self-host) path. NAT
@@ -286,7 +286,7 @@ home line doesn't have. Honest, not fixable from here.
 
 **Phase 1 — Minimal viable self-host (cone-NAT, this machine):** ✅ implemented
 - Build path with `production-dht` + `upnp` features.
-- The `scp-node --self-host` binary mode calls `host_site_until(HostSiteConfig::defaults(Reach::NatTraversal) { … })`:
+- The `scp-node --self-host` binary mode builds `HostSiteConfig { reach: Reach::NatTraversal, tls, dht, … }` and calls `host_site_until`:
   probes NAT → NAT-PMP-maps the HTTP port → STUN-confirms → publishes `did:dht` to
   Mainline. Serves self-signed HTTPS by default (§10.12.11);
   `SCP_NODE_SELF_HOST_PLAINTEXT=1` opts out to plaintext for a DNS-free stress test.
