@@ -105,10 +105,11 @@ Three addressing paths, none requiring DNS-as-central-authority:
 
 ### Known addressing gaps (honest)
 
-- **The published DID document carries only the relay (`wss://…/scp/v1`)
-  endpoint — there is *no* HTTP/site service-endpoint type** (`SCPRelay` is the
-  only network endpoint in the closed set at
-  `crates/scp-identity/src/document.rs:203`; no `SCPSite`/`SCPHttp`). So a client
+- **The published DID document carries only relay endpoints — there is *no*
+  HTTP/site service-endpoint type** (`SCPRelay` and `SCPBroadcastContext` are the
+  network endpoint types in the closed set at
+  `crates/scp-identity/src/document.rs`; both point at relay URLs, not an origin
+  HTTP `IP:port`; no `SCPSite`/`SCPHttp` exists). So a client
   **cannot today discover the website's `IP:port` from `did:dht` alone** — it
   learns the relay, not the site. Closing the loop needs a new service-endpoint
   type. *(Tracked in §6.)*
@@ -127,7 +128,7 @@ A node behind a home NAT can make *itself* inbound-reachable using SCP's own
 stack. The reachability strategy `DefaultNatStrategy::select_tier`
 (`crates/scp-node/src/lib.rs`, `impl NatStrategy for DefaultNatStrategy`) runs in the **`host_site` / `--self-host` path** and — critically —
 operates on **`http_bind_addr.port()`, the public HTTP/site port (default 8443)**,
-not the internal relay port (see `lib.rs:3193` comment).
+not the internal relay port (see `fn build_no_domain_inner`, `crates/scp-node/src/lib.rs`).
 
 - **Tier 1 — UPnP-IGD (`igd-next`) / NAT-PMP (`natpmp`)**: real implementations
   (see `crates/scp-transport/src/nat/upnp.rs`, `fn map_port`). One-shot `map_port` opens an inbound **TCP** mapping on the router for
@@ -158,7 +159,7 @@ mapped address equals the *TCP* mapping (`crates/scp-node/src/lib.rs`, `fn try_t
 and Tier 1 is "rejected," falling through to Tier 2 (STUN)** (`lib.rs`, `fn try_tier1_upnp`).
 
 **This does not break hosting.** The NAT-PMP TCP mapping is created *before* the
-self-test and is **not released** on failure (see `lib.rs:1865` comment) — so port 8443 stays
+self-test and is **not released** on failure (see the no-release fall-through in `fn try_tier1_upnp`, `crates/scp-node/src/lib.rs`) — so port 8443 stays
 forwarded regardless of which tier "wins." The website is reachable over raw-IP
 TCP, which is exactly what's mapped. The only consequence is cosmetic: the
 published `ws://` relay URL carries the Tier-2 (UDP) address — irrelevant to the
