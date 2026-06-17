@@ -945,14 +945,12 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
         Reach::NatTraversal => false,
         Reach::Local => true,
         Reach::Tunnel { public_url } => {
-            if !public_url.is_empty() {
-                tracing::warn!(
-                    public_url,
-                    "Reach::Tunnel.public_url is carried but not yet threaded in host_site; \
-                     the node publishes a loopback relay URL. Configure the tunnel to forward \
-                     to that loopback listener."
-                );
-            }
+            tracing::warn!(
+                public_url,
+                "Reach::Tunnel.public_url is carried but not yet threaded in host_site; \
+                 the node publishes a loopback relay URL. Configure the tunnel to forward \
+                 to that loopback listener."
+            );
             true
         }
         Reach::Domain { .. } => {
