@@ -391,7 +391,7 @@ Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
          leaf = 0x7a1a91c33ddaa1a92c02f70a3f567f065bed48b578124a803c07dca2f9a47863
 
   seq 4  ContextTombstoned        ts 1700000004
-         payload = rmp(ContextTombstonedPayload{ destination_context_id:"ctx-dest",
+         payload = rmp(ContextTombstonedPayload{ destination_id:"ctx-dest",
                        migration_proposal_id:[0xCD;32] })
          leaf = 0x3848718f23aefaba0e47743e72f5ce3bcc3254bc09b4cb38c3f5c263c9c4dd8d
 
