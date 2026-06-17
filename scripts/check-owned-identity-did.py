@@ -1633,16 +1633,44 @@ def _mint_call_arg_is_owning_did(node, fn_node, source: bytes) -> bool:
     params_node = fn_node.child_by_field_name("parameters")
     if params_node is None:
         return False
+    # (fix 2) POSITIONAL + COUNT-BOUNDED self-exclusion (fail-closed). A
+    # receiver-shaped parameter is either a `self_parameter` node (bare `&self` /
+    # `&mut self` / `self`) or a `parameter` whose binding pattern is the `self`
+    # keyword (typed-`self`, `self: &Arc<Self>`). The PRIOR form dropped EVERY
+    # such param regardless of position or count. tree-sitter is error-tolerant,
+    # so a malformed `fn f(self: &Arc<Self>, attacker: DID, self: &Handle)` tags
+    # BOTH `self`-spelled params as receiver-shaped; dropping both leaves
+    # `attacker: DID` as the "sole non-`self` param" → wrongly exempt. rustc
+    # rejects every such spelling (one receiver, first position only), so this is
+    # not live-exploitable — but the gate must NOT depend on rustc. We therefore
+    # enforce the receiver invariant STRUCTURALLY: only the FIRST value parameter
+    # (value-index 0) may be receiver-shaped; a receiver-shape at value-index ≥ 1,
+    # OR more than one receiver-shape total, is malformed → REFUSE the exemption
+    # (fail-closed). Punctuation children (`(`, `)`, `,`) are not value params and
+    # do not advance the value-index. The real production
+    # `build_actor_deps(self: &Arc<Self>, owning_did: &DID)` has exactly one
+    # receiver-shape in first position → still exempt.
     non_self_params = []
+    value_index = -1
     for p in params_node.children:
-        if p.type != "parameter":
-            # `self_parameter` (bare `&self` / `&mut self` / `self`) and
-            # punctuation are not real value parameters — skipped.
+        if p.type not in ("parameter", "self_parameter"):
+            # Punctuation (`(`, `)`, `,`) — not a value parameter. Does not
+            # advance the value-index.
             continue
-        pat = p.child_by_field_name("pattern")
-        if pat is not None and pat.type == "self":
-            # Typed-`self` (`self: &Arc<Self>`): a `parameter` whose binding is
-            # the `self` keyword. It is NOT a value parameter — excluded.
+        value_index += 1
+        is_receiver = p.type == "self_parameter"
+        if p.type == "parameter":
+            pat = p.child_by_field_name("pattern")
+            if pat is not None and pat.type == "self":
+                # Typed-`self` (`self: &Arc<Self>`): a `parameter` whose binding
+                # is the `self` keyword. Receiver-shaped, not a value parameter.
+                is_receiver = True
+        if is_receiver:
+            # A receiver-shape is only well-formed at value-index 0. ANY receiver
+            # at value-index ≥ 1 (a SECOND `self`-spelled param) is malformed and
+            # would let the count-of-non-`self` logic miscount → fail-closed.
+            if value_index != 0:
+                return False
             continue
         non_self_params.append(p)
     # EXACTLY ONE non-`self` parameter. A second parameter (the `attacker: DID`
@@ -1701,6 +1729,32 @@ def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
         return False
     name_node = fn_node.child_by_field_name("name")
     if name_node is None or node_text(name_node, source) != BUILD_ACTOR_DEPS_FN:
+        return False
+    # (fix 1) DIRECT-IMPL-METHOD BAN — symmetric to the construction path's
+    # `is_impl_method` structural guard in `_construction_hit_reason` and the
+    # nested-mod guard below. The mint-call exemption is a PARALLEL trust
+    # decision to the construction path: it must reject a NESTED fn named
+    # `build_actor_deps` declared lexically INSIDE the real
+    # `Supervisor::build_actor_deps` body. Such a nested fn passes every other
+    # check — name `build_actor_deps`, nearest `impl_item` = the real
+    # `impl Supervisor`, no intervening escapable scope (it IS `fn_node`, the
+    # boundary, never an INTERVENING node), one `&DID` param minting its own
+    # `owning_did` — yet its `owning_did` is INSIDER-CONTROLLED at the nested
+    # fn's call site (a plain `call_expression` the gate never inspects), not the
+    # trusted supervisor-supplied DID. A REAL inherent method's `function_item`
+    # is a direct child of the impl block's `declaration_list`, so its parent
+    # chain is `function_item -> declaration_list -> impl_item`. A nested fn's
+    # parent is a `block`, NOT a `declaration_list`, so this predicate is False
+    # for it → the exemption is refused and rule K flags its mint. The real
+    # production `Supervisor::build_actor_deps` IS a direct method
+    # (`function_item -> declaration_list -> impl_item`), so it stays exempt.
+    # Strictly ADDITIVE: it can only make the exemption MORE restrictive.
+    if not (
+        fn_node.parent is not None
+        and fn_node.parent.type == "declaration_list"
+        and fn_node.parent.parent is not None
+        and fn_node.parent.parent.type == "impl_item"
+    ):
         return False
     # (fix 2) GENERIC-`build_actor_deps` BAN. The per-call mint-arg check below
     # (`_mint_call_arg_is_owning_did`) identifies the owning binding by counting
@@ -4984,6 +5038,36 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     (
         "build_site_wrapper_owning_param",
         "'ti_wrap_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 1 (DIRECT-IMPL-METHOD BAN — nested `fn build_actor_deps`) — a nested
+    # `fn build_actor_deps(owning_did: &DID)` declared lexically INSIDE the real
+    # `Supervisor::build_actor_deps` body, minting `owning_did.clone()` directly.
+    # Pre-fix it passed every mint-call-exemption check (name `build_actor_deps`,
+    # nearest `impl_item` = the real `impl Supervisor`, not generic / nested-mod,
+    # no intervening escapable scope — it IS `fn_node`, one `&DID` param minting
+    # its own bare `owning_did`), yet its `owning_did` is INSIDER-CONTROLLED at
+    # the nested fn's plain `call_expression` site (which the gate never inspects).
+    # Fix 1 requires the exempt fn be a DIRECT impl method
+    # (`function_item -> declaration_list -> impl_item`); a nested fn's parent is a
+    # `block`, so the exemption is refused → rule K flags the nested mint. The mint
+    # spelling `nested_fn_direct_mint::…` is UNIQUE to this fixture.
+    (
+        "build_site_nested_fn_direct",
+        "'nested_fn_direct_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 2 (POSITIONAL + COUNT-BOUNDED self-exclusion — second `self`-param) — a
+    # `build_actor_deps(self: &Arc<Self>, attacker: DID, self: &Handle)`. tree-
+    # sitter (error-tolerant) tags BOTH `self`-spelled params as receiver-shaped;
+    # the prior self-exclusion dropped both regardless of position/count, leaving
+    # `attacker: DID` as the "sole non-`self` param" → wrongly pinned as the owning
+    # binding → the `attacker` mint inherited the exemption (rustc rejects this
+    # spelling, so not live-exploitable, but the gate must not depend on rustc).
+    # Fix 2 refuses the exemption when any receiver-shape appears at value-index
+    # ≥ 1 (fail-closed) → rule K flags the mint. The mint spelling
+    # `second_self_param_mint::…` is UNIQUE to this fixture.
+    (
+        "build_site_second_self_param",
+        "'second_self_param_mint::OwnedIdentityDid::issue_for_actor'",
     ),
 ]
 

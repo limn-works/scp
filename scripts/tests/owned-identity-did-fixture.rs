@@ -1723,6 +1723,77 @@ impl Supervisor {
     }
 }
 
+// BYPASS NESTED-FN-DIRECT (FIX 1 — direct-impl-method ban) — a nested
+// `fn build_actor_deps(owning_did: &DID)` declared lexically INSIDE the REAL
+// `Supervisor::build_actor_deps` body, minting `owning_did.clone()` DIRECTLY.
+// Pre-fix this passed every mint-call-exemption check: its nearest
+// `function_item` is named `build_actor_deps`; its nearest `impl_item` is the
+// real top-level `impl Supervisor`; it is not generic / nested-mod-shadowed;
+// there is NO intervening escapable scope (the nested fn IS `fn_node`, the
+// boundary); it has exactly one non-`self` `&DID` param and mints that bare
+// `owning_did` — so `_mint_ref_exempt_build_actor_deps` returned True and the
+// mint PASSED (exit 0). But the nested fn's `owning_did` is INSIDER-CONTROLLED
+// at the nested fn's call site (`build_actor_deps(&DID([9; 32]))`, a plain
+// `call_expression` the gate never inspects), NOT the trusted supervisor-
+// supplied DID. The construction path already rejects a nested constructor via
+// its `is_impl_method` guard; the mint-call exemption was the PARALLEL path that
+// lacked it. Fix 1 requires the exempt fn's parent chain be
+// `function_item -> declaration_list -> impl_item`; a nested fn's parent is a
+// `block`, so the guard is False → the nested mint is NOT exempt → rule K flags
+// it. The mint spelling `nested_fn_direct_mint::OwnedIdentityDid::issue_for_actor`
+// is UNIQUE to this fixture, pinning the direct-impl-method assertion. (The OUTER
+// `build_actor_deps` does not itself mint — it only declares + calls the nested
+// fn — so the ONLY rule-K reference in this block is the nested mint.)
+mod nested_fn_direct_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    // The REAL top-level `Supervisor::build_actor_deps` in `supervisor.rs`. Its
+    // body declares a NESTED `fn build_actor_deps` that mints its own param. The
+    // nested fn passes the name/impl/scope/param checks but is NOT a direct impl
+    // method, so fix 1 refuses its exemption and rule K flags the nested mint.
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, _owning_did: DID) -> ActorDeps {
+        fn build_actor_deps(owning_did: &DID) -> OwnedIdentityDid {
+            nested_fn_direct_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone())
+        }
+        let owned_identity = build_actor_deps(&DID([9; 32]));
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS SECOND-SELF-PARAM (FIX 2 — positional + count-bounded self-exclusion) —
+// a top-level `impl Supervisor` whose `build_actor_deps` carries a SECOND
+// `self`-spelled parameter at index ≥ 1: `(self: &Arc<Self>, attacker: DID,
+// self: &Handle)`. tree-sitter is error-tolerant, so it tags BOTH `self`-spelled
+// params as receiver-shaped. The PRIOR self-exclusion dropped EVERY receiver-
+// shaped param regardless of position/count, leaving `attacker: DID` as the
+// "sole non-`self` param" → wrongly pinned as the owning binding → the
+// `attacker` mint inherited the exemption (rustc rejects this spelling, so it is
+// not live-exploitable, but the gate must NOT depend on rustc). Fix 2 enforces
+// the receiver invariant STRUCTURALLY: a receiver-shape at value-index ≥ 1 (the
+// trailing `self: &Handle`) is malformed → REFUSE the exemption (fail-closed) →
+// rule K flags the mint. The mint spelling
+// `second_self_param_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE to this
+// fixture, pinning the positional-self assertion. (The production
+// `build_actor_deps(self: &Arc<Self>, owning_did: &DID)` has exactly ONE
+// receiver-shape in first position and stays exempt — asserted by K-NEG-1.)
+mod second_self_param_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(
+        self: &Arc<Self>,
+        attacker: DID,
+        self: &Handle,
+    ) -> ActorDeps {
+        let owned_identity =
+            second_self_param_mint::OwnedIdentityDid::issue_for_actor(attacker.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
 // NEGATIVE CONTROL RENAMED-FIELD-OK (FIX 1) — a top-level `impl Supervisor`
 // whose `build_actor_deps` destructures an UNRELATED struct via a RENAMED field
 // whose field NAME is LITERALLY `owning_did`: `let RenamedSrc { owning_did: other
