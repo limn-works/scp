@@ -703,7 +703,7 @@ Implement an append-only Merkle tree per context in `scp-core/event_log/`. The t
 
 - **ADR-008 (Context):** The event log is owned by a context. Every context state transition is an event. The Context Manager appends events to the log.
 - **ADR-002 (Envelope):** Events reference envelope hashes for message events.
-- **ADR-003 (DID):** Events are signed by the acting agent's DID. The `Event` struct includes a `signing_key_id` field (ADR-039) identifying which verification method signed (e.g., `"#active"` or `"#agent"`), enabling verifiers to resolve the correct public key from the actor's DID document. Checkpoint signatures are verified against DID public keys.
+- **ADR-003 (DID):** Events are signed by the acting agent's DID. The verification method that signed an event (`"#active"` or `"#agent"`, ADR-039) is carried by the signature apparatus, **not** as a field on the `Event` struct — the canonical `scp_event_log::Event` has seven fields (`event_type`, `actor_did`, `timestamp`, `sequence`, `payload`, `prev_hash`, `signature`) and no `signing_key_id`. A verifier resolves the correct public key from the actor's DID document exactly as it does for any other Ed25519 signature in the protocol (see the signing-key-identification note in criterion 1). Checkpoint signatures are verified against DID public keys.
 
 ### Acceptance Criteria
 
@@ -720,14 +720,24 @@ pub struct EventLog {
 pub struct Event {
     pub event_type: EventType,
     pub actor_did: DID,
-    pub signing_key_id: String,     // Which VM signed: "#active" or "#agent" (ADR-039)
     pub timestamp: u64,
     pub sequence: u64,              // Monotonic event sequence within this log
     pub payload: EventPayload,      // Type-specific data
     pub prev_hash: [u8; 32],        // Hash of the previous event (hash chain)
     pub signature: Ed25519Signature,
 }
+```
 
+   **Signing-key identification (ADR-039).** The verification method that signed
+   an event (`"#active"` or `"#agent"`) is carried by the credential / signature
+   apparatus, **not** as a struct field on `Event`. The canonical
+   `scp_event_log::Event` type has no `signing_key_id` field; a verifier resolves
+   the correct public key from the actor's DID document the same way it does for
+   any other Ed25519 signature in the protocol. (The `signing_key_id` parameter
+   on `generate_checkpoint` in criterion 8 is a *checkpoint*-signing argument and
+   is unaffected.)
+
+```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventType {
     ContextCreated,
@@ -749,8 +759,160 @@ pub enum EventType {
     AbsenceProofRequested,
     MemberBlocked,          // ADR-007: Signed block notification recorded for auditability
     KeyEpochAdvance,        // ADR-007: Sender key epoch rotation (shared across Encrypted and Broadcast modes)
+    MediaSessionStarted,    // ADR-024: media session start
+    MediaSessionEnded,      // ADR-024: media session end
+    PaymentReceived,        // §19.6.1: payment captured
+    EconomicPolicyChanged,  // §19.3: economic policy change proposed (24h notice start)
+    EconomicPolicyApplied,  // §19.3: pending economic policy change applied
+    SpendingUcanGranted,    // §19.6.1: spending UCAN granted
+    SpendingUcanRevoked,    // §19.6.1: spending UCAN revoked
+    // Governance event types (ADR-031 §8)
+    GovernanceProposalCreated,
+    GovernanceVoteCast,
+    GovernanceVoteWithdrawn,
+    GovernanceProposalResolved,
+    GovernanceConflictDetected,
+    GovernanceConflictResolved,
+    GovernanceDeadlockRecovery,
+    GovernanceActionExecuted,
+    // Provenance event types (§7.3, issue #586)
+    ProvenanceAttached,
+    ProvenanceReceived,
+    // Governance-action-coverage event types (native↔WASM unification; see the
+    // Amendment below). Each traces to a GovernanceAction (ADR-031 §2) or a
+    // §19 / §5.11A / §9.9 / §9.10 protocol action.
+    AdminTransferred,             // TransferAdmin
+    CeilingModified,              // ModifyCeiling applied
+    CeilingModificationPending,   // ModifyCeiling delay-window start
+    ThresholdModified,            // ModifyThreshold §4b
+    SignerAdded,                  // AddSigner §4b
+    SignerRemoved,                // RemoveSigner §4b
+    ChildContextCreated,          // CreateChildContext §5.13; consumed by §7 trust
+    ContextPromoted,              // PromoteContext §5.10
+    ContentKeysRotated,           // RotateContentKeys §9.17/ADR-038
+    MemberReset,                  // ResetMember ADR-029 Tier-3; §23 reset
+    MemberSuspended,              // SuspendCapability
+    MemberSuspendedAll,           // SuspendAccess
+    MemberUnblocked,              // ADR-007 block reversal; pairs with MemberBlocked
+    AccessRestored,               // RestoreAccess §5 ReadAccessRestored
+    GovernanceReconfigured,       // ReconfigureGovernance §10
+    GovernanceFreezeExpired,      // §7 conflict-freeze exit
+    HardRateLimitModified,        // ModifyHardRateLimit §19.7 D4
+    EconomicPolicyLocked,         // LockEconomicPolicy §19.3
+    ContextMigrationStarted,      // ProposeContextMigration §5.11A grace start
+    ToolRemoved,                  // RemoveTool; pairs with ToolRegistered
+    PruningPolicyModified,        // ModifyPruningPolicy ADR-030 §6
+    CommitBroadcasted,            // MLS commit broadcast record §9.9 reconciliation
+    CommitBroadcastPending,       // deferred-commit queue record
+    PseudonymAnnounced,           // §9.10.4 per-context pseudonym announcement
+    // Lifecycle / migration event types (ADR-049 §9; §5.11A). Parameters live
+    // in EventPayload, never in the type name.
+    ContextTombstoned,            // §5.11A.5 terminal migration; payload: destination_id, migration_proposal_id (actor_did = "system")
+    ContextMigrationCancelled,    // §5.11A migration abort; pairs with ContextMigrationStarted; payload: original_proposal_id
+    TtlExtended,                  // §5.10 unanimous TTL extension; payload: old_deadline_unix, new_deadline_unix, proposal_id, consenting_members
+    TtlExtensionRejected,         // §5.10 TTL extension denied; payload: proposal_id, rejecting_members
+    // Content-access governance event types (ADR-031 §3; §5). Pairs with the
+    // existing AccessRestored variant.
+    AccessRevoked,                // RevokeReadAccess / RevokeWriteAccess; payload: target_did, scope
+    // Economic event types (§19.6.1; ADR-031 §3).
+    SpendApproved,                // ApproveSpend governance action; payload: spender, amount, purpose
+    PaymentCaptureFailed,         // §19.6.1 payment capture failure record; payload: cost and capture-failure detail
+    // Consequence-enforcement event types (ADR phase-4 trust engine; §7.3.7).
+    // actor_did = the consequence-enforcement system actor.
+    ConsequenceTriggered,         // §7.3.7 rule trigger fired; payload: member_did, rule_index, trigger_kind, action_type
+    ConsequenceEnforced,          // §7.3.7 consequence action applied; payload: member_did, rule_index, trigger_kind, action_type
+    ConsequenceEnforcementFailed, // §7.3.7 enforcement failed (e.g. member departed mid-flight); payload as above
+    ConsequenceEscalatedToSuspendAll, // §7.3.7 failure escalated to SuspendAll; payload as above
+    // MLS commit-broadcast reconciliation outcomes (§9.9). Pairs with
+    // CommitBroadcasted / CommitBroadcastPending.
+    CommitBroadcastSucceeded,     // §9.9.4 deferred commit broadcast succeeded; payload: operation, attempts
+    CommitBroadcastFailed,        // §9.9.4 deferred commit broadcast permanently failed; payload: operation, reason, attempts
+    // Compromise-recovery event type (§9.12 step 2 "MLS Update in all active
+    // contexts"). Distinct from the ADR-007 sender-key KeyEpochAdvance: this
+    // records an MLS *group*-epoch advance (Update + self-Commit, broadcast to
+    // members) performed during trust recovery. actor_did = "system:recovery".
+    RecoveryEpochAdvanced,        // §9.12 step 2 MLS group-epoch advance; payload: old_epoch, new_epoch
+    // App-sandbox binding lifecycle (§8; "App binding and unbinding events are
+    // visible in the event log"). Parameters live in EventPayload.
+    AppBound,                     // §8 app bound to context; payload: app_did, app_name, app_version, capabilities
+    AppUnbound,                   // §8 app unbound from context; payload: app_did
 }
 ```
+
+   `EventType` is a closed set with no catch-all variant: every protocol action
+   that produces a verifiable history entry in the Merkle event log is one of the
+   enumerated variants above. The payment, economic-policy, spending-UCAN,
+   governance (ADR-031 §8), and provenance (§7.3) variants reflect types already
+   carried by the canonical `scp_event_log::EventType`; the trailing variant
+   groups (governance-action coverage, lifecycle/migration per §5.10–§5.11A,
+   content-access per §5, economic per §19.6.1, consequence-enforcement per
+   §7.3.7, commit-broadcast reconciliation per §9.9.4, compromise recovery per
+   §9.12, and app-sandbox binding per §8) were added by the native↔WASM
+   unification amendment below.
+   The closure obligation spans **every** source that appends to the Merkle log —
+   governance actions (ADR-031 §3), lifecycle/migration transitions (ADR-049 §9 /
+   §5.11A), membership and access changes (§5), media (ADR-024), economic actions
+   (§19), consequence enforcement (phase-4 trust engine / §7.3.7), app-sandbox
+   binding (§8), compromise recovery (§9.12 step 2 MLS group-epoch advance), and
+   provenance (§7.3) — not governance actions alone. Each new
+   variant carries its parameters in `EventPayload`; no parameter is ever baked
+   into the type name. Two `EventType`-shaped emissions are deliberately kept out
+   of the Merkle log (see the exclusion list below).
+
+   > **Amendment (native↔WASM event-log unification).** `EventType` is the single
+   > canonical event taxonomy across all implementations. The `scp-runtime`
+   > provider MUST construct `scp_event_log::Event` values with a typed
+   > `event_type` and compute leaves as `SHA-256(0x00 ‖ rmp_serde(Event))` per
+   > `tree::append`/`append_unsigned_event` — the free-form-string
+   > `EventLogEntry`/`"SCP-EXPORT-ENTRY:"` hash-chain is removed. The checkpoint
+   > `merkle_root` (§23.16.1) and the signed-export `event_log_merkle_root`
+   > binding (§23.16.8) are the RFC 6962 `tree::root`, NOT the hash-chain head.
+   >
+   > **Events excluded from the Merkle log (target end state).** After this
+   > unification, the canonical Merkle log MUST NOT contain `MessageReceived`
+   > (per-recipient local observation; the canonical record is the sender's
+   > `MessageSent`) or `EquivocationDetected` (a local divergence alert, surfaced
+   > as `EquivocationAlert` §23.16.6 / `ContextEvent`). Logging per-recipient or
+   > detection events would make member root-sets non-convergent and defeat
+   > §9.9.3 equivocation detection. This is not yet a pre-existing property:
+   > the `scp-runtime` provider CURRENTLY appends both — `MessageReceived` on the
+   > message-receive path, and `EquivocationDetected` as a local
+   > divergence-alert append. The unification therefore REMOVES those two append
+   > sites, in the same spirit as the name-string defect corrections below; once
+   > removed, these are the **only** two exclusions and every other distinct
+   > event the `scp-runtime` provider appends maps to a typed variant above.
+   > Local-only `ContextEvent` notifications that never reach the
+   > Merkle log (e.g. `DegradedMode`, `BufferOverflow`, `SequenceGapDetected`,
+   > `WelcomeGenerated`, `CheckpointCosignatureRequired`) are receive-buffer
+   > signals, not log entries, and so are out of `EventType`'s scope entirely.
+   >
+   > **Name-string defects corrected by this amendment.** Several runtime call
+   > sites passed parameters baked into the event *name* — either as `format!`
+   > strings (`"ContextTombstoned:{dest}:{pid}"`, `"ContextMigrationCancelled:{pid}"`,
+   > `"AppBound:{did}:{name}:{ver}:[{caps}]"`, `"AppUnbound:{did}"`) or as an
+   > entire JSON blob used as the type tag (`{"event":"SpendApproved",…}`,
+   > `{"event":"TtlExtended",…}`, `{"event":"TtlExtensionRejected",…}`). Each is a
+   > defect: it makes the signed leaf preimage non-convergent and un-enumerable.
+   > The correct end state is the typed variant with all parameters in
+   > `EventPayload`, as the variant comments above specify. (The canonical
+   > variant casing is `TtlExtended`/`TtlExtensionRejected`; spec prose elsewhere
+   > writes `TTLExtended`/`TTLExtensionRejected` — the `EventType` variant spelling
+   > is authoritative.)
+
+   **Rejected alternative — typed catch-all (`EventType::Other(String)`).**
+   Rejected because it reintroduces free-form strings into the signed preimage
+   (the non-convergence vector being removed), violates the closed/complete-set
+   and No-DOA principles, and defeats compile-time cross-bridge tag parity. The
+   closed set is achievable because every Merkle-logged event is enumerable from
+   a finite, governing source: governance actions (ADR-031 §3 `GovernanceAction`),
+   lifecycle/migration transitions (ADR-049 §9 / §5.11A), membership and access
+   changes (§5), media sessions (ADR-024), economic actions (§19),
+   consequence-enforcement outcomes (phase-4 trust engine / §7.3.7), app-sandbox
+   binding (§8), compromise recovery (§9.12 step 2 MLS group-epoch advance), and
+   provenance (§7.3). Lifecycle, consequence, recovery, and app-sandbox
+   events are enumerable yet are **not** `GovernanceAction`s — the closure
+   argument rests on the union of all these sources, not on
+   `GovernanceAction::variant_name()` alone. Enum expansion is strictly superior.
 
 2. **`append(log: &mut EventLog, event: Event) -> Result<u64, EventLogError>`**
    - Computes `leaf_hash = SHA256(serialize(event))`.
