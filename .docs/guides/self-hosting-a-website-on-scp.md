@@ -371,7 +371,7 @@ home line doesn't have. Honest, not fixable from here.
   publishes sealed `BroadcastContent` envelopes onto that relay, the relay stores
   the encrypted blobs, and `commit_deploy` scans **that same relay's blob storage**
   to build the `path → blob_id` index. Supervisor↔node communication is via the
-  relay, not a shared backend. **Other as-built facts now reflected above:**
+  relay, not a shared backend. **Other as-built facts verified at this date:**
   self-host serves self-signed HTTPS (TLS 1.3) by default with plaintext opt-out
   (`SCP_NODE_SELF_HOST_PLAINTEXT=1`) per §10.12.11; the `scp-node --self-host`
   binary mode selects `no_domain()` (§3 gap #2 / §6 resolved); origin-root mount
