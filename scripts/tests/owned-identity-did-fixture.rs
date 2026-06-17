@@ -297,6 +297,54 @@ impl OwnedIdentityDid {
     }
 }
 
+// BYPASS H6 (FIX-1 nested-fn name-launder) — NESTED `issue_for_actor` INSIDE
+// `reissue`. The cap literal is built inside a NESTED `fn issue_for_actor`
+// declared lexically INSIDE the real allowlisted `reissue`, which escapes as a
+// `fn`-pointer. Pre-fix, the literal's nearest enclosing `function_item` was the
+// INNER nested fn — its NAME (`issue_for_actor`) is in CONSTRUCTING_FNS, its
+// nearest enclosing `impl_item` (walking PAST the outer fn) is the real cap
+// impl, and it is inherent — so `in_allowlisted` was True. The escapable-scope
+// check then ran `_escapable_scope_between(literal, fn_node=inner_fn)` and
+// stopped AT the inner fn (it IS `fn_node`, the boundary), so the
+// `function_item` escapable arm never fired for it; the nested fn is ALSO
+// invisible to rule G (which only inspects fns that are DIRECT children of the
+// impl's `declaration_list` — a nested fn's parent is a `block`). It slipped
+// BOTH rules and the construction PASSED — forging any DID and handing handler
+// code an escaping `fn` pointer. The `is_impl_method` structural guard in
+// `_construction_hit_reason` now requires `fn_node` be a TRUE impl method (parent
+// chain `function_item -> declaration_list -> impl_item`); the nested fn's parent
+// is a `block`, so the guard is False, `in_allowlisted` falls through, and the
+// "outside the allowlisted constructors" branch HARD FAILs naming the inner fn.
+// The substring `in fn `issue_for_actor` outside` is produced ONLY by this case
+// (the allowlisted name `issue_for_actor` can never be the enclosing fn of a
+// rejected free-fn / helper-method construction).
+#[allow(dead_code)]
+impl OwnedIdentityDid {
+    pub(in crate::context) fn reissue(&self) -> fn(Did) -> OwnedIdentityDid {
+        fn issue_for_actor(_d: Did) -> OwnedIdentityDid {
+            OwnedIdentityDid { inner: [0; 32] }
+        }
+        issue_for_actor
+    }
+}
+
+// BYPASS H7 (FIX-1 nested-fn name-launder, symmetric) — NESTED `reissue` INSIDE
+// `issue_for_actor`. The mirror of H6: a NESTED `fn reissue` declared inside the
+// real allowlisted `issue_for_actor`, escaping as a `fn` pointer. Same pre-fix
+// bypass mechanics (inner fn's name is allowlisted, its nearest `impl_item` is
+// the cap impl, it is the escapable-scope boundary so the `function_item` arm
+// never fires, and rule G is blind to it). The same `is_impl_method` guard
+// rejects it. The substring `in fn `reissue` outside` is unique to this case.
+#[allow(dead_code)]
+impl OwnedIdentityDid {
+    pub(super) fn issue_for_actor(_d: &Did) -> Self {
+        fn reissue(_d: &Did) -> OwnedIdentityDid {
+            OwnedIdentityDid { inner: [0; 32] }
+        }
+        reissue(_d)
+    }
+}
+
 // @file: context/actor/forge_metavar_macro.rs
 // FIX-1 (BLACK-G05) — METAVARIABLE MACRO MINT in a NON-declaring file. The
 // macro DEFINITION synthesizes `impl $t { … }` on a passed-in type

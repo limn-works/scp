@@ -947,11 +947,21 @@ ESCAPABLE_SCOPE_TYPES: frozenset[str] = frozenset(
         "async_block",
         "gen_block",
         # A nested `function_item` between the literal and the OUTER allowlisted
-        # fn is itself an escapable scope. (`_nearest_enclosing(..., function_item)`
-        # already stops at the nearest fn, so the inner fn usually becomes
-        # `fn_node` and fails the NAME check; this entry hardens the case where
-        # an inner fn is itself named `issue_for_actor`/`reissue` and nested
-        # inside the real one.)
+        # fn is itself an escapable scope. `_nearest_enclosing(..., function_item)`
+        # stops at the nearest fn, so an inner fn normally BECOMES `fn_node` and
+        # fails the NAME check (it is not `issue_for_actor`/`reissue`). The case
+        # where the inner fn is itself NAMED `issue_for_actor`/`reissue` to
+        # launder the name is NOT closed by this entry — the inner fn is then
+        # `fn_node` itself (the boundary), so `_escapable_scope_between` never
+        # sees it as an INTERVENING node and this `function_item` arm never
+        # fires for it. That name-laundering case is closed instead by the
+        # `is_impl_method` structural guard in `_construction_hit_reason` (a
+        # nested fn's parent is a `block`, not an impl `declaration_list`). This
+        # `function_item` entry remains load-bearing for a DIFFERENT shape: a
+        # nested fn that sits BETWEEN the literal and a separate, outer
+        # allowlisted `fn_node` (e.g. literal inside `fn inner()` inside a
+        # closure inside `reissue`), where the nested fn is a genuine
+        # intervening escapable scope on the parent chain.
         "function_item",
     }
 )
@@ -1083,8 +1093,31 @@ def _construction_hit_reason(struct_expr_node, source: bytes) -> str | None:
         name_node = fn_node.child_by_field_name("name")
         fn_name = node_text(name_node, source) if name_node is not None else "<anon>"
         impl_node = _nearest_enclosing(fn_node, ("impl_item",))
+        # `fn_node` must be a TRUE impl method to honor the name-allowlist. A
+        # REAL inherent method's `function_item` is a direct child of the impl
+        # block's `declaration_list`, so its parent chain is
+        # `function_item -> declaration_list -> impl_item`. A NESTED fn (one
+        # declared lexically INSIDE another fn's body — including a nested fn
+        # named `issue_for_actor`/`reissue` to launder the name) has a `block`
+        # as its parent, NOT a `declaration_list`, so this predicate is False
+        # for it. Without this guard a nested `fn issue_for_actor(d: DID) ->
+        # OwnedIdentityDid { Self { did: d } }` declared inside the real
+        # constructor would (a) supply a CONSTRUCTING_FNS name, (b) resolve its
+        # nearest enclosing `impl_item` to the real cap impl, and (c) never trip
+        # the escapable-scope check (it IS `fn_node`, the boundary, never an
+        # INTERVENING escapable node) — forging any DID and escaping as a
+        # `fn`-pointer / `impl Fn`. ANDing `is_impl_method` in is strictly
+        # ADDITIVE: it can only make `in_allowlisted` MORE restrictive, never
+        # admit a construction the name/impl checks would have rejected.
+        is_impl_method = (
+            fn_node.parent is not None
+            and fn_node.parent.type == "declaration_list"
+            and fn_node.parent.parent is not None
+            and fn_node.parent.parent.type == "impl_item"
+        )
         in_allowlisted = (
-            fn_name in CONSTRUCTING_FNS
+            is_impl_method
+            and fn_name in CONSTRUCTING_FNS
             and _impl_targets_cap(impl_node, source)
             and _impl_is_inherent(impl_node)
         )
@@ -2735,6 +2768,30 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
         "async_block_in_constructor",
         "`async_block` nested within the allowlisted constructor `reissue`",
     ),
+    # FIX-1 (nested-fn name-launder) — NESTED `issue_for_actor` INSIDE `reissue`.
+    # A nested `fn issue_for_actor(d: Did) -> OwnedIdentityDid` declared lexically
+    # inside the real allowlisted `reissue` constructs the cap and escapes as a
+    # `fn` pointer. Pre-fix this slipped BOTH rules: the literal's nearest
+    # `function_item` was the INNER fn (name in CONSTRUCTING_FNS, nearest
+    # `impl_item` = the real cap impl, inherent → `in_allowlisted` True), the
+    # escapable-scope check stopped AT that inner fn (it IS `fn_node`, the
+    # boundary, never an INTERVENING node), and rule G — which only inspects fns
+    # that are DIRECT children of the impl `declaration_list` — never saw the
+    # nested fn (its parent is a `block`). The `is_impl_method` structural guard
+    # now requires `fn_node`'s parent chain be
+    # `function_item -> declaration_list -> impl_item`; a nested fn's parent is a
+    # `block`, so the guard is False and the construction falls through to the
+    # "outside the allowlisted constructors" branch naming the inner fn. The
+    # substring `in fn `issue_for_actor` outside` can ONLY be produced by this
+    # case — the allowlisted name is never the enclosing fn of a rejected
+    # free-fn / helper-method construction.
+    ("nested_fn_name_launder", "in fn `issue_for_actor` outside"),
+    # FIX-1 (nested-fn name-launder, symmetric) — NESTED `reissue` INSIDE
+    # `issue_for_actor`. The mirror of the above: a nested `fn reissue` inside the
+    # real allowlisted `issue_for_actor`, escaping as a `fn` pointer. Same pre-fix
+    # bypass mechanics, same `is_impl_method` rejection. The substring
+    # `in fn `reissue` outside` is unique to this symmetric case.
+    ("nested_fn_name_launder_symmetric", "in fn `reissue` outside"),
 ]
 
 
