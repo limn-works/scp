@@ -382,9 +382,16 @@ COVERS (source-text surface, via tree-sitter AST):
         `impl Supervisor` must be TOP-LEVEL (not under any in-file `mod`), so a
         shadow's mint is NOT exempt (fix 2, mirrors rule I);
       * a SECOND / ATTACKER-DID mint inside the real `build_actor_deps` — the
-        exempt mint's sole argument must be a bare `owning_did` parameter (or
-        `<p>.clone()`), NOT a constructed `DID("…")` literal, AND there may be
-        AT MOST ONE exempt mint call per `build_actor_deps` (fix 3);
+        per-call mint-arg check is BINDING-based, not name-based (fix 3): the
+        fn must have EXACTLY ONE non-`self` `DID`-typed parameter, the exempt
+        mint's sole argument must be a bare `<owning>` / `<owning>.clone()`
+        PINNED to that param's binding name (NOT a constructed `DID("…")`
+        literal, a non-`.clone()` method call, a reborrow, a field access, or
+        another local), and that param name must NOT be shadowed/re-bound by a
+        `let`/assignment before the mint. A second `DID` param (G03) or a
+        `let owning_did = …` shadow (G02) therefore dissolves the exemption —
+        the only value the exempt mint can consume is the unshadowed sole
+        caller-supplied `&DID` parameter;
     plus a bare `use_list` member of the mint (`use self::{issue_for_actor};`,
     no `as`) is now flagged as a mint reference (fix 5).
   - the KEYSTONE escape-position ban (whole supervisor subtree): the cap in a
@@ -405,6 +412,18 @@ COVERS (source-text surface, via tree-sitter AST):
     from split tokens the AST walk never reassembles (kills K03). cfg(test)
     exempt.
   - struct location, name-visibility, and field visibility (A / B / E)
+
+INTENTIONALLY NOT FLAGGED (RELOCATION of an already-owned cap):
+  A fn that RECEIVES an already-owned `OwnedIdentityDid` by value and merely
+  RE-HOMES it — moving it into a new returned struct field, a custom wrapper
+  type, or passing it by value to another call — is NOT flagged, by design.
+  The closure rests on rules J / K gating the cap's SOURCE: no arbitrary-DID
+  cap can be CREATED to relocate, because every creation routes through either
+  `issue_for_actor` (rule K — banned outside the pinned build site) or a struct
+  literal (rules H / I — only the two allowlisted constructors may build it).
+  A value that was never illicitly minted cannot become an attacker token by
+  being moved, so the "new returned struct field" and "custom UnsafeCell
+  wrapper" relocation shapes are inert here.
 
 OUT OF REMIT (NOT this AST gate — covered by the type system + human review):
   - build-script (`build.rs`) code generation, and
@@ -1011,6 +1030,15 @@ MINT_FN_NAME: str = "issue_for_actor"
 # targets `Supervisor`.
 BUILD_ACTOR_DEPS_FN: str = "build_actor_deps"
 SUPERVISOR_IMPL_TYPE: str = "Supervisor"
+# The raw-DID type the actor's owning identity is carried as. The per-call
+# mint-arg check (fix 3) is BINDING-based, not NAME-based: the exempt mint may
+# only consume the SOLE non-`self` parameter of `build_actor_deps` whose TYPE
+# tail-identifier is this (covers `owning_did: &DID` and `owning_did: DID`). A
+# second `DID`-typed parameter, or an added one carrying an attacker DID,
+# dissolves the exemption (G03); a `let`/assignment shadow of that param's name
+# before the mint dissolves it too (G02). Both forgeries leave the mint
+# consuming an attacker-controlled value, so neither may be exempt.
+DID_PARAM_TYPE: str = "DID"
 # Rule K exemption (b) is additionally PINNED to the real build-site FILE, so a
 # forger cannot plant a local `struct Supervisor; impl Supervisor { fn
 # build_actor_deps(..) { ..issue_for_actor(..) } }` in ANOTHER subtree file and
@@ -1250,29 +1278,140 @@ def _is_mint_reference(node, source: bytes) -> bool:
     return False
 
 
+def _param_type_tail(param_node, source: bytes) -> str | None:
+    """Return the TYPE tail-identifier of a `parameter` node, peeling any
+    leading `&` / `&mut` references first. `&DID` → `DID`, `DID` → `DID`,
+    `&crate::id::DID` → `DID`, `&Arc<Self>` → `Arc`. Returns None for a
+    parameter with no type field (e.g. a bare `self_parameter`, which has no
+    `type` field) or an unrecognized type node.
+    """
+    ty = param_node.child_by_field_name("type")
+    # Peel `reference_type` (`&T`, `&mut T`, `&&T`) down to the referent.
+    while ty is not None and ty.type == "reference_type":
+        ty = ty.child_by_field_name("type")
+    return _type_tail_identifier(ty, source)
+
+
+def _param_binding_name(param_node, source: bytes) -> str | None:
+    """Return the binding identifier of a `parameter`'s pattern, or None.
+
+    A by-value pattern is the `pattern` field (`owning_did: DID` →
+    `owning_did`). A typed-`self` pattern (`self: &Arc<Self>`) has a `self`
+    node, not an `identifier`, so it returns None — it is never a DID param and
+    never the owning binding.
+    """
+    pat = param_node.child_by_field_name("pattern")
+    if pat is not None and pat.type == "identifier":
+        return node_text(pat, source)
+    return None
+
+
+def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool:
+    """True if, anywhere inside `fn_node`'s body and LEXICALLY BEFORE
+    `before_byte`, the identifier `name` is RE-BOUND by either a `let`
+    declaration whose pattern binds `name` or an assignment whose left-hand
+    side is the bare identifier `name`.
+
+    A shadow/rebind defeats name-matching: `let owning_did = make_evil();`
+    before the mint makes the bare argument `owning_did` resolve to an
+    attacker-controlled local rather than the caller-supplied parameter (G02).
+    "Before" is by source byte offset relative to the mint reference's position;
+    a `let`/assignment AFTER the mint cannot affect the value the mint already
+    consumed, so only earlier rebinds disqualify the exemption.
+
+    Both `let` patterns (`identifier`, and destructuring patterns that name the
+    identifier — `tuple_pattern`, `ref`/`mut`-prefixed bindings, etc.) and
+    `assignment_expression` LHS identifiers are walked. Conservative by design:
+    any earlier binding of the param name dissolves the exemption.
+    """
+    body = fn_node.child_by_field_name("body")
+    if body is None:
+        return False
+
+    def _pattern_binds(pat) -> bool:
+        # Direct `identifier` pattern, or a compound pattern (tuple/ref/mut/
+        # slice/struct) that contains the identifier as a bound name. Walk the
+        # subtree for any `identifier` token equal to `name`. A `let` pattern
+        # has no field-accesses (it is purely binding positions), so every
+        # `identifier` in it is a binding.
+        stack = [pat]
+        while stack:
+            p = stack.pop()
+            if p.type == "identifier" and node_text(p, source) == name:
+                return True
+            stack.extend(p.children)
+        return False
+
+    found = False
+
+    def _walk(n) -> None:
+        nonlocal found
+        if found:
+            return
+        # Only consider rebinds positioned before the mint reference.
+        if n.start_byte < before_byte:
+            if n.type == "let_declaration":
+                pat = n.child_by_field_name("pattern")
+                if pat is not None and _pattern_binds(pat):
+                    found = True
+                    return
+            elif n.type == "assignment_expression":
+                lhs = n.child_by_field_name("left")
+                if (
+                    lhs is not None
+                    and lhs.type == "identifier"
+                    and node_text(lhs, source) == name
+                ):
+                    found = True
+                    return
+        for c in n.children:
+            _walk(c)
+
+    _walk(body)
+    return found
+
+
 def _mint_call_arg_is_owning_did(node, fn_node, source: bytes) -> bool:
-    """True if the mint reference `node` is the FUNCTION of a `call_expression`
-    whose SOLE argument is a bare identifier `<p>` or `<p>.clone()` where `<p>`
-    is a PARAMETER name of the enclosing `build_actor_deps` fn (`fn_node`) — the
-    actor's own `owning_did`.
+    """True iff the exempt mint reference `node` is the FUNCTION of a
+    `call_expression` whose SOLE argument is the genuine, unshadowed,
+    caller-supplied owning DID of `build_actor_deps` (`fn_node`).
 
-    Rule K exemption-(b) tightening (fix 3, per-call mint-arg check). The
-    build-site exemption otherwise trusts the ENTIRE BODY of any
-    `Supervisor::build_actor_deps` in `supervisor.rs`, so a SECOND mint call in
-    that body — e.g. `issue_for_actor(DID("attacker"))` minting an ATTACKER DID
-    rather than the actor's own identity — would inherit the exemption (K02).
-    Constraining the exempt call's argument to a bare parameter (or its
-    `.clone()`) of `build_actor_deps` means the ONLY value the exempt mint may
-    consume is the very DID the actor was built for: a constructed `DID("…")`
-    literal, a field access, a different local, or any non-parameter expression
-    is NOT exempt and surfaces as a rule-K mint reference. The real production
-    call is `issue_for_actor(owning_did.clone())` where `owning_did` is the sole
-    `&DID` parameter — exactly this shape.
+    This is the per-call mint-arg check (rule K exemption-(b) tightening,
+    fix 3) and it is BINDING-based, not name-based. After this check, the ONLY
+    value the exempt mint may consume is the very DID the actor was built for.
+    The guarantee rests on three conjoined conditions:
 
-    Only a mint reference that is the `function` field of a `call_expression`
-    can be exempted (a bare value-path `let f = …::issue_for_actor;` re-exports
-    the mint without calling it and is never exempt). The argument list must
-    contain EXACTLY ONE argument.
+      (1) EXACTLY ONE DID-typed parameter. Collect `build_actor_deps`'s
+          parameters; the sole non-`self` parameter whose TYPE tail-identifier
+          is `DID` (covers `owning_did: &DID` and `owning_did: DID`) is the
+          owning binding. If ZERO or ≥2 such DID params exist, the exemption
+          does NOT apply — the mint reference is flagged by rule K. This kills
+          G03 (`fn build_actor_deps(&self, owning_did: &DID, attacker: DID)`
+          then `issue_for_actor(attacker.clone())`): a second `DID` param makes
+          the owning binding ambiguous, so no body mint can be trusted. Other
+          (non-DID) parameters are ignored — they cannot carry a DID.
+
+      (2) THE ARG IS PINNED TO THAT SOLE DID PARAM'S BINDING NAME. The call's
+          single argument must be a bare `<owning>` or `<owning>.clone()` where
+          `<owning>` is exactly the sole DID param's binding name — never a
+          constructed `DID("…")` literal, a method call other than `.clone()`,
+          a reborrow `&*x`, a field access, a different local, or an `if`/
+          `match` expression. The real production call is
+          `issue_for_actor(owning_did.clone())`.
+
+      (3) NO SHADOW/REBIND of that binding before the mint. If a `let`
+          declaration or an assignment re-binds the owning param's name
+          anywhere in the body LEXICALLY BEFORE the mint call, the bare
+          argument no longer resolves to the caller-supplied parameter, so the
+          exemption is refused. This kills G02
+          (`let owning_did = make_evil_did(); … issue_for_actor(owning_did.clone())`).
+
+    With (1)+(2)+(3), an insider editing the body of `build_actor_deps` cannot
+    substitute an attacker DID into the exempt mint: the only value it can pass
+    is the unshadowed sole caller-supplied `&DID` parameter. The mint reference
+    must be the `function` field of a `call_expression` (a bare value-path
+    `let f = …::issue_for_actor;` re-exports the mint without calling it and is
+    never exempt), and the argument list must contain EXACTLY ONE argument.
     """
     parent = node.parent
     if parent is None or parent.type != "call_expression":
@@ -1309,20 +1448,35 @@ def _mint_call_arg_is_owning_did(node, fn_node, source: bytes) -> bool:
                 ident_name = node_text(value, source)
     if ident_name is None:
         return False
-    # The identifier must be a PARAMETER of `fn_node` (the owning_did), not an
-    # arbitrary local / constructed value. Walk the fn's `parameters` node for a
-    # `parameter` whose binding pattern identifier matches.
+    # (1) Collect the SOLE non-`self` DID-typed parameter's binding name. Zero
+    # or ≥2 DID-typed params → ambiguous owning binding → not exempt.
     params_node = fn_node.child_by_field_name("parameters")
     if params_node is None:
         return False
-    param_names: set[str] = set()
+    did_param_names: list[str] = []
     for p in params_node.children:
         if p.type != "parameter":
+            # `self_parameter` (bare `&self`) and punctuation are skipped; only
+            # real `parameter` nodes carry types. A typed-`self` param
+            # (`self: &Arc<Self>`) IS a `parameter` but its binding name is
+            # `self` (not an `identifier`), and its type tail is `Arc`, so it
+            # never counts as a DID param below.
             continue
-        pat = p.child_by_field_name("pattern")
-        if pat is not None and pat.type == "identifier":
-            param_names.add(node_text(pat, source))
-    return ident_name in param_names
+        if _param_type_tail(p, source) != DID_PARAM_TYPE:
+            continue
+        binding = _param_binding_name(p, source)
+        if binding is not None:
+            did_param_names.append(binding)
+    if len(did_param_names) != 1:
+        return False
+    owning_param = did_param_names[0]
+    # (2) The mint arg must be pinned to THAT sole DID param's binding name.
+    if ident_name != owning_param:
+        return False
+    # (3) No shadow/rebind of the owning param before the mint call.
+    if _shadows_before(fn_node, owning_param, node.start_byte, source):
+        return False
+    return True
 
 
 def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
@@ -4285,6 +4439,28 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     (
         "build_site_second_mint",
         "SECOND exempt-shaped reference to the mint `issue_for_actor`",
+    ),
+    # FIX 3 (PER-CALL MINT-ARG — SHADOW-REBIND) — G02. The real
+    # `Supervisor::build_actor_deps` SHADOWS its `owning_did` parameter with a
+    # `let owning_did = make_evil_did();` BEFORE the mint, then mints the bare
+    # (now attacker-controlled) `owning_did`. The name-based predecessor accepted
+    # the arg because the name was still ∈ param_names; the binding-based check
+    # (no `let`/assignment rebind of the owning param before the mint) refuses
+    # the exemption → rule K flags it. Spelling `g02_shadow_mint::…` is UNIQUE.
+    (
+        "build_site_param_shadow_rebind",
+        "'g02_shadow_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 3 (PER-CALL MINT-ARG — ADDED DID PARAM) — G03. The real
+    # `Supervisor::build_actor_deps` declares a SECOND `DID`-typed parameter
+    # (`attacker: DID`) and mints from it. The name-based predecessor accepted
+    # `attacker` because it was a param name; the binding-based check requires
+    # EXACTLY ONE non-`self` `DID`-typed parameter, so two DID params dissolve
+    # the exemption → rule K flags the mint. Spelling `g03_added_param_mint::…`
+    # is UNIQUE.
+    (
+        "build_site_added_did_param",
+        "'g03_added_param_mint::OwnedIdentityDid::issue_for_actor'",
     ),
     # KEYSTONE (static/const by-value sink) — K02-SINK. A module-level
     # `static mut …: Option<OwnedIdentityDid>` is a global exfil sink rules J/K

@@ -1125,10 +1125,16 @@ pub(in crate::context) fn forge4(d: Did) -> OwnedIdentityDid {
 // and FAILS if `bsite_mint_ok::OwnedIdentityDid::issue_for_actor` ever appears —
 // i.e. if the exemption regressed. (Distinct from the cfg(test) exemptions: this
 // is PRODUCTION code that legitimately mints.)
-struct Did([u8; 32]);
+// NOTE: the raw-DID type here is spelled `DID` to mirror the REAL production
+// type (`owning_did: &DID` on `Supervisor::build_actor_deps`). The fix-3
+// per-call mint-arg check is BINDING-based: it recognizes the owning parameter
+// by its TYPE tail-identifier `DID`, so the build-site fixtures must use the
+// production spelling to exercise that path (a fixture-local `Did` would have
+// zero `DID`-typed params and wrongly dissolve the legit exemption).
+struct DID([u8; 32]);
 #[allow(dead_code)]
 pub(in crate::context) struct OwnedIdentityDid {
-    did: Did,
+    did: DID,
 }
 mod bsite_mint_ok {
     pub(in crate::context) use super::OwnedIdentityDid;
@@ -1151,7 +1157,7 @@ impl Supervisor {
     // the build-site exemption (b) regressed and this EXEMPT call started
     // surfacing a diagnostic.
     #[allow(dead_code)]
-    pub(in crate::context) fn build_actor_deps(self: &Self, d: Did) -> ActorDeps {
+    pub(in crate::context) fn build_actor_deps(self: &Self, d: DID) -> ActorDeps {
         let owned_identity = bsite_mint_ok::OwnedIdentityDid::issue_for_actor(d);
         ActorDeps { owned_identity }
     }
@@ -1191,7 +1197,7 @@ pub(in crate::context) struct PlainFieldOk {
 // UNIQUE to this fixture, pinning the rule-K nested-mod-shadow assertion.
 #[allow(dead_code)]
 mod k01_shadow {
-    use super::Did;
+    use super::DID;
     mod k01_shadow_mint {
         pub(in crate::context) use super::super::OwnedIdentityDid;
     }
@@ -1200,7 +1206,7 @@ mod k01_shadow {
         fn build_actor_deps(
             &self,
             out: &mut Option<super::OwnedIdentityDid>,
-            d: Did,
+            d: DID,
         ) {
             *out = Some(k01_shadow_mint::OwnedIdentityDid::issue_for_actor(d));
         }
@@ -1228,10 +1234,10 @@ impl Supervisor {
     // the assertion that the build-site exemption no longer trusts the WHOLE
     // body: an attacker-DID mint in the real fn is rejected.
     #[allow(dead_code)]
-    pub(in crate::context) fn build_actor_deps(&self, _owning_did: Did) {
+    pub(in crate::context) fn build_actor_deps(&self, _owning_did: DID) {
         // Mints an ATTACKER DID literal, not `_owning_did`.
         let _ =
-            k02_attacker_mint::OwnedIdentityDid::issue_for_actor(Did([9; 32]));
+            k02_attacker_mint::OwnedIdentityDid::issue_for_actor(DID([9; 32]));
     }
 }
 
@@ -1255,10 +1261,75 @@ impl Supervisor {
     // `k02b_mint::…` spelling so the flagged second mint's diagnostic does NOT
     // collide with the K-NEG-1 `bsite_mint_ok::…` forbidden substring.
     #[allow(dead_code)]
-    pub(in crate::context) fn build_actor_deps(&self, owning_did: Did) -> ActorDeps {
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> ActorDeps {
         let _first = k02b_mint::OwnedIdentityDid::issue_for_actor(owning_did);
         let owned_identity =
             k02b_mint::OwnedIdentityDid::issue_for_actor(owning_did);
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS G02 (FIX 3 per-call mint-arg — SHADOW-REBIND) — a top-level
+// `impl Supervisor` whose `build_actor_deps` SHADOWS its own `owning_did`
+// parameter with a `let owning_did = make_evil_did();` BEFORE the mint, then
+// mints the bare `owning_did`. Pre-fix the per-call arg check was NAME-based
+// (the arg identifier had to be IN the set of param names); a `let` shadow of
+// the param name kept the name ∈ param_names, so the mint of the ATTACKER local
+// inherited the exemption (exit 0). Fix 3 is BINDING-based and additionally
+// disqualifies the exemption when a `let`/assignment re-binds the owning param
+// name LEXICALLY BEFORE the mint, so the shadowed mint is NOT exempt → rule K
+// flags it. The mint spelling `g02_shadow_mint::OwnedIdentityDid::issue_for_actor`
+// is UNIQUE to this fixture, pinning the no-shadow assertion.
+mod g02_shadow_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    // On `Supervisor::build_actor_deps` in `supervisor.rs`, top-level, with the
+    // sole `DID`-typed parameter `owning_did` — so it REACHES the per-call
+    // mint-arg check. A `let owning_did = make_evil_did();` shadow precedes the
+    // mint, so the bare `owning_did` argument resolves to an ATTACKER local, not
+    // the caller-supplied parameter. The no-shadow arm (fix 3) refuses the
+    // exemption → rule K flags the mint.
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> ActorDeps {
+        let owning_did = make_evil_did();
+        let owned_identity =
+            g02_shadow_mint::OwnedIdentityDid::issue_for_actor(owning_did);
+        ActorDeps { owned_identity }
+    }
+}
+#[allow(dead_code)]
+fn make_evil_did() -> DID {
+    DID([7; 32])
+}
+
+// BYPASS G03 (FIX 3 per-call mint-arg — ADDED DID PARAM) — a top-level
+// `impl Supervisor` whose `build_actor_deps` declares a SECOND `DID`-typed
+// parameter (`attacker: DID`) and mints from IT, not the genuine `owning_did`.
+// Pre-fix the per-call arg check accepted ANY param name, so an attacker param
+// was IN the set of param names and the mint of `attacker` inherited the
+// exemption (exit 0). Fix 3 requires EXACTLY ONE non-`self` `DID`-typed
+// parameter; a second `DID` param makes the owning binding ambiguous, so the
+// exemption is refused outright → rule K flags the mint. The mint spelling
+// `g03_added_param_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE to this
+// fixture, pinning the single-DID-param assertion.
+mod g03_added_param_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    // On `Supervisor::build_actor_deps` in `supervisor.rs`, top-level, but with
+    // TWO `DID`-typed parameters (`owning_did` and `attacker`). The single-DID-
+    // param requirement (fix 3) fails (2 ≠ 1), so NO mint in this body can be
+    // exempt — including the `attacker.clone()` mint of the attacker DID.
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(
+        &self,
+        owning_did: DID,
+        attacker: DID,
+    ) -> ActorDeps {
+        let _keep = owning_did;
+        let owned_identity =
+            g03_added_param_mint::OwnedIdentityDid::issue_for_actor(attacker.clone());
         ActorDeps { owned_identity }
     }
 }
