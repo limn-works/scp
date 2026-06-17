@@ -18,19 +18,24 @@ use scp_node::{DhtMode, HostSiteConfig, Reach, TlsMode, host_site};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Use 8080 (not the 8443 HostSiteConfig default) to avoid colliding with a real node.
+    let port: u16 = std::env::var("PORT").map_or(8080, |raw| {
+        raw.parse::<u16>().unwrap_or_else(|_| {
+            eprintln!("PORT={raw:?} is not a valid u16 port number; using 8080");
+            8080
+        })
+    });
     host_site(HostSiteConfig {
         tls: TlsMode::Plaintext,
         dht: DhtMode::Memory,
         // `CARGO_MANIFEST_DIR` makes the sample-site path independent of the
         // directory `cargo run` is invoked from.
         site_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/website-site").into()),
-        // This example uses 8080 (the HostSiteConfig default is 8443) to avoid colliding with a real node.
-        port: std::env::var("PORT").map_or(8080, |raw| {
-            raw.parse::<u16>().unwrap_or_else(|_| {
-                eprintln!("PORT={raw:?} is not a valid u16 port number; using 8080");
-                8080
-            })
-        }),
+        port,
+        on_ready: Some(Box::new(|ready| {
+            let scheme = if ready.plaintext { "http" } else { "https" };
+            println!("Site is live — open: {scheme}://localhost:{}/", ready.port);
+        })),
         ..HostSiteConfig::defaults(Reach::Local)
     })
     .await?;
