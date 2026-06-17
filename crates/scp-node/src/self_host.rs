@@ -943,7 +943,18 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 
     let skip_nat = match reach {
         Reach::NatTraversal => false,
-        Reach::Local | Reach::Tunnel { .. } => true,
+        Reach::Local => true,
+        Reach::Tunnel { public_url } => {
+            if !public_url.is_empty() {
+                tracing::warn!(
+                    public_url,
+                    "Reach::Tunnel.public_url is carried but not yet threaded in host_site; \
+                     the node publishes a loopback relay URL. Configure the tunnel to forward \
+                     to that loopback listener."
+                );
+            }
+            true
+        }
         Reach::Domain { .. } => {
             return Err(HostSiteError::InvalidConfig(
                 "Reach::Domain is not valid for host_site: a hosted site builds a no-domain node \
