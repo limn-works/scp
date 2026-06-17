@@ -434,8 +434,8 @@ fn kat_events() -> Vec<Event> {
 }
 
 #[test]
-fn vector_20_typed_leaf_and_checkpoint_kat() {
-    println!("=== Vector 20: Typed-leaf + checkpoint KAT ===");
+fn vector_32_typed_leaf_and_checkpoint_kat() {
+    println!("=== Vector 32: Typed-leaf + checkpoint KAT ===");
     println!("  KAT DID: {}", kat_did());
 
     let events = kat_events();
@@ -485,8 +485,8 @@ fn vector_20_typed_leaf_and_checkpoint_kat() {
 }
 
 #[tokio::test]
-async fn vector_21_checkpoint_root_equals_tree_root_kat() {
-    println!("=== Vector 21: Checkpoint merkle_root == tree::root KAT ===");
+async fn vector_33_checkpoint_root_equals_tree_root_kat() {
+    println!("=== Vector 33: Checkpoint merkle_root == tree::root KAT ===");
 
     let events = kat_events();
     let mut log = EventLog::new("ctx-kat".to_owned());

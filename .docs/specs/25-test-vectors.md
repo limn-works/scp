@@ -358,7 +358,7 @@ Root: SHA-256(0x01 || interior_L || interior_R)
 
 Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree construction itself (leaf/interior domain prefixes, unbalanced promotion). The typed-leaf and checkpoint vectors below pin the *typed* leaf preimage and the checkpoint root.
 
-### Vector 20: Typed-Leaf KAT (closed `EventType` taxonomy)
+### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
 
 Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 76-variant `EventType` taxonomy (ADR-011 AC1 + native↔WASM unification Amendment). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
 
@@ -407,17 +407,17 @@ RFC 6962 tree::root over the 7 leaves:
   0x39e50b879956255f4fd28b2c6f03995e759919e07166c232dd61ed321b54d40d
 ```
 
-### Vector 21: Checkpoint Root KAT (§23.16.1)
+### Vector 33: Checkpoint Root KAT (§23.16.1)
 
-A `ConsistencyCheckpoint` generated over the Vector 20 log MUST carry `merkle_root == tree::root` (the RFC 6962 root above), NOT a hash-chain head. The checkpoint canonical hash is `SHA-256("SCP-CHECKPOINT-V1:" || len(context_id) || context_id || len(sender_did) || sender_did || event_count_BE || merkle_root || epoch_tag || timestamp_BE)` where `epoch_tag = 0x01 || epoch_BE` for `Some(epoch)` (§23.16.1); the checkpoint signature is the actor's Ed25519 signature over that canonical hash. The canonical hash and signature depend on the checkpoint `timestamp` (wall clock) and so are not pinned here; the pinned, timestamp-independent invariant is:
+A `ConsistencyCheckpoint` generated over the Vector 32 log MUST carry `merkle_root == tree::root` (the RFC 6962 root above), NOT a hash-chain head. The checkpoint canonical hash is `SHA-256("SCP-CHECKPOINT-V1:" || len(context_id) || context_id || len(sender_did) || sender_did || event_count_BE || merkle_root || epoch_tag || timestamp_BE)` where `epoch_tag = 0x01 || epoch_BE` for `Some(epoch)` (§23.16.1); the checkpoint signature is the actor's Ed25519 signature over that canonical hash. The canonical hash and signature depend on the checkpoint `timestamp` (wall clock) and so are not pinned here; the pinned, timestamp-independent invariant is:
 
 ```
-checkpoint.merkle_root == tree::root (Vector 20)
+checkpoint.merkle_root == tree::root (Vector 32)
   = 0x39e50b879956255f4fd28b2c6f03995e759919e07166c232dd61ed321b54d40d
 checkpoint.event_count == 7
 ```
 
-Reference implementation and assertions: `crates/scp-event-log/tests/test_vectors.rs` (`vector_20_typed_leaf_and_checkpoint_kat`, `vector_21_checkpoint_root_equals_tree_root_kat`). Regenerate with `cargo test -p scp-event-log --test test_vectors -- --nocapture`.
+Reference implementation and assertions: `crates/scp-event-log/tests/test_vectors.rs` (`vector_32_typed_leaf_and_checkpoint_kat`, `vector_33_checkpoint_root_equals_tree_root_kat`). Regenerate with `cargo test -p scp-event-log --test test_vectors -- --nocapture`.
 
 ## 25.9 Key Continuity Fingerprint Vectors (§9.11)
 
