@@ -143,6 +143,65 @@ mod tests {
     }
 }
 
+// @file: as_did_path_qualified_ref [ACCEPT]
+// FIX5 false-pos guard: `as_did` returns a path-qualified reference
+// `-> &scp_identity::DID`. The reference-return normalization splits off the
+// leading `&` and reduces the referent to its final path segment, so
+// `&scp_identity::DID` compares equal to `&DID` — symmetric with the FIELD
+// check, which already strips paths. This MUST be accepted.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &scp_identity::DID {
+        &self.did
+    }
+}
+
+// @file: cfg_all_test_mod [ACCEPT]
+// FIX6 false-pos guard: the test module carries `#[cfg(all(test))]` — a
+// NESTED cfg predicate. The cfg-test detection recurses nested token_trees,
+// so the inner `test` is found and the module is recognized as a cfg(test)
+// test module. This MUST be accepted.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+#[cfg(all(test))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issued_token_exposes_did_by_reference() {
+        let did = DID("did:example:alice".to_owned());
+        let token = OwnedIdentityDid::issue_for_actor(did.clone());
+        assert_eq!(token.as_did(), &did);
+    }
+}
+
 // @file: pub_struct_visibility [REJECT]
 // Struct name-visibility is `pub` — too broad. MUST be exactly
 // `pub(in crate::context)`.
@@ -712,6 +771,252 @@ impl OwnedIdentityDid {
         Self { did }
     }
     pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+// @file: deny_nested_in_fn [REJECT] mod=deny_nested_in_fn
+// FIX7 — A5 deny-scope guard. The body is the real, valid shape, but the
+// supervisor/mod.rs stub's only `#![deny(unsafe_code)]` occurrence is NESTED
+// inside a fn body, applying to that scope only — NOT the whole module. A5
+// must require a TOP-LEVEL inner attribute (direct child of source_file), so
+// this fixture (whose ONLY defect is the non-module-wide deny) must be
+// REJECTED.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+// @file: macro_invocation_in_impl_body [REJECT]
+// THE CRITICAL FORGERY. A `macro_invocation` inside the inherent impl body
+// (`super::second_minter!();`) is invisible to BOTH the module-item whitelist
+// (it is not a module-level item) and the old function_item-only FILTER (which
+// silently dropped non-fn children). The macro can expand to a second
+// `pub(in crate::context) fn` minter reachable from handler code — it compiles
+// and the old gate passed. The impl-body positive whitelist rejects it by KIND.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+    super::second_minter!();
+}
+
+// @file: const_in_impl_body [REJECT]
+// A `const_item` inside the inherent impl body. Not a `function_item` — the
+// impl-body positive whitelist rejects it by KIND (no associated const may be
+// smuggled into the frozen impl).
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+    const SNEAKY: u8 = 7;
+}
+
+// @file: type_in_impl_body [REJECT]
+// A `type_item` (associated type alias) inside the inherent impl body.
+// Rejected by KIND by the impl-body positive whitelist.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+    type Alias = DID;
+}
+
+// @file: proc_attr_on_impl_block [REJECT]
+// FIX2 — a proc-macro / path-qualified attribute on the `impl` block itself
+// (`#[some::proc]`). `_check_inert_attrs` now runs on the impl_item, rejecting
+// any non-bare-inert attribute that could rewrite or inject members.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+#[some::proc]
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+// @file: reissue_mut_self [REJECT]
+// FIX3 — `reissue(&mut self)`. The param-kind list accepts any
+// `self_parameter`, so the receiver-MODE check asserts the exact shared-ref
+// `&self`. A mutable-ref receiver is rejected.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&mut self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+// @file: reissue_by_value_self [REJECT]
+// FIX3 — `reissue(self)` (by-value receiver). Rejected by the receiver-mode
+// check: must be exactly `&self`.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+// @file: as_did_mut_self [REJECT]
+// FIX3 — `as_did(&mut self)`. Rejected by the receiver-mode check: must be
+// exactly `&self`.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&mut self) -> &DID {
+        &self.did
+    }
+}
+
+// @file: unsafe_issue_for_actor [REJECT]
+// FIX4 — `const unsafe fn issue_for_actor`. The fn-modifier set must be a
+// subset of {const}; `unsafe` is rejected.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const unsafe fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+// @file: async_reissue [REJECT]
+// FIX4 — `async fn reissue`. `async` is not in the permitted modifier set
+// {const}; rejected.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) async fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+// @file: extern_reissue [REJECT]
+// FIX4 — `extern "C" fn reissue`. `extern` is not in the permitted modifier
+// set {const}; rejected.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) extern "C" fn reissue(&self) -> Self {
         Self { did: self.did.clone() }
     }
     pub(in crate::context) const fn as_did(&self) -> &DID {

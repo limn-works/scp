@@ -60,13 +60,25 @@ COMPLETE CHECK SET (definition shape only), scanning identity_capability.rs:
       proc-macro / unknown attribute is rejected.
   A3. The one impl's exact shape: it is INHERENT (no trait); its target, after
       stripping any leading path to the final segment, is `OwnedIdentityDid`;
-      it contains EXACTLY {issue_for_actor, reissue, as_did} — no more, no
-      fewer. Per-method exact signature: `issue_for_actor` is `pub(super)`,
-      ONE by-value param, returns `Self`/`OwnedIdentityDid`; `reissue` is
-      `pub(in crate::context)`, params EXACTLY `&self`, returns
-      `Self`/`OwnedIdentityDid`; `as_did` is `pub(in crate::context)`, params
-      EXACTLY `&self`, returns `&DID`. Each method's attributes must be inert
-      built-ins (`allow` / `must_use` / `cfg` / `inline` / `doc`).
+      its OWN attributes must be bare inert built-ins (a proc-macro / derive /
+      path-qualified attribute on the `impl` block is rejected); and its body
+      (the `declaration_list`) is itself a POSITIVE WHITELIST mirroring A1 one
+      level down: the ONLY permitted body children are `function_item`s plus
+      inert trivia, so a `macro_invocation` (most critically — it can expand
+      to a second minter), `const_item`, `type_item`, `static_item`, or any
+      other in-impl item is rejected BY KIND. It contains EXACTLY
+      {issue_for_actor, reissue, as_did} — no more, no fewer. Per-method exact
+      signature: `issue_for_actor` is `pub(super)`, ONE by-value param, returns
+      `Self`/`OwnedIdentityDid`; `reissue` is `pub(in crate::context)`,
+      receiver EXACTLY `&self` (shared ref — reject `&mut self` / by-value
+      `self`), returns `Self`/`OwnedIdentityDid`; `as_did` is
+      `pub(in crate::context)`, receiver EXACTLY `&self`, returns a shared
+      reference to `DID` (`&DID` or path-qualified `&scp_identity::DID`,
+      normalized symmetrically with the field-type check; `&mut DID` and
+      by-value `DID` rejected). Every method's fn-modifier set must be a subset
+      of {const} (reject `unsafe` / `async` / `extern` / `gen`; `const` not
+      required). Each method's attributes must be inert built-ins (`allow` /
+      `must_use` / `cfg` / `inline` / `doc`).
   A4. No construction outside the allowlisted method bodies — LOCATION-BASED
       and NAME-AGNOSTIC: ANY `struct_expression` whose lexical position is
       neither inside one of the three allowlisted method bodies NOR inside the
@@ -76,8 +88,10 @@ COMPLETE CHECK SET (definition shape only), scanning identity_capability.rs:
       caught by LOCATION. Belt-and-braces on top of A1's ban on free fns /
       aliases (which already makes a stray literal's enclosing item moot).
   A5. `deny(unsafe_code)` / `forbid(unsafe_code)` present in `supervisor/mod.rs`
-      via REAL inner-attribute parse — a commented-out or string occurrence
-      does NOT satisfy it; extra lints (`deny(unsafe_code, missing_docs)`) DO.
+      via REAL inner-attribute parse of a TOP-LEVEL `#![..]` (a direct child of
+      the `source_file` root — a deny nested inside a fn body applies only to
+      that scope and does NOT count); a commented-out or string occurrence does
+      NOT satisfy it; extra lints (`deny(unsafe_code, missing_docs)`) DO.
 
 PREREQUISITES: pip install tree-sitter tree-sitter-rust (already in CI).
 Python 3.12+, offline.
@@ -236,6 +250,88 @@ def _fn_return_text(fn: Node, src: bytes) -> str:
     return " ".join(_text(ret, src).split()) if ret is not None else ""
 
 
+def _fn_return_node(fn: Node) -> Node | None:
+    return fn.child_by_field_name("return_type")
+
+
+def _self_receiver_mode(self_param: Node) -> str:
+    """Classify a `self_parameter` node's receiver mode.
+
+    Returns one of: `&self` (shared ref), `&mut self` (mutable ref), or
+    `self` (by-value). In tree-sitter-rust `self_parameter` has children
+    `&`? `mutable_specifier`? `self`; a typed `self: &Self` is a plain
+    `parameter` node, not `self_parameter`, so it never reaches here.
+    """
+    kinds = {c.type for c in self_param.children}
+    if "&" in kinds:
+        return "&mut self" if "mutable_specifier" in kinds else "&self"
+    return "self"
+
+
+def _fn_self_param(fn: Node) -> Node | None:
+    """The `self_parameter` child of a function, if any."""
+    params = _fn_params(fn)
+    if params is None:
+        return None
+    for c in params.children:
+        if c.type == "self_parameter":
+            return c
+    return None
+
+
+def _fn_modifier_kinds(fn: Node) -> set[str]:
+    """The set of modifier keywords on a function.
+
+    Reads the `function_modifiers` child (if present) and returns the set
+    of its modifier tokens normalized to keywords: `const`, `unsafe`,
+    `async`, `extern` (from `extern_modifier`), `gen`. An empty set means a
+    plain `fn` with no modifiers.
+    """
+    out: set[str] = set()
+    for child in fn.children:
+        if child.type != "function_modifiers":
+            continue
+        for m in child.children:
+            if m.type == "extern_modifier":
+                out.add("extern")
+            elif m.type in ("const", "unsafe", "async", "gen"):
+                out.add(m.type)
+            else:
+                # Unknown modifier token — record its kind so the
+                # subset-check rejects it by name.
+                out.add(m.type)
+    return out
+
+
+def _normalize_ref_return(ret_node: Node, src: bytes) -> tuple[bool, bool, str]:
+    """Decompose a return-type node for the reference-return comparison.
+
+    Returns `(is_reference, is_mutable, normalized_core)` where
+    `normalized_core` is the final path segment of the referent type. For a
+    `reference_type` (`&DID`, `&scp_identity::DID`, `&'a DID`, `&mut DID`)
+    the leading `&`, an optional `'lifetime`, and an optional `mut` are
+    split off and the remaining core type is reduced to its final path
+    segment — so `&scp_identity::DID` and `&DID` both normalize to
+    `(True, False, "DID")`. A non-reference return yields
+    `(False, False, <final segment of the whole type>)`.
+    """
+    if ret_node.type != "reference_type":
+        return (False, False, _final_type_segment(_text(ret_node, src)))
+    is_mut = False
+    core: Node | None = None
+    for c in ret_node.children:
+        if c.type == "&":
+            continue
+        if c.type == "mutable_specifier":
+            is_mut = True
+            continue
+        if c.type == "lifetime":
+            continue
+        core = c  # the referent type node
+    core_text = _final_type_segment(_text(core, src)) if core is not None else ""
+    return (True, is_mut, core_text)
+
+
 def _walk(node: Node):
     stack = [node]
     while stack:
@@ -329,6 +425,25 @@ def _attr_args(attr: Node) -> list[str]:
     ]
 
 
+def _attr_args_deep(attr: Node) -> list[str]:
+    """All `identifier` descendants inside an attribute's `token_tree`.
+
+    Unlike `_attr_args` (which only collects TOP-LEVEL identifiers), this
+    recurses through nested `token_tree`s, so `cfg(all(test))` yields
+    `["all", "test"]` rather than just `["all"]`. Used ONLY for cfg(test)
+    detection on the test module — NOT for `_check_inert_attrs` / derive
+    detection, where only the top-level meta args are meaningful.
+    """
+    tt = _attr_token_tree(attr)
+    if tt is None:
+        return []
+    return [
+        (n.text or b"").decode("utf-8", "replace")
+        for n in _walk(tt)
+        if n.type == "identifier"
+    ]
+
+
 def _check_inert_attrs(
     item: Node,
     src: bytes,
@@ -387,7 +502,13 @@ def _has_deny_unsafe_code(mod_src: bytes) -> bool:
     (`deny(unsafe_code, missing_docs)`) DO.
     """
     root = _parser().parse(mod_src).root_node
-    for n in _walk(root):
+    # Only a TOP-LEVEL inner attribute counts: `#![deny(unsafe_code)]` must
+    # be a DIRECT child of the `source_file` root (i.e. apply to the whole
+    # module). A `#![deny(unsafe_code)]` nested inside a fn body or block
+    # applies only to that scope and does NOT satisfy the module-wide
+    # requirement — so we iterate the root's direct children, not the whole
+    # tree.
+    for n in root.children:
         if n.type != "inner_attribute_item":
             continue
         attr = _attr_node(n)
@@ -437,7 +558,10 @@ def _mod_has_cfg_test(mod: Node) -> bool:
         if attr is None:
             continue
         is_bare, path = _attr_path_is_bare(attr)
-        if is_bare and path == "cfg" and "test" in _attr_args(attr):
+        # Recurse nested token_trees so `#[cfg(all(test))]` (and other
+        # nested cfg predicates) are recognized — `_attr_args` only sees
+        # the top-level `all`, missing the inner `test`.
+        if is_bare and path == "cfg" and "test" in _attr_args_deep(attr):
             return True
     return False
 
@@ -595,10 +719,53 @@ def _enforce(cap_src_path: Path, mod_src_path: Path) -> list[str]:
     # === A3: the one impl's exact shape ===
     inherent_fns: list[Node] = []
     for impl_item in inherent_impls:
+        # A3-attr: the impl block's OWN attributes must be bare inert
+        # built-ins — same allowlist as a method — so a proc-macro /
+        # derive-style / path-qualified attribute on `impl OwnedIdentityDid`
+        # (which could rewrite or inject members) is rejected.
+        failures.extend(
+            _check_inert_attrs(
+                impl_item, src, METHOD_INERT_ATTRS, f"`impl {TYPE_NAME}`"
+            )
+        )
         decl = impl_item.child_by_field_name("body")
         if decl is None:
             continue
-        inherent_fns.extend(c for c in decl.children if c.type == "function_item")
+        # A3-body: POSITIVE WHITELIST over the impl body, mirroring A1 one
+        # level down. The ONLY permitted children of the inherent impl's
+        # `declaration_list` are `function_item`s plus inert trivia (braces,
+        # comments, and the empty `;` statement that follows a macro). EVERY
+        # other node kind is rejected by KIND — most critically
+        # `macro_invocation` (a `mac!();` in the impl body can expand to a
+        # second minter, invisible to BOTH A1 (not module-level) and the
+        # old function_item-only FILTER), but also `const_item`, `type_item`,
+        # `static_item`, `macro_definition`, and any nested item. Generalizes:
+        # an unknown kind is rejected too.
+        for child in decl.children:
+            kind = child.type
+            if kind in (
+                "{",
+                "}",
+                "line_comment",
+                "block_comment",
+                "empty_statement",
+                # Outer attributes decorating the following `fn` are separate
+                # siblings; they are validated by `_check_inert_attrs` on each
+                # method (via `_preceding_attr_items`), so skip them here.
+                "attribute_item",
+            ):
+                continue
+            if kind == "function_item":
+                inherent_fns.append(child)
+                continue
+            label = _DISALLOWED_KIND_LABEL.get(kind, f"a `{kind}`")
+            failures.append(
+                f"`impl {TYPE_NAME}` body contains a node of kind `{kind}` "
+                f"({label}) — only inherent `fn` items are permitted inside "
+                f"the impl block; a `macro_invocation` / `const` / `type` / "
+                f"`static` / macro definition in the body can smuggle a "
+                f"second minter and is rejected by KIND"
+            )
 
     seen_names: list[str] = []
     fn_by_name: dict[str, Node] = {}
@@ -625,31 +792,54 @@ def _enforce(cap_src_path: Path, mod_src_path: Path) -> list[str]:
                 f"inherent fn `{required}` is defined {count} times; expected once"
             )
 
-    # Per-method EXACT signature: (required_vis, exact_param_kinds, return_set).
+    # Per-method EXACT signature. Each spec is:
+    #   required_vis      — exact normalized visibility string
+    #   exact_param_kinds — exact ordered parameter NODE-KIND list
+    #   receiver_mode     — for `&self` methods, the exact required receiver
+    #                       mode (`&self`); None for the by-value-param mint
+    #   return_kind       — ("value", {allowed final segments}) for a by-value
+    #                       return, or ("ref", core, is_mut) for a reference
+    #                       return. Reference returns are normalized so a
+    #                       path-qualified referent (`&scp_identity::DID`)
+    #                       compares equal to `&DID` — symmetric with the
+    #                       field-type check, which already strips the path.
     method_spec = {
         "issue_for_actor": (
             "pub(super)",
             ["parameter"],  # exactly one by-value param (not &self)
-            {"Self", TYPE_NAME},
+            None,  # not a method; takes a by-value DID, no self receiver
+            ("value", {"Self", TYPE_NAME}),
         ),
         "reissue": (
             REQUIRED_STRUCT_VIS,
-            ["self_parameter"],  # EXACTLY &self, nothing else
-            {"Self", TYPE_NAME},
+            ["self_parameter"],  # EXACTLY one &self receiver, nothing else
+            "&self",  # shared-ref receiver: reject &mut self / by-value self
+            ("value", {"Self", TYPE_NAME}),
         ),
         "as_did": (
             REQUIRED_STRUCT_VIS,
-            ["self_parameter"],  # EXACTLY &self
-            {"&DID", "& DID"},
+            ["self_parameter"],  # EXACTLY one &self receiver
+            "&self",
+            ("ref", "DID", False),  # -> &DID (shared ref to DID)
         ),
     }
-    for name, (req_vis, want_params, ret_set) in method_spec.items():
+    for name, (req_vis, want_params, recv_mode, ret_spec) in method_spec.items():
         fn = fn_by_name.get(name)
         if fn is None:
             continue
         v = _norm_vis(_vis_node(fn), src) or "<inherited-private>"
         if v != req_vis:
             failures.append(f"`{name}` visibility is `{v}`; must be `{req_vis}`")
+        # Fn-modifier whitelist: the modifier set must be a subset of
+        # {const} — permit `const`, reject `unsafe` / `async` / `extern` /
+        # `gen` (and any unknown modifier). `const` is NOT required.
+        mods = _fn_modifier_kinds(fn)
+        bad_mods = sorted(mods - {"const"})
+        if bad_mods:
+            failures.append(
+                f"`{name}` carries fn modifier(s) {bad_mods}; only `const` is "
+                f"permitted (reject `unsafe` / `async` / `extern` / `gen`)"
+            )
         params = _fn_param_kinds(fn)
         if params != want_params:
             failures.append(
@@ -661,14 +851,45 @@ def _enforce(cap_src_path: Path, mod_src_path: Path) -> list[str]:
                     else ""
                 )
             )
-        ret = _fn_return_text(fn, src)
-        ret_norm = _final_type_segment(ret) if "::" in ret and "&" not in ret else ret
-        if ret not in ret_set and ret_norm not in {
-            _final_type_segment(r) for r in ret_set
-        }:
-            failures.append(
-                f"`{name}` returns `{ret or '()'}`; must be one of {sorted(ret_set)}"
-            )
+        # Receiver-MODE check for the `&self` methods: the param-kind list
+        # above accepts any `self_parameter`, so `&mut self`, by-value
+        # `self`, and `&self` are indistinguishable there. Assert the exact
+        # shared-reference receiver here. (A typed `self: &Self` is a
+        # `parameter` node, already rejected by the param-kind check above.)
+        if recv_mode is not None:
+            sp = _fn_self_param(fn)
+            if sp is not None:
+                actual = _self_receiver_mode(sp)
+                if actual != recv_mode:
+                    failures.append(
+                        f"`{name}` receiver is `{actual}`; must be exactly "
+                        f"`{recv_mode}` (reject `&mut self`, by-value `self`, "
+                        f"and typed `self: &Self`/`&mut Self`)"
+                    )
+        ret_node = _fn_return_node(fn)
+        ret_text = _fn_return_text(fn, src)
+        if ret_node is None:
+            failures.append(f"`{name}` returns `()`; a return type is required")
+        elif ret_spec[0] == "value":
+            _, allowed = ret_spec
+            allowed_segs = {_final_type_segment(r) for r in allowed}
+            seg = _final_type_segment(ret_text)
+            if ret_node.type == "reference_type" or seg not in allowed_segs:
+                failures.append(
+                    f"`{name}` returns `{ret_text or '()'}`; must be one of "
+                    f"{sorted(allowed)}"
+                )
+        else:  # ("ref", core, is_mut)
+            _, want_core, want_mut = ret_spec
+            is_ref, is_mut, core = _normalize_ref_return(ret_node, src)
+            if not is_ref or is_mut != want_mut or core != want_core:
+                want = ("&mut " if want_mut else "&") + want_core
+                failures.append(
+                    f"`{name}` returns `{ret_text or '()'}`; must be a "
+                    f"shared reference `{want}` (path-qualified referent "
+                    f"`&scp_identity::DID` is accepted; by-value `DID` and "
+                    f"`&mut DID` are rejected)"
+                )
         # Per-method attributes: inert built-ins only.
         failures.extend(
             _check_inert_attrs(fn, src, METHOD_INERT_ATTRS, f"method `{name}`")
@@ -801,6 +1022,12 @@ _MOD_RS_STUBS = {
     "default": "#![deny(unsafe_code)]\n",
     "deny_commented": "// #![deny(unsafe_code)]\n",
     "deny_extra_lints": "#![deny(unsafe_code, missing_docs)]\n",
+    #   - "deny_nested_in_fn": the only `#![deny(unsafe_code)]` occurrence is
+    #     NESTED inside a fn body (applies to that scope, not the module).
+    #     A5 must NOT be satisfied by a non-top-level inner attribute, so a
+    #     fixture pairing this with an otherwise-real-shape body must be
+    #     REJECTED.
+    "deny_nested_in_fn": "fn scoped() {\n    #![deny(unsafe_code)]\n}\n",
 }
 
 
