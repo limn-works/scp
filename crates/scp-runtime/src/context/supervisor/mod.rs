@@ -47,6 +47,57 @@
 //!   such an impl would be a SECOND minter authored from inside the module.
 //!   Denying the lint makes any nested impl a hard COMPILE error, enforcing
 //!   the sole-minter invariant at the compiler rather than via a scanner.
+//!
+//! ## Compile-fail witness for the `non_local_definitions` guarantee
+//!
+//! The example below witnesses the ADR-049 §5 compiler-enforcement
+//! guarantee: under `#![deny(non_local_definitions)]`, a second minter
+//! smuggled into a function body as a nested `impl` (the exact vector the
+//! type system's private-field + `pub(super)`-constructor rules do *not*
+//! cover) is a hard compile error, not a warning. The stand-in `Cap` mirrors
+//! `OwnedIdentityDid`: a private field with no public constructor. The
+//! body-nested `impl Cap { .. }` is otherwise valid Rust — Rust applies it
+//! globally rather than scoping it to `forge` — so the *only* reason this
+//! fails to compile is the denied lint. If a future toolchain narrowed the
+//! lint, this `compile_fail` doctest would start compiling and the test
+//! would fail, surfacing the silent regression.
+//!
+//! ```compile_fail
+//! #![deny(non_local_definitions)]
+//!
+//! mod capability {
+//!     pub struct Cap {
+//!         did: String,
+//!     }
+//!
+//!     impl Cap {
+//!         // The sole sanctioned minter (mirrors `issue_for_actor`).
+//!         pub fn issue(did: String) -> Self {
+//!             Self { did }
+//!         }
+//!     }
+//! }
+//!
+//! fn forge(raw: String) -> capability::Cap {
+//!     // A SECOND minter smuggled into a function body. Rust applies this
+//!     // `impl` globally (never scoping it to `forge`), so it would forge a
+//!     // `Cap` for an arbitrary DID from outside `capability` — but
+//!     // `#![deny(non_local_definitions)]` turns it into a compile error.
+//!     impl capability::Cap {
+//!         fn smuggled(did: String) -> Self {
+//!             // Routes through the sanctioned constructor: the point is
+//!             // purely that this nested `impl` is rejected by the lint,
+//!             // not by any name-resolution or visibility error.
+//!             capability::Cap::issue(did)
+//!         }
+//!     }
+//!     capability::Cap::smuggled(raw)
+//! }
+//!
+//! fn main() {
+//!     let _ = forge(String::from("did:example:attacker"));
+//! }
+//! ```
 
 #![deny(unsafe_code)]
 // `OwnedIdentityDid` (ADR-049 §5) is an unforgeable capability token: its
