@@ -345,6 +345,66 @@ impl OwnedIdentityDid {
     }
 }
 
+// BYPASS I1 (FIX — rule I, nested-mod inherent cap-impl) — A SECOND inherent
+// `impl OwnedIdentityDid` hosting an allowlisted-NAMED `issue_for_actor`,
+// hidden inside a nested `mod forge_surface` in the DECLARING file. Pre-fix
+// this PASSED exit 0: the per-file inherent allowlist (G) saw an allowlisted
+// name (`issue_for_actor`), and the construction scan (H) saw an inline
+// `Self { … }` whose nearest enclosing `function_item` is that allowlisted
+// `issue_for_actor` in an inherent cap impl (`in_allowlisted` True). A
+// literal-free module-level wrapper could then re-export this nested mint to
+// all of `crate::context`. The canonical production cap impl is TOP-LEVEL, so
+// rule I HARD FAILs ANY cap inherent-impl nested under a `mod` in the
+// declaring file — the in-file analogue of the `#[path]`-include escape. The
+// substring `inherent impl `impl OwnedIdentityDid` is nested under a `mod`` is
+// produced ONLY by a nested-mod inherent cap impl. (The nested `Self { … }`
+// ALSO trips the rule-I construction arm with a `Self`-labelled diagnostic;
+// BYPASS I2 below isolates the construction arm with an explicit-name label.)
+mod forge_surface {
+    use super::*;
+    #[allow(dead_code)]
+    impl OwnedIdentityDid {
+        pub(super) fn issue_for_actor(_d: &Did) -> Self {
+            Self { inner: [0; 32] }
+        }
+    }
+}
+
+// BYPASS I2 (FIX — rule I, nested-mod cap construction, non-allowlisted name) —
+// A nested-mod impl whose method constructs the cap via an EXPLICIT-NAME
+// `OwnedIdentityDid { … }` struct literal. Same nesting bypass as I1; this case
+// isolates the rule-I CONSTRUCTION arm by labelling the literal with the
+// explicit type name (not `Self`), so its diagnostic substring
+// `` `OwnedIdentityDid { … }` cap construction is nested under a `mod` `` is
+// unique to the explicit-name nested-mod construction (distinct from I1's
+// `Self`-labelled construction). The enclosing fn `forge_nested` is also
+// non-allowlisted, so rule G fires an `unexpected inherent fn` diagnostic too —
+// additive, not relied upon by this assertion.
+mod forge_surface_two {
+    use super::*;
+    #[allow(dead_code)]
+    impl OwnedIdentityDid {
+        pub(super) fn forge_nested(_d: &Did) -> Self {
+            OwnedIdentityDid { inner: [0; 32] }
+        }
+    }
+}
+
+// BYPASS J1 (FIX — rule J, declaring-file LITERAL-FREE by-value cap-return
+// wrapper) — A free fn at the declaring file's module level that returns the
+// cap BY VALUE by CALLING the `pub(super)` mint — NO struct literal of its own.
+// Pre-fix this PASSED exit 0: rule H is a struct-literal scanner (this fn has
+// no literal), and rule G only inspects INHERENT methods on the cap (this is a
+// free fn). It compiles and re-exports the mint to all of `crate::context`.
+// Rule J flags any fn whose return type mentions the cap by value, except the
+// two top-level inherent constructors and `#[cfg(test)]` items. The substring
+// `fn `forge_by_value_wrapper` returns OwnedIdentityDid BY VALUE` is unique to
+// this case.
+#[allow(dead_code)]
+pub(in crate::context) fn forge_by_value_wrapper(_d: &Did) -> OwnedIdentityDid {
+    OwnedIdentityDid::issue_for_actor(Did([0; 32]))
+}
+
 // @file: context/actor/forge_metavar_macro.rs
 // FIX-1 (BLACK-G05) — METAVARIABLE MACRO MINT in a NON-declaring file. The
 // macro DEFINITION synthesizes `impl $t { … }` on a passed-in type
@@ -891,5 +951,49 @@ impl UseGroupAlias {
     #[allow(dead_code)]
     pub(in crate::context) fn forge(did: Did) -> Self {
         Self { did }
+    }
+}
+
+// @file: context/supervisor/subtree_by_value_leak.rs
+// BYPASS J2 (FIX — rule J, SUBTREE non-declaring-file by-value cap-return
+// wrapper) — A free fn in ANOTHER supervisor-subtree file (NOT the declaring
+// file) that returns the cap BY VALUE by calling the `pub(super)` mint. Because
+// the mint is `pub(super)` (reachable across the whole `supervisor` module
+// tree), this re-export compiles and is handler-reachable from any
+// supervisor-subtree caller — yet the declaring-file-pinned rules (G/H, scoped
+// to `identity_capability.rs`) never look here. Pre-fix this PASSED exit 0.
+// Rule J is the ONE rule that scans the WHOLE subtree: it flags this fn's
+// by-value cap return. The substring `fn `leak_token` returns OwnedIdentityDid
+// BY VALUE` is unique to this subtree-leak case. (No cap declaration is needed
+// in this file — rule J keys on the RETURN TYPE's tail identifier, not on a
+// local decl; the AST gate does not resolve types.)
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) fn leak_token(_d: &Did) -> OwnedIdentityDid {
+    crate::context::supervisor::identity_capability::OwnedIdentityDid::issue_for_actor(Did([0; 32]))
+}
+
+// @file: context/supervisor/cfg_test_by_value_ok.rs
+// NEGATIVE CONTROL J3 (FIX — rule J cfg(test) exemption) — A `#[cfg(test)]`-gated
+// fn that returns the cap BY VALUE. Rule J EXEMPTS `#[cfg(test)]` items (the real
+// `#[cfg(test)] mod tests` in the declaring file mints via
+// `OwnedIdentityDid::issue_for_actor(...)` and the handle.rs test mints are
+// `#[cfg(test)]`-gated too — all MUST keep passing). This fn MUST NOT contribute
+// any rule-J diagnostic. The self-test asserts only that REQUIRED substrings are
+// PRESENT, so this negative is verified out-of-band: the orchestrator greps the
+// self-test diagnostics and confirms `test_only_by_value_mint` NEVER appears. If
+// the cfg(test) exemption regressed, this fn's by-value return would surface a
+// rule-J diagnostic naming `test_only_by_value_mint`, and the out-of-band check
+// would catch it. (The fn is INSIDE a `#[cfg(test)] mod` so `_inside_cfg_test`
+// walks its ancestor chain to the test-gated module and exempts it.)
+struct Did([u8; 32]);
+#[cfg(test)]
+mod fixture_tests_by_value {
+    use super::*;
+    #[allow(dead_code)]
+    pub(in crate::context) fn test_only_by_value_mint(_d: &Did) -> OwnedIdentityDid {
+        crate::context::supervisor::identity_capability::OwnedIdentityDid::issue_for_actor(
+            Did([0; 32]),
+        )
     }
 }

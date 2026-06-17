@@ -129,6 +129,46 @@ If the `OwnedIdentityDid` type exists anywhere in `crates/scp-runtime/src/`:
       struct-literals are `Self { did }` inside `issue_for_actor` and
       `reissue`, both allowlisted, so production PASSES.
 
+  (I) IN-FILE NESTED-MOD BAN (declaring file). Rules (G)/(H) collect every
+      `impl OwnedIdentityDid` block and every cap `struct_expression` in the
+      declaring file REGARDLESS of nesting (the AST walk recurses through
+      `mod_item` bodies), but they classify per-file: a SECOND cap inherent
+      impl hosting an allowlisted-NAMED `issue_for_actor` — hidden inside a
+      nested `mod` — supplies an allowlisted name (G passes) and an inline
+      `Self { … }` whose nearest enclosing fn is that allowlisted constructor
+      (H's `in_allowlisted` True), so BOTH wave it through. A literal-free
+      module-level wrapper can then re-export the nested mint to all of
+      `crate::context`. This is the IN-FILE analogue of the
+      `#[path]`-include escape (`_path_attr_escape` polices external files;
+      rule I polices in-file nested-mod surfaces). The canonical production
+      cap impl + its two `Self { did }` literals are TOP-LEVEL, so rule I
+      HARD FAILs ANY cap inherent/trait impl, and ANY cap struct literal,
+      nested under a `mod_item` in the declaring file — strictly additive.
+
+  (J) BY-VALUE CAP-RETURN BAN (whole supervisor subtree). A fn that returns
+      the cap BY VALUE — WITHOUT a struct literal, by CALLING the
+      `pub(super)` mint — re-exports a mint surface that rule H (a
+      construction-site scanner: no literal to see) and rule G (inherent
+      methods only) both miss. Example:
+        `pub(in crate::context) fn forge_for_any(d: DID) -> OwnedIdentityDid
+             { OwnedIdentityDid::issue_for_actor(d) }`
+      It compiles and is handler-reachable anywhere the `pub(super)` mint is
+      reachable — the WHOLE `crates/scp-runtime/src/context/supervisor/`
+      subtree. Rule J flags any fn (free fn, inherent method, trait method)
+      whose `return_type` MENTIONS the cap by value (the cap tail — or a
+      `Self` inside an inherent/trait cap impl — appears in the return type
+      NOT solely behind a `&` reference, including inside
+      `Option`/`Result`/`Box`/tuples/fn-returns), EXCEPT the two allowlisted
+      constructors `issue_for_actor`/`reissue` IN their canonical TOP-LEVEL
+      inherent cap impl IN the declaring file, and EXCEPT `#[cfg(test)]`
+      items. This is the ONE rule that scans the WHOLE subtree rather than
+      the declaring file alone; it is an ADDITIVE multi-file scan for ONE
+      anti-pattern and does NOT weaken the declaring-file pin (`REQUIRED_PATH`)
+      every other rule keys on. Production PASSES: `issue_for_actor`/`reissue`
+      are exempt, `build_actor_deps` returns `ActorDeps` (cap encapsulated,
+      not in the return type), `as_did` returns `&DID` (a borrow), and the
+      handle.rs test mints are `#[cfg(test)]`-gated.
+
   (C) The declaration MUST NOT carry a `derive(...)` — plain
       `#[derive(...)]` OR conditional `#[cfg_attr(..., derive(...))]` —
       listing ANY of:
@@ -309,6 +349,10 @@ COVERS (source-text surface, via tree-sitter AST):
   - forbidden derives / forbidden manual trait impls (C / D)
   - `type` aliases of the cap (F.1 / F.2)
   - non-struct nominal forms: `enum` (F.3) and `union` (F.4)
+  - in-file nested-mod cap impls / cap constructions in the declaring file
+    (I — the in-file analogue of the `#[path]` include escape)
+  - by-value cap returns anywhere under the supervisor subtree (J — a
+    literal-free re-export of the `pub(super)` mint that H and G both miss)
   - struct location, name-visibility, and field visibility (A / B / E)
 
 OUT OF REMIT (NOT this AST gate — covered by the type system + human review):
@@ -397,6 +441,17 @@ except ImportError:
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCAN_DIR = REPO_ROOT / "crates" / "scp-runtime" / "src"
 REQUIRED_PATH = "crates/scp-runtime/src/context/supervisor/identity_capability.rs"
+# The subtree (relative, posix) under which the `pub(super)` mint
+# `issue_for_actor` is REACHABLE. The struct is declared `pub(super)`-minted
+# in REQUIRED_PATH; `pub(super)` resolves to the parent module — the
+# `supervisor` directory — so any `.rs` file under it can call the mint and
+# thereby return a token by value (rule J, the by-value cap-return ban, scans
+# this whole subtree, not just the declaring file). Outside this subtree the
+# `pub(super)` mint is unreachable, so a by-value cap return cannot be
+# produced there. Kept as a path PREFIX (posix `rel.startswith(...)`) so the
+# self-test's temp staging tree — which mirrors the same relative layout —
+# matches identically.
+SUPERVISOR_SUBTREE_REL = "crates/scp-runtime/src/context/supervisor/"
 FIXTURE_FILE = REPO_ROOT / "scripts" / "tests" / "owned-identity-did-fixture.rs"
 TYPE_NAME = "OwnedIdentityDid"
 
@@ -1085,6 +1140,85 @@ def _impl_is_inherent(impl_node) -> bool:
     )
 
 
+def _nested_mod_ancestor(node):
+    """Return the FIRST `mod_item` ancestor strictly BETWEEN `node` and the
+    enclosing `source_file`, or None if `node` is at the file's TOP LEVEL
+    (no intervening `mod_item`).
+
+    Rule (I) — IN-FILE NESTED-MOD BAN. Rules (G)/(H) collect every
+    `impl OwnedIdentityDid` block and every cap `struct_expression` in the
+    declaring file REGARDLESS of nesting (the `walk` recurses through
+    `mod_item` bodies), but the canonical PRODUCTION cap impl + its two
+    `Self { … }` literals live at the declaring file's TOP LEVEL. A SECOND
+    cap impl — or any cap struct literal — placed inside a nested `mod` in
+    the declaring file is the in-file analogue of the `#[path]`-include
+    escape (`_path_attr_escape`): an extra construction surface that a
+    reviewer scanning the top-level body can miss. The nested-mod impl can
+    re-host a constructor (even an allowlisted-NAMED one, `issue_for_actor`,
+    which rule G/H per-file would WAVE THROUGH) and a literal-free wrapper at
+    module level can re-export it to all of `crate::context`. Because the
+    production cap impl/literals are TOP-LEVEL, hard-failing any cap
+    inherent-impl / cap struct-literal nested under a `mod_item` in the
+    declaring file is strictly ADDITIVE. We walk PARENTS and return the
+    nearest `mod_item` before hitting the `source_file` boundary.
+    """
+    cur = node.parent
+    while cur is not None:
+        if cur.type == "source_file":
+            return None
+        if cur.type == "mod_item":
+            return cur
+        cur = cur.parent
+    return None
+
+
+def _return_mentions_cap_by_value(return_node, source: bytes, in_cap_impl: bool) -> bool:
+    """True if a fn's `return_type` node MENTIONS the capability type BY
+    VALUE — i.e. the cap tail identifier (`OwnedIdentityDid`, incl. a scoped
+    `…::OwnedIdentityDid`) OR a bare `Self` (only when the fn is inside an
+    inherent/trait impl whose target IS the cap, `in_cap_impl`) appears in the
+    return type and is NOT located SOLELY behind a `&` reference.
+
+    This is the matcher for rule (J) — the BY-VALUE CAP-RETURN ban. A fn that
+    returns the cap by value re-exports a mint surface even WITHOUT a struct
+    literal (it can call the `pub(super)` `issue_for_actor`), so rule H (a
+    construction-site scanner that only sees struct literals) and rule G (which
+    only inspects INHERENT methods on the cap) both miss it. We walk the
+    `return_type` subtree; a `reference_type` (`&T` / `&mut T`) marks its
+    descendants as "behind a reference" so `-> &OwnedIdentityDid` / `-> &DID`
+    / `-> &Self` are NOT by-value returns (the existing `&OwnedIdentityDid`
+    parameter contract relies on references being borrows, not ownership
+    transfers). The cap appearing inside `Option<…>` / `Result<…>` / `Box<…>`
+    / a tuple / a `dyn Fn(..) -> Cap` / a fn-pointer return IS by-value (the
+    callee yields an owned token, however wrapped) and IS flagged.
+
+    `Self` is matched as the cap ONLY when `in_cap_impl` is True so a `Self`
+    return in some OTHER type's impl (or a free fn, where `Self` is
+    meaningless) is not misread as a cap return.
+    """
+    if return_node is None:
+        return False
+    found = [False]
+
+    def _rec(n, under_ref: bool) -> None:
+        if n.type == "reference_type":
+            # Everything inside a `&T` / `&mut T` is borrowed, not owned.
+            for c in n.children:
+                _rec(c, True)
+            return
+        if n.type in ("type_identifier", "scoped_type_identifier"):
+            tail = _type_tail_identifier(n, source)
+            if not under_ref and tail == TYPE_NAME:
+                found[0] = True
+            if not under_ref and tail == "Self" and in_cap_impl:
+                found[0] = True
+        for c in n.children:
+            _rec(c, under_ref)
+
+    _rec(return_node, False)
+    return found[0]
+
+
 def _struct_expr_constructs_cap(struct_expr_node, source: bytes) -> bool:
     """True if a `struct_expression` node CONSTRUCTS the capability type:
 
@@ -1663,9 +1797,12 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
     list[tuple[str, int, str]],
     list[tuple[str, int, str]],
     list[tuple[str, int, str]],
+    list[tuple[str, int, str]],
+    list[tuple[str, int, str]],
 ]:
     """Walk scan_dir and return (decls, impls, ctor_fns, cap_aliases,
-    trait_fns, macro_hits, construction_hits, use_aliases).
+    trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits,
+    by_value_return_hits).
 
     decls: list of (rel_path, line, visibility, derives, public_fields,
                     kind, generic) where kind is
@@ -1762,6 +1899,37 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
            OwnedIdentityDid as Alias};`) — the `use_as_clause` is found
            wherever it nests inside a `use_list` / `scoped_use_list`. Element
            shape: (rel_path, line, alias_name).
+    nested_mod_hits: (rule I) every `impl OwnedIdentityDid` block (inherent OR
+           trait) and every cap-constructing `struct_expression` in the
+           DECLARING FILE that is nested under a `mod_item` (i.e. NOT at the
+           file's top level). The canonical production cap impl + its two
+           `Self { … }` literals are TOP-LEVEL; a SECOND cap impl or any cap
+           struct literal hidden inside an in-file nested `mod` is the
+           in-file analogue of the `#[path]`-include escape — an extra
+           construction/mint surface that rules G/H per-file would WAVE
+           THROUGH (a nested-mod re-impl of `issue_for_actor` supplies an
+           allowlisted name + a `Self { did }` whose nearest enclosing
+           `function_item` is allowlisted, so both pass) but a literal-free
+           module-level wrapper can re-export to all of `crate::context`.
+           SCOPED to the declaring file (`required_rel`): in any other file
+           the private-field literal would not compile and a foreign cap impl
+           is caught by location check (A). Element shape: (rel_path, line,
+           reason).
+    by_value_return_hits: (rule J) every `function_item` ANYWHERE under the
+           SUPERVISOR SUBTREE (`SUPERVISOR_SUBTREE_REL`, where the
+           `pub(super)` mint is reachable) whose `return_type` MENTIONS the
+           cap BY VALUE (the cap tail — or a `Self` inside an inherent/trait
+           cap impl — appears in the return type NOT solely behind a `&`
+           reference, including inside `Option`/`Result`/`Box`/tuples/fn
+           returns), EXCEPT the two allowlisted constructors `issue_for_actor`
+           /`reissue` IN their canonical top-level inherent cap impl IN the
+           declaring file, and EXCEPT `#[cfg(test)]` items. Such a fn
+           re-exports a mint surface WITHOUT a struct literal (it can call the
+           `pub(super)` mint and return the token), so rule H (a struct-literal
+           scanner) and rule G (inherent-method-only) both miss it. This is an
+           ADDITIVE multi-file scan for ONE anti-pattern (by-value cap
+           returns); it does NOT weaken the declaring-file pin every other
+           rule keys on. Element shape: (rel_path, line, reason).
     """
     decls: list[
         tuple[str, int, str, list[str], list[tuple[int, str]], str, bool]
@@ -1773,13 +1941,15 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
     macro_hits: list[tuple[str, int, str]] = []
     construction_hits: list[tuple[str, int, str]] = []
     use_aliases: list[tuple[str, int, str]] = []
+    nested_mod_hits: list[tuple[str, int, str]] = []
+    by_value_return_hits: list[tuple[str, int, str]] = []
     # Rel path of the ONE file allowed to declare the cap type. The same
     # relative path holds under both the real repo_root and the self-test's
     # temp staging root, so the declaring-file macro rule (B, sub-case 1)
     # keys on it identically in both.
     required_rel = REQUIRED_PATH
     if not scan_dir.is_dir():
-        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases
+        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits
     for root, _, files in os.walk(scan_dir):
         for fname in files:
             if not fname.endswith(".rs"):
@@ -1856,6 +2026,44 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                     if hit is not None:
                         trait_name, line = hit
                         impls.append((rel, line, trait_name))
+                        # (I) IN-FILE NESTED-MOD BAN. A cap `impl` (inherent
+                        # OR trait) in the DECLARING FILE that is nested under
+                        # a `mod_item` is the in-file analogue of the
+                        # `#[path]`-include escape: a SECOND mint/construction
+                        # surface that rules G/H per-file would wave through (a
+                        # nested-mod re-impl of `issue_for_actor` supplies an
+                        # allowlisted name + an inline `Self { did }` literal,
+                        # so both pass). The canonical production cap impl is
+                        # TOP-LEVEL, so this is strictly additive.
+                        if rel == required_rel:
+                            mod_anc = _nested_mod_ancestor(node)
+                            if mod_anc is not None:
+                                kind = (
+                                    "trait impl"
+                                    if trait_name is not None
+                                    else "inherent impl"
+                                )
+                                nested_mod_hits.append(
+                                    (
+                                        rel,
+                                        line,
+                                        f"{kind} `impl {TYPE_NAME}` is nested "
+                                        f"under a `mod` in the declaring file; "
+                                        f"the canonical cap impl MUST be at the "
+                                        f"file's TOP LEVEL. A nested-mod cap "
+                                        f"impl is an extra mint/construction "
+                                        f"surface — the in-file analogue of a "
+                                        f"`#[path]` include — that the per-file "
+                                        f"inherent allowlist (G) and "
+                                        f"construction scan (H) wave through "
+                                        f"(it can re-host an allowlisted-named "
+                                        f"`issue_for_actor` with an inline "
+                                        f"`Self {{ did }}`), then be re-exported "
+                                        f"to all of `crate::context` by a "
+                                        f"module-level wrapper. Move the impl "
+                                        f"to the top level",
+                                    )
+                                )
                         # Inherent impls (trait_name is None) carry the
                         # constructor; record their functions so the
                         # closed-allowlist check (G) can inspect
@@ -1922,6 +2130,107 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                             construction_hits.append(
                                 (rel, node.start_point[0] + 1, reason)
                             )
+                        # (I) IN-FILE NESTED-MOD BAN for cap struct LITERALS.
+                        # A cap construction nested under a `mod` in the
+                        # declaring file is flagged EVEN IF its nearest
+                        # enclosing `function_item` is an allowlisted
+                        # constructor (which keeps rule H, above, silent — a
+                        # nested-mod `issue_for_actor` re-impl's inline
+                        # `Self { did }` is "in_allowlisted"). The production
+                        # cap literals are TOP-LEVEL; a nested-mod cap literal
+                        # is an extra construction surface, so reject it on
+                        # nesting alone. Additive to rule H — `_struct_expr_
+                        # constructs_cap` already proved this literal builds
+                        # the cap.
+                        mod_anc = _nested_mod_ancestor(node)
+                        if mod_anc is not None:
+                            label = node_text(
+                                node.child_by_field_name("name"), source
+                            ).strip()
+                            nested_mod_hits.append(
+                                (
+                                    rel,
+                                    node.start_point[0] + 1,
+                                    f"`{label} {{ … }}` cap construction is "
+                                    f"nested under a `mod` in the declaring "
+                                    f"file; the only legitimate cap struct "
+                                    f"literals are the inline `Self {{ did }}` "
+                                    f"in the TOP-LEVEL `issue_for_actor` / "
+                                    f"`reissue`. A nested-mod cap literal is an "
+                                    f"extra construction surface that rule H "
+                                    f"waves through when its enclosing fn is an "
+                                    f"allowlisted-named re-impl. Construct the "
+                                    f"cap only at the file's top level",
+                                )
+                            )
+                # (J) BY-VALUE CAP-RETURN BAN. Scans EVERY `function_item`
+                # under the SUPERVISOR SUBTREE (where the `pub(super)` mint is
+                # reachable), not just the declaring file. A fn whose return
+                # type mentions the cap BY VALUE re-exports a mint surface
+                # WITHOUT a struct literal (it can call the mint and return the
+                # token), so rule H (struct-literal scanner) and rule G
+                # (inherent-method-only) both miss it. EXEMPT: the two
+                # allowlisted constructors in their canonical TOP-LEVEL inherent
+                # cap impl in the DECLARING file, and `#[cfg(test)]` items.
+                if (
+                    node.type == "function_item"
+                    and rel.startswith(SUPERVISOR_SUBTREE_REL)
+                ):
+                    ret_node = node.child_by_field_name("return_type")
+                    if ret_node is not None:
+                        impl_anc = _nearest_enclosing(node, ("impl_item",))
+                        in_cap_impl = _impl_targets_cap(impl_anc, source)
+                        if _return_mentions_cap_by_value(
+                            ret_node, source, in_cap_impl
+                        ):
+                            name_node = node.child_by_field_name("name")
+                            fn_name = (
+                                node_text(name_node, source)
+                                if name_node is not None
+                                else "<anon>"
+                            )
+                            # Exempt the canonical constructors: allowlisted
+                            # name, in the DECLARING file, inside an INHERENT
+                            # cap impl that is itself TOP-LEVEL (a nested-mod
+                            # re-impl is already caught by rule I and must NOT
+                            # be exempted here). Anywhere else — including a
+                            # same-named wrapper in another subtree file — a
+                            # by-value cap return is flagged.
+                            is_top_level_inherent_cap_method = (
+                                impl_anc is not None
+                                and _impl_is_inherent(impl_anc)
+                                and in_cap_impl
+                                and _nested_mod_ancestor(impl_anc) is None
+                            )
+                            exempt_ctor = (
+                                rel == required_rel
+                                and fn_name in CONSTRUCTING_FNS
+                                and is_top_level_inherent_cap_method
+                            )
+                            if not exempt_ctor and not _inside_cfg_test(
+                                node, source
+                            ):
+                                by_value_return_hits.append(
+                                    (
+                                        rel,
+                                        node.start_point[0] + 1,
+                                        f"fn `{fn_name}` returns {TYPE_NAME} BY "
+                                        f"VALUE (return type "
+                                        f"{node_text(ret_node, source).strip()!r}); "
+                                        f"a non-constructor fn that yields an "
+                                        f"owned cap token re-exports the "
+                                        f"`pub(super)` mint to its callers "
+                                        f"WITHOUT a struct literal (so rule H "
+                                        f"misses it) and outside an inherent "
+                                        f"cap impl (so rule G misses it). The "
+                                        f"ONLY fns that may return the cap by "
+                                        f"value are the top-level inherent "
+                                        f"`issue_for_actor` / `reissue` in the "
+                                        f"declaring file. Return `&{TYPE_NAME}` "
+                                        f"(a borrow) or restructure so the token "
+                                        f"is not handed out by value",
+                                    )
+                                )
                 if node.type == "attribute_item":
                     path_hit = _path_attr_escape(node, source, full, scan_dir)
                     if path_hit is not None:
@@ -1949,7 +2258,7 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                     walk(c)
 
             walk(tree.root_node)
-    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases
+    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits
 
 
 def find_declarations():
@@ -2113,10 +2422,12 @@ def _enforce(
     macro_hits: list[tuple[str, int, str]],
     construction_hits: list[tuple[str, int, str]],
     use_aliases: list[tuple[str, int, str]],
+    nested_mod_hits: list[tuple[str, int, str]],
+    by_value_return_hits: list[tuple[str, int, str]],
     required_path: str,
     stream=sys.stderr,
 ) -> bool:
-    """Apply checks A-G. Returns True on FAIL, False on PASS. Writes
+    """Apply checks A-J. Returns True on FAIL, False on PASS. Writes
     diagnostics to `stream`. Caller must decide exit code and final
     messaging.
     """
@@ -2398,6 +2709,37 @@ def _enforce(
     # by `_scan_root` (the private-field literal cannot compile in any other
     # module). FAIL each.
     for rel, line, reason in construction_hits:
+        stream.write(
+            f"{C_RED}FAIL{C_RESET}: {rel}:{line}: {reason}. "
+            f"See ADR-049 §5.\n"
+        )
+        fail = True
+
+    # (I) IN-FILE NESTED-MOD BAN. The declaring file's canonical cap impl and
+    # its `Self { … }` literals are TOP-LEVEL; a cap impl / cap construction
+    # nested under an in-file `mod` is an extra mint/construction surface — the
+    # in-file analogue of a `#[path]` include — that the per-file inherent
+    # allowlist (G) and the construction scan (H) wave through (a nested-mod
+    # re-impl supplies an allowlisted name + an inline allowlisted literal).
+    # `_scan_root` already scoped this to the declaring file. FAIL each.
+    for rel, line, reason in nested_mod_hits:
+        stream.write(
+            f"{C_RED}FAIL{C_RESET}: {rel}:{line}: {reason}. "
+            f"See ADR-049 §5.\n"
+        )
+        fail = True
+
+    # (J) BY-VALUE CAP-RETURN BAN. A fn that returns the cap BY VALUE
+    # re-exports the `pub(super)` mint to its callers without a struct literal
+    # (so rule H, a construction-site scanner, misses it) and outside an
+    # inherent cap impl (so rule G, inherent-method-only, misses it). This is
+    # the ONLY rule that scans the WHOLE SUPERVISOR SUBTREE (where the mint is
+    # reachable) rather than the declaring file alone — `_scan_root` already
+    # exempted the two canonical top-level constructors and every
+    # `#[cfg(test)]` item. The declaring-file pin every other rule keys on is
+    # UNCHANGED; this is an additive multi-file scan for one anti-pattern.
+    # FAIL each.
+    for rel, line, reason in by_value_return_hits:
         stream.write(
             f"{C_RED}FAIL{C_RESET}: {rel}:{line}: {reason}. "
             f"See ADR-049 §5.\n"
@@ -2894,15 +3236,23 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     # `function_item -> declaration_list -> impl_item`; a nested fn's parent is a
     # `block`, so the guard is False and the construction falls through to the
     # "outside the allowlisted constructors" branch naming the inner fn. The
-    # substring `in fn `issue_for_actor` outside` can ONLY be produced by this
-    # case — the allowlisted name is never the enclosing fn of a rejected
-    # free-fn / helper-method construction.
+    # substring `in fn `issue_for_actor` outside` is produced by THIS case (and
+    # by any OTHER rejected construction whose nearest enclosing fn happens to
+    # be named `issue_for_actor` — e.g. a TRAIT-impl method literally named
+    # `issue_for_actor` constructing the cap, which also routes to the
+    # "outside" branch because its impl is not INHERENT). Every such shape is
+    # itself a rejected forgery, so the substring still uniquely pins a
+    # nested-fn-or-equivalent name-launder; it is simply less discriminating
+    # than "ONLY this fixture" — both producers are HARD FAILs.
     ("nested_fn_name_launder", "in fn `issue_for_actor` outside"),
     # FIX-1 (nested-fn name-launder, symmetric) — NESTED `reissue` INSIDE
     # `issue_for_actor`. The mirror of the above: a nested `fn reissue` inside the
     # real allowlisted `issue_for_actor`, escaping as a `fn` pointer. Same pre-fix
     # bypass mechanics, same `is_impl_method` rejection. The substring
-    # `in fn `reissue` outside` is unique to this symmetric case.
+    # `in fn `reissue` outside` is produced by THIS case (and by any other
+    # rejected construction whose nearest enclosing fn happens to be named
+    # `reissue` — e.g. a `reissue` trait-impl method constructing the cap);
+    # every such producer is itself a HARD FAIL.
     ("nested_fn_name_launder_symmetric", "in fn `reissue` outside"),
     # FIX (use-alias rename-evasion, F.2-use) — IMPORT-ALIAS OF THE CAP via
     # `use self::OwnedIdentityDid as UseAlias;` followed by an `impl UseAlias {
@@ -2921,6 +3271,51 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     # spelling is caught, not only the top-level qualified-path spelling. The
     # alias NAME `UseGroupAlias` is unique to this case.
     ("use_alias_group", "`use … as UseGroupAlias` is an import alias"),
+    # FIX (rule I — IN-FILE NESTED-MOD inherent cap-impl). A SECOND
+    # `impl OwnedIdentityDid` hosting an allowlisted-NAMED `issue_for_actor`,
+    # hidden inside a nested `mod` in the DECLARING file. Pre-fix it PASSED:
+    # the per-file inherent allowlist (G) saw an allowlisted name and the
+    # construction scan (H) saw an inline `Self { … }` whose nearest enclosing
+    # fn is that allowlisted `issue_for_actor` (`in_allowlisted` True). The
+    # canonical cap impl is TOP-LEVEL, so rule I HARD FAILs any cap inherent
+    # impl nested under an in-file `mod` — the analogue of the `#[path]`
+    # include escape. The substring is unique to a nested-mod inherent cap
+    # impl.
+    (
+        "nested_mod_inherent_impl",
+        "inherent impl `impl OwnedIdentityDid` is nested under a `mod`",
+    ),
+    # FIX (rule I — IN-FILE NESTED-MOD cap CONSTRUCTION, non-allowlisted name).
+    # A nested-mod impl whose method builds the cap via an EXPLICIT-NAME
+    # `OwnedIdentityDid { … }` literal. Isolates the rule-I CONSTRUCTION arm
+    # with the explicit-name label (distinct from the I1 `Self`-labelled
+    # construction). The substring is unique to the explicit-name nested-mod
+    # construction.
+    (
+        "nested_mod_construction",
+        "`OwnedIdentityDid { … }` cap construction is nested under a `mod`",
+    ),
+    # FIX (rule J — DECLARING-FILE LITERAL-FREE by-value cap-return wrapper). A
+    # free fn at the declaring file's module level that returns the cap BY
+    # VALUE by CALLING the `pub(super)` mint — NO struct literal of its own, so
+    # rule H (struct-literal scanner) misses it; a free fn, so rule G
+    # (inherent-method-only) misses it. Rule J flags the by-value cap return.
+    # The fn NAME is unique to this case.
+    (
+        "by_value_return_declaring_file",
+        "fn `forge_by_value_wrapper` returns OwnedIdentityDid BY VALUE",
+    ),
+    # FIX (rule J — SUBTREE non-declaring-file by-value cap-return wrapper). A
+    # free fn in ANOTHER supervisor-subtree file (NOT the declaring file)
+    # returning the cap BY VALUE via the `pub(super)` mint (reachable across
+    # the whole `supervisor` module tree). The declaring-file-pinned rules
+    # (G/H) never look here; rule J is the ONE rule that scans the whole
+    # subtree and flags it. The fn NAME is unique to this subtree-leak case,
+    # PROVING the rule fires OUTSIDE the declaring file.
+    (
+        "by_value_return_subtree",
+        "fn `leak_token` returns OwnedIdentityDid BY VALUE",
+    ),
 ]
 
 
@@ -2993,6 +3388,8 @@ def do_self_test() -> int:
             macro_hits,
             construction_hits,
             use_aliases,
+            nested_mod_hits,
+            by_value_return_hits,
         ) = _scan_root(fx_scan, tmp_root)
         # Capture stderr to inspect.
         buf = io.StringIO()
@@ -3005,6 +3402,8 @@ def do_self_test() -> int:
             macro_hits,
             construction_hits,
             use_aliases,
+            nested_mod_hits,
+            by_value_return_hits,
             fx_required,
             stream=buf,
         )
@@ -3072,6 +3471,8 @@ def main() -> int:
         macro_hits,
         construction_hits,
         use_aliases,
+        nested_mod_hits,
+        by_value_return_hits,
     ) = find_declarations()
     if (
         not decls
@@ -3081,6 +3482,8 @@ def main() -> int:
         and not macro_hits
         and not construction_hits
         and not use_aliases
+        and not nested_mod_hits
+        and not by_value_return_hits
     ):
         # Type does not yet exist AND nothing references it — this is the
         # pre-commit-5 state. (A macro touching the cap type or a trait impl
@@ -3102,6 +3505,8 @@ def main() -> int:
         macro_hits,
         construction_hits,
         use_aliases,
+        nested_mod_hits,
+        by_value_return_hits,
         REQUIRED_PATH,
         stream=sys.stderr,
     )
