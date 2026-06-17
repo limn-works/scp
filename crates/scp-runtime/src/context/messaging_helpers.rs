@@ -990,10 +990,38 @@ pub async fn send_message(
 // 8. deliver_incoming (top-level, actor-shape)
 // ---------------------------------------------------------------------------
 
+/// Classified result of delivering one incoming envelope (§9.9.2).
+///
+/// Replaces the prior `Option<(Vec<u8>, String)>` return so the receive path
+/// can distinguish three outcomes that callers must treat differently:
+///
+/// - [`DeliverOutcome::Application`] — a decrypted user message; the bridge
+///   forwards `(plaintext, sender_did)` to the language binding's receive
+///   channel.
+/// - [`DeliverOutcome::Heartbeat`] — a suppression-detection heartbeat
+///   (§9.9.2); processed internally, never surfaced as content, and the
+///   bridge records it against the transport-layer `HeartbeatMonitor` to keep
+///   the gap-detection baseline fresh. Distinct from `Handled` precisely so
+///   the bridge knows to call `record_heartbeat_received`.
+/// - [`DeliverOutcome::Handled`] — any other internally-processed message
+///   (MLS Commit/Proposal, consistency checkpoint, pseudonym announcement, or
+///   an out-of-order arrival buffered for later); no plaintext to surface and
+///   nothing for the bridge to do.
+#[derive(Debug)]
+pub enum DeliverOutcome {
+    /// Decrypted application message: `(plaintext, sender_did)`.
+    Application((Vec<u8>, String)),
+    /// A suppression-detection heartbeat was received and processed (§9.9.2).
+    Heartbeat,
+    /// An internal protocol message was processed; nothing to surface.
+    Handled,
+}
+
 /// Delivers an incoming encrypted message from the relay to a context
-/// (actor-shape). Returns the decrypted plaintext + sender DID for
-/// application messages, `None` for management messages or buffered
-/// out-of-order arrivals.
+/// (actor-shape). Returns a [`DeliverOutcome`] classifying the message:
+/// [`DeliverOutcome::Application`] for user content, [`DeliverOutcome::Heartbeat`]
+/// for a §9.9.2 heartbeat, or [`DeliverOutcome::Handled`] for management
+/// messages and buffered out-of-order arrivals.
 ///
 /// Sync — no await points in the actor body. The handler wraps the
 /// call in `async {...}` so the per-call transport-timeout budget
@@ -1004,7 +1032,7 @@ pub fn deliver_incoming(
     deps: &ActorDeps,
     context_id: &str,
     encrypted_blob: &[u8],
-) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+) -> Result<DeliverOutcome, ContextError> {
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
     state::require_active(&state.handle)?;
@@ -1030,7 +1058,9 @@ pub fn deliver_incoming(
     let Some(opened_envelope) =
         decrypt_and_dispatch(deps, context_id, &context_id_bytes, encrypted_blob)?
     else {
-        return Ok(None);
+        // MLS Commit / Proposal — processed internally by the crypto layer,
+        // no inner envelope to classify.
+        return Ok(DeliverOutcome::Handled);
     };
 
     let inner = opened_envelope.inner;
@@ -1080,9 +1110,21 @@ pub fn deliver_incoming(
     // NOT application content: it is processed for equivocation detection and
     // MUST NOT advance the per-sender application sequence, so it is handled
     // here — after signature/integrity verification, before the anti-replay /
-    // reorder sequence machinery — and returns `Ok(None)`.
+    // reorder sequence machinery — and returns `Handled`.
     if inner.message_type == MessageType::ConsistencyCheckpoint {
         return deliver_checkpoint_message(state, deps, context_id, &sender_did, &plaintext);
+    }
+
+    // Heartbeat dispatch (§9.9.2). A heartbeat is NOT application content: it
+    // carries an empty payload and exists only as a liveness beacon for
+    // suppression detection. Like a checkpoint, it is classified here — after
+    // signature/integrity verification, before the anti-replay / reorder
+    // sequence machinery — so it never advances the per-sender application
+    // sequence. The bridge maps `Heartbeat` to a `record_heartbeat_received`
+    // call against the transport-layer monitor so the gap-detection baseline
+    // stays fresh. The verified plaintext is intentionally discarded.
+    if inner.message_type == MessageType::Heartbeat {
+        return Ok(DeliverOutcome::Heartbeat);
     }
 
     // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
@@ -1104,9 +1146,9 @@ pub fn deliver_incoming(
                 is_local_sender,
             )?;
             if consumed_as_announcement {
-                Ok(None)
+                Ok(DeliverOutcome::Handled)
             } else {
-                Ok(Some((plaintext, sender_did)))
+                Ok(DeliverOutcome::Application((plaintext, sender_did)))
             }
         }
         SequenceCheck::Ahead { expected: _ } => {
@@ -1119,7 +1161,7 @@ pub fn deliver_incoming(
                 &plaintext,
                 now_ms,
             );
-            Ok(None)
+            Ok(DeliverOutcome::Handled)
         }
     }
 }
@@ -1135,8 +1177,9 @@ pub fn deliver_incoming(
 /// at equal event counts, and surfaces a
 /// [`ContextEvent::EquivocationDetected`] when divergent.
 ///
-/// Always returns `Ok(None)`: a checkpoint is never delivered as application
-/// content and never advances the per-sender application sequence.
+/// Always returns [`DeliverOutcome::Handled`]: a checkpoint is never delivered
+/// as application content and never advances the per-sender application
+/// sequence.
 ///
 /// # Errors
 ///
@@ -1150,7 +1193,7 @@ fn deliver_checkpoint_message(
     context_id: &str,
     sender_did: &str,
     plaintext: &[u8],
-) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+) -> Result<DeliverOutcome, ContextError> {
     let message: CheckpointMessage = rmp_serde::from_slice(plaintext).map_err(|e| {
         ContextError::CryptoFailed(format!("checkpoint message deserialization failed: {e}"))
     })?;
@@ -1180,7 +1223,7 @@ fn deliver_checkpoint_message(
         &message.checkpoint,
     )?;
 
-    Ok(None)
+    Ok(DeliverOutcome::Handled)
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,6 +1387,117 @@ pub fn send_checkpoint(
         None,
         &routing_ids,
         MessageType::ConsistencyCheckpoint,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 9c. send_heartbeat (§9.9.2)
+// ---------------------------------------------------------------------------
+
+/// Sends a suppression-detection heartbeat envelope to context peers (§9.9.2).
+///
+/// A heartbeat is a minimal MLS application message with an EMPTY payload and
+/// [`MessageType::Heartbeat`], routed through the regular [`encrypt_and_send`]
+/// envelope machinery (MLS + sender-key + Ed25519 layers). It carries no user
+/// content; its only purpose is to give peers a periodic liveness signal so the
+/// transport-layer `HeartbeatMonitor` can detect relay suppression — if
+/// heartbeats stop arriving from a recently-active participant, suppression is
+/// suspected.
+///
+/// Like [`send_checkpoint`], the send is independent of the application content
+/// sequence: it uses sequence `0`, and the receive path classifies it before
+/// the content sequence tracker so a heartbeat never advances the per-sender
+/// application sequence.
+///
+/// Routing mirrors the application-data send path (§9.10.4):
+/// - **Encrypted contexts** fan out to each known peer pseudonym routing ID.
+///   With no peers yet known (lone member or pre-bootstrap), there is nobody
+///   to inform and the call is a successful no-op.
+/// - **Broadcast contexts** publish to the derivable broadcast routing ID
+///   (`SHA-256(context_id)`).
+///
+/// # Errors
+///
+/// Returns the underlying transport error from [`encrypt_and_send`] if every
+/// fan-out send fails. The periodic bridge scheduler that drives this treats
+/// any error as best-effort (a failed heartbeat is itself a suppression
+/// signal, surfaced separately by the receiver's gap detection) and MUST NOT
+/// tear down the subscription on a single failure.
+pub fn send_heartbeat(
+    deps: &ActorDeps,
+    state: &PerContextState,
+    context_id: &str,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<(), ContextError> {
+    // Send-authorization gates, mirroring `send_message` (§9.9.2 routes a
+    // heartbeat through the same write path, so it must clear the same write
+    // gates). Without these a member whose `MessagesWrite` capability was
+    // suspended or revoked could keep asserting liveness on the write path,
+    // and a heartbeat racing a context close could slip through after the
+    // context is no longer active.
+    //
+    // 1. The context must be active. A send racing context-close is rejected.
+    state::require_active(&state.handle)?;
+    // 2. Capability check (broadcast contexts have no per-member write
+    //    capability and address the public broadcast routing ID, exactly as in
+    //    `send_message`). A suspended capability surfaces a distinct message so
+    //    the scheduler's best-effort log is actionable.
+    if state.broadcast_context.is_none()
+        && !state
+            .role_state
+            .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
+    {
+        let is_suspended = state
+            .role_state
+            .suspended_capabilities
+            .get(sender_did.as_ref())
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite));
+        let msg = if is_suspended {
+            format!("member {sender_did} write access has been revoked")
+        } else {
+            format!("member {sender_did} does not have messages:write capability")
+        };
+        return Err(ContextError::PermissionDenied(msg));
+    }
+
+    // Routing parallels the application-data and checkpoint send paths
+    // (§9.10.4): broadcast contexts address the derivable broadcast RID;
+    // encrypted contexts fan out to each known peer pseudonym. An empty
+    // encrypted routing set (no peers known yet) is a legitimate no-op —
+    // there is simply nobody to signal liveness to.
+    let (broadcast_envelope, recipients_data, routing_ids) = if state.broadcast_context.is_some() {
+        let broadcast_rid = scp_protocol::context::broadcast_routing_id(context_id);
+        (None, std::collections::HashMap::new(), vec![broadcast_rid])
+    } else {
+        let peer_pseudonyms: Vec<[u8; 32]> = state
+            .routing
+            .peer_registry()
+            .map(|reg| reg.values().copied().collect())
+            .unwrap_or_default();
+        (
+            None,
+            state.access.access_key_store.get_all(context_id),
+            peer_pseudonyms,
+        )
+    };
+
+    encrypt_and_send(
+        deps,
+        broadcast_envelope,
+        Some(signing_key),
+        context_id,
+        sender_did,
+        // Heartbeats carry NO user content — the empty payload is the whole
+        // point: a minimal liveness beacon, padded by the envelope machinery.
+        &[],
+        &recipients_data,
+        // Heartbeats do not consume the application content sequence; the
+        // receive path classifies them before the sequence tracker.
+        0,
+        None,
+        &routing_ids,
+        MessageType::Heartbeat,
     )
 }
 

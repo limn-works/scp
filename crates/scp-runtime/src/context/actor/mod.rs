@@ -807,6 +807,12 @@ impl ContextActor {
                     "messaging::compare_remote_checkpoint (use Supervisor — actor mailbox)",
                 );
             }
+            MessagingCommand::SendHeartbeat { reply, .. } => {
+                ack_not_impl(
+                    reply,
+                    "messaging::send_heartbeat (use Supervisor::send_heartbeat — actor mailbox)",
+                );
+            }
             #[cfg(feature = "testing")]
             MessagingCommand::SeedPeerPseudonym { reply, .. } => {
                 ack_not_impl(

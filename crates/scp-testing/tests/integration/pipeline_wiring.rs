@@ -74,6 +74,19 @@ const PYO3_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/tools.
 const NAPI_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
 const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 
+// NAPI context bridge — the only bridge with a live relay subscribe loop
+// (`context_subscribe_on`). The `b3_heartbeat_send_receive_loop_wired`
+// assertion pins the §9.9.2 send scheduler + the received-heartbeat
+// `record_heartbeat_received` call to this loop so a refactor cannot silently
+// sever the closed heartbeat loop.
+const NAPI_CONTEXT_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/context.rs");
+
+// Shared heartbeat scheduler (scp-ffi-common) — `run_heartbeat_scheduler`
+// drives `Supervisor::send_heartbeat` at the per-profile cadence. Pinned by
+// `b3_heartbeat_send_receive_loop_wired`.
+const HEARTBEAT_SCHEDULER_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/common/src/heartbeat_scheduler.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -97,7 +110,7 @@ const HANDLERS_MESSAGING_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 41;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 42;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -1228,6 +1241,87 @@ fn b3_merkle_proof_verification_wired() {
         ),
         "deliver_checkpoint_message must call compare_remote_checkpoint so a \
          received checkpoint is checked for equivocation (§9.9.3)"
+    );
+}
+
+/// The suppression-detection heartbeat loop (§9.9.2) must be closed end to
+/// end: a periodic SEND driven by the bridge subscribe scheduler, the SEND
+/// helper actually emitting a `MessageType::Heartbeat` envelope, the RECEIVE
+/// path classifying it, and the receive loop RECORDING it against the
+/// transport monitor. Real call-site assertions (not bare string searches):
+/// without each link the HeartbeatMonitor stays a dead component — built but
+/// never fed (the suppression-detection gap §9.9.2 closes).
+#[test]
+fn b3_heartbeat_send_receive_loop_wired() {
+    // SEND link 1 — the shared scheduler must drive Supervisor::send_heartbeat
+    // at the periodic tick.
+    assert!(
+        fn_body_contains(
+            HEARTBEAT_SCHEDULER_SRC,
+            "run_heartbeat_scheduler",
+            "send_heartbeat",
+        ),
+        "run_heartbeat_scheduler must call Supervisor::send_heartbeat each tick (§9.9.2 send side)"
+    );
+
+    // SEND link 2 — the napi subscribe loop must spawn the scheduler so the
+    // periodic send actually runs while subscribed.
+    assert!(
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "context_subscribe_on",
+            "run_heartbeat_scheduler",
+        ),
+        "context_subscribe_on must spawn run_heartbeat_scheduler alongside the subscribe loop"
+    );
+
+    // SEND link 3 — the core send helper must emit an actual heartbeat-typed
+    // envelope through the encrypt-and-send machinery.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "send_heartbeat", "encrypt_and_send"),
+        "send_heartbeat must route through encrypt_and_send"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "send_heartbeat", "MessageType::Heartbeat"),
+        "send_heartbeat must tag the envelope MessageType::Heartbeat"
+    );
+
+    // RECEIVE link 1 — deliver_incoming must classify heartbeats (returning
+    // DeliverOutcome::Heartbeat) before the content sequence tracker.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "deliver_incoming", "MessageType::Heartbeat")
+            && fn_body_contains(MANAGER_SRC, "deliver_incoming", "DeliverOutcome::Heartbeat"),
+        "deliver_incoming must classify MessageType::Heartbeat as DeliverOutcome::Heartbeat"
+    );
+
+    // RECEIVE link 2 — the napi receive loop must record the heartbeat against
+    // the transport monitor so suppression gap detection has a fresh baseline.
+    assert!(
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "context_subscribe_on",
+            "record_heartbeat_received",
+        ),
+        "the napi subscribe loop must call record_heartbeat_received on a received heartbeat"
+    );
+
+    // TEARDOWN link — the napi subscribe loop must cancel the per-subscription
+    // token when it exits so the co-scheduled run_heartbeat_scheduler tears
+    // down in lockstep. Without this, every non-unsubscribe exit path (stream
+    // exhaustion, relay Terminated, bridge shutdown) would leave the scheduler
+    // firing Supervisor::send_heartbeat on a dead subscription — leaking the
+    // task, its Arc<Supervisor>, and the exported signing key, and emitting
+    // false liveness. A re-subscribe overwrites the handle's token without
+    // cancelling the old one, so this teardown is the only stop.
+    assert!(
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "context_subscribe_on",
+            "cancel_token.cancel()"
+        ),
+        "context_subscribe_on must cancel_token.cancel() on subscribe-loop exit so the \
+         heartbeat scheduler tears down in lockstep (no orphaned scheduler on a dead \
+         subscription)"
     );
 }
 

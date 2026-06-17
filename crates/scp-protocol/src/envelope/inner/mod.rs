@@ -75,6 +75,19 @@ pub enum MessageType {
     /// the content sequence tracker, so a checkpoint never advances the
     /// per-sender application sequence.
     ConsistencyCheckpoint,
+
+    /// Suppression-detection heartbeat message (§9.9.2).
+    ///
+    /// A heartbeat is a minimal MLS application message with no user content
+    /// (empty payload). In active contexts the SDK periodically sends a
+    /// heartbeat so that peers can detect relay suppression: if heartbeats
+    /// stop arriving from a recently-active participant, suppression is
+    /// suspected. The receive path classifies a heartbeat on this
+    /// discriminator BEFORE the content sequence tracker, so a heartbeat
+    /// never advances the per-sender application sequence and is never
+    /// surfaced to the application layer as content. The arriving heartbeat
+    /// feeds the transport-layer `HeartbeatMonitor` gap-detection baseline.
+    Heartbeat,
 }
 
 impl MessageType {
@@ -87,6 +100,7 @@ impl MessageType {
             Self::KeyDistribution => 2,
             Self::Recovery => 3,
             Self::ConsistencyCheckpoint => 4,
+            Self::Heartbeat => 5,
         }
     }
 }
@@ -558,6 +572,40 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[test]
+    fn message_type_discriminator_bytes_are_stable_and_distinct() {
+        // The discriminator byte is part of the canonical signed hash, so these
+        // values are a wire-format commitment and must never change or collide.
+        // Heartbeat (§9.9.2) was added as discriminator 5 after the highest
+        // prior value (ConsistencyCheckpoint = 4).
+        assert_eq!(MessageType::Content.as_discriminator_byte(), 0);
+        assert_eq!(MessageType::Signaling.as_discriminator_byte(), 1);
+        assert_eq!(MessageType::KeyDistribution.as_discriminator_byte(), 2);
+        assert_eq!(MessageType::Recovery.as_discriminator_byte(), 3);
+        assert_eq!(
+            MessageType::ConsistencyCheckpoint.as_discriminator_byte(),
+            4
+        );
+        assert_eq!(MessageType::Heartbeat.as_discriminator_byte(), 5);
+
+        let all = [
+            MessageType::Content,
+            MessageType::Signaling,
+            MessageType::KeyDistribution,
+            MessageType::Recovery,
+            MessageType::ConsistencyCheckpoint,
+            MessageType::Heartbeat,
+        ];
+        let mut bytes: Vec<u8> = all.iter().map(MessageType::as_discriminator_byte).collect();
+        bytes.sort_unstable();
+        bytes.dedup();
+        assert_eq!(
+            bytes.len(),
+            all.len(),
+            "every MessageType discriminator byte must be distinct"
+        );
+    }
 
     #[test]
     fn domain_separator_changes_canonical_hash() {

@@ -188,6 +188,92 @@ async fn fullstack_alice_to_bob_encrypted_message() {
 }
 
 // ---------------------------------------------------------------------------
+// C2. Heartbeat send/receive (§9.9.2) — AC2 + AC3
+// ---------------------------------------------------------------------------
+
+/// AC2: `send_heartbeat` emits an empty-payload `MessageType::Heartbeat`
+/// envelope through the real encrypt-and-send pipeline (a peer can open it and
+/// see the heartbeat discriminator). AC3: a heartbeat carries sequence `0` and
+/// does NOT advance the per-sender application sequence — a message sent before
+/// and after a heartbeat keep consecutive application sequence numbers.
+#[tokio::test]
+async fn fullstack_heartbeat_send_does_not_advance_application_sequence() {
+    use scp_core::envelope::inner::MessageType;
+
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
+    let bob = network.create_node(BOB_DID, permissive_key_resolver());
+
+    let ctx_id = "e2e-heartbeat-ctx";
+    let ctx_bytes = context_id_bytes(ctx_id);
+    let handle = alice
+        .create_context(ctx_id, encrypted_params())
+        .await
+        .unwrap();
+    alice.add_member(&handle, BOB_DID).await.unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+
+    let bob_pseudonym = [0x42u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
+
+    // 1. First application message — application sequence 0.
+    alice.send_message(&handle, b"first").await.unwrap();
+    // 2. Heartbeat between the two messages.
+    alice.send_heartbeat(ctx_id).await.unwrap();
+    // 3. Second application message — must be application sequence 1 (the
+    //    heartbeat must NOT have consumed sequence 1).
+    alice.send_message(&handle, b"second").await.unwrap();
+
+    let sent = alice.take_sent_ciphertexts();
+    assert_eq!(
+        sent.len(),
+        3,
+        "three sends captured: message, heartbeat, message"
+    );
+
+    // Open each captured inner envelope (peer side) and classify it.
+    let inner0 = bob.open_inner_envelope(&ctx_bytes, &sent[0].1).unwrap();
+    let inner_hb = bob.open_inner_envelope(&ctx_bytes, &sent[1].1).unwrap();
+    let inner2 = bob.open_inner_envelope(&ctx_bytes, &sent[2].1).unwrap();
+
+    // AC2: the middle send is a heartbeat — heartbeat discriminator, no
+    // content. (Empty user payload survives as a minimal wrapped+padded blob,
+    // so we assert on the type + sequence rather than exact byte length.)
+    assert_eq!(
+        inner_hb.message_type,
+        MessageType::Heartbeat,
+        "the heartbeat send must be tagged MessageType::Heartbeat (AC2)"
+    );
+    assert_eq!(
+        inner_hb.sequence, 0,
+        "a heartbeat always uses sequence 0 (it is not application content)"
+    );
+
+    // The two application messages are Content.
+    assert_eq!(inner0.message_type, MessageType::Content);
+    assert_eq!(inner2.message_type, MessageType::Content);
+
+    // AC3: the heartbeat did NOT advance the per-sender application sequence —
+    // the two application messages straddling the heartbeat have CONSECUTIVE
+    // sequence numbers. Had the heartbeat consumed an application sequence,
+    // `inner2.sequence` would be `inner0.sequence + 2`, leaving a gap a peer's
+    // anti-replay tracker would treat as a suppressed message.
+    assert_eq!(
+        inner2.sequence,
+        inner0.sequence + 1,
+        "the two application messages straddling the heartbeat must have \
+         consecutive sequence numbers — the heartbeat must NOT advance the \
+         application sequence (AC3). first={}, second={}",
+        inner0.sequence,
+        inner2.sequence
+    );
+}
+
+// ---------------------------------------------------------------------------
 // C3. Three-party group
 // ---------------------------------------------------------------------------
 

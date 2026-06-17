@@ -258,21 +258,12 @@ impl NativeRelayAdapter {
             return (None, None);
         };
 
-        // Derive heartbeat config from the transport profile.
-        let heartbeat_config = match profile {
-            // Server and Desktop: default 60s interval.
-            TransportProfile::Server | TransportProfile::Desktop => HeartbeatConfig::default(),
-            // Mobile: 120s interval to reduce battery impact.
-            TransportProfile::Mobile => HeartbeatConfig {
-                interval: std::time::Duration::from_mins(2),
-                ..HeartbeatConfig::default()
-            },
-            // Constrained devices: no heartbeat monitoring (poll-based).
-            TransportProfile::Constrained => return (None, None),
-        };
-        if !heartbeat_config.enabled {
+        // Derive heartbeat config from the transport profile via the single
+        // source of truth shared with the send-side scheduler (§9.9.2). A
+        // `None` here means the profile disables heartbeats (Constrained).
+        let Some(heartbeat_config) = HeartbeatConfig::for_profile(*profile) else {
             return (None, None);
-        }
+        };
 
         let monitor = HeartbeatMonitor::new(heartbeat_config.clone(), relay_url.to_owned());
         let monitor = Arc::new(tokio::sync::Mutex::new(monitor));
@@ -379,6 +370,16 @@ impl NativeRelayAdapter {
     #[must_use]
     pub const fn has_heartbeat_monitor(&self) -> bool {
         self.heartbeat_monitor.is_some()
+    }
+
+    /// Test-only handle to the underlying [`HeartbeatMonitor`], so tests can
+    /// drive deterministic [`check_suppression`](HeartbeatMonitor::check_suppression)
+    /// against the same monitor that [`record_heartbeat_received`](Self::record_heartbeat_received)
+    /// mutates, proving the baseline actually moved (not merely that the call
+    /// did not panic).
+    #[cfg(test)]
+    fn heartbeat_monitor_handle(&self) -> Option<Arc<tokio::sync::Mutex<HeartbeatMonitor>>> {
+        self.heartbeat_monitor.clone()
     }
 
     /// Starts a background task that emits cover traffic at a constant rate
@@ -574,6 +575,16 @@ impl TransportAdapter for NativeRelayAdapter {
                 _ => Ok(()),
             }
         })
+    }
+
+    /// Trait-object entry point for the relay subscription loop: forwards to
+    /// the inherent [`NativeRelayAdapter::record_heartbeat_received`], which
+    /// refreshes the [`HeartbeatMonitor`] gap-detection baseline when a
+    /// transport profile is active (§9.9.2). `Self::` path syntax resolves to
+    /// the inherent method (inherent impls take method-resolution priority
+    /// over trait impls), so this is a delegation, not a recursion.
+    fn record_heartbeat_received(&self) -> BoxFuture<'_, ()> {
+        Box::pin(Self::record_heartbeat_received(self))
     }
 }
 
@@ -1353,9 +1364,15 @@ mod tests {
         );
     }
 
-    /// Verifies that `record_heartbeat_received` works on a connected adapter
-    /// with a heartbeat monitor active.
-    #[tokio::test]
+    /// Verifies that `record_heartbeat_received` on a connected adapter
+    /// actually MOVES the monitor's gap-detection baseline — not merely that
+    /// the call does not panic.
+    ///
+    /// Drives the real adapter method against the real monitor and asserts the
+    /// observable state transition: with a `last_sent` baseline and no recent
+    /// receive, `check_suppression` fires past the threshold; after
+    /// `record_heartbeat_received`, the same `check_suppression` clears.
+    #[tokio::test(start_paused = true)]
     async fn record_heartbeat_received_on_connected_adapter() {
         use crate::native::server::{RelayConfig, RelayServer};
         use crate::native::storage::BlobStorageBackend;
@@ -1386,9 +1403,45 @@ mod tests {
                 .await
                 .unwrap();
 
-        // Should not panic or error — exercises the full path through the
-        // monitor's lock and record_heartbeat_received.
+        let monitor = adapter
+            .heartbeat_monitor_handle()
+            .expect("Desktop profile must create a heartbeat monitor");
+
+        // Establish a deterministic `last_sent` baseline at a known instant so
+        // suppression has a reference point. (The connect path's monitor task
+        // also records a baseline; we overwrite it here to a known `t0`.)
+        let t0 = tokio::time::Instant::now();
+        {
+            let mut mon = monitor.lock().await;
+            mon.record_heartbeat_sent(t0);
+        }
+
+        // Desktop threshold is 240s (uniform). Past the threshold with nothing
+        // received, suppression is suspected.
+        let past_threshold = t0 + Duration::from_secs(241);
+        assert!(
+            monitor
+                .lock()
+                .await
+                .check_suppression(past_threshold)
+                .is_some(),
+            "monitor must suspect suppression once past the 240s threshold with no receive"
+        );
+
+        // Advance the (paused) clock so the adapter's internal
+        // `Instant::now()` records the receive at a point past the prior
+        // suppression window, then call the REAL adapter method.
+        tokio::time::advance(Duration::from_secs(241)).await;
         adapter.record_heartbeat_received().await;
+
+        // The baseline moved: a check shortly after the recorded receive is now
+        // within threshold and clears. If `record_heartbeat_received` had been
+        // a no-op, this would still report suppression.
+        let just_after = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert!(
+            monitor.lock().await.check_suppression(just_after).is_none(),
+            "record_heartbeat_received must move the baseline so suppression clears"
+        );
     }
 
     /// Verifies that `record_heartbeat_received` is a no-op when no monitor
@@ -1470,9 +1523,11 @@ mod tests {
     /// for longer than the threshold (spec §9.9.2, #1533 AC8).
     ///
     /// Uses `tokio::time::pause()` to control time without waiting real seconds.
-    /// The Server profile uses a 60s heartbeat interval with 2x multiplier,
-    /// so suppression fires after 120s of silence. We advance 130s to ensure
-    /// the heartbeat check loop has ticked past the threshold.
+    /// The Server profile sends every 60s, but the suppression threshold is the
+    /// uniform 240s (sized to the slowest honest sender — see
+    /// `HeartbeatConfig::for_profile`), so suppression fires only after 240s of
+    /// silence. We advance past 240s to ensure the heartbeat check loop has
+    /// ticked past the threshold.
     #[tokio::test(start_paused = true)]
     async fn suppression_detected_after_threshold() {
         use crate::native::server::{RelayConfig, RelayServer};
@@ -1500,7 +1555,10 @@ mod tests {
             source: RelayUrlSource::DhtResolved,
         };
 
-        // Connect with Server profile (60s heartbeat, 2x threshold = 120s).
+        // Connect with Server profile: 60s heartbeat send interval, but the
+        // suppression threshold is the UNIFORM 240s (sized to the slowest
+        // honest sender, Mobile's 120s × 2), so a receiver never out-runs an
+        // honest slower sender.
         let mut adapter =
             NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
                 .await
@@ -1518,12 +1576,13 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 
-        // Now advance time past the suppression threshold (120s) in
-        // steps of the heartbeat interval (60s). Each advance fires
-        // the pending timer tick; yielding lets the background task
-        // process the tick, acquire the monitor lock, check for
-        // suppression, and push to the channel.
-        for _ in 0..3 {
+        // Now advance time past the uniform 240s suppression threshold in
+        // steps of the 60s heartbeat interval. Each advance fires the pending
+        // timer tick; yielding lets the background task process the tick,
+        // acquire the monitor lock, check for suppression, and push to the
+        // channel. Five steps of 61s = 305s comfortably clears the 240s
+        // threshold.
+        for _ in 0..5 {
             tokio::time::advance(Duration::from_secs(61)).await;
             // Yield enough times for the background task to run.
             for _ in 0..20 {
@@ -1539,7 +1598,7 @@ mod tests {
         let event = rx.try_recv();
         assert!(
             event.is_ok(),
-            "expected SuppressionSuspected event on the channel after 130s of silence"
+            "expected SuppressionSuspected event on the channel after silence past the 240s threshold"
         );
 
         let suppression = event.unwrap();

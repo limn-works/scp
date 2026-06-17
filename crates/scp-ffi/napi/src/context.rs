@@ -1265,10 +1265,10 @@ pub(crate) async fn context_subscribe_on(
         .into());
     }
 
-    // `identity_did` is validated at the API boundary for future membership
-    // checks but not used in the current subscription path.
+    // `identity_did` is validated at the API boundary and reused below as the
+    // heartbeat author DID for the periodic suppression-detection scheduler
+    // (§9.9.2).
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    drop(identity_did);
 
     let Some(transport_mgr) = crate::transport::get_transport_manager_on(bi) else {
         // `outer_guard` Drop resets the flag.
@@ -1352,6 +1352,31 @@ pub(crate) async fn context_subscribe_on(
     // gracefully if the supervisor is not attached yet; the spawned task
     // signals completion when so.
     let supervisor_for_task = crate::runtime::supervisor(bi).ok().cloned();
+
+    // §9.9.2 send side: resolve the local member's signing key now (the key
+    // lives at this FFI boundary, never inside the actor) so a periodic
+    // heartbeat scheduler can be spawned alongside the subscribe loop. The
+    // cadence comes from the same per-profile source of truth the receive-side
+    // monitor uses (`heartbeat_interval`); `None` (Constrained) or an
+    // unavailable key (externally loaded DID-only identity) simply means no
+    // scheduler is spawned — the subscribe + receive path still runs.
+    let heartbeat_profile = scp_transport::profile::TransportProfile::platform_default();
+    let heartbeat_interval =
+        scp_ffi_common::heartbeat_scheduler::heartbeat_interval(heartbeat_profile);
+    let heartbeat_signing_key = match heartbeat_interval {
+        Some(_) => resolve_napi_signing_key(handle).await.ok(),
+        None => None,
+    };
+    let heartbeat_sender_did: scp_identity::DID = identity_did.clone().into();
+
+    // Clones for the heartbeat scheduler task — the main subscribe closure
+    // below is `async move` and consumes `context_id` / the cancel tokens /
+    // `supervisor_for_task`, so the scheduler captures its own copies.
+    let heartbeat_supervisor = supervisor_for_task.clone();
+    let heartbeat_context_id = context_id.clone();
+    let heartbeat_cancel = cancel_token.clone();
+    let heartbeat_bridge_cancel = bridge_cancel.clone();
+
     let mut tasks = bi_core.task_handle().await;
     // Disarm the outer guard and transfer the flag to the spawned task's
     // inner guard. No intermediate "flag is true but un-guarded" window —
@@ -1510,8 +1535,18 @@ pub(crate) async fn context_subscribe_on(
                             "deliver shim reply dropped".to_owned(),
                         )),
                     };
+                    use scp_core::context::actor::commands::DeliverOutcome;
                     match deliver_result {
-                        Ok(Some((plaintext, sender_did))) => {
+                        Ok(DeliverOutcome::Application((plaintext, sender_did))) => {
+                            // §9.9.2 defense-in-depth: a delivered application
+                            // message is equally strong evidence the relay set
+                            // is alive as a dedicated heartbeat. Refresh the
+                            // monitor baseline so a quiet-but-active peer's
+                            // normal traffic keeps suppression detection fresh
+                            // and a busy context never trips a spurious
+                            // suspicion just because heartbeats were preempted
+                            // by real sends.
+                            transport_mgr.record_heartbeat_received().await;
                             sequence_counter += 1.0;
                             #[allow(clippy::cast_precision_loss)]
                             let ts = scp_primitives::SystemClock.now_secs() as f64;
@@ -1527,10 +1562,22 @@ pub(crate) async fn context_subscribe_on(
                                 napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                             );
                         }
-                        Ok(None) => {
-                            // MLS Commit/Proposal or pseudonym announcement —
-                            // internal protocol message processed, no application
-                            // payload to forward to JS caller.
+                        Ok(DeliverOutcome::Heartbeat) => {
+                            // §9.9.2 suppression-detection heartbeat from a peer.
+                            // Refresh every relay monitor's gap-detection
+                            // baseline so suppression is only suspected after a
+                            // genuine silence. Not surfaced to the JS caller —
+                            // a heartbeat carries no user content.
+                            transport_mgr.record_heartbeat_received().await;
+                            tracing::trace!(
+                                context_id = %context_id,
+                                "heartbeat received — refreshed suppression baseline"
+                            );
+                        }
+                        Ok(DeliverOutcome::Handled) => {
+                            // MLS Commit/Proposal, checkpoint, or pseudonym
+                            // announcement — internal protocol message
+                            // processed, no application payload to forward.
                             tracing::debug!(
                                 context_id = %context_id,
                                 "protocol control message processed — no payload"
@@ -1568,6 +1615,22 @@ pub(crate) async fn context_subscribe_on(
             }
         }
 
+        // Tear down the co-scheduled heartbeat scheduler in lockstep with the
+        // subscribe loop. Every loop exit path lands here — explicit
+        // unsubscribe (`cancel_token` already fired), bridge shutdown
+        // (`bridge_cancel` fired), stream exhaustion (`None`), and relay
+        // `Terminated`. Only the explicit-unsubscribe path cancelled
+        // `cancel_token`; the other three did not, so without this the
+        // `run_heartbeat_scheduler` task (which shares this `cancel_token`)
+        // would keep firing `Supervisor::send_heartbeat` on a dead
+        // subscription — leaking the task plus its owned `Arc<Supervisor>`
+        // and exported signing key, and emitting false liveness. A later
+        // re-subscribe overwrites the handle's cancel token without cancelling
+        // the old one, so this teardown is the only thing that stops the
+        // orphaned scheduler. Cancelling an already-cancelled token (the
+        // unsubscribe path) is a harmless idempotent no-op.
+        cancel_token.cancel();
+
         // Signal stream completion.
         on_message.call(
             Ok(None),
@@ -1578,6 +1641,33 @@ pub(crate) async fn context_subscribe_on(
         // returns normally (below) or panics (the guard's `Drop` impl
         // fires on unwind).
     });
+
+    // §9.9.2 send side: spawn the periodic heartbeat scheduler alongside the
+    // subscribe loop, enrolled in the same `JoinSet` so `shutdown_core_async`
+    // drains it too. Only when the profile enables heartbeats AND the signing
+    // key resolved (an externally loaded DID-only identity cannot sign, so it
+    // sends none — its peers simply observe a quieter stream, which is a valid
+    // suppression-detection input, not an error). The scheduler shares the
+    // subscription cancel token, so unsubscribe / disconnect / re-subscribe
+    // tears it down exactly like the suppression-drain task lifecycle.
+    if let (Some(interval), Some(sk), Some(sup)) = (
+        heartbeat_interval,
+        heartbeat_signing_key,
+        heartbeat_supervisor,
+    ) {
+        tasks.spawn(
+            scp_ffi_common::heartbeat_scheduler::run_heartbeat_scheduler(
+                sup,
+                heartbeat_context_id,
+                heartbeat_sender_did,
+                sk,
+                interval,
+                heartbeat_cancel,
+                heartbeat_bridge_cancel,
+            ),
+        );
+    }
+
     // Drop the JoinSet guard now that spawn is done — shutdown requires
     // exclusive access to drain.
     drop(tasks);

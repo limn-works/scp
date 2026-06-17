@@ -448,6 +448,50 @@ impl FullStackNode {
             .await
     }
 
+    /// Sends a suppression-detection heartbeat (§9.9.2) through the real
+    /// `Supervisor` — an empty-payload `MessageType::Heartbeat` envelope routed
+    /// through the same encrypt-and-send pipeline as application messages. The
+    /// captured ciphertext is available via [`take_sent_ciphertexts`](Self::take_sent_ciphertexts).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the supervisor.
+    pub async fn send_heartbeat(&self, context_id: &str) -> Result<(), ContextError> {
+        self.manager
+            .send_heartbeat(context_id, &self.did, &self.signing_key)
+            .await
+    }
+
+    /// Opens a captured ciphertext through the MLS + sender-key + inner-envelope
+    /// layers and returns the decrypted [`InnerEnvelope`] without unwrapping the
+    /// access-key content layer.
+    ///
+    /// Lets tests inspect `message_type` / `sequence` / `payload` on the inner
+    /// envelope — e.g. to assert a sent heartbeat is tagged
+    /// `MessageType::Heartbeat` and carries sequence `0` (§9.9.2).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] if any decryption or verification step fails,
+    /// or if the open yields a control / management result rather than an
+    /// application envelope.
+    pub fn open_inner_envelope(
+        &self,
+        context_id: &[u8; 32],
+        ciphertext: &[u8],
+    ) -> Result<scp_core::envelope::inner::InnerEnvelope, ContextError> {
+        self.crypto.process_pending_commits(context_id)?;
+        match self.crypto.provider.open(context_id, ciphertext)? {
+            scp_core::context::builder::OpenResult::Application(env) => Ok(env.inner),
+            scp_core::context::builder::OpenResult::Control => {
+                Err(ContextError::CryptoFailed("open returned Control".into()))
+            }
+            scp_core::context::builder::OpenResult::Management { .. } => Err(
+                ContextError::CryptoFailed("open returned Management".into()),
+            ),
+        }
+    }
+
     /// Takes all captured application ciphertexts sent by this node and clears
     /// the buffer.
     #[must_use]
