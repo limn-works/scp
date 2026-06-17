@@ -897,10 +897,11 @@ pub enum HostSiteError {
 ///   is no DNS name to provision for and no upstream terminator in this
 ///   deployment driver).
 /// - `reach`: [`Reach::NatTraversal`] ⇒ `skip_nat = false` (probe NAT, publish a
-///   routable address); [`Reach::Local`] and [`Reach::Tunnel`] ⇒ `skip_nat =
-///   true` (loopback relay URL — correct behind a tunnel/proxy). [`Reach::Domain`]
-///   is a loud error: `host_site` builds a no-domain node, so a domain reach has
-///   no meaning here.
+///   routable address); [`Reach::Local`] ⇒ `skip_nat = true` (loopback relay URL).
+///   [`Reach::Tunnel`] ⇒ `skip_nat = true` (loopback relay URL — correct behind a
+///   tunnel/proxy) *and* emits a `tracing::warn!` that `public_url` is not yet
+///   threaded in `host_site`. [`Reach::Domain`] is a loud error: `host_site` builds
+///   a no-domain node, so a domain reach has no meaning here.
 ///
 /// This lowering does NOT validate the DHT axis: [`DhtMode::Memory`] (do not
 /// publish the DID document) is the fail-safe, non-disclosing direction and is
