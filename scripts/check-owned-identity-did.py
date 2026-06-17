@@ -41,7 +41,25 @@ records why approximating it in tree-sitter is an unbounded arms race and was
 deleted. The line drawn here is: bounded definition-SIDE shape assertions over a
 single file are sound and kept; use-site name resolution is forbidden.
 
+Equally OUT OF CHARTER is method-BODY semantics: the gate asserts each method's
+DEFINITION SHAPE (visibility, receiver, params, return type, modifiers,
+attributes) but never inspects what a body DOES — e.g. that `reissue`'s body
+could be edited to construct `Self` from a hardcoded constant `DID` rather than
+cloning `self.did` is not a gate concern. Such a constant is source-hardcoded
+(not a caller-chosen arbitrary DID, so not an arbitrary-DID minter), the type
+system already permits module-internal `Self` construction, and the
+`reissue_clones_the_same_owning_did` unit test in `identity_capability.rs`
+catches a static substitution that returns a non-self DID. Body semantics are
+covered by the type system + that unit test, NOT by this gate.
+
 COMPLETE CHECK SET (definition shape only), scanning identity_capability.rs:
+  A0. Parse-health guard. Every check below reasons over node KINDS on the
+      assumption of a faithful parse. A construct the PINNED grammar does not
+      recognize (e.g. a Rust 2024 `gen fn`) degrades to a nested `ERROR` node
+      inside an otherwise-valid item, invisible to the kind-based whitelist —
+      so a frozen-shape gate must reject ANY tree whose `root.has_error` is
+      set. The same guard applies before the `mod.rs` deny-parse (A5): a
+      malformed `mod.rs` is fail-closed (treated as NOT carrying the deny).
   A1. Module-item whitelist (the categorical closer). The ONLY permitted
       module-level item kinds are: any number of `use_declaration`; EXACTLY ONE
       `struct_item` named `OwnedIdentityDid`; EXACTLY ONE inherent `impl_item`
@@ -76,9 +94,18 @@ COMPLETE CHECK SET (definition shape only), scanning identity_capability.rs:
       reference to `DID` (`&DID` or path-qualified `&scp_identity::DID`,
       normalized symmetrically with the field-type check; `&mut DID` and
       by-value `DID` rejected). Every method's fn-modifier set must be a subset
-      of {const} (reject `unsafe` / `async` / `extern` / `gen`; `const` not
-      required). Each method's attributes must be inert built-ins (`allow` /
-      `must_use` / `cfg` / `inline` / `doc`).
+      of {const}: `unsafe` / `async` / `extern` are each a `function_modifiers`
+      token the pinned grammar DOES recognize, so they are rejected directly by
+      `_fn_modifier_kinds` (`const` permitted, not required). A Rust 2024
+      `gen fn` is rejected one layer earlier by the A0 parse-health
+      (`has_error`) guard: the pinned tree-sitter-rust does NOT tokenize `gen`
+      as a fn modifier, so `gen fn` degrades to a nested ERROR node rather than
+      a `function_modifiers` token — the kind-based modifier check would never
+      see it, but the malformed-parse guard rejects the whole file.
+      (`_fn_modifier_kinds` still lists `gen` as forward-compat defense in
+      depth: a future grammar bump that DOES tokenize `gen` would then be
+      rejected directly here too.) Each method's attributes must be inert
+      built-ins (`allow` / `must_use` / `cfg` / `inline` / `doc`).
   A4. No construction outside the allowlisted method bodies — LOCATION-BASED
       and NAME-AGNOSTIC: ANY `struct_expression` whose lexical position is
       neither inside one of the three allowlisted method bodies NOR inside the
@@ -286,6 +313,14 @@ def _fn_modifier_kinds(fn: Node) -> set[str]:
     of its modifier tokens normalized to keywords: `const`, `unsafe`,
     `async`, `extern` (from `extern_modifier`), `gen`. An empty set means a
     plain `fn` with no modifiers.
+
+    NOTE on `gen`: the PINNED tree-sitter-rust does NOT tokenize a Rust 2024
+    `gen fn` as a `function_modifiers` token — `gen fn` instead degrades to
+    a nested ERROR node, which the A0 parse-health (`has_error`) guard
+    rejects before this function is ever reached. The `gen` branch here is
+    therefore forward-compat defense in depth: a future grammar bump that
+    DOES tokenize `gen` as a modifier would then be rejected directly by the
+    subset-of-{const} check, without relying on the parse-health guard.
     """
     out: set[str] = set()
     for child in fn.children:
@@ -502,6 +537,12 @@ def _has_deny_unsafe_code(mod_src: bytes) -> bool:
     (`deny(unsafe_code, missing_docs)`) DO.
     """
     root = _parser().parse(mod_src).root_node
+    # Parse-health guard: a malformed `mod.rs` (a construct the pinned
+    # grammar mis-parses, degrading to a nested ERROR) must NOT be treated as
+    # carrying a valid module-wide `deny`. If the parser flagged the tree,
+    # the inner-attribute scan below is unreliable — fail closed (absent).
+    if root.has_error:
+        return False
     # Only a TOP-LEVEL inner attribute counts: `#![deny(unsafe_code)]` must
     # be a DIRECT child of the `source_file` root (i.e. apply to the whole
     # module). A `#![deny(unsafe_code)]` nested inside a fn body or block
@@ -575,6 +616,29 @@ def _enforce(cap_src_path: Path, mod_src_path: Path) -> list[str]:
         return [f"capability file missing: {cap_src_path}"]
     src = cap_src_path.read_bytes()
     root = parser.parse(src).root_node
+
+    # === A0: parse-health guard (precedes every kind-based check) ===
+    # The whole gate reasons over node KINDS on the ASSUMPTION of a faithful
+    # parse. A construct the PINNED `tree-sitter-rust` does not recognize —
+    # e.g. a Rust 2024 `gen fn` (the pinned grammar does not tokenize `gen`
+    # as a fn modifier) — does not surface as a new kind; it DEGRADES to an
+    # `ERROR` node NESTED inside an otherwise-valid `function_item`. The
+    # kind-based whitelist never sees it (`_fn_modifier_kinds` finds no
+    # `function_modifiers`; the impl-body whitelist sees a normal
+    # `function_item`), so the forgery would be ACCEPTED. A frozen-shape gate
+    # must therefore REJECT any tree the parser itself flagged as malformed:
+    # the "rejected by construction" premise only holds over a clean parse.
+    if root.has_error:
+        failures.append(
+            f"{cap_src_path.name} did not parse cleanly: tree-sitter reported "
+            f"an ERROR/MISSING node. A frozen-shape gate reasons over node "
+            f"KINDS and must reject any tree the parser flagged as malformed "
+            f"(e.g. a Rust 2024 `gen fn`, which the pinned grammar does not "
+            f"tokenize as a modifier and degrades to a nested ERROR node — "
+            f"invisible to the kind-based whitelist). Fix the source so it "
+            f"parses cleanly, or bump the pinned tree-sitter-rust grammar."
+        )
+        return failures
 
     # === A1: module-item whitelist (the categorical closer) ===
     struct_items: list[Node] = []

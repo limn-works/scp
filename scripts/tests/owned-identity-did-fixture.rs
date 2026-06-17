@@ -1023,3 +1023,51 @@ impl OwnedIdentityDid {
         &self.did
     }
 }
+
+// @file: gen_issue_for_actor [REJECT]
+// FIX1 (parse-health) — `gen fn issue_for_actor`. The PINNED tree-sitter-rust
+// does NOT tokenize the Rust 2024 `gen` keyword as a fn modifier; `gen fn`
+// degrades to a nested ERROR node inside an otherwise-valid `function_item`,
+// invisible to the kind-based modifier check (`_fn_modifier_kinds` sees no
+// `function_modifiers` token). The A0 `root.has_error` guard rejects the whole
+// file BY CONSTRUCTION — a frozen-shape gate must refuse any tree the parser
+// flagged as malformed.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) gen fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
+
+// @file: gen_reissue [REJECT]
+// FIX1 (parse-health) — `gen fn reissue`. Same mechanism as gen_issue_for_actor:
+// the pinned grammar mis-parses `gen fn`, the kind-based whitelist would not see
+// it, and the A0 parse-health (`has_error`) guard rejects the malformed tree.
+use scp_identity::DID;
+
+pub(in crate::context) struct OwnedIdentityDid {
+    did: DID,
+}
+
+impl OwnedIdentityDid {
+    pub(super) const fn issue_for_actor(did: DID) -> Self {
+        Self { did }
+    }
+    pub(in crate::context) gen fn reissue(&self) -> Self {
+        Self { did: self.did.clone() }
+    }
+    pub(in crate::context) const fn as_did(&self) -> &DID {
+        &self.did
+    }
+}
