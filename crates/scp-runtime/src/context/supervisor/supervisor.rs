@@ -1098,8 +1098,8 @@ impl Supervisor {
     /// drop the returned `Arc` within the same poll. The inner
     /// [`Zeroizing`] wrapper guarantees the bytes are zeroed on drop.
     ///
-    /// Visibility is `pub(in crate::context::supervisor)` per the
-    /// master plan §"Cross-identity isolation" — wrapping-secret
+    /// Visibility is `pub(in crate::context::supervisor)` per
+    /// ADR-049 §5 — wrapping-secret
     /// access must be capability-gated by `&OwnedIdentityDid`. Until
     /// Phase 2 wires that capability through `ActorDeps`, the
     /// narrower visibility scopes call sites to supervisor-module code

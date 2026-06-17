@@ -1,5 +1,6 @@
-//! Capability proof type — see ADR-049 §"`OwnedIdentityDid` via module
-//! visibility" and spec §9.4.1 four-point criterion.
+//! Capability proof type — see ADR-049 §5 (`OwnedIdentityDid`: unforgeable
+//! by constructor visibility + private field) and spec §9.4.1 four-point
+//! criterion.
 //!
 //! `OwnedIdentityDid` is the unforgeable token that proves the bearer's
 //! identity owns a particular [`ContextActor`]. The unforgeability
@@ -44,22 +45,22 @@
 //! - `Debug` / `Display` — accidental logging of identity tokens.
 //!
 //! Defense-in-depth: the CI gate `scripts/check-owned-identity-did.py`
-//! mechanically enforces every clause above (location, struct
-//! name-visibility, forbidden derives, forbidden manual impls, forbidden
-//! public fields, `type` alias ban). For the inherent API the gate is a
-//! CLOSED ALLOWLIST, not a name-keyed or return-type-keyed classifier: it
-//! asserts the inherent impl contains ONLY the allowlisted methods
-//! `issue_for_actor` (the `pub(super)` raw-`DID` mint), `reissue` and
-//! `as_did` (both `&self`); ANY other inherent fn — regardless of return
-//! type, including an aliased / `impl Trait` / `Result`-wrapped return —
-//! is rejected, and a `type` alias of the capability (e.g. `type OwnedCap
-//! = OwnedIdentityDid;`) is banned. The allowlist-by-name is the security
-//! boundary: a return-type-aliased forgery (`type OwnedCap =
-//! OwnedIdentityDid; fn forge(did: DID) -> OwnedCap`) is caught because
-//! `forge` is not allowlisted, even though it hides the cap type from a
-//! return-type check and the struct is `pub(in crate::context)`. Only
-//! `issue_for_actor` may take a raw `DID`. Any change here is also audited
-//! there.
+//! checks the type DEFINITION shape only — struct name-visibility (exactly
+//! `pub(in crate::context)`), the single PRIVATE `did` field, forbidden
+//! derives, forbidden manual trait impls, and that no second inherent
+//! `impl` or other item in this file constructs the struct. For the
+//! inherent API the gate is a CLOSED ALLOWLIST BY NAME: it asserts the
+//! inherent impl contains EXACTLY `issue_for_actor` (the `pub(super)`
+//! raw-`DID` mint), `reissue` and `as_did` (both `&self`, no raw `DID`) —
+//! no more, no fewer. ANY other inherent fn is rejected. This is the
+//! SOLE-MINTER invariant: it prevents adding a second arbitrary-`DID`
+//! constructor inside the module — the one thing the type system does NOT
+//! prevent. Construction confinement (that a token can only be minted via
+//! `issue_for_actor` or a struct literal inside this module) is guaranteed
+//! by the TYPE SYSTEM — the `pub(super)` constructor, the private field,
+//! and `#![deny(unsafe_code)]` — NOT by source-text analysis. The gate
+//! therefore does NOT and will NOT inspect any call site, build site, or
+//! mint argument.
 //!
 //! See also `#![deny(unsafe_code)]` at `supervisor/mod.rs` — prevents an
 //! unsafe `Send` impl or `transmute` that could fabricate a token.
