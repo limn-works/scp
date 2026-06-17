@@ -840,3 +840,56 @@ impl OwnedIdentityDid {
         Self { did: Did(d.0) }
     }
 }
+
+// @file: context/supervisor/use_alias_impl.rs
+// FIX (use-alias rename-evasion, rule F.2-use) — IMPORT-ALIAS OF THE CAP.
+// Rust has exactly TWO type-renaming mechanisms: `type X = T` (banned by rule
+// F.2 via `cap_aliases`) and `use … as X` (this hole). A
+// `use self::OwnedIdentityDid as UseAlias;` makes `UseAlias` a SECOND name for
+// the capability, so the `impl UseAlias { fn forge … -> Self { Self { did } } }`
+// below mints any DID while its impl target tail is `UseAlias` ≠
+// `OwnedIdentityDid`: rule G (inherent allowlist — `_impl_for_owned_identity_did`
+// returns None for tail `UseAlias`), rule H (construction scan —
+// `_struct_expr_constructs_cap` for `Self { … }` checks the enclosing impl
+// targets the cap by tail, which `UseAlias` is not), and `_impl_targets_cap`
+// ALL miss it. The forgery COMPILES and is handler-reachable (the private `did`
+// field is module-scoped). Pre-fix this PASSED exit 0. Rule F.2-use bans the
+// import alias outright — symmetric to F.2, with the same whole-scan-tree scope
+// — so the diagnostic `use … as UseAlias` is an import alias` fires. The alias
+// NAME `UseAlias` is unique to this case.
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+struct Did([u8; 32]);
+use self::OwnedIdentityDid as UseAlias;
+impl UseAlias {
+    #[allow(dead_code)]
+    pub(in crate::context) fn forge(did: Did) -> Self {
+        Self { did }
+    }
+}
+
+// @file: context/supervisor/use_alias_group.rs
+// FIX (use-alias, USE-GROUP form) — the `use_as_clause` nested inside a
+// `use_list`: `use self::{OwnedIdentityDid as UseGroupAlias};`. tree-sitter
+// shapes the clause's `path` as a bare `identifier` (not a `scoped_identifier`)
+// here, and the clause lives several levels below the `use_declaration`; the
+// collector's `walk` recurses into the list and still finds + bans it. This
+// proves the use-group spelling (and the multi-import
+// `use foo::{Bar, OwnedIdentityDid as Alias}` shape) is caught, not only the
+// top-level qualified-path spelling. The accompanying `impl UseGroupAlias`
+// forgery is the same rename-evasion as above. The alias NAME `UseGroupAlias`
+// is unique to this case.
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+struct Did([u8; 32]);
+use self::{OwnedIdentityDid as UseGroupAlias};
+impl UseGroupAlias {
+    #[allow(dead_code)]
+    pub(in crate::context) fn forge(did: Did) -> Self {
+        Self { did }
+    }
+}

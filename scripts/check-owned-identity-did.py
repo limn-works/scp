@@ -904,6 +904,51 @@ def _type_tail_identifier(type_node, source: bytes) -> str | None:
     return None
 
 
+def _use_alias_cap_tail(use_as_clause_node, source: bytes) -> str | None:
+    """For a `use_as_clause` node (`use <path> as <Alias>`), return the
+    imported `<Alias>` NAME iff the imported path's LAST `::` segment is the
+    capability type, else None.
+
+    Rust has exactly TWO type-renaming mechanisms: a `type X = T` alias (rule
+    F.2, banned via `cap_aliases`) and a `use … as X` import alias (this hole).
+    The latter is the symmetric forgery surface: `use self::OwnedIdentityDid as
+    Alias;` makes `Alias` a second name for the cap, so an `impl Alias { … Self
+    { did } }` / `impl Alias { … Alias { did } }` / a free fn `-> Alias { Alias
+    { did } }` all have a tail identifier ≠ `OwnedIdentityDid` and slip rule G
+    (inherent allowlist), rule H (construction scan), and `_impl_targets_cap`
+    — every one of which recognizes the cap ONLY by the literal tail
+    `OwnedIdentityDid` (or `Self` inside a cap impl). Banning the `use`-alias
+    outright (symmetric to F.2) guarantees the cap can only ever be NAMED
+    `OwnedIdentityDid`, keeping tail-identifier recognition airtight.
+
+    tree-sitter shapes the clause's `path` field as either an `identifier`
+    (when the clause lives inside a `use_list` / `scoped_use_list`, e.g.
+    `use self::{OwnedIdentityDid as Alias};` or `use foo::{Bar,
+    OwnedIdentityDid as Alias};`) or a `scoped_identifier` (a fully- or
+    partially-qualified path, e.g. `use self::OwnedIdentityDid as Alias;`,
+    `use super::OwnedIdentityDid as Alias;`, or
+    `use crate::…::identity_capability::OwnedIdentityDid as Alias;`). For a
+    `scoped_identifier` the LAST segment is its `name` field; for a bare
+    `identifier` the whole node is the tail. We match the tail word-exactly
+    (tree-sitter token boundary), so `OwnedIdentityDidExtra` does NOT match.
+    Returns the alias identifier text for the diagnostic, or None.
+    """
+    path_node = use_as_clause_node.child_by_field_name("path")
+    if path_node is None:
+        return None
+    if path_node.type == "identifier":
+        tail = node_text(path_node, source)
+    elif path_node.type == "scoped_identifier":
+        name = path_node.child_by_field_name("name")
+        tail = node_text(name, source) if name is not None else None
+    else:
+        return None
+    if tail != TYPE_NAME:
+        return None
+    alias_node = use_as_clause_node.child_by_field_name("alias")
+    return node_text(alias_node, source) if alias_node is not None else "<?>"
+
+
 def _nearest_enclosing(node, kinds: tuple[str, ...]):
     """Walk PARENTS (not `node` itself) and return the first ancestor whose
     `.type` is in `kinds`, else None.
@@ -1617,9 +1662,10 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
     list[tuple[str, int, str, str, str, str, str]],
     list[tuple[str, int, str]],
     list[tuple[str, int, str]],
+    list[tuple[str, int, str]],
 ]:
     """Walk scan_dir and return (decls, impls, ctor_fns, cap_aliases,
-    trait_fns, macro_hits, construction_hits).
+    trait_fns, macro_hits, construction_hits, use_aliases).
 
     decls: list of (rel_path, line, visibility, derives, public_fields,
                     kind, generic) where kind is
@@ -1696,6 +1742,26 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
            forgery vector there), and a `Self { … }` in a foreign-file impl is
            already covered by location check (A) / trait-mint rule (D).
            Element shape: (rel_path, line, reason).
+    use_aliases: every `use <path> as <Alias>;` import alias whose imported
+           path's LAST `::` segment is the capability type — the SYMMETRIC
+           counterpart of `cap_aliases` (rule F.2). Rust has exactly two
+           type-renaming mechanisms: `type X = T` (banned via `cap_aliases`)
+           and `use … as X` (collected here). A `use self::OwnedIdentityDid as
+           Alias;` makes `Alias` a second name for the cap, so an `impl Alias`
+           / `Alias { … }` / `Self { … }`-in-`impl Alias` / free fn `-> Alias`
+           all have a tail identifier ≠ `OwnedIdentityDid` and slip rule G
+           (inherent allowlist), rule H (construction scan), and
+           `_impl_targets_cap` — every one of which recognizes the cap ONLY by
+           the literal tail `OwnedIdentityDid` (or `Self` inside a cap impl).
+           Rule F.2-use bans the import alias outright, mirroring the F.2
+           `type`-alias ban EXACTLY in scope (whole-scan-tree collection +
+           whole-tree enforcement), so the cap can only ever be NAMED
+           `OwnedIdentityDid`. Catches the qualified path forms
+           (`self::`/`super::`/`crate::…::`) AND the use-group forms
+           (`use self::{OwnedIdentityDid as Alias};`, `use foo::{Bar,
+           OwnedIdentityDid as Alias};`) — the `use_as_clause` is found
+           wherever it nests inside a `use_list` / `scoped_use_list`. Element
+           shape: (rel_path, line, alias_name).
     """
     decls: list[
         tuple[str, int, str, list[str], list[tuple[int, str]], str, bool]
@@ -1706,13 +1772,14 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
     trait_fns: list[tuple[str, int, str, str, str, str, str]] = []
     macro_hits: list[tuple[str, int, str]] = []
     construction_hits: list[tuple[str, int, str]] = []
+    use_aliases: list[tuple[str, int, str]] = []
     # Rel path of the ONE file allowed to declare the cap type. The same
     # relative path holds under both the real repo_root and the self-test's
     # temp staging root, so the declaring-file macro rule (B, sub-case 1)
     # keys on it identically in both.
     required_rel = REQUIRED_PATH
     if not scan_dir.is_dir():
-        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits
+        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases
     for root, _, files in os.walk(scan_dir):
         for fname in files:
             if not fname.endswith(".rs"):
@@ -1861,11 +1928,28 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                         macro_hits.append(
                             (rel, node.start_point[0] + 1, path_hit)
                         )
+                # (F.2-use) Import-alias ban — the SYMMETRIC counterpart of the
+                # F.2 `type X = OwnedIdentityDid` ban. A `use <path> as <Alias>;`
+                # whose imported path's LAST segment is the cap type makes
+                # `Alias` a second name for it, defeating the gate's
+                # tail-identifier recognition (rule G / H / `_impl_targets_cap`
+                # all key on the literal `OwnedIdentityDid` tail). Collected
+                # ANYWHERE under the scan root, mirroring `cap_aliases` scope
+                # EXACTLY (F.2 is whole-tree, not declaring-file-only). The
+                # `use_as_clause` is found wherever it nests — top-level or
+                # inside a `use_list` / `scoped_use_list` — because `walk`
+                # recurses into every node.
+                if node.type == "use_as_clause":
+                    alias = _use_alias_cap_tail(node, source)
+                    if alias is not None:
+                        use_aliases.append(
+                            (rel, node.start_point[0] + 1, alias)
+                        )
                 for c in node.children:
                     walk(c)
 
             walk(tree.root_node)
-    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits
+    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases
 
 
 def find_declarations():
@@ -2028,6 +2112,7 @@ def _enforce(
     trait_fns: list[tuple[str, int, str, str, str, str, str]],
     macro_hits: list[tuple[str, int, str]],
     construction_hits: list[tuple[str, int, str]],
+    use_aliases: list[tuple[str, int, str]],
     required_path: str,
     stream=sys.stderr,
 ) -> bool:
@@ -2065,6 +2150,33 @@ def _enforce(
             f"capability type. Such an alias lets a mint fn declare "
             f"`-> {alias_name}` to hide the capability return type from a "
             f"return-type check; it is banned outright. Use {TYPE_NAME} "
+            f"directly. See ADR-049 §5.\n"
+        )
+        fail = True
+
+    # (F.2-use) A `use <path> as <Alias>;` import alias whose imported path's
+    # LAST segment is the cap type. Rust has exactly TWO type-renaming
+    # mechanisms: `type X = T` (F.2 above) and `use … as X` (here). The
+    # `use`-alias is the SYMMETRIC forgery surface: `use self::OwnedIdentityDid
+    # as Alias;` makes `Alias` a second name for the cap, so an
+    # `impl Alias { … Self { did } }` / `impl Alias { … Alias { did } }` / a
+    # free fn `-> Alias { Alias { did } }` all have a tail identifier ≠
+    # `OwnedIdentityDid` and slip rule G (inherent allowlist), rule H
+    # (construction scan), and `_impl_targets_cap` — every one of which
+    # recognizes the cap ONLY by the literal tail `OwnedIdentityDid` (or `Self`
+    # inside a cap impl). The forgery COMPILES and is handler-reachable (the
+    # private `did` field is module-scoped). Banning the import alias outright,
+    # symmetric to F.2 and with the IDENTICAL whole-scan-tree scope, guarantees
+    # the cap can only ever be NAMED `OwnedIdentityDid` (or `Self`), keeping
+    # tail-identifier recognition airtight. See ADR-049 §5.
+    for rel, line, alias_name in use_aliases:
+        stream.write(
+            f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
+            f"`use … as {alias_name}` is an import alias OF the capability "
+            f"type; it lets an `impl {alias_name}` / `{alias_name} {{ … }}` / "
+            f"`Self {{ … }}`-in-`impl {alias_name}` hide the capability from "
+            f"tail-identifier recognition (rules G / H key on the literal "
+            f"`{TYPE_NAME}` tail); banned outright. Name {TYPE_NAME} "
             f"directly. See ADR-049 §5.\n"
         )
         fail = True
@@ -2792,6 +2904,23 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     # bypass mechanics, same `is_impl_method` rejection. The substring
     # `in fn `reissue` outside` is unique to this symmetric case.
     ("nested_fn_name_launder_symmetric", "in fn `reissue` outside"),
+    # FIX (use-alias rename-evasion, F.2-use) — IMPORT-ALIAS OF THE CAP via
+    # `use self::OwnedIdentityDid as UseAlias;` followed by an `impl UseAlias {
+    # fn forge … -> Self { Self { did } } }`. Rust has exactly two
+    # type-renaming mechanisms: `type X = T` (banned by F.2) and `use … as X`
+    # (this hole). The alias gives the `impl` / `Self { … }` a tail identifier
+    # ≠ `OwnedIdentityDid`, so rule G (inherent allowlist), rule H
+    # (construction scan), and `_impl_targets_cap` all MISS it while the
+    # forgery compiles and is handler-reachable. Rule F.2-use bans the import
+    # alias outright, symmetric to F.2 and with the same whole-tree scope. The
+    # alias NAME `UseAlias` in the diagnostic is unique to this case.
+    ("use_alias_impl", "`use … as UseAlias` is an import alias"),
+    # FIX (use-alias, use-group form) — `use self::{OwnedIdentityDid as
+    # UseGroupAlias};` nests the `use_as_clause` inside a `use_list`; the
+    # collector walks into the list and still bans it. Proves the use-group
+    # spelling is caught, not only the top-level qualified-path spelling. The
+    # alias NAME `UseGroupAlias` is unique to this case.
+    ("use_alias_group", "`use … as UseGroupAlias` is an import alias"),
 ]
 
 
@@ -2863,6 +2992,7 @@ def do_self_test() -> int:
             trait_fns,
             macro_hits,
             construction_hits,
+            use_aliases,
         ) = _scan_root(fx_scan, tmp_root)
         # Capture stderr to inspect.
         buf = io.StringIO()
@@ -2874,6 +3004,7 @@ def do_self_test() -> int:
             trait_fns,
             macro_hits,
             construction_hits,
+            use_aliases,
             fx_required,
             stream=buf,
         )
@@ -2940,6 +3071,7 @@ def main() -> int:
         trait_fns,
         macro_hits,
         construction_hits,
+        use_aliases,
     ) = find_declarations()
     if (
         not decls
@@ -2948,6 +3080,7 @@ def main() -> int:
         and not trait_fns
         and not macro_hits
         and not construction_hits
+        and not use_aliases
     ):
         # Type does not yet exist AND nothing references it — this is the
         # pre-commit-5 state. (A macro touching the cap type or a trait impl
@@ -2968,6 +3101,7 @@ def main() -> int:
         trait_fns,
         macro_hits,
         construction_hits,
+        use_aliases,
         REQUIRED_PATH,
         stream=sys.stderr,
     )
