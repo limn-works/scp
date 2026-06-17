@@ -1171,6 +1171,43 @@ def _use_alias_mint_tail(use_as_clause_node, source: bytes) -> str | None:
     return node_text(alias_node, source) if alias_node is not None else "<?>"
 
 
+def _use_alias_did_tail(use_as_clause_node, source: bytes) -> str | None:
+    """For a `use_as_clause` node (`use <path> as <Alias>`), return the
+    imported `<Alias>` NAME iff the imported path's LAST `::` segment is the
+    raw-DID type `DID`, else None.
+
+    This is the raw-DID analogue of `_use_alias_cap_tail` / `_use_alias_mint_tail`.
+    The per-call mint-arg check (rule K exemption b) counts the SOLE non-`self`
+    parameter whose TYPE tail-identifier is the literal `DID` to find the owning
+    binding. A `use scp_identity::DID as GoodId;` import alias renames `DID` on
+    the OWNING parameter so the ATTACKER parameter becomes the ONLY literal-`DID`
+    param — it then gets pinned as the owning binding and the attacker DID is
+    minted (G03-via-alias). Banning the import alias outright, scoped to the
+    supervisor subtree (`SUPERVISOR_SUBTREE_REL`) — symmetric to the cap-type
+    F.2-use ban — keeps `DID` un-renameable where the owning-param count runs, so
+    the literal-`DID` param count is airtight.
+
+    Path-node shapes mirror `_use_alias_mint_tail`: a bare `identifier` inside a
+    `use_list`/`scoped_use_list`, or a `scoped_identifier` whose `name` field is
+    the tail segment. Matched word-exactly, so `DIDExtra` does NOT match.
+    Returns the alias identifier text for the diagnostic, or None.
+    """
+    path_node = use_as_clause_node.child_by_field_name("path")
+    if path_node is None:
+        return None
+    if path_node.type == "identifier":
+        tail = node_text(path_node, source)
+    elif path_node.type == "scoped_identifier":
+        name = path_node.child_by_field_name("name")
+        tail = node_text(name, source) if name is not None else None
+    else:
+        return None
+    if tail != DID_PARAM_TYPE:
+        return None
+    alias_node = use_as_clause_node.child_by_field_name("alias")
+    return node_text(alias_node, source) if alias_node is not None else "<?>"
+
+
 def _use_wildcard_is_cap_module(use_wildcard_node, source: bytes) -> bool:
     """For a `use_wildcard` node (the `…::*` glob of a `use_declaration`),
     return True iff the glob's PATH (the segment(s) before `::*`) ends in the
@@ -1307,22 +1344,48 @@ def _param_binding_name(param_node, source: bytes) -> str | None:
 
 
 def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool:
-    """True if, anywhere inside `fn_node`'s body and LEXICALLY BEFORE
-    `before_byte`, the identifier `name` is RE-BOUND by either a `let`
-    declaration whose pattern binds `name` or an assignment whose left-hand
-    side is the bare identifier `name`.
+    """True if, anywhere inside `fn_node`'s body, the identifier `name` is
+    RE-BOUND in a way that defeats name-matching of the bare mint argument — by
+    a `let` declaration whose pattern binds `name`, an assignment whose
+    left-hand side is the bare identifier `name`, OR a NON-`let` PATTERN BINDER
+    (`match` arm, `if let`/`while let`/`let else` condition, `for` loop, closure
+    parameter) whose pattern binds `name` and which ENCLOSES or LEXICALLY
+    PRECEDES the mint.
 
     A shadow/rebind defeats name-matching: `let owning_did = make_evil();`
     before the mint makes the bare argument `owning_did` resolve to an
     attacker-controlled local rather than the caller-supplied parameter (G02).
-    "Before" is by source byte offset relative to the mint reference's position;
-    a `let`/assignment AFTER the mint cannot affect the value the mint already
-    consumed, so only earlier rebinds disqualify the exemption.
+    The SAME laundering is possible through every OTHER Rust binding form, and
+    the bare `owning_did` at the mint then resolves to attacker data:
+
+        match make_evil_did() { owning_did => issue_for_actor(owning_did.clone()) }
+        if let owning_did = make_evil_did() { issue_for_actor(owning_did.clone()) }
+        for owning_did in once(make_evil_did()) { issue_for_actor(owning_did.clone()) }
+        (|owning_did: DID| issue_for_actor(owning_did.clone()))(make_evil_did())
+
+    For a `let`/assignment the rebind is a STATEMENT that runs BEFORE the mint,
+    so "before" is by source byte offset relative to the mint reference's
+    position; a `let`/assignment AFTER the mint cannot affect the value the mint
+    already consumed, so only earlier rebinds disqualify the exemption.
+
+    For the NON-`let` binder forms the binding pattern is positioned at the head
+    of a construct whose BODY CONTAINS the mint (the mint lives in the match-arm
+    body / closure body / for body / if-let body). Such a binder's node starts
+    BEFORE `before_byte` (the head precedes the body it encloses), so the same
+    `n.start_byte < before_byte` test catches the enclosing case as well as a
+    textually-earlier sibling binder. The shadowing pattern lives in the node's
+    `pattern` field (`match_arm`, `let_condition`, `for_expression`) or its
+    `parameters` field (`closure_expression`); these field/node names were
+    confirmed empirically against the loaded tree-sitter-rust grammar
+    (`if let`/`while let`/`let else` all surface a `let_condition`; `let else`
+    additionally surfaces a `let_declaration`, already covered by the `let`
+    arm). A POST-mint `let`/binder must still NOT disqualify the exemption, so
+    the byte-order guard is preserved for all forms.
 
     Both `let` patterns (`identifier`, and destructuring patterns that name the
     identifier — `tuple_pattern`, `ref`/`mut`-prefixed bindings, etc.) and
     `assignment_expression` LHS identifiers are walked. Conservative by design:
-    any earlier binding of the param name dissolves the exemption.
+    any earlier/enclosing binding of the param name dissolves the exemption.
     """
     body = fn_node.child_by_field_name("body")
     if body is None:
@@ -1342,13 +1405,29 @@ def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool
             stack.extend(p.children)
         return False
 
+    # NON-`let` pattern-binder node types and the FIELD that carries their
+    # binding pattern. A binder here shadows when it ENCLOSES the mint (its head
+    # precedes `before_byte`) or lexically precedes it. Field/node names verified
+    # empirically against the loaded grammar:
+    #   `match_arm`        -> `pattern` (a `match_pattern` wrapping the binder)
+    #   `let_condition`    -> `pattern` (if let / while let / let else head)
+    #   `for_expression`   -> `pattern` (the loop binder)
+    #   `closure_expression` -> `parameters` (`closure_parameters` of `parameter`s)
+    _PATTERN_BINDER_FIELDS: dict[str, str] = {
+        "match_arm": "pattern",
+        "let_condition": "pattern",
+        "for_expression": "pattern",
+        "closure_expression": "parameters",
+    }
+
     found = False
 
     def _walk(n) -> None:
         nonlocal found
         if found:
             return
-        # Only consider rebinds positioned before the mint reference.
+        # Only consider rebinds positioned before the mint reference (a binder
+        # that ENCLOSES the mint has its head before `before_byte` too).
         if n.start_byte < before_byte:
             if n.type == "let_declaration":
                 pat = n.child_by_field_name("pattern")
@@ -1362,6 +1441,11 @@ def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool
                     and lhs.type == "identifier"
                     and node_text(lhs, source) == name
                 ):
+                    found = True
+                    return
+            elif n.type in _PATTERN_BINDER_FIELDS:
+                pat = n.child_by_field_name(_PATTERN_BINDER_FIELDS[n.type])
+                if pat is not None and _pattern_binds(pat):
                     found = True
                     return
         for c in n.children:
@@ -1526,6 +1610,21 @@ def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
     # `impl Supervisor` is TOP-LEVEL, so an enclosing `mod` means a shadow:
     # NOT exempt (its mint reference is then flagged by rule K). Mirrors rule I.
     if _nested_mod_ancestor(impl_node) is not None:
+        return False
+    # (fix — CLOSURE-LAUNDERED MINT) ESCAPABLE-SCOPE GUARD. The exempt mint must
+    # be DIRECTLY in `build_actor_deps`'s body, NOT nested in a deferred-execution
+    # scope (`closure_expression` / `async_block` / `gen_block` / nested
+    # `function_item`) between the mint and `fn_node`. Without this, a mint inside
+    # such a scope still has `build_actor_deps` as its nearest `function_item` and
+    # would be exempt — but the closure/future can be RETURNED or STORED and
+    # invoked LATER with an attacker-chosen DID, the same threat rules H/I guard
+    # against at construction sites. Reuse the same `_escapable_scope_between`
+    # helper: if ANY escapable scope intervenes between the mint reference and the
+    # real `build_actor_deps` body, the mint is NOT exempt → rule K flags it. The
+    # real production mint is a plain statement directly in the (async) fn body,
+    # whose body is a `block` (not an `async_block`), so it has no intervening
+    # escapable scope and stays exempt.
+    if _escapable_scope_between(node, fn_node) is not None:
         return False
     # (fix 3) PER-CALL MINT-ARG CHECK. The exempt mint may only mint the actor's
     # OWN identity: its sole argument must be a bare `owning_did` parameter (or
@@ -3125,6 +3224,91 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                                 f"(only in `Supervisor::{BUILD_ACTOR_DEPS_FN}`)",
                             )
                         )
+                    # (fix — DID-TYPE USE-ALIAS BAN). A `use …::DID as GoodId;`
+                    # in the supervisor subtree renames the raw-DID type. The
+                    # per-call mint-arg check (rule K exemption b) finds the
+                    # owning binding by counting the SOLE non-`self` parameter
+                    # whose TYPE tail-identifier is the literal `DID`. Aliasing
+                    # `DID` on the OWNING param makes the ATTACKER param the only
+                    # literal-`DID` param, so IT is pinned and the attacker DID is
+                    # minted (G03-via-alias). Banning the import alias keeps `DID`
+                    # un-renameable in the subtree so the literal-`DID` param count
+                    # is airtight — symmetric to the cap-type F.2-use ban. Scoped
+                    # to the subtree (where the count runs) and cfg(test) exempt
+                    # (mirroring the other subtree-scoped rules).
+                    if (
+                        rel.startswith(SUPERVISOR_SUBTREE_REL)
+                        and not (
+                            _inside_cfg_test(node, source)
+                            or _has_preceding_cfg_test(node, source)
+                        )
+                    ):
+                        did_use_alias = _use_alias_did_tail(node, source)
+                        if did_use_alias is not None:
+                            mint_ref_hits.append(
+                                (
+                                    rel,
+                                    node.start_point[0] + 1,
+                                    f"`use … as {did_use_alias}` renames the raw-DID "
+                                    f"type `{DID_PARAM_TYPE}` in the supervisor "
+                                    f"subtree. The build-site mint-arg check finds "
+                                    f"the owning binding by counting the SOLE "
+                                    f"non-`self` parameter whose type tail is the "
+                                    f"literal `{DID_PARAM_TYPE}`; renaming "
+                                    f"`{DID_PARAM_TYPE}` on the owning param lets an "
+                                    f"attacker param become the only literal-"
+                                    f"`{DID_PARAM_TYPE}` param and be pinned as the "
+                                    f"owning binding. Banned outright (symmetric to "
+                                    f"the cap-type import-alias ban) so "
+                                    f"`{DID_PARAM_TYPE}` stays un-renameable where "
+                                    f"the param count runs. Name `{DID_PARAM_TYPE}` "
+                                    f"directly. See ADR-049 §5",
+                                )
+                            )
+                # (fix — DID-TYPE ALIAS BAN). A `type GoodId = …DID;` alias in the
+                # supervisor subtree whose RHS type tail is the raw-DID type. Same
+                # threat as the `use … as` form above: it renames `DID` so the
+                # owning param's type tail is no longer the literal `DID`, leaving
+                # the ATTACKER param as the only literal-`DID` param to be pinned.
+                # Rust has exactly two type-renaming mechanisms (`type X = T` here,
+                # `use … as X` above); banning both in the subtree keeps the
+                # literal-`DID` param count airtight. Scoped to the subtree, cfg
+                # (test) exempt.
+                if (
+                    node.type == "type_item"
+                    and rel.startswith(SUPERVISOR_SUBTREE_REL)
+                    and not (
+                        _inside_cfg_test(node, source)
+                        or _has_preceding_cfg_test(node, source)
+                    )
+                    and not _is_associated_type(node)
+                ):
+                    alias_name_node = node.child_by_field_name("name")
+                    rhs_node = node.child_by_field_name("type")
+                    if (
+                        alias_name_node is not None
+                        and rhs_node is not None
+                        and _type_tail_identifier(rhs_node, source)
+                        == DID_PARAM_TYPE
+                    ):
+                        alias_name = node_text(alias_name_node, source)
+                        mint_ref_hits.append(
+                            (
+                                rel,
+                                node.start_point[0] + 1,
+                                f"`type {alias_name} = …{DID_PARAM_TYPE}` is a "
+                                f"`type` alias OF the raw-DID type in the supervisor "
+                                f"subtree. It renames `{DID_PARAM_TYPE}` so the "
+                                f"owning parameter's type tail is no longer the "
+                                f"literal `{DID_PARAM_TYPE}`, leaving an attacker "
+                                f"param as the only literal-`{DID_PARAM_TYPE}` param "
+                                f"to be pinned by the build-site mint-arg check. "
+                                f"Banned outright (symmetric to the cap-type "
+                                f"`type X = {TYPE_NAME}` ban) so `{DID_PARAM_TYPE}` "
+                                f"stays un-renameable where the param count runs. "
+                                f"Use `{DID_PARAM_TYPE}` directly. See ADR-049 §5",
+                            )
+                        )
                 # (fix 4 — GLOB-IMPORT BAN). A `use …identity_capability::*;`
                 # glob in the subtree drags the cap type and any future
                 # re-exported mint into the importing module under their bare
@@ -4524,6 +4708,78 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     (
         "file_pin_non_build_site",
         "'file_pin_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX A (PATTERN-BINDING SHADOW — `match` arm). The real
+    # `Supervisor::build_actor_deps` re-binds `owning_did` through a `match` ARM
+    # PATTERN (not a `let`/assignment) before minting the bare `owning_did`.
+    # `_shadows_before` pre-fix walked only `let`/assignment; the extended check
+    # treats an enclosing `match_arm` pattern binding as a shadow → not exempt →
+    # rule K flags the mint. Spelling `a_match_arm_mint::…` is UNIQUE.
+    (
+        "build_site_match_arm_shadow",
+        "'a_match_arm_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX A (PATTERN-BINDING SHADOW — `if let`). The `let_condition` pattern of an
+    # `if let` re-binds `owning_did`, enclosing the mint. Extended `_shadows_before`
+    # treats the `let_condition` binding as a shadow → not exempt → flagged.
+    # Spelling `a_if_let_mint::…` is UNIQUE.
+    (
+        "build_site_if_let_shadow",
+        "'a_if_let_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX A (PATTERN-BINDING SHADOW — `while let`). The `while let` spelling of the
+    # same `let_condition` shadow; proves the while-let head too. Spelling
+    # `a_while_let_mint::…` is UNIQUE.
+    (
+        "build_site_while_let_shadow",
+        "'a_while_let_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX A (PATTERN-BINDING SHADOW — `for` loop). The `for_expression` loop
+    # pattern re-binds `owning_did`, enclosing the mint. Extended `_shadows_before`
+    # treats the `for` binder as a shadow → not exempt → flagged. Spelling
+    # `a_for_pattern_mint::…` is UNIQUE.
+    (
+        "build_site_for_pattern_shadow",
+        "'a_for_pattern_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX A (PATTERN-BINDING SHADOW — closure parameter). A `closure_expression`
+    # PARAMETER re-binds `owning_did`, enclosing the mint, invoked with an attacker
+    # DID. Extended `_shadows_before` treats the closure param as a shadow → not
+    # exempt → flagged. (The escapable-scope guard also fires; either dissolves the
+    # exemption.) Spelling `a_closure_param_mint::…` is UNIQUE.
+    (
+        "build_site_closure_param_shadow",
+        "'a_closure_param_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX B (CLOSURE-LAUNDERED MINT — escapable-scope guard). The real
+    # `Supervisor::build_actor_deps` mints its OWN un-shadowed `owning_did` but
+    # INSIDE a `closure_expression` it RETURNS; pre-fix the mint inherited the
+    # build-site exemption (nearest `function_item` = `build_actor_deps`), yet the
+    # returned closure can be invoked later with the captured token. The
+    # escapable-scope guard (`_escapable_scope_between`) detects the intervening
+    # closure → not exempt → rule K flags it. Spelling `b_closure_launder_mint::…`
+    # is UNIQUE.
+    (
+        "build_site_closure_laundered_mint",
+        "'b_closure_launder_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX C (DID-TYPE ALIAS — sole-DID-param count defeat). A `type GoodId = DID;`
+    # alias on the OWNING param plus a literal-`DID` ATTACKER param; pre-fix the
+    # alias hid the owning param's `DID`-ness so the attacker param was the only
+    # literal-`DID` param and was pinned. The DID-type-alias ban flags the alias
+    # outright in the subtree. The alias NAME `GoodId` is UNIQUE to this fixture.
+    (
+        "did_type_alias_owning_param",
+        "`type GoodId = …DID` is a `type` alias OF the raw-DID type",
+    ),
+    # FIX C (DID-IMPORT ALIAS — sole-DID-param count defeat). A
+    # `use super::DID as ImportedId;` import alias on the OWNING param plus a
+    # literal-`DID` ATTACKER param; same threat as the `type` form. The
+    # DID-use-alias ban flags the import alias outright in the subtree. The alias
+    # NAME `ImportedId` is UNIQUE to this fixture.
+    (
+        "did_use_alias",
+        "`use … as ImportedId` renames the raw-DID type `DID`",
     ),
 ]
 

@@ -1334,6 +1334,197 @@ impl Supervisor {
     }
 }
 
+// BYPASS A-MATCH-ARM (FIX — pattern-binding shadow via `match`) — a top-level
+// `impl Supervisor` whose `build_actor_deps` re-binds its `owning_did` parameter
+// through a `match` ARM PATTERN (NOT a `let`/assignment), then mints the bare
+// (now attacker-controlled) `owning_did` inside the arm body. Pre-fix
+// `_shadows_before` walked only `let_declaration` + `assignment_expression`, so a
+// `match make_evil_did() { owning_did => issue_for_actor(owning_did.clone()) }`
+// re-bind slipped: the bare `owning_did` resolved to attacker data yet the arg
+// check saw an un-shadowed param name → exempt (exit 0). The fix treats a
+// `match_arm` pattern binding `owning_did` that ENCLOSES the mint as a shadow, so
+// the exemption is refused → rule K flags the mint. Spelling
+// `a_match_arm_mint::…` is UNIQUE.
+mod a_match_arm_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> ActorDeps {
+        match make_evil_did() {
+            owning_did => {
+                let owned_identity =
+                    a_match_arm_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+                ActorDeps { owned_identity }
+            }
+        }
+    }
+}
+
+// BYPASS A-IF-LET (FIX — pattern-binding shadow via `if let`) — a top-level
+// `impl Supervisor` whose `build_actor_deps` re-binds `owning_did` through an
+// `if let` CONDITION PATTERN (a `let_condition` node, NOT a `let_declaration`),
+// then mints the bare `owning_did` in the if-body. The `let_condition` pattern
+// shadow ENCLOSES the mint; the fix treats it as a rebind → not exempt → rule K
+// flags it. Spelling `a_if_let_mint::…` is UNIQUE.
+mod a_if_let_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> Option<ActorDeps> {
+        if let owning_did = make_evil_did() {
+            let owned_identity =
+                a_if_let_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+            return Some(ActorDeps { owned_identity });
+        }
+        None
+    }
+}
+
+// BYPASS A-WHILE-LET (FIX — pattern-binding shadow via `while let`) — the
+// `while let` spelling of the `let_condition` shadow. Same node type
+// (`let_condition`) as the `if let` case, so catching this proves the
+// `while let` head too. Spelling `a_while_let_mint::…` is UNIQUE.
+mod a_while_let_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> Option<ActorDeps> {
+        while let owning_did = make_evil_did() {
+            let owned_identity =
+                a_while_let_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+            return Some(ActorDeps { owned_identity });
+        }
+        None
+    }
+}
+
+// BYPASS A-FOR-PATTERN (FIX — pattern-binding shadow via `for`) — a top-level
+// `impl Supervisor` whose `build_actor_deps` re-binds `owning_did` through a
+// `for` LOOP PATTERN (a `for_expression` `pattern` field), then mints the bare
+// `owning_did` in the loop body. The `for` binder ENCLOSES the mint; the fix
+// treats it as a rebind → not exempt → rule K flags it. Spelling
+// `a_for_pattern_mint::…` is UNIQUE.
+mod a_for_pattern_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> Option<ActorDeps> {
+        for owning_did in core::iter::once(make_evil_did()) {
+            let owned_identity =
+                a_for_pattern_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+            return Some(ActorDeps { owned_identity });
+        }
+        None
+    }
+}
+
+// BYPASS A-CLOSURE-PARAM (FIX — pattern-binding shadow via closure param) — a
+// top-level `impl Supervisor` whose `build_actor_deps` re-binds `owning_did`
+// through a CLOSURE PARAMETER (`closure_expression` `parameters` field), then
+// mints the bare `owning_did` in the closure body — invoking the closure with an
+// attacker DID. The closure-param binder ENCLOSES the mint; the fix treats it as
+// a rebind → not exempt → rule K flags it. (The escapable-scope guard ALSO fires
+// on the intervening closure; either independently dissolves the exemption — the
+// mint is flagged regardless.) Spelling `a_closure_param_mint::…` is UNIQUE.
+mod a_closure_param_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> ActorDeps {
+        let _ = owning_did;
+        let owned_identity = (|owning_did: DID| {
+            a_closure_param_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone())
+        })(make_evil_did());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS B-CLOSURE-LAUNDERED (FIX — escapable-scope guard) — a top-level
+// `impl Supervisor` whose `build_actor_deps` mints its OWN un-shadowed
+// `owning_did` (so the per-call arg check WOULD pass) but does so INSIDE a
+// `closure_expression` that the fn RETURNS. The closure's nearest enclosing
+// `function_item` is still `build_actor_deps`, so pre-fix the mint inherited the
+// build-site exemption (exit 0) — yet the returned closure can be invoked LATER
+// by handler code with the captured token, the same deferred-execution threat
+// rules H/I guard at construction sites. The escapable-scope guard
+// (`_escapable_scope_between`) detects the intervening `closure_expression`
+// between the mint and `build_actor_deps` → not exempt → rule K flags it. The
+// closure captures `owning_did` (no closure PARAMETER shadows it, isolating the
+// escapable-scope arm from the closure-param-shadow case above). Spelling
+// `b_closure_launder_mint::…` is UNIQUE.
+mod b_closure_launder_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(
+        &self,
+        owning_did: DID,
+    ) -> Box<dyn Fn() -> OwnedIdentityDid> {
+        Box::new(move || {
+            b_closure_launder_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone())
+        })
+    }
+}
+
+// BYPASS C-DID-TYPE-ALIAS (FIX — DID-type-alias defeats sole-DID-param count) —
+// a `type GoodId = DID;` alias on the OWNING parameter plus a second, literal-
+// `DID` ATTACKER parameter. The per-call mint-arg check counts the sole non-
+// `self` param whose TYPE tail is the literal `DID`; pre-fix the alias hid the
+// owning param's `DID`-ness, leaving `attacker: DID` as the only literal-`DID`
+// param — it was pinned as the owning binding and the attacker DID was minted
+// (exit 0). The fix BANS any `type X = …DID` in the subtree, so the alias itself
+// is flagged (the count never even runs on this fn). The alias NAME `GoodId` is
+// UNIQUE to this fixture.
+type GoodId = DID;
+mod c_did_type_alias_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(
+        &self,
+        owning_did: GoodId,
+        attacker: DID,
+    ) -> ActorDeps {
+        let _keep = owning_did;
+        let owned_identity =
+            c_did_type_alias_mint::OwnedIdentityDid::issue_for_actor(attacker.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS C-DID-USE-ALIAS (FIX — DID-import-alias defeats sole-DID-param count) —
+// a `use super::DID as ImportedId;` import alias on the OWNING parameter plus a
+// second, literal-`DID` ATTACKER parameter. Same threat as the `type` form: the
+// alias hides the owning param's `DID`-ness so the attacker param is the only
+// literal-`DID` param. The fix BANS any `use …DID as X` in the subtree; the
+// alias is flagged outright. The alias NAME `ImportedId` is UNIQUE to this
+// fixture. (`DID` is re-imported via `super::DID` so the `use … as` path tail is
+// the literal `DID`.)
+use super::DID as ImportedId;
+mod c_did_use_alias_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(
+        &self,
+        owning_did: ImportedId,
+        attacker: DID,
+    ) -> ActorDeps {
+        let _keep = owning_did;
+        let owned_identity =
+            c_did_use_alias_mint::OwnedIdentityDid::issue_for_actor(attacker.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
 // @file: context/supervisor/k02_static_sink.rs
 // BYPASS K02-SINK (KEYSTONE — `static`/`const` by-value sink) — a module-level
 // `static mut` holding the cap BY VALUE in an `Option<…>`. Pre-keystone a static
