@@ -1998,6 +1998,88 @@ impl Supervisor {
     }
 }
 
+// BYPASS FIX-1-POST-MINT-CONST (ITEM-SHADOW BYTE-ORDER UNSOUNDNESS) — the
+// `Supervisor::build_actor_deps` mints the bare `owning_did` and THEN declares
+// `const owning_did: &DID = &DID([0; 32]);` AFTER the mint statement. Rust
+// resolves ITEM names (`const`/`static`/`fn`/`use`) over the WHOLE block scope,
+// ORDER-INDEPENDENT, so the post-mint `const owning_did` STILL shadows the param
+// AT the mint (rustc-confirmed: the bare `owning_did` resolves to the const).
+// Pre-fix `_shadows_before` gated the item arms by `n.start_byte < before_byte`,
+// so a const placed AFTER the mint was skipped and the mint was WRONGLY EXEMPT (a
+// compiling forgery). Fix 1 lifts the four item arms OUT of the byte-order guard
+// (match UNCONDITIONALLY anywhere in the body) → shadow detected → not exempt →
+// rule K flags the mint. The mint spelling
+// `post_mint_const_shadow_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE.
+mod post_mint_const_shadow_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: &DID) -> ActorDeps {
+        let owned_identity =
+            post_mint_const_shadow_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+        const owning_did: &DID = &DID([0; 32]);
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS FIX-2-MACRO-IN-BODY (MACRO-INJECTED ITEM SHADOW) — the
+// `Supervisor::build_actor_deps` body defines a `macro_rules! shadow` whose
+// expansion is `const owning_did: &DID = &DID([9; 32]);` and INVOKES it before
+// the mint. tree-sitter does NOT expand macros, so `_shadows_before` (walking the
+// pre-expansion AST) CANNOT see the injected `const owning_did` shadow — the bare
+// `owning_did` at the mint resolves to the attacker const, a COMPILING forgery the
+// gate would miss. Fix 2 (`_body_has_macro_invocation`) refuses the build-site
+// exemption if the body contains ANY `macro_invocation` (fail-closed: the
+// invocation node is visible, its expansion is not) → not exempt → rule K flags
+// the mint. The mint spelling
+// `macro_in_body_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE.
+mod macro_in_body_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: &DID) -> ActorDeps {
+        macro_rules! shadow {
+            () => {
+                const owning_did: &DID = &DID([9; 32]);
+            };
+        }
+        shadow!();
+        let owned_identity =
+            macro_in_body_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS FIX-3-GLOB-IN-BODY (GLOB-IMPORT SHADOW) — the
+// `Supervisor::build_actor_deps` body declares an in-fn `mod glob_src { pub const
+// owning_did: &DID = &DID([9; 32]); }` and glob-imports it via `use glob_src::*;`
+// before the mint. The glob imports a VALUE-NAMESPACE `owning_did` from the
+// in-file sibling mod — a deterministic local shadow of the owning param.
+// `_use_tree_binds` deliberately CANNOT see what a glob binds (its source
+// resolution is not in the use tree), so the gate cannot prove the glob does NOT
+// import `owning_did`. Fix 3 (`_body_has_glob_use`) refuses the build-site
+// exemption if the body contains any glob `use …::*;` (fail-closed) → not exempt →
+// rule K flags the mint. The mint spelling
+// `glob_in_body_mint::OwnedIdentityDid::issue_for_actor` is UNIQUE.
+mod glob_in_body_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: &DID) -> ActorDeps {
+        mod glob_src {
+            pub const owning_did: &super::DID = &super::DID([9; 32]);
+        }
+        use glob_src::*;
+        let _ = owning_did;
+        let owned_identity =
+            glob_in_body_mint::OwnedIdentityDid::issue_for_actor(owning_did.clone());
+        ActorDeps { owned_identity }
+    }
+}
+
 // @file: context/supervisor/k02_static_sink.rs
 // BYPASS K02-SINK (KEYSTONE — `static`/`const` by-value sink) — a module-level
 // `static mut` holding the cap BY VALUE in an `Option<…>`. Pre-keystone a static

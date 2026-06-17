@@ -1406,12 +1406,14 @@ def _use_tree_binds(use_arg, name: str, source: bytes) -> bool:
       - `scoped_use_list` / `use_list`
             (`use a::{x, name, y as name};`)            -> recurse each member
       - `use_wildcard`      (`use a::*;`)               -> binds NO fixed name
-        (a glob CANNOT be statically known to bind `name`; conservatively it is
-        NOT treated as a definite rebind here — the let/assignment/pattern and
-        explicit-item forms already cover every DEFINITE rebind, and a glob that
-        happens to re-export `name` is not a construct an insider can use to
-        deterministically point the bare mint arg at attacker data, since the
-        glob's contents are external)
+        (a glob CANNOT be statically known to bind `name`: its source resolution
+        is not present in the use tree, so this fn cannot DECIDE whether the glob
+        rebinds `name`. It is therefore NOT analyzed here. A glob is NOT a benign
+        case — an in-file `mod m { pub const owning_did … } use m::*;` IS a
+        deterministic local shadow — but because it is un-analyzable, the
+        build-site exemption REFUSES outright (fail-closed) when a glob `use`
+        appears in the `build_actor_deps` body (`_body_has_glob_use`), rather
+        than relying on this fn to detect the rebind.)
 
     Field/node names confirmed empirically against the loaded tree-sitter-rust
     grammar. Recurses `scoped_use_list`/`use_list` so a single nested member
@@ -1458,19 +1460,30 @@ def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool
     whose tail is `name`, or `use …::name`) — and which ENCLOSES or LEXICALLY
     PRECEDES the mint.
 
-    The let/assignment/pattern-binder forms cover EXPRESSION-position rebinds.
-    The const/static/nested-fn/use forms cover ITEM-position rebinds: Rust
-    allows items (`const`, `static`, `fn`, `use`) as statements inside a fn
-    body, and each introduces a VALUE-NAMESPACE name visible to the rest of the
-    body. A `const owning_did: &DID = &DID(String::new());` placed before the
-    mint makes the bare `owning_did` at `issue_for_actor(owning_did.clone())`
-    resolve to the attacker-controlled const, NOT the caller-supplied parameter.
-    The same is true for a `static owning_did`, a nested `fn owning_did`, or a
-    `use evil::thing as owning_did;` — every value-namespace fn-body construct
-    that can bind the owning param name. Together with the let/assignment/
-    pattern-binder forms above, these are the COMPLETE set of fn-body constructs
-    that introduce a value-namespace binding under a given name; any of them,
-    positioned before the mint, dissolves the exemption.
+    The let/assignment/pattern-binder forms cover EXPRESSION-position rebinds
+    (caught order-correctly via the `n.start_byte < before_byte` byte-order
+    guard: only a rebind LEXICALLY BEFORE or ENCLOSING the mint can change the
+    value the mint consumes). The const/static/nested-fn/use forms cover
+    ITEM-position rebinds, which are matched UNCONDITIONALLY (no byte-order
+    guard): Rust resolves item names over the WHOLE block scope, ORDER-
+    INDEPENDENT, so a `const owning_did: &DID = &DID(String::new());` placed
+    EITHER BEFORE OR AFTER the mint makes the bare `owning_did` at
+    `issue_for_actor(owning_did.clone())` resolve to the attacker-controlled
+    const, NOT the caller-supplied parameter. The same is true for a `static
+    owning_did`, a nested `fn owning_did`, or a `use evil::thing as owning_did;`.
+
+    GUARANTEE (not "completeness"): this fn catches every AST-VISIBLE item- and
+    expression-position value-namespace binding under `name`, with correct
+    order-semantics per category (items: order-independent; expressions:
+    byte-order-guarded). It does NOT — and cannot — see two un-analyzable
+    constructs: (a) bindings injected by MACRO EXPANSION (tree-sitter does not
+    expand macros) and (b) names introduced by a GLOB import (`use …::*;`, whose
+    source resolution is not in the AST). Those two are NOT analyzed here; the
+    build-site exemption instead REFUSES OUTRIGHT (fail-closed) when the
+    `build_actor_deps` body contains any macro invocation
+    (`_body_has_macro_invocation`) or any glob `use` (`_body_has_glob_use`). Any
+    AST-visible binding caught here, in its correct position-semantics, dissolves
+    the exemption.
 
     A shadow/rebind defeats name-matching: `let owning_did = make_evil();`
     before the mint makes the bare argument `owning_did` resolve to an
@@ -1566,9 +1579,46 @@ def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool
         nonlocal found
         if found:
             return
-        # Only consider rebinds positioned before the mint reference (a binder
-        # that ENCLOSES the mint has its head before `before_byte` too).
-        if n.start_byte < before_byte:
+        # ITEM-POSITION shadows (`const`/`static`/`fn`/`use`) are matched
+        # UNCONDITIONALLY — Rust resolves ITEM names over the WHOLE block scope,
+        # ORDER-INDEPENDENT, so a `const owning_did …` (or `static`/nested `fn`/
+        # `use …`) placed AFTER the mint STILL shadows the owning param AT the
+        # mint (rustc-confirmed). The `n.start_byte < before_byte` byte-order
+        # guard is UNSOUND for items: it is correct only for the position-
+        # DEPENDENT expression binders below (`let`/assignment/pattern-binder),
+        # whose binding takes effect at a runtime statement position. A post-mint
+        # `let owning_did = …` cannot affect the value the mint already consumed,
+        # but a post-mint `const owning_did` redefines what the bare name
+        # RESOLVES to over the entire body. Lifting the four item arms out of the
+        # byte-order guard closes the post-mint item-shadow hole (rustc-PROVEN).
+        if n.type in ("const_item", "static_item", "function_item"):
+            # ITEM-LEVEL value-namespace binding inside the fn body:
+            # `const owning_did …`, `static owning_did …`, or a NESTED
+            # `fn owning_did(…)`. Each carries a `name` field (an `identifier`);
+            # a match shadows the owning param in the value namespace over the
+            # WHOLE body, regardless of position relative to the mint. (A nested
+            # `function_item` whose OWN body contains the mint is already handled
+            # by the escapable-scope guard in the caller; treating its NAME as a
+            # shadow unconditionally only TIGHTENS — it can never falsely exempt.)
+            nm = n.child_by_field_name("name")
+            if nm is not None and node_text(nm, source) == name:
+                found = True
+                return
+        elif n.type == "use_declaration":
+            # A `use` item imports a value-namespace name into the body:
+            # `use evil::thing as owning_did;`, `use evil::{a, owning_did};`,
+            # or `use evil::owning_did;`. Any of these makes the bare
+            # `owning_did` at the mint resolve to the imported item, and (like
+            # the other items) it resolves over the WHOLE body regardless of
+            # position — so it is matched UNCONDITIONALLY too.
+            if _use_tree_binds(n.child_by_field_name("argument"), name, source):
+                found = True
+                return
+        # EXPRESSION-POSITION rebinds are position-DEPENDENT: only a rebind
+        # LEXICALLY BEFORE (or ENCLOSING) the mint can affect the value the mint
+        # consumes. A binder that ENCLOSES the mint has its head before
+        # `before_byte` too, so the same test catches the enclosing case.
+        elif n.start_byte < before_byte:
             if n.type == "let_declaration":
                 pat = n.child_by_field_name("pattern")
                 if pat is not None and _pattern_binds(pat):
@@ -1586,30 +1636,6 @@ def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool
             elif n.type in _PATTERN_BINDER_FIELDS:
                 pat = n.child_by_field_name(_PATTERN_BINDER_FIELDS[n.type])
                 if pat is not None and _pattern_binds(pat):
-                    found = True
-                    return
-            elif n.type in ("const_item", "static_item", "function_item"):
-                # ITEM-LEVEL value-namespace binding inside the fn body:
-                # `const owning_did …`, `static owning_did …`, or a NESTED
-                # `fn owning_did(…)`. Each carries a `name` field (an
-                # `identifier`); a match shadows the owning param in the value
-                # namespace for the rest of the body. (A nested `function_item`
-                # is also walked into below, so an inner fn that itself contains
-                # the mint is still scanned — but the mint inside the exempt
-                # `build_actor_deps` lives in THIS fn's body, and an intervening
-                # nested fn is independently blocked by the escapable-scope
-                # guard; here we only treat the nested fn's NAME as a shadow of
-                # the owning param.)
-                nm = n.child_by_field_name("name")
-                if nm is not None and node_text(nm, source) == name:
-                    found = True
-                    return
-            elif n.type == "use_declaration":
-                # A `use` item imports a value-namespace name into the body:
-                # `use evil::thing as owning_did;`, `use evil::{a, owning_did};`,
-                # or `use evil::owning_did;`. Any of these makes the bare
-                # `owning_did` at the mint resolve to the imported item.
-                if _use_tree_binds(n.child_by_field_name("argument"), name, source):
                     found = True
                     return
         for c in n.children:
@@ -1799,6 +1825,79 @@ def _mint_call_arg_is_owning_did(node, fn_node, source: bytes) -> bool:
     return True
 
 
+def _body_has_macro_invocation(fn_node) -> bool:
+    """True if `build_actor_deps`'s body contains ANY `macro_invocation` node.
+
+    tree-sitter does NOT expand macros, so a `macro_rules! shadow { () => {
+    const owning_did: &DID = &DID([9; 32]); }; } shadow!();` in the body expands
+    to a `const owning_did` shadow item that `_shadows_before` (which walks the
+    pre-expansion AST) CANNOT see — the bare `owning_did` at the mint then
+    resolves to the attacker const, a COMPILING forgery the gate would miss. The
+    macro INVOCATION node itself IS visible, but its expansion is opaque, so any
+    macro invocation in the body could inject an unseeable shadow item. We
+    therefore FAIL CLOSED: refuse the exemption if the body invokes ANY macro.
+
+    The real production `Supervisor::build_actor_deps` body contains NO macro
+    invocation (every `Arc::new(…)` is a `call_expression`, the `use …;` is a
+    `use_declaration`, `?` is the try operator, `||` is a closure — none are
+    `macro_invocation` nodes), so this is zero-false-positive on the real mint.
+    """
+    body = fn_node.child_by_field_name("body")
+    if body is None:
+        return False
+    found = False
+
+    def _walk(n) -> None:
+        nonlocal found
+        if found:
+            return
+        if n.type == "macro_invocation":
+            found = True
+            return
+        for c in n.children:
+            _walk(c)
+
+    _walk(body)
+    return found
+
+
+def _body_has_glob_use(fn_node) -> bool:
+    """True if `build_actor_deps`'s body contains ANY glob import — a
+    `use_declaration` whose argument subtree is (or contains) a `use_wildcard`
+    (`use …::*;`).
+
+    A glob `mod evil { pub const owning_did: &DID = &DID([9; 32]); } use evil::*;`
+    in the body imports a VALUE-NAMESPACE `owning_did` from an in-file sibling
+    mod — a deterministic local shadow of the owning param. `_use_tree_binds`
+    deliberately CANNOT see what a glob binds (the glob's source resolution is
+    not in the use tree), so the gate cannot prove the glob does NOT import
+    `owning_did`. We therefore FAIL CLOSED: refuse the exemption if the body
+    contains any glob `use`.
+
+    The real production `Supervisor::build_actor_deps` body has a single SCOPED
+    `use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;` (a
+    `scoped_identifier`, NOT a `use_wildcard`) and no glob, so this is
+    zero-false-positive on the real mint.
+    """
+    body = fn_node.child_by_field_name("body")
+    if body is None:
+        return False
+    found = False
+
+    def _walk(n) -> None:
+        nonlocal found
+        if found:
+            return
+        if n.type == "use_wildcard":
+            found = True
+            return
+        for c in n.children:
+            _walk(c)
+
+    _walk(body)
+    return found
+
+
 def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
     """True if a mint reference `node` is the ONE legitimate mint CALL site
     (rule K exemption b): it lives in the real build-site FILE
@@ -1920,6 +2019,29 @@ def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
     # whose body is a `block` (not an `async_block`), so it has no intervening
     # escapable scope and stays exempt.
     if _escapable_scope_between(node, fn_node) is not None:
+        return False
+    # (fix — MACRO-INJECTED ITEM SHADOW) MACRO-IN-BODY BAN. tree-sitter does NOT
+    # expand macros, so a `macro_rules! shadow { () => { const owning_did: &DID =
+    # &DID([9; 32]); }; } shadow!();` in the body expands to a `const owning_did`
+    # shadow item that `_shadows_before` (walking the pre-expansion AST) CANNOT
+    # see — the bare `owning_did` at the mint then resolves to the attacker const,
+    # a COMPILING forgery. The macro INVOCATION node is visible but its expansion
+    # is opaque, so any macro invocation in the body could inject an unseeable
+    # shadow item. FAIL CLOSED: refuse the exemption if the body invokes ANY
+    # macro. The real `Supervisor::build_actor_deps` body has no macro invocation
+    # (every `Arc::new(…)` is a `call_expression`), so this is zero-false-positive.
+    if _body_has_macro_invocation(fn_node):
+        return False
+    # (fix — GLOB-IMPORT SHADOW) GLOB-USE-IN-BODY BAN. A `mod evil { pub const
+    # owning_did: &DID = &DID([9; 32]); } use evil::*;` in the body glob-imports a
+    # value-namespace `owning_did` from an in-file sibling mod — a deterministic
+    # local shadow. `_use_tree_binds` cannot see what a glob binds (its source
+    # resolution is not in the use tree), so the gate cannot prove the glob does
+    # NOT import `owning_did`. FAIL CLOSED: refuse the exemption if the body
+    # contains any glob `use …::*;`. The real `Supervisor::build_actor_deps` body
+    # has only a SCOPED `use crate::context::manager_methods::…;` (no glob), so
+    # this is zero-false-positive.
+    if _body_has_glob_use(fn_node):
         return False
     # (fix 3) PER-CALL MINT-ARG CHECK. The exempt mint may only mint the actor's
     # OWN identity: its sole argument must be a bare `owning_did` parameter (or
@@ -5348,6 +5470,43 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     (
         "build_site_use_list_shadow",
         "'use_list_shadow_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 1 (ITEM-SHADOW BYTE-ORDER UNSOUNDNESS — post-mint `const`) — the
+    # `Supervisor::build_actor_deps` mints the bare `owning_did` and THEN declares
+    # `const owning_did: &DID = &DID([0; 32]);` AFTER the mint. Rust resolves item
+    # names ORDER-INDEPENDENTLY over the whole block, so the post-mint const
+    # shadows the param AT the mint (rustc-confirmed). Pre-fix `_shadows_before`
+    # gated the item arms by `n.start_byte < before_byte`, skipping the post-mint
+    # const → mint WRONGLY EXEMPT (compiling forgery). Fix 1 lifts the four item
+    # arms (`const`/`static`/`fn`/`use`) out of the byte-order guard (match
+    # UNCONDITIONALLY) → shadow detected → not exempt → flagged. Spelling
+    # `post_mint_const_shadow_mint::…` is UNIQUE.
+    (
+        "build_site_post_mint_const_shadow",
+        "'post_mint_const_shadow_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 2 (MACRO-INJECTED ITEM SHADOW) — the `Supervisor::build_actor_deps` body
+    # defines `macro_rules! shadow { () => { const owning_did: &DID = &DID([9;
+    # 32]); }; }` and invokes `shadow!();` before the mint. tree-sitter does NOT
+    # expand macros, so `_shadows_before` cannot see the injected `const owning_did`
+    # → bare `owning_did` resolves to the attacker const, a compiling forgery the
+    # gate would miss. Fix 2 (`_body_has_macro_invocation`) refuses the exemption
+    # if the body invokes ANY macro (fail-closed) → not exempt → flagged. Spelling
+    # `macro_in_body_mint::…` is UNIQUE.
+    (
+        "build_site_macro_in_body",
+        "'macro_in_body_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 3 (GLOB-IMPORT SHADOW) — the `Supervisor::build_actor_deps` body declares
+    # an in-fn `mod glob_src { pub const owning_did … }` and glob-imports it via
+    # `use glob_src::*;` before the mint, deterministically shadowing the param.
+    # `_use_tree_binds` cannot see what a glob binds (source resolution absent from
+    # the use tree). Fix 3 (`_body_has_glob_use`) refuses the exemption if the body
+    # contains any glob `use …::*;` (fail-closed) → not exempt → flagged. Spelling
+    # `glob_in_body_mint::…` is UNIQUE.
+    (
+        "build_site_glob_in_body",
+        "'glob_in_body_mint::OwnedIdentityDid::issue_for_actor'",
     ),
 ]
 
