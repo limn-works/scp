@@ -98,57 +98,13 @@ fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
         hasher.update((bytes.len() as u32).to_be_bytes());
         hasher.update(bytes);
     };
-    hasher.update(event_type_tag(&event.event_type).to_be_bytes());
+    hasher.update(tree::event_type_tag(&event.event_type).to_be_bytes());
     length_prefix(&mut hasher, event.actor_did.as_bytes());
     hasher.update(event.timestamp.to_be_bytes());
     hasher.update(event.sequence.to_be_bytes());
     length_prefix(&mut hasher, &event.payload.data);
     hasher.update(event.prev_hash);
     hasher.finalize().to_vec()
-}
-
-/// Returns a stable numeric tag for each event type variant.
-const fn event_type_tag(event_type: &EventType) -> u16 {
-    match event_type {
-        EventType::ContextCreated => 0,
-        EventType::ContextClosing => 1,
-        EventType::ContextClosed => 2,
-        EventType::ContextExpired => 3,
-        EventType::MemberJoined => 4,
-        EventType::MemberLeft => 5,
-        EventType::RoleAssigned => 6,
-        EventType::TokenRevoked => 7,
-        EventType::MessageSent => 8,
-        EventType::ToolRegistered => 9,
-        EventType::ToolUpdated => 10,
-        EventType::ToolInvoked => 11,
-        EventType::ToolVerified => 12,
-        EventType::ToolInterfaceEstablished => 13,
-        EventType::GovernanceAction => 14,
-        EventType::ConsistencyCheckpoint => 15,
-        EventType::AbsenceProofRequested => 16,
-        EventType::MemberBlocked => 17,
-        EventType::KeyEpochAdvance => 18,
-        EventType::MediaSessionStarted => 19,
-        EventType::MediaSessionEnded => 20,
-        EventType::PaymentReceived => 21,
-        EventType::EconomicPolicyChanged => 22,
-        EventType::EconomicPolicyApplied => 33,
-        EventType::SpendingUcanGranted => 23,
-        EventType::SpendingUcanRevoked => 24,
-        // Governance event types (ADR-031 §8)
-        EventType::GovernanceProposalCreated => 25,
-        EventType::GovernanceVoteCast => 26,
-        EventType::GovernanceVoteWithdrawn => 27,
-        EventType::GovernanceProposalResolved => 28,
-        EventType::GovernanceConflictDetected => 29,
-        EventType::GovernanceConflictResolved => 30,
-        EventType::GovernanceDeadlockRecovery => 31,
-        EventType::GovernanceActionExecuted => 32,
-        // Provenance event types (issue #586)
-        EventType::ProvenanceAttached => 34,
-        EventType::ProvenanceReceived => 35,
-    }
 }
 
 /// Signs an event and returns it with the signature populated.
