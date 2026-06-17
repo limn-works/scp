@@ -1,6 +1,6 @@
 [package]
 name = "scp-identity"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 description = "Decentralized identity (DID) management for SCP (Shared Context Protocol)"
 edition.workspace = true
 repository.workspace = true
@@ -11,14 +11,14 @@ keywords = ["did", "identity", "decentralized", "dht"]
 categories = ["authentication", "cryptography"]
 
 [dependencies]
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }
+scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
 # `testing` is enabled non-optionally because the standalone identity
 # construction front-end (`config.rs`, ADR-052 Phase B-P3e) mints an
 # `InMemoryPreRotationCustody` on its production `Identity::create` path —
 # the only `PreRotationCustody` backend that exists today. This mirrors
 # `scp-node`, which enables `scp-platform/testing` non-optionally for the
 # identical reason on its production `Node::start` path.
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1", features = ["testing"] }
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["testing"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

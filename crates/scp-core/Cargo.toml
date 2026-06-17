@@ -1,6 +1,6 @@
 [package]
 name = "scp-core"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 description = "SCP protocol + runtime — unified API surface"
 edition.workspace = true
 repository.workspace = true
@@ -8,8 +8,8 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.1" }
-scp-runtime = { path = "../scp-runtime", version = "=0.1.0-beta.1" }
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+scp-runtime = { path = "../scp-runtime", version = "=0.1.0-beta.2" }
 
 [features]
 testing = ["scp-runtime/testing"]

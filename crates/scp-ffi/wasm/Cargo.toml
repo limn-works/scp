@@ -59,8 +59,8 @@ base64 = { workspace = true }
 jsonschema = { workspace = true }
 hex = { workspace = true }
 serde_bytes = { workspace = true }
-scp-protocol = { path = "../../scp-protocol", version = "=0.1.0-beta.1" }
-scp-event-log = { path = "../../scp-event-log", version = "=0.1.0-beta.1" }
+scp-protocol = { path = "../../scp-protocol", version = "=0.1.0-beta.2" }
+scp-event-log = { path = "../../scp-event-log", version = "=0.1.0-beta.2" }
 scp-ffi-common = { path = "../common", default-features = false }
 zeroize = { workspace = true }
 subtle = { workspace = true }
@@ -83,7 +83,7 @@ wasm-bindgen-test = "0.3"
 # multi-thread, which doesn't compile to wasm32 (ADR-034). Only loaded
 # when running `cargo test` on the host.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-scp-identity = { path = "../../scp-identity", version = "=0.1.0-beta.1" }
+scp-identity = { path = "../../scp-identity", version = "=0.1.0-beta.2" }
 # Host-only: encoder-parity tests pin the WASM-local `zbase32_encode`
 # helper against the canonical `z-base-32` crate the native bridges use.
 z-base-32 = { workspace = true }

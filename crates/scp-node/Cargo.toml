@@ -1,6 +1,6 @@
 [package]
 name = "scp-node"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 description = "Application node composing relay, identity, and HTTP server for SCP"
 edition.workspace = true
 repository.workspace = true
@@ -15,17 +15,17 @@ name = "scp-node"
 path = "src/main.rs"
 
 [dependencies]
-scp-core = { path = "../scp-core", version = "=0.1.0-beta.1" }
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }
-scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.1", features = ["production-dht"] }
-scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.1", features = [
+scp-core = { path = "../scp-core", version = "=0.1.0-beta.2" }
+scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2", features = ["production-dht"] }
+scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.2", features = [
     "sqlite-blob",
     "redb-blob",
     "postgres-blob",
     "s3-blob",
     "startup",
 ] }
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1", features = ["testing", "sqlite", "file", "encrypting"] }
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["testing", "sqlite", "file", "encrypting"] }
 arc-swap = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
 ed25519-dalek = { workspace = true }

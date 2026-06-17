@@ -1,6 +1,6 @@
 [package]
 name = "scp-transport"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 description = "Transport abstraction layer for SCP (Shared Context Protocol)"
 edition.workspace = true
 repository.workspace = true
@@ -34,10 +34,10 @@ upnp = ["dep:igd-next", "dep:natpmp"]
 startup = ["dep:tracing-subscriber"]
 
 [dependencies]
-scp-core = { path = "../scp-core", version = "=0.1.0-beta.1" }
-scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.1" }
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1", optional = true }
+scp-core = { path = "../scp-core", version = "=0.1.0-beta.2" }
+scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
+scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", optional = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -1,6 +1,6 @@
 [package]
 name = "scp-runtime"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 description = "Core protocol implementation for SCP (Shared Context Protocol)"
 edition.workspace = true
 repository.workspace = true
@@ -32,11 +32,11 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }
-scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.1" }
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1" }
-scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.1" }
-scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.1" }
+scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2" }
+scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
+scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 async-trait = { workspace = true }
 aes = { workspace = true }
 aes-gcm = { workspace = true }

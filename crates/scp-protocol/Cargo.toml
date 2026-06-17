@@ -1,6 +1,6 @@
 [package]
 name = "scp-protocol"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 description = "Pure sync protocol types and logic for SCP"
 edition.workspace = true
 repository.workspace = true
@@ -8,8 +8,8 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }
-scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.1" }
+scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }

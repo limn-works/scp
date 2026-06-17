@@ -1,6 +1,6 @@
 [package]
 name = "scp-platform"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 description = "Platform abstraction traits for SCP (Shared Context Protocol)"
 edition.workspace = true
 repository.workspace = true
