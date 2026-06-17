@@ -356,6 +356,8 @@ Root: SHA-256(0x01 || interior_L || interior_R)
     = 0x5c8dc617d287a4297eb2bcb81b37644b5138e57ad461c657db152109e3fc9fca
 ```
 
+Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree construction itself (leaf/interior domain prefixes, unbalanced promotion). A typed-leaf vector — where each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` value whose `event_type` is one of the closed `EventType` taxonomy (ADR-011 AC1, native↔WASM unification Amendment, including the lifecycle, consequence-enforcement, commit-broadcast, and app-sandbox variants added by that Amendment) — together with a checkpoint `tree::root` (§23.16.1) KAT, will be added here when the unification lands in code; the expected byte values are implementation-derived and are not pre-computed in this spec.
+
 ## 25.9 Key Continuity Fingerprint Vectors (§9.11)
 
 Domain: `"SCP-KEY-CONTINUITY-V1:"`
