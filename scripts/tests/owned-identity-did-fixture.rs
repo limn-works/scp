@@ -1525,6 +1525,147 @@ impl Supervisor {
     }
 }
 
+// BYPASS A-SHORTHAND-LET (FIX 1 — struct-pattern field-SHORTHAND shadow via
+// `let`) — a top-level `impl Supervisor` whose `build_actor_deps` re-binds its
+// `owning_did` parameter through a `let Foo { owning_did } = …;` struct-pattern
+// field SHORTHAND, then mints the bare (now attacker-controlled) `owning_did`.
+// A shorthand field binds the local via a `shorthand_field_identifier` node
+// (NOT an `identifier`); pre-fix `_pattern_binds` matched only `identifier`, so
+// the shorthand shadow slipped the shadow guard and the attacker DID was
+// wrongly exempted (gate exit 0). Fix 1 matches BOTH binder leaf types, so the
+// shorthand `let` rebind is recognized as a shadow → not exempt → rule K flags
+// it. Spelling `a_shorthand_let_mint::…` is UNIQUE.
+struct ShorthandSrc {
+    owning_did: DID,
+}
+#[allow(dead_code)]
+fn make_evil_shorthand() -> ShorthandSrc {
+    ShorthandSrc {
+        owning_did: DID([3; 32]),
+    }
+}
+mod a_shorthand_let_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> ActorDeps {
+        let ShorthandSrc { owning_did } = make_evil_shorthand();
+        let owned_identity =
+            a_shorthand_let_mint::OwnedIdentityDid::issue_for_actor(owning_did);
+        ActorDeps { owned_identity }
+    }
+}
+
+// BYPASS A-SHORTHAND-MATCH (FIX 1 — struct-pattern field-SHORTHAND shadow via
+// `match` arm) — a top-level `impl Supervisor` whose `build_actor_deps` re-binds
+// `owning_did` through a `match … { Foo { owning_did } => … }` arm-pattern field
+// SHORTHAND, then mints the bare `owning_did` in the arm body. Same
+// `shorthand_field_identifier`-binder evasion as the `let` form, exercised via
+// the `match_arm` `_PATTERN_BINDER_FIELDS` path: pre-fix the shorthand binder in
+// the arm pattern was not recognized, so the shadow slipped and the attacker DID
+// was exempted (exit 0). Fix 1 recognizes the shorthand binder → shadow → not
+// exempt → rule K flags it. Spelling `a_shorthand_match_mint::…` is UNIQUE.
+mod a_shorthand_match_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> ActorDeps {
+        match make_evil_shorthand() {
+            ShorthandSrc { owning_did } => {
+                let owned_identity =
+                    a_shorthand_match_mint::OwnedIdentityDid::issue_for_actor(owning_did);
+                ActorDeps { owned_identity }
+            }
+        }
+    }
+}
+
+// BYPASS F5-GENERIC (FIX 2 — generic `build_actor_deps` launders the literal-
+// `DID` count) — a top-level `impl Supervisor` whose `build_actor_deps` is
+// GENERIC (`<D: Into<DID>>`), takes the owning param as `&D`, and adds a literal-
+// `DID` ATTACKER param. The per-call mint-arg check counts the sole non-`self`
+// param whose TYPE tail is the literal `DID`; pre-fix `&D` had tail `D` ≠ `DID`,
+// so the ATTACKER `DID` param was the only literal-`DID` param and was pinned as
+// the owning binding — the attacker DID was minted (exit 0). Fix 2 refuses the
+// exemption outright when `build_actor_deps` is declared generic (carries
+// `type_parameters`), because the literal-`DID`-param count is UNSOUND under
+// generics → rule K flags the mint. Spelling `f5_generic_mint::…` is UNIQUE.
+mod f5_generic_mint {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps<D: Into<DID>>(
+        &self,
+        owning_did: &D,
+        attacker: DID,
+    ) -> ActorDeps {
+        let _keep = owning_did;
+        let owned_identity =
+            f5_generic_mint::OwnedIdentityDid::issue_for_actor(attacker);
+        ActorDeps { owned_identity }
+    }
+}
+
+// NEGATIVE CONTROL RENAMED-FIELD-OK (FIX 1) — a top-level `impl Supervisor`
+// whose `build_actor_deps` destructures an UNRELATED struct via a RENAMED field
+// `let RenamedSrc { f: other } = …;` (binding the local `other`, via an
+// `identifier` node — NOT a shadow of `owning_did`), then mints the genuine
+// bare `owning_did` parameter. The renamed-field form binds via `identifier`,
+// which fix 1 leaves untouched; because the bound local is `other` (≠
+// `owning_did`), it is NOT a shadow, so the exempt mint of the un-shadowed
+// `owning_did` MUST stay EXEMPT (PASS). Proves fix 1 added NO false positive on
+// the renamed-field spelling. The UNIQUE exempt mint spelling
+// `renamed_field_ok::OwnedIdentityDid::issue_for_actor` is in
+// FORBIDDEN_FIXTURE_SUBSTRINGS — it appears in a diagnostic ONLY if the renamed-
+// field destructure wrongly dissolved the legit build-site exemption.
+struct RenamedSrc {
+    f: u8,
+}
+#[allow(dead_code)]
+fn make_renamed_src() -> RenamedSrc {
+    RenamedSrc { f: 0 }
+}
+mod renamed_field_ok {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+impl Supervisor {
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(&self, owning_did: DID) -> ActorDeps {
+        let RenamedSrc { f: other } = make_renamed_src();
+        let _ = other;
+        let owned_identity =
+            renamed_field_ok::OwnedIdentityDid::issue_for_actor(owning_did);
+        ActorDeps { owned_identity }
+    }
+}
+
+// NEGATIVE CONTROL BODY-LOCAL-DID-ALIAS-OK (FIX 3) — a free function in the
+// supervisor SUBTREE whose body declares a body-local `type BodyLocalDidAliasOk
+// = DID;` and a body-local `use super::DID as BodyLocalUseAliasOk;`. A body-local
+// alias inside a free-function body has NO scope over any parameter SIGNATURE
+// (signatures resolve types in the enclosing MODULE scope, never inside a fn
+// body), so it can NEVER launder the build-site param count — banning it was an
+// over-broad false-positive. Fix 3 excludes body-local aliases from BOTH the
+// `type X = …DID` ban and the `use …DID as X` ban via `_is_body_local`, so this
+// fn MUST PASS (produce NO DID-alias diagnostic). The UNIQUE markers
+// `BodyLocalDidAliasOk` and `BodyLocalUseAliasOk` are in
+// FORBIDDEN_FIXTURE_SUBSTRINGS — either appears in a diagnostic ONLY if a
+// body-local alias was wrongly flagged (the fix regressed). NOTE: the MODULE-
+// level DID-alias threat stays caught — the C-DID-TYPE-ALIAS / C-DID-USE-ALIAS
+// bypass fixtures above (module-level `type GoodId = DID;` / `use super::DID as
+// ImportedId;`) still FAIL, asserting the real threat is unaffected.
+#[allow(dead_code)]
+fn body_local_did_alias_ok(owning_did: DID) -> DID {
+    type BodyLocalDidAliasOk = DID;
+    use super::DID as BodyLocalUseAliasOk;
+    let _local: BodyLocalDidAliasOk = DID([0; 32]);
+    let _imported: BodyLocalUseAliasOk = owning_did;
+    _local
+}
+
 // @file: context/supervisor/k02_static_sink.rs
 // BYPASS K02-SINK (KEYSTONE — `static`/`const` by-value sink) — a module-level
 // `static mut` holding the cap BY VALUE in an `Option<…>`. Pre-keystone a static

@@ -932,6 +932,42 @@ def _is_associated_type(type_item_node) -> bool:
     return False
 
 
+def _is_body_local(node) -> bool:
+    """True if `node` lives inside a FUNCTION or CLOSURE body — i.e. its
+    nearest meaningful ancestor is a `function_item` or `closure_expression`
+    (the node is a body-local statement), as opposed to a module / impl /
+    trait MEMBER.
+
+    Used by the DID-alias bans (`type X = …DID;` and `use …DID as X;`). Those
+    bans exist to keep `DID` UN-RENAMEABLE in the supervisor subtree so the
+    build-site mint-arg check's literal-`DID`-param count stays airtight. A
+    module-level (or impl/trait-member) alias CAN rename the type a parameter
+    SIGNATURE references, so it is the real threat and stays banned. A
+    body-local `type X = DID;` / `use …DID as X;` inside a free function body,
+    by contrast, has NO scope over any parameter signature (signatures resolve
+    types in the enclosing module scope, never inside a fn body), so it can
+    NEVER launder the param count — banning it is an over-broad false-positive
+    that blocks legitimate future body-local code. Excluding body-local from
+    BOTH bans narrows the over-reach WITHOUT weakening the module-level threat
+    coverage.
+
+    Walks parents and returns True the moment it hits a `function_item` /
+    `closure_expression` before any `source_file` / `mod_item` / `impl_item` /
+    `trait_item` boundary (the latter four mark a non-body-local declaration
+    position: a `mod`/file member, or an impl/trait member — the associated-
+    type case, which the `type`-alias ban already excludes via
+    `_is_associated_type`).
+    """
+    parent = node.parent
+    while parent is not None:
+        if parent.type in ("function_item", "closure_expression"):
+            return True
+        if parent.type in ("source_file", "mod_item", "impl_item", "trait_item"):
+            return False
+        parent = parent.parent
+    return False
+
+
 def _impl_for_owned_identity_did(
     impl_node, source: bytes
 ) -> tuple[str | None, int] | None:
@@ -1401,13 +1437,33 @@ def _shadows_before(fn_node, name: str, before_byte: int, source: bytes) -> bool
     def _pattern_binds(pat) -> bool:
         # Direct `identifier` pattern, or a compound pattern (tuple/ref/mut/
         # slice/struct) that contains the identifier as a bound name. Walk the
-        # subtree for any `identifier` token equal to `name`. A `let` pattern
+        # subtree for any binder leaf token equal to `name`. A `let` pattern
         # has no field-accesses (it is purely binding positions), so every
-        # `identifier` in it is a binding.
+        # binder leaf in it is a binding.
+        #
+        # tree-sitter-rust has EXACTLY TWO pattern-binder leaf node types:
+        #   - `identifier`                 — `let x = …`, `Foo(x)` (tuple
+        #     struct), `Foo { f: x }` (renamed field), `Bar::V(x)` (enum).
+        #   - `shorthand_field_identifier` — `Foo { owning_did }` (struct
+        #     field SHORTHAND), where the field NAME is also the bound LOCAL.
+        # A shorthand field binds a local of the field's name WITHOUT an
+        # `identifier` node, so a guard keyed only on `identifier` would miss
+        # `let Foo { owning_did } = attacker;` (and the `match`-arm form),
+        # letting a shadow of the owning param slip the shadow guard. Matching
+        # BOTH leaf types completes the binder enumeration. A
+        # `shorthand_field_identifier` only ever appears in a pattern-binder
+        # position (never as a field EXPRESSION), so this adds no false
+        # positive: the renamed form `Foo { f: owning_did }` binds via
+        # `identifier` (the field NAME `f` is a `field_identifier`, not a
+        # binder) and the tuple form `Foo(owning_did)` binds via `identifier`,
+        # both still caught by the `identifier` arm.
         stack = [pat]
         while stack:
             p = stack.pop()
-            if p.type == "identifier" and node_text(p, source) == name:
+            if (
+                p.type in ("identifier", "shorthand_field_identifier")
+                and node_text(p, source) == name
+            ):
                 return True
             stack.extend(p.children)
         return False
@@ -1601,6 +1657,22 @@ def _mint_ref_exempt_build_actor_deps(node, source: bytes, rel: str) -> bool:
         return False
     name_node = fn_node.child_by_field_name("name")
     if name_node is None or node_text(name_node, source) != BUILD_ACTOR_DEPS_FN:
+        return False
+    # (fix 2) GENERIC-`build_actor_deps` BAN. The per-call mint-arg check below
+    # (`_mint_call_arg_is_owning_did`) identifies the owning binding by counting
+    # the SOLE non-`self` parameter whose TYPE tail-identifier is the literal
+    # `DID`. A GENERIC build_actor_deps — `fn build_actor_deps<D: Into<DID>>(
+    # &self, owning_did: &D, attacker: DID)` — laundres that count: `_param_type_
+    # tail` of `&D` is `D` ≠ `DID`, so the literal-`DID` ATTACKER param becomes
+    # the sole `DID` param and is wrongly pinned as the owning binding. The
+    # literal-`DID`-param count is UNSOUND under generics, so refuse the
+    # exemption outright when the `function_item` carries a `type_parameters`
+    # child (is declared generic). The real production
+    # `async fn build_actor_deps(self: &Arc<Self>, owning_did: &DID)` is NOT
+    # generic, so this is zero-false-positive. A generic build_actor_deps is
+    # also caller-incompatible (it needs an extra param), but closing the
+    # exemption keeps the count's soundness premise enforced structurally.
+    if fn_node.child_by_field_name("type_parameters") is not None:
         return False
     impl_node = _nearest_enclosing(fn_node, ("impl_item",))
     if impl_node is None:
@@ -3249,6 +3321,12 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                             _inside_cfg_test(node, source)
                             or _has_preceding_cfg_test(node, source)
                         )
+                        # Symmetric to the `type`-alias ban: a body-local
+                        # `use …DID as X;` inside a free-function (or closure)
+                        # body has no scope over any parameter signature and
+                        # cannot launder the build-site param count — exclude
+                        # it. The MODULE-level import alias stays banned.
+                        and not _is_body_local(node)
                     ):
                         did_use_alias = _use_alias_did_tail(node, source)
                         if did_use_alias is not None:
@@ -3289,6 +3367,12 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                         or _has_preceding_cfg_test(node, source)
                     )
                     and not _is_associated_type(node)
+                    # A body-local `type X = DID;` inside a FREE-FUNCTION (or
+                    # closure) body has no scope over any parameter signature,
+                    # so it cannot launder the build-site param count — exclude
+                    # it (narrows an over-broad false-positive; the MODULE-level
+                    # alias, the real threat, stays banned).
+                    and not _is_body_local(node)
                 ):
                     alias_name_node = node.child_by_field_name("name")
                     rhs_node = node.child_by_field_name("type")
@@ -4788,6 +4872,39 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
         "did_use_alias",
         "`use … as ImportedId` renames the raw-DID type `DID`",
     ),
+    # FIX 1 (STRUCT-PATTERN FIELD-SHORTHAND SHADOW — `let`) — the real
+    # `Supervisor::build_actor_deps` re-binds `owning_did` through a
+    # `let Foo { owning_did } = …;` struct-pattern field SHORTHAND, which binds
+    # via a `shorthand_field_identifier` node (NOT `identifier`). Pre-fix
+    # `_pattern_binds` matched only `identifier`, so the shorthand shadow slipped
+    # the shadow guard and the attacker DID was exempted. Fix 1 matches BOTH
+    # binder leaf types → shadow → not exempt → rule K flags the mint. Spelling
+    # `a_shorthand_let_mint::…` is UNIQUE.
+    (
+        "build_site_shorthand_let_shadow",
+        "'a_shorthand_let_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 1 (STRUCT-PATTERN FIELD-SHORTHAND SHADOW — `match` arm) — the
+    # `match`-arm spelling of the shorthand shadow: a `Foo { owning_did }` arm
+    # pattern re-binds `owning_did` (via `shorthand_field_identifier`) before the
+    # mint. Exercises the `match_arm` `_PATTERN_BINDER_FIELDS` path with the
+    # shorthand binder. Pre-fix slipped; fix 1 recognizes it → not exempt →
+    # flagged. Spelling `a_shorthand_match_mint::…` is UNIQUE.
+    (
+        "build_site_shorthand_match_shadow",
+        "'a_shorthand_match_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
+    # FIX 2 (GENERIC `build_actor_deps` launders the literal-`DID` count) — a
+    # generic `build_actor_deps<D: Into<DID>>(&self, owning_did: &D, attacker:
+    # DID)`: `_param_type_tail` of `&D` is `D` ≠ `DID`, so the ATTACKER `DID`
+    # param became the sole literal-`DID` param and was wrongly pinned as the
+    # owning binding. Fix 2 refuses the exemption when `build_actor_deps` carries
+    # `type_parameters` (the count is unsound under generics) → rule K flags the
+    # mint. Spelling `f5_generic_mint::…` is UNIQUE.
+    (
+        "build_site_generic_param_mint",
+        "'f5_generic_mint::OwnedIdentityDid::issue_for_actor'",
+    ),
 ]
 
 # Negative-control fn / reference markers that MUST NEVER appear in the
@@ -4818,6 +4935,20 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
 #     field is the cap's legit home (`ActorDeps.owned_identity`), NOT an escape.
 #     The struct marker appears in a diagnostic ONLY if the keystone over-flagged
 #     a plain by-value struct field.
+#   - `renamed_field_ok::OwnedIdentityDid::issue_for_actor` — fix 1's renamed-
+#     field negative control. A build-site `build_actor_deps` that destructures
+#     an unrelated struct via a RENAMED field (`let RenamedSrc { f: other } =
+#     …;`, binding `other` via an `identifier` — NOT a shadow of `owning_did`)
+#     and mints the genuine bare `owning_did` MUST stay EXEMPT. The UNIQUE mint
+#     spelling appears in a diagnostic ONLY if the renamed-field destructure
+#     wrongly dissolved the build-site exemption (a fix-1 false positive).
+#   - `BodyLocalDidAliasOk` / `BodyLocalUseAliasOk` — fix 3's body-local DID-
+#     alias negative controls. A free-fn body-local `type X = DID;` / `use …DID
+#     as X;` has no scope over any param signature and MUST NOT be flagged by the
+#     DID-alias bans. Either marker appears in a diagnostic ONLY if a body-local
+#     alias was wrongly flagged (a fix-3 over-reach regressed). The MODULE-level
+#     DID-alias threat stays caught by the C-DID-TYPE-ALIAS / C-DID-USE-ALIAS
+#     bypass fixtures.
 FORBIDDEN_FIXTURE_SUBSTRINGS: tuple[str, ...] = (
     "test_only_by_value_mint",
     "test_only_fn_by_value_mint",
@@ -4825,6 +4956,9 @@ FORBIDDEN_FIXTURE_SUBSTRINGS: tuple[str, ...] = (
     "cfgtest_mint_ok::OwnedIdentityDid::issue_for_actor",
     "shared_borrow_ok",
     "PlainFieldOk",
+    "renamed_field_ok::OwnedIdentityDid::issue_for_actor",
+    "BodyLocalDidAliasOk",
+    "BodyLocalUseAliasOk",
 )
 
 
