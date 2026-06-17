@@ -69,7 +69,7 @@ fn log_summary_timestamp_plausible_and_clamped() {
 // the entry. This module is a small INDEPENDENT model of those semantics —
 // registration/duplicate-rejection/lookup/removal — not a line-for-line copy
 // of any single bridge function (the bridge stores richer `PerContextState`).
-// It pins the contract the bridge's registry must uphold. See issue #137.
+// It pins the contract the bridge's registry must uphold.
 //
 // NOTE (separate cleanup): like the former hand-mirrored tag table, this model
 // re-implements its own registry rather than exercising the real WASM type, so
@@ -1474,17 +1474,27 @@ fn provenance_hash_conformance_registry_with_payment() {
 // ===========================================================================
 // Canonical event-type tag contract (closed 76-variant bijection)
 //
-// The WASM bridge does NOT carry its own event-type tag table. Its context
-// manager (`crates/scp-ffi/wasm/src/manager.rs`) imports and calls the
-// canonical `scp_event_log::tree::event_type_tag` DIRECTLY — the same function
-// the native runtime uses — because `scp-ffi-wasm` depends on `scp-event-log`.
-// Native↔WASM tag parity therefore holds BY CONSTRUCTION (one shared
-// implementation), not by maintaining a hand-mirrored copy.
+// `event_type_tag` (`scp_event_log::tree`) is a protocol constant used in two
+// places: (a) the NATIVE signed-event canonical hash —
+// `tree::compute_event_canonical_hash`, the `SCP-EVENT-V1:` signature preimage
+// — and (b) retention classification (`scp-event-log/src/pruning.rs` and
+// `tiered_storage.rs`). It does NOT enter the Merkle leaf hash.
 //
-// This test pins the contract that shared code actually relies on: over the
-// full closed `EventType` taxonomy, `event_type_tag` is a bijection onto 76
-// distinct tags. A new `EventType` variant that lacks a tag (or collides with
-// an existing one) breaks the closed taxonomy and is caught here. The
+// The WASM bridge does NOT invoke `event_type_tag` at all. Its context manager
+// (`crates/scp-ffi/wasm/src/manager.rs`, `append_log_event`) appends UNSIGNED
+// events via `append_unsigned_event` (`signature: vec![]`), whose leaf is
+// `SHA-256(0x00 || rmp_serde(Event))` — committing `EventType` through its
+// SERDE VARIANT NAME, not through this numeric tag. Native↔WASM leaf parity for
+// the event type is therefore carried by the SHARED SERDE REPRESENTATION of the
+// `EventType` enum (both targets depend on the same `scp_event_log` crate), NOT
+// by `event_type_tag`.
+//
+// This test pins the tag invariant the native signed path and retention
+// classification rely on: over the full closed `EventType` taxonomy,
+// `event_type_tag` is a bijection onto the contiguous tags 0..=75. A variant
+// that lacks a tag (or collides with an existing one) would corrupt the native
+// `SCP-EVENT-V1:` signature preimage and retention classification, and is
+// caught here. The
 // byte-level native↔WASM root anchor lives in the §25 KAT (Vectors 32/33 in
 // `crates/scp-event-log/tests/test_vectors.rs`); this test is the
 // closed-taxonomy / distinct-tag pin that complements it.
@@ -1589,10 +1599,10 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
     );
 
     // Distinct-tag bijection: every canonical variant maps to a unique tag in
-    // 0..=75. Because the WASM bridge calls this exact `event_type_tag`, this is
-    // simultaneously the WASM tag contract. A collision (two variants → one tag)
-    // or a gap would corrupt the signed Merkle-leaf preimage and produce false
-    // §9.9.3 equivocation hits across implementations.
+    // 0..=75. A collision (two variants → one tag) or a gap would corrupt the
+    // native `SCP-EVENT-V1:` signature preimage (`compute_event_canonical_hash`)
+    // and the retention classification keyed on the tag in `pruning.rs` /
+    // `tiered_storage.rs`.
     let mut tags: Vec<u16> = all_variants.iter().map(event_type_tag).collect();
     assert_eq!(
         tags.len(),
@@ -1609,8 +1619,8 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
     );
 
     // The bijection must cover the contiguous range 0..=75 with no holes, which
-    // (together with distinctness above) pins the exact canonical assignment the
-    // WASM bridge inherits by sharing this function.
+    // (together with distinctness above) pins the exact canonical tag assignment
+    // the native signature preimage and retention classification depend on.
     assert_eq!(
         tags.first().copied(),
         Some(0),

@@ -48,19 +48,25 @@ fn print_vec(label: &str, bytes: &[u8]) {
 #[test]
 fn vector_15_empty_tree() {
     println!("=== Vector 15: Empty Merkle Tree ===");
-    // Spec defines empty tree root as SHA-256("").
-    // Note: The EventLog implementation returns [0u8; 32] for empty logs.
-    // This test documents both values.
+    // Spec §25.8 defines the empty-tree root as SHA-256("") (RFC 6962 MTH({})),
+    // and the production EventLog matches it: `tree::root` returns
+    // `empty_tree_root()` = SHA-256("") for an empty log. The all-zero value
+    // below is NOT the empty root — it is the distinct genesis `prev_hash`
+    // sentinel (`GENESIS_PREV_HASH = [0u8; 32]`), shown here only to contrast
+    // the two so they are not conflated.
     let spec_empty_root: [u8; 32] = Sha256::digest(b"").into();
-    print_vec("SHA-256(\"\") [spec §25.8]", &spec_empty_root);
+    print_vec(
+        "SHA-256(\"\") [spec §25.8 = EventLog empty root]",
+        &spec_empty_root,
+    );
     assert_eq!(
         hex(&spec_empty_root),
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
 
-    let impl_empty_root: [u8; 32] = [0u8; 32];
-    print_vec("EventLog empty root [impl]", &impl_empty_root);
-    println!("  Note: Implementation uses all-zeros for empty log.");
+    let genesis_prev_hash: [u8; 32] = [0u8; 32];
+    print_vec("genesis prev_hash sentinel [distinct]", &genesis_prev_hash);
+    println!("  Note: all-zeros is the genesis prev_hash, not the empty root.");
 }
 
 #[test]
