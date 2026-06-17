@@ -121,7 +121,6 @@ check-call-invariants.py, call-invariants-baseline.json,
 check-pure-helpers.sh, pure-helpers-allowlist.txt,
 bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 pretooluse-enforcement-files.sh,
-check-owned-identity-did.py,
 CLAUDE.md (enforcement sections).
 If a check fails, fix the code. The only legitimate modifications are:
 - Adding NEW assertions/operations (expanding coverage)

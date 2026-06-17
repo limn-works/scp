@@ -22,22 +22,43 @@
 //!   `DID`) and the struct's single field stays PRIVATE (no struct-literal
 //!   construction outside the module). Module-path reachability lets
 //!   `crate::context` code *name* the type; it grants no path to
-//!   *construct* one. The module is NOT `pub`/`pub(crate)`. See ADR-049
-//!   §5 and the CI gate
-//!   `scripts/check-owned-identity-did.py`.
+//!   *construct* one. The module is NOT `pub`/`pub(crate)`. The sole-minter
+//!   guarantee is enforced by the compiler (the type system plus the two
+//!   module lints below) and code review — there is NO bespoke CI scanner.
+//!   See ADR-049 §5.
 //!
-//! # `#![deny(unsafe_code)]`
+//! # `#![deny(unsafe_code)]` and `#![deny(non_local_definitions)]`
 //!
-//! The crate-level lint at `lib.rs` is `forbid(unsafe_code)`, which already
-//! covers this module. The module-level `deny` here is documentation: it
-//! states the intent that no submodule of `supervisor/` may use `unsafe`
-//! to fabricate an `OwnedIdentityDid` via `transmute` or escape its
-//! `pub(super)` visibility via an unsafe `Send`/`Sync` impl. The crate-
-//! level `forbid` makes the deny redundant in practice — but keeping the
-//! deny here keeps the constraint legible at the module that the
-//! constraint protects.
+//! These two module lints, together with the type system, are what make the
+//! `OwnedIdentityDid` token unforgeable — no source-text CI gate is used.
+//!
+//! - **`#![deny(unsafe_code)]`.** The crate-level lint at `lib.rs` is
+//!   `forbid(unsafe_code)`, which already covers this module. The module-
+//!   level `deny` here is legibility: it states the intent that no submodule
+//!   of `supervisor/` may use `unsafe` to fabricate an `OwnedIdentityDid`
+//!   via `transmute` or escape its `pub(super)` visibility via an unsafe
+//!   `Send`/`Sync` impl. The crate-level `forbid` makes the deny redundant
+//!   in practice — but keeping it here keeps the constraint legible at the
+//!   module the constraint protects.
+//! - **`#![deny(non_local_definitions)]`.** This closes the one forgery
+//!   vector the visibility rules alone do not: a nested
+//!   `impl OwnedIdentityDid { .. }` written inside a method body. Rust never
+//!   scopes a nested impl to its enclosing fn — it applies globally — so
+//!   such an impl would be a SECOND minter authored from inside the module.
+//!   Denying the lint makes any nested impl a hard COMPILE error, enforcing
+//!   the sole-minter invariant at the compiler rather than via a scanner.
 
 #![deny(unsafe_code)]
+// `OwnedIdentityDid` (ADR-049 §5) is an unforgeable capability token: its
+// constructor `issue_for_actor` is `pub(super)` and its `did` field is
+// private, so the only way to mint a token for an arbitrary DID is from
+// supervisor-module code. A nested `impl OwnedIdentityDid { .. }` written
+// inside a method body would be a SECOND minter — Rust applies nested impls
+// globally, never scoping them to the enclosing fn (the `non_local_definitions`
+// lint) — defeating the sole-minter guarantee from inside the module. Denying
+// the lint turns any such nested impl into a hard COMPILE error, closing that
+// vector at the compiler instead of via a source-text scanner.
+#![deny(non_local_definitions)]
 
 /// Public, A-authored standing-pair creation metadata (spec §5.15.8) plus
 /// its reverse-order best-effort rollback. `pub(in crate::context)` —

@@ -44,26 +44,36 @@
 //!   contract.
 //! - `Debug` / `Display` — accidental logging of identity tokens.
 //!
-//! Defense-in-depth: the CI gate `scripts/check-owned-identity-did.py`
-//! checks the type DEFINITION shape only — struct name-visibility (exactly
-//! `pub(in crate::context)`), the single PRIVATE `did` field, forbidden
-//! derives, forbidden manual trait impls, and that no second inherent
-//! `impl` or other item in this file constructs the struct. For the
-//! inherent API the gate is a CLOSED ALLOWLIST BY NAME: it asserts the
-//! inherent impl contains EXACTLY `issue_for_actor` (the `pub(super)`
-//! raw-`DID` mint), `reissue` and `as_did` (both `&self`, no raw `DID`) —
-//! no more, no fewer. ANY other inherent fn is rejected. This is the
-//! SOLE-MINTER invariant: it prevents adding a second arbitrary-`DID`
-//! constructor inside the module — the one thing the type system does NOT
-//! prevent. Construction confinement (that a token can only be minted via
-//! `issue_for_actor` or a struct literal inside this module) is guaranteed
-//! by the TYPE SYSTEM — the `pub(super)` constructor, the private field,
-//! and `#![deny(unsafe_code)]` — NOT by source-text analysis. The gate
-//! therefore does NOT and will NOT inspect any call site, build site, or
-//! mint argument.
+//! # Enforcement is the compiler's, not a bespoke CI gate
 //!
-//! See also `#![deny(unsafe_code)]` at `supervisor/mod.rs` — prevents an
-//! unsafe `Send` impl or `transmute` that could fabricate a token.
+//! There is NO source-text CI scanner over this file. The sole-minter
+//! guarantee is enforced entirely by the language and the compiler:
+//!
+//! - **The type system.** The `did` field is private, so no external
+//!   struct-literal `OwnedIdentityDid { did }` can construct a token. The
+//!   constructor `issue_for_actor` is `pub(super)`, so only supervisor-
+//!   module code can mint a token from a raw [`DID`]. Together these make
+//!   the type *nameable* throughout `crate::context` but *constructible*
+//!   only from supervisor-module code.
+//! - **`#![deny(unsafe_code)]`** at `supervisor/mod.rs` — blocks an unsafe
+//!   `Send` impl or a `transmute` that could fabricate a token while
+//!   bypassing visibility.
+//! - **`#![deny(non_local_definitions)]`** at `supervisor/mod.rs` — turns a
+//!   nested `impl OwnedIdentityDid { .. }` written inside a method body
+//!   (which Rust would otherwise apply globally, creating a SECOND minter
+//!   from inside the module) into a hard COMPILE error. This closes the one
+//!   forgery vector the visibility rules alone do not: an in-module second
+//!   constructor smuggled into a function body.
+//! - **Code review** of this small, frozen file for the EXPLICIT NON-DERIVES
+//!   above and for the absence of any second arbitrary-`DID` constructor.
+//!   Adding a derive or a new minter is a visible diff to a tiny file with a
+//!   single struct and a single inherent impl; review catches it.
+//!
+//! A bespoke external scanner was deliberately NOT used. Its only residual
+//! threat model is an insider editing this file — but such an insider could
+//! equally edit the scanner or its CI wiring, so a scanner adds no marginal
+//! security over the type system + the two compiler lints + review. See
+//! ADR-049 §5 and spec §9.4.1.
 
 use scp_identity::DID;
 
