@@ -936,6 +936,26 @@ def _impl_for_owned_identity_did(
 # count).
 CONSTRUCTING_FNS: frozenset[str] = frozenset({"issue_for_actor", "reissue"})
 
+# The SOLE arbitrary-DID minter (ADR-049 §5). `issue_for_actor(did: DID) ->
+# Self` is the ONLY fn that fabricates a capability token from an arbitrary
+# raw DID; `reissue(&self) -> Self` merely clones an already-held token and is
+# not a forgery vector. Rule (K) — MINT-CALL CONTAINMENT — keys on a CODE
+# REFERENCE to THIS name (a call / value path / `use … as` alias), not on the
+# evadable RETURN-TYPE TEXT that rule (J) inspects. Every arbitrary-DID forgery
+# MUST reference this name, so banning the reference everywhere except the one
+# legitimate mint site closes the return-type-disguise arms race (assoc-type
+# projection, trait-method projection, `impl Sized` opaque return, future
+# return spellings) that rule J alone cannot.
+MINT_FN_NAME: str = "issue_for_actor"
+
+# The ONE legitimate non-test mint CALL site (ADR-049 §5): the actor-spawn
+# builder `Supervisor::build_actor_deps`, which mints each actor's token for
+# its own `owning_did`. Rule (K) exempts a mint reference whose nearest
+# enclosing `function_item` is named this AND whose enclosing `impl_item`
+# targets `Supervisor`.
+BUILD_ACTOR_DEPS_FN: str = "build_actor_deps"
+SUPERVISOR_IMPL_TYPE: str = "Supervisor"
+
 
 def _type_tail_identifier(type_node, source: bytes) -> str | None:
     """Return the tail identifier of a type node — the bare type name with any
@@ -1002,6 +1022,129 @@ def _use_alias_cap_tail(use_as_clause_node, source: bytes) -> str | None:
         return None
     alias_node = use_as_clause_node.child_by_field_name("alias")
     return node_text(alias_node, source) if alias_node is not None else "<?>"
+
+
+def _use_alias_mint_tail(use_as_clause_node, source: bytes) -> str | None:
+    """For a `use_as_clause` node (`use <path> as <Alias>`), return the
+    imported `<Alias>` NAME iff the imported path's LAST `::` segment is the
+    MINT fn `issue_for_actor`, else None.
+
+    This is the mint-fn analogue of `_use_alias_cap_tail` (which guards the cap
+    TYPE name). Rule (K) bans every CODE REFERENCE to `issue_for_actor`; a
+    `use …::issue_for_actor as m;` followed by a bare `m(d)` would dodge a scan
+    that keys on the literal identifier `issue_for_actor` at the call site (the
+    call is spelled `m`, not `issue_for_actor`). Banning the import alias closes
+    that fn-rename residual, symmetric to the cap-type F.2-use ban: the mint can
+    only ever be NAMED `issue_for_actor`, so the call-reference scan stays
+    airtight.
+
+    tree-sitter shapes the clause's `path` field as either an `identifier`
+    (inside a `use_list` / `scoped_use_list`, e.g.
+    `use a::b::{issue_for_actor as n};`) or a `scoped_identifier` (a qualified
+    path, e.g. `use self::issue_for_actor as m;`). For a `scoped_identifier` the
+    LAST segment is its `name` field; for a bare `identifier` the whole node is
+    the tail. We match the tail word-exactly, so `issue_for_actor_extra` does
+    NOT match. Returns the alias identifier text for the diagnostic, or None.
+    """
+    path_node = use_as_clause_node.child_by_field_name("path")
+    if path_node is None:
+        return None
+    if path_node.type == "identifier":
+        tail = node_text(path_node, source)
+    elif path_node.type == "scoped_identifier":
+        name = path_node.child_by_field_name("name")
+        tail = node_text(name, source) if name is not None else None
+    else:
+        return None
+    if tail != MINT_FN_NAME:
+        return None
+    alias_node = use_as_clause_node.child_by_field_name("alias")
+    return node_text(alias_node, source) if alias_node is not None else "<?>"
+
+
+def _is_mint_reference(node, source: bytes) -> bool:
+    """True if `node` is a CODE REFERENCE to the mint fn `issue_for_actor` —
+    a `call_expression`/value-path reference whose tail identifier is the mint
+    name — and is NOT the mint's own DEFINITION nor a `use`-path segment.
+
+    Recognized reference shapes (matching the empirically-confirmed grammar):
+      - a `scoped_identifier` whose `name` field is `issue_for_actor` — covers
+        `a::b::issue_for_actor(d)` and `Self::issue_for_actor(d)` (the call
+        `function`), AND a bare VALUE path `let f = a::b::issue_for_actor;`.
+      - a bare `identifier` whose text is `issue_for_actor` — covers a bare
+        `issue_for_actor(d)` call and a bare value reference.
+
+    EXCLUDED here (so this predicate fires ONLY on genuine references):
+      - the DEFINITION site (exemption a): the `identifier` that is a
+        `function_item`'s `name` field (`fn issue_for_actor`). A definition is
+        not a reference.
+      - a bare `identifier` that is a CHILD of a `scoped_identifier` — it is a
+        path SEGMENT already accounted for by the enclosing scoped node
+        (matching the scoped case would double-count, and a non-tail segment
+        like the `a` in `a::issue_for_actor` is irrelevant anyway). We match the
+        scoped node by its `name` field instead.
+      - a bare `identifier` inside a `use` path (`use … issue_for_actor …`) —
+        an import is governed by the `use … as` alias ban (`use_aliases`), not
+        the call-reference rule. The `use_as_clause` path-segment / `use_list`
+        membership is detected by walking ancestors for a `use_declaration`.
+      - a `field_identifier` (`x.issue_for_actor`) — tree-sitter spells a
+        method/field access tail as `field_identifier`, a DISTINCT node type
+        from `identifier`, so it is never matched here. (Moot in practice: the
+        mint is an associated fn taking `did: DID`, not `&self`, so
+        `x.issue_for_actor()` cannot type-check — but excluding the node type
+        keeps the predicate precise.)
+    """
+    if node.type == "scoped_identifier":
+        name = node.child_by_field_name("name")
+        return name is not None and node_text(name, source) == MINT_FN_NAME
+    if node.type == "identifier":
+        if node_text(node, source) != MINT_FN_NAME:
+            return False
+        parent = node.parent
+        if parent is None:
+            return False
+        # Definition site: the `name` field of a `fn issue_for_actor` decl.
+        if parent.type == "function_item":
+            name_field = parent.child_by_field_name("name")
+            if name_field is not None and name_field.id == node.id:
+                return False
+        # Path SEGMENT of a `scoped_identifier` (e.g. the `name` tail OR a
+        # leading segment): the enclosing `scoped_identifier` arm above already
+        # handles the tail; a leading segment is not a mint reference.
+        if parent.type == "scoped_identifier":
+            return False
+        # Inside a `use` path / alias clause — governed by the use-alias ban.
+        if _nearest_enclosing(node, ("use_declaration",)) is not None:
+            return False
+        return True
+    return False
+
+
+def _mint_ref_exempt_build_actor_deps(node, source: bytes) -> bool:
+    """True if a mint reference `node` is the ONE legitimate mint CALL site
+    (rule K exemption b): its nearest enclosing `function_item` is named
+    `build_actor_deps` AND that fn's enclosing `impl_item` targets `Supervisor`.
+
+    Structural, NOT name-text-on-the-line: a reference is exempt ONLY when it
+    lexically lives inside `Supervisor::build_actor_deps`'s body. A mint call in
+    any OTHER fn — even one a reviewer named `build_actor_deps` on a DIFFERENT
+    impl — is exempt ONLY if that impl's target type is literally `Supervisor`.
+    Verified against the real call at `supervisor.rs` (the `build_actor_deps`
+    method of `impl Supervisor`).
+    """
+    fn_node = _nearest_enclosing(node, ("function_item",))
+    if fn_node is None:
+        return False
+    name_node = fn_node.child_by_field_name("name")
+    if name_node is None or node_text(name_node, source) != BUILD_ACTOR_DEPS_FN:
+        return False
+    impl_node = _nearest_enclosing(fn_node, ("impl_item",))
+    if impl_node is None:
+        return False
+    return (
+        _type_tail_identifier(impl_node.child_by_field_name("type"), source)
+        == SUPERVISOR_IMPL_TYPE
+    )
 
 
 def _nearest_enclosing(node, kinds: tuple[str, ...]):
@@ -1205,6 +1348,30 @@ def _return_mentions_cap_by_value(return_node, source: bytes, in_cap_impl: bool)
             # Everything inside a `&T` / `&mut T` is borrowed, not owned.
             for c in n.children:
                 _rec(c, True)
+            return
+        if n.type in ("function_type", "abstract_type", "dynamic_type"):
+            # A function-type node (`fn(..) -> T`, `dyn Fn(..) -> T`,
+            # `impl Fn(..) -> T`) borrowed behind a `&` (`-> &dyn Fn() ->
+            # OwnedIdentityDid`) borrows the CALLABLE, but the callable's
+            # OUTPUT is OWNED — invoking it yields an owned cap token the
+            # caller keeps. Recurse into the `function_type`'s `return_type`
+            # field with `under_ref=False` so a cap OUTPUT is flagged even
+            # when the callable itself is borrowed; the rest of the node (the
+            # `parameters` input types, the `Fn`/`dyn`/`impl` head) stays at
+            # the inherited `under_ref` since those are not the owned output.
+            # `abstract_type` (`impl Fn(..) -> T`) and `dynamic_type` (`dyn
+            # Fn(..) -> T`) wrap a `function_type`; their non-function-type
+            # children carry the inherited `under_ref` and the inner
+            # `function_type` re-enters this arm, resetting its own
+            # `return_type`. (Rule K already flags these shapes as forgeries
+            # because the body CALLS the mint; this keeps rule J's by-value
+            # accuracy honest for the borrowed-callable / owned-output case.)
+            ret_field = n.child_by_field_name("return_type")
+            for c in n.children:
+                if ret_field is not None and c.id == ret_field.id:
+                    _rec(c, False)
+                else:
+                    _rec(c, under_ref)
             return
         if n.type in ("type_identifier", "scoped_type_identifier"):
             tail = _type_tail_identifier(n, source)
@@ -1799,10 +1966,11 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
     list[tuple[str, int, str]],
     list[tuple[str, int, str]],
     list[tuple[str, int, str]],
+    list[tuple[str, int, str]],
 ]:
     """Walk scan_dir and return (decls, impls, ctor_fns, cap_aliases,
     trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits,
-    by_value_return_hits).
+    by_value_return_hits, mint_ref_hits).
 
     decls: list of (rel_path, line, visibility, derives, public_fields,
                     kind, generic) where kind is
@@ -1930,6 +2098,26 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
            ADDITIVE multi-file scan for ONE anti-pattern (by-value cap
            returns); it does NOT weaken the declaring-file pin every other
            rule keys on. Element shape: (rel_path, line, reason).
+    mint_ref_hits: (rule K) every CODE REFERENCE to the sole arbitrary-DID
+           minter `issue_for_actor` ANYWHERE under the SUPERVISOR SUBTREE —
+           a `call_expression` function / value-path / bare call (a
+           `scoped_identifier` whose `name` is the mint, or a bare mint
+           `identifier`), PLUS a `use …::issue_for_actor as X;` rename alias.
+           This is the CATEGORICAL closer for the by-value-return rule (J): J
+           keys on the RETURN-TYPE TEXT and is evadable by type-level
+           indirection (assoc-type projection `<Cz as Carry>::O`, trait-method
+           projection, `impl Sized` opaque return), but EVERY such forgery still
+           CALLS `issue_for_actor` — the one mint — so detecting the DANGEROUS
+           OPERATION (the call) rather than the disguised return type closes the
+           whole class. EXEMPT: (a) the mint's own DEFINITION (`_is_mint_reference`
+           never collects the `fn issue_for_actor` name node), (b) references
+           lexically inside `Supervisor::build_actor_deps` (the ONE legitimate
+           mint site), and (c) `#[cfg(test)]` references (reusing rule J's
+           cfg-test exemption). Doc-comments / string literals mentioning the
+           mint are NOT flagged — the scan keys on `identifier` /
+           `scoped_identifier` AST nodes only. Rule J is KEPT as-is (additive
+           defense-in-depth for direct cap-by-value returns); rule K is strictly
+           additive. Element shape: (rel_path, line, reason).
     """
     decls: list[
         tuple[str, int, str, list[str], list[tuple[int, str]], str, bool]
@@ -1943,13 +2131,14 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
     use_aliases: list[tuple[str, int, str]] = []
     nested_mod_hits: list[tuple[str, int, str]] = []
     by_value_return_hits: list[tuple[str, int, str]] = []
+    mint_ref_hits: list[tuple[str, int, str]] = []
     # Rel path of the ONE file allowed to declare the cap type. The same
     # relative path holds under both the real repo_root and the self-test's
     # temp staging root, so the declaring-file macro rule (B, sub-case 1)
     # keys on it identically in both.
     required_rel = REQUIRED_PATH
     if not scan_dir.is_dir():
-        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits
+        return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits, mint_ref_hits
     for root, _, files in os.walk(scan_dir):
         for fname in files:
             if not fname.endswith(".rs"):
@@ -2264,11 +2453,92 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                         use_aliases.append(
                             (rel, node.start_point[0] + 1, alias)
                         )
+                    # (K — use-alias residual) A `use …::issue_for_actor as X;`
+                    # renames the MINT fn so a later bare `X(d)` call dodges the
+                    # identifier-keyed mint-reference scan below (the call is
+                    # spelled `X`, not `issue_for_actor`). Ban the rename outright,
+                    # symmetric to the cap-type F.2-use ban and to the same
+                    # whole-tree scope, so the mint can only ever be NAMED
+                    # `issue_for_actor`. Collected ANYWHERE under the scan root —
+                    # an import can re-export the `pub(super)` mint reference into
+                    # any module that imports it, and the rename evasion is not
+                    # subtree-bound. NOT exempted for the build-site (an aliased
+                    # import is never how `build_actor_deps` names the mint — it
+                    # uses the fully-qualified path) nor for cfg(test): a renaming
+                    # import has no legitimate use.
+                    mint_alias = _use_alias_mint_tail(node, source)
+                    if mint_alias is not None:
+                        mint_ref_hits.append(
+                            (
+                                rel,
+                                node.start_point[0] + 1,
+                                f"`use … as {mint_alias}` renames the mint fn "
+                                f"`{MINT_FN_NAME}`; a later bare `{mint_alias}(…)` "
+                                f"call would dodge the identifier-keyed "
+                                f"mint-reference scan (rule K). Rust has exactly "
+                                f"two renaming mechanisms (`use … as` here, "
+                                f"`type`/fn-path elsewhere); banning the import "
+                                f"alias keeps the sole arbitrary-DID mint always "
+                                f"NAMED `{MINT_FN_NAME}` so every forgery surfaces "
+                                f"as a mint reference. Call "
+                                f"`{TYPE_NAME}::{MINT_FN_NAME}` by its real name "
+                                f"(only in `Supervisor::{BUILD_ACTOR_DEPS_FN}`)",
+                            )
+                        )
+                # (K) MINT-CALL CONTAINMENT. Scans EVERY code reference to the
+                # sole arbitrary-DID minter `issue_for_actor` ANYWHERE under the
+                # SUPERVISOR SUBTREE (where the `pub(super)` mint is reachable),
+                # not just the declaring file. A reference is a `call_expression`
+                # function / a value-path / a bare call to `issue_for_actor`.
+                # Every arbitrary-DID forgery MUST reference the mint, so this
+                # rule is IMMUNE to the return-type disguise (assoc-type
+                # projection, trait-method projection, `impl Sized` opaque return)
+                # that rule J — which keys on the evadable RETURN-TYPE TEXT —
+                # cannot fully close. EXEMPT: (a) the mint's own DEFINITION (never
+                # collected — `_is_mint_reference` excludes the `fn` name node),
+                # (b) the ONE legitimate mint call inside
+                # `Supervisor::build_actor_deps`, and (c) `#[cfg(test)]` code
+                # (reusing the rule-J cfg-test exemption). Doc-comments / string
+                # literals mentioning `issue_for_actor` are NOT flagged: the walk
+                # keys on `identifier` / `scoped_identifier` AST nodes, which a
+                # comment or string payload never produces.
+                if rel.startswith(SUPERVISOR_SUBTREE_REL) and _is_mint_reference(
+                    node, source
+                ):
+                    if not (
+                        _mint_ref_exempt_build_actor_deps(node, source)
+                        or _inside_cfg_test(node, source)
+                        or _has_preceding_cfg_test(node, source)
+                    ):
+                        ref_text = node_text(node, source).strip()
+                        mint_ref_hits.append(
+                            (
+                                rel,
+                                node.start_point[0] + 1,
+                                f"reference to the sole arbitrary-DID mint "
+                                f"`{MINT_FN_NAME}` ({ref_text!r}); a call / value "
+                                f"path to the mint fabricates a {TYPE_NAME} token "
+                                f"for an ARBITRARY DID and re-exports the mint "
+                                f"surface, defeating cross-identity isolation. "
+                                f"This is flagged REGARDLESS of the enclosing "
+                                f"fn's return type, so it closes the "
+                                f"return-disguise forgeries (assoc-type / "
+                                f"trait-method projection, `impl Sized` opaque "
+                                f"return) that the by-value-return rule (J) "
+                                f"cannot see. The ONLY non-test mint reference "
+                                f"allowed is inside `Supervisor::"
+                                f"{BUILD_ACTOR_DEPS_FN}` (the actor-spawn mint "
+                                f"site); `#[cfg(test)]` references are exempt. "
+                                f"Move the mint into "
+                                f"`{BUILD_ACTOR_DEPS_FN}` or restructure so no "
+                                f"other code references it",
+                            )
+                        )
                 for c in node.children:
                     walk(c)
 
             walk(tree.root_node)
-    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits
+    return decls, impls, ctor_fns, cap_aliases, trait_fns, macro_hits, construction_hits, use_aliases, nested_mod_hits, by_value_return_hits, mint_ref_hits
 
 
 def find_declarations():
@@ -2434,10 +2704,11 @@ def _enforce(
     use_aliases: list[tuple[str, int, str]],
     nested_mod_hits: list[tuple[str, int, str]],
     by_value_return_hits: list[tuple[str, int, str]],
+    mint_ref_hits: list[tuple[str, int, str]],
     required_path: str,
     stream=sys.stderr,
 ) -> bool:
-    """Apply checks A-J. Returns True on FAIL, False on PASS. Writes
+    """Apply checks A-K. Returns True on FAIL, False on PASS. Writes
     diagnostics to `stream`. Caller must decide exit code and final
     messaging.
     """
@@ -2750,6 +3021,27 @@ def _enforce(
     # UNCHANGED; this is an additive multi-file scan for one anti-pattern.
     # FAIL each.
     for rel, line, reason in by_value_return_hits:
+        stream.write(
+            f"{C_RED}FAIL{C_RESET}: {rel}:{line}: {reason}. "
+            f"See ADR-049 §5.\n"
+        )
+        fail = True
+
+    # (K) MINT-CALL CONTAINMENT. The CATEGORICAL closer for rule J. Rule J
+    # bans a fn that RETURNS the cap by value, but keys on the evadable
+    # RETURN-TYPE TEXT — defeated by type-level indirection (assoc-type
+    # projection, trait-method projection, `impl Sized` opaque return, future
+    # spellings). Rule K instead bans the DANGEROUS OPERATION: any code
+    # reference to the sole arbitrary-DID minter `issue_for_actor`. Every
+    # forgery, however it disguises its return type, MUST call the mint, so
+    # this is immune to the return-type arms race. Collected over the whole
+    # SUPERVISOR SUBTREE (where the `pub(super)` mint is reachable); `_scan_root`
+    # already exempted (a) the mint DEFINITION, (b) the lone legitimate call in
+    # `Supervisor::build_actor_deps`, and (c) `#[cfg(test)]` references, and
+    # also folds in the `use … as` rename of the mint (which would otherwise
+    # dodge an identifier-keyed call scan). Rule J is retained as additive
+    # defense-in-depth; rule K is strictly additive. FAIL each.
+    for rel, line, reason in mint_ref_hits:
         stream.write(
             f"{C_RED}FAIL{C_RESET}: {rel}:{line}: {reason}. "
             f"See ADR-049 §5.\n"
@@ -3326,7 +3618,68 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
         "by_value_return_subtree",
         "fn `leak_token` returns OwnedIdentityDid BY VALUE",
     ),
+    # FIX (rule K — ASSOC-TYPE PROJECTION return disguise). `forge1` returns the
+    # cap via `<Cz as Carry>::O` (an associated-type projection = the cap), so
+    # rule J's return-type-TEXT scan sees no cap tail and MISSES it. The fn
+    # still CALLS the sole mint `issue_for_actor` — rule K flags that call,
+    # immune to the return disguise. The mint reference spelling
+    # `self::OwnedIdentityDid::issue_for_actor` is UNIQUE to this fixture.
+    (
+        "rule_k_assoc_type_projection",
+        "mint `issue_for_actor` ('self::OwnedIdentityDid::issue_for_actor')",
+    ),
+    # FIX (rule K — TRAIT-METHOD PROJECTION mint). `mk` returns `Self::T` (an
+    # impl-set associated type = the cap), dodging rule J's return-text scan AND
+    # its `_returns_self`/raw-DID trait-fn path. The body CALLS the mint —
+    # rule K flags it. The spelling `mods::OwnedIdentityDid::issue_for_actor` is
+    # UNIQUE to this fixture.
+    (
+        "rule_k_trait_method_projection",
+        "mint `issue_for_actor` ('mods::OwnedIdentityDid::issue_for_actor')",
+    ),
+    # FIX (rule K — OPAQUE `impl Sized` RETURN). `forge3` returns `impl Sized`,
+    # hiding the cap type entirely from any return classifier; rule J MISSES it.
+    # The body CALLS the mint via the full canonical path — rule K flags it.
+    # That spelling is UNIQUE to this fixture.
+    (
+        "rule_k_opaque_return",
+        "mint `issue_for_actor` ('crate::context::supervisor::identity_capability::OwnedIdentityDid::issue_for_actor')",
+    ),
+    # FIX (rule K — USE-ALIAS RENAME RESIDUAL). `use …::issue_for_actor as
+    # MintRename;` renames the mint so a later bare `MintRename(d)` would dodge
+    # the identifier-keyed mint-reference scan. Rule K bans the import alias
+    # outright at the `use … as` site; the alias NAME `MintRename` is UNIQUE to
+    # this fixture.
+    (
+        "rule_k_use_rename",
+        "`use … as MintRename` renames the mint fn `issue_for_actor`",
+    ),
 ]
+
+# Negative-control fn / reference markers that MUST NEVER appear in the
+# self-test diagnostics. Each names a UNIQUE token that surfaces in a
+# diagnostic ONLY if a passing-by-design exemption regressed:
+#   - `test_only_by_value_mint` / `test_only_fn_by_value_mint` — rule J's
+#     cfg(test) exemption (J3 / J3b negative controls). If either regressed,
+#     the cfg(test) by-value cap return would surface a rule-J diagnostic
+#     NAMING the fn.
+#   - `bsite_mint_ok::OwnedIdentityDid::issue_for_actor` — rule K's build-site
+#     exemption (b). The K-NEG-1 fixture's EXEMPT mint call uses this UNIQUE
+#     reference spelling; rule K echoes the spelling in its `ref_text`, so the
+#     spelling appears in diagnostics ONLY if exemption (b) regressed.
+#   - `cfgtest_mint_ok::OwnedIdentityDid::issue_for_actor` — rule K's cfg(test)
+#     exemption (c). The K-NEG-2 fixture's EXEMPT (test-gated) mint call uses
+#     this UNIQUE spelling; it appears in diagnostics ONLY if exemption (c)
+#     regressed.
+# `do_self_test` asserts NONE of these appear on the pass path, giving the
+# otherwise-silent negative controls real regression teeth (an over-eager
+# scanner that flags an EXEMPT mint would be caught, not shipped green).
+FORBIDDEN_FIXTURE_SUBSTRINGS: tuple[str, ...] = (
+    "test_only_by_value_mint",
+    "test_only_fn_by_value_mint",
+    "bsite_mint_ok::OwnedIdentityDid::issue_for_actor",
+    "cfgtest_mint_ok::OwnedIdentityDid::issue_for_actor",
+)
 
 
 def do_self_test() -> int:
@@ -3400,6 +3753,7 @@ def do_self_test() -> int:
             use_aliases,
             nested_mod_hits,
             by_value_return_hits,
+            mint_ref_hits,
         ) = _scan_root(fx_scan, tmp_root)
         # Capture stderr to inspect.
         buf = io.StringIO()
@@ -3414,6 +3768,7 @@ def do_self_test() -> int:
             use_aliases,
             nested_mod_hits,
             by_value_return_hits,
+            mint_ref_hits,
             fx_required,
             stream=buf,
         )
@@ -3439,6 +3794,27 @@ def do_self_test() -> int:
         )
         for m in missing:
             sys.stderr.write(f"  - {m}\n")
+        sys.stderr.write("\nActual diagnostics:\n")
+        sys.stderr.write(diag)
+        return 1
+
+    # Negative-control regression teeth. The REQUIRED_FIXTURE_FAILURES check
+    # above only asserts that EXPECTED diagnostics are PRESENT — it discards the
+    # diagnostics on the pass path, so a regressed EXEMPTION (a cfg(test) /
+    # build-site mint that started being flagged) would ship GREEN. Assert that
+    # NONE of the negative-control markers appear: each surfaces ONLY if a
+    # passing-by-design exemption (rule J cfg(test); rule K cfg(test) /
+    # build-site) over-eagerly flagged an EXEMPT mint.
+    forbidden_present = [s for s in FORBIDDEN_FIXTURE_SUBSTRINGS if s in diag]
+    if forbidden_present:
+        sys.stderr.write(
+            f"{C_RED}self-test FAILED{C_RESET}: "
+            f"{len(forbidden_present)} negative-control marker(s) appeared in "
+            f"diagnostics — a passing-by-design exemption regressed (an EXEMPT "
+            f"cfg(test) / build-site mint was wrongly flagged):\n"
+        )
+        for s in forbidden_present:
+            sys.stderr.write(f"  - {s!r} must NOT appear in diagnostics\n")
         sys.stderr.write("\nActual diagnostics:\n")
         sys.stderr.write(diag)
         return 1
@@ -3483,6 +3859,7 @@ def main() -> int:
         use_aliases,
         nested_mod_hits,
         by_value_return_hits,
+        mint_ref_hits,
     ) = find_declarations()
     if (
         not decls
@@ -3494,6 +3871,7 @@ def main() -> int:
         and not use_aliases
         and not nested_mod_hits
         and not by_value_return_hits
+        and not mint_ref_hits
     ):
         # Type does not yet exist AND nothing references it — this is the
         # pre-commit-5 state. (A macro touching the cap type or a trait impl
@@ -3517,6 +3895,7 @@ def main() -> int:
         use_aliases,
         nested_mod_hits,
         by_value_return_hits,
+        mint_ref_hits,
         REQUIRED_PATH,
         stream=sys.stderr,
     )

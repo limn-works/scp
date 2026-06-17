@@ -1015,3 +1015,170 @@ pub(in crate::context) fn test_only_fn_by_value_mint(_d: &Did2) -> OwnedIdentity
         [0; 32],
     ))
 }
+
+// @file: context/supervisor/k01_assoc_type_projection.rs
+// BYPASS K01 (FIX — rule K, mint-call containment) — ASSOC-TYPE PROJECTION
+// return disguise. A fn returns the cap via an ASSOCIATED-TYPE PROJECTION
+// (`<Cz as Carry>::O` where `Carry::O = OwnedIdentityDid`), so rule J — which
+// keys on the cap tail identifier appearing in the RETURN-TYPE TEXT — sees only
+// `<Cz as Carry>::O` (no `OwnedIdentityDid` tail) and MISSES it. The forgery
+// COMPILES, exit 0 pre-K, and is handler-reachable. But it MUST CALL the sole
+// arbitrary-DID mint `issue_for_actor` to fabricate the token — rule K detects
+// THAT call regardless of the disguised return type. The mint reference is
+// spelled `self::OwnedIdentityDid::issue_for_actor`, UNIQUE to this fixture, so
+// the diagnostic substring discriminates K01 from K02/K03.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+trait Carry {
+    type O;
+}
+struct Cz;
+impl Carry for Cz {
+    type O = OwnedIdentityDid;
+}
+#[allow(dead_code)]
+pub(in crate::context) fn forge1(d: Did) -> <Cz as Carry>::O {
+    self::OwnedIdentityDid::issue_for_actor(d)
+}
+
+// @file: context/supervisor/k02_trait_method_projection.rs
+// BYPASS K02 (FIX — rule K, mint-call containment) — TRAIT-METHOD PROJECTION
+// mint. A trait method's return type is a PROJECTION (`Self::T` where the impl
+// sets `type T = OwnedIdentityDid`), so rule J's return-type-text scan sees
+// `Self::T`, not the cap tail, and MISSES the mint. Rule J ALSO does not flag
+// this via its trait-fn path (that path keys on `_returns_self` / raw-DID
+// params, and the projection return is neither a literal `Self` nor `-> Self`).
+// The method still CALLS `issue_for_actor` to mint — rule K flags that call.
+// The mint reference here is spelled `mods::OwnedIdentityDid::issue_for_actor`,
+// UNIQUE to this fixture.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+mod mods {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+trait Mk {
+    type T;
+    fn mk(d: Did) -> Self::T;
+}
+struct MkP;
+impl Mk for MkP {
+    type T = OwnedIdentityDid;
+    #[allow(dead_code)]
+    fn mk(d: Did) -> Self::T {
+        mods::OwnedIdentityDid::issue_for_actor(d)
+    }
+}
+
+// @file: context/supervisor/k03_opaque_return.rs
+// BYPASS K03 (FIX — rule K, mint-call containment) — OPAQUE `impl Sized`
+// RETURN. A fn returns `impl Sized`, which hides the cap type ENTIRELY from any
+// return-type classifier (the return text is `impl Sized` — no cap tail at
+// all). Rule J cannot see the cap in the return type and MISSES it. The fn body
+// CALLS `issue_for_actor` to mint the token it returns — rule K flags that
+// call. The mint reference is spelled with the full canonical path
+// `crate::context::supervisor::identity_capability::OwnedIdentityDid::issue_for_actor`,
+// UNIQUE to this fixture.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) fn forge3(d: Did) -> impl Sized {
+    crate::context::supervisor::identity_capability::OwnedIdentityDid::issue_for_actor(d)
+}
+
+// @file: context/supervisor/k04_use_rename.rs
+// BYPASS K04 (FIX — rule K, use-alias rename residual) — `use …::issue_for_actor
+// as MintRename;` renames the MINT fn so a later bare `MintRename(d)` call would
+// dodge an identifier-keyed mint-reference scan (the call is spelled
+// `MintRename`, not `issue_for_actor`). Rule K bans the import alias outright —
+// the mint can only ever be NAMED `issue_for_actor` — so the rename surfaces as
+// a mint reference at the `use … as` site. Note the bare `MintRename(d)` call in
+// the body does NOT itself trip rule K (its identifier is `MintRename`), which is
+// exactly why banning the alias is load-bearing. The alias NAME `MintRename` is
+// UNIQUE to this fixture.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+use self::OwnedIdentityDid::issue_for_actor as MintRename;
+#[allow(dead_code)]
+pub(in crate::context) fn forge4(d: Did) -> OwnedIdentityDid {
+    MintRename(d)
+}
+
+// @file: context/supervisor/k_neg_build_actor_deps_ok.rs
+// NEGATIVE CONTROL K-NEG-1 (FIX — rule K exemption b) — the ONE legitimate mint
+// call site. A `build_actor_deps` method on `impl Supervisor` that calls
+// `issue_for_actor` MUST PASS: this mirrors the real
+// `Supervisor::build_actor_deps` (the actor-spawn mint site). Rule K exempts a
+// mint reference whose nearest enclosing `function_item` is named
+// `build_actor_deps` AND whose enclosing `impl_item` targets `Supervisor`. This
+// fn MUST NOT contribute any rule-K diagnostic; the out-of-band forbidden-
+// substring check (FORBIDDEN_FIXTURE_SUBSTRINGS) greps the self-test diagnostics
+// and FAILS if `build_actor_deps_mint_ok` ever appears — i.e. if the exemption
+// regressed. (Distinct from the cfg(test) exemptions: this is PRODUCTION code
+// that legitimately mints.)
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+mod bsite_mint_ok {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+struct Supervisor;
+struct ActorDeps {
+    owned_identity: OwnedIdentityDid,
+}
+impl Supervisor {
+    // The real `Supervisor::build_actor_deps` returns `Result<ActorDeps, _>`,
+    // NOT the cap by value — it ENCAPSULATES the minted token in `ActorDeps`.
+    // The fixture mirrors that: the fn returns `ActorDeps` (not the cap), so
+    // rule J (by-value cap return) does NOT fire, and rule K's build-site
+    // exemption (b) must keep the EXEMPT mint CALL silent. The mint reference
+    // is spelled `bsite_mint_ok::OwnedIdentityDid::issue_for_actor` — a path
+    // UNIQUE to this fixture. Rule K's diagnostic echoes the reference spelling
+    // in its `ref_text`; the forbidden-substring check (FORBIDDEN_FIXTURE_
+    // SUBSTRINGS) greps the self-test diagnostics and FAILS if
+    // `bsite_mint_ok::OwnedIdentityDid::issue_for_actor` ever appears — i.e. if
+    // the build-site exemption (b) regressed and this EXEMPT call started
+    // surfacing a diagnostic.
+    #[allow(dead_code)]
+    pub(in crate::context) fn build_actor_deps(self: &Self, d: Did) -> ActorDeps {
+        let owned_identity = bsite_mint_ok::OwnedIdentityDid::issue_for_actor(d);
+        ActorDeps { owned_identity }
+    }
+}
+
+// @file: context/supervisor/k_neg_cfg_test_ok.rs
+// NEGATIVE CONTROL K-NEG-2 (FIX — rule K exemption c) — a `#[cfg(test)]` fn that
+// CALLS `issue_for_actor`. A test-only mint reference is not in the production
+// binary and can never be a handler-reachable forgery, so rule K exempts it
+// (reusing the rule-J `_inside_cfg_test` / `_has_preceding_cfg_test` checks).
+// This mirrors the real `#[cfg(test)] mod tests` mints in the declaring file and
+// the `#[cfg(test)]` handle.rs test mints — all MUST keep passing. This fn MUST
+// NOT contribute any rule-K diagnostic. The mint reference is spelled
+// `cfgtest_mint_ok::OwnedIdentityDid::issue_for_actor` — a path UNIQUE to this
+// fixture; the forbidden-substring check FAILS if that spelling appears in the
+// self-test diagnostics, catching a regressed cfg(test) exemption.
+struct Did([u8; 32]);
+#[allow(dead_code)]
+pub(in crate::context) struct OwnedIdentityDid {
+    did: Did,
+}
+mod cfgtest_mint_ok {
+    pub(in crate::context) use super::OwnedIdentityDid;
+}
+#[cfg(test)]
+mod fixture_tests_mint_ref {
+    use super::*;
+    #[allow(dead_code)]
+    pub(in crate::context) fn cfg_test_mint_ref_ok(d: Did) -> OwnedIdentityDid {
+        cfgtest_mint_ok::OwnedIdentityDid::issue_for_actor(d)
+    }
+}
