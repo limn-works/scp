@@ -997,3 +997,21 @@ mod fixture_tests_by_value {
         )
     }
 }
+
+// @file: context/supervisor/cfg_test_fn_by_value_ok.rs
+// NEGATIVE CONTROL J3b (FIX — rule J cfg(test) exemption, ATTRIBUTE-ON-FN form) —
+// Same intent as J3, but the `#[cfg(test)]` is placed DIRECTLY on the fn rather
+// than on an enclosing `mod`. `_inside_cfg_test` only walks ANCESTORS, so a
+// fn-level attribute is invisible to it; the exemption relies on the additional
+// `_has_preceding_cfg_test(fn)` check (the `#[cfg(test)]` attribute is a preceding
+// sibling of the `function_item`). This fn MUST NOT contribute any rule-J
+// diagnostic naming `test_only_fn_by_value_mint`; if the fn-level exemption
+// regressed, the out-of-band grep over the self-test diagnostics would catch it.
+struct Did2([u8; 32]);
+#[cfg(test)]
+#[allow(dead_code)]
+pub(in crate::context) fn test_only_fn_by_value_mint(_d: &Did2) -> OwnedIdentityDid {
+    crate::context::supervisor::identity_capability::OwnedIdentityDid::issue_for_actor(Did2(
+        [0; 32],
+    ))
+}

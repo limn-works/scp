@@ -2207,8 +2207,18 @@ def _scan_root(scan_dir: Path, repo_root: Path) -> tuple[
                                 and fn_name in CONSTRUCTING_FNS
                                 and is_top_level_inherent_cap_method
                             )
-                            if not exempt_ctor and not _inside_cfg_test(
-                                node, source
+                            # cfg(test) exemption: a `#[cfg(test)]` item is not
+                            # in the production binary, so it can never be a
+                            # handler-reachable forgery. `_inside_cfg_test`
+                            # covers an ancestor (`#[cfg(test)] mod tests`);
+                            # `_has_preceding_cfg_test` covers `#[cfg(test)]`
+                            # placed DIRECTLY on this fn (the attribute is a
+                            # preceding sibling of the `function_item`, never an
+                            # ancestor, so `_inside_cfg_test` alone misses it).
+                            if (
+                                not exempt_ctor
+                                and not _inside_cfg_test(node, source)
+                                and not _has_preceding_cfg_test(node, source)
                             ):
                                 by_value_return_hits.append(
                                     (
