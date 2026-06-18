@@ -12078,8 +12078,16 @@ mod tests {
     /// A KP-actor panic is caught by the watchdog, recorded payload-free in the
     /// per-identity crash window, and the actor is respawned — a subsequent
     /// `key_package_store_for` resolves a fresh, live handle.
+    ///
+    /// Runs on a 2-worker multi-thread runtime (rather than the default
+    /// current-thread `#[tokio::test]`) so the background supervisor watchdog
+    /// task has a dedicated worker and cannot be starved by the polling loop on
+    /// the same single worker. Combined with the serial `supervisor-watchdog-
+    /// poison` nextest test-group (`.config/nextest.toml`), this removes the
+    /// CPU-starvation tail that made the bounded `poll_until` wait flaky under
+    /// the fully-saturated `cargo nextest run --workspace` load.
     #[cfg(feature = "testing")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kp_actor_watchdog_records_panic_and_respawns() {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpWatchdog".to_owned());
@@ -12127,8 +12135,16 @@ mod tests {
 
     /// Three KP-actor panics within the budget window poison the identity; the
     /// next `key_package_store_for` surfaces a typed `ContextPoisoned` error.
+    ///
+    /// Runs on a 2-worker multi-thread runtime (rather than the default
+    /// current-thread `#[tokio::test]`) so the background supervisor watchdog
+    /// task has a dedicated worker and cannot be starved by the polling loop on
+    /// the same single worker. Combined with the serial `supervisor-watchdog-
+    /// poison` nextest test-group (`.config/nextest.toml`), this removes the
+    /// CPU-starvation tail that made the bounded `poll_until` wait flaky under
+    /// the fully-saturated `cargo nextest run --workspace` load.
     #[cfg(feature = "testing")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kp_actor_poisons_after_budget() {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpPoison".to_owned());
@@ -12170,8 +12186,16 @@ mod tests {
     /// reconciles from the journal), WITHOUT routing through the per-context
     /// snapshot respawn (there is no KP context-snapshot). After recovery the
     /// identity resolves a live handle again.
+    ///
+    /// Runs on a 2-worker multi-thread runtime (rather than the default
+    /// current-thread `#[tokio::test]`) so the background supervisor watchdog
+    /// task has a dedicated worker and cannot be starved by the polling loop on
+    /// the same single worker. Combined with the serial `supervisor-watchdog-
+    /// poison` nextest test-group (`.config/nextest.toml`), this removes the
+    /// CPU-starvation tail that made the bounded `poll_until` wait flaky under
+    /// the fully-saturated `cargo nextest run --workspace` load.
     #[cfg(feature = "testing")]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clear_kp_poison_recovers_poisoned_actor() {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpClearPoison".to_owned());
