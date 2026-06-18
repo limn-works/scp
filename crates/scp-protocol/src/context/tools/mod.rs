@@ -42,6 +42,7 @@
 //! - [`ToolErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
 //! - [`ToolCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
+pub mod cross_context_saga;
 pub mod integrity;
 pub mod interface;
 pub mod lifecycle;
@@ -51,6 +52,10 @@ pub mod summary;
 
 use crate::context::roles;
 
+pub use cross_context_saga::{
+    CommittedSide, CrossContextDivergenceMarker, CrossContextSagaError, CrossContextToolReceipt,
+    XCTX_DIVERGENCE_DOMAIN, XCTX_RECEIPT_DOMAIN,
+};
 pub use lifecycle::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, Provenance, ToolCancel, ToolErrorCode, ToolExecutionError,
     ToolInvokedEvent, ToolRequest, ToolResponse, ToolStatus, sha256_json,
