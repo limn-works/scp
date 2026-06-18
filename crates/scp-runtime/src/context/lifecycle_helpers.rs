@@ -3615,7 +3615,7 @@ mod restore_reconcile_tests {
             .expect("join_context must commit the economy ticket before the append");
         // The MemberJoined append is the next fallible step after the commit.
         let append_idx = body
-            .find("\"MemberJoined\"")
+            .find("EventType::MemberJoined")
             .expect("join_context must append a MemberJoined event");
         assert!(
             commit_idx < append_idx,
