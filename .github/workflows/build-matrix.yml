@@ -199,10 +199,12 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # TypeScript (Node/Bun) — napi-rs native addon for @limn-works/scp-ts-node
+  # TypeScript (Node/Bun) — napi-rs native addon for @limn-works/scp-ts-napi-*
+  # One artifact per platform; release workflow publishes each as a separate
+  # optional dependency package consumed by @limn-works/scp-ts.
   # ---------------------------------------------------------------------------
   typescript-napi:
-    name: TypeScript napi (${{ matrix.target }})
+    name: TypeScript NAPI (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -210,19 +212,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            napi-target: x86_64-unknown-linux-gnu
+            npm-platform: linux-x64-gnu
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            napi-target: aarch64-unknown-linux-gnu
+            npm-platform: linux-arm64-gnu
           - target: x86_64-apple-darwin
             runner: macos-latest
-            napi-target: x86_64-apple-darwin
+            npm-platform: darwin-x64
           - target: aarch64-apple-darwin
             runner: macos-latest
-            napi-target: aarch64-apple-darwin
+            npm-platform: darwin-arm64
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            napi-target: x86_64-pc-windows-msvc
+            npm-platform: win32-x64-msvc
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -232,13 +234,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
         with:
-          node-version: "24"
-
-      - name: Install napi-cli
-        run: npm install -g @napi-rs/cli
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: napi-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: napi-${{ matrix.target }}-
 
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -247,16 +251,29 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
-      - name: Build napi addon
-        run: |
-          cd crates/scp-ffi/napi
-          napi build --release --target ${{ matrix.napi-target }} --output-dir ../../../bindings/typescript-node/
+      - name: Build NAPI addon
+        run: cargo build -p scp-ffi-napi --release --target ${{ matrix.target }}
 
-      - name: Upload napi artifacts
+      - name: Stage index.node (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p napi-out
+          LIB=$(find "target/${{ matrix.target }}/release" -maxdepth 1 \( -name "libscp_ffi_napi.dylib" -o -name "libscp_ffi_napi.so" \) | head -1)
+          [ -z "$LIB" ] && { echo "::error::cdylib not found"; exit 1; }
+          cp "$LIB" napi-out/index.node
+
+      - name: Stage index.node (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force napi-out | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/scp_ffi_napi.dll" napi-out/index.node
+
+      - name: Upload NAPI artifact
         uses: actions/upload-artifact@v4
         with:
           name: napi-${{ matrix.target }}
-          path: bindings/typescript-node/*.node
+          path: napi-out/index.node
           retention-days: 7
 
   # ---------------------------------------------------------------------------
