@@ -105,7 +105,7 @@ where
 
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "MemberJoined",
+        scp_event_log::EventType::MemberJoined,
         subscriber_did.as_ref(),
     )?;
     state.checkpoint_events_since += 1;
@@ -161,7 +161,7 @@ pub fn unsubscribe_broadcast(
 
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "MemberLeft",
+        scp_event_log::EventType::MemberLeft,
         subscriber_did.as_ref(),
     )?;
     state.checkpoint_events_since += 1;
@@ -396,7 +396,7 @@ fn apply_guarded(
 
     deps.event_log.append_context_event(
         context_id_bytes,
-        "MessageSent",
+        scp_event_log::EventType::MessageSent,
         pending.author_did.as_ref(),
     )?;
     state.checkpoint_events_since += 1;
@@ -523,7 +523,7 @@ pub fn block_broadcast_subscriber(
     persist_broadcast_snapshot(deps, context_id, &snapshot);
 
     deps.event_log
-        .append_context_event(&context_id_bytes, "MemberBlocked", author_did.as_ref())?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberBlocked, author_did.as_ref())?;
     state.checkpoint_events_since += 1;
 
     Ok(result)
@@ -577,7 +577,7 @@ pub fn unblock_broadcast_subscriber(
 
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "MemberUnblocked",
+        scp_event_log::EventType::MemberUnblocked,
         author_did.as_ref(),
     )?;
     state.checkpoint_events_since += 1;

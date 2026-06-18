@@ -89,20 +89,28 @@ fn append_consequence_event(
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     context_id: &str,
     context_id_bytes: &[u8; 32],
-    event_name: &'static str,
+    event_type: scp_event_log::EventType,
     member_did: &DID,
     payload: &serde_json::Value,
 ) {
+    // Consequence-enforcement records keep a JSON-object payload (rule_index,
+    // trigger_kind, action_type, target_did) because the consequence engine
+    // reads target_did out of it via `payload_target_is`, which decodes both
+    // JSON objects and the typed positional structs. Wrap the JSON bytes in an
+    // EventPayload for the typed event-log substrate.
+    let payload = scp_event_log::EventPayload {
+        data: serde_json::to_vec(payload).unwrap_or_default(),
+    };
     if let Err(e) = event_log.append_context_event_with_payload(
         context_id_bytes,
-        event_name,
+        event_type,
         CONSEQUENCE_ACTOR_DID,
-        Some(payload),
+        payload,
     ) {
         tracing::warn!(
             context_id,
             member = %member_did,
-            event = event_name,
+            event = ?event_type,
             error = %e,
             "failed to append consequence event to durable event log"
         );
@@ -334,7 +342,7 @@ fn emit_consequence_triggered(
         args.event_log,
         args.context_id,
         context_id_bytes,
-        "ConsequenceTriggered",
+        scp_event_log::EventType::ConsequenceTriggered,
         args.member_did,
         &payload,
     );
@@ -372,7 +380,7 @@ fn emit_absent_member_enforcement_failed(
         args.event_log,
         args.context_id,
         context_id_bytes,
-        "ConsequenceEnforcementFailed",
+        scp_event_log::EventType::ConsequenceEnforcementFailed,
         args.member_did,
         &payload,
     );
@@ -406,7 +414,7 @@ fn emit_consequence_enforced_success(
         args.event_log,
         args.context_id,
         context_id_bytes,
-        "ConsequenceEnforced",
+        scp_event_log::EventType::ConsequenceEnforced,
         args.member_did,
         &payload,
     );
@@ -542,7 +550,7 @@ fn emit_failure_escalation(
         args.event_log,
         context_id,
         context_id_bytes,
-        "ConsequenceEnforcementFailed",
+        scp_event_log::EventType::ConsequenceEnforcementFailed,
         member_did,
         &failed_payload,
     );
@@ -557,7 +565,7 @@ fn emit_failure_escalation(
         args.event_log,
         context_id,
         context_id_bytes,
-        "ConsequenceEscalatedToSuspendAll",
+        scp_event_log::EventType::ConsequenceEscalatedToSuspendAll,
         member_did,
         &escalation_payload,
     );
@@ -670,51 +678,52 @@ pub fn event_log_entries_for_consequences(
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
     if let Ok(Some(entries)) = event_log.event_log_entries(&context_id_bytes) {
         for (seq, entry) in entries.iter().enumerate() {
-            let event_type = match entry.event.as_str() {
-                "MessageSent" | "MessageReceived" => scp_event_log::EventType::MessageSent,
-                "MemberJoined" => scp_event_log::EventType::MemberJoined,
-                "MemberLeft" => scp_event_log::EventType::MemberLeft,
-                "RoleAssigned" => scp_event_log::EventType::RoleAssigned,
-                "ToolRegistered" | "ToolRemoved" | "ToolInvoked" => {
-                    scp_event_log::EventType::ToolInvoked
+            use scp_event_log::EventType;
+            // Project the entry's typed `EventType` onto the coarse trigger
+            // buckets that `matches_trigger` understands. The event log now
+            // stores the real closed-taxonomy variant, so we map governance
+            // and consequence-enforcement variants down to
+            // `EventType::GovernanceAction` (the bucket the `WarningCount` /
+            // `Custom` triggers match), and operational variants to their
+            // velocity buckets. Mapping consequence events into the
+            // governance bucket closes the recursive blind spot from the
+            // white-hat review (H4): subsequent rule evaluation can see prior
+            // consequence enforcement, enabling rules like "if member has
+            // been auto-suspended N times, demote".
+            let event_type = match entry.event_type {
+                EventType::MessageSent => EventType::MessageSent,
+                EventType::MemberJoined => EventType::MemberJoined,
+                EventType::MemberLeft => EventType::MemberLeft,
+                EventType::RoleAssigned => EventType::RoleAssigned,
+                EventType::ToolRegistered | EventType::ToolRemoved | EventType::ToolInvoked => {
+                    EventType::ToolInvoked
                 }
-                // Governance actions and consequence enforcement records
-                // both feed the WarningCount trigger via the
-                // EventType::GovernanceAction match arm in
-                // `matches_trigger`. Mapping consequence events to this
-                // bucket closes the recursive blind spot from the
-                // white-hat review (H4): subsequent rule evaluation can
-                // see prior consequence enforcement, enabling rules like
-                // "if member has been auto-suspended N times, demote".
-                "GovernanceAction"
-                | "GovernanceProposalCreated"
-                | "GovernanceVoteCast"
-                | "GovernanceVoteWithdrawn"
-                | "GovernanceProposalResolved"
-                | "GovernanceDeadlockRecovery"
-                | "GovernanceConflictDetected"
-                | "GovernanceConflictResolved"
-                | "GovernanceActionExecuted"
-                | "ConsequenceTriggered"
-                | "ConsequenceEnforced"
-                | "ConsequenceEnforcementFailed"
-                | "ConsequenceEscalatedToSuspendAll" => scp_event_log::EventType::GovernanceAction,
+                EventType::GovernanceAction
+                | EventType::GovernanceProposalCreated
+                | EventType::GovernanceVoteCast
+                | EventType::GovernanceVoteWithdrawn
+                | EventType::GovernanceProposalResolved
+                | EventType::GovernanceDeadlockRecovery
+                | EventType::GovernanceConflictDetected
+                | EventType::GovernanceConflictResolved
+                | EventType::GovernanceActionExecuted
+                | EventType::AccessRevoked
+                | EventType::ConsequenceTriggered
+                | EventType::ConsequenceEnforced
+                | EventType::ConsequenceEnforcementFailed
+                | EventType::ConsequenceEscalatedToSuspendAll => EventType::GovernanceAction,
                 _ => continue, // Skip event types not relevant to consequence evaluation
             };
-            // Convert structured JSON payload to EventPayload bytes.
-            // The payload is serialized as JSON bytes for consumption by
-            // extract_target_did_from_payload and payload_target_is.
-            let payload_data = entry
-                .payload
-                .as_ref()
-                .and_then(|v| serde_json::to_vec(v).ok())
-                .unwrap_or_default();
+            // The event already carries its canonical payload bytes (typed
+            // positional MessagePack for promoted variants, JSON for the
+            // remaining untyped ones). `payload_target_is` / `payload_starts_with`
+            // decode both encodings, so pass the bytes through unchanged.
             events.push(scp_event_log::Event {
                 event_type,
-                actor_did: DID(entry.actor_did.clone()),
+                actor_did: entry.actor_did.clone(),
                 timestamp: entry.timestamp,
                 sequence: seq as u64,
-                payload: scp_event_log::EventPayload { data: payload_data },
+                payload: entry.payload.clone(),
                 prev_hash: [0u8; 32],
                 signature: Vec::new(),
             });

@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::providers::event_log::compute_entry_hash;
 use super::state::ContextSnapshot;
 use crate::store::StoredValue;
 use scp_identity::DID;
@@ -453,49 +452,41 @@ pub fn deserialize_export(bytes: &[u8]) -> Result<ContextExport, ContextError> {
 /// Returns [`ContextError::EventLogFailed`] if deserialization fails or
 /// the Merkle chain is broken (`prev_hash` mismatch or hash mismatch).
 pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextError> {
-    use super::providers::event_log::EventLogEntry;
+    use scp_event_log::{Event, EventLog};
 
     if event_log_data.is_empty() {
         return Ok([0u8; 32]);
     }
 
-    let entries: Vec<EventLogEntry> = rmp_serde::from_slice(event_log_data).map_err(|e| {
+    let entries: Vec<Event> = rmp_serde::from_slice(event_log_data).map_err(|e| {
         ContextError::EventLogFailed(format!(
-            "failed to deserialize event log entries for verification: {e}"
+            "failed to deserialize event log for verification: {e}"
         ))
     })?;
 
     if entries.is_empty() {
-        return Ok([0u8; 32]);
+        return Ok(scp_event_log::tree::root(&EventLog::new(String::new())));
     }
 
-    for (i, entry) in entries.iter().enumerate() {
-        // Skip prev_hash linkage check for the first entry: if the log was
-        // pruned, entries[0].prev_hash references a discarded predecessor and
-        // cannot be validated. This matches the logic in
-        // `providers::event_log::verify_chain_integrity`.
-        if i > 0 && !bool::from(entry.prev_hash.ct_eq(&entries[i - 1].hash)) {
-            return Err(ContextError::EventLogFailed(format!(
-                "Merkle chain broken at entry {i}: prev_hash mismatch"
-            )));
-        }
-
-        // Verify self-hash correctness.
-        let expected_hash = compute_entry_hash(
-            &entry.event,
-            &entry.actor_did,
-            entry.timestamp,
-            &entry.prev_hash,
-            entry.payload.as_ref(),
-        );
-        if !bool::from(entry.hash.ct_eq(&expected_hash)) {
-            return Err(ContextError::EventLogFailed(format!(
-                "Merkle chain broken at entry {i}: hash mismatch"
-            )));
-        }
+    // Replay the events through the canonical substrate Merkle tree exactly as
+    // exported (preserving each event's own sequence + prev_hash), so the
+    // recomputed root is bit-identical to the root the exporter signed. The
+    // context id is not authenticated by the chain, so a synthetic id hosts the
+    // replay. `append_unsigned_event` validates each leaf's sequence and
+    // prev_hash chain link (returning an error on any break), and `tree::root`
+    // returns the RFC 6962 root committing to the full leaf sequence. This
+    // mirrors `providers::event_log::rebuild_log_from_events`.
+    let mut log = EventLog::new(String::new());
+    for entry in &entries {
+        scp_event_log::tree::append_unsigned_event(&mut log, entry).map_err(|e| {
+            ContextError::EventLogFailed(format!(
+                "Merkle chain broken at sequence {}: {e}",
+                entry.sequence
+            ))
+        })?;
     }
 
-    Ok(entries.last().map_or([0u8; 32], |e| e.hash))
+    Ok(scp_event_log::tree::root(&log))
 }
 
 /// Validates a [`ContextExport`] for import readiness, including the

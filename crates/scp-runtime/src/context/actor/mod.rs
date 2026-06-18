@@ -1516,9 +1516,9 @@ mod tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }

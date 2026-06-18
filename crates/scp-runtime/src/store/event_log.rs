@@ -625,7 +625,7 @@ impl<S: Storage> ProtocolRepository<S> {
         &self,
         context_id: &str,
         seq: usize,
-        entry: &crate::context::providers::event_log::EventLogEntry,
+        entry: &scp_event_log::Event,
     ) -> Result<(), StoreError> {
         let key = merkle_event_log_entry_key(context_id, seq)?;
         self.store_value(&key, entry).await
@@ -644,7 +644,7 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn store_merkle_event_log_entries(
         &self,
         context_id: &str,
-        entries: &[crate::context::providers::event_log::EventLogEntry],
+        entries: &[scp_event_log::Event],
     ) -> Result<(), StoreError> {
         // Delete all existing keys under this prefix (per-entry + legacy blob).
         let prefix = merkle_event_log_prefix(context_id)?;
@@ -670,7 +670,7 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_merkle_event_log_entries(
         &self,
         context_id: &str,
-    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, StoreError> {
+    ) -> Result<Option<Vec<scp_event_log::Event>>, StoreError> {
         let prefix = merkle_event_log_prefix(context_id)?;
         let keys = self.storage.list_keys(&prefix).await?;
 
@@ -683,7 +683,7 @@ impl<S: Storage> ProtocolRepository<S> {
         // to zero-padding).
         let mut entries = Vec::with_capacity(keys.len());
         for key in &keys {
-            let entry: crate::context::providers::event_log::EventLogEntry =
+            let entry: scp_event_log::Event =
                 self.load_value(key).await?.ok_or_else(|| {
                     StoreError::DeserializationFailed(format!(
                         "merkle event log entry missing after list_keys: {key}"
@@ -1221,16 +1221,16 @@ mod tests {
 
     #[tokio::test]
     async fn store_and_load_single_merkle_event_log_entry() {
-        use crate::context::providers::event_log::EventLogEntry;
 
         let store = make_store();
-        let entry = EventLogEntry {
-            event: "ContextCreated".to_owned(),
-            actor_did: String::new(),
+        let entry = scp_event_log::Event {
+            event_type: scp_event_log::EventType::ContextCreated,
+            actor_did: scp_event_log::DID(String::new()),
             timestamp: 1_700_000_000,
+            sequence: 0,
+            payload: scp_event_log::EventPayload::default(),
             prev_hash: [0u8; 32],
-            hash: [1u8; 32],
-            payload: None,
+            signature: Vec::new(),
         };
 
         store
@@ -1245,31 +1245,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].event, "ContextCreated");
+        assert_eq!(loaded[0].event_type, scp_event_log::EventType::ContextCreated);
     }
 
     #[tokio::test]
     async fn store_and_load_merkle_event_log_entries_roundtrip() {
-        use crate::context::providers::event_log::EventLogEntry;
 
         let store = make_store();
         let entries = vec![
-            EventLogEntry {
-                event: "ContextCreated".to_owned(),
-                actor_did: String::new(),
-                timestamp: 1_700_000_000,
-                prev_hash: [0u8; 32],
-                hash: [1u8; 32],
-                payload: None,
-            },
-            EventLogEntry {
-                event: "MemberJoined".to_owned(),
-                actor_did: String::new(),
-                timestamp: 1_700_000_001,
-                prev_hash: [1u8; 32],
-                hash: [2u8; 32],
-                payload: None,
-            },
+            scp_event_log::Event {
+            event_type: scp_event_log::EventType::ContextCreated,
+            actor_did: scp_event_log::DID(String::new()),
+            timestamp: 1_700_000_000,
+            sequence: 0,
+            payload: scp_event_log::EventPayload::default(),
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        },
+            scp_event_log::Event {
+            event_type: scp_event_log::EventType::MemberJoined,
+            actor_did: scp_event_log::DID(String::new()),
+            timestamp: 1_700_000_001,
+            sequence: 0,
+            payload: scp_event_log::EventPayload::default(),
+            prev_hash: [1u8; 32],
+            signature: Vec::new(),
+        },
         ];
 
         store
@@ -1284,8 +1285,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].event, "ContextCreated");
-        assert_eq!(loaded[1].event, "MemberJoined");
+        assert_eq!(loaded[0].event_type, scp_event_log::EventType::ContextCreated);
+        assert_eq!(loaded[1].event_type, scp_event_log::EventType::MemberJoined);
     }
 
     #[tokio::test]
@@ -1300,16 +1301,16 @@ mod tests {
 
     #[tokio::test]
     async fn delete_merkle_event_log_entries() {
-        use crate::context::providers::event_log::EventLogEntry;
 
         let store = make_store();
-        let entries = vec![EventLogEntry {
-            event: "ContextCreated".to_owned(),
-            actor_did: String::new(),
+        let entries = vec![scp_event_log::Event {
+            event_type: scp_event_log::EventType::ContextCreated,
+            actor_did: scp_event_log::DID(String::new()),
             timestamp: 1_700_000_000,
+            sequence: 0,
+            payload: scp_event_log::EventPayload::default(),
             prev_hash: [0u8; 32],
-            hash: [1u8; 32],
-            payload: None,
+            signature: Vec::new(),
         }];
 
         store
@@ -1341,19 +1342,21 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_store_replaces_existing_per_entry_keys() {
-        use crate::context::providers::event_log::EventLogEntry;
 
         let store = make_store();
 
-        // Store 5 entries individually.
+        // Store 5 entries individually. Each carries a distinct timestamp so
+        // the round trip can be checked without a synthetic event name (the
+        // store path is a pure serialize/deserialize, no chain validation).
         for i in 0..5u8 {
-            let entry = EventLogEntry {
-                event: format!("Event{i}"),
-                actor_did: String::new(),
+            let entry = scp_event_log::Event {
+                event_type: scp_event_log::EventType::MessageSent,
+                actor_did: scp_event_log::DID(String::new()),
                 timestamp: u64::from(i),
+                sequence: u64::from(i),
+                payload: scp_event_log::EventPayload::default(),
                 prev_hash: [i; 32],
-                hash: [i + 1; 32],
-                payload: None,
+                signature: Vec::new(),
             };
             store
                 .store_merkle_event_log_entry("ctx-bulk", usize::from(i), &entry)
@@ -1363,21 +1366,23 @@ mod tests {
 
         // Bulk-store only 2 entries (simulating prune).
         let pruned = vec![
-            EventLogEntry {
-                event: "Event3".to_owned(),
-                actor_did: String::new(),
+            scp_event_log::Event {
+                event_type: scp_event_log::EventType::MessageSent,
+                actor_did: scp_event_log::DID(String::new()),
                 timestamp: 3,
+                sequence: 0,
+                payload: scp_event_log::EventPayload::default(),
                 prev_hash: [3; 32],
-                hash: [4; 32],
-                payload: None,
+                signature: Vec::new(),
             },
-            EventLogEntry {
-                event: "Event4".to_owned(),
-                actor_did: String::new(),
+            scp_event_log::Event {
+                event_type: scp_event_log::EventType::MessageSent,
+                actor_did: scp_event_log::DID(String::new()),
                 timestamp: 4,
+                sequence: 1,
+                payload: scp_event_log::EventPayload::default(),
                 prev_hash: [4; 32],
-                hash: [5; 32],
-                payload: None,
+                signature: Vec::new(),
             },
         ];
         store
@@ -1393,7 +1398,7 @@ mod tests {
 
         // Should only have the 2 entries, not 5.
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].event, "Event3");
-        assert_eq!(loaded[1].event, "Event4");
+        assert_eq!(loaded[0].timestamp, 3);
+        assert_eq!(loaded[1].timestamp, 4);
     }
 }

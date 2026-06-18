@@ -1955,7 +1955,6 @@ mod tests {
     /// backend-injection in commit 12c.9f.
     fn test_context_manager() -> Arc<crate::context::supervisor::Supervisor> {
         use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-        use crate::context::providers::event_log::EventLogEntry;
         use scp_protocol::context::builder::ContextCreationError;
         use scp_protocol::context::{ContextError, ContextParams};
 
@@ -1989,9 +1988,9 @@ mod tests {
             fn append_event(
                 &self,
                 _: &[u8; 32],
-                _: &str,
+                _: scp_event_log::EventType,
                 _actor_did: &str,
-                _payload: Option<&serde_json::Value>,
+                _payload: scp_event_log::EventPayload,
             ) -> Result<(), ContextCreationError> {
                 Ok(())
             }
@@ -2001,7 +2000,7 @@ mod tests {
             fn event_log_entries(
                 &self,
                 _: &[u8; 32],
-            ) -> Result<Option<Vec<EventLogEntry>>, ContextError> {
+            ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
                 Ok(None)
             }
         }

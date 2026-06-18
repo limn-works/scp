@@ -206,7 +206,7 @@ pub async fn complete_paid_action(
     let context_id_bytes = context_id_to_bytes(context_id);
     if let Err(e) = deps.event_log.append_context_event(
         &context_id_bytes,
-        "PaymentReceived",
+        scp_event_log::EventType::PaymentReceived,
         payer_did.as_ref(),
     ) {
         tracing::warn!(

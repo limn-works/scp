@@ -2465,7 +2465,7 @@ pub enum QueriesCommand {
         /// Oneshot reply channel. `Ok(None)` iff no log exists for the
         /// context.
         reply: oneshot::Sender<
-            Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>,
+            Result<Option<Vec<scp_event_log::Event>>, ContextError>,
         >,
     },
 

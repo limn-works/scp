@@ -8868,7 +8868,7 @@ impl Supervisor {
     pub fn event_log_entries(
         &self,
         context_id_bytes: &[u8; 32],
-    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
+    ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError>
     {
         let event_log = self.event_log_ref().ok_or_else(|| {
             ContextError::NotInitialized(
@@ -10894,9 +10894,9 @@ mod tests {
         fn append_event(
             &self,
             _context_id: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor_did: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
@@ -11597,7 +11597,7 @@ mod tests {
 
         let creator = "did:key:forge-test-creator";
         let snapshot = import_test_snapshot("forge-ctx", creator);
-        let event_log_data = create_event_log_data(&[0x11u8; 32], &["ContextCreated"]);
+        let event_log_data = create_event_log_data(&[0x11u8; 32], &[scp_event_log::EventType::ContextCreated]);
 
         // Sign with the real creator key so the export is internally
         // consistent (exporter_did == creator_did, signature authentic
@@ -11647,7 +11647,7 @@ mod tests {
         let mut snapshot = import_test_snapshot("broadcast-ctx", creator);
         snapshot.context_params.mode = scp_protocol::context::ContextMode::Broadcast;
         snapshot.routing = crate::context::actor::state::ContextRouting::Broadcast;
-        let event_log_data = create_event_log_data(&[0x22u8; 32], &["ContextCreated"]);
+        let event_log_data = create_event_log_data(&[0x22u8; 32], &[scp_event_log::EventType::ContextCreated]);
 
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let export = crate::context::export_import::create_export(
@@ -11736,7 +11736,7 @@ mod tests {
         // Event-log bytes keyed on the import path's own derivation so
         // the recomputed Merkle root matches what the importer expects.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]);
         crate::context::export_import::create_export(
             snapshot,
             event_log_data,
@@ -11868,13 +11868,21 @@ mod tests {
 
     /// Helper mirroring `export_import::tests::create_event_log_data` —
     /// builds a Merkle event log byte payload via the provider.
-    fn create_event_log_data(context_id_bytes: &[u8; 32], event_names: &[&str]) -> Vec<u8> {
+    fn create_event_log_data(
+        context_id_bytes: &[u8; 32],
+        event_types: &[scp_event_log::EventType],
+    ) -> Vec<u8> {
         use crate::context::builder::ContextEventLogProvider;
         let provider = crate::context::providers::event_log::MerkleEventLogProvider::new();
         provider.init_event_log(context_id_bytes).unwrap();
-        for name in event_names {
+        for event_type in event_types {
             provider
-                .append_event(context_id_bytes, name, "", None)
+                .append_event(
+                    context_id_bytes,
+                    *event_type,
+                    "",
+                    scp_event_log::EventPayload::default(),
+                )
                 .unwrap();
         }
         provider.export_event_log_entries(context_id_bytes).unwrap()

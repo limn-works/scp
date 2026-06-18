@@ -105,7 +105,7 @@ pub trait EventLogSigner: Send + Sync {
 /// Governance event payloads are serialized into [`EventPayload`]. The
 /// payload fields for each governance event type are documented below;
 /// producers serialize them as `MessagePack` into `EventPayload::data`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     /// Context was created.
     ContextCreated,

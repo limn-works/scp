@@ -922,12 +922,12 @@ fn apply_commit_retry_outcomes(
     deps: &ActorDeps,
     context_id: &str,
     outcomes: Vec<CommitRetryOutcome>,
-) -> Vec<&'static str> {
+) -> Vec<scp_event_log::EventType> {
     use scp_protocol::context::membership::ContextEvent;
 
     use crate::context::state::CommitFaultMarker;
 
-    let mut event_log_writes: Vec<&'static str> = Vec::new();
+    let mut event_log_writes: Vec<scp_event_log::EventType> = Vec::new();
     let queue_len = state.pending_commits.len();
     let mut to_remove: Vec<usize> = Vec::new();
     for outcome in outcomes {
@@ -947,7 +947,7 @@ fn apply_commit_retry_outcomes(
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                event_log_writes.push("CommitBroadcastSucceeded");
+                event_log_writes.push(scp_event_log::EventType::CommitBroadcastSucceeded);
                 to_remove.push(outcome.index);
             }
             CommitRetryOutcomeKind::Retry {
@@ -970,7 +970,7 @@ fn apply_commit_retry_outcomes(
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                event_log_writes.push("CommitBroadcastPending");
+                event_log_writes.push(scp_event_log::EventType::CommitBroadcastPending);
             }
             CommitRetryOutcomeKind::Failed {
                 reason,
@@ -993,7 +993,7 @@ fn apply_commit_retry_outcomes(
                     context_id,
                     deps.event_tx.as_ref(),
                 );
-                event_log_writes.push("CommitBroadcastFailed");
+                event_log_writes.push(scp_event_log::EventType::CommitBroadcastFailed);
                 to_remove.push(outcome.index);
             }
         }

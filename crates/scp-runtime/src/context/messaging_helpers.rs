@@ -354,7 +354,7 @@ pub fn deliver_plaintext_or_announcement(
     plaintext: &[u8],
     context_id: &str,
     event_tx: Option<&ContextEventSender>,
-) -> Option<&'static str> {
+) -> Option<scp_event_log::EventType> {
     // §9.10.4: run the shared announcement-ingest validator. The buffered path
     // maps a rejection to `None` (silent drop) — the message has already been
     // buffered/reordered, so there is no caller to return a typed error to.
@@ -365,16 +365,23 @@ pub fn deliver_plaintext_or_announcement(
                 sender_did,
                 "processed buffered pseudonym announcement"
             );
-            Some("PseudonymAnnounced")
+            Some(scp_event_log::EventType::PseudonymAnnounced)
         }
         AnnouncementOutcome::Rejected(_reason) => None,
         AnnouncementOutcome::NotAnnouncement => {
+            // Received application messages are pushed to the in-memory
+            // receive buffer for SDK observation, but NOT appended to the
+            // durable Merkle event log: a receiver-minted MessageReceived leaf
+            // is not authenticated by the sender, so logging it would let two
+            // honest receivers compute divergent Merkle roots for the same
+            // context and trip §9.9.3 equivocation detection. Returning `None`
+            // suppresses the append while preserving the buffer push.
             let event = ContextEvent::MessageReceived {
                 sender_did: DID(sender_did.to_owned()),
                 payload: plaintext.to_vec(),
             };
             emit_event_into(&mut state.receive_buffer, event, context_id, event_tx);
-            Some("MessageReceived")
+            None
         }
     }
 }
@@ -588,7 +595,7 @@ pub fn run_buffered_post_delivery(
     context_id: &str,
     context_id_bytes: &[u8; 32],
     sender_did: &str,
-    event_name: &str,
+    event_name: scp_event_log::EventType,
     clock: &dyn Clock,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     event_tx: Option<&ContextEventSender>,
@@ -605,7 +612,7 @@ pub fn run_buffered_post_delivery(
         tracing::warn!(
             context_id,
             sender_did,
-            event_name,
+            event_name = ?event_name,
             "failed to append buffered event to event log: {e}"
         );
     }
@@ -1576,16 +1583,19 @@ fn record_payment_capture_failure(
     cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-    let payload = serde_json::json!({
+    let payload_json = serde_json::json!({
         "action": action,
         "error": error_msg,
         "cost": cost.map(scp_protocol::economy::types::Amount::value),
     });
+    let payload = scp_event_log::EventPayload {
+        data: serde_json::to_vec(&payload_json).unwrap_or_default(),
+    };
     if let Err(log_err) = deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        "PaymentCaptureFailed",
+        scp_event_log::EventType::PaymentCaptureFailed,
         actor_did.as_ref(),
-        Some(&payload),
+        payload,
     ) {
         tracing::warn!(
             context_id,
@@ -1625,7 +1635,7 @@ fn append_message_sent_or_rollback_sequence(
 ) -> Result<(), ContextError> {
     if let Err(e) =
         deps.event_log
-            .append_context_event(context_id_bytes, "MessageSent", sender_did.as_ref())
+            .append_context_event(context_id_bytes, scp_event_log::EventType::MessageSent, sender_did.as_ref())
     {
         if !is_broadcast {
             state.membership.rollback_sequence_number(sender_did);
@@ -2544,7 +2554,7 @@ pub fn deliver_message_and_drain_buffered(
             }
             if let Err(e) = deps.event_log.append_context_event(
                 context_id_bytes,
-                "PseudonymAnnounced",
+                scp_event_log::EventType::PseudonymAnnounced,
                 sender_did,
             ) {
                 tracing::warn!(
@@ -2647,17 +2657,12 @@ pub fn deliver_message_and_drain_buffered(
         }
     }
 
-    // H5: append durable event log entry BEFORE consequence eval.
-    if let Err(e) =
-        deps.event_log
-            .append_context_event(context_id_bytes, "MessageReceived", sender_did)
-    {
-        tracing::warn!(
-            context_id,
-            sender_did,
-            "failed to append MessageReceived to event log on receive path: {e}"
-        );
-    }
+    // §9.9.3: received application messages are NOT appended to the durable
+    // Merkle event log. A MessageReceived leaf is minted by the receiver and
+    // is not authenticated by the sender, so two honest receivers would
+    // compute divergent roots for the same context and false-positive
+    // equivocation detection. The receive buffer (in-memory, SDK-observable)
+    // still records the message; consequence evaluation reads it from there.
 
     // H16: defense-in-depth velocity + consequence eval on receive.
     let now = deps.clock.now_secs();
@@ -2897,7 +2902,7 @@ mod pseudonym_routing_tests {
         let bytes = announcement_bytes(ALICE, alice_pseudonym);
 
         let result = deliver_plaintext_or_announcement(&mut state, ALICE, &bytes, &ctx, None);
-        assert_eq!(result, Some("PseudonymAnnounced"));
+        assert_eq!(result, Some(scp_event_log::EventType::PseudonymAnnounced));
         // Registry now maps Alice's DID to her announced routing ID.
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(reg.get(&DID(ALICE.to_owned())), Some(&alice_pseudonym));
@@ -2919,7 +2924,7 @@ mod pseudonym_routing_tests {
                 &ctx,
                 None
             ),
-            Some("PseudonymAnnounced")
+            Some(scp_event_log::EventType::PseudonymAnnounced)
         );
         // Same DID re-announces a rotated routing ID — legitimate key rotation.
         assert_eq!(
@@ -2930,7 +2935,7 @@ mod pseudonym_routing_tests {
                 &ctx,
                 None
             ),
-            Some("PseudonymAnnounced")
+            Some(scp_event_log::EventType::PseudonymAnnounced)
         );
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(
@@ -2997,7 +3002,7 @@ mod pseudonym_routing_tests {
                 &ctx,
                 None
             ),
-            Some("PseudonymAnnounced")
+            Some(scp_event_log::EventType::PseudonymAnnounced)
         );
         // Bob tries to claim Alice's already-registered routing ID → collision.
         assert_eq!(
@@ -3039,9 +3044,20 @@ mod pseudonym_routing_tests {
     fn buffered_non_announcement_is_delivered_as_normal_message() {
         let mut state = encrypted_state();
         let ctx = ctx_hex(0x11);
+        let buffered_before = state.receive_buffer.event_log_entries().len();
         let result =
             deliver_plaintext_or_announcement(&mut state, ALICE, b"hello world", &ctx, None);
-        assert_eq!(result, Some("MessageReceived"));
+        // A non-announcement application message is pushed to the in-memory
+        // receive buffer but NOT minted as a durable Merkle leaf (a
+        // receiver-minted MessageReceived leaf is not sender-authenticated and
+        // would let honest receivers diverge their roots, §9.9.3), so the
+        // function returns None.
+        assert_eq!(result, None);
+        assert_eq!(
+            state.receive_buffer.event_log_entries().len(),
+            buffered_before + 1,
+            "the received message must still be buffered for SDK observation"
+        );
     }
 
     /// The shared validator returns the EXACT outcome each call site maps:

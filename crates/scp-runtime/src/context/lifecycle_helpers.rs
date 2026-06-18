@@ -369,7 +369,7 @@ pub async fn leave_context(
 
     // Append MemberLeft event to event log.
     deps.event_log
-        .append_context_event(&context_id_bytes, "MemberLeft", member_did.as_ref())?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberLeft, member_did.as_ref())?;
     state.checkpoint_events_since += 1;
 
     // ADR-049 §9 Class S: a member leaving removes their own membership (a
@@ -862,7 +862,7 @@ pub async fn join_context(
     // persist-failure branch below already follows.
     if let Err(e) =
         deps.event_log
-            .append_context_event(&context_id_bytes, "MemberJoined", member_did.as_ref())
+            .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberJoined, member_did.as_ref())
     {
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
@@ -1075,16 +1075,19 @@ fn record_payment_capture_failure(
     cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-    let payload = serde_json::json!({
+    let payload_json = serde_json::json!({
         "action": action,
         "error": error_msg,
         "cost": cost.map(scp_protocol::economy::types::Amount::value),
     });
+    let payload = scp_event_log::EventPayload {
+        data: serde_json::to_vec(&payload_json).unwrap_or_default(),
+    };
     if let Err(log_err) = deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        "PaymentCaptureFailed",
+        scp_event_log::EventType::PaymentCaptureFailed,
         actor_did.as_ref(),
-        Some(&payload),
+        payload,
     ) {
         tracing::warn!(
             context_id,
@@ -2740,9 +2743,9 @@ mod restore_reconcile_tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
@@ -2764,9 +2767,9 @@ mod restore_reconcile_tests {
         fn append_event(
             &self,
             _id: &[u8; 32],
-            _event: &str,
+            _event: scp_event_log::EventType,
             _actor: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
         ) -> Result<(), ContextCreationError> {
             Err(ContextCreationError::EventLogFailed(
                 "fixture: event-log append deliberately fails".to_owned(),

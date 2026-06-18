@@ -288,14 +288,16 @@ pub async fn tombstone_migrated_context(
     // fail-closed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
 
-    deps.event_log.append_context_event(
+    let tombstone_payload = scp_event_log::payload::encode_payload(&scp_event_log::payload::ContextTombstonedPayload {
+        destination_id: destination_id.clone(),
+        migration_proposal_id: migration_pid,
+    })
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        &format!(
-            "ContextTombstoned:{}:{}",
-            destination_id,
-            hex::encode(migration_pid)
-        ),
+        scp_event_log::EventType::ContextTombstoned,
         "system",
+        tombstone_payload,
     )?;
     state.checkpoint_events_since += 1;
 
@@ -409,7 +411,7 @@ pub async fn apply_pending_ceiling_modification(
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "CeilingModified", "")?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::CeilingModified, "")?;
     state.checkpoint_events_since += 1;
 
     Ok(true)
@@ -448,7 +450,7 @@ pub async fn apply_pending_economic_policy_change(
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::EconomicPolicyApplied, "")?;
     state.checkpoint_events_since += 1;
 
     Ok(true)
@@ -675,7 +677,7 @@ pub fn execute_suspend_member(
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberSuspended, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -783,11 +785,17 @@ pub fn execute_revoke(
     if let Some(ref bc) = bc_snap {
         persist_broadcast_snapshot(deps, context_id, bc);
     }
+    let access_revoked_payload = scp_event_log::payload::encode_payload(
+        &scp_event_log::payload::AccessRevokedPayload {
+            target_did: did.as_ref().to_owned(),
+        },
+    )
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        "AccessRevoked",
+        scp_event_log::EventType::AccessRevoked,
         actor_did,
-        Some(&serde_json::json!({"target_did": did.as_ref()})),
+        access_revoked_payload,
     )?;
     state.checkpoint_events_since += 1;
 
@@ -910,7 +918,7 @@ pub fn execute_restore_access(
         persist_broadcast_snapshot(deps, context_id, bc);
     }
     deps.event_log
-        .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::AccessRestored, actor_did)?;
     state.checkpoint_events_since += 1;
 
     Ok(())
@@ -986,7 +994,7 @@ pub fn execute_add_member(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberJoined, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1096,7 +1104,7 @@ pub fn execute_remove_member(
     // member.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
-        .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberLeft, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1135,7 +1143,7 @@ pub fn execute_change_role(
     // a demotion removed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
-        .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::RoleAssigned, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1171,7 +1179,7 @@ pub fn execute_register_tool(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::ToolRegistered, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1204,7 +1212,7 @@ pub fn execute_remove_tool(
     // re-grant invocation of a tool the caller was told was removed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
-        .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::ToolRemoved, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1267,7 +1275,7 @@ pub fn execute_modify_ceiling(
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "CeilingModificationPending",
+        scp_event_log::EventType::CeilingModificationPending,
         actor_did,
     )?;
     state.checkpoint_events_since += 1;
@@ -1308,7 +1316,7 @@ pub async fn execute_close_context(
     // fail-closed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
-        .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::ContextClosing, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1341,15 +1349,16 @@ pub async fn execute_extend_ttl(
     let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
     if !missing.is_empty() {
         let rejecting_members: Vec<&str> = missing.clone();
-        let rejected_payload = serde_json::json!({
-            "event": "TTLExtensionRejected",
-            "proposal_id": hex::encode(proposal_id),
-            "rejecting_members": rejecting_members,
-        });
-        deps.event_log.append_context_event(
+        let rejected_payload = scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtensionRejectedPayload {
+            proposal_id,
+            rejecting_members: rejecting_members.iter().map(|m| (*m).to_owned()).collect(),
+        })
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        deps.event_log.append_context_event_with_payload(
             &context_id_bytes,
-            &rejected_payload.to_string(),
+            scp_event_log::EventType::TtlExtensionRejected,
             actor_did,
+            rejected_payload,
         )?;
         state.checkpoint_events_since += 1;
         return Err(ContextError::PermissionDenied(format!(
@@ -1391,17 +1400,18 @@ pub async fn execute_extend_ttl(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
 
-    let extended_payload = serde_json::json!({
-        "event": "TTLExtended",
-        "old_deadline_unix": old_dl,
-        "new_deadline_unix": new_dl,
-        "proposal_id": hex::encode(proposal_id),
-        "consenting_members": consenting,
-    });
-    deps.event_log.append_context_event(
+    let extended_payload = scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
+        old_deadline_unix: old_dl,
+        new_deadline_unix: new_dl,
+        proposal_id,
+        consenting_members: consenting,
+    })
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        &extended_payload.to_string(),
+        scp_event_log::EventType::TtlExtended,
         actor_did,
+        extended_payload,
     )?;
     state.checkpoint_events_since += 1;
     Ok(())
@@ -1454,7 +1464,7 @@ pub fn execute_transfer_admin(
     // acknowledged.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
-        .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::AdminTransferred, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1486,7 +1496,7 @@ pub fn execute_create_child_context(
     }
 
     deps.event_log
-        .append_context_event(&context_id_bytes, "ChildContextCreated", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::ChildContextCreated, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1547,7 +1557,7 @@ pub fn execute_modify_pruning_policy(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "PruningPolicyModified", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::PruningPolicyModified, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1610,7 +1620,7 @@ pub fn execute_add_signer(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::SignerAdded, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1668,7 +1678,7 @@ pub fn execute_remove_signer(
     // signer.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
-        .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::SignerRemoved, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1702,7 +1712,7 @@ pub fn execute_modify_threshold(
     // revert to a weaker threshold the caller was told had changed.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
-        .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::ThresholdModified, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1743,7 +1753,7 @@ pub fn execute_establish_tool_interface(
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "ToolInterfaceEstablished",
+        scp_event_log::EventType::ToolInterfaceEstablished,
         actor_did,
     )?;
     state.checkpoint_events_since += 1;
@@ -1838,7 +1848,7 @@ pub fn execute_reset_member(
     }
 
     deps.event_log
-        .append_context_event(&context_id_bytes, "MemberReset", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberReset, actor_did)?;
     state.checkpoint_events_since += 1;
     state.governance.pending_epoch_resets.push(did.clone());
 
@@ -1948,7 +1958,7 @@ pub fn execute_resolve_conflict(
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log.append_context_event(
         &context_id_bytes,
-        "GovernanceConflictResolved",
+        scp_event_log::EventType::GovernanceConflictResolved,
         actor_did,
     )?;
     state.checkpoint_events_since += 1;
@@ -1999,7 +2009,7 @@ pub fn execute_promote_context(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::ContextPromoted, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2087,7 +2097,7 @@ pub fn execute_rotate_content_keys(
     }
 
     deps.event_log
-        .append_context_event(&context_id_bytes, "ContentKeysRotated", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::ContentKeysRotated, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2173,7 +2183,7 @@ pub fn execute_reconfigure_governance(
     // reconfiguration was acknowledged.
     crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
     deps.event_log
-        .append_context_event(&context_id_bytes, "GovernanceReconfigured", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::GovernanceReconfigured, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2233,7 +2243,7 @@ pub fn execute_set_economic_policy(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "EconomicPolicyChanged", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::EconomicPolicyChanged, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2264,14 +2274,18 @@ pub fn execute_approve_spend(
     state.governance.budget_tracker.grant(spender, amount);
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    let payload = serde_json::json!({
-        "event": "SpendApproved",
-        "spender": spender.as_ref(),
-        "amount": amount,
-        "purpose": purpose,
-    });
-    deps.event_log
-        .append_context_event(&context_id_bytes, &payload.to_string(), actor_did)?;
+    let spend_payload = scp_event_log::payload::encode_payload(&scp_event_log::payload::SpendApprovedPayload {
+        spender: spender.as_ref().to_owned(),
+        amount: amount.value(),
+        purpose: purpose.to_owned(),
+    })
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    deps.event_log.append_context_event_with_payload(
+        &context_id_bytes,
+        scp_event_log::EventType::SpendApproved,
+        actor_did,
+        spend_payload,
+    )?;
     Ok(())
 }
 
@@ -2308,7 +2322,7 @@ pub fn execute_lock_economic_policy(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "EconomicPolicyLocked", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::EconomicPolicyLocked, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2355,7 +2369,7 @@ pub fn execute_modify_hard_rate_limit(
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     deps.event_log
-        .append_context_event(&context_id_bytes, "HardRateLimitModified", actor_did)?;
+        .append_context_event(&context_id_bytes, scp_event_log::EventType::HardRateLimitModified, actor_did)?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -2513,7 +2527,7 @@ pub fn execute_propose_context_migration<'a>(
         crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
         deps.event_log.append_context_event(
             &context_id_bytes,
-            "ContextMigrationStarted",
+            scp_event_log::EventType::ContextMigrationStarted,
             actor_did,
         )?;
         state.checkpoint_events_since += 1;
@@ -2575,13 +2589,15 @@ pub async fn execute_cancel_context_migration(
     );
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log.append_context_event(
+    let cancel_payload = scp_event_log::payload::encode_payload(&scp_event_log::payload::ContextMigrationCancelledPayload {
+        original_proposal_id,
+    })
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
-        &format!(
-            "ContextMigrationCancelled:{}",
-            hex::encode(original_proposal_id)
-        ),
+        scp_event_log::EventType::ContextMigrationCancelled,
         actor_did,
+        cancel_payload,
     )?;
     state.checkpoint_events_since += 1;
     Ok(())
@@ -2668,7 +2684,7 @@ pub async fn propose_governance_action_inner(
             if let GovernanceEvent::ConflictResolved { .. } = event {
                 deps.event_log.append_context_event(
                     &cid_bytes,
-                    "GovernanceFreezeExpired",
+                    scp_event_log::EventType::GovernanceFreezeExpired,
                     proposer_did.as_ref(),
                 )?;
                 state.checkpoint_events_since += 1;
@@ -2721,7 +2737,7 @@ pub async fn propose_governance_action_inner(
                 GovernanceEvent::ConflictDetected { .. } => {
                     deps.event_log.append_context_event(
                         &context_id_bytes,
-                        "GovernanceConflictDetected",
+                        scp_event_log::EventType::GovernanceConflictDetected,
                         proposer_did.as_ref(),
                     )?;
                     conflict_event_count += 1;
@@ -2729,7 +2745,7 @@ pub async fn propose_governance_action_inner(
                 GovernanceEvent::ConflictResolved { .. } => {
                     deps.event_log.append_context_event(
                         &context_id_bytes,
-                        "GovernanceConflictResolved",
+                        scp_event_log::EventType::GovernanceConflictResolved,
                         proposer_did.as_ref(),
                     )?;
                     conflict_event_count += 1;
@@ -3016,7 +3032,7 @@ pub async fn vote_on_proposal_inner(
                 GovernanceEvent::ConflictDetected { .. } => {
                     deps.event_log.append_context_event(
                         &context_id_bytes,
-                        "GovernanceConflictDetected",
+                        scp_event_log::EventType::GovernanceConflictDetected,
                         voter_did.as_ref(),
                     )?;
                     conflict_event_count += 1;
@@ -3024,7 +3040,7 @@ pub async fn vote_on_proposal_inner(
                 GovernanceEvent::ConflictResolved { .. } => {
                     deps.event_log.append_context_event(
                         &context_id_bytes,
-                        "GovernanceConflictResolved",
+                        scp_event_log::EventType::GovernanceConflictResolved,
                         voter_did.as_ref(),
                     )?;
                     conflict_event_count += 1;
@@ -3423,7 +3439,7 @@ pub async fn dispatch_governance_action(
             crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id)?;
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log
-                .append_context_event(&context_id_bytes, "MemberSuspendedAll", actor)?;
+                .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberSuspendedAll, actor)?;
             state.checkpoint_events_since += 1;
             Ok(GovernanceActionResult::Executed)
         }
@@ -3574,15 +3590,22 @@ pub fn finalize_governance_action(
 
     let context_id_bytes = context_id_to_bytes(context_id);
     let action_variant = proposal.action.variant_name();
-    let payload = Some(proposal.action.target_did().map_or_else(
-        || serde_json::json!({"action_type": action_variant}),
-        |d| serde_json::json!({"target_did": d.as_ref(), "action_type": action_variant}),
-    ));
+    let executed_payload = scp_event_log::payload::encode_payload(
+        &scp_event_log::payload::GovernanceActionExecutedPayload {
+            target_did: proposal
+                .action
+                .target_did()
+                .map(|d| d.as_ref().to_owned())
+                .unwrap_or_default(),
+            action_type: action_variant.to_owned(),
+        },
+    )
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     deps.event_log.append_context_event_with_payload(
         &context_id_bytes,
         governance_event_label(&executed_event),
         proposal.proposer_did.as_ref(),
-        payload.as_ref(),
+        executed_payload,
     )?;
 
     let action_summary = proposal.action.variant_name().to_owned();
@@ -3853,7 +3876,7 @@ pub fn try_broadcast_commit_or_enqueue(
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log.append_context_event(
                 &context_id_bytes,
-                "CommitBroadcasted",
+                scp_event_log::EventType::CommitBroadcasted,
                 actor_did,
             )?;
             state.checkpoint_events_since += 1;
@@ -3909,7 +3932,7 @@ pub fn try_broadcast_commit_or_enqueue(
             );
             deps.event_log.append_context_event(
                 &context_id_bytes,
-                "CommitBroadcastPending",
+                scp_event_log::EventType::CommitBroadcastPending,
                 actor_did,
             )?;
             state.checkpoint_events_since += 1;
