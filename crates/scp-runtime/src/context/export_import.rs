@@ -625,24 +625,27 @@ pub fn validate_export_for_import(
     //    different internally-consistent event log, because its recomputed
     //    root would not match the signed value. See §23.16.4 / §23.16.8.
     //
-    //    Security scope: the signed root is the event-log hash-CHAIN HEAD, not
-    //    a Merkle-tree commitment over all entries. `verify_merkle_chain` is
-    //    pruning-tolerant (it does not validate entry[0].prev_hash), so a
-    //    contiguous SUFFIX of the log (oldest entries dropped) verifies against
-    //    the signed head. The signature thus attests that no entry was
-    //    added/modified/reordered/forged and that the head is authentic, but
-    //    NOT full-history completeness.
+    //    Security scope: the signed root is the RFC 6962 `tree::root` over ALL
+    //    entries (ADR-050), not a hash-chain head. `verify_merkle_chain`
+    //    recomputes it by replaying every entry through
+    //    `append_unsigned_event`, which validates each leaf's `sequence` against
+    //    the running count and its `prev_hash` against the prior leaf (genesis
+    //    for entry[0]). A PREFIX-truncated log (oldest entries dropped) is
+    //    therefore rejected outright — the new first entry's non-zero `sequence`
+    //    (and non-genesis `prev_hash`) fails the replay check — while any
+    //    suffix-truncated, reordered, removed-middle, or added/modified/forged
+    //    log yields a different `tree::root` than the signed value and fails the
+    //    constant-time compare below. The signature thus attests full-history
+    //    completeness AND integrity: no entry can be added, modified, reordered,
+    //    dropped, or forged without invalidating it. Truncation forgery is
+    //    CLOSED, not merely detected.
     //
-    //    This is not audit-only: the imported pre-import entries are consumed by
-    //    post-import enforcement — `event_log_entries_for_consequences` reads
-    //    them as "Source 1" to drive consequence/participation/standing on the
-    //    first live action. A front-truncated but valid-head log can thus lower
-    //    consequence counts and suppress an auto-suspend/demote/ban for rules
-    //    whose `window` exceeds the dropped entries' age (inert under the
-    //    default 1-5 minute matrix windows, where the droppable entries are
-    //    already out-of-window). A true cold-start for enforcement (imported
-    //    history audit-only) is a planned hardening; until then front-truncation
-    //    is not authoritative-state-neutral.
+    //    Because the imported pre-import entries are consumed by post-import
+    //    enforcement — `event_log_entries_for_consequences` reads them as
+    //    "Source 1" to drive consequence/participation/standing on the first
+    //    live action — this completeness guarantee means an importer cannot
+    //    silently suppress consequences by truncating history: the full,
+    //    signed-over leaf set is the only set that verifies.
     if !bool::from(computed_root.ct_eq(&export.snapshot.event_log_merkle_root)) {
         return Err(ContextError::EventLogFailed(
             "signed snapshot root mismatch: recomputed event-log root does not \
