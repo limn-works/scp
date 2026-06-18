@@ -214,20 +214,167 @@ impl StandingPairCreatePrepared {
 
 /// Staged state for a cross-context tool-invocation saga.
 ///
+/// This is the **public-metadata journal projection** of the
+/// `CrossContextToolInvoke` envelope (spec §6.2.4 "Public-metadata
+/// journaling") — eight fields, all public.
+///
 /// **Not bearer-bearing.** The UCAN proof bytes are NOT carried here;
 /// only the proof's identifier (token ID). The receiving actor re-resolves
-/// the proof from its own UCAN store at Commit time. This keeps the
-/// prepared-state non-secret-bearing.
+/// the proof from its own UCAN store at Commit time, re-running the full §7
+/// validation re-bound to `caller_did` plus `tool_registration_id`. This
+/// keeps the prepared-state non-secret-bearing (`mark_resolved(secret_bearing
+/// = false)`); the §9.4.3 commitment path stays dormant.
+///
+/// **B-controlled, replay-deterministic fields.** Three of the eight fields
+/// are staged at Prepare-B precisely so a Commit replayed after a crash —
+/// when B no longer holds the wire envelope — reproduces the signed
+/// `CrossContextToolReceipt` preimage byte-for-byte from durable state:
+///
+/// - `recorded_timestamp_ms` is B's OWN clock captured once at Prepare-B
+///   (NOT the caller-asserted envelope `timestamp_ms`, which is untrusted
+///   and consumed only by the freshness check).
+/// - `recorded_nonce` is B's staged COPY of the 16-byte wire `nonce`. It
+///   equals the caller-supplied wire value by design — the `nonce` is a
+///   public correlation/dedup token, not a trust-bearing input — but is
+///   staged from B's captured copy so a replayed Commit reproduces it
+///   without the envelope.
+/// - `recorded_chain_depth` is B's OWN re-derived inbound depth
+///   (`incoming chain_depth + 1`), explicitly NOT the caller-asserted
+///   advisory envelope `chain_depth`.
+///
+/// All three are public plan-metadata; staging them keeps the journal
+/// non-secret-bearing.
+///
+/// # Serialization
+///
+/// This actor-side prepared state is deliberately NOT `Serialize` (the
+/// wrapping [`SagaPreparedState`] enum carries the §9.4.3 non-derive
+/// barrier). Journal evidence is produced via the explicit
+/// [`CrossContextToolInvocationPreparedWire`] mirror (`MessagePack` of the
+/// public fields), reached through
+/// [`CrossContextToolInvocationPrepared::to_evidence_bytes`] /
+/// [`CrossContextToolInvocationPrepared::from_evidence_bytes`], mirroring
+/// the [`StandingPairCreatePrepared`] discipline above.
 pub struct CrossContextToolInvocationPrepared {
-    /// Calling context ID.
+    /// Calling context ID — the raw 32-byte context-id digest (never a
+    /// `"standing-"`-prefixed string), matching the id-form rule §6.2.4
+    /// states for both context ids.
     pub caller_context_id: [u8; 32],
+    /// Target context ID — B's own context, the context in which B executes
+    /// the tool (the verified `target_context` of the established interface,
+    /// §6.2.4 "Target-context binding"). Raw 32-byte digest, same id-form as
+    /// `caller_context_id`.
+    pub target_context_id: [u8; 32],
     /// Calling DID.
     pub caller_did: DID,
-    /// Tool registration ID (target tool's stable identifier).
+    /// Tool registration ID (target tool's stable identifier). Context-LOCAL
+    /// — it indexes B's own tool registry.
     pub tool_registration_id: String,
     /// UCAN proof reference (token ID), NOT the proof bytes. Resolved
     /// against the receiving actor's UCAN store at Commit time.
     pub ucan_proof_id: String,
+    /// B's wall-clock value captured ONCE at Prepare-B (§6.2.4 "Recorded
+    /// timestamp"). Both the Commit-time `ToolInvoked` record and the
+    /// receipt signature draw `timestamp_ms` from this single staged value;
+    /// it is NOT the caller-asserted envelope `timestamp_ms`.
+    pub recorded_timestamp_ms: u64,
+    /// B's staged copy of the 16-byte wire `nonce` (§6.2.4 "Staged nonce and
+    /// recorded chain-depth"). Equal to the caller-supplied wire value by
+    /// design; staged from B's captured copy for replay determinism.
+    pub recorded_nonce: [u8; 16],
+    /// B's re-derived inbound chain depth = `incoming chain_depth + 1`
+    /// (§6.2.4 "Chain-depth enforcement" / "Staged nonce and recorded
+    /// chain-depth"). NOT the caller-asserted advisory envelope
+    /// `chain_depth`. A `u8`, matching `ProvenanceRecord.chain_depth` and
+    /// the `[1, 255]` range in §6.2.0 / §24.4.
+    pub recorded_chain_depth: u8,
+}
+
+/// `Serialize`/`Deserialize` wire mirror of the **public** fields of
+/// [`CrossContextToolInvocationPrepared`], used to produce the journal
+/// `evidence` (the `MessagePack` of the eight public journaled fields,
+/// §6.2.4 "Public-metadata journaling"). The actor-side
+/// [`CrossContextToolInvocationPrepared`] is deliberately non-`Serialize`
+/// because the wrapping [`SagaPreparedState`] enum carries the §9.4.3
+/// non-derive barrier; this explicit mirror is the sanctioned serialization
+/// path, matching the [`StandingPairCreatePreparedWire`] discipline above.
+///
+/// All eight fields are public plan-metadata classified **public** — there
+/// is no §9.4.3 secret commitment (`mark_resolved(secret_bearing=false)`).
+/// `DID` is carried as its canonical string.
+///
+/// `dead_code` is allowed: this wire mirror and the `to_evidence_bytes` /
+/// `from_evidence_bytes` helpers below are the journal-evidence path for the
+/// cross-context tool-invocation saga, consumed when the saga dispatch
+/// wiring lands in a follow-on PR. The unit tests exercise the round-trip
+/// now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub(in crate::context) struct CrossContextToolInvocationPreparedWire {
+    /// The raw 32-byte caller context id.
+    pub caller_context_id: [u8; 32],
+    /// The raw 32-byte target context id.
+    pub target_context_id: [u8; 32],
+    /// `caller_did.0`.
+    pub caller_did: String,
+    /// Context-local tool registration id.
+    pub tool_registration_id: String,
+    /// UCAN proof reference (token id), not the proof bytes.
+    pub ucan_proof_id: String,
+    /// B's Prepare-B captured clock value.
+    pub recorded_timestamp_ms: u64,
+    /// B's staged copy of the 16-byte wire nonce.
+    pub recorded_nonce: [u8; 16],
+    /// B's re-derived inbound depth = `incoming chain_depth + 1`.
+    pub recorded_chain_depth: u8,
+}
+
+#[allow(dead_code)] // evidence path consumed by the saga dispatch wiring PR
+impl CrossContextToolInvocationPrepared {
+    /// Encode the public prepared state to its journal `evidence` bytes —
+    /// `MessagePack` of the [`CrossContextToolInvocationPreparedWire`]
+    /// mirror (§6.2.4 "Public-metadata journaling"). Classified **public**;
+    /// the supervisor wraps these bytes in the standard `Zeroizing` envelope
+    /// for uniformity only.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `rmp_serde` encode error string if serialization fails.
+    pub(in crate::context) fn to_evidence_bytes(&self) -> Result<Vec<u8>, String> {
+        let wire = CrossContextToolInvocationPreparedWire {
+            caller_context_id: self.caller_context_id,
+            target_context_id: self.target_context_id,
+            caller_did: self.caller_did.0.clone(),
+            tool_registration_id: self.tool_registration_id.clone(),
+            ucan_proof_id: self.ucan_proof_id.clone(),
+            recorded_timestamp_ms: self.recorded_timestamp_ms,
+            recorded_nonce: self.recorded_nonce,
+            recorded_chain_depth: self.recorded_chain_depth,
+        };
+        rmp_serde::to_vec_named(&wire).map_err(|e| format!("encode: {e}"))
+    }
+
+    /// Decode public prepared state from its journal `evidence` bytes,
+    /// reversing [`Self::to_evidence_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the `rmp_serde` decode error string if `bytes` is not a valid
+    /// `MessagePack` encoding of the wire mirror.
+    pub(in crate::context) fn from_evidence_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let wire: CrossContextToolInvocationPreparedWire =
+            rmp_serde::from_slice(bytes).map_err(|e| format!("decode: {e}"))?;
+        Ok(Self {
+            caller_context_id: wire.caller_context_id,
+            target_context_id: wire.target_context_id,
+            caller_did: DID(wire.caller_did),
+            tool_registration_id: wire.tool_registration_id,
+            ucan_proof_id: wire.ucan_proof_id,
+            recorded_timestamp_ms: wire.recorded_timestamp_ms,
+            recorded_nonce: wire.recorded_nonce,
+            recorded_chain_depth: wire.recorded_chain_depth,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,19 +490,71 @@ mod tests {
         let state =
             SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
                 caller_context_id: [5u8; 32],
+                target_context_id: [6u8; 32],
                 caller_did: alice(),
                 tool_registration_id: "calculator-v1".to_owned(),
                 ucan_proof_id: "ucan-token-abcdef".to_owned(),
+                recorded_timestamp_ms: 1_725_000_000_123,
+                recorded_nonce: [0xABu8; 16],
+                recorded_chain_depth: 3,
             });
         match state {
             SagaPreparedState::CrossContextToolInvocation(inner) => {
                 assert_eq!(inner.caller_context_id, [5u8; 32]);
+                assert_eq!(inner.target_context_id, [6u8; 32]);
                 assert_eq!(inner.caller_did, alice());
                 assert_eq!(inner.tool_registration_id, "calculator-v1");
                 assert_eq!(inner.ucan_proof_id, "ucan-token-abcdef");
+                assert_eq!(inner.recorded_timestamp_ms, 1_725_000_000_123);
+                assert_eq!(inner.recorded_nonce, [0xABu8; 16]);
+                assert_eq!(inner.recorded_chain_depth, 3);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn cross_context_tool_invocation_evidence_round_trips_all_eight_fields() {
+        let original = CrossContextToolInvocationPrepared {
+            caller_context_id: [0x11u8; 32],
+            target_context_id: [0x22u8; 32],
+            caller_did: alice(),
+            tool_registration_id: "calculator-v1".to_owned(),
+            ucan_proof_id: "ucan-token-abcdef".to_owned(),
+            recorded_timestamp_ms: 1_725_000_000_123,
+            recorded_nonce: [0xCDu8; 16],
+            recorded_chain_depth: 7,
+        };
+        let bytes = original.to_evidence_bytes().unwrap();
+        let back = CrossContextToolInvocationPrepared::from_evidence_bytes(&bytes).unwrap();
+        assert_eq!(back.caller_context_id, original.caller_context_id);
+        assert_eq!(back.target_context_id, original.target_context_id);
+        assert_eq!(back.caller_did, original.caller_did);
+        assert_eq!(back.tool_registration_id, original.tool_registration_id);
+        assert_eq!(back.ucan_proof_id, original.ucan_proof_id);
+        assert_eq!(back.recorded_timestamp_ms, original.recorded_timestamp_ms);
+        assert_eq!(back.recorded_nonce, original.recorded_nonce);
+        assert_eq!(back.recorded_chain_depth, original.recorded_chain_depth);
+    }
+
+    #[test]
+    fn cross_context_tool_invocation_wire_round_trips_via_messagepack() {
+        // Exercises the explicit Wire mirror directly, matching the
+        // §9.4.3 non-derive discipline: the live enum stays non-Serialize,
+        // serialization flows only through the Wire type.
+        let wire = CrossContextToolInvocationPreparedWire {
+            caller_context_id: [0x33u8; 32],
+            target_context_id: [0x44u8; 32],
+            caller_did: bob().0,
+            tool_registration_id: "translator-v2".to_owned(),
+            ucan_proof_id: "ucan-token-99".to_owned(),
+            recorded_timestamp_ms: 42,
+            recorded_nonce: [0xEEu8; 16],
+            recorded_chain_depth: 255,
+        };
+        let bytes = rmp_serde::to_vec_named(&wire).unwrap();
+        let back: CrossContextToolInvocationPreparedWire = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back, wire);
     }
 
     #[test]
