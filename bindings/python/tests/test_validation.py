@@ -26,16 +26,16 @@ class TestValidateContentPath:
     """Tests for validate_content_path (SCP-297)."""
 
     def test_valid_root(self) -> None:
-        validate_content_path("/")
+        assert validate_content_path("/") is None
 
     def test_valid_simple_path(self) -> None:
-        validate_content_path("/index.html")
+        assert validate_content_path("/index.html") is None
 
     def test_valid_nested_path(self) -> None:
-        validate_content_path("/assets/css/main.css")
+        assert validate_content_path("/assets/css/main.css") is None
 
     def test_valid_hidden_file(self) -> None:
-        validate_content_path("/.well-known/acme-challenge/token")
+        assert validate_content_path("/.well-known/acme-challenge/token") is None
 
     def test_rejects_no_leading_slash(self) -> None:
         with pytest.raises(ValidationError, match="must start with '/'"):
@@ -116,7 +116,7 @@ class TestValidateContentPath:
     def test_nfc_normalization(self) -> None:
         """Fix 3: NFC normalization — decomposed e-acute accepted after normalization."""
         # U+0065 U+0301 (e + combining acute) normalizes to U+00E9 (e-acute)
-        validate_content_path("/caf\u0065\u0301")
+        assert validate_content_path("/caf\u0065\u0301") is None
 
     def test_error_code(self) -> None:
         with pytest.raises(ValidationError) as exc_info:
@@ -133,13 +133,13 @@ class TestValidateMimeType:
     """Tests for validate_mime_type (SCP-297)."""
 
     def test_valid_text_html(self) -> None:
-        validate_mime_type("text/html")
+        assert validate_mime_type("text/html") is None
 
     def test_valid_application_json(self) -> None:
-        validate_mime_type("application/json")
+        assert validate_mime_type("application/json") is None
 
     def test_valid_image_png(self) -> None:
-        validate_mime_type("image/png")
+        assert validate_mime_type("image/png") is None
 
     def test_rejects_empty(self) -> None:
         with pytest.raises(ValidationError, match="must not be empty"):
@@ -194,7 +194,7 @@ class TestValidateMimeType:
 
     def test_accepts_tchar_special_chars(self) -> None:
         """Fix 2: tchar special characters are accepted."""
-        validate_mime_type("application/vnd.foo+bar")
+        assert validate_mime_type("application/vnd.foo+bar") is None
 
     def test_error_code(self) -> None:
         with pytest.raises(ValidationError) as exc_info:
@@ -211,16 +211,16 @@ class TestValidateDeployId:
     """Tests for validate_deploy_id (SCP-297)."""
 
     def test_valid_simple(self) -> None:
-        validate_deploy_id("deploy-1")
+        assert validate_deploy_id("deploy-1") is None
 
     def test_valid_hex(self) -> None:
-        validate_deploy_id("abc123def456")
+        assert validate_deploy_id("abc123def456") is None
 
     def test_valid_underscore(self) -> None:
-        validate_deploy_id("my_deploy_id")
+        assert validate_deploy_id("my_deploy_id") is None
 
     def test_valid_mixed(self) -> None:
-        validate_deploy_id("Deploy-2024_v1")
+        assert validate_deploy_id("Deploy-2024_v1") is None
 
     def test_rejects_empty(self) -> None:
         with pytest.raises(ValidationError, match="must not be empty"):
