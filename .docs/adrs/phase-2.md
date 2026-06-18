@@ -780,7 +780,7 @@ pub enum EventType {
     ProvenanceReceived,
     // Governance-action-coverage event types (native↔WASM unification; see the
     // Amendment below). Each traces to a GovernanceAction (ADR-031 §2) or a
-    // §19 / §5.11A / §9.9 / §9.10 protocol action.
+    // §19 / §5.11A / §9.9 protocol action.
     AdminTransferred,             // TransferAdmin
     CeilingModified,              // ModifyCeiling applied
     CeilingModificationPending,   // ModifyCeiling delay-window start
@@ -804,7 +804,7 @@ pub enum EventType {
     PruningPolicyModified,        // ModifyPruningPolicy ADR-030 §6
     CommitBroadcasted,            // MLS commit broadcast record §9.9 reconciliation
     CommitBroadcastPending,       // deferred-commit queue record
-    PseudonymAnnounced,           // §9.10.4 per-context pseudonym announcement
+    // (PseudonymAnnounced is NOT a durable EventType — see the exclusion list below.)
     // Lifecycle / migration event types (ADR-049 §9; §5.11A). Parameters live
     // in EventPayload, never in the type name.
     ContextTombstoned,            // §5.11A.5 terminal migration; payload: destination_id, migration_proposal_id (actor_did = "system")
@@ -856,8 +856,8 @@ pub enum EventType {
    binding (§8), compromise recovery (§9.12 step 2 MLS group-epoch advance), and
    provenance (§7.3) — not governance actions alone. Each new
    variant carries its parameters in `EventPayload`; no parameter is ever baked
-   into the type name. Two `EventType`-shaped emissions are deliberately kept out
-   of the Merkle log (see the exclusion list below).
+   into the type name. Three `EventType`-shaped emissions are deliberately kept
+   out of the Merkle log (see the exclusion list below).
 
    > **Amendment (native↔WASM event-log unification).** `EventType` is the single
    > canonical event taxonomy across all implementations. The `scp-runtime`
@@ -871,18 +871,36 @@ pub enum EventType {
    > **Events excluded from the Merkle log (target end state).** After this
    > unification, the canonical Merkle log MUST NOT contain `MessageReceived`
    > (per-recipient local observation; the canonical record is the sender's
-   > `MessageSent`) or `EquivocationDetected` (a local divergence alert, surfaced
-   > as `EquivocationAlert` §23.16.6 / `ContextEvent`). Logging per-recipient or
-   > detection events would make member root-sets non-convergent and defeat
-   > §9.9.3 equivocation detection. This is not yet a pre-existing property:
-   > the `scp-runtime` provider CURRENTLY appends both — `MessageReceived` on the
-   > message-receive path, and `EquivocationDetected` as a local
-   > divergence-alert append. The unification therefore REMOVES those two append
-   > sites, in the same spirit as the name-string defect corrections below; once
-   > removed, these are the **only** two exclusions and every other distinct
-   > event the `scp-runtime` provider appends maps to a typed variant above.
+   > `MessageSent`), `EquivocationDetected` (a local divergence alert, surfaced
+   > as `EquivocationAlert` §23.16.6 / `ContextEvent`), or `PseudonymAnnounced`
+   > (a §9.10.4 routing-bootstrap signal — see below). Logging per-recipient,
+   > detection, or per-receiver routing events would make member root-sets
+   > non-convergent and defeat §9.9.3 equivocation detection. This is not yet a
+   > pre-existing property: the `scp-runtime` provider CURRENTLY appends all
+   > three — `MessageReceived` on the message-receive path, `EquivocationDetected`
+   > as a local divergence-alert append, and `PseudonymAnnounced` on the
+   > announcement-receive path. The unification therefore REMOVES those three
+   > append sites, in the same spirit as the name-string defect corrections
+   > below; once removed, these are the **only** three exclusions and every other
+   > distinct event the `scp-runtime` provider appends maps to a typed variant
+   > above.
+   >
+   > `PseudonymAnnounced` is a `ContextEvent`-only routing-bootstrap signal
+   > (§9.10.4), not a durable `EventType`. A pseudonym announcement is a broadcast
+   > a receiver processes by inserting the peer's `member_did → routing_id` mapping
+   > into its **in-memory** peer registry — the prerequisite for pseudonym-only
+   > app-data fan-out. That registry update plus the in-process
+   > `ContextEvent::PseudonymAnnounced` buffer notification (for SDK observation)
+   > carry the announcement's entire function. A durable Merkle append, by
+   > contrast, would be minted **per receiver, in per-receiver arrival order**:
+   > late joiners never observe earlier announcements, the WASM context manager
+   > appends nothing on receive, and so no two honest members converge on the same
+   > `tree::root` — the exact §9.9.3 non-convergence the `MessageReceived` and
+   > `EquivocationDetected` exclusions guard against. The receive-path append also
+   > had **zero durable consumers** (no checkpoint, export, or proof reads it).
    > Local-only `ContextEvent` notifications that never reach the
-   > Merkle log (e.g. `DegradedMode`, `BufferOverflow`, `SequenceGapDetected`,
+   > Merkle log (e.g. `MessageReceived`, `EquivocationDetected`,
+   > `PseudonymAnnounced`, `DegradedMode`, `BufferOverflow`, `SequenceGapDetected`,
    > `WelcomeGenerated`, `CheckpointCosignatureRequired`) are receive-buffer
    > signals, not log entries, and so are out of `EventType`'s scope entirely.
    >
