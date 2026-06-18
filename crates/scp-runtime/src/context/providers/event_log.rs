@@ -397,10 +397,16 @@ impl MerkleEventLogProvider {
     /// operational events per ADR-030 §2c, classified by the canonical typed
     /// [`scp_event_log::pruning::is_structural_event`].
     ///
-    /// The retained tail is reconstructed via
-    /// [`scp_event_log::checkpoint::TruncatedEventLog::from_log_and_checkpoint`]
-    /// so leaf hashes (and therefore proof paths) remain identical to the
-    /// pre-prune tree.
+    /// The retained tail is reconstructed by re-chaining its events as a fresh
+    /// [`scp_event_log::EventLog`] (see [`truncate_log_keeping_tail`]): the
+    /// first retained event re-anchors to `GENESIS_PREV_HASH` and each
+    /// subsequent event re-chains to the new running head. The pruned
+    /// predecessors are gone, so every tail leaf hash (and the resulting root)
+    /// CHANGES — this matches the `TruncatedEventLog` semantics where a pruned
+    /// log's first entry references a discarded predecessor. Pre-prune proofs
+    /// against the OLD root are no longer valid against the re-chained tail;
+    /// proofs are re-derived from the new tail or generated against the
+    /// retained checkpoint root.
     ///
     /// # Returns
     ///
@@ -595,8 +601,13 @@ fn rebuild_log_from_events(
 /// containing only the tail.
 ///
 /// Uses [`scp_event_log::checkpoint::TruncatedEventLog::from_log_and_checkpoint`]
-/// to recompute the retained tail from the original leaves, preserving leaf
-/// hashes (and therefore the post-prune proof paths) exactly.
+/// to validate the prune boundary, then rebuilds a standalone, append-capable
+/// `EventLog` from the retained tail events. The tail is RE-CHAINED: the first
+/// retained event re-anchors to `GENESIS_PREV_HASH` (its real predecessor was
+/// pruned) and each subsequent event re-chains to the new running head. Every
+/// non-`prev_hash` field (timestamp, type, payload, signature) is preserved,
+/// but because the chaining changes, every tail leaf hash and the resulting
+/// Merkle root differ from the pre-prune tree.
 fn truncate_log_keeping_tail(
     log: &EventLog,
     prune_count: usize,
@@ -771,10 +782,9 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                 .map_err(|e| scp_protocol::context::ContextError::EventLogFailed(e.to_string()))
         })
         .unwrap_or_else(|| {
-            Err(scp_protocol::context::ContextError::EventLogFailed(format!(
-                "no event log for context {}",
-                hex::encode(context_id)
-            )))
+            Err(scp_protocol::context::ContextError::EventLogFailed(
+                format!("no event log for context {}", hex::encode(context_id)),
+            ))
         })
     }
 
@@ -789,10 +799,9 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                 .map_err(|e| scp_protocol::context::ContextError::EventLogFailed(e.to_string()))
         })
         .unwrap_or_else(|| {
-            Err(scp_protocol::context::ContextError::EventLogFailed(format!(
-                "no event log for context {}",
-                hex::encode(context_id)
-            )))
+            Err(scp_protocol::context::ContextError::EventLogFailed(
+                format!("no event log for context {}", hex::encode(context_id)),
+            ))
         })
     }
 }
