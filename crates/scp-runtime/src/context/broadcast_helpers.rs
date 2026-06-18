@@ -789,5 +789,8 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         checkpoint_last_time_secs: state.checkpoint_last_time_secs,
         generation: state.generation,
         routing: state.routing.clone(),
+        // ADR-049 §9 Class S (line 144): persist the staged saga slot
+        // through its sanctioned mirror via the shared helper.
+        saga_pending: crate::context::messaging_helpers::saga_pending_snapshot(state),
     }
 }

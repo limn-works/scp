@@ -8794,6 +8794,7 @@ mod tests {
             checkpoint_last_time_secs: 0,
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
+            saga_pending: HashMap::new(),
         }
     }
 
@@ -10890,6 +10891,7 @@ mod tests {
     /// field added to `GovernanceState` but not the snapshot drops on
     /// round-trip → the corresponding assertion fires).
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn security_critical_state_is_class_s_or_m_not_coalesced() {
         // ---- Class M (crash-surviving in the supervisor-owned crypto Arc;
         // restored by monotonic max-merge per §23.17.2 Inv 2, NOT via the
@@ -10953,6 +10955,43 @@ mod tests {
         let excluded = DID("did:example:class-s-excluded".to_owned());
         state.access.read_exclusion_list.insert(excluded.clone());
 
+        // saga_pending (ADR-049 §9 line 144 — staged cross-context saga
+        // evidence). Stage TWO variants under distinct saga ids: the live
+        // slice-2 cross-context-tool variant (eight journaled fields) and the
+        // receipt-bearing standing-pair variant. Both must survive the
+        // snapshot round-trip through their sanctioned non-derive mirror.
+        let xctx_saga_id =
+            crate::context::supervisor::saga_journal::SagaId("saga-class-s-xctx".to_owned());
+        state.saga_pending.insert(
+            xctx_saga_id.clone(),
+            crate::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextToolInvocation(
+                crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared {
+                    caller_context_id: [0x5Au8; 32],
+                    target_context_id: [0x6Bu8; 32],
+                    caller_did: DID("did:example:class-s-caller".to_owned()),
+                    tool_registration_id: "class-s-tool-v1".to_owned(),
+                    ucan_proof_id: "class-s-ucan-token".to_owned(),
+                    recorded_timestamp_ms: 1_700_000_000_456,
+                    recorded_nonce: [0xC7u8; 16],
+                    recorded_chain_depth: 4,
+                },
+            ),
+        );
+        let standing_saga_id =
+            crate::context::supervisor::saga_journal::SagaId("saga-class-s-standing".to_owned());
+        let standing_derived = [0x9Du8; 32];
+        state.saga_pending.insert(
+            standing_saga_id.clone(),
+            crate::context::supervisor::saga_prepared_state::SagaPreparedState::StandingPairCreate(
+                crate::context::supervisor::saga_prepared_state::StandingPairCreatePrepared {
+                    peer_did: DID("did:example:class-s-peer".to_owned()),
+                    local_did: DID("did:example:class-s-admin".to_owned()),
+                    derived_context_id: standing_derived,
+                    creation_receipt: None,
+                },
+            ),
+        );
+
         // Build the snapshot via the EXACT production sync-persist builder
         // (`build_snapshot_from_state`, the one `persist_state_fail_closed`
         // calls), then round-trip through the real on-disk serialization format.
@@ -10989,6 +11028,63 @@ mod tests {
             restored.read_exclusion_list.contains(&excluded),
             "Class S: read_exclusion_list must round-trip (access revocation)"
         );
+
+        // saga_pending (ADR-049 §9 line 144): both staged variants must survive
+        // the snapshot round-trip through the `SagaPreparedStateSnapshot`
+        // mirror, and rehydrate to the identical live `SagaPreparedState`. A
+        // field that the builder dropped, or a mirror that lost a journaled
+        // field, is exactly the regression this asserts against.
+        assert_eq!(
+            restored.saga_pending.len(),
+            2,
+            "Class S: both staged sagas must round-trip the snapshot"
+        );
+        match restored
+            .saga_pending
+            .get(&xctx_saga_id)
+            .expect("Class S: cross-context saga must round-trip")
+        {
+            crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot::CrossContextToolInvocation(snap) => {
+                assert_eq!(snap.caller_context_id, [0x5Au8; 32]);
+                assert_eq!(snap.target_context_id, [0x6Bu8; 32]);
+                assert_eq!(snap.caller_did, "did:example:class-s-caller");
+                assert_eq!(snap.tool_registration_id, "class-s-tool-v1");
+                assert_eq!(snap.ucan_proof_id, "class-s-ucan-token");
+                assert_eq!(snap.recorded_timestamp_ms, 1_700_000_000_456);
+                assert_eq!(snap.recorded_nonce, [0xC7u8; 16]);
+                assert_eq!(snap.recorded_chain_depth, 4);
+            }
+            _ => panic!("Class S: wrong cross-context saga variant after round-trip"),
+        }
+        match restored
+            .saga_pending
+            .get(&standing_saga_id)
+            .expect("Class S: standing-pair saga must round-trip")
+        {
+            crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot::StandingPairCreate(snap) => {
+                assert_eq!(snap.peer_did, "did:example:class-s-peer");
+                assert_eq!(snap.local_did, "did:example:class-s-admin");
+                assert_eq!(snap.derived_context_id, standing_derived);
+                assert!(snap.creation_receipt.is_none());
+            }
+            _ => panic!("Class S: wrong standing-pair saga variant after round-trip"),
+        }
+
+        // The mirror must rehydrate to the identical live `SagaPreparedState`
+        // (the same-node restore contract). Exercise `into_prepared` directly.
+        match restored
+            .saga_pending
+            .get(&xctx_saga_id)
+            .expect("present")
+            .clone()
+            .into_prepared()
+        {
+            crate::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextToolInvocation(p) => {
+                assert_eq!(p.recorded_chain_depth, 4);
+                assert_eq!(p.caller_did, DID("did:example:class-s-caller".to_owned()));
+            }
+            _ => panic!("Class S: rehydrated wrong variant"),
+        }
     }
 
     /// Drive a membership mutation through its sync-persisting helper boundary

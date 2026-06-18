@@ -1816,9 +1816,18 @@ pub async fn import_context(
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 Phase 2A finalization keystone: import path is
         // encrypted-only (`mode = ContextModeState::Encrypted(default)`).
-        // Receive tracker, saga registry, and Welcome scratchpad start
-        // empty; lifecycle is Open after the replaceability gate
-        // succeeded and the snapshot validated.
+        // Receive tracker and Welcome scratchpad start empty; lifecycle is
+        // Open after the replaceability gate succeeded and the snapshot
+        // validated.
+        //
+        // The saga slot starts EMPTY on import (NOT rehydrated from the
+        // snapshot): unlike same-node restore, a cross-node import receives an
+        // UNTRUSTED exporter's snapshot, and staged saga evidence is
+        // local-instance cross-context coordination state with no authority on
+        // the importing node — its supervisor `SagaJournal`, reservations, and
+        // peer actors do not exist here. `strip_snapshot_for_public` already
+        // strips it to empty; a full import deliberately drops it too so a
+        // foreign saga cannot drive local Commit/Abort.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
         pending_broadcast_publishes: HashMap::new(),
@@ -2236,12 +2245,19 @@ pub async fn restore_context(
         merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
         routing: restored_routing,
         send_tracker: SendSequenceTracker::new(),
-        // ADR-049 Phase 2A finalization keystone: restore path rehydrates
-        // pending sagas / Welcome scratchpads as fresh — the legacy
-        // snapshot format does not carry them, and restore is local
-        // re-launch so cross-context sagas are restarted from scratch.
+        // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
+        // staged saga slot from the snapshot. This is the crash-recovery path
+        // the §9 invariant covers — a Prepare's staged-but-unpublished MLS
+        // handles and B-side reservation linkage MUST survive a crash so
+        // Commit can consume the right reservation. Each entry is reconstructed
+        // from its sanctioned `SagaPreparedStateSnapshot` mirror. The Welcome
+        // scratchpad is genuinely transient and restarts fresh.
         recv_tracker: RecvSequenceTracker::new(),
-        saga_pending: HashMap::new(),
+        saga_pending: ctx_snapshot
+            .saga_pending
+            .into_iter()
+            .map(|(id, mirror)| (id, mirror.into_prepared()))
+            .collect(),
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,

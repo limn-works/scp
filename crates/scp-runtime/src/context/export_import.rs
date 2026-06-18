@@ -817,6 +817,11 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // snapshots are never imported back into a live encrypted context, so
         // the routing axis is irrelevant here.)
         routing: crate::context::actor::state::ContextRouting::Broadcast,
+        // ADR-049 §9: staged saga evidence is local-instance cross-context
+        // coordination state with no authority on any other node. A foreign
+        // saga must never drive a public importer's Commit/Abort, so it is
+        // ALWAYS dropped from the public export.
+        saga_pending: HashMap::new(),
     })
 }
 
@@ -1004,6 +1009,7 @@ mod tests {
             checkpoint_last_time_secs: 0,
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
+            saga_pending: HashMap::new(),
         }
     }
 

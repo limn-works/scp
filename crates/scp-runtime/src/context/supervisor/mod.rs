@@ -136,8 +136,9 @@ pub use saga_journal::{
     SagaJournal, SagaState, SagaTerminalState,
 };
 pub use saga_prepared_state::{
-    BroadcastHostingHandshakePrepared, CrossContextToolInvocationPrepared, SagaPreparedState,
-    StandingPairCreatePrepared,
+    BroadcastHostingHandshakePrepared, BroadcastHostingHandshakeSnapshot,
+    CrossContextToolInvocationPrepared, CrossContextToolInvocationSnapshot, SagaPreparedState,
+    SagaPreparedStateSnapshot, StandingPairCreatePrepared, StandingPairCreateSnapshot,
 };
 /// The per-saga participant-context-set reservation RAII guard. Exposed only
 /// under `test`/`testing` so integration tests can deterministically hold a

@@ -399,6 +399,188 @@ pub struct BroadcastHostingHandshakePrepared {
 }
 
 // ---------------------------------------------------------------------------
+// Class-S snapshot mirror (ADR-049 §9 line 144)
+// ---------------------------------------------------------------------------
+
+/// `Serialize`/`Deserialize` snapshot mirror of [`SagaPreparedState`].
+///
+/// Used to persist the actor-side `saga_pending` slot inside
+/// [`ContextSnapshot`](crate::context::state::ContextSnapshot) as **Class S**
+/// (synchronously-persisted, fail-closed) state per ADR-049 §9 line 144.
+///
+/// # Why a separate mirror
+///
+/// The live [`SagaPreparedState`] enum deliberately does NOT derive `Clone`,
+/// `Debug`, `Display`, `Serialize`, or `Deserialize` — the §9.4.3 non-derive
+/// barrier so a future bearer-bearing variant cannot leak through the enum's
+/// auto-generated impls (see this module's header). The snapshot path
+/// therefore CANNOT serialize the live enum directly. This mirror carries
+/// ONLY the public, non-bearer projection of each variant (the same public
+/// fields the per-variant `*Wire` mirrors already journal), so `saga_pending`
+/// can ride [`ContextSnapshot`] across an actor crash without the live enum
+/// ever gaining a serialization impl. A future bearer-bearing variant would
+/// have to add its own explicit, audited mirror branch here (under
+/// `Zeroizing` discipline) — the barrier holds.
+///
+/// The match in [`SagaPreparedStateSnapshot::from_prepared`] is exhaustive
+/// over every live variant: adding a variant to [`SagaPreparedState`] fails
+/// to compile here until its snapshot projection is decided, so a new saga
+/// type can never be silently dropped from the Class-S snapshot.
+///
+/// Each variant carries its OWN public-field payload struct rather than
+/// reusing the `pub(in crate::context)` journal `*Wire` mirrors: the
+/// snapshot rides the fully-`pub` [`ContextSnapshot`] surface, while the
+/// journal wires stay crate-context-internal to the evidence path. The two
+/// projections cover the identical public fields but have independent
+/// visibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SagaPreparedStateSnapshot {
+    /// Mirror of [`SagaPreparedState::StandingPairCreate`].
+    StandingPairCreate(StandingPairCreateSnapshot),
+    /// Mirror of [`SagaPreparedState::CrossContextToolInvocation`].
+    CrossContextToolInvocation(CrossContextToolInvocationSnapshot),
+    /// Mirror of [`SagaPreparedState::BroadcastHostingHandshake`].
+    BroadcastHostingHandshake(BroadcastHostingHandshakeSnapshot),
+}
+
+/// Public snapshot payload for [`SagaPreparedState::StandingPairCreate`]
+/// (§5.15.8; all fields public, not bearer-bearing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandingPairCreateSnapshot {
+    /// `peer_did.0`.
+    pub peer_did: String,
+    /// `local_did.0`.
+    pub local_did: String,
+    /// The raw 32-byte derived context id.
+    pub derived_context_id: [u8; 32],
+    /// `Some` on the A-side; `None` on the B-side (§5.15.8 "Prepare-B").
+    ///
+    /// `private_interfaces` is allowed for the same deliberate asymmetry as
+    /// the live [`StandingPairCreatePrepared::creation_receipt`] field: the
+    /// field is `pub` (the snapshot rides the public [`ContextSnapshot`]
+    /// surface) while [`CreationReceipt`] is `pub(in crate::context)`.
+    #[allow(private_interfaces)]
+    pub creation_receipt: Option<CreationReceipt>,
+}
+
+/// Public snapshot payload for
+/// [`SagaPreparedState::CrossContextToolInvocation`] (§6.2.4 "Public-metadata
+/// journaling"; all eight fields public, not bearer-bearing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossContextToolInvocationSnapshot {
+    /// The raw 32-byte caller context id.
+    pub caller_context_id: [u8; 32],
+    /// The raw 32-byte target context id.
+    pub target_context_id: [u8; 32],
+    /// `caller_did.0`.
+    pub caller_did: String,
+    /// Context-local tool registration id.
+    pub tool_registration_id: String,
+    /// UCAN proof reference (token id), not the proof bytes.
+    pub ucan_proof_id: String,
+    /// B's Prepare-B captured clock value.
+    pub recorded_timestamp_ms: u64,
+    /// B's staged copy of the 16-byte wire nonce.
+    pub recorded_nonce: [u8; 16],
+    /// B's re-derived inbound depth = `incoming chain_depth + 1`.
+    pub recorded_chain_depth: u8,
+}
+
+/// Public snapshot payload for
+/// [`SagaPreparedState::BroadcastHostingHandshake`] (§5.14.2; all fields
+/// public, not bearer-bearing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BroadcastHostingHandshakeSnapshot {
+    /// The raw 32-byte hosting context id.
+    pub host_context_id: [u8; 32],
+    /// The raw 32-byte broadcast context id being hosted.
+    pub broadcast_context_id: [u8; 32],
+    /// `subscriber_did.0`.
+    pub subscriber_did: String,
+    /// Encoded `BroadcastHostConfig` bytes (opaque pending the broadcast
+    /// handler's actor migration).
+    pub broadcast_host_config_bytes: Vec<u8>,
+}
+
+impl SagaPreparedStateSnapshot {
+    /// Project a live [`SagaPreparedState`] onto its serializable Class-S
+    /// snapshot mirror.
+    ///
+    /// The match is exhaustive — a new [`SagaPreparedState`] variant must add
+    /// a branch here, so it cannot be silently dropped from the snapshot.
+    #[must_use]
+    pub fn from_prepared(prepared: &SagaPreparedState) -> Self {
+        match prepared {
+            SagaPreparedState::StandingPairCreate(inner) => {
+                Self::StandingPairCreate(StandingPairCreateSnapshot {
+                    peer_did: inner.peer_did.0.clone(),
+                    local_did: inner.local_did.0.clone(),
+                    derived_context_id: inner.derived_context_id,
+                    creation_receipt: inner.creation_receipt.clone(),
+                })
+            }
+            SagaPreparedState::CrossContextToolInvocation(inner) => {
+                Self::CrossContextToolInvocation(CrossContextToolInvocationSnapshot {
+                    caller_context_id: inner.caller_context_id,
+                    target_context_id: inner.target_context_id,
+                    caller_did: inner.caller_did.0.clone(),
+                    tool_registration_id: inner.tool_registration_id.clone(),
+                    ucan_proof_id: inner.ucan_proof_id.clone(),
+                    recorded_timestamp_ms: inner.recorded_timestamp_ms,
+                    recorded_nonce: inner.recorded_nonce,
+                    recorded_chain_depth: inner.recorded_chain_depth,
+                })
+            }
+            SagaPreparedState::BroadcastHostingHandshake(inner) => {
+                Self::BroadcastHostingHandshake(BroadcastHostingHandshakeSnapshot {
+                    host_context_id: inner.host_context_id,
+                    broadcast_context_id: inner.broadcast_context_id,
+                    subscriber_did: inner.subscriber_did.0.clone(),
+                    broadcast_host_config_bytes: inner.broadcast_host_config_bytes.clone(),
+                })
+            }
+        }
+    }
+
+    /// Rehydrate a live [`SagaPreparedState`] from its snapshot mirror — the
+    /// same-node restore path (ADR-049 §9 crash recovery). The inverse of
+    /// [`Self::from_prepared`].
+    #[must_use]
+    pub fn into_prepared(self) -> SagaPreparedState {
+        match self {
+            Self::StandingPairCreate(snap) => {
+                SagaPreparedState::StandingPairCreate(StandingPairCreatePrepared {
+                    peer_did: DID(snap.peer_did),
+                    local_did: DID(snap.local_did),
+                    derived_context_id: snap.derived_context_id,
+                    creation_receipt: snap.creation_receipt,
+                })
+            }
+            Self::CrossContextToolInvocation(snap) => {
+                SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
+                    caller_context_id: snap.caller_context_id,
+                    target_context_id: snap.target_context_id,
+                    caller_did: DID(snap.caller_did),
+                    tool_registration_id: snap.tool_registration_id,
+                    ucan_proof_id: snap.ucan_proof_id,
+                    recorded_timestamp_ms: snap.recorded_timestamp_ms,
+                    recorded_nonce: snap.recorded_nonce,
+                    recorded_chain_depth: snap.recorded_chain_depth,
+                })
+            }
+            Self::BroadcastHostingHandshake(snap) => {
+                SagaPreparedState::BroadcastHostingHandshake(BroadcastHostingHandshakePrepared {
+                    host_context_id: snap.host_context_id,
+                    broadcast_context_id: snap.broadcast_context_id,
+                    subscriber_did: DID(snap.subscriber_did),
+                    broadcast_host_config_bytes: snap.broadcast_host_config_bytes,
+                })
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -594,5 +776,91 @@ mod tests {
         assert_send_sync::<StandingPairCreatePrepared>();
         assert_send_sync::<CrossContextToolInvocationPrepared>();
         assert_send_sync::<BroadcastHostingHandshakePrepared>();
+    }
+
+    /// The Class-S snapshot mirror (ADR-049 §9 line 144) must serialize, then
+    /// deserialize, then rehydrate to an identical live `SagaPreparedState`
+    /// for the standing-pair variant (receipt-bearing A-side).
+    #[test]
+    fn snapshot_mirror_round_trips_standing_pair_a_side() {
+        let prepared = SagaPreparedState::StandingPairCreate(StandingPairCreatePrepared {
+            peer_did: bob(),
+            local_did: alice(),
+            derived_context_id: [0x5Cu8; 32],
+            creation_receipt: Some(sample_receipt()),
+        });
+        let mirror = SagaPreparedStateSnapshot::from_prepared(&prepared);
+        let bytes = serde_json::to_vec(&mirror).unwrap();
+        let back: SagaPreparedStateSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(mirror, back);
+        match back.into_prepared() {
+            SagaPreparedState::StandingPairCreate(inner) => {
+                assert_eq!(inner.peer_did, bob());
+                assert_eq!(inner.local_did, alice());
+                assert_eq!(inner.derived_context_id, [0x5Cu8; 32]);
+                assert_eq!(inner.creation_receipt, Some(sample_receipt()));
+            }
+            _ => panic!("wrong variant after rehydrate"),
+        }
+    }
+
+    /// Same round-trip for the cross-context tool-invocation variant — all
+    /// eight journaled fields must survive (§6.2.4 public-metadata journaling).
+    #[test]
+    fn snapshot_mirror_round_trips_cross_context_tool() {
+        let prepared =
+            SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
+                caller_context_id: [0x1Au8; 32],
+                target_context_id: [0x2Bu8; 32],
+                caller_did: alice(),
+                tool_registration_id: "calc-v2".to_owned(),
+                ucan_proof_id: "ucan-xyz".to_owned(),
+                recorded_timestamp_ms: 1_700_111_222_333,
+                recorded_nonce: [0x9Eu8; 16],
+                recorded_chain_depth: 7,
+            });
+        let mirror = SagaPreparedStateSnapshot::from_prepared(&prepared);
+        let bytes = serde_json::to_vec(&mirror).unwrap();
+        let back: SagaPreparedStateSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(mirror, back);
+        match back.into_prepared() {
+            SagaPreparedState::CrossContextToolInvocation(inner) => {
+                assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
+                assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
+                assert_eq!(inner.caller_did, alice());
+                assert_eq!(inner.tool_registration_id, "calc-v2");
+                assert_eq!(inner.ucan_proof_id, "ucan-xyz");
+                assert_eq!(inner.recorded_timestamp_ms, 1_700_111_222_333);
+                assert_eq!(inner.recorded_nonce, [0x9Eu8; 16]);
+                assert_eq!(inner.recorded_chain_depth, 7);
+            }
+            _ => panic!("wrong variant after rehydrate"),
+        }
+    }
+
+    /// Same round-trip for the broadcast-hosting-handshake variant
+    /// (§5.14.2 public fields).
+    #[test]
+    fn snapshot_mirror_round_trips_broadcast_hosting() {
+        let prepared =
+            SagaPreparedState::BroadcastHostingHandshake(BroadcastHostingHandshakePrepared {
+                host_context_id: [0x3Cu8; 32],
+                broadcast_context_id: [0x4Du8; 32],
+                subscriber_did: bob(),
+                broadcast_host_config_bytes: vec![0xAB, 0xCD, 0xEF],
+            });
+        let mirror = SagaPreparedStateSnapshot::from_prepared(&prepared);
+        let bytes = serde_json::to_vec(&mirror).unwrap();
+        let back: SagaPreparedStateSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(mirror, back);
+        match back.into_prepared() {
+            SagaPreparedState::BroadcastHostingHandshake(inner) => {
+                assert_eq!(inner.host_context_id, [0x3Cu8; 32]);
+                assert_eq!(inner.broadcast_context_id, [0x4Du8; 32]);
+                assert_eq!(inner.subscriber_did, bob());
+                assert_eq!(inner.broadcast_host_config_bytes, vec![0xAB, 0xCD, 0xEF]);
+            }
+            _ => panic!("wrong variant after rehydrate"),
+        }
     }
 }

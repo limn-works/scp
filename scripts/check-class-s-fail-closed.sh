@@ -88,6 +88,31 @@
 #   Anti-replay marker:
 #     executed_proposals.insert(   — marks a governance proposal as executed
 #
+#   Cross-context saga staging markers (ADR-049 §9 line 144; spec §5.15.8,
+#   §6.2.4):
+#     saga_pending.insert(         — STAGES (Prepare) cross-context saga
+#                                    evidence into the actor's `saga_pending`
+#                                    map. ADR-049 §9 line 144 lists
+#                                    `saga_pending` Prepare/Commit/Abort
+#                                    transitions in the synchronously-persisted
+#                                    Class-S set. A crash that rolled a staged
+#                                    slot back behind an acked Prepare orphans
+#                                    the supervisor saga journal's reservation
+#                                    linkage (a wedged saga that can neither
+#                                    commit nor cleanly abort). The §6.2.4
+#                                    Prepare/Commit/Abort handlers MUST persist
+#                                    fail-closed before acking.
+#     saga_pending.remove(         — CLEARS (Commit/Abort) the staged slot. The
+#                                    same Class-S fail-closed contract applies:
+#                                    a Commit/Abort that acks before persisting
+#                                    the cleared slot could re-stage a stale
+#                                    saga on a crash respawn.
+#                                    (The struct-literal `saga_pending:` forms
+#                                    in the snapshot builders use `:`, not a
+#                                    method call, so they are NOT flagged — only
+#                                    the live-state `.insert(` / `.remove(`
+#                                    mutations are.)
+#
 # ---------------------------------------------------------------------------
 # HOW A MUTATING FUNCTION IS SATISFIED
 # ---------------------------------------------------------------------------
@@ -268,6 +293,8 @@ suspend_capabilities( \
 membership.remove_member( \
 executed_proposals.insert( \
 threshold_signers.retain( \
+saga_pending.insert( \
+saga_pending.remove( \
 threshold_value= \
 role_state.ceiling="
 

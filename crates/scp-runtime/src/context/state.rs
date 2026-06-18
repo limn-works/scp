@@ -851,6 +851,50 @@ pub struct ContextSnapshot {
     /// re-announce, the same state a cold restore always starts from.
     #[serde(default = "default_context_routing")]
     pub routing: crate::context::actor::state::ContextRouting,
+    /// Staged cross-context saga evidence awaiting Commit or Abort
+    /// (ADR-049 §3 / §9; spec §5.15.8, §6.2.4). **Class S** —
+    /// synchronously-persisted, fail-closed.
+    ///
+    /// # Crash-safety classification — Class S (sync-persisted, fail-closed)
+    ///
+    /// ADR-049 §9 line 144 lists "`saga_pending` Prepare/Commit/Abort
+    /// transitions in the actor snapshot" in the synchronously-persisted set.
+    /// The live actor-side slot is
+    /// [`PerContextState::saga_pending`](crate::context::actor::state::PerContextState::saga_pending),
+    /// a `HashMap<SagaId, SagaPreparedState>`. Each Prepare/Commit/Abort
+    /// transition persists the snapshot containing this map SYNCHRONOUSLY —
+    /// via [`persist_state_fail_closed`](crate::context::messaging_helpers::persist_state_fail_closed)
+    /// — BEFORE the phase reply is acked, and a persist FAILURE FAILS CLOSED
+    /// (the handler returns `Err`, never a best-effort `Ok`). Without this, a
+    /// crash between Prepare and Commit would leave the supervisor
+    /// `SagaJournal` recording a phase the actor can no longer replay (lost
+    /// staged MLS handles / reservation linkage) — an orphaned reservation
+    /// plus a wedged saga that can neither commit nor cleanly abort.
+    ///
+    /// # Non-derive barrier (§9.4.3)
+    ///
+    /// The live [`SagaPreparedState`](crate::context::supervisor::saga_prepared_state::SagaPreparedState)
+    /// enum deliberately does NOT derive `Serialize`/`Deserialize` (the
+    /// §9.4.3 bearer barrier). This snapshot field therefore carries the
+    /// sanctioned public-projection mirror
+    /// [`SagaPreparedStateSnapshot`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot)
+    /// instead, populated through the shared
+    /// [`saga_pending_snapshot`](crate::context::messaging_helpers::saga_pending_snapshot)
+    /// helper at every snapshot builder.
+    ///
+    /// # Local-only coordination state
+    ///
+    /// This is local cross-context coordination evidence with no authority on
+    /// any other node. Same-node restore REHYDRATES it (crash recovery);
+    /// cross-node `import_context` and the public `strip_snapshot_for_public`
+    /// export DROP it to empty — a foreign saga must never drive local
+    /// Commit/Abort. `#[serde(default)]` so legacy / stripped snapshots
+    /// deserialize as an empty map.
+    #[serde(default)]
+    pub saga_pending: HashMap<
+        crate::context::supervisor::saga_journal::SagaId,
+        crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot,
+    >,
 }
 
 /// Default routing variant for degraded / pre-routing-field snapshots.

@@ -2117,7 +2117,41 @@ pub fn build_snapshot_from_state(
         // single shared type between live state and the serialized snapshot,
         // so no field-by-field translation is needed.
         routing: state.routing.clone(),
+        // ADR-049 §9 Class S (line 144): persist the staged saga slot through
+        // its sanctioned serialization mirror so a Prepare's staged evidence
+        // survives an actor crash. See [`saga_pending_snapshot`].
+        saga_pending: saga_pending_snapshot(state),
     }
+}
+
+/// Project the actor-side `saga_pending` map onto its serializable Class-S
+/// snapshot mirror (ADR-049 §9 line 144; spec §5.15.8 / §6.2.4 Prepare).
+///
+/// The live [`SagaPreparedState`](crate::context::supervisor::saga_prepared_state::SagaPreparedState)
+/// enum keeps the §9.4.3 non-derive barrier, so the snapshot carries the
+/// sanctioned
+/// [`SagaPreparedStateSnapshot`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot)
+/// mirror instead. Every snapshot builder (the canonical one here plus the
+/// broadcast / ttl-close / trust-recovery / manager copies) routes through
+/// THIS one helper, so a saga in flight is dropped by none of them.
+#[must_use]
+pub(in crate::context) fn saga_pending_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<
+    crate::context::supervisor::saga_journal::SagaId,
+    crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot,
+> {
+    use crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot;
+    state
+        .saga_pending
+        .iter()
+        .map(|(id, prepared)| {
+            (
+                id.clone(),
+                SagaPreparedStateSnapshot::from_prepared(prepared),
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
