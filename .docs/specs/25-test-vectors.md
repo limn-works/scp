@@ -356,7 +356,68 @@ Root: SHA-256(0x01 || interior_L || interior_R)
     = 0x5c8dc617d287a4297eb2bcb81b37644b5138e57ad461c657db152109e3fc9fca
 ```
 
-Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree construction itself (leaf/interior domain prefixes, unbalanced promotion). A typed-leaf vector — where each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` value whose `event_type` is one of the closed `EventType` taxonomy (ADR-011 AC1, native↔WASM unification Amendment, including the lifecycle, consequence-enforcement, commit-broadcast, and app-sandbox variants added by that Amendment) — together with a checkpoint `tree::root` (§23.16.1) KAT, will be added here when the unification lands in code; the expected byte values are implementation-derived and are not pre-computed in this spec.
+Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree construction itself (leaf/interior domain prefixes, unbalanced promotion). The typed-leaf and checkpoint vectors below pin the *typed* leaf preimage and the checkpoint root.
+
+### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
+
+Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 76-variant `EventType` taxonomy (ADR-011 AC1 + native↔WASM unification Amendment). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+
+```
+Signing key seed (32 bytes): 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+Actor DID (did:dht:z<z-base-32(pubkey)>):
+  did:dht:zxg4icmwxh3kx1odasrjqtkcmw6eb9bj4h4k57i9yhqeozmer131y
+Context ID: "ctx-kat"
+
+Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
+
+  seq 0  AppBound                 ts 1700000000
+         payload = rmp(AppBoundPayload{ app_did:"did:key:app", app_name:"Scheduler",
+                       app_version:"1.0.0", capabilities:["tool:invoke:*"] })
+         leaf = 0xe0c0691d264ca38d086375a0274afb630e9bbb906f2e12e0112adf4d1b4fcd38
+
+  seq 1  SpendApproved            ts 1700000001
+         payload = rmp(SpendApprovedPayload{ spender:"did:key:agent", amount:5000,
+                       purpose:"inference" })
+         leaf = 0xf2f973a4df60ef87abcb99dd1f3afcd537037cbd1aae6297582c52be3bd8e695
+
+  seq 2  TtlExtended              ts 1700000002
+         payload = rmp(TtlExtendedPayload{ old_deadline_unix:1700000000,
+                       new_deadline_unix:1800000000, proposal_id:[0xAB;32],
+                       consenting_members:["did:key:a","did:key:b"] })
+         leaf = 0xccdbb8dfa15a7abff3fbd0c08efe45e99d9fc4cb5f042f8f7db5f9e36e3fb0b0
+
+  seq 3  RecoveryEpochAdvanced    ts 1700000003
+         payload = rmp(RecoveryEpochAdvancedPayload{ old_epoch:7, new_epoch:8 })
+         leaf = 0x7a1a91c33ddaa1a92c02f70a3f567f065bed48b578124a803c07dca2f9a47863
+
+  seq 4  ContextTombstoned        ts 1700000004
+         payload = rmp(ContextTombstonedPayload{ destination_id:"ctx-dest",
+                       migration_proposal_id:[0xCD;32] })
+         leaf = 0x3848718f23aefaba0e47743e72f5ce3bcc3254bc09b4cb38c3f5c263c9c4dd8d
+
+  seq 5  ConsequenceTriggered     ts 1700000005
+         payload = b"member_did=did:key:m;rule_index=2;trigger_kind=absence;action_type=suspend"
+         leaf = 0x7ea6b6a020d94e0850cb84410af43e69ecd1c945223cbf478356d93503724507
+
+  seq 6  CommitBroadcastSucceeded ts 1700000006
+         payload = b"operation=join;attempts=3"
+         leaf = 0x87e3cde25168f4af4328f010369313e28fde305dbc6f706be3392fdf7b8e7f3c
+
+RFC 6962 tree::root over the 7 leaves:
+  0x39e50b879956255f4fd28b2c6f03995e759919e07166c232dd61ed321b54d40d
+```
+
+### Vector 33: Checkpoint Root KAT (§23.16.1)
+
+A `ConsistencyCheckpoint` generated over the Vector 32 log MUST carry `merkle_root == tree::root` (the RFC 6962 root above), NOT a hash-chain head. The checkpoint canonical hash is `SHA-256("SCP-CHECKPOINT-V1:" || len(context_id) || context_id || len(sender_did) || sender_did || event_count_BE || merkle_root || epoch_tag || timestamp_BE)` where `epoch_tag = 0x01 || epoch_BE` for `Some(epoch)` (§23.16.1); the checkpoint signature is the actor's Ed25519 signature over that canonical hash. The canonical hash and signature depend on the checkpoint `timestamp` (wall clock) and so are not pinned here; the pinned, timestamp-independent invariant is:
+
+```
+checkpoint.merkle_root == tree::root (Vector 32)
+  = 0x39e50b879956255f4fd28b2c6f03995e759919e07166c232dd61ed321b54d40d
+checkpoint.event_count == 7
+```
+
+Reference implementation and assertions: `crates/scp-event-log/tests/test_vectors.rs` (`vector_32_typed_leaf_and_checkpoint_kat`, `vector_33_checkpoint_root_equals_tree_root_kat`). Regenerate with `cargo test -p scp-event-log --test test_vectors -- --nocapture`.
 
 ## 25.9 Key Continuity Fingerprint Vectors (§9.11)
 

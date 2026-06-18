@@ -5040,7 +5040,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scp-core"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "scp-protocol",
  "scp-runtime",
@@ -5049,7 +5049,7 @@ dependencies = [
 
 [[package]]
 name = "scp-event-log"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
  "ed25519-dalek 2.2.0",
@@ -5260,7 +5260,7 @@ dependencies = [
 
 [[package]]
 name = "scp-identity"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "base64",
  "bs58",
@@ -5284,7 +5284,7 @@ dependencies = [
 
 [[package]]
 name = "scp-mcp"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "axum",
  "scp-core",
@@ -5302,7 +5302,7 @@ dependencies = [
 
 [[package]]
 name = "scp-media"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "openmls_traits 0.5.0",
  "scp-core",
@@ -5316,7 +5316,7 @@ dependencies = [
 
 [[package]]
 name = "scp-node"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -5365,7 +5365,7 @@ dependencies = [
 
 [[package]]
 name = "scp-platform"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -5391,7 +5391,7 @@ dependencies = [
 
 [[package]]
 name = "scp-primitives"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
@@ -5404,7 +5404,7 @@ dependencies = [
 
 [[package]]
 name = "scp-protocol"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -5443,7 +5443,7 @@ dependencies = [
 
 [[package]]
 name = "scp-relay"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "axum",
  "metrics",
@@ -5456,7 +5456,7 @@ dependencies = [
 
 [[package]]
 name = "scp-runtime"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -5549,7 +5549,7 @@ dependencies = [
 
 [[package]]
 name = "scp-transport"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
  "aws-config",

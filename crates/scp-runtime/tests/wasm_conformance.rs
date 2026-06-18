@@ -61,18 +61,31 @@ fn log_summary_timestamp_plausible_and_clamped() {
 }
 
 // ===========================================================================
-// WASM context registry mirror (verbatim from scp-ffi-wasm/src/runtime.rs)
+// WASM context registry semantics (independent mirror)
 //
-// Mirrors the registry functions to validate registration, lookup, and
-// removal semantics. See issue #137.
+// The WASM bridge keys per-context state by context ID in
+// `WasmContextManager` (`crates/scp-ffi/wasm/src/manager.rs`): registration
+// rejects duplicates, lookup of an unknown context errors, and removal evicts
+// the entry. This module is a small INDEPENDENT model of those semantics —
+// registration/duplicate-rejection/lookup/removal — not a line-for-line copy
+// of any single bridge function (the bridge stores richer `PerContextState`).
+// It pins the contract the bridge's registry must uphold.
+//
+// NOTE (separate cleanup): like the former hand-mirrored tag table, this model
+// re-implements its own registry rather than exercising the real WASM type, so
+// it can only catch contract regressions in this copy, not in the bridge. It is
+// left intact here per the scope of this change; a follow-up should retarget it
+// at the real `WasmContextManager` or retire it.
 // ===========================================================================
 
 mod wasm_registry_mirror {
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
 
-    /// Minimal mirror of `WasmContextRuntime` — only the fields needed to
-    /// validate registry semantics.
+    /// Minimal model of the per-context state the WASM bridge tracks — only the
+    /// fields needed to validate registry semantics (registration, lookup,
+    /// removal, default ceiling). The real bridge state is `PerContextState` in
+    /// `crates/scp-ffi/wasm/src/manager.rs`.
     pub struct WasmContextRuntime {
         pub creator_did: String,
         pub ceiling_strings: HashSet<String>,
@@ -83,7 +96,9 @@ mod wasm_registry_mirror {
             RefCell::new(HashMap::new());
     }
 
-    /// Mirrors `runtime::register_context` from `scp-ffi-wasm/src/runtime.rs`.
+    /// Models the WASM bridge's context-registration semantics
+    /// (`WasmContextManager` in `crates/scp-ffi/wasm/src/manager.rs`):
+    /// inserts per-context state and rejects a duplicate context ID.
     pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), String> {
         CONTEXT_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
@@ -117,14 +132,18 @@ mod wasm_registry_mirror {
         })
     }
 
-    /// Mirrors `runtime::remove_context` from `scp-ffi-wasm/src/runtime.rs`.
+    /// Models the WASM bridge's context-removal semantics
+    /// (`WasmContextManager` in `crates/scp-ffi/wasm/src/manager.rs`): evicts
+    /// the per-context entry on close.
     pub fn remove_context(context_id: &str) {
         CONTEXT_REGISTRY.with(|reg| {
             reg.borrow_mut().remove(context_id);
         });
     }
 
-    /// Mirrors `runtime::with_context` from `scp-ffi-wasm/src/runtime.rs`.
+    /// Models the WASM bridge's per-context lookup-or-error semantics
+    /// (`WasmContextManager` in `crates/scp-ffi/wasm/src/manager.rs`): a lookup
+    /// against an unknown context ID returns a "not found" error.
     pub fn with_context<T, F>(context_id: &str, f: F) -> Result<T, String>
     where
         F: FnOnce(&mut WasmContextRuntime) -> Result<T, String>,
@@ -1453,174 +1472,165 @@ fn provenance_hash_conformance_registry_with_payment() {
 }
 
 // ===========================================================================
-// WASM event type tag exhaustiveness
+// Canonical event-type tag contract (closed 76-variant bijection)
+//
+// `event_type_tag` (`scp_event_log::tree`) is a protocol constant used in two
+// places: (a) the NATIVE signed-event canonical hash —
+// `tree::compute_event_canonical_hash`, the `SCP-EVENT-V1:` signature preimage
+// — and (b) retention classification (`scp-event-log/src/pruning.rs` and
+// `tiered_storage.rs`). It does NOT enter the Merkle leaf hash.
+//
+// The WASM bridge does NOT invoke `event_type_tag` at all. Its context manager
+// (`crates/scp-ffi/wasm/src/manager.rs`, `append_log_event`) appends UNSIGNED
+// events via `append_unsigned_event` (`signature: vec![]`), whose leaf is
+// `SHA-256(0x00 || rmp_serde(Event))` — committing `EventType` through its
+// SERDE VARIANT NAME, not through this numeric tag. Native↔WASM leaf parity for
+// the event type is therefore carried by the SHARED SERDE REPRESENTATION of the
+// `EventType` enum (both targets depend on the same `scp_event_log` crate), NOT
+// by `event_type_tag`.
+//
+// This test pins the tag invariant the native signed path and retention
+// classification rely on: over the full closed `EventType` taxonomy,
+// `event_type_tag` is a bijection onto the contiguous tags 0..=75. A variant
+// that lacks a tag (or collides with an existing one) would corrupt the native
+// `SCP-EVENT-V1:` signature preimage and retention classification, and is
+// caught here. The
+// byte-level native↔WASM root anchor lives in the §25 KAT (Vectors 32/33 in
+// `crates/scp-event-log/tests/test_vectors.rs`); this test is the
+// closed-taxonomy / distinct-tag pin that complements it.
 // ===========================================================================
 
 #[test]
-fn wasm_event_type_tag_exhaustiveness() {
-    fn wasm_event_type_tag(event_type: &str) -> u16 {
-        match event_type {
-            "ContextCreated" => 0,
-            "ContextClosing" => 1,
-            "ContextClosed" => 2,
-            "ContextExpired" => 3,
-            "MemberJoined" => 4,
-            "MemberLeft" => 5,
-            "RoleAssigned" => 6,
-            "TokenRevoked" | "UcanRevoked" => 7,
-            "MessageSent" => 8,
-            "ToolRegistered" => 9,
-            "ToolUpdated" => 10,
-            "ToolInvoked" => 11,
-            "ToolVerified" => 12,
-            "ToolInterfaceEstablished" => 13,
-            "GovernanceAction" => 14,
-            "ConsistencyCheckpoint" => 15,
-            "AbsenceProofRequested" => 16,
-            "MemberBlocked" => 17,
-            "KeyEpochAdvance" => 18,
-            "MediaSessionStarted" => 19,
-            "MediaSessionEnded" => 20,
-            "PaymentReceived" => 21,
-            "EconomicPolicyChanged" => 22,
-            "EconomicPolicyApplied" => 33,
-            "SpendingUcanGranted" => 23,
-            "SpendingUcanRevoked" => 24,
-            "GovernanceProposalCreated" => 25,
-            "GovernanceVoteCast" => 26,
-            "GovernanceVoteWithdrawn" => 27,
-            "GovernanceProposalResolved" => 28,
-            "GovernanceConflictDetected" => 29,
-            "GovernanceConflictResolved" => 30,
-            "GovernanceDeadlockRecovery" => 31,
-            "GovernanceActionExecuted" | "GovernanceExecuted" => 32,
-            "ProvenanceAttached" => 34,
-            "ProvenanceReceived" => 35,
-            _ => 0xFFFF,
-        }
-    }
-
-    let all_event_type_strings = [
-        "ContextCreated",
-        "ContextClosing",
-        "ContextClosed",
-        "ContextExpired",
-        "MemberJoined",
-        "MemberLeft",
-        "MessageSent",
-        "ToolRegistered",
-        "ToolInvoked",
-        "UcanRevoked",
-        "GovernanceExecuted",
-        "GovernanceProposalCreated",
-        "GovernanceVoteCast",
-        "GovernanceVoteWithdrawn",
-        "ProvenanceAttached",
-        "ProvenanceReceived",
-        "RoleAssigned",
-        "TokenRevoked",
-        "ToolUpdated",
-        "ToolVerified",
-        "ToolInterfaceEstablished",
-        "GovernanceAction",
-        "ConsistencyCheckpoint",
-        "AbsenceProofRequested",
-        "MemberBlocked",
-        "KeyEpochAdvance",
-        "MediaSessionStarted",
-        "MediaSessionEnded",
-        "PaymentReceived",
-        "EconomicPolicyChanged",
-        "EconomicPolicyApplied",
-        "SpendingUcanGranted",
-        "SpendingUcanRevoked",
-        "GovernanceProposalResolved",
-        "GovernanceConflictDetected",
-        "GovernanceConflictResolved",
-        "GovernanceDeadlockRecovery",
-        "GovernanceActionExecuted",
+fn canonical_event_type_tag_is_a_closed_bijection() {
+    // The complete closed `EventType` taxonomy in canonical (tag) order. This
+    // is enumerated here independently of `scp_event_log`'s internal test-only
+    // array so that adding a variant to the public enum without updating this
+    // conformance list is itself a compile/assertion failure.
+    let all_variants: [EventType; 76] = [
+        EventType::ContextCreated,
+        EventType::ContextClosing,
+        EventType::ContextClosed,
+        EventType::ContextExpired,
+        EventType::MemberJoined,
+        EventType::MemberLeft,
+        EventType::RoleAssigned,
+        EventType::TokenRevoked,
+        EventType::MessageSent,
+        EventType::ToolRegistered,
+        EventType::ToolUpdated,
+        EventType::ToolInvoked,
+        EventType::ToolVerified,
+        EventType::ToolInterfaceEstablished,
+        EventType::GovernanceAction,
+        EventType::ConsistencyCheckpoint,
+        EventType::AbsenceProofRequested,
+        EventType::MemberBlocked,
+        EventType::KeyEpochAdvance,
+        EventType::MediaSessionStarted,
+        EventType::MediaSessionEnded,
+        EventType::PaymentReceived,
+        EventType::EconomicPolicyChanged,
+        EventType::EconomicPolicyApplied,
+        EventType::SpendingUcanGranted,
+        EventType::SpendingUcanRevoked,
+        EventType::GovernanceProposalCreated,
+        EventType::GovernanceVoteCast,
+        EventType::GovernanceVoteWithdrawn,
+        EventType::GovernanceProposalResolved,
+        EventType::GovernanceConflictDetected,
+        EventType::GovernanceConflictResolved,
+        EventType::GovernanceDeadlockRecovery,
+        EventType::GovernanceActionExecuted,
+        EventType::ProvenanceAttached,
+        EventType::ProvenanceReceived,
+        EventType::AdminTransferred,
+        EventType::CeilingModified,
+        EventType::CeilingModificationPending,
+        EventType::ThresholdModified,
+        EventType::SignerAdded,
+        EventType::SignerRemoved,
+        EventType::ChildContextCreated,
+        EventType::ContextPromoted,
+        EventType::ContentKeysRotated,
+        EventType::MemberReset,
+        EventType::MemberSuspended,
+        EventType::MemberSuspendedAll,
+        EventType::MemberUnblocked,
+        EventType::AccessRestored,
+        EventType::GovernanceReconfigured,
+        EventType::GovernanceFreezeExpired,
+        EventType::HardRateLimitModified,
+        EventType::EconomicPolicyLocked,
+        EventType::ContextMigrationStarted,
+        EventType::ToolRemoved,
+        EventType::PruningPolicyModified,
+        EventType::CommitBroadcasted,
+        EventType::CommitBroadcastPending,
+        EventType::PseudonymAnnounced,
+        EventType::ContextTombstoned,
+        EventType::ContextMigrationCancelled,
+        EventType::TtlExtended,
+        EventType::TtlExtensionRejected,
+        EventType::AccessRevoked,
+        EventType::SpendApproved,
+        EventType::PaymentCaptureFailed,
+        EventType::ConsequenceTriggered,
+        EventType::ConsequenceEnforced,
+        EventType::ConsequenceEnforcementFailed,
+        EventType::ConsequenceEscalatedToSuspendAll,
+        EventType::CommitBroadcastSucceeded,
+        EventType::CommitBroadcastFailed,
+        EventType::RecoveryEpochAdvanced,
+        EventType::AppBound,
+        EventType::AppUnbound,
     ];
 
-    for event_type in &all_event_type_strings {
-        let tag = wasm_event_type_tag(event_type);
-        assert_ne!(
-            tag, 0xFFFF,
-            "WASM event type string '{event_type}' maps to sentinel 0xFFFF — \
-             add a mapping to wasm_event_type_tag in crates/scp-ffi/wasm/src/runtime.rs"
-        );
-    }
+    // Exhaustiveness guard: the closed taxonomy is exactly 76 variants
+    // (canonical tags 0..=75). If a variant is added to the public `EventType`
+    // enum, this conformance list must grow to match — a stale list of 76 here
+    // would fail to exercise the new variant, so keeping this pinned forces the
+    // list to be maintained alongside the enum.
+    assert_eq!(
+        all_variants.len(),
+        76,
+        "this conformance list must enumerate the full closed 76-variant \
+         EventType taxonomy — update it (and `scp-event-log/src/tree.rs` \
+         `event_type_tag`) when an EventType variant is added"
+    );
 
-    let all_variants = [
-        (EventType::ContextCreated, "ContextCreated"),
-        (EventType::ContextClosing, "ContextClosing"),
-        (EventType::ContextClosed, "ContextClosed"),
-        (EventType::ContextExpired, "ContextExpired"),
-        (EventType::MemberJoined, "MemberJoined"),
-        (EventType::MemberLeft, "MemberLeft"),
-        (EventType::RoleAssigned, "RoleAssigned"),
-        (EventType::TokenRevoked, "TokenRevoked"),
-        (EventType::MessageSent, "MessageSent"),
-        (EventType::ToolRegistered, "ToolRegistered"),
-        (EventType::ToolUpdated, "ToolUpdated"),
-        (EventType::ToolInvoked, "ToolInvoked"),
-        (EventType::ToolVerified, "ToolVerified"),
-        (
-            EventType::ToolInterfaceEstablished,
-            "ToolInterfaceEstablished",
-        ),
-        (EventType::GovernanceAction, "GovernanceAction"),
-        (EventType::ConsistencyCheckpoint, "ConsistencyCheckpoint"),
-        (EventType::AbsenceProofRequested, "AbsenceProofRequested"),
-        (EventType::MemberBlocked, "MemberBlocked"),
-        (EventType::KeyEpochAdvance, "KeyEpochAdvance"),
-        (EventType::MediaSessionStarted, "MediaSessionStarted"),
-        (EventType::MediaSessionEnded, "MediaSessionEnded"),
-        (EventType::PaymentReceived, "PaymentReceived"),
-        (EventType::EconomicPolicyChanged, "EconomicPolicyChanged"),
-        (EventType::EconomicPolicyApplied, "EconomicPolicyApplied"),
-        (EventType::SpendingUcanGranted, "SpendingUcanGranted"),
-        (EventType::SpendingUcanRevoked, "SpendingUcanRevoked"),
-        (
-            EventType::GovernanceProposalCreated,
-            "GovernanceProposalCreated",
-        ),
-        (EventType::GovernanceVoteCast, "GovernanceVoteCast"),
-        (
-            EventType::GovernanceVoteWithdrawn,
-            "GovernanceVoteWithdrawn",
-        ),
-        (
-            EventType::GovernanceProposalResolved,
-            "GovernanceProposalResolved",
-        ),
-        (
-            EventType::GovernanceConflictDetected,
-            "GovernanceConflictDetected",
-        ),
-        (
-            EventType::GovernanceConflictResolved,
-            "GovernanceConflictResolved",
-        ),
-        (
-            EventType::GovernanceDeadlockRecovery,
-            "GovernanceDeadlockRecovery",
-        ),
-        (
-            EventType::GovernanceActionExecuted,
-            "GovernanceActionExecuted",
-        ),
-        (EventType::ProvenanceAttached, "ProvenanceAttached"),
-        (EventType::ProvenanceReceived, "ProvenanceReceived"),
-    ];
+    // Distinct-tag bijection: every canonical variant maps to a unique tag in
+    // 0..=75. A collision (two variants → one tag) or a gap would corrupt the
+    // native `SCP-EVENT-V1:` signature preimage (`compute_event_canonical_hash`)
+    // and the retention classification keyed on the tag in `pruning.rs` /
+    // `tiered_storage.rs`.
+    let mut tags: Vec<u16> = all_variants.iter().map(event_type_tag).collect();
+    assert_eq!(
+        tags.len(),
+        76,
+        "expected one tag per canonical EventType variant"
+    );
+    tags.sort_unstable();
+    tags.dedup();
+    assert_eq!(
+        tags.len(),
+        76,
+        "event_type_tag must be a bijection: all 76 EventType variants must map \
+         to distinct tags — fix `scp-event-log/src/tree.rs` `event_type_tag`"
+    );
 
-    for (variant, name) in &all_variants {
-        let native_tag = event_type_tag(variant);
-        let wasm_tag = wasm_event_type_tag(name);
-        assert_eq!(
-            native_tag, wasm_tag,
-            "tag mismatch for {name}: native={native_tag}, wasm={wasm_tag}"
-        );
-    }
+    // The bijection must cover the contiguous range 0..=75 with no holes, which
+    // (together with distinctness above) pins the exact canonical tag assignment
+    // the native signature preimage and retention classification depend on.
+    assert_eq!(
+        tags.first().copied(),
+        Some(0),
+        "canonical event_type_tag range must start at 0"
+    );
+    assert_eq!(
+        tags.last().copied(),
+        Some(75),
+        "canonical event_type_tag range must end at 75 (76 contiguous tags)"
+    );
 }
 
 /// Confirms that `chain_depth: u8` (scp-core) and `chain_depth: u32` (WASM)
