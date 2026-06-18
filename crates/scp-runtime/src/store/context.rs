@@ -1086,10 +1086,7 @@ impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersist
     fn load_entries(
         &self,
         context_id: &str,
-    ) -> Result<
-        Option<Vec<scp_event_log::Event>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Option<Vec<scp_event_log::Event>>, Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.clone();
         let ctx_id = context_id.to_owned();
         let result = tokio::task::block_in_place(|| {
@@ -1937,7 +1934,10 @@ mod tests {
 
         let loaded = bridge.load_entries("ctx-bridge-el").unwrap().unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].event_type, scp_event_log::EventType::ContextCreated);
+        assert_eq!(
+            loaded[0].event_type,
+            scp_event_log::EventType::ContextCreated
+        );
         assert_eq!(loaded[1].event_type, scp_event_log::EventType::MemberJoined);
 
         bridge.delete_entries("ctx-bridge-el").unwrap();
@@ -1976,7 +1976,10 @@ mod tests {
 
         let loaded = bridge.load_entries("ctx-bridge-bulk").unwrap().unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].event_type, scp_event_log::EventType::ContextCreated);
+        assert_eq!(
+            loaded[0].event_type,
+            scp_event_log::EventType::ContextCreated
+        );
         assert_eq!(loaded[1].event_type, scp_event_log::EventType::MemberJoined);
     }
 

@@ -1649,10 +1649,11 @@ fn append_message_sent_or_rollback_sequence(
     sender_did: &DID,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
-    if let Err(e) =
-        deps.event_log
-            .append_context_event(context_id_bytes, scp_event_log::EventType::MessageSent, sender_did.as_ref())
-    {
+    if let Err(e) = deps.event_log.append_context_event(
+        context_id_bytes,
+        scp_event_log::EventType::MessageSent,
+        sender_did.as_ref(),
+    ) {
         if !is_broadcast {
             state.membership.rollback_sequence_number(sender_did);
         }
@@ -3201,15 +3202,12 @@ mod pseudonym_routing_tests {
         // enough to trip threshold 1. The triggered consequence carries non-empty
         // evidence, so `ConsequenceTriggered` is emitted even though the sender is
         // not in the test fixture's (empty) membership set.
-        state
-            .governance
-            .consequence_rules
-            .push(ConsequenceRule {
-                trigger: ConsequenceTrigger::MessageVelocity,
-                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-                threshold: 1,
-                window: std::time::Duration::from_secs(3600),
-            });
+        state.governance.consequence_rules.push(ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: std::time::Duration::from_secs(3600),
+        });
 
         let clock = TestClock::new(1_700_000_100);
         let event_log = RecordingEventLog::default();
@@ -3230,14 +3228,7 @@ mod pseudonym_routing_tests {
         // in-order path — this is exactly the call shape the four buffered-drain
         // sites now use.
         run_buffered_post_delivery(
-            &mut state,
-            &ctx,
-            &ctx_bytes,
-            ALICE,
-            event_name,
-            &clock,
-            &event_log,
-            None,
+            &mut state, &ctx, &ctx_bytes, ALICE, event_name, &clock, &event_log, None,
         );
 
         // (a) Velocity was recorded for the sender.

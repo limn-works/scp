@@ -600,7 +600,11 @@ pub async fn close_context(
     let should_schedule_key_destruction =
         memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary;
 
-    event_log.append_context_event(&context_id_bytes, scp_event_log::EventType::ContextClosing, initiator_did.as_ref())?;
+    event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ContextClosing,
+        initiator_did.as_ref(),
+    )?;
 
     Ok(CloseResult {
         should_generate_summary,
@@ -658,7 +662,11 @@ pub async fn finalize_close(
         let _ = transport.delete_published(&context_id_bytes);
     }
 
-    event_log.append_context_event(&context_id_bytes, scp_event_log::EventType::ContextClosed, "system:close")?;
+    event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::ContextClosed,
+        "system:close",
+    )?;
 
     Ok(())
 }
@@ -836,7 +844,11 @@ pub async fn try_ttl_expiry_cleanup(
     // 3. Event log append — skip if already succeeded on a prior attempt to
     //    avoid duplicate ContextExpired entries in the Merkle log.
     if result.completed_steps & STEP_EVENT_LOGGED == 0 {
-        match event_log.append_context_event(&context_id_bytes, scp_event_log::EventType::ContextExpired, "system:timer") {
+        match event_log.append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextExpired,
+            "system:timer",
+        ) {
             Ok(()) => result.set_step(STEP_EVENT_LOGGED),
             Err(e) => {
                 let msg = format!("failed to log ContextExpired event: {e}");

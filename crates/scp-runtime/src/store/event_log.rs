@@ -683,12 +683,11 @@ impl<S: Storage> ProtocolRepository<S> {
         // to zero-padding).
         let mut entries = Vec::with_capacity(keys.len());
         for key in &keys {
-            let entry: scp_event_log::Event =
-                self.load_value(key).await?.ok_or_else(|| {
-                    StoreError::DeserializationFailed(format!(
-                        "merkle event log entry missing after list_keys: {key}"
-                    ))
-                })?;
+            let entry: scp_event_log::Event = self.load_value(key).await?.ok_or_else(|| {
+                StoreError::DeserializationFailed(format!(
+                    "merkle event log entry missing after list_keys: {key}"
+                ))
+            })?;
             entries.push(entry);
         }
         Ok(Some(entries))
@@ -1221,7 +1220,6 @@ mod tests {
 
     #[tokio::test]
     async fn store_and_load_single_merkle_event_log_entry() {
-
         let store = make_store();
         let entry = scp_event_log::Event {
             event_type: scp_event_log::EventType::ContextCreated,
@@ -1245,32 +1243,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].event_type, scp_event_log::EventType::ContextCreated);
+        assert_eq!(
+            loaded[0].event_type,
+            scp_event_log::EventType::ContextCreated
+        );
     }
 
     #[tokio::test]
     async fn store_and_load_merkle_event_log_entries_roundtrip() {
-
         let store = make_store();
         let entries = vec![
             scp_event_log::Event {
-            event_type: scp_event_log::EventType::ContextCreated,
-            actor_did: scp_event_log::DID(String::new()),
-            timestamp: 1_700_000_000,
-            sequence: 0,
-            payload: scp_event_log::EventPayload::default(),
-            prev_hash: [0u8; 32],
-            signature: Vec::new(),
-        },
+                event_type: scp_event_log::EventType::ContextCreated,
+                actor_did: scp_event_log::DID(String::new()),
+                timestamp: 1_700_000_000,
+                sequence: 0,
+                payload: scp_event_log::EventPayload::default(),
+                prev_hash: [0u8; 32],
+                signature: Vec::new(),
+            },
             scp_event_log::Event {
-            event_type: scp_event_log::EventType::MemberJoined,
-            actor_did: scp_event_log::DID(String::new()),
-            timestamp: 1_700_000_001,
-            sequence: 0,
-            payload: scp_event_log::EventPayload::default(),
-            prev_hash: [1u8; 32],
-            signature: Vec::new(),
-        },
+                event_type: scp_event_log::EventType::MemberJoined,
+                actor_did: scp_event_log::DID(String::new()),
+                timestamp: 1_700_000_001,
+                sequence: 0,
+                payload: scp_event_log::EventPayload::default(),
+                prev_hash: [1u8; 32],
+                signature: Vec::new(),
+            },
         ];
 
         store
@@ -1285,7 +1285,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].event_type, scp_event_log::EventType::ContextCreated);
+        assert_eq!(
+            loaded[0].event_type,
+            scp_event_log::EventType::ContextCreated
+        );
         assert_eq!(loaded[1].event_type, scp_event_log::EventType::MemberJoined);
     }
 
@@ -1301,7 +1304,6 @@ mod tests {
 
     #[tokio::test]
     async fn delete_merkle_event_log_entries() {
-
         let store = make_store();
         let entries = vec![scp_event_log::Event {
             event_type: scp_event_log::EventType::ContextCreated,
@@ -1342,7 +1344,6 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_store_replaces_existing_per_entry_keys() {
-
         let store = make_store();
 
         // Store 5 entries individually. Each carries a distinct timestamp so

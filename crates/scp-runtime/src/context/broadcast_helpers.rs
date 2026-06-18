@@ -522,8 +522,11 @@ pub fn block_broadcast_subscriber(
 
     persist_broadcast_snapshot(deps, context_id, &snapshot);
 
-    deps.event_log
-        .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberBlocked, author_did.as_ref())?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberBlocked,
+        author_did.as_ref(),
+    )?;
     state.checkpoint_events_since += 1;
 
     Ok(result)

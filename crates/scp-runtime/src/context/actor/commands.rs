@@ -2464,9 +2464,7 @@ pub enum QueriesCommand {
         context_id_bytes: [u8; 32],
         /// Oneshot reply channel. `Ok(None)` iff no log exists for the
         /// context.
-        reply: oneshot::Sender<
-            Result<Option<Vec<scp_event_log::Event>>, ContextError>,
-        >,
+        reply: oneshot::Sender<Result<Option<Vec<scp_event_log::Event>>, ContextError>>,
     },
 
     /// Local MLS epoch for the context (§9.12). Read-only.

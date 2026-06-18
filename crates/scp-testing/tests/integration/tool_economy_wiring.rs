@@ -187,7 +187,10 @@ impl ContextEventLogProvider for MockEventLog {
         _actor_did: &str,
         _payload: scp_event_log::EventPayload,
     ) -> Result<(), ContextCreationError> {
-        self.events.lock().unwrap().push((*id, format!("{event_type:?}")));
+        self.events
+            .lock()
+            .unwrap()
+            .push((*id, format!("{event_type:?}")));
         Ok(())
     }
     fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {

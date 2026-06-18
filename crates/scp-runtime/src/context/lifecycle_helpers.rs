@@ -368,8 +368,11 @@ pub async fn leave_context(
     let should_close = state.membership.count() == 0;
 
     // Append MemberLeft event to event log.
-    deps.event_log
-        .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberLeft, member_did.as_ref())?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberLeft,
+        member_did.as_ref(),
+    )?;
     state.checkpoint_events_since += 1;
 
     // ADR-049 §9 Class S: a member leaving removes their own membership (a
@@ -860,10 +863,11 @@ pub async fn join_context(
     // joiner for an unacknowledged join. VOID the escrow here (gated on
     // `auth.is_some()`) before returning — mirroring the money-ordering rule the
     // persist-failure branch below already follows.
-    if let Err(e) =
-        deps.event_log
-            .append_context_event(&context_id_bytes, scp_event_log::EventType::MemberJoined, member_did.as_ref())
-    {
+    if let Err(e) = deps.event_log.append_context_event(
+        &context_id_bytes,
+        scp_event_log::EventType::MemberJoined,
+        member_did.as_ref(),
+    ) {
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }

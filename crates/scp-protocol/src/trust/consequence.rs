@@ -1127,12 +1127,11 @@ mod tests {
 
         // Encode the same way the runtime producers do: positional rmp of a
         // struct whose first field is `target_did`.
-        let revoked = scp_event_log::payload::encode_payload(
-            &scp_event_log::payload::AccessRevokedPayload {
+        let revoked =
+            scp_event_log::payload::encode_payload(&scp_event_log::payload::AccessRevokedPayload {
                 target_did: "did:key:alice".to_owned(),
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         let executed = scp_event_log::payload::encode_payload(
             &scp_event_log::payload::GovernanceActionExecutedPayload {
                 target_did: "did:key:alice".to_owned(),

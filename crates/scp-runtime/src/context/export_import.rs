@@ -1080,7 +1080,11 @@ mod tests {
     /// All test events use [`scp_event_log::EventType::MessageSent`]; their
     /// leaf hashes still differ because the per-event `sequence`, `timestamp`,
     /// and payload bytes vary.
-    fn append_test_event(provider: &MerkleEventLogProvider, context_id_bytes: &[u8; 32], label: &str) {
+    fn append_test_event(
+        provider: &MerkleEventLogProvider,
+        context_id_bytes: &[u8; 32],
+        label: &str,
+    ) {
         provider
             .append_event(
                 context_id_bytes,
@@ -1846,9 +1850,7 @@ mod tests {
         );
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("Merkle")
-                || err_msg.contains("chain")
-                || err_msg.contains("root"),
+            err_msg.contains("Merkle") || err_msg.contains("chain") || err_msg.contains("root"),
             "expected signed-root mismatch failure, got: {err_msg}"
         );
     }
@@ -2225,7 +2227,9 @@ mod tests {
         // Merkle root matches the original — the chain verified on import (the
         // `import_event_log_entries().unwrap()` above would have errored on a
         // broken chain) and survives a round-trip.
-        let reexported = new_provider.export_event_log_entries(&ctx_id_bytes).unwrap();
+        let reexported = new_provider
+            .export_event_log_entries(&ctx_id_bytes)
+            .unwrap();
         assert_eq!(verify_merkle_chain(&reexported).unwrap(), original_root);
     }
 
@@ -2302,8 +2306,12 @@ mod tests {
         // The imported log's chain verified on import; re-exporting recomputes
         // to the same root as the source provider.
         assert_eq!(
-            verify_merkle_chain(&new_provider.export_event_log_entries(&ctx_id_bytes).unwrap())
-                .unwrap(),
+            verify_merkle_chain(
+                &new_provider
+                    .export_event_log_entries(&ctx_id_bytes)
+                    .unwrap()
+            )
+            .unwrap(),
             merkle_root
         );
 
@@ -2318,8 +2326,12 @@ mod tests {
         );
         // Re-export still recomputes to a valid (non-error) root.
         assert!(
-            verify_merkle_chain(&new_provider.export_event_log_entries(&ctx_id_bytes).unwrap())
-                .is_ok()
+            verify_merkle_chain(
+                &new_provider
+                    .export_event_log_entries(&ctx_id_bytes)
+                    .unwrap()
+            )
+            .is_ok()
         );
     }
 

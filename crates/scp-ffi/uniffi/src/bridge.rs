@@ -12727,13 +12727,12 @@ impl Scp {
                             scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
                         let mut manager_events: Vec<Event> = Vec::with_capacity(filtered.len());
                         for (seq, entry) in filtered {
-                            let leaf_hash =
-                                scp_event_log::tree::leaf_hash(entry).map_err(|e| {
-                                    ScpError::Context {
-                                        msg: format!("event leaf hash failed: {e}"),
-                                        code: codes::CTX_2000.to_owned(),
-                                    }
-                                })?;
+                            let leaf_hash = scp_event_log::tree::leaf_hash(entry).map_err(|e| {
+                                ScpError::Context {
+                                    msg: format!("event leaf hash failed: {e}"),
+                                    code: codes::CTX_2000.to_owned(),
+                                }
+                            })?;
                             manager_events.push(Event {
                                 event_type: scp_ffi_common::event_log::event_type_label(
                                     &entry.event_type,

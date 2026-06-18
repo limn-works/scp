@@ -205,7 +205,10 @@ mod tests {
             },
         );
         assert_eq!(out.len(), 3);
-        assert!(out.iter().all(|(_, e)| e.actor_did.0 == "did:example:alice"));
+        assert!(
+            out.iter()
+                .all(|(_, e)| e.actor_did.0 == "did:example:alice")
+        );
     }
 
     #[test]

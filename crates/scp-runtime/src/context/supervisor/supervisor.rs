@@ -8868,8 +8868,7 @@ impl Supervisor {
     pub fn event_log_entries(
         &self,
         context_id_bytes: &[u8; 32],
-    ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError>
-    {
+    ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
         let event_log = self.event_log_ref().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::event_log_entries — event_log provider not configured".to_owned(),
@@ -11597,7 +11596,8 @@ mod tests {
 
         let creator = "did:key:forge-test-creator";
         let snapshot = import_test_snapshot("forge-ctx", creator);
-        let event_log_data = create_event_log_data(&[0x11u8; 32], &[scp_event_log::EventType::ContextCreated]);
+        let event_log_data =
+            create_event_log_data(&[0x11u8; 32], &[scp_event_log::EventType::ContextCreated]);
 
         // Sign with the real creator key so the export is internally
         // consistent (exporter_did == creator_did, signature authentic
@@ -11647,7 +11647,8 @@ mod tests {
         let mut snapshot = import_test_snapshot("broadcast-ctx", creator);
         snapshot.context_params.mode = scp_protocol::context::ContextMode::Broadcast;
         snapshot.routing = crate::context::actor::state::ContextRouting::Broadcast;
-        let event_log_data = create_event_log_data(&[0x22u8; 32], &[scp_event_log::EventType::ContextCreated]);
+        let event_log_data =
+            create_event_log_data(&[0x22u8; 32], &[scp_event_log::EventType::ContextCreated]);
 
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let export = crate::context::export_import::create_export(
@@ -11736,7 +11737,8 @@ mod tests {
         // Event-log bytes keyed on the import path's own derivation so
         // the recomputed Merkle root matches what the importer expects.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]);
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]);
         crate::context::export_import::create_export(
             snapshot,
             event_log_data,
