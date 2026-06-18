@@ -864,23 +864,70 @@ fn matches_trigger(trigger: &ConsequenceTrigger, event: &Event, subject_did: &st
 
 /// Checks if the payload data represents a target DID matching the given DID.
 ///
-/// Parses the payload as a JSON object with a `"target_did"` field. Falls
-/// back to the legacy null-terminated string convention for backward
-/// compatibility.
-fn payload_target_is(data: &[u8], target_did: &str) -> bool {
+/// Returns the `target_did` carried by an event-log payload, if any.
+///
+/// The runtime emits two payload encodings into the durable event log:
+///
+/// 1. **Positional `MessagePack`** for the typed
+///    [`scp_event_log::payload`] structs whose first field is `target_did`
+///    (e.g. [`scp_event_log::payload::AccessRevokedPayload`],
+///    [`scp_event_log::payload::GovernanceActionExecutedPayload`]). These are
+///    fixarrays; the first element is the `target_did` string.
+/// 2. **JSON objects** with a `"target_did"` field, for the consequence
+///    enforcement records (`ConsequenceTriggered`, …) and other untyped
+///    governance payloads that have not (yet) been promoted to a typed struct.
+///
+/// A legacy null-terminated UTF-8 string is also accepted as a final
+/// fallback. Returns the borrowed `target_did` slice without allocating for
+/// the JSON / legacy cases; the positional case allocates a `String` because
+/// the bytes are decoded.
+fn payload_target_did(data: &[u8]) -> Option<String> {
     if data.is_empty() {
-        return false;
+        return None;
     }
-    // Try structured JSON first.
+    // 1. Typed positional MessagePack: read the fixarray and take element 0.
+    if let Some(did) = rmp_array_first_string(data) {
+        return Some(did);
+    }
+    // 2. Structured JSON object.
     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
         return val
             .get("target_did")
             .and_then(|v| v.as_str())
-            .is_some_and(|s| s == target_did);
+            .map(str::to_owned);
     }
-    // Legacy fallback: null-terminated UTF-8 string.
+    // 3. Legacy null-terminated UTF-8 string.
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    std::str::from_utf8(&data[..end]) == Ok(target_did)
+    std::str::from_utf8(&data[..end]).ok().map(str::to_owned)
+}
+
+/// Decodes `data` as a positional `MessagePack` array and returns its first
+/// element as a `String`, if `data` is an array whose first element is a
+/// string. Returns `None` for any other shape (including JSON-object payloads,
+/// which are `MessagePack` maps, not arrays).
+///
+/// This is the decode counterpart to
+/// [`scp_event_log::payload::encode_payload`] for the typed payload structs
+/// whose first field is `target_did`. It reads only the first element, so it
+/// works uniformly across structs of differing arity (1-field
+/// `AccessRevokedPayload`, 2-field `GovernanceActionExecutedPayload`).
+fn rmp_array_first_string(data: &[u8]) -> Option<String> {
+    let mut cursor = data;
+    let value = rmpv::decode::read_value(&mut cursor).ok()?;
+    match value {
+        rmpv::Value::Array(items) => items
+            .into_iter()
+            .next()
+            .and_then(|v| v.as_str().map(str::to_owned)),
+        _ => None,
+    }
+}
+
+/// Checks whether the event-log payload's `target_did` matches `target_did`.
+///
+/// See [`payload_target_did`] for the supported payload encodings.
+fn payload_target_is(data: &[u8], target_did: &str) -> bool {
+    payload_target_did(data).is_some_and(|did| did == target_did)
 }
 
 /// Checks if a payload's data starts with the given prefix.
@@ -891,7 +938,13 @@ fn payload_starts_with(data: &[u8], prefix: &str) -> bool {
     if data.is_empty() {
         return false;
     }
-    // Try structured JSON first.
+    // Typed positional MessagePack: match the first array element (target_did)
+    // against the custom key, mirroring the JSON target_did backward-compat
+    // path below.
+    if let Some(did) = rmp_array_first_string(data) {
+        return did == prefix || did.starts_with(prefix);
+    }
+    // Try structured JSON.
     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
         // Check custom_key field for Custom triggers.
         if let Some(key) = val.get("custom_key").and_then(|v| v.as_str()) {
@@ -1056,6 +1109,65 @@ mod tests {
             }
         );
         assert_eq!(result[0].evidence.len(), 2);
+    }
+
+    /// The `WarningCount` trigger must match events whose payload is a typed
+    /// positional `MessagePack` struct (the encoding the runtime now emits for
+    /// `AccessRevoked` / `GovernanceActionExecuted`), not just JSON objects.
+    /// Exercises the `rmp_array_first_string` decode path in
+    /// [`payload_target_did`].
+    #[test]
+    fn warning_count_matches_typed_positional_payload() {
+        let rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::AssignRole {
+                to_role: "observer".to_owned(),
+            },
+            threshold: 2,
+            window: Duration::from_mins(5),
+        }];
+
+        // Encode the same way the runtime producers do: positional rmp of a
+        // struct whose first field is `target_did`.
+        let revoked = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::AccessRevokedPayload {
+                target_did: "did:key:alice".to_owned(),
+            },
+        )
+        .unwrap();
+        let executed = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::GovernanceActionExecutedPayload {
+                target_did: "did:key:alice".to_owned(),
+                action_type: "RemoveMember".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let events = vec![
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                800,
+                0,
+                revoked.data,
+            ),
+            // A 2-field struct must still decode to its first element.
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:moderator",
+                900,
+                1,
+                executed.data,
+            ),
+        ];
+
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        assert_eq!(result.len(), 1, "typed payloads must drive WarningCount");
+        assert_eq!(result[0].evidence.len(), 2);
+
+        // A different subject must NOT match.
+        let none = evaluate_consequence_rules(&rules, &events, "did:key:bob", 1000);
+        assert!(none.is_empty(), "typed payload target_did must be exact");
     }
 
     // -----------------------------------------------------------------------
