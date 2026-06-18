@@ -2240,9 +2240,11 @@ impl MlsCryptoProvider {
     /// Test-only: seed a per-sender epoch high-water floor directly into the
     /// live sender-key store, simulating a floor that advanced AFTER the last
     /// coalesced snapshot was persisted (the exact §23.17.2 Invariant 2
-    /// scenario the respawn floor-guard must tolerate). `cfg(test)`-gated so it
-    /// never compiles into any non-test build.
-    #[cfg(test)]
+    /// scenario the respawn floor-guard must tolerate). Gated on the `testing`
+    /// feature (and `test`) so it never compiles into any non-test build, and so
+    /// a plain `cargo test` (without `--features testing`) — which excludes its
+    /// sole caller, a fault-injection respawn test — does not see it as dead.
+    #[cfg(all(test, feature = "testing"))]
     pub(crate) fn seed_sender_key_epoch_for_test(
         &self,
         context_id: &[u8; 32],
