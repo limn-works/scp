@@ -414,13 +414,14 @@ async fn reconnect_detects_forged_divergent_checkpoint() {
 ///    reconnection driver's targeted drain does not destroy the SDK's delivery
 ///    queue (the bug this work fixes).
 /// 3. Replaying the identical signed divergent checkpoint emits no second
-///    alert. In this single-node path the suppression comes from the
-///    PRIMARY count-advance, NOT the per-sender dedup set: the first
-///    detection appended an `EquivocationDetected` event, so `local_count`
-///    advanced past the remote count and the replayed comparison routes to
-///    the Ahead/Behind arm — it never re-reaches the `Equal`/dedup path.
-///    The keyed-on-root dedup gate itself is exercised by the focused unit
-///    tests in `crates/scp-runtime` (stable-count construction), not here.
+///    alert. Suppression comes from the per-sender dedup set: the
+///    divergence is recorded only in the receive buffer (never appended to
+///    the durable Merkle log, so `local_count` does not advance), and the
+///    replayed checkpoint's `(event_count, remote_merkle_root)` pair is
+///    already present in the per-sender set, making it a no-op. The
+///    keyed-on-root behavior of that gate (distinct roots at the same count
+///    are each fresh) is exercised by the focused unit tests in
+///    `crates/scp-runtime`, not here.
 ///
 /// The structural wiring that the *decrypt* prefix
 /// (`deliver_incoming → deliver_checkpoint_message → compare_remote_checkpoint`)
@@ -485,11 +486,11 @@ async fn runtime_equivocation_dispatch_and_targeted_drain() {
     );
 
     // Runtime dispatch #2 — REPLAY the identical signed checkpoint. The replay
-    // must NOT emit a second EquivocationDetected alert. Here the suppression
-    // is the PRIMARY count-advance, not the per-sender dedup set: the first
-    // detection appended an `EquivocationDetected` event to the durable log,
-    // advancing `local_count` past the remote count, so the replayed
-    // comparison routes to Ahead/Behind and never re-reaches the dedup gate.
+    // must NOT emit a second EquivocationDetected alert. The divergence is
+    // recorded only in the receive buffer, never appended to the durable log,
+    // so `local_count` does not advance; suppression is the per-sender dedup
+    // set, whose `(event_count, remote_merkle_root)` entry already covers this
+    // replayed checkpoint, making the second detection a no-op.
     // The load-bearing guarantee is "no second alert", asserted by the
     // exactly-once count below. (The dedup gate's own keyed-on-root behavior
     // is covered by the focused runtime unit tests.)

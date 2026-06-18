@@ -516,29 +516,30 @@ pub struct ContextSnapshot {
     /// received `event_log_data` and compares it to THIS signed value
     /// (`validate_export_for_import`).
     ///
-    /// **Security scope — chain head, not history completeness.** This root
-    /// is the event-log hash-*chain* HEAD (the last entry's `hash`), not a
-    /// Merkle-tree commitment over a fixed entry set. The chain verifier is
-    /// pruning-tolerant: it does not validate the first entry's `prev_hash`
-    /// (see `verify_merkle_chain`). The signature therefore guarantees that no
-    /// entry can be added, modified, reordered, or forged and that the head is
-    /// authentic — but it does NOT attest full-history *completeness*. A holder
-    /// of a valid signed export can present a contiguous *suffix* of the log
-    /// (dropping the oldest entries) and it still verifies against this signed
-    /// head.
+    /// **Security scope — full-history completeness AND integrity.** This root
+    /// is the RFC 6962 `tree::root` over ALL event-log entries (ADR-050), not a
+    /// hash-chain head. `verify_merkle_chain` recomputes it by replaying every
+    /// entry through `append_unsigned_event`, validating each leaf's `sequence`
+    /// against the running count and its `prev_hash` against the prior leaf
+    /// (genesis for the first entry). A PREFIX-truncated log (oldest entries
+    /// dropped) is rejected outright — the new first entry's non-zero
+    /// `sequence` and non-genesis `prev_hash` fail the replay — while any
+    /// suffix-truncated, reordered, removed-middle, or added/modified/forged log
+    /// yields a different root than this signed value and fails the
+    /// constant-time compare in `validate_export_for_import`. The signature thus
+    /// attests that no entry can be added, modified, reordered, dropped, or
+    /// forged: truncation forgery is CLOSED, not merely detected.
     ///
-    /// This is NOT purely an audit-history concern. The imported pre-import
-    /// event-log entries are currently consumed by post-import enforcement: on
-    /// the first live action `event_log_entries_for_consequences` reads them as
-    /// "Source 1" to drive consequence evaluation and participation/standing.
-    /// A front-truncated (oldest-dropped) but validly-signed-head log can
-    /// therefore lower consequence counts and suppress an auto-suspend/demote/
-    /// ban — but only for consequence rules whose `window` exceeds the age of
-    /// the dropped entries. Under the default 1-5 minute matrix windows the
-    /// droppable old entries are already out-of-window, so this is inert by
-    /// default. Making import a true cold-start for enforcement (imported
-    /// history audit-only) is tracked as a planned hardening; until then do not
-    /// treat front-truncation as having no authoritative-state effect.
+    /// This completeness guarantee matters for enforcement, not just audit. The
+    /// imported pre-import event-log entries are consumed by post-import
+    /// enforcement: on the first live action `event_log_entries_for_consequences`
+    /// reads them as "Source 1" to drive consequence evaluation and
+    /// participation/standing. Because the full, signed-over leaf set is the
+    /// only set that verifies, an importer cannot silently suppress consequences
+    /// by truncating history. A legitimately pruned log still verifies because
+    /// `prune_before_checkpoint` re-anchors the retained tail to genesis and
+    /// renumbers sequences from 0, making the exported pruned log itself a valid
+    /// genesis-rooted prefix.
     ///
     /// All zeros when no event log is included (e.g. `ExportScope::Public`,
     /// broadcast-only contexts, or the live snapshot before export). Populated

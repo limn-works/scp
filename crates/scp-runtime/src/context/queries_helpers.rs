@@ -849,8 +849,9 @@ pub fn compare_remote_checkpoint(
         },
     };
 
-    // Emit (and persist) an EquivocationDetected event when divergent —
-    // deduped per distinct divergent checkpoint (replay defense).
+    // Record an EquivocationDetected event in the receive buffer when divergent
+    // (NOT appended to the durable Merkle log — see `record_equivocation_if_fresh`)
+    // — deduped per distinct divergent checkpoint (replay defense).
     if matches!(
         comparison,
         scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }

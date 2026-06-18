@@ -579,35 +579,6 @@ fn emit_failure_escalation(
     emit_event_into(state.receive_buffer, event, context_id, args.event_tx);
 }
 
-/// Converts receive buffer events into `scp_event_log::Event` format for
-/// consequence rule evaluation and participation record computation.
-///
-/// This bridges the gap between the in-memory receive buffer (which tracks
-/// recent context events) and the event log types expected by the trust
-/// evaluation functions.
-///
-/// **Known limitation (#1594):** The receive buffer is capped at 1000 events
-/// (`ReceiveBuffer::DEFAULT_BUFFER_CAPACITY`). Long-running contexts lose
-/// older history, which means participation records and consequence evaluation
-/// only reflect recent activity.
-///
-/// **Why the Merkle event log cannot be used as a replacement:**
-/// `ContextEventLogProvider::event_log_entries()` returns `scp_event_log::Event`,
-/// Collects event history for consequence evaluation and participation
-/// record computation (ADR-017, #1530, #1531, #1594).
-///
-/// Combines two sources:
-/// 1. **Event log history** — full persisted history from the
-///    `ContextEventLogProvider`. Each `scp_event_log::Event` includes `actor_did`
-///    (#1594), enabling proper attribution.
-/// 2. **Receive buffer events** — recent in-memory events that may not
-///    yet be in the event log (the event log is appended after the
-///    operation, but the receive buffer is updated inside the lock).
-///
-/// Events from the event log use their real timestamps. Receive buffer
-/// events use estimated timestamps (spaced 1 second apart backwards from
-/// `now`). The merge deduplicates by preferring event log entries (which
-/// have accurate timestamps and hashes) over buffer estimates.
 /// Serializes an optional target DID into JSON payload bytes for event log
 /// consumption by consequence triggers and participation records.
 fn target_did_to_payload(did: Option<&DID>) -> Vec<u8> {
@@ -656,10 +627,12 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 /// older history, which means participation records and consequence evaluation
 /// only reflect recent activity.
 ///
-/// **Why the Merkle event log cannot be used as a replacement:**
-/// `ContextEventLogProvider::event_log_entries()` returns `scp_event_log::Event`,
-/// not the raw `scp_event_log::Event` that consequence rules consume. The
-/// conversion is done here, bridging the gap between the two formats.
+/// Each persisted `scp_event_log::Event` carries a typed `EventType` from the
+/// closed taxonomy. This function projects those variants onto the coarse
+/// trigger buckets `matches_trigger` understands (governance/consequence
+/// variants collapse to `EventType::GovernanceAction`; operational variants
+/// map to their velocity buckets) and passes the canonical payload bytes
+/// through unchanged. Recent receive-buffer events are merged in on top.
 /// Event-log + receive-buffer merge used by consequence enforcement
 /// (ADR-017, #1531). Takes a borrowed [`ReceiveBuffer`] directly so the
 /// caller may build it from sub-borrows of the unified

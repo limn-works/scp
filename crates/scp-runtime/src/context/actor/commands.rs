@@ -404,9 +404,13 @@ pub enum MessagingCommand {
 
     /// Compare a remote consistency checkpoint against local event-log
     /// state for equivocation detection (§9.9.3, ADR-011 AC-8). Mutating
-    /// — emits `ContextEvent::EquivocationDetected` into the receive
-    /// buffer and appends an `EquivocationDetected` event to the log when
-    /// the comparison is `Divergent`.
+    /// — surfaces a divergence by minting an `EquivocationDetected` record
+    /// into the receive buffer (and broadcasting it) when the comparison is
+    /// `Divergent`. The record is NOT appended to the durable Merkle log: it
+    /// is a receiver-local mint outside the sender-authenticated leaf
+    /// sequence, so persisting it would let two honest receivers compute
+    /// divergent roots and false-positive the very §9.9.3 detection it
+    /// records (deduped per distinct divergent checkpoint per sender).
     ///
     /// Delegates to
     /// [`compare_remote_checkpoint`](crate::context::queries_helpers::compare_remote_checkpoint).
