@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "scp-python"
-version = "0.1.0"
+version = "0.1.0b2"
 description = "SCP (Shared Context Protocol) Python SDK — cryptographic identity, governed contexts, and trust for AI agents"
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }

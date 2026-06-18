@@ -165,6 +165,34 @@ pub struct RecoveryEpochAdvancedPayload {
     pub new_epoch: u64,
 }
 
+/// Payload for [`EventType::AccessRevoked`](crate::EventType::AccessRevoked)
+/// (`RevokeReadAccess` / `RevokeWriteAccess`; ADR-031 §3, §5).
+///
+/// `target_did` is the member whose access was revoked. The consequence
+/// engine's `WarningCount` trigger matches governance actions against this
+/// field (see `scp_protocol::trust::consequence::payload_target_is`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessRevokedPayload {
+    /// The DID whose read/write access was revoked.
+    pub target_did: String,
+}
+
+/// Payload for
+/// [`EventType::GovernanceActionExecuted`](crate::EventType::GovernanceActionExecuted)
+/// (ADR-031 §8; PRD SCP-269/SCP-270).
+///
+/// `target_did` is the member the action targeted (empty when the action has
+/// no target, e.g. a context-wide policy change). `action_type` is the
+/// `GovernanceAction` variant name. The consequence engine reads `target_did`
+/// for the `WarningCount` trigger and `action_type` for participation records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernanceActionExecutedPayload {
+    /// The DID the executed action targeted (empty if the action is untargeted).
+    pub target_did: String,
+    /// The `GovernanceAction` variant name (e.g. `"RemoveMember"`).
+    pub action_type: String,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -285,6 +313,43 @@ mod tests {
         let encoded = encode_payload(&p).unwrap();
         assert_positional_array(&encoded.data, 2);
         let decoded: RecoveryEpochAdvancedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn access_revoked_round_trip() {
+        let p = AccessRevokedPayload {
+            target_did: "did:key:alice".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 1);
+        let decoded: AccessRevokedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn governance_action_executed_round_trip() {
+        let p = GovernanceActionExecutedPayload {
+            target_did: "did:key:bob".to_owned(),
+            action_type: "RemoveMember".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 2);
+        let decoded: GovernanceActionExecutedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn governance_action_executed_empty_target_round_trip() {
+        // Untargeted actions (e.g. context-wide policy changes) carry an empty
+        // target_did but must still round-trip and stay a 2-element fixarray.
+        let p = GovernanceActionExecutedPayload {
+            target_did: String::new(),
+            action_type: "ModifyPolicy".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 2);
+        let decoded: GovernanceActionExecutedPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 
