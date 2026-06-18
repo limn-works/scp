@@ -886,6 +886,7 @@ mod tests {
     /// `signed_at = 1_700_000_000_000`. Challenge `issued_at` /
     /// `expires_at` must straddle the override; the harness sets them
     /// to `override_ts` and `override_ts + 60_000` respectively.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     #[ignore = "golden-value print — run with --ignored --nocapture"]
     async fn print_parity_sign_golden_value() {
