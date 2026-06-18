@@ -622,15 +622,15 @@ pub fn run_buffered_post_delivery(
 
     // Durable Merkle append ONLY for sender-authenticated events. Application
     // messages (`None`) skip the append but still run governance below.
-    if let Some(event_name) = event_name {
-        if let Err(e) = event_log.append_context_event(context_id_bytes, event_name, sender_did) {
-            tracing::warn!(
-                context_id,
-                sender_did,
-                event_name = ?event_name,
-                "failed to append buffered event to event log: {e}"
-            );
-        }
+    if let Some(event_name) = event_name
+        && let Err(e) = event_log.append_context_event(context_id_bytes, event_name, sender_did)
+    {
+        tracing::warn!(
+            context_id,
+            sender_did,
+            event_name = ?event_name,
+            "failed to append buffered event to event log: {e}"
+        );
     }
 
     let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
@@ -3138,17 +3138,17 @@ mod pseudonym_routing_tests {
 
     use crate::context::actor::state::PerContextState as RegressionState;
     use scp_primitives::TestClock;
-    use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-    /// Event-log provider that records every appended `EventType` so the test
-    /// can prove (a) no `MessageReceived` append happens for `None` events and
-    /// (b) consequence evaluation/enforcement DID append its `Consequence*`
-    /// events. Append-count is also tracked for a simple total.
+    /// Event-log provider that flags which `EventType`s were appended so the
+    /// test can prove (a) consequence evaluation/enforcement DID append a
+    /// `ConsequenceTriggered` event and (b) the application message itself
+    /// appended NO `MessageSent` Merkle leaf for a `None` event name. Uses
+    /// atomics only (no `Mutex`) per ADR-049's runtime-state model.
     #[derive(Default)]
     struct RecordingEventLog {
-        appended: StdMutex<Vec<scp_event_log::EventType>>,
-        appends: AtomicUsize,
+        saw_consequence_triggered: AtomicBool,
+        saw_message_sent: AtomicBool,
     }
 
     impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
@@ -3166,11 +3166,16 @@ mod pseudonym_routing_tests {
             _actor: &str,
             _payload: scp_event_log::EventPayload,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            self.appends.fetch_add(1, AtomicOrdering::SeqCst);
-            self.appended
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(event);
+            match event {
+                scp_event_log::EventType::ConsequenceTriggered => {
+                    self.saw_consequence_triggered
+                        .store(true, AtomicOrdering::SeqCst);
+                }
+                scp_event_log::EventType::MessageSent => {
+                    self.saw_message_sent.store(true, AtomicOrdering::SeqCst);
+                }
+                _ => {}
+            }
             Ok(())
         }
 
@@ -3206,7 +3211,7 @@ mod pseudonym_routing_tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
-            window: std::time::Duration::from_secs(3600),
+            window: std::time::Duration::from_hours(1),
         });
 
         let clock = TestClock::new(1_700_000_100);
@@ -3244,20 +3249,16 @@ mod pseudonym_routing_tests {
         // no `MessageReceived` variant in the closed event taxonomy precisely
         // because received app messages are never durably logged); the only
         // appends come from consequence enforcement.
-        let appended = event_log
-            .appended
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         assert!(
-            appended.contains(&scp_event_log::EventType::ConsequenceTriggered),
+            event_log
+                .saw_consequence_triggered
+                .load(AtomicOrdering::SeqCst),
             "buffered application message must run consequence evaluation/enforcement \
-             (gated bug skipped it); appended events were {appended:?}"
+             (gated bug skipped it)"
         );
         assert!(
-            !appended.contains(&scp_event_log::EventType::MessageSent),
-            "a received application message must NOT append a MessageSent Merkle leaf (§9.9.3); \
-             appended events were {appended:?}"
+            !event_log.saw_message_sent.load(AtomicOrdering::SeqCst),
+            "a received application message must NOT append a MessageSent Merkle leaf (§9.9.3)"
         );
 
         // (c) The checkpoint counter advanced for the delivered application
