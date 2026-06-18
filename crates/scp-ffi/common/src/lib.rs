@@ -135,7 +135,7 @@ pub mod context_params;
 // Canonical event-log filter shared across PyO3, napi-rs, and UniFFI.
 // Pins `after_sequence` / `before_sequence` / `event_type` / `actor_did` /
 // `limit` semantics so the three bridges cannot drift. Requires scp-core
-// for `EventLogEntry` (behind `resolvers` feature). Not available for WASM.
+// for `scp_event_log::Event` (behind `resolvers` feature). Not available for WASM.
 #[cfg(feature = "resolvers")]
 pub mod event_log;
 

@@ -592,13 +592,13 @@ fn emit_failure_escalation(
 /// only reflect recent activity.
 ///
 /// **Why the Merkle event log cannot be used as a replacement:**
-/// `ContextEventLogProvider::event_log_entries()` returns `EventLogEntry`,
+/// `ContextEventLogProvider::event_log_entries()` returns `scp_event_log::Event`,
 /// Collects event history for consequence evaluation and participation
 /// record computation (ADR-017, #1530, #1531, #1594).
 ///
 /// Combines two sources:
 /// 1. **Event log history** — full persisted history from the
-///    `ContextEventLogProvider`. Each `EventLogEntry` includes `actor_did`
+///    `ContextEventLogProvider`. Each `scp_event_log::Event` includes `actor_did`
 ///    (#1594), enabling proper attribution.
 /// 2. **Receive buffer events** — recent in-memory events that may not
 ///    yet be in the event log (the event log is appended after the
@@ -640,7 +640,7 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 ///
 /// Combines two sources:
 /// 1. **Event log history** — full persisted history from the
-///    `ContextEventLogProvider`. Each `EventLogEntry` includes `actor_did`
+///    `ContextEventLogProvider`. Each `scp_event_log::Event` includes `actor_did`
 ///    (#1594), enabling proper attribution.
 /// 2. **Receive buffer events** — recent in-memory events that may not
 ///    yet be in the event log (the event log is appended after the
@@ -657,7 +657,7 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 /// only reflect recent activity.
 ///
 /// **Why the Merkle event log cannot be used as a replacement:**
-/// `ContextEventLogProvider::event_log_entries()` returns `EventLogEntry`,
+/// `ContextEventLogProvider::event_log_entries()` returns `scp_event_log::Event`,
 /// not the raw `scp_event_log::Event` that consequence rules consume. The
 /// conversion is done here, bridging the gap between the two formats.
 /// Event-log + receive-buffer merge used by consequence enforcement

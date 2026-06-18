@@ -20,7 +20,7 @@
 //! event data instead of just Merkle summaries. See GitHub issue #303.
 //!
 //! The `merkle_event_log/{seq:020d}` key space stores individual
-//! `EventLogEntry` values for the `MerkleEventLogProvider`, enabling O(1)
+//! `scp_event_log::Event` values for the `MerkleEventLogProvider`, enabling O(1)
 //! append persistence. Restore loads all entries by prefix scan.
 //! See GitHub issues #636, #710.
 //!
@@ -614,7 +614,7 @@ impl<S: Storage> ProtocolRepository<S> {
 
     /// Stores a single `MerkleEventLogProvider` entry at the given sequence.
     ///
-    /// Persists one `EventLogEntry` under
+    /// Persists one `scp_event_log::Event` under
     /// `context/{context_id}/merkle_event_log/{seq:020d}`. O(1) per append.
     ///
     /// # Errors
