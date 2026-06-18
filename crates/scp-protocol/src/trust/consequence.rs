@@ -631,7 +631,7 @@ pub fn evaluate_consequence_rules(
                 event_sequence: event.sequence,
                 timestamp: event.timestamp,
                 actor_did: event.actor_did.clone(),
-                event_type: event.event_type.clone(),
+                event_type: event.event_type,
             })
             .collect();
 

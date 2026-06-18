@@ -1001,7 +1001,7 @@ mod tests {
         let mut prev_hash = GENESIS_PREV_HASH;
         for (i, event_type) in event_types.iter().enumerate() {
             let event = sign_event(
-                event_type.clone(),
+                *event_type,
                 &did,
                 1_000_000 + i as u64,
                 i as u64,

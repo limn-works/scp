@@ -637,7 +637,7 @@ fn truncate_log_keeping_tail(
             leaves[leaves.len() - 1]
         };
         let rechained = Event {
-            event_type: event.event_type.clone(),
+            event_type: event.event_type,
             actor_did: event.actor_did.clone(),
             timestamp: event.timestamp,
             sequence,
