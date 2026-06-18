@@ -396,7 +396,10 @@ pub enum EventType {
 ///
 /// Phase 2 stores the payload as opaque bytes. Future phases will introduce
 /// structured payload variants per `EventType`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// [`Default`] yields an empty payload (`data == []`), the canonical
+/// representation for non-parameterized events.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventPayload {
     /// Opaque payload data. Interpretation depends on the event type.
     #[serde(with = "serde_bytes")]

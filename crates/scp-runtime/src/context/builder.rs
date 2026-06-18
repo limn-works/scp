@@ -130,16 +130,18 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Returns [`ContextCreationError`] if initialisation fails.
     fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
-    /// Appends a named event to the context's event log.
+    /// Appends a typed event to the context's event log.
     ///
     /// `actor_did` is the DID of the actor who produced this event (the sender
     /// for messages, the proposer for governance, the joiner for membership
     /// events). Pass an empty string when the actor is unknown or not
     /// applicable (e.g., system-initiated events).
     ///
-    /// `payload` is an optional structured JSON value included in the Merkle
-    /// hash. Used by governance actions to carry `target_did` and other
-    /// structured data for consequence triggers and participation records.
+    /// `event_type` is the closed-taxonomy [`scp_event_log::EventType`] variant
+    /// for this event. `payload` is the structured event payload included in
+    /// the Merkle leaf preimage. Parameterized events carry positional
+    /// `MessagePack` bytes built via [`scp_event_log::payload::encode_payload`];
+    /// non-parameterized events carry an empty [`scp_event_log::EventPayload`].
     ///
     /// # Errors
     ///
@@ -147,9 +149,9 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn append_event(
         &self,
         context_id: &[u8; 32],
-        event: &str,
+        event_type: scp_event_log::EventType,
         actor_did: &str,
-        payload: Option<&serde_json::Value>,
+        payload: scp_event_log::EventPayload,
     ) -> Result<(), ContextCreationError>;
 
     /// Destroys the event log for the given context (rollback).
@@ -175,17 +177,23 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn append_context_event(
         &self,
         context_id: &[u8; 32],
-        event: &str,
+        event_type: scp_event_log::EventType,
         actor_did: &str,
     ) -> Result<(), ContextError> {
-        self.append_event(context_id, event, actor_did, None)
-            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+        self.append_event(
+            context_id,
+            event_type,
+            actor_did,
+            scp_event_log::EventPayload::default(),
+        )
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
-    /// Appends a named event with an optional structured payload.
+    /// Appends a typed event with a structured payload.
     ///
     /// Like [`append_context_event`](Self::append_context_event) but accepts
-    /// an optional JSON payload that is included in the Merkle hash.
+    /// a structured [`scp_event_log::EventPayload`] included in the Merkle leaf
+    /// preimage (parameterized events).
     ///
     /// # Errors
     ///
@@ -193,11 +201,11 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn append_context_event_with_payload(
         &self,
         context_id: &[u8; 32],
-        event: &str,
+        event_type: scp_event_log::EventType,
         actor_did: &str,
-        payload: Option<&serde_json::Value>,
+        payload: scp_event_log::EventPayload,
     ) -> Result<(), ContextError> {
-        self.append_event(context_id, event, actor_did, payload)
+        self.append_event(context_id, event_type, actor_did, payload)
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
@@ -218,8 +226,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn event_log_entries(
         &self,
         context_id: &[u8; 32],
-    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
-    {
+    ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
         let _ = context_id;
         Err(ContextError::EventLogFailed(
             "event log entry reading not supported by this provider".into(),
@@ -229,7 +236,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     // -- Export/import for context state portability (#363) -------------------
 
     /// Exports the event log entries for a context as serialized bytes
-    /// (MessagePack-encoded `Vec<EventLogEntry>`).
+    /// (MessagePack-encoded `Vec<scp_event_log::Event>`).
     ///
     /// # Errors
     ///
@@ -727,8 +734,12 @@ pub async fn create_context(
     }
 
     // Step 7: Append ContextCreated event.
-    if let Err(e) = event_log_provider.append_event(&id_bytes, "ContextCreated", creator_did, None)
-    {
+    if let Err(e) = event_log_provider.append_event(
+        &id_bytes,
+        scp_event_log::EventType::ContextCreated,
+        creator_did,
+        scp_event_log::EventPayload::default(),
+    ) {
         // Even though the handle is Active, we must roll back everything.
         receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
         return Err(e);
@@ -792,9 +803,9 @@ mod tests {
         fn append_event(
             &self,
             _: &[u8; 32],
-            _: &str,
+            _event_type: scp_event_log::EventType,
             _actor_did: &str,
-            _payload: Option<&serde_json::Value>,
+            _payload: scp_event_log::EventPayload,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }

@@ -146,20 +146,21 @@ pub fn build_governance_context(state: &PerContextState, clock: &dyn Clock) -> G
 // governance_event_label (transitive helper, actor-shape — pure)
 // ---------------------------------------------------------------------------
 
-/// Returns the event-log label string for a [`GovernanceEvent`] variant.
+/// Returns the [`scp_event_log::EventType`] for a [`GovernanceEvent`] variant.
 ///
 /// Pure projection over a borrowed event; no `state`/`deps` needed.
 #[must_use]
-pub const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
+pub const fn governance_event_label(event: &GovernanceEvent) -> scp_event_log::EventType {
+    use scp_event_log::EventType;
     match event {
-        GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
-        GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
-        GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
-        GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
-        GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
-        GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
-        GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
-        GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
+        GovernanceEvent::ProposalCreated { .. } => EventType::GovernanceProposalCreated,
+        GovernanceEvent::VoteCast { .. } => EventType::GovernanceVoteCast,
+        GovernanceEvent::VoteWithdrawn { .. } => EventType::GovernanceVoteWithdrawn,
+        GovernanceEvent::ProposalResolved { .. } => EventType::GovernanceProposalResolved,
+        GovernanceEvent::DeadlockRecovery { .. } => EventType::GovernanceDeadlockRecovery,
+        GovernanceEvent::ConflictDetected { .. } => EventType::GovernanceConflictDetected,
+        GovernanceEvent::ConflictResolved { .. } => EventType::GovernanceConflictResolved,
+        GovernanceEvent::GovernanceActionExecuted { .. } => EventType::GovernanceActionExecuted,
     }
 }
 
