@@ -929,30 +929,32 @@ pub struct PerContextState {
 
     /// Set of distinct divergent checkpoints `(event_count, merkle_root)`
     /// already recorded per remote checkpoint sender DID (§9.9.3 replay
-    /// defense, secondary guard). A re-presented divergence whose
-    /// `(count, remote_merkle_root)` is already in the sender's set is a
-    /// no-op in `compare_remote_checkpoint`: it neither re-appends an
-    /// `EquivocationDetected` event nor re-bumps `checkpoint_events_since`.
-    /// A NEW root at an already-seen count is treated as fresh evidence —
-    /// two members can equivocate with different forged roots at the same
-    /// height, and each is a distinct §9.9.4 security event.
+    /// defense). A re-presented divergence whose `(count, remote_merkle_root)`
+    /// is already in the sender's set is a no-op in
+    /// `compare_remote_checkpoint`. A NEW root at an already-seen count is
+    /// treated as fresh evidence — two members can equivocate with different
+    /// forged roots at the same height, and each is a distinct §9.9.4 security
+    /// event.
     ///
-    /// PRIMARY replay-idempotency does NOT come from this map. Recording a
-    /// divergence appends an `EquivocationDetected` event to the durable
-    /// event log, which advances `local_count` (the `event_log_entries`
-    /// length read in `compare_remote_checkpoint`); a re-delivered
-    /// checkpoint at the same remote count then routes to the Ahead/Behind
-    /// arm and never re-reaches the `Equal`/dedup path. That count-advance
-    /// is durable across respawn (the event log is persisted), so replay
-    /// stays blocked even though this in-memory set resets to empty on
-    /// respawn. This set is the secondary belt-and-suspenders guard against
-    /// an exact-divergence re-record within a single process lifetime.
+    /// This in-memory set is the SOLE dedup mechanism. A divergence is NOT
+    /// appended to the durable Merkle event log: an equivocation record is
+    /// minted locally by the receiver and is not part of the
+    /// sender-authenticated leaf sequence, so logging it would let two honest
+    /// receivers compute divergent roots for the same context and
+    /// false-positive the very §9.9.3 detection it records. Because there is no
+    /// durable append, there is no `local_count` advance and therefore no
+    /// durable cross-respawn backstop: the set resets to empty when a new actor
+    /// instance respawns. The bounded consequence is that the FIRST
+    /// re-presentation of a previously-seen divergence after a respawn re-emits
+    /// one duplicate alert — an acceptable, bounded duplicate notification of a
+    /// real §9.9.4 event, not a correctness or replay-amplification bug.
     ///
-    /// Bounded per sender at
-    /// [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`] distinct entries:
-    /// once a sender's set is full the alert is still EMITTED (a §9.9.4
-    /// security event is never silently discarded) but no further entry is
-    /// inserted, capping the memory a malicious sender can pin.
+    /// Emission of the §9.9.4 alert is ALWAYS-ON; only INSERTION into this set
+    /// is cap-gated. Bounded per sender at
+    /// [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`] distinct entries: once a
+    /// sender's set is full the alert is still EMITTED (a §9.9.4 security event
+    /// is never silently discarded) but no further `(count, root)` is inserted,
+    /// capping the memory a malicious sender can pin.
     pub last_seen_remote_checkpoint: HashMap<DID, HashSet<(u64, [u8; 32])>>,
 
     // -----------------------------------------------------------------

@@ -1054,13 +1054,16 @@ pub async fn is_local_did(supervisor: &crate::context::supervisor::Supervisor, d
 #[cfg(test)]
 mod equivocation_dedup_tests {
     //! Focused unit coverage for the `record_equivocation_if_fresh` dedup
-    //! gate (§9.9.3 replay defense, secondary guard). The integration path
-    //! (`reconnect_sync.rs`) rarely reaches this gate because recording a
-    //! divergence appends an `EquivocationDetected` event, advancing
-    //! `local_count` so the same remote count routes to Ahead/Behind — so
-    //! the dedup gate's keyed-on-`(count, root)` behavior is asserted here
-    //! by constructing state directly and calling the helper at a stable
-    //! count, never advancing through `compare_remote_checkpoint`.
+    //! gate (§9.9.3 replay defense). The per-sender `(count, root)` set is the
+    //! SOLE dedup mechanism: a divergence is buffer-only and is NOT appended to
+    //! the durable Merkle log (a receiver-minted equivocation record is not
+    //! sender-authenticated, so logging it would let honest receivers diverge
+    //! their roots and false-positive the very detection it records). With no
+    //! durable append there is no `local_count` advance, so the gate's
+    //! keyed-on-`(count, root)` behavior is the only thing standing between a
+    //! re-presented divergence and a duplicate alert. These tests assert it by
+    //! constructing state directly and calling the helper at a stable count,
+    //! never advancing through `compare_remote_checkpoint`.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use std::sync::Arc;
@@ -1074,8 +1077,9 @@ mod equivocation_dedup_tests {
     use crate::context::supervisor::supervisor::Supervisor;
 
     /// Event-log provider that counts `append_event` calls so the test can
-    /// assert how many `EquivocationDetected` events the dedup gate let
-    /// through. All other methods are no-ops (the gate only appends).
+    /// assert the dedup gate appends NOTHING to the durable Merkle log —
+    /// equivocation alerts are buffer-only (§9.9.3). All other methods are
+    /// no-ops.
     #[derive(Default)]
     struct CountingEventLog {
         appends: Arc<AtomicUsize>,
