@@ -607,12 +607,13 @@ const MAX_FUTURE_TOLERANCE_SECS: u64 = 5;
 const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 
 /// Collects event history for consequence evaluation and participation
-/// record computation (ADR-017, #1530, #1531, #1594).
+/// record computation (ADR-017), merging the durable event log with the
+/// recent receive buffer.
 ///
 /// Combines two sources:
 /// 1. **Event log history** — full persisted history from the
-///    `ContextEventLogProvider`. Each `scp_event_log::Event` includes `actor_did`
-///    (#1594), enabling proper attribution.
+///    `ContextEventLogProvider`. Each `scp_event_log::Event` includes
+///    `actor_did`, enabling proper attribution.
 /// 2. **Receive buffer events** — recent in-memory events that may not
 ///    yet be in the event log (the event log is appended after the
 ///    operation, but the receive buffer is updated inside the lock).
@@ -622,22 +623,21 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 /// `now`). The merge deduplicates by preferring event log entries (which
 /// have accurate timestamps and hashes) over buffer estimates.
 ///
-/// **Known limitation (#1594):** The receive buffer is capped at 1000 events
-/// (`ReceiveBuffer::DEFAULT_BUFFER_CAPACITY`). Long-running contexts lose
-/// older history, which means participation records and consequence evaluation
-/// only reflect recent activity.
-///
 /// Each persisted `scp_event_log::Event` carries a typed `EventType` from the
 /// closed taxonomy. This function projects those variants onto the coarse
 /// trigger buckets `matches_trigger` understands (governance/consequence
 /// variants collapse to `EventType::GovernanceAction`; operational variants
 /// map to their velocity buckets) and passes the canonical payload bytes
 /// through unchanged. Recent receive-buffer events are merged in on top.
-/// Event-log + receive-buffer merge used by consequence enforcement
-/// (ADR-017, #1531). Takes a borrowed [`ReceiveBuffer`] directly so the
-/// caller may build it from sub-borrows of the unified
-/// [`PerContextState`] (ADR-049 §Decision 1) without holding the whole
-/// state across the merge.
+///
+/// **Known limitation:** The receive buffer is capped at 1000 events
+/// (`ReceiveBuffer::DEFAULT_BUFFER_CAPACITY`). Long-running contexts lose
+/// older history, which means participation records and consequence evaluation
+/// only reflect recent activity.
+///
+/// Takes a borrowed [`ReceiveBuffer`] directly so the caller may build it from
+/// sub-borrows of the unified [`PerContextState`] (ADR-049 §Decision 1) without
+/// holding the whole state across the merge.
 #[allow(clippy::too_many_lines)]
 pub fn event_log_entries_for_consequences(
     receive_buffer: &ReceiveBuffer,
