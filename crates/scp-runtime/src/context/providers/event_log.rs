@@ -602,9 +602,9 @@ fn rebuild_log_from_events(
 /// Drops the first `prune_count` events, returning a new [`EventLog`]
 /// containing only the tail.
 ///
-/// Uses [`scp_event_log::checkpoint::TruncatedEventLog::from_log_and_checkpoint`]
-/// to validate the prune boundary, then rebuilds a standalone, append-capable
-/// `EventLog` from the retained tail events. The tail is RE-CHAINED: the first
+/// Rebuilds a standalone, append-capable `EventLog` from the retained tail
+/// events after validating the prune boundary lies within the event set. The
+/// tail is RE-CHAINED: the first
 /// retained event re-anchors to `GENESIS_PREV_HASH` (its real predecessor was
 /// pruned) and each subsequent event re-chains to the new running head. Every
 /// non-`prev_hash` field (timestamp, type, payload, signature) is preserved,
@@ -614,23 +614,14 @@ fn truncate_log_keeping_tail(
     log: &EventLog,
     prune_count: usize,
 ) -> Result<EventLog, scp_event_log::EventLogError> {
-    use scp_event_log::checkpoint::{ConsistencyCheckpoint, TruncatedEventLog};
-
-    let prune_boundary = prune_count as u64;
-    // A synthetic checkpoint marking the prune boundary. `from_log_and_checkpoint`
-    // only reads `event_count`; the remaining fields are not consulted, so a
-    // zero-valued root/signature is acceptable here.
-    let checkpoint = ConsistencyCheckpoint {
-        context_id: log.context_id().to_owned(),
-        sender_did: DID::from(String::new()),
-        event_count: prune_boundary,
-        merkle_root: scp_event_log::tree::root(log),
-        epoch: None,
-        timestamp: 0,
-        signature: Vec::new(),
-    };
-
-    let truncated = TruncatedEventLog::from_log_and_checkpoint(log, checkpoint)?;
+    // The prune boundary must lie within the existing event set; the caller
+    // (`prune_before_checkpoint`) clamps `prune_count` to the log length, but
+    // assert the invariant here so a future caller cannot silently over-prune.
+    debug_assert!(
+        prune_count <= log.events().len(),
+        "prune_count ({prune_count}) exceeds event count ({})",
+        log.events().len()
+    );
 
     // Rebuild a standalone EventLog from the retained tail events so the
     // provider continues to own a full (event-backed) log it can append to.
@@ -660,9 +651,6 @@ fn truncate_log_keeping_tail(
         };
         scp_event_log::tree::append_unsigned_event(&mut tail, &rechained)?;
     }
-    // `truncated` is consulted only to validate the boundary; the rebuilt
-    // `tail` is the authoritative retained log.
-    debug_assert_eq!(truncated.tail_event_count(), tail.events().len() as u64);
     Ok(tail)
 }
 
