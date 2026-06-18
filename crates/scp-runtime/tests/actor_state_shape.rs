@@ -76,7 +76,6 @@ fn per_context_state_encrypted_public_fields_accessible() {
 
     // Event buffers + logs.
     assert!(s.event_log.is_none());
-    assert_eq!(s.merkle_tree.leaves().len(), 0);
     assert_eq!(s.receive_buffer.len(), 0);
 
     // Mode-specific metadata.

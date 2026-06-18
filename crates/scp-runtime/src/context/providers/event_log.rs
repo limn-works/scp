@@ -758,6 +758,43 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         // Delegate to the concrete method on MerkleEventLogProvider.
         Self::prune_before_checkpoint(self, context_id, checkpoint_event_count, policy)
     }
+
+    fn prove_event_inclusion(
+        &self,
+        context_id: &[u8; 32],
+        leaf_index: u64,
+    ) -> Result<scp_event_log::proof::InclusionProof, scp_protocol::context::ContextError> {
+        // Build the proof directly against the provider's own canonical tree
+        // via `with_log` — no replay, no second tree (the proof seam).
+        self.with_log(context_id, |log| {
+            scp_event_log::proof::prove_inclusion(log, leaf_index)
+                .map_err(|e| scp_protocol::context::ContextError::EventLogFailed(e.to_string()))
+        })
+        .unwrap_or_else(|| {
+            Err(scp_protocol::context::ContextError::EventLogFailed(format!(
+                "no event log for context {}",
+                hex::encode(context_id)
+            )))
+        })
+    }
+
+    fn prove_event_consistency(
+        &self,
+        context_id: &[u8; 32],
+        old_size: u64,
+    ) -> Result<scp_event_log::proof::ConsistencyProof, scp_protocol::context::ContextError> {
+        self.with_log(context_id, |log| {
+            let current_size = scp_event_log::tree::event_count(log);
+            scp_event_log::proof::prove_consistency(log, old_size, current_size)
+                .map_err(|e| scp_protocol::context::ContextError::EventLogFailed(e.to_string()))
+        })
+        .unwrap_or_else(|| {
+            Err(scp_protocol::context::ContextError::EventLogFailed(format!(
+                "no event log for context {}",
+                hex::encode(context_id)
+            )))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

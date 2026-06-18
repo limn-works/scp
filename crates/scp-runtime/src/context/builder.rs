@@ -322,6 +322,86 @@ pub trait ContextEventLogProvider: Send + Sync {
     ) -> Option<usize> {
         None
     }
+
+    // -- Merkle proofs (ADR-011) ---------------------------------------------
+
+    /// Returns an RFC 6962 inclusion proof for the event at `leaf_index`.
+    ///
+    /// The default implementation reads the context's events via
+    /// [`event_log_entries`](Self::event_log_entries), replays them through the
+    /// canonical [`scp_event_log`] substrate to reconstruct the Merkle tree
+    /// (the same leaf preimage the provider committed to), and constructs the
+    /// proof against that tree. This is the single proof seam: there is no
+    /// second tree to keep in sync with the provider's log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if no log exists for the
+    /// context, the leaf index is out of bounds, the log is empty, or the
+    /// replayed events fail hash-chain verification.
+    fn prove_event_inclusion(
+        &self,
+        context_id: &[u8; 32],
+        leaf_index: u64,
+    ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
+        let log = self.rebuild_event_log_for_proof(context_id)?;
+        scp_event_log::proof::prove_inclusion(&log, leaf_index)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Returns an RFC 6962 consistency proof between the tree at `old_size`
+    /// and the current tree size.
+    ///
+    /// Reconstructs the Merkle tree the same way as
+    /// [`prove_event_inclusion`](Self::prove_event_inclusion).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if no log exists for the
+    /// context, `old_size` is 0, `old_size` exceeds the current size, the log
+    /// is empty, or the replayed events fail hash-chain verification.
+    fn prove_event_consistency(
+        &self,
+        context_id: &[u8; 32],
+        old_size: u64,
+    ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
+        let log = self.rebuild_event_log_for_proof(context_id)?;
+        let current_size = scp_event_log::tree::event_count(&log);
+        scp_event_log::proof::prove_consistency(&log, old_size, current_size)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Reconstructs the canonical [`scp_event_log::EventLog`] for a context by
+    /// replaying its events through the substrate.
+    ///
+    /// Shared by the proof methods. Returns an error if no log exists for the
+    /// context or the replayed events break the hash chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] on a missing log or a broken
+    /// chain.
+    fn rebuild_event_log_for_proof(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<scp_event_log::EventLog, ContextError> {
+        let entries = self.event_log_entries(context_id)?.ok_or_else(|| {
+            ContextError::EventLogFailed(format!(
+                "no event log for context {}",
+                hex::encode(context_id)
+            ))
+        })?;
+        let mut log = scp_event_log::EventLog::new(hex::encode(context_id));
+        for event in &entries {
+            scp_event_log::tree::append_unsigned_event(&mut log, event).map_err(|e| {
+                ContextError::EventLogFailed(format!(
+                    "event log chain broken at sequence {}: {e}",
+                    event.sequence
+                ))
+            })?;
+        }
+        Ok(log)
+    }
 }
 
 // ---------------------------------------------------------------------------

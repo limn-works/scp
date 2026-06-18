@@ -58,7 +58,8 @@
 //! - [`compare_remote_checkpoint`] — equivocation detection (§9.9.3).
 //!   Mutates `checkpoint_events_since` on divergent compare.
 //! - [`prove_event_inclusion`], [`prove_event_consistency`] — Merkle
-//!   proofs. `sync_merkle_tree` mutation runs first.
+//!   proofs. Delegate to the event-log provider, which builds the proof
+//!   directly against its own canonical tree (no per-context twin tree).
 //!
 //! Field-disjoint actor-shape entries used by other domains:
 //!
@@ -959,41 +960,41 @@ fn record_equivocation_if_fresh(
 /// Returns a Merkle inclusion proof for the event at `leaf_index` in
 /// the per-context RFC 6962 event log.
 ///
-/// Actor-shape — synchronizes the in-memory Merkle tree against the
-/// shared event-log provider before constructing the proof.
+/// Delegates to the event-log provider, which constructs the proof directly
+/// against its own canonical [`scp_event_log::EventLog`] (the single proof
+/// seam — there is no second per-context tree to keep in sync).
 ///
 /// # Errors
 ///
-/// Returns [`ContextError::EventLogFailed`] if the leaf index is out of
-/// bounds or the log is empty.
+/// Returns [`ContextError::EventLogFailed`] if no log exists for the context,
+/// the leaf index is out of bounds, or the log is empty.
 pub fn prove_event_inclusion(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     leaf_index: u64,
 ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
-    sync_merkle_tree(context_id, state, deps.event_log.as_ref());
-    scp_event_log::proof::prove_inclusion(&state.merkle_tree, leaf_index)
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    let context_id_bytes = state::context_id_to_bytes(context_id);
+    deps.event_log
+        .prove_event_inclusion(&context_id_bytes, leaf_index)
 }
 
 /// Returns a Merkle consistency proof between the tree at `old_size`
 /// and the current tree size.
 ///
+/// Delegates to the event-log provider (the single proof seam).
+///
 /// # Errors
 ///
-/// Returns [`ContextError::EventLogFailed`] if `old_size` is 0, exceeds
-/// the current size, or the log is empty.
+/// Returns [`ContextError::EventLogFailed`] if no log exists for the context,
+/// `old_size` is 0, `old_size` exceeds the current size, or the log is empty.
 pub fn prove_event_consistency(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     old_size: u64,
 ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
-    sync_merkle_tree(context_id, state, deps.event_log.as_ref());
-    let current_size = scp_event_log::tree::event_count(&state.merkle_tree);
-    scp_event_log::proof::prove_consistency(&state.merkle_tree, old_size, current_size)
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    let context_id_bytes = state::context_id_to_bytes(context_id);
+    deps.event_log
+        .prove_event_consistency(&context_id_bytes, old_size)
 }
 
 /// Verifies a Merkle inclusion proof. Pure function — no state needed.
@@ -1006,47 +1007,6 @@ pub fn verify_event_inclusion(proof: &scp_event_log::proof::InclusionProof) -> b
 #[must_use]
 pub fn verify_event_consistency(proof: &scp_event_log::proof::ConsistencyProof) -> bool {
     scp_event_log::proof::verify_consistency(proof)
-}
-
-// ===========================================================================
-// Merkle tree synchronization (private helper)
-// ===========================================================================
-
-/// Synchronizes the per-context Merkle tree with the event-log provider.
-///
-/// Replays missing events through the canonical substrate
-/// [`scp_event_log::tree::append_unsigned_event`], which recomputes each
-/// leaf hash (`SHA-256(0x00 ‖ rmp_serde(Event))`) and rebuilds the RFC 6962
-/// interior nodes. The provider's log and this per-context tree share the
-/// identical leaf preimage, so replaying the provider's tail events
-/// reproduces the same leaves and root.
-fn sync_merkle_tree(
-    context_id: &str,
-    state: &mut PerContextState,
-    event_log: &dyn ContextEventLogProvider,
-) {
-    let context_id_bytes = state::context_id_to_bytes(context_id);
-    // event_count returns u64; on 32-bit targets the log size is bounded
-    // by available memory well below u32::MAX, so saturating is safe.
-    let tree_count =
-        usize::try_from(scp_event_log::tree::event_count(&state.merkle_tree)).unwrap_or(usize::MAX);
-
-    if let Ok(Some(entries)) = event_log.event_log_entries(&context_id_bytes)
-        && entries.len() > tree_count
-    {
-        for entry in entries.iter().skip(tree_count) {
-            if let Err(e) = scp_event_log::tree::append_unsigned_event(&mut state.merkle_tree, entry)
-            {
-                tracing::warn!(
-                    context_id,
-                    sequence = entry.sequence,
-                    error = %e,
-                    "failed to sync event into per-context Merkle tree"
-                );
-                break;
-            }
-        }
-    }
 }
 
 // ===========================================================================

@@ -66,7 +66,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use scp_event_log::EventLog as MerkleEventLog;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_identity::DID;
 use scp_primitives::{Clock, SystemClock};
@@ -812,18 +811,8 @@ pub struct PerContextState {
     /// RFC-6962 Merkle event log. `None` until the first event; some
     /// actor constructions (test fixtures, mid-restore) run with it
     /// unset. Wraps [`scp_event_log::EventLog`] for the actor's
-    /// `EventLogPersistence` path; not the same as
-    /// [`Self::merkle_tree`] (the in-memory RFC-6962 tree legacy held
-    /// for proof generation).
+    /// `EventLogPersistence` path.
     pub event_log: Option<ContextEventLog>,
-
-    /// In-memory RFC-6962 Merkle tree (ADR-011) parallel to the
-    /// persisted event log. Used by `manager/messaging.rs` for O(log n)
-    /// inclusion / consistency proofs. Mirrors legacy
-    /// `state::PerContextState::merkle_tree`. Not persisted — rebuilt
-    /// from `MerkleEventLogProvider` on `restore_context` /
-    /// `import_context` per legacy comment.
-    pub merkle_tree: MerkleEventLog,
 
     /// Receive event buffer (bounded 1000-entry deque). Mirrors legacy
     /// `state::PerContextState::receive_buffer`.
@@ -1276,7 +1265,6 @@ impl PerContextState {
             members: HashSet::new(),
             role_state: empty_role_state_for_test(),
             event_log: None,
-            merkle_tree: MerkleEventLog::new(context_id_str.to_owned()),
             receive_buffer: ReceiveBuffer::new(),
             broadcast_context: None,
             migration_state: None,
@@ -1501,7 +1489,6 @@ mod tests {
             members,
             role_state,
             event_log,
-            merkle_tree,
             receive_buffer,
             broadcast_context,
             migration_state,
@@ -1545,7 +1532,6 @@ mod tests {
 
         // Event buffers + logs.
         assert!(event_log.is_none());
-        assert_eq!(merkle_tree.leaves().len(), 0);
         assert_eq!(receive_buffer.len(), 0);
 
         // Mode-specific metadata.
@@ -1621,7 +1607,6 @@ mod tests {
             members: _,
             role_state: _,
             event_log: _,
-            merkle_tree: _,
             receive_buffer: _,
             broadcast_context: _,
             migration_state: _,

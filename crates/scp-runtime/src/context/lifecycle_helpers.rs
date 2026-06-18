@@ -1279,7 +1279,6 @@ pub async fn create_context(
         checkpoint_last_time_secs: deps.clock.now_secs(),
         checkpoints: Vec::new(),
         last_seen_remote_checkpoint: std::collections::HashMap::new(),
-        merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
         // §9.10.4: pseudonym routing axis. Encrypted contexts carry the
         // member's pseudonym + an empty peer registry; broadcast contexts
         // carry no pseudonym state.
@@ -1855,7 +1854,6 @@ pub async fn import_context(
         checkpoints: Vec::new(),
         last_seen_remote_checkpoint: std::collections::HashMap::new(),
         // Fresh Merkle tree for imported contexts.
-        merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
         // §9.10.4: the importer derives their OWN pseudonym — the exporter's
         // is local-instance state with no meaning here. The peer registry
         // starts empty; the importer re-announces and learns peers' pseudonyms
@@ -2307,7 +2305,6 @@ pub async fn restore_context(
         checkpoint_last_time_secs: ctx_snapshot.checkpoint_last_time_secs,
         checkpoints: Vec::new(),
         last_seen_remote_checkpoint: std::collections::HashMap::new(),
-        merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
         routing: restored_routing,
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
