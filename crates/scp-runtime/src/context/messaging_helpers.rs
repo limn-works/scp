@@ -3276,6 +3276,248 @@ mod pseudonym_routing_tests {
     }
 
     // -----------------------------------------------------------------------
+    // STRONGER regression: drive a buffered APPLICATION message END-TO-END
+    // through a REAL buffered-drain call site so a re-introduced
+    // `if let Some(event_name) { run_buffered_post_delivery(...) }` gate is
+    // caught.
+    //
+    // The helper-contract test above calls `run_buffered_post_delivery`
+    // DIRECTLY, so it proves the helper does the right thing GIVEN it is
+    // called — but it cannot observe the four call sites that decide WHETHER
+    // to call it. The actual bug lived at those call sites (the
+    // `deliver_plaintext_or_announcement` result was gated through
+    // `if let Some(...)`, which is `None` for application data, so governance
+    // was skipped). This test exercises `validate_and_drain_timeouts` — one of
+    // the four real drain paths — with a buffered-ahead application message
+    // that times out, forcing the call site to run
+    // `deliver_plaintext_or_announcement` (→ `None`) followed by
+    // `run_buffered_post_delivery`. It asserts the governance side effects fire
+    // (velocity recorded + `ConsequenceTriggered` appended + checkpoint
+    // advanced) WITHOUT a `MessageSent` Merkle leaf. Re-adding an `if let Some`
+    // gate around the call site makes this test FAIL (governance is skipped for
+    // the `None`-typed application message), which the helper-contract test
+    // would not catch.
+    // -----------------------------------------------------------------------
+
+    /// Event-log provider that records appended `EventType`s through shared
+    /// `Arc<AtomicBool>` handles, so the test can read them AFTER the provider
+    /// has been moved into the supervisor / `ActorDeps`. Atomics only (no
+    /// `Mutex`) per ADR-049's runtime-state model.
+    struct DrainRecordingEventLog {
+        saw_consequence_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        saw_message_sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::context::builder::ContextEventLogProvider for DrainRecordingEventLog {
+        fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            match event {
+                scp_event_log::EventType::ConsequenceTriggered => {
+                    self.saw_consequence_triggered
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                scp_event_log::EventType::MessageSent => {
+                    self.saw_message_sent
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Minimal application-message `InnerEnvelope` for the drain test. The
+    /// drain path reads only `sequence`/`timestamp`/`context_id`/`sender_did`;
+    /// the body is the separate `plaintext` argument.
+    fn drain_test_inner(ctx: &str, sequence: u64) -> scp_protocol::envelope::inner::InnerEnvelope {
+        scp_protocol::envelope::inner::InnerEnvelope {
+            version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+            context_id: ctx.to_owned(),
+            sender_did: ALICE.to_owned(),
+            epoch: 0,
+            generation: 0,
+            sequence,
+            timestamp: 1_700_000_000,
+            message_type: scp_protocol::envelope::inner::MessageType::Content,
+            payload_hash: [0u8; 32],
+            payload: Vec::new(),
+            provenance: None,
+            provenance_hash: [0u8; 32],
+            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signature: [0u8; 64],
+            extensions: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Assemble a supervisor-backed `ActorDeps` carrying `event_log` and a
+    /// `TestClock`. Extracted so the drain test stays under `too_many_lines`.
+    async fn build_drain_test_deps(
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+    ) -> crate::context::actor::deps::ActorDeps {
+        use crate::context::supervisor::supervisor::Supervisor;
+        use scp_platform::testing::InMemoryStorage;
+        use std::sync::Arc;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            ALICE.to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let clock: Arc<dyn scp_primitives::Clock> =
+            Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            None,
+            None,
+            None,
+            Some(clock),
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID(ALICE.to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    #[tokio::test]
+    async fn buffered_drain_call_site_runs_governance_for_application_message() {
+        use crate::context::messaging_helpers::validate_and_drain_timeouts;
+        use scp_protocol::context::roles::Capability;
+        use scp_protocol::envelope::validation::{BufferedMessage, DEFAULT_GAP_TIMEOUT_MS};
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let ctx = ctx_hex(0x11);
+        let mut state: PerContextState = encrypted_state();
+
+        // ALICE must be a writable member: the drain loop re-checks membership +
+        // `MessagesWrite` before delivering each buffered message.
+        state
+            .membership
+            .add_member(DID(ALICE.to_owned()), "member".to_owned(), Vec::new());
+        state.members.insert(DID(ALICE.to_owned()));
+        state.role_state.members.insert(ALICE.to_owned());
+        let mut caps = std::collections::HashSet::new();
+        caps.insert(Capability::MessagesWrite);
+        state
+            .role_state
+            .member_capabilities
+            .insert(ALICE.to_owned(), caps);
+
+        // A MessageVelocity rule that trips on the first message. Received
+        // application messages project to `EventType::MessageSent` for
+        // consequence purposes, so one buffered app message trips threshold 1
+        // and emits `ConsequenceTriggered` (non-empty evidence).
+        state.governance.consequence_rules.push(ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: std::time::Duration::from_hours(1),
+        });
+
+        // Pre-buffer an out-of-order APPLICATION message (sequence 2, expected
+        // 1) with `received_at = 0` so it is past the gap timeout once we pass a
+        // large `now_ms`. This is a plain application payload (not a pseudonym
+        // announcement), so on drain `deliver_plaintext_or_announcement` returns
+        // `None` — exactly the case the gated bug dropped.
+        let buffered = state.reorder_buffer.buffer(BufferedMessage {
+            inner: drain_test_inner(&ctx, 2),
+            sender_did: ALICE.to_owned(),
+            plaintext: b"buffered application payload".to_vec(),
+            received_at: 0,
+        });
+        assert!(
+            buffered.is_none(),
+            "single buffered message must not overflow the reorder buffer"
+        );
+
+        // Shared recording handles survive the move into the supervisor.
+        let saw_consequence_triggered = Arc::new(AtomicBool::new(false));
+        let saw_message_sent = Arc::new(AtomicBool::new(false));
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(DrainRecordingEventLog {
+                saw_consequence_triggered: Arc::clone(&saw_consequence_triggered),
+                saw_message_sent: Arc::clone(&saw_message_sent),
+            });
+        let deps = build_drain_test_deps(event_log).await;
+
+        let checkpoint_before = state.checkpoint_events_since;
+
+        // Drive the REAL drain call site: the incoming in-order message (seq 1)
+        // is validated, and `now_ms` is past the gap timeout, so the buffered
+        // seq-2 application message force-drains through
+        // `validate_and_drain_timeouts`' loop — which calls
+        // `deliver_plaintext_or_announcement` (→ `None`) then
+        // `run_buffered_post_delivery`. A re-added `if let Some` gate here would
+        // skip governance for the `None`-typed application message.
+        let incoming = drain_test_inner(&ctx, 1);
+        let now_ms = 1_700_000_000 + DEFAULT_GAP_TIMEOUT_MS + 10;
+        validate_and_drain_timeouts(&mut state, &deps, &ctx, &incoming, now_ms)
+            .expect("validate_and_drain_timeouts");
+
+        // (a) Velocity recorded for the buffered sender via the drain path.
+        let velocity = state.governance.velocity_tracker.snapshot_entries();
+        assert!(
+            velocity.get(ALICE).is_some_and(|ts| !ts.is_empty()),
+            "buffered-drain call site must record sender velocity (a re-added `if let Some` gate skips it)"
+        );
+
+        // (b) Consequence evaluation/enforcement ran (a `ConsequenceTriggered`
+        // event was appended) and the application message itself appended NO
+        // `MessageSent` Merkle leaf (§9.9.3 — received app messages are never
+        // durably logged).
+        assert!(
+            saw_consequence_triggered.load(AtomicOrdering::SeqCst),
+            "buffered-drain call site must run consequence evaluation/enforcement (a re-added `if let Some` gate skips it)"
+        );
+        assert!(
+            !saw_message_sent.load(AtomicOrdering::SeqCst),
+            "a received application message must NOT append a MessageSent Merkle leaf (§9.9.3)"
+        );
+
+        // (c) The checkpoint counter advanced for the drained application
+        // message. The gated bug left it unchanged.
+        assert!(
+            state.checkpoint_events_since > checkpoint_before,
+            "buffered-drain call site must advance checkpoint_events_since (a re-added `if let Some` gate skips it): \
+             before={checkpoint_before}, after={}",
+            state.checkpoint_events_since
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Consistency-checkpoint wire message (§9.9.3, §23.7)
     // -----------------------------------------------------------------------
 
