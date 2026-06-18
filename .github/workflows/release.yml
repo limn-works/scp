@@ -619,7 +619,8 @@ JSON
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          ./gradlew :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository
+          ./gradlew :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository \
+            -PscpVersion=${{ env.VERSION }}
 
       # Kotlin Android AAR: works.limn:scp-kt-android
       - name: Publish Kotlin Android AAR to Maven Central
@@ -631,29 +632,87 @@ JSON
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          ./gradlew :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository
+          ./gradlew :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository \
+            -PscpVersion=${{ env.VERSION }}
 
   publish-spm:
     name: "Step 6f: Publish Swift Package (SPM)"
     needs: [sign-apple]
     if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
+    outputs:
+      xcframework-zip: ScpFFI-${{ inputs.version }}.xcframework.zip
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-      # SPM distribution uses binary targets pointing to a GitHub Release URL.
-      # The release step (Step 7) uploads the XCFramework zip.
-      # Package.swift already references ScpFFI.xcframework as a local path
-      # for development; for release, consumers use the tagged version.
-      - name: Verify Package.swift
+      - name: Configure git identity
         run: |
-          if [ ! -f bindings/swift/Package.swift ]; then
-            echo "::error::bindings/swift/Package.swift not found"
-            exit 1
-          fi
-          echo "SPM package will be available at tag scp-swift@${{ env.VERSION }}"
-          echo "Consumers add: .package(url: \"https://github.com/limn/scp\", from: \"${{ env.VERSION }}\")"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Download signed XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: swift-xcframework-signed
+          path: xcframework-signed/
+
+      - name: Zip XCFramework and compute checksum
+        id: xcf
+        run: |
+          ZIP="ScpFFI-${{ env.VERSION }}.xcframework.zip"
+          cd xcframework-signed
+          zip -r "../$ZIP" .
+          cd ..
+          CHECKSUM=$(shasum -a 256 "$ZIP" | awk '{print $1}')
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
+          echo "XCFramework zip: $ZIP ($CHECKSUM)"
+
+      # The GitHub Release URL is deterministic — the zip will be uploaded
+      # to the scp-core@{version} release in Step 7.
+      - name: Update Package.swift with URL binary target
+        env:
+          CHECKSUM: ${{ steps.xcf.outputs.checksum }}
+        run: |
+          RELEASE_URL="https://github.com/limn-works/scp/releases/download/scp-core@${{ env.VERSION }}/ScpFFI-${{ env.VERSION }}.xcframework.zip"
+          python3 - <<PYEOF
+          import re, os, pathlib
+          path = pathlib.Path("bindings/swift/Package.swift")
+          src = path.read_text()
+          # Matches .binaryTarget(name: "ScpFFI", ...) regardless of whether
+          # it currently uses path: or url:/checksum: (handles repeated releases).
+          old = r'\.binaryTarget\(\s*name:\s*"ScpFFI"[^)]*\)'
+          new = (
+              '.binaryTarget(\n'
+              '            name: "ScpFFI",\n'
+              f'            url: "{os.environ["RELEASE_URL"]}",\n'
+              f'            checksum: "{os.environ["CHECKSUM"]}"\n'
+              '        )'
+          )
+          updated = re.sub(old, new, src, flags=re.DOTALL)
+          assert updated != src, "Pattern not found in Package.swift — update the regex"
+          path.write_text(updated)
+          PYEOF
+
+      - name: Commit and tag updated Package.swift
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git add bindings/swift/Package.swift
+          git commit -m "chore(swift): update Package.swift binary target for ${{ env.VERSION }}"
+          git push origin HEAD:main
+          git tag -a "scp-swift@${{ env.VERSION }}" -m "Swift SDK ${{ env.VERSION }}"
+          git push origin "scp-swift@${{ env.VERSION }}"
+
+      - name: Upload XCFramework zip for GitHub Release
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcframework-zip
+          path: ScpFFI-${{ env.VERSION }}.xcframework.zip
+          retention-days: 1
 
   # ===========================================================================
   # Step 7: Create GitHub Release
@@ -678,23 +737,17 @@ JSON
           name: scp-release-bundle
           path: release-artifacts/
 
-      - name: Download signed XCFramework
+      - name: Download XCFramework zip (produced by publish-spm)
         uses: actions/download-artifact@v4
         with:
-          name: swift-xcframework-signed
-          path: release-artifacts/swift-xcframework-signed/
+          name: xcframework-zip
+          path: release-artifacts/
 
       - name: Download signed Windows artifacts
         uses: actions/download-artifact@v4
         with:
           name: windows-signed
           path: release-artifacts/windows-signed/
-
-      - name: Package XCFramework as zip
-        run: |
-          cd release-artifacts/swift-xcframework-signed
-          zip -r ../ScpFFI-${{ env.VERSION }}.xcframework.zip .
-          cd ../..
 
       - name: Extract changelog for this version
         id: changelog

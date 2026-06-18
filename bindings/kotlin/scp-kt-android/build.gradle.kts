@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "works.limn"
-version = "0.1.0"
+version = findProperty("scpVersion")?.toString() ?: "0.1.0-SNAPSHOT"
 
 repositories {
     google()
