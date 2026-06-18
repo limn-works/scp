@@ -40,13 +40,21 @@
 //!   `Send`/`Sync` impl. The crate-level `forbid` makes the deny redundant
 //!   in practice — but keeping it here keeps the constraint legible at the
 //!   module the constraint protects.
-//! - **`#![deny(non_local_definitions)]`.** This closes the one forgery
-//!   vector the visibility rules alone do not: a nested
+//! - **`#![deny(non_local_definitions)]`.** This closes ONE specific forgery
+//!   vector — the **body-nested `impl`** form: a nested
 //!   `impl OwnedIdentityDid { .. }` written inside a method body. Rust never
 //!   scopes a nested impl to its enclosing fn — it applies globally — so
-//!   such an impl would be a SECOND minter authored from inside the module.
-//!   Denying the lint makes any nested impl a hard COMPILE error, enforcing
-//!   the sole-minter invariant at the compiler rather than via a scanner.
+//!   such an impl would be a SECOND minter authored from inside the module,
+//!   buried deep in a long function body where a human reviewer is worst at
+//!   spotting it. Denying the lint makes any body-nested impl a hard COMPILE
+//!   error, closing that one vector at the compiler rather than via a
+//!   scanner. The lint does NOT close the other in-module ways to add a
+//!   second minter — a top-level second inherent `impl`, a top-level trait
+//!   `impl` whose method mints, a module-level free fn constructing via the
+//!   in-module struct literal, a visibility widen, a forbidden derive, or a
+//!   `pub` field. All of those compile cleanly and are visible diffs to this
+//!   frozen file; the "no second minter of ANY form" invariant is owned by
+//!   code review, NOT mechanically backstopped by this lint. See ADR-049 §5.
 //!
 //! ## Compile-fail witness for the `non_local_definitions` guarantee
 //!
@@ -60,7 +68,9 @@
 //! globally rather than scoping it to `forge` — so the *only* reason this
 //! fails to compile is the denied lint. If a future toolchain narrowed the
 //! lint, this `compile_fail` doctest would start compiling and the test
-//! would fail, surfacing the silent regression.
+//! would fail, surfacing the silent regression. This doctest is the SOLE
+//! automated tripwire for `non_local_definitions` lint drift — it MUST NOT
+//! be deleted as "just an example"; its survival is tied to the guarantee.
 //!
 //! ```compile_fail
 //! #![deny(non_local_definitions)]

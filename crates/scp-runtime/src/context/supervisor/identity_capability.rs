@@ -61,13 +61,24 @@
 //! - **`#![deny(non_local_definitions)]`** at `supervisor/mod.rs` — turns a
 //!   nested `impl OwnedIdentityDid { .. }` written inside a method body
 //!   (which Rust would otherwise apply globally, creating a SECOND minter
-//!   from inside the module) into a hard COMPILE error. This closes the one
-//!   forgery vector the visibility rules alone do not: an in-module second
-//!   constructor smuggled into a function body.
+//!   from inside the module) into a hard COMPILE error. This closes ONE
+//!   specific forgery vector: the body-nested-`impl` form — a second
+//!   constructor buried deep in a function body, where a human reviewer is
+//!   worst at spotting it. It does NOT close the other in-module ways to add
+//!   a second minter (a top-level second inherent `impl`, a top-level trait
+//!   `impl` whose method mints, a module-level free fn constructing via the
+//!   in-module struct literal, a visibility widen, a forbidden derive, or a
+//!   `pub` field) — those compile cleanly and are review-owned. The lint is
+//!   NOT a complete mechanical backstop for "only the sanctioned minters."
 //! - **Code review** of this small, frozen file for the EXPLICIT NON-DERIVES
-//!   above and for the absence of any second arbitrary-`DID` constructor.
-//!   Adding a derive or a new minter is a visible diff to a tiny file with a
-//!   single struct and a single inherent impl; review catches it.
+//!   above and for the absence of any second arbitrary-`DID` constructor in
+//!   ANY form (the broader "no second minter of any form" invariant is
+//!   review-owned, not lint-enforced). Adding a derive or a new minter is a
+//!   visible diff to a tiny file with a single struct and a single inherent
+//!   impl; review catches it. The exact `pub(in crate::context)` visibility
+//!   of `reissue`/`as_did` is likewise review-enforced — Rust visibility is
+//!   not compile-time assertable the way a missing derive is (a widen still
+//!   compiles).
 //!
 //! A bespoke external scanner was deliberately NOT used. Its only residual
 //! threat model is an insider editing this file — but such an insider could
