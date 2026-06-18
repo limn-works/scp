@@ -8172,6 +8172,7 @@ mod tests {
     /// WALL-CLOCK wait for the watchdog to be scheduled is widened. The tighter
     /// 5ms interval keeps the common (fast) case responsive while the long
     /// deadline removes the false-timeout tail.
+    #[cfg(feature = "testing")]
     async fn poll_until<F: Fn() -> bool>(cond: F) -> bool {
         // ~8s ceiling = 1600 iterations × 5ms. Far above any realistic watchdog
         // scheduling delay, but still bounded so a genuinely stuck test fails
@@ -9284,6 +9285,7 @@ mod tests {
     /// A KP-actor panic is caught by the watchdog, recorded payload-free in the
     /// per-identity crash window, and the actor is respawned — a subsequent
     /// `key_package_store_for` resolves a fresh, live handle.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn kp_actor_watchdog_records_panic_and_respawns() {
         let supervisor = supervisor_with_providers();
@@ -9332,6 +9334,7 @@ mod tests {
 
     /// Three KP-actor panics within the budget window poison the identity; the
     /// next `key_package_store_for` surfaces a typed `ContextPoisoned` error.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn kp_actor_poisons_after_budget() {
         let supervisor = supervisor_with_providers();
@@ -9374,6 +9377,7 @@ mod tests {
     /// reconciles from the journal), WITHOUT routing through the per-context
     /// snapshot respawn (there is no KP context-snapshot). After recovery the
     /// identity resolves a live handle again.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn clear_kp_poison_recovers_poisoned_actor() {
         let supervisor = supervisor_with_providers();
@@ -9589,6 +9593,7 @@ mod tests {
     }
 
     /// Captured watchdog log lines that mention `ctx_key`.
+    #[cfg(feature = "testing")]
     fn captured_log_lines_for(ctx_key: &str) -> Vec<String> {
         capture_buffer()
             .lock()
@@ -9693,6 +9698,7 @@ mod tests {
     /// `Err` (the reply channel drops when the actor task unwinds) — that
     /// is the signal the actor has crashed. We then poll until the
     /// supervisor's registry/budget reflects the watchdog's reaction.
+    #[cfg(feature = "testing")]
     async fn induce_panic(handle: &ContextActorHandle, sentinel: &str) {
         // Fire-and-forget: `TestInducePanic` carries no reply channel and the
         // actor unwinds on dispatch, so use the pre-built-command send path.
@@ -9763,6 +9769,7 @@ mod tests {
     /// a RESPONSIVE respawned actor — a bare registry `lookup` is not enough
     /// because a just-crashed actor's handle lingers in the registry until
     /// the watchdog despawns it.
+    #[cfg(feature = "testing")]
     async fn wait_until_async<F, Fut>(timeout: std::time::Duration, mut cond: F) -> bool
     where
         F: FnMut() -> Fut,
@@ -9784,6 +9791,7 @@ mod tests {
     /// true, `lookup` returns None (the dead handle is despawned), a
     /// subsequent dispatch surfaces `ContextPoisoned`, and no respawn
     /// happens after the poison.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn three_crashes_poison_and_stop_respawning() {
         let clock = Arc::new(TestClock::new(1_700_000_000));
@@ -9867,6 +9875,7 @@ mod tests {
     /// context's crash window and attempts ONE respawn from the snapshot,
     /// returning it to a usable Active state. The poison flag is cleared and
     /// per-context dispatch resolves to the live actor again.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clear_poison_recovers_a_poisoned_context() {
         let clock = Arc::new(TestClock::new(1_700_000_000));
@@ -9975,6 +9984,7 @@ mod tests {
     /// A single crash (below the threshold) respawns the actor from its
     /// persisted snapshot, and the rehydrated context preserves the
     /// persisted state — including the §9.10.4 routing axis.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn single_crash_respawns_and_preserves_state() {
         let clock = Arc::new(TestClock::new(1_700_000_000));
@@ -10078,6 +10088,7 @@ mod tests {
     /// before the crash — must SUCCEED, max-merging the live floor, NOT fail
     /// (which would poison a healthy context). The crash-surviving live floor
     /// (Class M, supervisor-owned crypto provider) is authoritative.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn respawn_from_coalesce_lagged_snapshot_max_merges_floor() {
         let clock = Arc::new(TestClock::new(1_700_000_000));
@@ -10173,6 +10184,7 @@ mod tests {
     /// thread, so a thread-local `set_default` on the test thread would not
     /// see its events). Every test using a distinct `context_id` reads only
     /// its own lines out of the shared global buffer.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn panic_payload_is_not_logged() {
         const SENTINEL: &str = "SECRET_SENTINEL_abc123";
@@ -10267,6 +10279,7 @@ mod tests {
     /// crashes (the panic itself + the failed respawn), proving failed
     /// respawns consume the budget rather than looping forever. The context
     /// is left dormant (lookup None) — it was not resurrected.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_respawn_counts_as_crash() {
         let clock = Arc::new(TestClock::new(1_700_000_000));
@@ -10637,6 +10650,7 @@ mod tests {
     /// the deps' `local_dids` view is the SHARED full set, not a snapshot of
     /// the min DID. Verify the respawn succeeds and the actor is responsive on
     /// a node with two local DIDs.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn respawn_preserves_owning_identity_on_multi_did_node() {
         let clock = Arc::new(TestClock::new(1_700_000_000));
@@ -10720,6 +10734,7 @@ mod tests {
     /// suspended and the read-exclusion entry present. If `execute_revoke`
     /// rode the coalesce path, the crash (which lands before any coalesce)
     /// would roll the revocation back and re-grant access.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn capability_revocation_survives_crash_before_coalesce() {
         use scp_protocol::context::roles::Capability;
@@ -10981,6 +10996,7 @@ mod tests {
     /// calls before returning), then crash+respawn. The removed member MUST
     /// stay removed: a respawn that re-admitted them would be a security
     /// rollback. Asserted through the production mailbox read path (`IsMember`).
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_removal_survives_crash_before_coalesce() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
@@ -11057,6 +11073,7 @@ mod tests {
     /// respawn that re-opened the consumed nonce would let the spending UCAN be
     /// replayed. Asserted through the persisted snapshot the respawn rehydrates
     /// from (the nonce-tracker entry must be present post-crash).
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spending_nonce_consume_survives_crash_before_coalesce() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
@@ -11257,6 +11274,7 @@ mod tests {
     /// consumed nonce persisted via the PRODUCTION `finalize_send(.. = true)` is
     /// still present in the snapshot the respawn rehydrates from — so a replayed
     /// spending UCAN would be rejected post-crash.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_path_spending_nonce_consume_survives_crash_before_coalesce() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
@@ -11340,6 +11358,7 @@ mod tests {
     /// (`execute_resolve_conflict`) sync-persists fail-closed before its reply;
     /// a respawn that dropped it would let an already-resolved proposal be
     /// re-executed.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn executed_proposal_survives_crash_before_coalesce() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
@@ -11403,6 +11422,7 @@ mod tests {
     /// field (it was previously reset to empty on every restore — a silent
     /// downward-authorization rollback the instant a writer existed). A respawn
     /// that dropped it would re-admit a revoked token.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spending_ucan_revocation_survives_crash_before_coalesce() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
@@ -11546,6 +11566,7 @@ mod tests {
     /// A respawn that re-granted the banned member's capabilities would be a
     /// security rollback. Asserted through the persisted snapshot the respawn
     /// rehydrates from (the suspended-capabilities entry must be present).
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn suspend_all_survives_crash_before_coalesce() {
         use scp_protocol::context::roles::Capability;
@@ -11629,6 +11650,7 @@ mod tests {
     /// so the marker is durably captured in the same snapshot. A respawn that
     /// dropped the marker would let an already-executed governance proposal be
     /// replayed. Asserted through the persisted snapshot.
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn executed_proposals_marker_survives_crash_before_coalesce() {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
