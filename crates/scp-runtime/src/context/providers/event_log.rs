@@ -8,7 +8,7 @@
 //! (`SHA-256(0x00 ‖ rmp_serde(Event))`), so their Merkle roots converge and
 //! §9.9.3 equivocation detection cannot false-positive on encoding drift.
 //!
-//! # Persistence (#636, #710)
+//! # Persistence
 //!
 //! When constructed with [`MerkleEventLogProvider::with_persistence`], the
 //! provider persists [`scp_event_log::Event`] values to an
@@ -121,14 +121,12 @@ impl ContextLog {
 /// All methods use `context_id` as a hex string (matching `ProtocolRepository` key
 /// conventions).
 ///
-/// # Per-event storage (#710)
+/// # Per-event storage
 ///
 /// Each event is stored under its own key (`merkle_event_log/{seq:020d}`)
 /// rather than as a single serialized blob. This makes `append_event` O(1)
 /// instead of O(n) per persist. Bulk operations (prune, import) use
 /// [`persist_entries`](Self::persist_entries) which rewrites all keys.
-///
-/// See GitHub issues #636, #710.
 pub trait EventLogPersistence: Send + Sync {
     /// Persists a single event at the given sequence index.
     ///
@@ -703,7 +701,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         #[allow(clippy::cast_possible_truncation)]
         let seq = event.sequence as usize;
 
-        // O(1) persist: only the newly appended event (#710).
+        // O(1) persist: only the newly appended event.
         drop(logs);
         self.persist_entry_best_effort(context_id, seq, &event);
 

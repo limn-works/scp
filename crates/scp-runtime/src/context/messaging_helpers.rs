@@ -346,8 +346,9 @@ pub fn verify_and_unwrap(
 // ---------------------------------------------------------------------------
 
 /// Delivers a single plaintext to the receive buffer, checking if it is a
-/// pseudonym announcement first. Returns the event-log event name for the
-/// delivered message, or `None` when silently dropped.
+/// pseudonym announcement first. Returns the typed event-log
+/// [`scp_event_log::EventType`] for the delivered message, or `None` when
+/// silently dropped.
 pub fn deliver_plaintext_or_announcement(
     state: &mut PerContextState,
     sender_did: &str,
@@ -3143,7 +3144,7 @@ mod pseudonym_routing_tests {
     /// Event-log provider that flags which `EventType`s were appended so the
     /// test can prove (a) consequence evaluation/enforcement DID append a
     /// `ConsequenceTriggered` event and (b) the application message itself
-    /// appended NO `MessageSent` Merkle leaf for a `None` event name. Uses
+    /// appended NO `MessageSent` Merkle leaf for a `None` event type. Uses
     /// atomics only (no `Mutex`) per ADR-049's runtime-state model.
     #[derive(Default)]
     struct RecordingEventLog {
@@ -3244,7 +3245,7 @@ mod pseudonym_routing_tests {
         );
 
         // (b) Consequence evaluation + enforcement ran: a `ConsequenceTriggered`
-        // event was appended to the durable log. The `None` event name means the
+        // event was appended to the durable log. The `None` event type means the
         // application message itself appended NO message leaf (§9.9.3 — there is
         // no `MessageReceived` variant in the closed event taxonomy precisely
         // because received app messages are never durably logged); the only

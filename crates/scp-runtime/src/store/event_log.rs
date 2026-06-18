@@ -9,7 +9,7 @@
 //! context/{context_id}/event_meta/root                -- 32-byte Merkle root
 //! context/{context_id}/event_tree/{level}/{index}     -- Merkle tree nodes
 //! context/{context_id}/event_data/{seq:020d}          -- MessagePack-serialized Event payload
-//! context/{context_id}/merkle_event_log/{seq:020d}    -- per-entry MerkleEventLogProvider (#710)
+//! context/{context_id}/merkle_event_log/{seq:020d}    -- per-entry MerkleEventLogProvider
 //! ```
 //!
 //! Event sequence numbers use 20-digit zero-padding for lexicographic
@@ -22,7 +22,7 @@
 //! The `merkle_event_log/{seq:020d}` key space stores individual
 //! `scp_event_log::Event` values for the `MerkleEventLogProvider`, enabling O(1)
 //! append persistence. Restore loads all entries by prefix scan.
-//! See GitHub issues #636, #710.
+//! See GitHub issue #636.
 //!
 //! See spec sections 17.3, 17.4, and ADR-011.
 
@@ -104,7 +104,7 @@ fn event_data_prefix(context_id: &str) -> Result<String, StoreError> {
 /// Format: `context/{context_id}/merkle_event_log/{seq:020d}`
 /// Uses 20-digit zero-padding for lexicographic ordering, matching
 /// the `event/{seq:020d}` convention.
-/// See GitHub issues #636, #710.
+/// See GitHub issue #636.
 fn merkle_event_log_entry_key(context_id: &str, seq: usize) -> Result<String, StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/merkle_event_log/{seq:020}"))
@@ -678,7 +678,7 @@ impl<S: Storage> ProtocolRepository<S> {
             return Ok(None);
         }
 
-        // Per-entry format (#710): load each entry individually.
+        // Per-entry format: load each entry individually.
         // Keys are returned in lexicographic order (= sequence order due
         // to zero-padding).
         let mut entries = Vec::with_capacity(keys.len());
@@ -1347,7 +1347,7 @@ mod tests {
         let store = make_store();
 
         // Store 5 entries individually. Each carries a distinct timestamp so
-        // the round trip can be checked without a synthetic event name (the
+        // the round trip can be checked without a synthetic event type (the
         // store path is a pure serialize/deserialize, no chain validation).
         for i in 0..5u8 {
             let entry = scp_event_log::Event {
