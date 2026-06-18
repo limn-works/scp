@@ -75,37 +75,29 @@
 //! ```compile_fail
 //! #![deny(non_local_definitions)]
 //!
-//! mod capability {
-//!     pub struct Cap {
-//!         did: String,
-//!     }
+//! // Stand-in for `OwnedIdentityDid`: a module-level type with a private field
+//! // and no public constructor.
+//! struct Cap {
+//!     did: String,
+//! }
 //!
+//! fn smuggle() {
+//!     // A SECOND minter smuggled into a function body. Rust applies a nested
+//!     // `impl` GLOBALLY — it never scopes it to the enclosing fn — so `forge`
+//!     // would mint a `Cap` for an arbitrary value from anywhere the type is
+//!     // nameable. `#![deny(non_local_definitions)]` turns this nested `impl`
+//!     // into a hard compile error. It fails for the lint alone, not for a
+//!     // name-resolution or visibility error: `impl Cap` shares `Cap`'s
+//!     // module, so the private field `did` is reachable.
 //!     impl Cap {
-//!         // The sole sanctioned minter (mirrors `issue_for_actor`).
-//!         pub fn issue(did: String) -> Self {
+//!         fn forge(did: String) -> Self {
 //!             Self { did }
 //!         }
 //!     }
 //! }
 //!
-//! fn forge(raw: String) -> capability::Cap {
-//!     // A SECOND minter smuggled into a function body. Rust applies this
-//!     // `impl` globally (never scoping it to `forge`), so it would forge a
-//!     // `Cap` for an arbitrary DID from outside `capability` — but
-//!     // `#![deny(non_local_definitions)]` turns it into a compile error.
-//!     impl capability::Cap {
-//!         fn smuggled(did: String) -> Self {
-//!             // Routes through the sanctioned constructor: the point is
-//!             // purely that this nested `impl` is rejected by the lint,
-//!             // not by any name-resolution or visibility error.
-//!             capability::Cap::issue(did)
-//!         }
-//!     }
-//!     capability::Cap::smuggled(raw)
-//! }
-//!
 //! fn main() {
-//!     let _ = forge(String::from("did:example:attacker"));
+//!     smuggle();
 //! }
 //! ```
 
