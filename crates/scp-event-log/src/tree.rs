@@ -440,7 +440,8 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
         // Native↔WASM unification variants (ADR-011 Amendment). Tags 36..=75
-        // are assigned in ADR declaration order. Tags 0-35 above are protocol
+        // are assigned in ADR declaration order, with tag 59 retired (see the
+        // PseudonymAnnounced removal note below). Tags 0-35 above are protocol
         // constants and MUST NOT change.
         EventType::AdminTransferred => 36,
         EventType::CeilingModified => 37,
@@ -465,7 +466,10 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::PruningPolicyModified => 56,
         EventType::CommitBroadcasted => 57,
         EventType::CommitBroadcastPending => 58,
-        EventType::PseudonymAnnounced => 59,
+        // 59 retired: PseudonymAnnounced removed — a §9.10.4 routing-bootstrap
+        // ContextEvent signal, not a durable Merkle event (ADR-011 Amendment).
+        // The tag value is intentionally left as a gap so every other variant's
+        // canonical tag (and the §25 KAT preimages) stays byte-stable.
         EventType::ContextTombstoned => 60,
         EventType::ContextMigrationCancelled => 61,
         EventType::TtlExtended => 62,
@@ -1297,13 +1301,14 @@ mod tests {
     // -----------------------------------------------------------------------
     // Closed-taxonomy tag invariants (ADR-011 native↔WASM unification):
     //   - tags 0-35 are protocol constants and MUST NOT change;
-    //   - the 40 unification variants occupy tags 36..=75;
-    //   - all 76 tags are distinct.
+    //   - the 39 unification variants occupy tags 36..=75 with tag 59 retired
+    //     (PseudonymAnnounced removed — a routing-bootstrap ContextEvent signal);
+    //   - all 75 tags are distinct.
     // -----------------------------------------------------------------------
 
     /// The complete `EventType` taxonomy in ADR declaration order, used to
     /// cross-check against `event_type_tag`.
-    const ALL_EVENT_TYPES: [EventType; 76] = [
+    const ALL_EVENT_TYPES: [EventType; 75] = [
         EventType::ContextCreated,
         EventType::ContextClosing,
         EventType::ContextClosed,
@@ -1363,7 +1368,6 @@ mod tests {
         EventType::PruningPolicyModified,
         EventType::CommitBroadcasted,
         EventType::CommitBroadcastPending,
-        EventType::PseudonymAnnounced,
         EventType::ContextTombstoned,
         EventType::ContextMigrationCancelled,
         EventType::TtlExtended,
@@ -1385,13 +1389,19 @@ mod tests {
     #[test]
     fn all_event_type_tags_are_distinct() {
         let mut tags: Vec<u16> = ALL_EVENT_TYPES.iter().map(event_type_tag).collect();
-        assert_eq!(tags.len(), 76, "taxonomy must enumerate all 76 variants");
+        assert_eq!(tags.len(), 75, "taxonomy must enumerate all 75 variants");
         tags.sort_unstable();
         tags.dedup();
         assert_eq!(
             tags.len(),
-            76,
-            "all 76 EventType tags must be distinct (no two variants share a tag)"
+            75,
+            "all 75 EventType tags must be distinct (no two variants share a tag)"
+        );
+        // Tag 59 is intentionally retired (PseudonymAnnounced removed); the tag
+        // space is therefore 0..=75 minus {59}. This is the only gap.
+        assert!(
+            !tags.contains(&59),
+            "tag 59 is retired and must not be reused (PseudonymAnnounced removal)"
         );
     }
 
@@ -1441,8 +1451,8 @@ mod tests {
 
     #[test]
     fn unification_variant_tags_occupy_36_through_75() {
-        // The 40 native↔WASM unification variants occupy tags 36..=75 in ADR
-        // declaration order.
+        // The 39 native↔WASM unification variants occupy tags 36..=75 in ADR
+        // declaration order, with tag 59 retired (PseudonymAnnounced removed).
         assert_eq!(event_type_tag(&EventType::AdminTransferred), 36);
         assert_eq!(event_type_tag(&EventType::CeilingModified), 37);
         assert_eq!(event_type_tag(&EventType::CeilingModificationPending), 38);
@@ -1466,7 +1476,7 @@ mod tests {
         assert_eq!(event_type_tag(&EventType::PruningPolicyModified), 56);
         assert_eq!(event_type_tag(&EventType::CommitBroadcasted), 57);
         assert_eq!(event_type_tag(&EventType::CommitBroadcastPending), 58);
-        assert_eq!(event_type_tag(&EventType::PseudonymAnnounced), 59);
+        // Tag 59 retired: PseudonymAnnounced removed (routing-bootstrap signal).
         assert_eq!(event_type_tag(&EventType::ContextTombstoned), 60);
         assert_eq!(event_type_tag(&EventType::ContextMigrationCancelled), 61);
         assert_eq!(event_type_tag(&EventType::TtlExtended), 62);

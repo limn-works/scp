@@ -1472,7 +1472,7 @@ fn provenance_hash_conformance_registry_with_payment() {
 }
 
 // ===========================================================================
-// Canonical event-type tag contract (closed 76-variant bijection)
+// Canonical event-type tag contract (closed 75-variant injection)
 //
 // `event_type_tag` (`scp_event_log::tree`) is a protocol constant used in two
 // places: (a) the NATIVE signed-event canonical hash —
@@ -1506,7 +1506,7 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
     // is enumerated here independently of `scp_event_log`'s internal test-only
     // array so that adding a variant to the public enum without updating this
     // conformance list is itself a compile/assertion failure.
-    let all_variants: [EventType; 76] = [
+    let all_variants: [EventType; 75] = [
         EventType::ContextCreated,
         EventType::ContextClosing,
         EventType::ContextClosed,
@@ -1566,7 +1566,6 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
         EventType::PruningPolicyModified,
         EventType::CommitBroadcasted,
         EventType::CommitBroadcastPending,
-        EventType::PseudonymAnnounced,
         EventType::ContextTombstoned,
         EventType::ContextMigrationCancelled,
         EventType::TtlExtended,
@@ -1585,42 +1584,46 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
         EventType::AppUnbound,
     ];
 
-    // Exhaustiveness guard: the closed taxonomy is exactly 76 variants
-    // (canonical tags 0..=75). If a variant is added to the public `EventType`
-    // enum, this conformance list must grow to match — a stale list of 76 here
-    // would fail to exercise the new variant, so keeping this pinned forces the
-    // list to be maintained alongside the enum.
+    // Exhaustiveness guard: the closed taxonomy is exactly 75 variants
+    // (canonical tags 0..=75 with tag 59 retired — PseudonymAnnounced removed as
+    // a routing-bootstrap ContextEvent signal, not a durable event). If a variant
+    // is added to the public `EventType` enum, this conformance list must grow to
+    // match — a stale list of 75 here would fail to exercise the new variant, so
+    // keeping this pinned forces the list to be maintained alongside the enum.
     assert_eq!(
         all_variants.len(),
-        76,
-        "this conformance list must enumerate the full closed 76-variant \
+        75,
+        "this conformance list must enumerate the full closed 75-variant \
          EventType taxonomy — update it (and `scp-event-log/src/tree.rs` \
          `event_type_tag`) when an EventType variant is added"
     );
 
-    // Distinct-tag bijection: every canonical variant maps to a unique tag in
-    // 0..=75. A collision (two variants → one tag) or a gap would corrupt the
-    // native `SCP-EVENT-V1:` signature preimage (`compute_event_canonical_hash`)
-    // and the retention classification keyed on the tag in `pruning.rs` /
-    // `tiered_storage.rs`.
+    // Distinct-tag injection: every canonical variant maps to a unique tag in
+    // 0..=75. A collision (two variants → one tag) would corrupt the native
+    // `SCP-EVENT-V1:` signature preimage (`compute_event_canonical_hash`) and the
+    // retention classification keyed on the tag in `pruning.rs` /
+    // `tiered_storage.rs`. The mapping is injective but NOT onto: tag 59 is
+    // retired (PseudonymAnnounced removed), so the 75 live variants occupy
+    // 0..=75 minus {59}.
     let mut tags: Vec<u16> = all_variants.iter().map(event_type_tag).collect();
     assert_eq!(
         tags.len(),
-        76,
+        75,
         "expected one tag per canonical EventType variant"
     );
     tags.sort_unstable();
     tags.dedup();
     assert_eq!(
         tags.len(),
-        76,
-        "event_type_tag must be a bijection: all 76 EventType variants must map \
+        75,
+        "event_type_tag must be injective: all 75 EventType variants must map \
          to distinct tags — fix `scp-event-log/src/tree.rs` `event_type_tag`"
     );
 
-    // The bijection must cover the contiguous range 0..=75 with no holes, which
-    // (together with distinctness above) pins the exact canonical tag assignment
-    // the native signature preimage and retention classification depend on.
+    // The live tags span 0..=75 with exactly one hole at the retired tag 59
+    // (PseudonymAnnounced). Pinning the endpoints plus the single retired gap
+    // fixes the exact canonical tag assignment the native signature preimage and
+    // retention classification depend on.
     assert_eq!(
         tags.first().copied(),
         Some(0),
@@ -1629,8 +1632,22 @@ fn canonical_event_type_tag_is_a_closed_bijection() {
     assert_eq!(
         tags.last().copied(),
         Some(75),
-        "canonical event_type_tag range must end at 75 (76 contiguous tags)"
+        "canonical event_type_tag range must end at 75"
     );
+    assert!(
+        !tags.contains(&59),
+        "tag 59 is retired (PseudonymAnnounced removed) and must not be reused"
+    );
+    // Every tag in 0..=75 except the retired 59 must be present (no other holes).
+    for tag in 0u16..=75 {
+        if tag == 59 {
+            continue;
+        }
+        assert!(
+            tags.contains(&tag),
+            "canonical event_type_tag must cover {tag} (the only permitted hole is the retired tag 59)"
+        );
+    }
 }
 
 /// Confirms that `chain_depth: u8` (scp-core) and `chain_depth: u32` (WASM)

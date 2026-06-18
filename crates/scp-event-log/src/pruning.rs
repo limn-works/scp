@@ -479,7 +479,6 @@ pub const fn is_structural_event(event_type: &EventType) -> bool {
         | EventType::ProvenanceReceived
         // Unification variants — high-frequency operational records
         // (ADR-011 Amendment):
-        | EventType::PseudonymAnnounced
         | EventType::CommitBroadcasted
         | EventType::CommitBroadcastPending
         | EventType::CommitBroadcastSucceeded
@@ -1132,7 +1131,7 @@ mod tests {
         // exists — so a future re-classification of any variant must update this
         // table deliberately. The expected values mirror the cryptographer-
         // confirmed classification in `is_structural_event`.
-        const EXPECTED: [(EventType, bool); 76] = [
+        const EXPECTED: [(EventType, bool); 75] = [
             // --- Base variants ---
             (EventType::ContextCreated, true),
             (EventType::ContextClosing, true),
@@ -1194,7 +1193,6 @@ mod tests {
             (EventType::PruningPolicyModified, true),
             (EventType::CommitBroadcasted, false),
             (EventType::CommitBroadcastPending, false),
-            (EventType::PseudonymAnnounced, false),
             (EventType::ContextTombstoned, true),
             (EventType::ContextMigrationCancelled, true),
             (EventType::TtlExtended, true),
@@ -1214,12 +1212,12 @@ mod tests {
         ];
 
         // Exhaustiveness guard: the table must cover the full closed taxonomy
-        // (exactly 76 variants). Adding a variant to `EventType` without adding
+        // (exactly 75 variants). Adding a variant to `EventType` without adding
         // it here leaves it unclassified-by-test, so this count is pinned.
         assert_eq!(
             EXPECTED.len(),
-            76,
-            "classification table must cover all 76 EventType variants"
+            75,
+            "classification table must cover all 75 EventType variants"
         );
 
         for (event_type, expected_structural) in &EXPECTED {

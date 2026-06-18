@@ -346,9 +346,18 @@ pub fn verify_and_unwrap(
 // ---------------------------------------------------------------------------
 
 /// Delivers a single plaintext to the receive buffer, checking if it is a
-/// pseudonym announcement first. Returns the typed event-log
-/// [`scp_event_log::EventType`] for the delivered message, or `None` when
-/// silently dropped.
+/// pseudonym announcement first.
+///
+/// The return is an optional [`scp_event_log::EventType`] — the event to
+/// durably append for the delivered message — but ALL received traffic is
+/// buffer-only, so this currently always returns `None`: ordinary application
+/// messages, pseudonym announcements (a §9.10.4 routing-bootstrap signal handled
+/// via the in-memory peer registry + `ContextEvent::PseudonymAnnounced` buffer
+/// emit), and silently-dropped rejections alike. A receiver-minted Merkle leaf
+/// is not sender-authenticated and would diverge honest receivers' roots
+/// (§9.9.3). The `Some` channel is retained so a future sender-authenticated
+/// received event can opt into a durable append without re-plumbing the
+/// buffered-drain call sites.
 pub fn deliver_plaintext_or_announcement(
     state: &mut PerContextState,
     sender_did: &str,
@@ -366,7 +375,17 @@ pub fn deliver_plaintext_or_announcement(
                 sender_did,
                 "processed buffered pseudonym announcement"
             );
-            Some(scp_event_log::EventType::PseudonymAnnounced)
+            // A received pseudonym announcement is a §9.10.4 routing-bootstrap
+            // signal, NOT a durable Merkle event. `ingest_pseudonym_announcement`
+            // already inserted the peer's routing ID into the in-memory registry
+            // and emitted `ContextEvent::PseudonymAnnounced` to the receive
+            // buffer (the announcement's entire function). Returning `None`
+            // suppresses any durable append, exactly as for received application
+            // messages (`NotAnnouncement` below): a per-receiver, per-arrival-order
+            // append cannot converge across honest members (late joiners miss
+            // earlier announcements; WASM never appends on receive), which would
+            // false-positive §9.9.3 equivocation detection.
+            None
         }
         AnnouncementOutcome::Rejected(_reason) => None,
         AnnouncementOutcome::NotAnnouncement => {
@@ -596,12 +615,17 @@ fn ingest_pseudonym_announcement(
 /// (`deliver_message_and_drain_buffered`). Two regressions this function is the
 /// fix for: (1) buffered messages historically skipped governance entirely; (2)
 /// the durable Merkle append is now decoupled — `event_name` is `Some` only for
-/// events the sender authenticates (e.g. `PseudonymAnnounced`). Received
-/// application messages return `None` (§9.9.3: a receiver-minted
-/// `MessageReceived` leaf is not sender-authenticated, so appending it would let
-/// honest receivers compute divergent roots and false-positive equivocation
-/// detection) — they MUST still record velocity, run consequence eval, and
-/// increment the checkpoint counter, only skipping the append.
+/// a sender-authenticated received event. No current received-traffic class
+/// qualifies: ordinary application messages (`MessageReceived`) and pseudonym
+/// announcements (`PseudonymAnnounced`) are both receive-buffer/`ContextEvent`
+/// signals, not durable events, so `deliver_plaintext_or_announcement` returns
+/// `None` for all received traffic (§9.9.3: a receiver-minted leaf is not
+/// sender-authenticated, so appending it — per receiver, in per-receiver arrival
+/// order — would let honest receivers compute divergent roots and false-positive
+/// equivocation detection). Such messages MUST still record velocity, run
+/// consequence eval, and increment the checkpoint counter, only skipping the
+/// append. The `Some` branch remains so a future sender-authenticated received
+/// event can opt into a durable append without re-plumbing this helper.
 #[allow(clippy::too_many_arguments)]
 pub fn run_buffered_post_delivery(
     state: &mut PerContextState,
@@ -2515,10 +2539,16 @@ pub fn deliver_message_and_drain_buffered(
             // Fall through to the normal-message delivery path below.
         }
         AnnouncementOutcome::Recorded => {
-            // Recorded + emitted by the shared validator. The remaining
+            // Recorded + emitted by the shared validator (registry insert +
+            // `ContextEvent::PseudonymAnnounced` buffer signal). The remaining
             // follow-up — sequence-tracker advance, reorder-buffer drain,
-            // velocity, durable event-log append, and consequence evaluation —
-            // is specific to the in-order direct path and runs here only.
+            // velocity, and consequence evaluation — is specific to the in-order
+            // direct path and runs here only. There is NO durable Merkle append:
+            // a received announcement is a §9.10.4 routing-bootstrap signal, not a
+            // convergent event (per-receiver arrival order; WASM never appends on
+            // receive), so appending it would false-positive §9.9.3 equivocation
+            // detection — the same reason received application messages are
+            // buffer-only.
             state
                 .sequence_tracker
                 .advance(context_id, sender_did, inner.sequence, inner.timestamp);
@@ -2566,17 +2596,6 @@ pub fn deliver_message_and_drain_buffered(
                     .governance
                     .velocity_tracker
                     .record_message(&DID(sender_did.to_owned()), now);
-            }
-            if let Err(e) = deps.event_log.append_context_event(
-                context_id_bytes,
-                scp_event_log::EventType::PseudonymAnnounced,
-                sender_did,
-            ) {
-                tracing::warn!(
-                    context_id,
-                    sender_did,
-                    "failed to append PseudonymAnnounced to event log: {e}"
-                );
             }
             let consequence_rules: Vec<ConsequenceRule> =
                 state.governance.consequence_rules.clone();
@@ -2916,7 +2935,10 @@ mod pseudonym_routing_tests {
         let bytes = announcement_bytes(ALICE, alice_pseudonym);
 
         let result = deliver_plaintext_or_announcement(&mut state, ALICE, &bytes, &ctx, None);
-        assert_eq!(result, Some(scp_event_log::EventType::PseudonymAnnounced));
+        // A recorded announcement is a buffer-only routing signal — NO durable
+        // Merkle leaf is minted on receive (§9.9.3), so the typed-append channel
+        // is `None`. The registry update is the observable effect.
+        assert_eq!(result, None);
         // Registry now maps Alice's DID to her announced routing ID.
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(reg.get(&DID(ALICE.to_owned())), Some(&alice_pseudonym));
@@ -2929,7 +2951,9 @@ mod pseudonym_routing_tests {
         let first = [0x42u8; 32];
         let rotated = [0x43u8; 32];
 
-        // First announcement.
+        // First announcement. Recorded announcements are buffer-only (no durable
+        // Merkle leaf on receive, §9.9.3), so the typed-append channel is `None`;
+        // the registry update below is the observable effect.
         assert_eq!(
             deliver_plaintext_or_announcement(
                 &mut state,
@@ -2938,7 +2962,7 @@ mod pseudonym_routing_tests {
                 &ctx,
                 None
             ),
-            Some(scp_event_log::EventType::PseudonymAnnounced)
+            None
         );
         // Same DID re-announces a rotated routing ID — legitimate key rotation.
         assert_eq!(
@@ -2949,7 +2973,7 @@ mod pseudonym_routing_tests {
                 &ctx,
                 None
             ),
-            Some(scp_event_log::EventType::PseudonymAnnounced)
+            None
         );
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(
@@ -3007,7 +3031,9 @@ mod pseudonym_routing_tests {
         let ctx = ctx_hex(0x11);
         let shared_rid = [0x55u8; 32];
 
-        // Alice legitimately claims `shared_rid` first.
+        // Alice legitimately claims `shared_rid` first. Recorded ⇒ buffer-only
+        // (no durable Merkle leaf on receive, §9.9.3) ⇒ `None`; the registry
+        // assertions below distinguish Recorded (inserted) from Rejected.
         assert_eq!(
             deliver_plaintext_or_announcement(
                 &mut state,
@@ -3016,7 +3042,7 @@ mod pseudonym_routing_tests {
                 &ctx,
                 None
             ),
-            Some(scp_event_log::EventType::PseudonymAnnounced)
+            None
         );
         // Bob tries to claim Alice's already-registered routing ID → collision.
         assert_eq!(
@@ -3304,8 +3330,14 @@ mod pseudonym_routing_tests {
     /// has been moved into the supervisor / `ActorDeps`. Atomics only (no
     /// `Mutex`) per ADR-049's runtime-state model.
     struct DrainRecordingEventLog {
-        saw_consequence_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        saw_message_sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        consequence_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        message_sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// `EventType` enumerates 75 variants; `PseudonymAnnounced` was REMOVED
+        /// (it is a `ContextEvent`-only routing signal, not a durable event). A
+        /// recorder cannot match a non-existent variant, so a received
+        /// announcement is proven buffer-only by the ABSENCE of any append at
+        /// all (`any_append == false`) after the announcement-drain path.
+        any_append: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl crate::context::builder::ContextEventLogProvider for DrainRecordingEventLog {
@@ -3323,13 +3355,15 @@ mod pseudonym_routing_tests {
             _actor: &str,
             _payload: scp_event_log::EventPayload,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.any_append
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             match event {
                 scp_event_log::EventType::ConsequenceTriggered => {
-                    self.saw_consequence_triggered
+                    self.consequence_triggered
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 scp_event_log::EventType::MessageSent => {
-                    self.saw_message_sent
+                    self.message_sent
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 _ => {}
@@ -3468,8 +3502,9 @@ mod pseudonym_routing_tests {
         let saw_message_sent = Arc::new(AtomicBool::new(false));
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(DrainRecordingEventLog {
-                saw_consequence_triggered: Arc::clone(&saw_consequence_triggered),
-                saw_message_sent: Arc::clone(&saw_message_sent),
+                consequence_triggered: Arc::clone(&saw_consequence_triggered),
+                message_sent: Arc::clone(&saw_message_sent),
+                any_append: Arc::new(AtomicBool::new(false)),
             });
         let deps = build_drain_test_deps(event_log).await;
 
@@ -3514,6 +3549,104 @@ mod pseudonym_routing_tests {
             "buffered-drain call site must advance checkpoint_events_since (a re-added `if let Some` gate skips it): \
              before={checkpoint_before}, after={}",
             state.checkpoint_events_since
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: a RECEIVED pseudonym announcement must NOT mint a durable
+    // Merkle leaf.
+    //
+    // PseudonymAnnounced is a §9.10.4 routing-bootstrap `ContextEvent` signal,
+    // not a durable event (it was removed from the closed `EventType` taxonomy).
+    // A received announcement updates the in-memory peer registry and emits a
+    // `ContextEvent::PseudonymAnnounced` buffer notification, but a per-receiver,
+    // per-arrival-order Merkle append cannot converge across honest members and
+    // would false-positive §9.9.3 equivocation detection. This test drives a
+    // legitimate in-order announcement through the REAL direct delivery path
+    // (`deliver_message_and_drain_buffered`) and asserts (a) the registry was
+    // updated (the announcement WAS processed) and (b) NO event was appended to
+    // the durable log at all. A re-introduced receive-path append would set
+    // `saw_any_append` and fail this test.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn received_announcement_updates_registry_without_durable_append() {
+        use crate::context::messaging_helpers::deliver_message_and_drain_buffered;
+        use scp_protocol::context::roles::Capability;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let ctx = ctx_hex(0x11);
+        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        let mut state: PerContextState = encrypted_state();
+
+        // The direct delivery path requires an Active context handle.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .expect("transition to Active");
+
+        // ALICE must be a writable member: the direct path checks membership +
+        // `MessagesWrite` before delivering.
+        state
+            .membership
+            .add_member(DID(ALICE.to_owned()), "member".to_owned(), Vec::new());
+        state.members.insert(DID(ALICE.to_owned()));
+        state.role_state.members.insert(ALICE.to_owned());
+        let mut caps = std::collections::HashSet::new();
+        caps.insert(Capability::MessagesWrite);
+        state
+            .role_state
+            .member_capabilities
+            .insert(ALICE.to_owned(), caps);
+
+        let saw_any_append = Arc::new(AtomicBool::new(false));
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(DrainRecordingEventLog {
+                consequence_triggered: Arc::new(AtomicBool::new(false)),
+                message_sent: Arc::new(AtomicBool::new(false)),
+                any_append: Arc::clone(&saw_any_append),
+            });
+        let deps = build_drain_test_deps(event_log).await;
+
+        // A legitimate in-order pseudonym announcement (ALICE announces her own
+        // routing ID). The drain path reads sequence/timestamp/context/sender
+        // from the inner envelope; the announcement payload is the `plaintext`.
+        let alice_pseudonym = [0x42u8; 32];
+        let announcement = crate::context::state::PseudonymAnnouncement {
+            tag: crate::context::state::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+            member_did: ALICE.to_owned(),
+            pseudonym: alice_pseudonym,
+        };
+        let plaintext = rmp_serde::to_vec_named(&announcement).expect("serialize announcement");
+        let inner = drain_test_inner(&ctx, 1);
+
+        let consumed = deliver_message_and_drain_buffered(
+            &mut state, &deps, &ctx, &ctx_bytes, ALICE, &inner, &plaintext, false,
+        )
+        .expect("deliver_message_and_drain_buffered");
+
+        // The announcement WAS recognized + processed (consumed as an internal
+        // protocol message) and inserted into the in-memory peer registry.
+        assert!(
+            consumed,
+            "a tagged pseudonym announcement must be consumed as an internal protocol message"
+        );
+        let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
+        assert_eq!(
+            reg.get(&DID(ALICE.to_owned())),
+            Some(&alice_pseudonym),
+            "a processed announcement must update the in-memory peer registry (its entire function)"
+        );
+
+        // But NO durable Merkle leaf was appended on the receive path: a received
+        // announcement is buffer-only (§9.9.3 non-convergence). There are no
+        // consequence rules installed, so the ONLY append a regression could add
+        // is the removed receive-path PseudonymAnnounced leaf.
+        assert!(
+            !saw_any_append.load(AtomicOrdering::SeqCst),
+            "a received pseudonym announcement must NOT mint any durable Merkle leaf (§9.9.3)"
         );
     }
 

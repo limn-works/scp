@@ -20,7 +20,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 76 event type variants.
+//! - [`EventType`] -- The 75 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //! - [`EventLogSigner`] -- Trait abstracting signing for checkpoint generation.
@@ -90,7 +90,7 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 76 event type variants for SCP context event logs.
+/// The 75 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
@@ -222,7 +222,7 @@ pub enum EventType {
     // -------------------------------------------------------------------
     // Governance-action-coverage event types (native↔WASM unification;
     // ADR-011 Amendment in `.docs/adrs/phase-2.md`). Each traces to a
-    // GovernanceAction (ADR-031 §2) or a §19 / §5.11A / §9.9 / §9.10
+    // GovernanceAction (ADR-031 §2) or a §19 / §5.11A / §9.9
     // protocol action. Parameters live in [`EventPayload`], never in the
     // type name.
     // -------------------------------------------------------------------
@@ -279,8 +279,11 @@ pub enum EventType {
     /// A commit broadcast was deferred to the queue (deferred-commit queue
     /// record).
     CommitBroadcastPending,
-    /// A per-context pseudonym was announced (§9.10.4).
-    PseudonymAnnounced,
+    // PseudonymAnnounced (§9.10.4) is intentionally NOT a variant: a
+    // pseudonym announcement is a per-receiver routing-bootstrap signal, not a
+    // convergent durable event. It lives only as `ContextEvent::PseudonymAnnounced`
+    // (a receive-buffer notification) — see the ADR-011 Amendment exclusion list
+    // in `.docs/adrs/phase-2.md`, alongside MessageReceived and EquivocationDetected.
 
     // -------------------------------------------------------------------
     // Lifecycle / migration event types (ADR-049 §9; §5.11A). Parameters
@@ -653,8 +656,8 @@ mod tests {
     #[test]
     fn event_type_serialization_roundtrip_all_variants() {
         // Round-trips every variant of the closed taxonomy through serde JSON.
-        // The 76-variant count and wire-distinctness are pinned separately in
-        // `event_type_taxonomy_is_closed_at_76_distinct_variants`.
+        // The 75-variant count and wire-distinctness are pinned separately in
+        // `event_type_taxonomy_is_closed_at_75_distinct_variants`.
         for event_type in all_event_types() {
             let json = serde_json::to_string(&event_type).expect("serialize");
             let deserialized: EventType = serde_json::from_str(&json).expect("deserialize");
@@ -727,7 +730,6 @@ mod tests {
             EventType::PruningPolicyModified,
             EventType::CommitBroadcasted,
             EventType::CommitBroadcastPending,
-            EventType::PseudonymAnnounced,
             EventType::ContextTombstoned,
             EventType::ContextMigrationCancelled,
             EventType::TtlExtended,
@@ -748,15 +750,15 @@ mod tests {
     }
 
     #[test]
-    fn event_type_taxonomy_is_closed_at_76_distinct_variants() {
+    fn event_type_taxonomy_is_closed_at_75_distinct_variants() {
         // Pins the closed-set count and asserts wire-distinctness, independent
         // of the round-trip test (which would otherwise exceed the function
         // line limit).
         let event_types = all_event_types();
         assert_eq!(
             event_types.len(),
-            76,
-            "closed EventType taxonomy must enumerate exactly 76 variants"
+            75,
+            "closed EventType taxonomy must enumerate exactly 75 variants"
         );
 
         let mut serialized: Vec<String> = event_types
@@ -767,8 +769,8 @@ mod tests {
         serialized.dedup();
         assert_eq!(
             serialized.len(),
-            76,
-            "all 76 EventType variants must serialize to distinct values"
+            75,
+            "all 75 EventType variants must serialize to distinct values"
         );
     }
 
