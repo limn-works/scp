@@ -489,8 +489,12 @@ impl MerkleEventLogProvider {
             return Some(0);
         }
 
-        // Reconstruct the retained tail via the canonical substrate truncation
-        // so leaf hashes (and proof paths) survive the prune unchanged.
+        // Reconstruct the retained tail via the canonical substrate truncation.
+        // The tail is RE-CHAINED to a fresh genesis (see
+        // `truncate_log_keeping_tail`): the first retained event re-anchors to
+        // `GENESIS_PREV_HASH`, so every tail leaf hash and the resulting Merkle
+        // root CHANGE. Pre-prune proofs against the OLD root are intentionally
+        // invalidated, matching RFC 6962 log truncation semantics.
         let pruned_log = match truncate_log_keeping_tail(&context_log.log, prune_count) {
             Ok(log) => log,
             Err(e) => {
