@@ -250,8 +250,10 @@ scan_dispatch_hub() {
         test_count = 0
         depth = 0            # running brace depth
         testing_pending = 0  # saw #[cfg(feature="testing")], awaiting item open
-        in_testing = 0       # currently inside a testing-gated region
-        testing_floor = 0    # brace depth to which the testing region returns
+        # Testing-gated regions form a STACK of brace-depth floors (see
+        # scan_helper_file): a nested testing gate must not clear the enclosing
+        # region on its own close. `testing_top` is the active count.
+        testing_top = 0      # number of active testing-region floors on the stack
         split("panic unreachable unimplemented todo assert assert_eq assert_ne debug_assert debug_assert_eq debug_assert_ne", names, " ")
     }
     {
@@ -316,13 +318,13 @@ scan_dispatch_hub() {
         # (net positive braces), enter the testing region. The floor is the
         # depth BEFORE this item opened.
         if (testing_pending && opens > 0) {
-            in_testing = 1
-            testing_floor = depth
+            testing_floor[testing_top] = depth
+            testing_top++
             testing_pending = 0
         }
 
         # Scan for banned macros UNLESS inside a testing-gated region.
-        if (!in_testing) {
+        if (testing_top == 0) {
             # Count scanned (live, non-comment, production) lines so the
             # harness can assert this scan is not vacuous.
             if (line ~ /[^[:space:]]/) {
@@ -340,11 +342,11 @@ scan_dispatch_hub() {
             }
         }
 
-        # Update running depth; close the testing region when we return to
-        # the floor.
+        # Update running depth; pop every testing floor we have returned
+        # to/below (nested regions pop one at a time).
         depth += opens - closes
-        if (in_testing && depth <= testing_floor) {
-            in_testing = 0
+        while (testing_top > 0 && depth <= testing_floor[testing_top - 1]) {
+            testing_top--
         }
     }
     END {
@@ -442,8 +444,14 @@ scan_helper_file() {
         in_block = 0
         depth = 0
         gated_pending = 0   # saw a test/testing #[cfg(...)], awaiting item open
-        in_gated = 0        # currently inside a test/testing-gated region
-        gated_floor = 0     # brace depth the gated region returns to
+        # Gated regions form a STACK of brace-depth floors, not a single flag:
+        # a test/testing gate may open INSIDE another (e.g. a
+        # `#[cfg(feature = "testing")]` accessor nested in a `#[cfg(test)]`
+        # module). A single bool would clear on the INNER region close and
+        # wrongly re-scan the rest of the OUTER region. `gated_top` is the
+        # number of active floors; `gated_floor[]` holds each. `in_gated` ⇔
+        # `gated_top > 0`.
+        gated_top = 0       # number of active gated-region floors on the stack
         # Reachable-panic family ONLY (assert/debug_assert intentionally absent).
         split("panic unreachable unimplemented todo", names, " ")
     }
@@ -485,14 +493,15 @@ scan_helper_file() {
         closes = gsub(/}/, "}", line)
 
         # A pending test/testing gate opens its region at the first net-positive
-        # brace line; the floor is the depth BEFORE this item opened.
+        # brace line; the floor is the depth BEFORE this item opened. PUSH it so a
+        # nested gate does not clobber the floor of the enclosing region.
         if (gated_pending && opens > 0) {
-            in_gated = 1
-            gated_floor = depth
+            gated_floor[gated_top] = depth
+            gated_top++
             gated_pending = 0
         }
 
-        if (!in_gated) {
+        if (gated_top == 0) {
             if (line ~ /[^[:space:]]/) scanned++
             for (i in names) {
                 pat = "(^|[^A-Za-z0-9_])" names[i] "!"
@@ -507,7 +516,11 @@ scan_helper_file() {
         }
 
         depth += opens - closes
-        if (in_gated && depth <= gated_floor) in_gated = 0
+        # Pop every gated floor we have now returned to/below. Nested regions
+        # pop one at a time; an inner close leaves any enclosing region active.
+        while (gated_top > 0 && depth <= gated_floor[gated_top - 1]) {
+            gated_top--
+        }
     }
     END {
         printf("SCANNED\t%s\t%d\n", FILE, scanned)
@@ -794,6 +807,10 @@ self_test() {
 #   (7) DOES flag a production reachable panic inside a `#[cfg(not(test))]` item
 #       — `not(test)` is PRODUCTION code and must stay scanned; the gate-detect
 #       must NOT mistake it for a test gate.
+#   (8) does NOT flag a panic inside a `#[cfg(test)]` module that contains a
+#       NESTED `#[cfg(feature = "testing")]` item before the panic — regression
+#       guard for the single-bool gated-region bug (issue #1835): an inner
+#       region close must not clear the enclosing test-module exclusion.
 # Set NO_PANIC_GATE_SELFTEST=1 to skip (not recommended).
 # ---------------------------------------------------------------------------
 self_test_helpers() {
@@ -912,6 +929,39 @@ self_test_helpers() {
             "$C_RED" "$C_RESET" >&2
         printf 'panic inside a `#[cfg(not(test))]` item — the gate-detect wrongly treats\n' >&2
         printf '`not(test)` as a test gate and excludes production code.\n' >&2
+        rc=1
+    fi
+
+    # (8): a panic inside a `#[cfg(test)]` module that ALSO contains a NESTED
+    # `#[cfg(feature = "testing")]` item BEFORE the panic — the panic MUST stay
+    # excluded. This is the regression guard for the single-bool gated-region
+    # bug (issue #1835): the inner testing region's closing brace must NOT clear
+    # the enclosing test-module exclusion. Mirrors the real shape in
+    # supervisor.rs (a `#[cfg(feature="testing")] poll_until` nested in the
+    # trailing `#[cfg(test)] mod tests`, followed by `=> panic!(...)` arms).
+    {
+        printf 'pub fn prod_clean6() { let _ = 6; }\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod tests {\n'
+        printf '    #[cfg(feature = "testing")]\n'
+        printf '    async fn poll_until() {\n'
+        printf '        let _ = 1;\n'
+        printf '    }\n'
+        printf '    #[test]\n'
+        printf '    fn t() {\n'
+        printf '        match v {\n'
+        printf '            other => panic!("expected X, got {other:?}"),\n'
+        printf '        }\n'
+        printf '    }\n'
+        printf '}\n'
+    } > "$fixt/g_helpers.rs"
+    out=$(scan_helper_file "$fixt/g_helpers.rs")
+    if grep -q $'^HIT\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner flagged a panic inside a `#[cfg(test)]`\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'module that contains a nested `#[cfg(feature = "testing")]` item — the\n' >&2
+        printf 'gated-region stack is broken (an inner region close cleared the outer\n' >&2
+        printf 'test-module exclusion; see issue #1835).\n' >&2
         rc=1
     fi
 
