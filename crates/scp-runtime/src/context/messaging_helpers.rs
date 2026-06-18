@@ -587,15 +587,27 @@ fn ingest_pseudonym_announcement(
 // ---------------------------------------------------------------------------
 
 /// Runs post-delivery governance logic for a single buffered/drained
-/// message. Bug fix: velocity, event-log append, consequence
-/// evaluation, and checkpoint increment apply to buffered messages too.
+/// message.
+///
+/// Governance — velocity tracking, consequence evaluation/enforcement, and the
+/// `checkpoint_events_since` increment — runs UNCONDITIONALLY for every
+/// delivered buffered message, mirroring the in-order delivery path
+/// (`deliver_message_and_drain_buffered`). Two regressions this function is the
+/// fix for: (1) buffered messages historically skipped governance entirely; (2)
+/// the durable Merkle append is now decoupled — `event_name` is `Some` only for
+/// events the sender authenticates (e.g. `PseudonymAnnounced`). Received
+/// application messages return `None` (§9.9.3: a receiver-minted
+/// `MessageReceived` leaf is not sender-authenticated, so appending it would let
+/// honest receivers compute divergent roots and false-positive equivocation
+/// detection) — they MUST still record velocity, run consequence eval, and
+/// increment the checkpoint counter, only skipping the append.
 #[allow(clippy::too_many_arguments)]
 pub fn run_buffered_post_delivery(
     state: &mut PerContextState,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     sender_did: &str,
-    event_name: scp_event_log::EventType,
+    event_name: Option<scp_event_log::EventType>,
     clock: &dyn Clock,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     event_tx: Option<&ContextEventSender>,
@@ -608,13 +620,17 @@ pub fn run_buffered_post_delivery(
         .velocity_tracker
         .record_message(&DID(sender_did.to_owned()), now);
 
-    if let Err(e) = event_log.append_context_event(context_id_bytes, event_name, sender_did) {
-        tracing::warn!(
-            context_id,
-            sender_did,
-            event_name = ?event_name,
-            "failed to append buffered event to event log: {e}"
-        );
+    // Durable Merkle append ONLY for sender-authenticated events. Application
+    // messages (`None`) skip the append but still run governance below.
+    if let Some(event_name) = event_name {
+        if let Err(e) = event_log.append_context_event(context_id_bytes, event_name, sender_did) {
+            tracing::warn!(
+                context_id,
+                sender_did,
+                event_name = ?event_name,
+                "failed to append buffered event to event log: {e}"
+            );
+        }
     }
 
     let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
@@ -2333,24 +2349,23 @@ pub fn validate_and_drain_timeouts(
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
-            if let Some(event_name) = deliver_plaintext_or_announcement(
+            let event_name = deliver_plaintext_or_announcement(
                 state,
                 &msg.sender_did,
                 &msg.plaintext,
                 context_id,
                 deps.event_tx.as_ref(),
-            ) {
-                run_buffered_post_delivery(
-                    state,
-                    context_id,
-                    &context_id_bytes,
-                    &msg.sender_did,
-                    event_name,
-                    &*deps.clock,
-                    &*deps.event_log,
-                    deps.event_tx.as_ref(),
-                );
-            }
+            );
+            run_buffered_post_delivery(
+                state,
+                context_id,
+                &context_id_bytes,
+                &msg.sender_did,
+                event_name,
+                &*deps.clock,
+                &*deps.event_log,
+                deps.event_tx.as_ref(),
+            );
         }
     }
 
@@ -2414,24 +2429,23 @@ pub fn buffer_ahead_message(
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
-            if let Some(event_name) = deliver_plaintext_or_announcement(
+            let event_name = deliver_plaintext_or_announcement(
                 state,
                 &msg.sender_did,
                 &msg.plaintext,
                 context_id,
                 deps.event_tx.as_ref(),
-            ) {
-                run_buffered_post_delivery(
-                    state,
-                    context_id,
-                    &context_id_bytes,
-                    &msg.sender_did,
-                    event_name,
-                    &*deps.clock,
-                    &*deps.event_log,
-                    deps.event_tx.as_ref(),
-                );
-            }
+            );
+            run_buffered_post_delivery(
+                state,
+                context_id,
+                &context_id_bytes,
+                &msg.sender_did,
+                event_name,
+                &*deps.clock,
+                &*deps.event_log,
+                deps.event_tx.as_ref(),
+            );
         }
     }
 }
@@ -2525,24 +2539,23 @@ pub fn deliver_message_and_drain_buffered(
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                if let Some(event_name) = deliver_plaintext_or_announcement(
+                let event_name = deliver_plaintext_or_announcement(
                     state,
                     &msg.sender_did,
                     &msg.plaintext,
                     context_id,
                     deps.event_tx.as_ref(),
-                ) {
-                    run_buffered_post_delivery(
-                        state,
-                        context_id,
-                        context_id_bytes,
-                        &msg.sender_did,
-                        event_name,
-                        &*deps.clock,
-                        &*deps.event_log,
-                        deps.event_tx.as_ref(),
-                    );
-                }
+                );
+                run_buffered_post_delivery(
+                    state,
+                    context_id,
+                    context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    &*deps.clock,
+                    &*deps.event_log,
+                    deps.event_tx.as_ref(),
+                );
             }
 
             let now = deps.clock.now_secs();
@@ -2637,24 +2650,23 @@ pub fn deliver_message_and_drain_buffered(
             msg.inner.sequence,
             msg.inner.timestamp,
         );
-        if let Some(event_name) = deliver_plaintext_or_announcement(
+        let event_name = deliver_plaintext_or_announcement(
             state,
             &msg.sender_did,
             &msg.plaintext,
             context_id,
             deps.event_tx.as_ref(),
-        ) {
-            run_buffered_post_delivery(
-                state,
-                context_id,
-                context_id_bytes,
-                &msg.sender_did,
-                event_name,
-                &*deps.clock,
-                &*deps.event_log,
-                deps.event_tx.as_ref(),
-            );
-        }
+        );
+        run_buffered_post_delivery(
+            state,
+            context_id,
+            context_id_bytes,
+            &msg.sender_did,
+            event_name,
+            &*deps.clock,
+            &*deps.event_log,
+            deps.event_tx.as_ref(),
+        );
     }
 
     // §9.9.3: received application messages are NOT appended to the durable
@@ -3100,6 +3112,174 @@ mod pseudonym_routing_tests {
             ),
             AnnouncementOutcome::Rejected(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: buffered-drain post-delivery governance MUST run for
+    // application messages even though they produce no Merkle append.
+    //
+    // The Merkle-append suppression for received application messages (§9.9.3 —
+    // a receiver-minted `MessageReceived` leaf is not sender-authenticated, so
+    // appending it would let honest receivers diverge their roots) made
+    // `deliver_plaintext_or_announcement` return `None` for app data. The four
+    // buffered-drain call sites previously gated ALL of
+    // `run_buffered_post_delivery` on that `Some`, which silently dropped
+    // velocity tracking, consequence evaluation/enforcement, and the
+    // `checkpoint_events_since` increment for every buffered application
+    // message — only announcements (still `Some`) stayed covered. The in-order
+    // path always ran these unconditionally, so the buffered path had drifted.
+    //
+    // This test drives the post-delivery helper with `event_name == None` (the
+    // application-message case) and asserts all three governance side effects
+    // still fire. It FAILS against the gated implementation (the helper was
+    // never called) and PASSES once the append is decoupled from governance.
+    // -----------------------------------------------------------------------
+
+    use crate::context::actor::state::PerContextState as RegressionState;
+    use scp_primitives::TestClock;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Event-log provider that records every appended `EventType` so the test
+    /// can prove (a) no `MessageReceived` append happens for `None` events and
+    /// (b) consequence evaluation/enforcement DID append its `Consequence*`
+    /// events. Append-count is also tracked for a simple total.
+    #[derive(Default)]
+    struct RecordingEventLog {
+        appended: StdMutex<Vec<scp_event_log::EventType>>,
+        appends: AtomicUsize,
+    }
+
+    impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
+        fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.appends.fetch_add(1, AtomicOrdering::SeqCst);
+            self.appended
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+            Ok(())
+        }
+
+        fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn buffered_application_message_runs_velocity_consequence_and_checkpoint() {
+        use crate::context::messaging_helpers::{
+            deliver_plaintext_or_announcement, run_buffered_post_delivery,
+        };
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        };
+
+        let ctx = ctx_hex(0x11);
+        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        let mut state: RegressionState = encrypted_state();
+
+        // Install a MessageVelocity rule that triggers on the FIRST message from
+        // a sender. Received application messages are projected to
+        // `EventType::MessageSent` for consequence purposes
+        // (`event_log_entries_for_consequences`), so one buffered app message is
+        // enough to trip threshold 1. The triggered consequence carries non-empty
+        // evidence, so `ConsequenceTriggered` is emitted even though the sender is
+        // not in the test fixture's (empty) membership set.
+        state
+            .governance
+            .consequence_rules
+            .push(ConsequenceRule {
+                trigger: ConsequenceTrigger::MessageVelocity,
+                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+                threshold: 1,
+                window: std::time::Duration::from_secs(3600),
+            });
+
+        let clock = TestClock::new(1_700_000_100);
+        let event_log = RecordingEventLog::default();
+
+        let checkpoint_before = state.checkpoint_events_since;
+
+        // Deliver an ordinary application message via the buffered ingest entry
+        // point. It is pushed to the receive buffer but returns `None` (no
+        // sender-authenticated Merkle leaf — §9.9.3).
+        let event_name =
+            deliver_plaintext_or_announcement(&mut state, ALICE, b"hello world", &ctx, None);
+        assert_eq!(
+            event_name, None,
+            "a received application message must not mint a durable Merkle leaf"
+        );
+
+        // Post-delivery governance MUST run unconditionally, mirroring the
+        // in-order path — this is exactly the call shape the four buffered-drain
+        // sites now use.
+        run_buffered_post_delivery(
+            &mut state,
+            &ctx,
+            &ctx_bytes,
+            ALICE,
+            event_name,
+            &clock,
+            &event_log,
+            None,
+        );
+
+        // (a) Velocity was recorded for the sender.
+        let velocity = state.governance.velocity_tracker.snapshot_entries();
+        assert!(
+            velocity.get(ALICE).is_some_and(|ts| !ts.is_empty()),
+            "buffered application message must record sender velocity (was skipped by the gated bug)"
+        );
+
+        // (b) Consequence evaluation + enforcement ran: a `ConsequenceTriggered`
+        // event was appended to the durable log. The `None` event name means the
+        // application message itself appended NO message leaf (§9.9.3 — there is
+        // no `MessageReceived` variant in the closed event taxonomy precisely
+        // because received app messages are never durably logged); the only
+        // appends come from consequence enforcement.
+        let appended = event_log
+            .appended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            appended.contains(&scp_event_log::EventType::ConsequenceTriggered),
+            "buffered application message must run consequence evaluation/enforcement \
+             (gated bug skipped it); appended events were {appended:?}"
+        );
+        assert!(
+            !appended.contains(&scp_event_log::EventType::MessageSent),
+            "a received application message must NOT append a MessageSent Merkle leaf (§9.9.3); \
+             appended events were {appended:?}"
+        );
+
+        // (c) The checkpoint counter advanced for the delivered application
+        // message. `run_buffered_post_delivery` increments it once for the
+        // message itself; consequence enforcement increments it again per
+        // emitted `Consequence*` event, so the total is strictly greater than
+        // the pre-delivery value. The gated bug left it UNCHANGED.
+        assert!(
+            state.checkpoint_events_since > checkpoint_before,
+            "buffered application message must advance checkpoint_events_since (was skipped by the gated bug): \
+             before={checkpoint_before}, after={}",
+            state.checkpoint_events_since
+        );
     }
 
     // -----------------------------------------------------------------------
