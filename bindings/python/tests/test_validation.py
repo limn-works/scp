@@ -113,9 +113,17 @@ class TestValidateContentPath:
         with pytest.raises(ValidationError, match="whitespace/formatting U\\+00A0"):
             validate_content_path("/path\u00a0file")
 
-    def test_nfc_normalization(self) -> None:
-        """Fix 3: NFC normalization — decomposed e-acute accepted after normalization."""
-        # U+0065 U+0301 (e + combining acute) normalizes to U+00E9 (e-acute)
+    def test_accepts_decomposed_unicode(self) -> None:
+        """Decomposed Unicode (NFD) is accepted — combining marks are not
+        rejected as control/formatting characters.
+
+        NOTE: validate_content_path NFC-normalizes internally but returns None
+        (it discards the canonical form), so this asserts only that the
+        decomposed form is *accepted*, not that normalization changed it.
+        Observing the canonical output would need an SDK accessor that returns
+        the normalized path (tracked separately).
+        """
+        # U+0065 U+0301 (e + combining acute); NFC form is U+00E9 (e-acute).
         assert validate_content_path("/caf\u0065\u0301") is None
 
     def test_error_code(self) -> None:

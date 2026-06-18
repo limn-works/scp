@@ -11,6 +11,8 @@ class SmokeTest {
         // CustodyType enum's wire-format mapping and its fromRawValue parser.
         // (Replaces a prior assertTrue(true) placeholder that asserted nothing.)
         assertEquals("platform", CustodyType.PLATFORM.rawValue)
+        assertEquals("in_memory", CustodyType.IN_MEMORY.rawValue)
+        assertEquals("software", CustodyType.SOFTWARE.rawValue)
         assertEquals(CustodyType.IN_MEMORY, CustodyType.fromRawValue("in_memory"))
         assertNull(CustodyType.fromRawValue("not-a-custody-type"))
     }
