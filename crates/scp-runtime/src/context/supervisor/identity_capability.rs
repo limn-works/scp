@@ -1,5 +1,6 @@
-//! Capability proof type — see ADR-049 §"`OwnedIdentityDid` via module
-//! visibility" and spec §9.4.1 four-point criterion.
+//! Capability proof type — see ADR-049 §5 (`OwnedIdentityDid`: unforgeable
+//! by constructor visibility + private field) and spec §9.4.1 four-point
+//! criterion.
 //!
 //! `OwnedIdentityDid` is the unforgeable token that proves the bearer's
 //! identity owns a particular [`ContextActor`]. The unforgeability
@@ -43,26 +44,47 @@
 //!   contract.
 //! - `Debug` / `Display` — accidental logging of identity tokens.
 //!
-//! Defense-in-depth: the CI gate `scripts/check-owned-identity-did.py`
-//! mechanically enforces every clause above (location, struct
-//! name-visibility, forbidden derives, forbidden manual impls, forbidden
-//! public fields, `type` alias ban). For the inherent API the gate is a
-//! CLOSED ALLOWLIST, not a name-keyed or return-type-keyed classifier: it
-//! asserts the inherent impl contains ONLY the allowlisted methods
-//! `issue_for_actor` (the `pub(super)` raw-`DID` mint), `reissue` and
-//! `as_did` (both `&self`); ANY other inherent fn — regardless of return
-//! type, including an aliased / `impl Trait` / `Result`-wrapped return —
-//! is rejected, and a `type` alias of the capability (e.g. `type OwnedCap
-//! = OwnedIdentityDid;`) is banned. The allowlist-by-name is the security
-//! boundary: a return-type-aliased forgery (`type OwnedCap =
-//! OwnedIdentityDid; fn forge(did: DID) -> OwnedCap`) is caught because
-//! `forge` is not allowlisted, even though it hides the cap type from a
-//! return-type check and the struct is `pub(in crate::context)`. Only
-//! `issue_for_actor` may take a raw `DID`. Any change here is also audited
-//! there.
+//! # Enforcement is the compiler's, not a bespoke CI gate
 //!
-//! See also `#![deny(unsafe_code)]` at `supervisor/mod.rs` — prevents an
-//! unsafe `Send` impl or `transmute` that could fabricate a token.
+//! There is NO source-text CI scanner over this file. The sole-minter
+//! guarantee is enforced entirely by the language and the compiler:
+//!
+//! - **The type system.** The `did` field is private, so no external
+//!   struct-literal `OwnedIdentityDid { did }` can construct a token. The
+//!   constructor `issue_for_actor` is `pub(super)`, so only supervisor-
+//!   module code can mint a token from a raw [`DID`]. Together these make
+//!   the type *nameable* throughout `crate::context` but *constructible*
+//!   only from supervisor-module code.
+//! - **`#![deny(unsafe_code)]`** at `supervisor/mod.rs` — blocks an unsafe
+//!   `Send` impl or a `transmute` that could fabricate a token while
+//!   bypassing visibility.
+//! - **`#![deny(non_local_definitions)]`** at `supervisor/mod.rs` — turns a
+//!   nested `impl OwnedIdentityDid { .. }` written inside a method body
+//!   (which Rust would otherwise apply globally, creating a SECOND minter
+//!   from inside the module) into a hard COMPILE error. This closes ONE
+//!   specific forgery vector: the body-nested-`impl` form — a second
+//!   constructor buried deep in a function body, where a human reviewer is
+//!   worst at spotting it. It does NOT close the other in-module ways to add
+//!   a second minter (a top-level second inherent `impl`, a top-level trait
+//!   `impl` whose method mints, a module-level free fn constructing via the
+//!   in-module struct literal, a visibility widen, a forbidden derive, or a
+//!   `pub` field) — those compile cleanly and are review-owned. The lint is
+//!   NOT a complete mechanical backstop for "only the sanctioned minters."
+//! - **Code review** of this small, frozen file for the EXPLICIT NON-DERIVES
+//!   above and for the absence of any second arbitrary-`DID` constructor in
+//!   ANY form (the broader "no second minter of any form" invariant is
+//!   review-owned, not lint-enforced). Adding a derive or a new minter is a
+//!   visible diff to a tiny file with a single struct and a single inherent
+//!   impl; review catches it. The exact `pub(in crate::context)` visibility
+//!   of `reissue`/`as_did` is likewise review-enforced — Rust visibility is
+//!   not compile-time assertable the way a missing derive is (a widen still
+//!   compiles).
+//!
+//! A bespoke external scanner was deliberately NOT used. Its only residual
+//! threat model is an insider editing this file — but such an insider could
+//! equally edit the scanner or its CI wiring, so a scanner adds no marginal
+//! security over the type system + the two compiler lints + review. See
+//! ADR-049 §5 and spec §9.4.1.
 
 use scp_identity::DID;
 

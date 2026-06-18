@@ -11,7 +11,7 @@ type: project
 - All helpers in `*_helpers.rs` and `*_logic.rs` take `&Supervisor` and are `pub` (not `pub(crate)`).
 - Per-context state is `Arc<DashMap<String, Arc<Mutex<PerContextState>>>>` on the supervisor.
 - Helper-side persistence + saga journal are wired via `Supervisor::with_providers(...)` from FFI.
-- `OwnedIdentityDid` exists at `crates/scp-runtime/src/context/supervisor/identity_capability.rs` and is `pub(super)`. Production callers haven't been wired (issue_for_actor only used in tests). CI gate: `scripts/check-owned-identity-did.py`.
+- `OwnedIdentityDid` exists at `crates/scp-runtime/src/context/supervisor/identity_capability.rs` and is `pub(super)`. Production callers haven't been wired (issue_for_actor only used in tests). Sole-minter enforcement is compiler-only (type system + `deny(unsafe_code)` + `deny(non_local_definitions)`) — the source-text CI scanner that existed at commit 12 was later dropped (see CI gates section below).
 - `ContextActor::run()` is still skeleton dispatch — production messaging/governance still flows through `Supervisor::dispatch_*` + helper functions, NOT through actor mailbox state ownership. Watchdog/panic recovery not yet in commit 12.
 
 ## Findings recorded
@@ -65,7 +65,7 @@ type: project
 - `DEFAULT_BRIDGE_INSTANCE` global singleton in PyO3/UniFFI/NAPI.
 
 ## CI gates (verified working)
-- `scripts/check-owned-identity-did.py` — enforces declaration location, `pub(super)` visibility, no Clone/Copy/Serialize/Deserialize/Default/Hash/PartialEq/Eq/Borrow/From/Into/Debug/Display/Deref/AsRef derives, no manual impls.
+- OwnedIdentityDid sole-minter enforcement: at commit 12 a `scripts/` Python source-text scanner enforced declaration location, `pub(super)` visibility, and forbidden derives. That scanner was later DROPPED entirely in favor of compiler enforcement — the type system (private field + `pub(super)` constructor), `#![deny(unsafe_code)]`, and `#![deny(non_local_definitions)]` (blocks a nested-impl second minter), plus review of the small frozen file. No bespoke CI gate remains.
 - `disallowed-types` clippy.toml in scp-runtime forbidding `tokio::sync::RwLock` and `tokio::sync::Mutex` on read paths (Decision 12).
 - `forbid(unsafe_code)` at scp-runtime/lib.rs.
 - `clippy::expect_used` denied; verified all surviving `unwrap()/expect()` are in `#[cfg(test)]` blocks.

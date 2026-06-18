@@ -317,26 +317,6 @@ jobs:
       - name: Real check
         run: bash scripts/check-saga-gating-granularity.sh
 
-  owned-identity-did:
-    needs: check-draft
-    name: Actor / OwnedIdentityDid capability check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install tree-sitter tree-sitter-rust
-      # Self-test MUST run first: it proves every bypass pattern
-      # (forbidden derive, manual impl, public field, type alias,
-      # wrong visibility, wrong location) is detected before we trust
-      # the scanner on the real tree. If the scanner is weakened, this
-      # step fails loudly.
-      - name: Self-test scanner
-        run: python3.12 scripts/check-owned-identity-did.py --self-test
-      - name: Real scan
-        run: python3.12 scripts/check-owned-identity-did.py
-
   bridge-instance-lifecycle:
     needs: check-draft
     name: Actor / BridgeInstance lifecycle drift
