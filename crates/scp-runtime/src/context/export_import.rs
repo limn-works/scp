@@ -214,7 +214,8 @@ pub const CONTEXT_EXPORT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-EXPORT-V1:";
 pub struct ContextExport {
     /// The context snapshot (membership, roles, governance, TTL, broadcast).
     pub snapshot: ContextSnapshot,
-    /// Serialized event log entries (MessagePack-encoded `Vec<EventLogEntry>`).
+    /// Serialized event log entries
+    /// (`MessagePack`-encoded `Vec<scp_event_log::Event>`).
     /// Empty for [`ExportScope::Public`] exports.
     #[serde(with = "serde_bytes")]
     pub event_log_data: Vec<u8>,
@@ -432,25 +433,41 @@ pub fn deserialize_export(bytes: &[u8]) -> Result<ContextExport, ContextError> {
 // Merkle verification
 // ---------------------------------------------------------------------------
 
-/// Recomputes the Merkle chain hash for a set of serialized event log entries
-/// and returns the root hash (the hash of the last entry).
+/// Recomputes the canonical RFC 6962 Merkle root over a set of serialized
+/// event log entries by replaying them through the [`scp_event_log`] substrate.
 ///
 /// Returns all zeros for empty data.
 ///
-/// # Pruning tolerance
+/// # Verification model
 ///
-/// The first entry's `prev_hash` linkage is **not** validated. If the log was
-/// pruned, `entries[0].prev_hash` references a discarded predecessor that
-/// cannot be checked. A non-genesis `prev_hash` on the first entry is therefore
-/// accepted — the log is treated as a pruned suffix. Hash-chain verification
-/// begins at the link between the first and second entries; each subsequent
-/// entry's `prev_hash` must match its predecessor's `hash`. Self-hash
-/// correctness is still verified for every entry, including the first.
+/// The entries are replayed through
+/// [`scp_event_log::tree::append_unsigned_event`], which validates, for every
+/// entry, that its `sequence` equals the running count (starting at 0) and that
+/// its `prev_hash` matches the prior leaf hash (or
+/// [`GENESIS_PREV_HASH`](scp_event_log::tree::GENESIS_PREV_HASH) for the first
+/// entry). The returned [`scp_event_log::tree::root`] commits to the full leaf
+/// sequence. This is bit-identical to the root the exporter signed and to the
+/// provider's own tree (this mirrors
+/// `providers::event_log::rebuild_log_from_events`).
+///
+/// # Truncation / reorder rejection
+///
+/// Because every entry's `sequence` is checked against the running count, a
+/// **prefix-truncated** log (leading events dropped) is rejected outright (the
+/// new first event's non-zero `sequence` fails the check), as is any reordered
+/// or removed-middle log. A **suffix-truncated** log (trailing events dropped)
+/// replays cleanly — it is a valid prefix — but yields a *different* root than
+/// the full log, so the caller's constant-time compare against the signed
+/// `snapshot.event_log_merkle_root` (in `import_context` /
+/// `validate_export_for_import`) rejects it. A legitimately pruned log is
+/// accepted because [`MerkleEventLogProvider::prune_before_checkpoint`]
+/// re-anchors the retained tail to genesis and renumbers sequences from 0, so
+/// the exported pruned log is itself a valid genesis-rooted prefix.
 ///
 /// # Errors
 ///
-/// Returns [`ContextError::EventLogFailed`] if deserialization fails or
-/// the Merkle chain is broken (`prev_hash` mismatch or hash mismatch).
+/// Returns [`ContextError::EventLogFailed`] if deserialization fails or the
+/// replay's sequence / `prev_hash` chain validation fails.
 pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextError> {
     use scp_event_log::{Event, EventLog};
 
@@ -1056,14 +1073,37 @@ mod tests {
         }
     }
 
+    /// Appends a test event to the provider, carrying the human-readable
+    /// label in the [`scp_event_log::EventPayload`] data so post-prune /
+    /// post-import identity assertions can recover it via [`event_label`].
+    ///
+    /// All test events use [`scp_event_log::EventType::MessageSent`]; their
+    /// leaf hashes still differ because the per-event `sequence`, `timestamp`,
+    /// and payload bytes vary.
+    fn append_test_event(provider: &MerkleEventLogProvider, context_id_bytes: &[u8; 32], label: &str) {
+        provider
+            .append_event(
+                context_id_bytes,
+                scp_event_log::EventType::MessageSent,
+                "",
+                scp_event_log::EventPayload {
+                    data: label.as_bytes().to_vec(),
+                },
+            )
+            .unwrap();
+    }
+
+    /// Recovers the human-readable label embedded in a test event's payload.
+    fn event_label(event: &scp_event_log::Event) -> String {
+        String::from_utf8(event.payload.data.clone()).unwrap()
+    }
+
     /// Helper to create event log entries via the provider.
     fn create_event_log_data(context_id_bytes: &[u8; 32], event_names: &[&str]) -> Vec<u8> {
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(context_id_bytes).unwrap();
         for name in event_names {
-            provider
-                .append_event(context_id_bytes, name, "", None)
-                .unwrap();
+            append_test_event(&provider, context_id_bytes, name);
         }
         provider.export_event_log_entries(context_id_bytes).unwrap()
     }
@@ -1259,26 +1299,26 @@ mod tests {
     }
 
     #[test]
-    fn verify_merkle_chain_detects_tampered_hash() {
+    fn verify_merkle_chain_detects_tampered_chain_link() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-2");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event1", "", None)
-            .unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event2", "", None)
-            .unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1");
+        append_test_event(&provider, &ctx_id_bytes, "Event2");
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
-        // Tamper with the first entry's hash.
-        entries[0].hash = [0xFF; 32];
+        // Tamper the second entry's prev_hash chain link so the substrate
+        // replay's `append_unsigned_event` prev_hash check fails closed.
+        entries[1].prev_hash = [0xFF; 32];
 
         let tampered_data = rmp_serde::to_vec_named(&entries).unwrap();
         let result = verify_merkle_chain(&tampered_data);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("hash mismatch") || err_msg.contains("prev_hash mismatch"));
+        assert!(
+            err_msg.contains("Merkle chain broken"),
+            "unexpected error: {err_msg}"
+        );
     }
 
     #[test]
@@ -1286,23 +1326,78 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-3");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event1", "", None)
-            .unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event2", "", None)
-            .unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event3", "", None)
-            .unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1");
+        append_test_event(&provider, &ctx_id_bytes, "Event2");
+        append_test_event(&provider, &ctx_id_bytes, "Event3");
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
-        // Remove the middle entry.
+        // Remove the middle entry: the surviving tail now carries stale
+        // sequence numbers, so the substrate replay's sequence check rejects
+        // it (the removed-entry / reorder forgery is closed).
         entries.remove(1);
 
         let tampered_data = rmp_serde::to_vec_named(&entries).unwrap();
         let result = verify_merkle_chain(&tampered_data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_merkle_chain_rejects_suffix_truncated_log() {
+        // Truncation-forgery-closed property: dropping trailing events from a
+        // signed export must be detected. `verify_merkle_chain` recomputes the
+        // RFC 6962 root over whatever events it receives; a suffix-truncated
+        // log replays cleanly (it is a valid prefix) but yields a DIFFERENT
+        // root than the full log, so `import_context`'s constant-time compare
+        // against the signed `snapshot.event_log_merkle_root` rejects it.
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-trunc");
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id_bytes).unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1");
+        append_test_event(&provider, &ctx_id_bytes, "Event2");
+        append_test_event(&provider, &ctx_id_bytes, "Event3");
+
+        let full_root = provider.merkle_root(&ctx_id_bytes).unwrap();
+        let full_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
+        // Sanity: the untruncated export recomputes to the signed root.
+        assert_eq!(verify_merkle_chain(&full_data).unwrap(), full_root);
+
+        // Drop the trailing event (suffix truncation).
+        let mut entries = provider.entries(&ctx_id_bytes).unwrap();
+        entries.pop();
+        let truncated_data = rmp_serde::to_vec_named(&entries).unwrap();
+
+        // The truncated log still replays cleanly (valid prefix)...
+        let truncated_root = verify_merkle_chain(&truncated_data).unwrap();
+        // ...but its recomputed root no longer matches the full (signed) root,
+        // so a verifier comparing against the signed root rejects it.
+        assert_ne!(
+            truncated_root, full_root,
+            "suffix-truncated log must yield a different Merkle root"
+        );
+    }
+
+    #[test]
+    fn verify_merkle_chain_rejects_prefix_truncated_log() {
+        // Prefix truncation (dropping leading events) is rejected outright:
+        // the new first event carries a non-zero `sequence`, so the substrate
+        // replay's sequence check fails closed inside `verify_merkle_chain`.
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-prefix");
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id_bytes).unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1");
+        append_test_event(&provider, &ctx_id_bytes, "Event2");
+        append_test_event(&provider, &ctx_id_bytes, "Event3");
+
+        // Drop the leading event (prefix truncation).
+        let mut entries = provider.entries(&ctx_id_bytes).unwrap();
+        entries.remove(0);
+        let truncated_data = rmp_serde::to_vec_named(&entries).unwrap();
+
+        let result = verify_merkle_chain(&truncated_data);
+        assert!(
+            result.is_err(),
+            "prefix-truncated log must be rejected by the sequence check"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1668,15 +1763,9 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-4");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event1", "", None)
-            .unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event2", "", None)
-            .unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event3", "", None)
-            .unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1");
+        append_test_event(&provider, &ctx_id_bytes, "Event2");
+        append_test_event(&provider, &ctx_id_bytes, "Event3");
 
         let _original_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
         let merkle_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -1713,6 +1802,54 @@ mod tests {
         assert!(
             err_msg.contains("Merkle") || err_msg.contains("chain"),
             "expected Merkle failure, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn validate_export_rejects_suffix_truncated_event_log() {
+        // Full-pipeline truncation-forgery-closed property: an attacker takes a
+        // legitimately signed export and drops trailing events from the
+        // `event_log_data`. The signed `snapshot.event_log_merkle_root` commits
+        // to the FULL log's root, so step 5 recomputes the (different)
+        // suffix-truncated root and rejects on the constant-time compare —
+        // without the signing key the attacker cannot re-bind the snapshot.
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-trunc");
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id_bytes).unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1");
+        append_test_event(&provider, &ctx_id_bytes, "Event2");
+        append_test_event(&provider, &ctx_id_bytes, "Event3");
+
+        let full_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
+
+        // A legitimate, signed full export. `create_export` binds the full-log
+        // root into the signed snapshot.
+        let mut export = create_export(
+            test_snapshot("ctx-validate-trunc"),
+            full_data,
+            DID::from(TEST_CREATOR_DID),
+            ExportScope::Full,
+            &scp_primitives::SystemClock,
+            sign_with_test_key,
+        )
+        .unwrap();
+
+        // Attacker drops the trailing event from the (signed) export's log.
+        let mut entries = provider.entries(&ctx_id_bytes).unwrap();
+        entries.pop();
+        export.event_log_data = rmp_serde::to_vec_named(&entries).unwrap();
+
+        let result = validate_export_for_import(&export, &test_verifying_key());
+        assert!(
+            result.is_err(),
+            "suffix-truncated event log must be rejected on import"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Merkle")
+                || err_msg.contains("chain")
+                || err_msg.contains("root"),
+            "expected signed-root mismatch failure, got: {err_msg}"
         );
     }
 
@@ -2051,15 +2188,9 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-el-roundtrip");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event1", "", None)
-            .unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event2", "", None)
-            .unwrap();
-        provider
-            .append_event(&ctx_id_bytes, "Event3", "", None)
-            .unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1");
+        append_test_event(&provider, &ctx_id_bytes, "Event2");
+        append_test_event(&provider, &ctx_id_bytes, "Event3");
 
         let original_entries = provider.entries(&ctx_id_bytes).unwrap();
         let original_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -2080,14 +2211,22 @@ mod tests {
         assert_eq!(imported_root, original_root);
 
         for (orig, imported) in original_entries.iter().zip(imported_entries.iter()) {
-            assert_eq!(orig.event, imported.event);
+            assert_eq!(orig.event_type, imported.event_type);
             assert_eq!(orig.timestamp, imported.timestamp);
             assert_eq!(orig.prev_hash, imported.prev_hash);
-            assert_eq!(orig.hash, imported.hash);
+            assert_eq!(orig.sequence, imported.sequence);
+            assert_eq!(
+                scp_event_log::tree::leaf_hash(orig).unwrap(),
+                scp_event_log::tree::leaf_hash(imported).unwrap()
+            );
         }
 
-        // The imported log should verify.
-        assert!(new_provider.verify_chain(&ctx_id_bytes));
+        // The imported log re-exports to a byte-identical blob whose recomputed
+        // Merkle root matches the original — the chain verified on import (the
+        // `import_event_log_entries().unwrap()` above would have errored on a
+        // broken chain) and survives a round-trip.
+        let reexported = new_provider.export_event_log_entries(&ctx_id_bytes).unwrap();
+        assert_eq!(verify_merkle_chain(&reexported).unwrap(), original_root);
     }
 
     // -------------------------------------------------------------------
@@ -2100,19 +2239,30 @@ mod tests {
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
         for i in 0..10 {
-            provider
-                .append_event(&ctx_id_bytes, &format!("Event{i}"), "", None)
-                .unwrap();
+            append_test_event(&provider, &ctx_id_bytes, &format!("Event{i}"));
         }
 
-        // Prune, keeping only the last 3 entries.
-        let removed = provider.prune_event_log(&ctx_id_bytes, 3).unwrap();
+        // Prune, keeping only the last 3 entries via a size-based policy.
+        // The checkpoint boundary is the full event count, so all but the
+        // most-recent `max_event_count` events are prunable.
+        let policy = scp_protocol::context::governance::PruningPolicy {
+            size_based: Some(scp_protocol::context::governance::SizeBasedPolicy {
+                max_event_count: 3,
+                max_storage_bytes: u64::MAX,
+            }),
+            ..Default::default()
+        };
+        let removed = provider
+            .prune_before_checkpoint(&ctx_id_bytes, 10, &policy)
+            .unwrap();
         assert_eq!(removed, 7);
 
         let entries = provider.entries(&ctx_id_bytes).unwrap();
         assert_eq!(entries.len(), 3);
-        // First remaining entry's prev_hash is NOT the genesis sentinel.
-        assert_ne!(entries[0].prev_hash, [0u8; 32]);
+        // The retained tail re-anchors its first entry to the genesis sentinel
+        // (its real predecessor was pruned), matching the substrate
+        // `TruncatedEventLog` re-chaining semantics.
+        assert_eq!(entries[0].prev_hash, scp_event_log::tree::GENESIS_PREV_HASH);
 
         // Export the pruned event log.
         let data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
@@ -2146,17 +2296,31 @@ mod tests {
 
         let imported_entries = new_provider.entries(&ctx_id_bytes).unwrap();
         assert_eq!(imported_entries.len(), 3);
-        assert_eq!(imported_entries[0].event, "Event7");
-        assert!(new_provider.verify_chain(&ctx_id_bytes));
+        // The first retained event is the 8th appended ("Event7"); its payload
+        // label survives the prune + re-import.
+        assert_eq!(event_label(&imported_entries[0]), "Event7");
+        // The imported log's chain verified on import; re-exporting recomputes
+        // to the same root as the source provider.
+        assert_eq!(
+            verify_merkle_chain(&new_provider.export_event_log_entries(&ctx_id_bytes).unwrap())
+                .unwrap(),
+            merkle_root
+        );
 
-        // Appending after import should chain correctly.
-        new_provider
-            .append_event(&ctx_id_bytes, "Event10", "", None)
-            .unwrap();
+        // Appending after import should chain correctly: the new event's
+        // prev_hash equals the canonical leaf hash of the prior tail entry.
+        append_test_event(&new_provider, &ctx_id_bytes, "Event10");
         let final_entries = new_provider.entries(&ctx_id_bytes).unwrap();
         assert_eq!(final_entries.len(), 4);
-        assert_eq!(final_entries[3].prev_hash, final_entries[2].hash);
-        assert!(new_provider.verify_chain(&ctx_id_bytes));
+        assert_eq!(
+            final_entries[3].prev_hash,
+            scp_event_log::tree::leaf_hash(&final_entries[2]).unwrap()
+        );
+        // Re-export still recomputes to a valid (non-error) root.
+        assert!(
+            verify_merkle_chain(&new_provider.export_event_log_entries(&ctx_id_bytes).unwrap())
+                .is_ok()
+        );
     }
 
     // -------------------------------------------------------------------
