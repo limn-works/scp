@@ -253,13 +253,15 @@ fn query_manager_entries(
     for (seq, entry) in filtered {
         #[allow(clippy::cast_precision_loss)]
         let timestamp = entry.timestamp as f64;
+        let leaf_hash = scp_event_log::tree::leaf_hash(entry)
+            .map_err(|e| ScpPyError::context(format!("event leaf hash failed: {e}")))?;
         let payload_json = serde_json::json!({
-            "hash": encode_hex(&entry.hash),
+            "hash": encode_hex(&leaf_hash),
         });
         let payload = json_to_py_dict(py, &payload_json)?;
         py_events.push(PyEvent {
-            event_type: entry.event.clone(),
-            actor_did: entry.actor_did.clone(),
+            event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
+            actor_did: entry.actor_did.0.clone(),
             timestamp,
             payload,
             sequence: seq,

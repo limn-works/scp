@@ -22,6 +22,7 @@ scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-primitives = { path = "../scp-primitives" }
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
 scp-transport = { path = "../scp-transport" }
+scp-event-log = { path = "../scp-event-log" }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 openmls = { workspace = true }
@@ -41,7 +42,6 @@ tokio-stream = { workspace = true }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core", features = ["testing"] }
-scp-event-log = { path = "../scp-event-log" }
 scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-transport = { path = "../scp-transport" }

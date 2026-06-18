@@ -16,17 +16,30 @@
 //!    `seq <= after` are skipped).
 //! 2. `before_sequence`: **exclusive** upper bound (entries with
 //!    `seq >= before` are skipped).
-//! 3. `event_type`: equality match on `EventLogEntry::event`.
-//! 4. `actor_did`: equality match on `EventLogEntry::actor_did`.
+//! 3. `event_type`: equality match on the event's type rendered via
+//!    [`event_type_label`] (e.g. `"MessageSent"`), matching the bridge's
+//!    surfaced `event_type` string.
+//! 4. `actor_did`: equality match on `Event::actor_did` (the inner DID string).
 //! 5. `limit`: applied **after** the entry is accepted (push-then-check);
 //!    once `out.len() >= lim`, iteration breaks.
 //!
 //! Sequence numbers are 0-indexed positions within the input slice
-//! (`idx as u64`). Mapping `EventLogEntry` → native bridge struct
+//! (`idx as u64`). Mapping [`scp_event_log::Event`] → native bridge struct
 //! (`PyEvent` / `NapiEvent` / `UniFFI` `Event`) is the caller's
 //! responsibility — the helper only encodes the filter contract.
 
-use scp_core::context::providers::event_log::EventLogEntry;
+use scp_event_log::Event;
+
+/// Renders an event type as its canonical label string (the `Debug` form,
+/// e.g. `"MessageSent"`).
+///
+/// This is the single source of truth for the `event_type` string surfaced
+/// across all FFI bridges and matched by the `event_type` filter clause, so
+/// the filter and the surfaced value stay in lock-step by construction.
+#[must_use]
+pub fn event_type_label(event_type: &scp_event_log::EventType) -> String {
+    format!("{event_type:?}")
+}
 
 /// The five canonical filter clauses applied to manager event-log entries.
 ///
@@ -39,9 +52,9 @@ pub struct EventLogFilter<'a> {
     pub after_sequence: Option<u64>,
     /// Exclusive upper bound on sequence number.
     pub before_sequence: Option<u64>,
-    /// Equality match on `EventLogEntry::event`.
+    /// Equality match on the event-type label (see [`event_type_label`]).
     pub event_type: Option<&'a str>,
-    /// Equality match on `EventLogEntry::actor_did`.
+    /// Equality match on `Event::actor_did` (the inner DID string).
     pub actor_did: Option<&'a str>,
     /// Maximum number of entries to return. Applied post-push.
     pub limit: Option<usize>,
@@ -59,10 +72,10 @@ pub struct EventLogFilter<'a> {
 /// reallocation in the common "limit=N" path).
 #[must_use]
 pub fn filter_manager_entries<'a>(
-    entries: &'a [EventLogEntry],
+    entries: &'a [Event],
     filter: &EventLogFilter<'a>,
-) -> Vec<(u64, &'a EventLogEntry)> {
-    let mut out: Vec<(u64, &'a EventLogEntry)> = filter
+) -> Vec<(u64, &'a Event)> {
+    let mut out: Vec<(u64, &'a Event)> = filter
         .limit
         .map_or_else(Vec::new, |lim| Vec::with_capacity(lim.min(entries.len())));
     for (idx, entry) in entries.iter().enumerate() {
@@ -78,12 +91,12 @@ pub fn filter_manager_entries<'a>(
             continue;
         }
         if let Some(et) = filter.event_type
-            && entry.event != et
+            && event_type_label(&entry.event_type) != et
         {
             continue;
         }
         if let Some(did) = filter.actor_did
-            && entry.actor_did != did
+            && entry.actor_did.0 != did
         {
             continue;
         }
@@ -102,24 +115,26 @@ pub fn filter_manager_entries<'a>(
 mod tests {
     use super::*;
 
-    fn entry(event: &str, actor: &str) -> EventLogEntry {
-        EventLogEntry {
-            event: event.to_owned(),
-            actor_did: actor.to_owned(),
+    fn entry(event_type: scp_event_log::EventType, actor: &str) -> Event {
+        Event {
+            event_type,
+            actor_did: scp_event_log::DID(actor.to_owned()),
             timestamp: 0,
+            sequence: 0,
+            payload: scp_event_log::EventPayload::default(),
             prev_hash: [0u8; 32],
-            hash: [0u8; 32],
-            payload: None,
+            signature: Vec::new(),
         }
     }
 
-    fn corpus() -> Vec<EventLogEntry> {
+    fn corpus() -> Vec<Event> {
+        use scp_event_log::EventType;
         vec![
-            entry("ContextCreated", "did:example:alice"),
-            entry("MemberJoined", "did:example:bob"),
-            entry("MessageSent", "did:example:alice"),
-            entry("MessageSent", "did:example:bob"),
-            entry("MemberLeft", "did:example:alice"),
+            entry(EventType::ContextCreated, "did:example:alice"),
+            entry(EventType::MemberJoined, "did:example:bob"),
+            entry(EventType::MessageSent, "did:example:alice"),
+            entry(EventType::MessageSent, "did:example:bob"),
+            entry(EventType::MemberLeft, "did:example:alice"),
         ]
     }
 
@@ -173,7 +188,10 @@ mod tests {
             },
         );
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|(_, e)| e.event == "MessageSent"));
+        assert!(
+            out.iter()
+                .all(|(_, e)| e.event_type == scp_event_log::EventType::MessageSent)
+        );
     }
 
     #[test]
@@ -187,7 +205,7 @@ mod tests {
             },
         );
         assert_eq!(out.len(), 3);
-        assert!(out.iter().all(|(_, e)| e.actor_did == "did:example:alice"));
+        assert!(out.iter().all(|(_, e)| e.actor_did.0 == "did:example:alice"));
     }
 
     #[test]

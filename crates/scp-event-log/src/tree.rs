@@ -81,11 +81,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     verify_event_signature(event)?;
 
     // 4. Serialize and hash with 0x00 leaf domain prefix (RFC 6962 §2.1).
-    let serialized = serialize_event_for_hashing(event)?;
-    let mut hasher = Sha256::new();
-    hasher.update([0x00]);
-    hasher.update(&serialized);
-    let leaf_hash: [u8; 32] = hasher.finalize().into();
+    let leaf_hash = leaf_hash(event)?;
 
     // 5. Append leaf and incrementally update tree — O(log n).
     let leaf_index = log.leaves.len() as u64;
@@ -190,11 +186,7 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
     }
 
     // 3. Serialize and hash with 0x00 leaf domain prefix (RFC 6962 §2.1).
-    let serialized = serialize_event_for_hashing(event)?;
-    let mut hasher = Sha256::new();
-    hasher.update([0x00]);
-    hasher.update(&serialized);
-    let leaf_hash: [u8; 32] = hasher.finalize().into();
+    let leaf_hash = leaf_hash(event)?;
 
     // 4. Append leaf and incrementally update tree — O(log n).
     let leaf_index = log.leaves.len() as u64;
@@ -287,6 +279,26 @@ fn serialize_event_for_hashing(event: &Event) -> Result<Vec<u8>, EventLogError> 
     // The leaf hash is a commitment to the complete event (including its
     // signature), which is the standard approach in event logs.
     rmp_serde::to_vec(event).map_err(|e| EventLogError::SerializationFailed(e.to_string()))
+}
+
+/// Computes the RFC 6962 leaf hash for an event: `SHA-256(0x00 ‖ rmp_serde(event))`.
+///
+/// This is the canonical Merkle leaf preimage used by both [`append`] and
+/// [`append_unsigned_event`]. It is exposed so consumers that hold an
+/// [`Event`] (e.g. FFI bridge event-log surfaces) can reproduce the exact leaf
+/// hash a verifier would compute, without re-deriving the domain-separation
+/// scheme. The `0x00` prefix provides RFC 6962 §2.1 domain separation from
+/// interior nodes (which use `0x01`).
+///
+/// # Errors
+///
+/// Returns [`EventLogError::SerializationFailed`] if event serialization fails.
+pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
+    let serialized = serialize_event_for_hashing(event)?;
+    let mut hasher = Sha256::new();
+    hasher.update([0x00]);
+    hasher.update(&serialized);
+    Ok(hasher.finalize().into())
 }
 
 /// Verifies the Ed25519 signature of an event against the actor's DID.

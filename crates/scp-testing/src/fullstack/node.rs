@@ -140,11 +140,11 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn append_event(
         &self,
         id: &[u8; 32],
-        event: &str,
+        event_type: scp_event_log::EventType,
         actor_did: &str,
-        payload: Option<&serde_json::Value>,
+        payload: scp_event_log::EventPayload,
     ) -> Result<(), ContextCreationError> {
-        self.0.append_event(id, event, actor_did, payload)
+        self.0.append_event(id, event_type, actor_did, payload)
     }
     fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.destroy_event_log(id)
@@ -152,8 +152,7 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn event_log_entries(
         &self,
         id: &[u8; 32],
-    ) -> Result<Option<Vec<scp_core::context::providers::event_log::EventLogEntry>>, ContextError>
-    {
+    ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
         self.0.event_log_entries(id)
     }
     fn export_event_log_data(&self, id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
