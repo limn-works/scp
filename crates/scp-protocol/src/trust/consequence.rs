@@ -96,8 +96,9 @@ pub enum ConsequenceTrigger {
     WarningCount,
 
     /// A custom trigger identified by a string key. The event counting logic
-    /// matches governance action events whose payload starts with the given
-    /// key (null-terminated or end-of-data), allowing context-specific
+    /// matches governance-action events whose payload's `target_did` field
+    /// (decoded from the typed positional-`MessagePack` or JSON-object
+    /// encoding) starts with the given key, allowing context-specific
     /// consequence definitions.
     Custom(String),
 }
@@ -866,7 +867,8 @@ fn matches_trigger(trigger: &ConsequenceTrigger, event: &Event, subject_did: &st
 ///
 /// Returns the `target_did` carried by an event-log payload, if any.
 ///
-/// The runtime emits two payload encodings into the durable event log:
+/// The runtime emits exactly two payload encodings into the durable event log,
+/// and this decoder accepts only those two:
 ///
 /// 1. **Positional `MessagePack`** for the typed
 ///    [`scp_event_log::payload`] structs whose first field is `target_did`
@@ -877,10 +879,8 @@ fn matches_trigger(trigger: &ConsequenceTrigger, event: &Event, subject_did: &st
 ///    enforcement records (`ConsequenceTriggered`, …) and other untyped
 ///    governance payloads that have not (yet) been promoted to a typed struct.
 ///
-/// A legacy null-terminated UTF-8 string is also accepted as a final
-/// fallback. Returns the borrowed `target_did` slice without allocating for
-/// the JSON / legacy cases; the positional case allocates a `String` because
-/// the bytes are decoded.
+/// The positional case allocates a `String` because the bytes are decoded; the
+/// JSON case copies the matched field.
 fn payload_target_did(data: &[u8]) -> Option<String> {
     if data.is_empty() {
         return None;
@@ -890,15 +890,13 @@ fn payload_target_did(data: &[u8]) -> Option<String> {
         return Some(did);
     }
     // 2. Structured JSON object.
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
-        return val
-            .get("target_did")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-    }
-    // 3. Legacy null-terminated UTF-8 string.
-    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    std::str::from_utf8(&data[..end]).ok().map(str::to_owned)
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|val| {
+            val.get("target_did")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
 }
 
 /// Decodes `data` as a positional `MessagePack` array and returns its first
@@ -930,37 +928,37 @@ fn payload_target_is(data: &[u8], target_did: &str) -> bool {
     payload_target_did(data).is_some_and(|did| did == target_did)
 }
 
-/// Checks if a payload's data starts with the given prefix.
+/// Checks whether the event-log payload's identifying string matches (or
+/// begins with) `prefix`, used by the `Custom` trigger to match consequence
+/// records against its key.
 ///
-/// For structured JSON payloads, checks the `"custom_key"` field. Falls
-/// back to the legacy null-terminated string convention.
+/// Decodes the same two live encodings as [`payload_target_did`]:
+///
+/// 1. **Positional `MessagePack`** — match the first array element
+///    (`target_did`) against the prefix.
+/// 2. **JSON objects** — match the `"target_did"` field against the prefix.
+///
+/// The `Custom` trigger's payload is the consequence-record JSON object, whose
+/// identifying field is `target_did` (the trigger kind is separately encoded as
+/// `"trigger_kind": "Custom:<key>"`), so the JSON branch reads `target_did`.
 fn payload_starts_with(data: &[u8], prefix: &str) -> bool {
     if data.is_empty() {
         return false;
     }
     // Typed positional MessagePack: match the first array element (target_did)
-    // against the custom key, mirroring the JSON target_did backward-compat
-    // path below.
+    // against the prefix, mirroring the JSON target_did path below.
     if let Some(did) = rmp_array_first_string(data) {
         return did == prefix || did.starts_with(prefix);
     }
-    // Try structured JSON.
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
-        // Check custom_key field for Custom triggers.
-        if let Some(key) = val.get("custom_key").and_then(|v| v.as_str()) {
-            return key == prefix || key.starts_with(prefix);
-        }
-        // Also check target_did for backward compat with custom triggers
-        // that might use target DID as key.
-        if let Some(did) = val.get("target_did").and_then(|v| v.as_str()) {
-            return did == prefix || did.starts_with(prefix);
-        }
-        return false;
-    }
-    // Legacy fallback: null-terminated UTF-8 string.
-    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    std::str::from_utf8(&data[..end])
-        .is_ok_and(|payload_str| payload_str == prefix || payload_str.starts_with(prefix))
+    // Structured JSON object: match the target_did field.
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|val| {
+            val.get("target_did")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|did| did == prefix || did.starts_with(prefix))
 }
 
 // ---------------------------------------------------------------------------
