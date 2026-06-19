@@ -797,22 +797,22 @@ class TestAdmissionValidation:
     def test_open_accepted(self) -> None:
         from scp_sdk.context import validate_admission
 
-        validate_admission("open")
+        assert validate_admission("open") is None
 
     def test_gated_accepted(self) -> None:
         from scp_sdk.context import validate_admission
 
-        validate_admission("gated")
+        assert validate_admission("gated") is None
 
     def test_open_title_case_accepted(self) -> None:
         from scp_sdk.context import validate_admission
 
-        validate_admission("Open")
+        assert validate_admission("Open") is None
 
     def test_gated_title_case_accepted(self) -> None:
         from scp_sdk.context import validate_admission
 
-        validate_admission("Gated")
+        assert validate_admission("Gated") is None
 
     def test_invalid_rejected(self) -> None:
         import pytest
@@ -842,12 +842,12 @@ class TestBroadcastKeyHexValidation:
     def test_valid_64_char_hex(self) -> None:
         from scp_sdk.context import validate_broadcast_key_hex
 
-        validate_broadcast_key_hex("ab" * 32)
+        assert validate_broadcast_key_hex("ab" * 32) is None
 
     def test_uppercase_hex(self) -> None:
         from scp_sdk.context import validate_broadcast_key_hex
 
-        validate_broadcast_key_hex("AB" * 32)
+        assert validate_broadcast_key_hex("AB" * 32) is None
 
     def test_too_short_rejected(self) -> None:
         import pytest

@@ -164,7 +164,8 @@ def main() -> int:
             print(f"  {v}", file=sys.stderr)
         print(
             f"\n{len(all_violations)} violation(s). "
-            "See bindings/python/scp_sdk/context.py:evaluate_invitation for the canonical fix.",
+            "See the `evaluate_invitation` method in bindings/python/scp_sdk/scp.py "
+            "for the canonical fix.",
             file=sys.stderr,
         )
         return 1

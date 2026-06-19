@@ -250,8 +250,12 @@ scan_dispatch_hub() {
         test_count = 0
         depth = 0            # running brace depth
         testing_pending = 0  # saw #[cfg(feature="testing")], awaiting item open
-        in_testing = 0       # currently inside a testing-gated region
-        testing_floor = 0    # brace depth to which the testing region returns
+        in_testing = 0       # inside a testing-gated region
+        # Latch the OUTERMOST floor only (see scan_helper_file): a nested
+        # testing gate must not overwrite the floor of the enclosing region.
+        # Gated cfg regions are always brace-nested, so the outermost floor
+        # alone bounds the region.
+        testing_floor = 0    # brace depth the outermost testing region returns to
         split("panic unreachable unimplemented todo assert assert_eq assert_ne debug_assert debug_assert_eq debug_assert_ne", names, " ")
     }
     {
@@ -316,8 +320,7 @@ scan_dispatch_hub() {
         # (net positive braces), enter the testing region. The floor is the
         # depth BEFORE this item opened.
         if (testing_pending && opens > 0) {
-            in_testing = 1
-            testing_floor = depth
+            if (!in_testing) { in_testing = 1; testing_floor = depth }
             testing_pending = 0
         }
 
@@ -340,12 +343,10 @@ scan_dispatch_hub() {
             }
         }
 
-        # Update running depth; close the testing region when we return to
-        # the floor.
+        # Update running depth; the region ends only when we return to the
+        # outermost testing floor (an inner gate close leaves it active).
         depth += opens - closes
-        if (in_testing && depth <= testing_floor) {
-            in_testing = 0
-        }
+        if (in_testing && depth <= testing_floor) in_testing = 0
     }
     END {
         if (test_count > 1) {
@@ -442,8 +443,15 @@ scan_helper_file() {
         in_block = 0
         depth = 0
         gated_pending = 0   # saw a test/testing #[cfg(...)], awaiting item open
-        in_gated = 0        # currently inside a test/testing-gated region
-        gated_floor = 0     # brace depth the gated region returns to
+        in_gated = 0        # inside a test/testing-gated region
+        # A test/testing gate may open INSIDE another (e.g. a
+        # `#[cfg(feature = "testing")]` accessor nested in a `#[cfg(test)]`
+        # module). Track only the OUTERMOST floor: latch it on the FIRST gate
+        # entry and clear only when depth returns to it. Gated cfg regions are
+        # always brace-nested (the source compiles), so the outermost floor
+        # alone bounds the whole region — a nested gate must NOT overwrite it
+        # (the bug that re-scanned the rest of the outer module; issue #1835).
+        gated_floor = 0     # brace depth the outermost active gate returns to
         # Reachable-panic family ONLY (assert/debug_assert intentionally absent).
         split("panic unreachable unimplemented todo", names, " ")
     }
@@ -485,10 +493,11 @@ scan_helper_file() {
         closes = gsub(/}/, "}", line)
 
         # A pending test/testing gate opens its region at the first net-positive
-        # brace line; the floor is the depth BEFORE this item opened.
+        # brace line; the floor is the depth BEFORE this item opened. Latch it
+        # only when NOT already inside a gated region, so a nested gate keeps the
+        # enclosing (outermost) floor instead of clobbering it.
         if (gated_pending && opens > 0) {
-            in_gated = 1
-            gated_floor = depth
+            if (!in_gated) { in_gated = 1; gated_floor = depth }
             gated_pending = 0
         }
 
@@ -507,6 +516,8 @@ scan_helper_file() {
         }
 
         depth += opens - closes
+        # The region ends only when we return to the outermost floor; an inner
+        # gate close leaves the enclosing region active.
         if (in_gated && depth <= gated_floor) in_gated = 0
     }
     END {
@@ -794,6 +805,10 @@ self_test() {
 #   (7) DOES flag a production reachable panic inside a `#[cfg(not(test))]` item
 #       — `not(test)` is PRODUCTION code and must stay scanned; the gate-detect
 #       must NOT mistake it for a test gate.
+#   (8) does NOT flag a panic inside a `#[cfg(test)]` module that contains a
+#       NESTED `#[cfg(feature = "testing")]` item before the panic — regression
+#       guard for the single-bool gated-region bug (issue #1835): an inner
+#       region close must not clear the enclosing test-module exclusion.
 # Set NO_PANIC_GATE_SELFTEST=1 to skip (not recommended).
 # ---------------------------------------------------------------------------
 self_test_helpers() {
@@ -912,6 +927,39 @@ self_test_helpers() {
             "$C_RED" "$C_RESET" >&2
         printf 'panic inside a `#[cfg(not(test))]` item — the gate-detect wrongly treats\n' >&2
         printf '`not(test)` as a test gate and excludes production code.\n' >&2
+        rc=1
+    fi
+
+    # (8): a panic inside a `#[cfg(test)]` module that ALSO contains a NESTED
+    # `#[cfg(feature = "testing")]` item BEFORE the panic — the panic MUST stay
+    # excluded. This is the regression guard for the single-bool gated-region
+    # bug (issue #1835): the inner testing region's closing brace must NOT clear
+    # the enclosing test-module exclusion. Mirrors the real shape in
+    # supervisor.rs (a `#[cfg(feature="testing")] poll_until` nested in the
+    # trailing `#[cfg(test)] mod tests`, followed by `=> panic!(...)` arms).
+    {
+        printf 'pub fn prod_clean6() { let _ = 6; }\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod tests {\n'
+        printf '    #[cfg(feature = "testing")]\n'
+        printf '    async fn poll_until() {\n'
+        printf '        let _ = 1;\n'
+        printf '    }\n'
+        printf '    #[test]\n'
+        printf '    fn t() {\n'
+        printf '        match v {\n'
+        printf '            other => panic!("expected X, got {other:?}"),\n'
+        printf '        }\n'
+        printf '    }\n'
+        printf '}\n'
+    } > "$fixt/g_helpers.rs"
+    out=$(scan_helper_file "$fixt/g_helpers.rs")
+    if grep -q $'^HIT\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: helper scanner flagged a panic inside a `#[cfg(test)]`\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'module that contains a nested `#[cfg(feature = "testing")]` item — the\n' >&2
+        printf 'outermost-floor tracking is broken (an inner region close cleared the\n' >&2
+        printf 'outer test-module exclusion; see issue #1835).\n' >&2
         rc=1
     fi
 
