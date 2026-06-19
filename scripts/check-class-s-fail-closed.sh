@@ -523,6 +523,147 @@ scan_file() {
         vis = "(pub[[:space:]]*(\\([^)]*\\))?[[:space:]]+)?"
         return (s ~ ("^" vis "mod[[:space:]]"))
     }
+    # is_test_cfg_attr_head — TRUE iff the STRIPPED line OPENS a column-0
+    # test-cfg gate attribute, whether or not it is balanced on this one line.
+    # `is_column0_reopening_test_gate` requires the WHOLE `#[cfg(..)]` on one
+    # physical line; this companion recognises the OPENING of the same three
+    # test-cfg shapes so the multi-line-attribute carry can remember that the
+    # attribute it is consuming is a test gate and arm `pending_test_gate` when it
+    # COMPLETES (a `#[cfg(all(test,\n feature="x"\n))]` split across lines). It is
+    # deliberately scoped to the SAME `test` / `all(test` / `any(test` heads — it
+    # does NOT broaden the carry to arbitrary multi-line attributes.
+    function is_test_cfg_attr_head(s) {
+        return (s ~ /^#\[cfg\(test[,)]/ \
+            || s ~ /^#\[cfg\(test\)/ \
+            || s ~ /^#\[cfg\(all\(test[,)]/ \
+            || s ~ /^#\[cfg\(any\(test[,)]/)
+    }
+    # strip_leading_attr — return the remainder of a STRIPPED line AFTER a single
+    # balanced leading column-0 `#[..]` / `#![..]` attribute (with its leading
+    # whitespace trimmed), or "" if the line does not begin with a balanced
+    # attribute. Used to recognise a SAME-LINE `#[cfg(test)] mod NAME {` (gate and
+    # mod on ONE physical line): the leading attribute is consumed and the
+    # remainder re-examined as a column-0 `mod` decl. Single-pass bracket scan
+    # over `[`/`]`/`(`/`)` from the leading `#[`; returns the tail past the `]`
+    # that closes the attribute to depth 0. Only fires for a balanced
+    # single-physical-line attribute (a multi-line head returns "").
+    function strip_leading_attr(s,   t, i, ch, d, started) {
+        t = s
+        sub(/^[[:space:]]+/, "", t)
+        if (t !~ /^#!?\[/) return ""
+        d = 0
+        started = 0
+        for (i = 1; i <= length(t); i++) {
+            ch = substr(t, i, 1)
+            if (ch == "[") { d++; started = 1 }
+            else if (ch == "]") {
+                d--
+                if (started && d <= 0) {
+                    t = substr(t, i + 1)
+                    sub(/^[[:space:]]+/, "", t)
+                    return t
+                }
+            }
+        }
+        return ""
+    }
+    # is_production_remainder — TRUE iff the post-structural-close remainder of a
+    # physical line (already code-stripped) carries column-0 PRODUCTION content:
+    # after trimming leading whitespace it is non-empty and is neither an
+    # attribute line (`#[..]`) nor a re-opening test gate. Used by the
+    # close-line / multi-line-attr-closer resume re-evaluation (GAP-1): when a
+    # test-module closing `}` — or a `)]` closing a multi-line attribute that
+    # itself preceded a structural close — SHARES a physical line with production
+    # code, that trailing production is a vacuum the bare `next` would silently
+    # drop. The trim mirrors `is_column0_code_line` but is applied to a remainder
+    # that does not itself begin at column 0 (it follows the closing brace).
+    function is_production_remainder(s,   t) {
+        t = s
+        sub(/^[[:space:]]+/, "", t)
+        if (t == "") return 0
+        if (t ~ /^#!?\[/) return 0
+        if (is_column0_reopening_test_gate(t)) return 0
+        return 1
+    }
+    # brace_close_pos — given a STRIPPED line and the test-module CODE brace depth
+    # BEFORE this line (`pre`), return the 1-based index of the `}` that brings the
+    # running depth to 0 (the brace that CLOSES the trailing test module), or 0 if
+    # the module does not close anywhere on this line. A single left-to-right brace
+    # scan over the already-code-stripped line, so a `{`/`}` inside a
+    # literal/comment (removed by `strip_code`) cannot mis-count. This finds the
+    # close POSITIONALLY rather than by NET brace count, so a brace-BALANCED line
+    # that both closes the module AND re-opens a brace for trailing production
+    # (`} fn resumed() { .. }`) is still recognised as closing the module (net
+    # count would stay > 0 and miss it — the GAP-1 close-line vacuum).
+    function brace_close_pos(s, pre,   i, ch, d) {
+        d = pre
+        for (i = 1; i <= length(s); i++) {
+            ch = substr(s, i, 1)
+            if (ch == "{") d++
+            else if (ch == "}") {
+                d--
+                if (d <= 0) return i
+            }
+        }
+        return 0
+    }
+    # remainder_after_brace_close — the substring of a STRIPPED line AFTER the `}`
+    # that closes the trailing test module (depth `pre` before this line), or ""
+    # if the module does not close on this line / nothing follows the closer.
+    function remainder_after_brace_close(s, pre,   p) {
+        p = brace_close_pos(s, pre)
+        if (p == 0) return ""
+        return substr(s, p + 1)
+    }
+    # remainder_after_attr_close — given a STRIPPED line and the in-flight
+    # multi-line ATTRIBUTE bracket depth BEFORE this line (`pre`, the net unclosed
+    # `[`+`(`), return the substring AFTER the bracket (`]`/`)`) that brings the
+    # combined depth to 0 — i.e. the production item that a multi-line attribute
+    # closing `)]` decorates when it shares the physical line
+    # (`)] fn sneaky_production() { .. }`). Empty if the attribute does not close
+    # on this line, or nothing follows the closer. Mirrors the `attr_brk` /
+    # `attr_brk_close` accounting (`[`/`(` open, `]`/`)` close) so the split point
+    # matches the depth model exactly.
+    function remainder_after_attr_close(s, pre,   i, ch, d) {
+        d = pre
+        for (i = 1; i <= length(s); i++) {
+            ch = substr(s, i, 1)
+            if (ch == "[" || ch == "(") d++
+            else if (ch == "]" || ch == ")") {
+                d--
+                if (d <= 0) return substr(s, i + 1)
+            }
+        }
+        return ""
+    }
+    # enter_test_module — ENTER a trailing test module on the line carrying its
+    # `mod NAME {`, given that line CODE brace counts (`opens`/`closes`). Sets
+    # `after_test_module=0`, `in_test_module=1`, and the module CODE brace depth.
+    # A degenerate single-physical-line `mod x {}` (already balanced, depth <= 0)
+    # is treated as immediately closed (its body had nothing to skip) and the
+    # remainder of THIS physical line after the module-closing `}` is re-evaluated
+    # for a same-line production resume (GAP-1), so a non-trailing
+    # `#[cfg(test)] mod x {} fn resumed() {..}` is still surfaced. Shared by the
+    # same-line gate+mod path (GAP-2) and the pending-gate path so both behave
+    # identically. `line` (the stripped physical line) is read as a global.
+    function enter_test_module(opens, closes) {
+        after_test_module = 0
+        in_test_module = 1
+        test_mod_depth = opens - closes
+        if (test_mod_depth <= 0) {
+            in_test_module = 0
+            test_mod_depth = 0
+            after_test_module = 1
+            # The module opened and closed on this one physical line (depth 0
+            # before it). Re-evaluate the post-close remainder for a same-line
+            # production vacuum, mirroring the in_test_module close branch.
+            if (!nontrailing_hit \
+                && is_production_remainder(remainder_after_brace_close(line, 0))) {
+                printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
+                nontrailing_hit = 1
+            }
+        }
+    }
     # normalize_assign — collapse whitespace around a bare assignment `=` so a
     # space-free ASSIGNMENT marker (`threshold_value=`, `role_state.ceiling=`)
     # matches the downward-auth write `x = y` but NOT a read, a comparison, or a
@@ -785,11 +926,11 @@ scan_file() {
         raw_hash = 0
         in_string = 0
         # Trailing-test-module brace-depth state (wave-18 reframe). The cutoff no
-        # longer flips a single "skip rest of file" `seen_test` flag and classify
-        # every later column-0 line by item KIND; it TRACKS the trailing test
-        # the CODE brace depth of the trailing test module and treats ANY
-        # column-0 production content AFTER its closing brace as a non-trailing
-        # vacuum (NTTEST).
+        # longer flips a single "skip rest of file" `seen_test` flag and then
+        # classify every later column-0 line by item KIND; instead it TRACKS the
+        # CODE brace depth of the trailing test module and treats ANY column-0
+        # production content AFTER its closing brace as a non-trailing vacuum
+        # (NTTEST).
         #   in_test_module     — currently inside a trailing test module body.
         #   test_mod_depth      — CODE brace depth WITHIN that module (the module
         #                         opens at depth 1 on its `mod .. {` line and CLOSES
@@ -824,6 +965,16 @@ scan_file() {
         # whole attribute, however many lines it spans, is transparent — the
         # classifier-free analogue of how `strip_code` carries multi-line literals.
         attr_bracket_depth = 0
+        # attr_is_test_cfg — set when the in-flight multi-line attribute OPENED
+        # with a test-cfg head (`#[cfg(all(test,` / `#[cfg(any(test,`). When the
+        # attribute COMPLETES across lines, this arms `pending_test_gate` so a
+        # MULTI-LINE test-cfg gate is recognised exactly like a single-line one
+        # (GAP-3): without it, the multi-line gate is consumed as an opaque
+        # attribute and the `mod` it decorates is scanned as production.
+        attr_is_test_cfg = 0
+        # attr_test_cfg_line — the physical line on which a multi-line test-cfg
+        # gate OPENED, reported as the gate line when the gate completes (GAP-3).
+        attr_test_cfg_line = 0
         depth = 0
         in_fn = 0
         fn_name = ""
@@ -939,13 +1090,40 @@ scan_file() {
         tm_closes = gsub(/}/, "}", line)
 
         if (in_test_module) {
-            # Inside a trailing test module body: track depth, skip from the
-            # production scan. The module CLOSES when depth returns to 0.
-            test_mod_depth += tm_opens - tm_closes
-            if (test_mod_depth <= 0) {
-                in_test_module = 0
-                test_mod_depth = 0
-                after_test_module = 1
+            # Inside a trailing test module body: skip from the production scan.
+            # The module CLOSES at the `}` that returns the running CODE brace
+            # depth (starting at `test_mod_depth`) to 0. We find that close
+            # POSITIONALLY (not by NET brace count), so a brace-BALANCED closing
+            # line that both closes the module AND re-opens a brace for trailing
+            # production (`} fn resumed_production() { .. }`) is still recognised
+            # as a close — a net count would stay > 0 and miss the GAP-1 vacuum.
+            tm_close_pos = brace_close_pos(line, test_mod_depth)
+            if (tm_close_pos == 0) {
+                # Module does not close on this line: carry the depth forward.
+                test_mod_depth += tm_opens - tm_closes
+                next
+            }
+            in_test_module = 0
+            test_mod_depth = 0
+            after_test_module = 1
+            # GAP-1 — CONTENT ON THE MODULE-CLOSING LINE. When the closing `}`
+            # SHARES a physical line with production code
+            # (`} fn resumed_production() { ...class-s mutation... }`), a bare
+            # `next` here would scan NEITHER the production on that line NOR its
+            # Class-S mutation — a silent vacuum. Re-evaluate the remainder of THIS
+            # physical line AFTER the brace that closed the module: if it is
+            # column-0 production content (not blank / comment / attribute /
+            # re-opening test gate), the module was NOT trailing and that trailing
+            # production is an un-scanned vacuum. Fire NTTEST once, mirroring the
+            # after-module guard below (which only sees the NEXT line and so would
+            # miss same-line production). Fail-closed direction: a same-line
+            # re-opening test gate in the remainder is treated as non-content (not
+            # re-entered from a remainder), which can only ever over-report a
+            # vacuum, never hide one.
+            if (!nontrailing_hit \
+                && is_production_remainder(substr(line, tm_close_pos + 1))) {
+                printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
+                nontrailing_hit = 1
             }
             next
         }
@@ -969,8 +1147,39 @@ scan_file() {
         attr_brk_close = gsub(/[)\]]/, "&", line)   # `)` or `]` closes
         if (attr_bracket_depth > 0) {
             # Continuation of an in-flight multi-line attribute.
+            attr_pre = attr_bracket_depth
             attr_bracket_depth += attr_brk - attr_brk_close
-            if (attr_bracket_depth < 0) attr_bracket_depth = 0
+            if (attr_bracket_depth <= 0) {
+                attr_bracket_depth = 0
+                # The multi-line attribute COMPLETED on this line.
+                if (attr_is_test_cfg) {
+                    # GAP-3 — a MULTI-LINE test-cfg gate (`#[cfg(all(test,\n
+                    # feature="x"\n))]`). Arm the pending test gate exactly as the
+                    # single-line gate detector below does, so the `mod` it
+                    # decorates (on a following line) is consumed as a test module
+                    # rather than scanned as production. Anchor the reported gate
+                    # line at the attribute OPENING line (recorded when the head
+                    # was seen).
+                    attr_is_test_cfg = 0
+                    pending_test_gate = 1
+                    pending_test_line = attr_test_cfg_line
+                    next
+                }
+                # GAP-1 (attr-closer variant) — a NON-test multi-line attribute
+                # whose closing `)]` SHARES a physical line with production
+                # (`)] fn sneaky_production() { ... }`) AFTER a trailing test
+                # module has closed would, with a bare `next`, silently drop that
+                # production region. Re-evaluate the remainder after the `]` that
+                # closed the attribute: if it is column-0 production content, the
+                # module was NOT trailing — an un-scanned vacuum. (The attribute
+                # decorates that production item; the item itself begins after the
+                # closer on the same physical line.)
+                if (after_test_module && !nontrailing_hit \
+                    && is_production_remainder(remainder_after_attr_close(line, attr_pre))) {
+                    printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
+                    nontrailing_hit = 1
+                }
+            }
             next
         }
         if (line ~ /^#!?\[/ && (attr_brk - attr_brk_close) > 0) {
@@ -978,10 +1187,39 @@ scan_file() {
             # (A `#[cfg(test)]` re-opening gate is single-line/balanced, so it does
             # NOT enter here — it is matched by the gate detector below.)
             attr_bracket_depth = attr_brk - attr_brk_close
+            # Remember whether this multi-line attribute is a test-cfg gate head
+            # (`#[cfg(all(test,` / `#[cfg(any(test,`) so its completion can arm the
+            # pending test gate (GAP-3). Record the OPENING line for the gate-line
+            # report.
+            if (is_test_cfg_attr_head(line)) {
+                attr_is_test_cfg = 1
+                attr_test_cfg_line = NR
+            } else {
+                attr_is_test_cfg = 0
+            }
             next
         }
 
         # Detect the column-0 test gate that opens a trailing test module.
+        #
+        # GAP-2 — SAME-LINE `#[cfg(test)] mod NAME {`. The gate and the `mod` it
+        # decorates may share ONE physical line. The reopening-gate test below is
+        # prefix-anchored, so it would arm `pending_test_gate` and then look to the
+        # NEXT line for the `mod` — leaving a same-line `mod {` to fall into the
+        # production scanner (the test body scanned as production: a false HIT, and
+        # a trailing production vacuum after it missed). Detect it here: a column-0
+        # reopening test gate whose remainder, AFTER stripping the leading
+        # attribute, is itself a column-0 `mod` decl IS a same-iteration module
+        # entry. Consume it now (count this line braces as the module body) so
+        # the body is not scanned and a real trailing production resume is still
+        # caught by the after-module guard.
+        if (is_column0_reopening_test_gate(line) \
+            && is_column0_mod_decl(strip_leading_attr(line))) {
+            if (!after_test_module) test_gate_line = NR
+            pending_test_gate = 0
+            enter_test_module(tm_opens, tm_closes)
+            next
+        }
         if (is_column0_reopening_test_gate(line)) {
             pending_test_gate = 1
             pending_test_line = NR
@@ -1000,18 +1238,8 @@ scan_file() {
                 # eventual NTTEST reports). ENTER the module via brace depth: the
                 # `mod .. {` line contributes `tm_opens` (>=1).
                 if (!after_test_module) test_gate_line = pending_test_line
-                after_test_module = 0
-                in_test_module = 1
-                test_mod_depth = tm_opens - tm_closes
-                if (test_mod_depth <= 0) {
-                    # Degenerate single-line `mod x {}` — already balanced. Treat
-                    # the module as immediately closed (its body had nothing to
-                    # skip) and resume scanning for a production vacuum after it.
-                    in_test_module = 0
-                    test_mod_depth = 0
-                    after_test_module = 1
-                }
                 pending_test_gate = 0
+                enter_test_module(tm_opens, tm_closes)
                 next
             }
             # else: interspersed single-item test gate — NOT a module. The item
@@ -2359,6 +2587,148 @@ self_test() {
         printf '\n'
     } > "$fdir/comments_after_close.rs"
 
+    # (49) GAP-1 CLOSE-LINE PRODUCTION RESUME (wave-19) — a NON-trailing test
+    # module whose closing `}` SHARES a physical line with a production fn
+    # (`} fn resumed_production() { ..class-s mutation.. }`). The pre-wave-19 close
+    # branch incremented the NET brace count (which a brace-BALANCED closing line
+    # keeps > 0, so the module looked un-closed) OR, even on a net-zero line, took
+    # a bare `next` that scanned NEITHER the production after the `}` NOR its
+    # Class-S mutation — a silent vacuum. The brace-depth tracker now finds the
+    # module-closing `}` POSITIONALLY and re-evaluates the line remainder after it;
+    # the trailing production is a column-0 resume, so this MUST emit an NTTEST
+    # HIT. Non-vacuity: reverting the positional close / remainder re-eval makes
+    # this fixture stop HITting.
+    {
+        printf 'pub fn closeline_prod_before_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod closeline_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '} pub fn closeline_resumed_production() {\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/gap1_closeline_resume.rs"
+
+    # (50) GAP-1 MULTI-LINE-ATTRIBUTE-CLOSER PRODUCTION RESUME (wave-19) — after a
+    # trailing test module closes, a production fn is decorated by a MULTI-LINE
+    # attribute whose closing `)]` SHARES a physical line with the fn
+    # (`)] pub fn sneaky_production() { ..mutation.. }`). The attr-carry close
+    # branch previously took a bare `next`, dropping the production region after
+    # the `)]`. It now re-evaluates the remainder after the attribute closer; the
+    # trailing production is a column-0 resume, so this MUST emit an NTTEST HIT.
+    {
+        printf 'pub fn attrcloser_prod_before_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod attrcloser_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[allow(\n'
+        printf '    clippy::foo,\n'
+        printf '    clippy::bar\n'
+        # The production resume sits ENTIRELY on the `)]` closer line (a single
+        # physical line, so no LATER column-0 line — e.g. a dangling `}` — can
+        # trigger NTTEST instead). This makes the fixture a TRUE non-vacuity proof
+        # for the attr-closer remainder branch: the NTTEST can ONLY come from
+        # re-evaluating the post-`)]` remainder.
+        printf ')] pub fn attrcloser_sneaky_production() { state.xctx_caller_reservations.insert(saga_id, record); persist_state_best_effort(state, deps, ctx); }\n'
+    } > "$fdir/gap1_attrcloser_resume.rs"
+
+    # (51) GAP-2 SAME-LINE GATE+MOD, TRAILING (wave-19) — a `#[cfg(test)] mod NAME
+    # { .. }` with the gate AND the `mod` (and a test-only Class-S mutation in its
+    # body) on ONE physical line, closing at EOF with nothing after it. The
+    # pre-wave-19 detector armed the gate but only looked to the NEXT line for the
+    # `mod`, so the same-line `mod {` fell into the production scanner and the
+    # test-only mutation was FALSE-flagged. The same-line gate+mod is now consumed
+    # as a test module in one iteration, so its body is NOT scanned and this MUST
+    # NOT emit an NTTEST HIT or a (false) HIT on the test mutation.
+    {
+        printf 'pub fn sameline_trailing_prod_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        # Gate AND `mod {` share ONE physical line; the test body is on SEPARATE
+        # (indented) lines so that, if the module is NOT recognised, the indented
+        # test fn IS detected by the production scanner and its Class-S mutation
+        # HITs — making this a load-bearing non-vacuity proof for the same-line
+        # gate+mod recognition (revert it and `sameline_trailing_test_body` HITs).
+        printf '#[cfg(test)] mod sameline_trailing_tests {\n'
+        printf '    fn sameline_trailing_test_body() {\n'
+        printf '        state.xctx_caller_reservations.insert(x, y);\n'
+        printf '    }\n'
+        printf '}\n'
+    } > "$fdir/gap2_sameline_trailing.rs"
+
+    # (52) GAP-2 SAME-LINE GATE+MOD, NON-TRAILING (wave-19) — a same-line
+    # `#[cfg(test)] mod NAME { .. }` FOLLOWED by a column-0 production fn. The
+    # module is recognised and consumed same-iteration; the production resume after
+    # it is an un-scanned vacuum, so this MUST emit an NTTEST HIT.
+    {
+        printf 'pub fn sameline_nontrailing_prod_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)] mod sameline_nontrailing_tests { fn a_test() {} }\n'
+        printf '\n'
+        printf 'pub fn sameline_resumed_production() {\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/gap2_sameline_nontrailing.rs"
+
+    # (53) GAP-3 MULTI-LINE TEST-CFG GATE, TRAILING (wave-19) — a
+    # `#[cfg(all(test,\n feature = "testing"\n))]` gate SPLIT across physical lines
+    # then a `mod NAME { .. }`, closing at EOF. The pre-wave-19 detector required
+    # the whole `#[cfg(all(test,..))]` on one line, so the multi-line gate was
+    # consumed as an opaque attribute and the `mod` it decorates was scanned as
+    # production (its test-only body FALSE-flagged). The multi-line-attribute carry
+    # now remembers a test-cfg head and arms the pending gate when it COMPLETES, so
+    # the following `mod` is consumed as a test module. This MUST NOT emit an NTTEST
+    # HIT or a (false) HIT on the test body.
+    {
+        printf 'pub fn multiline_cfg_prod_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(all(test,\n'
+        printf '    feature = "testing"\n'
+        printf '))]\n'
+        printf 'mod multiline_cfg_tests {\n'
+        printf '    fn multiline_cfg_test_body() { state.xctx_caller_reservations.insert(x, y); }\n'
+        printf '}\n'
+    } > "$fdir/gap3_multiline_cfg_gate.rs"
+
+    # (54) NIT-1 — MULTI-LINE NON-TEST ATTRIBUTE CARRY, TRAILING TEST MODULE
+    # (wave-19). A `#[cfg(test)]` gate + `mod tests { .. }`, then a multi-line
+    # `#[allow(\n clippy::foo,\n clippy::bar\n)]` whose bare `)]` closer sits at
+    # column 0 BEFORE the (degenerate, immediately-closed) `mod` it decorates. The
+    # `)]` closer must NOT be read as interspersed production (which would
+    # mis-decide mod-vs-item and skip the module) NOR false-fire NTTEST. With
+    # nothing but the decorated trailing test module after, this MUST NOT emit an
+    # NTTEST HIT — exercising the `attr_bracket_depth` multi-line carry on a
+    # NON-test attribute whose `)]` closer is column-0.
+    {
+        printf 'pub fn attrcarry_prod_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf '#[allow(\n'
+        printf '    clippy::foo,\n'
+        printf '    clippy::bar\n'
+        printf ')]\n'
+        printf 'mod attrcarry_tests {\n'
+        printf '    #[test]\n'
+        printf '    fn it_works() {}\n'
+        printf '}\n'
+    } > "$fdir/attr_carry_trailing.rs"
+
     local rc=0
     local out
     out=$(
@@ -2826,6 +3196,90 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'wrongly flagged NTTEST — trailing commentary was mistaken for a production\n' >&2
         printf 'resume (a `//`/`/* */` comment must strip to non-content).\n' >&2
+        rc=1
+    fi
+    # (49) GAP-1 close-line production resume — a test module whose closing `}`
+    # SHARES a physical line with a production fn MUST emit an NTTEST HIT (the
+    # positional module-close + remainder re-eval). FAILS pre-wave-19 (the net
+    # brace count kept the balanced closing line looking un-closed / the bare
+    # `next` dropped the same-line production).
+    if ! grep -q $'^NTTEST\t.*/gap1_closeline_resume\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a NON-trailing test module whose closing `}` shares a\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'physical line with a production fn was NOT flagged — the module-close is not\n' >&2
+        printf 'found positionally, so same-line production is a silent un-scanned vacuum.\n' >&2
+        rc=1
+    fi
+    # (50) GAP-1 multi-line-attribute-closer production resume — a production fn
+    # decorated by a multi-line attribute whose `)]` closer shares its physical
+    # line, after a trailing test module, MUST emit an NTTEST HIT. FAILS pre-wave-19
+    # (the attr-carry close branch dropped the post-`)]` production region).
+    if ! grep -q $'^NTTEST\t.*/gap1_attrcloser_resume\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a production fn whose multi-line-attribute `)]` closer\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'shares a physical line, resuming after a trailing test module, was NOT flagged\n' >&2
+        printf '— the attr-carry close drops the same-line production after the closer.\n' >&2
+        rc=1
+    fi
+    # (51) GAP-2 same-line gate+mod, TRAILING — a `#[cfg(test)] mod NAME { .. }` on
+    # ONE physical line, closing at EOF, MUST NOT emit an NTTEST HIT and its
+    # test-only body MUST NOT be scanned as production. FAILS pre-wave-19 (the
+    # same-line `mod {` fell into the production scanner; the test body was
+    # FALSE-flagged). Assert both: no NTTEST on the file …
+    if grep -q $'^NTTEST\t.*/gap2_sameline_trailing\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a TRAILING same-line `#[cfg(test)] mod NAME { .. }` was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'wrongly flagged NTTEST — the same-line gate+mod was not recognised as a module.\n' >&2
+        rc=1
+    fi
+    # … and no (false) HIT on the test-only mutation in its body. This is the
+    # load-bearing non-vacuity check: revert the same-line gate+mod recognition and
+    # `sameline_trailing_test_body` is scanned as production and HITs.
+    if grep -q $'^HIT\t.*\tsameline_trailing_test_body$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: the test-only Class-S mutation inside a same-line\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`#[cfg(test)] mod { .. }` body was wrongly scanned as production and flagged.\n' >&2
+        rc=1
+    fi
+    # (52) GAP-2 same-line gate+mod, NON-TRAILING — a same-line gate+mod FOLLOWED by
+    # a column-0 production fn MUST emit an NTTEST HIT (the production resume after
+    # the recognised module is an un-scanned vacuum).
+    if ! grep -q $'^NTTEST\t.*/gap2_sameline_nontrailing\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a same-line `#[cfg(test)] mod NAME { .. }` FOLLOWED by a\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'column-0 production fn was NOT flagged — the post-module production vacuum was\n' >&2
+        printf 'missed (the same-line module entry must still arm the after-module guard).\n' >&2
+        rc=1
+    fi
+    # (53) GAP-3 multi-line test-cfg gate, TRAILING — a `#[cfg(all(test,\n
+    # feature="x"\n))]` gate split across lines then a `mod`, closing at EOF, MUST
+    # NOT emit an NTTEST HIT and its test body MUST NOT be scanned. FAILS pre-wave-19
+    # (the multi-line gate was an opaque attribute, the `mod` scanned as production).
+    if grep -q $'^NTTEST\t.*/gap3_multiline_cfg_gate\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a TRAILING multi-line `#[cfg(all(test,..))]` gate was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'wrongly flagged NTTEST — the multi-line test-cfg gate was not recognised.\n' >&2
+        rc=1
+    fi
+    # The test body fn (`multiline_cfg_test_body`) carries a Class-S mutation; if
+    # the multi-line gate is not recognised, that fn is scanned as production and
+    # HITs. Assert it does NOT (this is the load-bearing non-vacuity check: revert
+    # the multi-line test-cfg recognition and this fn HITs).
+    if grep -q $'^HIT\t.*\tmultiline_cfg_test_body$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: the test-only Class-S mutation inside a multi-line\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'test-cfg-gated `mod { .. }` body was wrongly scanned as production and flagged.\n' >&2
+        rc=1
+    fi
+    # (54) NIT-1 — a multi-line NON-test `#[allow(..)]` whose `)]` closer sits at
+    # column 0 between a `#[cfg(test)]` gate and the `mod tests` it decorates MUST
+    # NOT emit an NTTEST HIT (the `)]` must not be read as interspersed production).
+    # This exercises the `attr_bracket_depth` multi-line carry on a column-0 `)]`.
+    if grep -q $'^NTTEST\t.*/attr_carry_trailing\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a column-0 multi-line-attribute `)]` closer before a\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'trailing test module was wrongly read as interspersed production (NTTEST) —\n' >&2
+        printf 'the attr-carry did not keep the multi-line attribute transparent.\n' >&2
         rc=1
     fi
 
