@@ -529,8 +529,19 @@ scan_file() {
             c2t = index(substr(s, m), "*/")
             if (c2t == 0) {
                 # No close on the rest of the line: still inside the comment.
-                # A trailing open `/*` (o2 != 0) only deepens an already-open
-                # comment; depth is carried regardless. Signal "line consumed".
+                # Count every remaining nested open `/*` so block_depth carries
+                # the CORRECT depth to the next line (Rust block comments nest).
+                # This branch is reached only when there is genuinely NO `*/` on
+                # the remainder, so each remaining `/*` is an unambiguous
+                # deepening. A boolean "carry regardless" UNDER-counted depth: a
+                # nested `/*` that is the last comment-token on its physical line
+                # was dropped, surfacing from the comment one level too early and
+                # leaking the trailing comment braces into the code residue.
+                while (o2 != 0) {
+                    block_depth++
+                    m = m + (o2 - 1) + 2
+                    o2 = index(substr(s, m), "/*")
+                }
                 return 0
             }
             if (o2 != 0 && o2 < c2t) {
@@ -1656,6 +1667,71 @@ self_test() {
         printf '}\n'
     } > "$fdir/multiline_literals_fail_closed.rs"
 
+    # (32) TRAILING-NESTED-OPEN DEFLATION (wave-13) — a nested `/*` that is the
+    # LAST comment-token on its physical line (no `*/` after it on that line).
+    # The prior scanner carried the comment depth but did NOT increment for that
+    # trailing nested open, so it under-counted depth by one and surfaced from the
+    # comment one `*/` too EARLY, leaking the trailing ` } */` residue. The leaked
+    # `}` closed the body prematurely (deflation) and the best-effort Class-S
+    # mutation below went invisible. The comment is a properly nested+closed
+    # `/* .. /* .. */ } */` (2 opens, 2 closes), so the code is legal,
+    # cargo-fmt-clean Rust. Fixtures 26/27 only exercise SAME-LINE `/* inner */`;
+    # this covers the last-token-on-line path. The mutation MUST be caught.
+    {
+        printf 'pub async fn nested_comment_trailing_open_deflation_fixture() {\n'
+        printf '    /* legacy approach:\n'
+        printf '       fn old() { /* helper open\n'
+        printf '    */ } */\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/nested_comment_trailing_open_deflation.rs"
+
+    # (33) TRAILING-NESTED-OPEN INFLATION (wave-13) — the same trailing-open
+    # hazard, but the early surface leaks a ` { */` residue. The leaked `{`
+    # inflated the poison fn's depth so it never returned to its floor and
+    # SWALLOWED the SEPARATE later fn — blinding the file. The best-effort Class-S
+    # mutation in that LATER (victim) fn MUST still be caught (the file is not
+    # blinded). The poison fn fail-closes so it is not the HIT.
+    {
+        printf 'pub async fn nested_comment_trailing_open_inflation_poison_fixture() {\n'
+        printf '    /* legacy approach:\n'
+        printf '       fn old() { /* helper open\n'
+        printf '    */ { */\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf 'pub async fn nested_comment_trailing_open_inflation_victim_fixture() {\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/nested_comment_trailing_open_inflation.rs"
+
+    # (34) CHAR-LITERAL UNICODE-ESCAPE BRACE — branch-completeness (wave-13). The
+    # `'\u{7d}'` / `'\u{7b}'` unicode-escape char literals carry a `}` / `{`
+    # CODEPOINT inside the literal. The strip already handles this branch
+    # correctly (black-hat verified), but it was the only brace-bearing literal
+    # branch WITHOUT a poison fixture. The deflation variant (a `'\u{7d}'` `}`
+    # before a best-effort mutation) MUST be caught — the brace inside the char
+    # literal must be stripped, not leaked to close the body early. The fail-closed
+    # variant (a `'\u{7b}'` `{` in a CORRECTLY fail-closed fn) is the over-strip
+    # guard — it MUST NOT be flagged.
+    {
+        printf 'pub async fn char_unicode_escape_brace_deflation_fixture() {\n'
+        printf "    let _close = '\\\\u{7d}';\n"
+        printf "    let _open = '\\\\u{7b}';\n"
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+        printf '\n'
+        printf 'pub async fn char_unicode_escape_brace_fail_closed_fixture() {\n'
+        printf "    let _open = '\\\\u{7b}';\n"
+        printf "    let _close = '\\\\u{7d}';\n"
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+    } > "$fdir/char_unicode_escape_brace.rs"
+
     local rc=0
     local out
     out=$(
@@ -1926,6 +2002,46 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'comment and a multi-line string was wrongly flagged — the strip over-stripped\n' >&2
         printf 'real code or lost the fail-closed persist that follows the literals.\n' >&2
+        rc=1
+    fi
+    # (32) TRAILING-NESTED-OPEN DEFLATION — a nested `/*` that is the last
+    # comment-token on its line must deepen block_depth, or the comment surfaces
+    # one `*/` early and the leaked `}` closes the body prematurely. The
+    # best-effort Class-S mutation after the comment MUST be caught.
+    if ! grep -q $'^HIT\t.*\tnested_comment_trailing_open_deflation_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation after a block comment whose nested\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`/*` was the LAST token on its line was NOT caught — scan_block_comment did\n' >&2
+        printf 'not count the trailing nested open, under-counted depth, and surfaced one\n' >&2
+        printf '`*/` early, leaking a `}` that closed the body prematurely.\n' >&2
+        rc=1
+    fi
+    # (33) TRAILING-NESTED-OPEN INFLATION — the same under-count leaking a `{`
+    # must NOT inflate the poison fn so it swallows the SEPARATE later fn. The
+    # best-effort mutation in the LATER (victim) fn MUST still be caught.
+    if ! grep -q $'^HIT\t.*\tnested_comment_trailing_open_inflation_victim_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a leaked `{` from an under-counted trailing nested\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'block-comment open blinded the rest of the file — the later (victim) fn was\n' >&2
+        printf 'swallowed by an inflated body and its Class-S mutation went unscanned.\n' >&2
+        rc=1
+    fi
+    # (34) CHAR-LITERAL UNICODE-ESCAPE BRACE — branch-completeness. The `}` inside
+    # a `'\u{7d}'` char literal must be stripped (not leak and deflate the body),
+    # so the best-effort mutation after it MUST be caught; and a `'\u{7b}'` `{` in
+    # a CORRECTLY fail-closed fn MUST NOT be flagged (over-strip / inflation guard).
+    if ! grep -q $'^HIT\t.*\tchar_unicode_escape_brace_deflation_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation after a `\\u{7d}` unicode-escape char\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'literal was NOT caught — the `}` codepoint inside the char literal leaked and\n' >&2
+        printf 'closed the body prematurely.\n' >&2
+        rc=1
+    fi
+    if grep -q $'^HIT\t.*\tchar_unicode_escape_brace_fail_closed_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a CORRECTLY fail-closed fn carrying `\\u{7b}` / `\\u{7d}`\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'unicode-escape char literals was wrongly flagged — the strip over-stripped\n' >&2
+        printf 'real code or a brace inside the char literal leaked.\n' >&2
         rc=1
     fi
 
