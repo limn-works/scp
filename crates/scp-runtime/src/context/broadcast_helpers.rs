@@ -394,12 +394,12 @@ fn apply_guarded(
     deps.transport
         .send_message(context_id_bytes, &envelope_bytes)?;
 
-    deps.event_log.append_context_event(
-        context_id_bytes,
-        scp_event_log::EventType::MessageSent,
-        pending.author_did.as_ref(),
-    )?;
-    state.checkpoint_events_since += 1;
+    // `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 / the
+    // phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,
+    // non-convergent event surfaced only as the local `ContextEvent::MessageSent`
+    // emitted above. The former durable append (and its `checkpoint_events_since`
+    // increment) is removed so two honest members derive the same
+    // `event_log_merkle_root` (§9.9.3).
 
     Ok(envelope)
 }

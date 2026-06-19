@@ -1052,7 +1052,8 @@ pub async fn capture_join_payment(
             context_id,
             "payment capture failed after successful join: {e}"
         );
-        // H19: append durable audit record to event log + receive buffer.
+        // H19: surface the capture failure as a local `ContextEvent` (no durable
+        // Merkle leaf — per-payee, non-convergent; ADR-051 §6 / phase-2.md §2).
         record_payment_capture_failure(
             state,
             deps,
@@ -1065,9 +1066,18 @@ pub async fn capture_join_payment(
     }
 }
 
-/// Append a `PaymentCaptureFailed` durable event log entry plus the
-/// matching receive-buffer push. Actor-shape inline replacement for
+/// Surface a `PaymentCaptureFailed` as a local `ContextEvent` (receive-buffer
+/// push + `event_tx` notification). Actor-shape inline replacement for
 /// `manager_methods::record_payment_capture_failure`.
+///
+/// Per ADR-051 §6 / the phase-2.md ADR-011 amendment exclusion taxonomy §2, the
+/// payment receipts (`PaymentReceived` / `PaymentCaptureFailed`) are per-payee,
+/// non-convergent events appended by their payee alone — they are excluded from
+/// the canonical Merkle log so two honest members derive the same
+/// `event_log_merkle_root` (§9.9.3). The former durable
+/// `EventType::PaymentCaptureFailed` append (and its `checkpoint_events_since`
+/// increment) is removed; the `ContextEvent::PaymentCaptureFailed` emission
+/// below is the sole surfacing of a capture failure.
 #[allow(clippy::too_many_arguments)]
 fn record_payment_capture_failure(
     state: &mut PerContextState,
@@ -1078,27 +1088,6 @@ fn record_payment_capture_failure(
     error_msg: &str,
     cost: Option<scp_protocol::economy::types::Amount>,
 ) {
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-    let payload_json = serde_json::json!({
-        "action": action,
-        "error": error_msg,
-        "cost": cost.map(scp_protocol::economy::types::Amount::value),
-    });
-    let payload = scp_event_log::EventPayload {
-        data: serde_json::to_vec(&payload_json).unwrap_or_default(),
-    };
-    if let Err(log_err) = deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::PaymentCaptureFailed,
-        actor_did.as_ref(),
-        payload,
-    ) {
-        tracing::warn!(
-            context_id,
-            "failed to append PaymentCaptureFailed to event log: {log_err}"
-        );
-    }
-    state.checkpoint_events_since += 1;
     let event = ContextEvent::PaymentCaptureFailed {
         action: action.to_owned(),
         actor_did: actor_did.clone(),

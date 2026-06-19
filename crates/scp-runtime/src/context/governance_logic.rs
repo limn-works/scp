@@ -190,14 +190,26 @@ pub struct EnforceConsequencesCtx<'a> {
 /// used for evaluation. When called from `dispatch_consequences`, the
 /// already-cloned rules are passed to avoid a second clone.
 ///
-/// **Durability invariant (H4, PR #1606):** Every consequence event is
-/// appended to the durable Merkle event log via `event_log` BEFORE the
-/// matching `ctx.receive_buffer.push(...)` call. The order matters: a crash
-/// between the append and the buffer push leaves the Merkle-anchored record
-/// intact (the buffer is in-memory and capped at 1000, so its loss is not a
-/// non-repudiation gap; the durable log is the system of record). The
-/// receive buffer pushes remain because they are still useful for
-/// in-session SDK observation.
+/// **Durability invariant (H4; durability gated per ADR-051 §6 / phase-2.md
+/// ADR-011 amendment "Consequence emission"):** a consequence leaf is a durable
+/// Merkle entry **iff its trigger is convergent** — `WarningCount` / `Custom`
+/// (governance counts), tested via
+/// [`is_convergent_trigger`](scp_protocol::trust::consequence::is_convergent_trigger).
+/// `MessageVelocity` / `ToolRateExceeded` are non-convergent (a rate needs a
+/// clock the protocol neither has nor needs); their consequences are
+/// **buffer-only** — local enforcement still runs and the `ContextEvent` is
+/// still emitted, but **no durable leaf** is minted, because a per-receiver,
+/// velocity-derived leaf would diverge across honest members and break §9.9.3.
+/// When a leaf IS durable, it is appended via `event_log` BEFORE the matching
+/// `ctx.receive_buffer.push(...)` call: a crash between the append and the
+/// buffer push leaves the Merkle-anchored record intact (the buffer is
+/// in-memory and capped at 1000, so its loss is not a non-repudiation gap; the
+/// durable log is the system of record). The receive buffer pushes are always
+/// performed — they are useful for in-session SDK observation and, for
+/// non-durable consequences, are the sole surfacing. The
+/// `checkpoint_events_since` counter is incremented only when a durable leaf is
+/// actually appended, so it matches the true durable-leaf count (a §9.9.3
+/// checkpoint-position drift otherwise).
 pub fn enforce_triggered_consequences(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
@@ -240,13 +252,26 @@ fn process_one_triggered_consequence(
     }
 
     let action_type = consequence_action_type(&consequence.action);
-    let trigger_kind = args
-        .rules
-        .get(consequence.rule_index)
-        .map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
+    let rule = args.rules.get(consequence.rule_index);
+    let trigger_kind =
+        rule.map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
 
-    // Always emit `ConsequenceTriggered` (durable + buffer) regardless
-    // of whether the member is still present.
+    // Durability gate (ADR-051 §6 / phase-2.md ADR-011 amendment "Consequence
+    // emission"): a consequence leaf is a durable Merkle entry ONLY when its
+    // trigger input is convergent — `WarningCount` / `Custom` (governance
+    // counts), keyed on the enum via `is_convergent_trigger`, never on a string.
+    // `MessageVelocity` / `ToolRateExceeded` are non-convergent (a rate needs a
+    // clock the protocol has none of), so their consequences are buffer-only
+    // `ContextEvent`s — local enforcement still runs, but no durable leaf is
+    // minted (a leaf would diverge across honest members and break §9.9.3). A
+    // missing or unresolvable rule is treated as non-durable (fail-safe).
+    let durable = rule.is_some_and(|r| {
+        scp_protocol::trust::consequence::is_convergent_trigger(&r.trigger)
+    });
+
+    // Always emit `ConsequenceTriggered` into the receive buffer + event_tx
+    // (regardless of member presence). The durable Merkle leaf is gated on
+    // `durable`; the buffer push and `event_tx` notification are unconditional.
     emit_consequence_triggered(
         state,
         args,
@@ -254,6 +279,7 @@ fn process_one_triggered_consequence(
         consequence,
         &trigger_kind,
         action_type,
+        durable,
     );
 
     if !member_present {
@@ -270,6 +296,7 @@ fn process_one_triggered_consequence(
             consequence,
             &trigger_kind,
             action_type,
+            durable,
         );
         return;
     }
@@ -290,6 +317,7 @@ fn process_one_triggered_consequence(
             consequence,
             &trigger_kind,
             action_type,
+            durable,
         );
         return; // skip cooldown recording — failed action doesn't count
     }
@@ -309,6 +337,7 @@ fn process_one_triggered_consequence(
         consequence,
         &trigger_kind,
         action_type,
+        durable,
     );
 }
 
@@ -322,8 +351,12 @@ const fn consequence_action_type(
     }
 }
 
-/// Emits a `ConsequenceTriggered` durable event log entry followed by
-/// the matching receive-buffer push (H4 ordering invariant).
+/// Emits a `ConsequenceTriggered` event. When `durable`, appends the durable
+/// Merkle leaf (and bumps `checkpoint_events_since`) BEFORE the matching
+/// receive-buffer push (H4 ordering invariant); when `!durable` (a
+/// velocity/rate-triggered, non-convergent consequence — ADR-051 §6), the
+/// durable leaf and counter bump are suppressed and only the `ContextEvent` is
+/// surfaced.
 fn emit_consequence_triggered(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
@@ -331,22 +364,25 @@ fn emit_consequence_triggered(
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
+    durable: bool,
 ) {
-    let payload = consequence_event_payload(
-        args.member_did,
-        consequence.rule_index,
-        trigger_kind,
-        action_type,
-    );
-    append_consequence_event(
-        args.event_log,
-        args.context_id,
-        context_id_bytes,
-        scp_event_log::EventType::ConsequenceTriggered,
-        args.member_did,
-        &payload,
-    );
-    *state.checkpoint_events_since += 1;
+    if durable {
+        let payload = consequence_event_payload(
+            args.member_did,
+            consequence.rule_index,
+            trigger_kind,
+            action_type,
+        );
+        append_consequence_event(
+            args.event_log,
+            args.context_id,
+            context_id_bytes,
+            scp_event_log::EventType::ConsequenceTriggered,
+            args.member_did,
+            &payload,
+        );
+        *state.checkpoint_events_since += 1;
+    }
     let event = ContextEvent::ConsequenceTriggered {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
@@ -369,22 +405,25 @@ fn emit_absent_member_enforcement_failed(
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
+    durable: bool,
 ) {
-    let payload = consequence_event_payload(
-        args.member_did,
-        consequence.rule_index,
-        trigger_kind,
-        action_type,
-    );
-    append_consequence_event(
-        args.event_log,
-        args.context_id,
-        context_id_bytes,
-        scp_event_log::EventType::ConsequenceEnforcementFailed,
-        args.member_did,
-        &payload,
-    );
-    *state.checkpoint_events_since += 1;
+    if durable {
+        let payload = consequence_event_payload(
+            args.member_did,
+            consequence.rule_index,
+            trigger_kind,
+            action_type,
+        );
+        append_consequence_event(
+            args.event_log,
+            args.context_id,
+            context_id_bytes,
+            scp_event_log::EventType::ConsequenceEnforcementFailed,
+            args.member_did,
+            &payload,
+        );
+        *state.checkpoint_events_since += 1;
+    }
     let event = ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
@@ -403,22 +442,25 @@ fn emit_consequence_enforced_success(
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
+    durable: bool,
 ) {
-    let payload = consequence_event_payload(
-        args.member_did,
-        consequence.rule_index,
-        trigger_kind,
-        action_type,
-    );
-    append_consequence_event(
-        args.event_log,
-        args.context_id,
-        context_id_bytes,
-        scp_event_log::EventType::ConsequenceEnforced,
-        args.member_did,
-        &payload,
-    );
-    *state.checkpoint_events_since += 1;
+    if durable {
+        let payload = consequence_event_payload(
+            args.member_did,
+            consequence.rule_index,
+            trigger_kind,
+            action_type,
+        );
+        append_consequence_event(
+            args.event_log,
+            args.context_id,
+            context_id_bytes,
+            scp_event_log::EventType::ConsequenceEnforced,
+            args.member_did,
+            &payload,
+        );
+        *state.checkpoint_events_since += 1;
+    }
     let event = ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
@@ -524,6 +566,7 @@ fn emit_failure_escalation(
     consequence: &TriggeredConsequence,
     trigger_kind: &str,
     action_type: &str,
+    durable: bool,
 ) {
     let context_id = args.context_id;
     let member_did = args.member_did;
@@ -534,42 +577,48 @@ fn emit_failure_escalation(
         "consequence enforcement failed — escalating to SuspendAll"
     );
 
-    // H10: escalate to SuspendAll when enforcement fails.
-    // Skip cooldown on failure so the escalation fires immediately.
+    // H10: escalate to SuspendAll when enforcement fails. The local enforcement
+    // (and its cooldown skip so the escalation fires immediately) is unconditional
+    // — independent of whether the trigger is convergent.
     state.role_state.suspend_all(member_did.as_ref());
 
-    // First the failure record, then the escalation record. Both go to
-    // the durable log before the receive buffer push.
-    let failed_payload = consequence_event_payload(
-        member_did,
-        consequence.rule_index,
-        trigger_kind,
-        action_type,
-    );
-    append_consequence_event(
-        args.event_log,
-        context_id,
-        context_id_bytes,
-        scp_event_log::EventType::ConsequenceEnforcementFailed,
-        member_did,
-        &failed_payload,
-    );
-    *state.checkpoint_events_since += 1;
-    let escalation_payload = consequence_event_payload(
-        member_did,
-        consequence.rule_index,
-        trigger_kind,
-        "SuspendAll",
-    );
-    append_consequence_event(
-        args.event_log,
-        context_id,
-        context_id_bytes,
-        scp_event_log::EventType::ConsequenceEscalatedToSuspendAll,
-        member_did,
-        &escalation_payload,
-    );
-    *state.checkpoint_events_since += 1;
+    // The two audit records (failure then escalation) are durable Merkle leaves
+    // only for convergent triggers (ADR-051 §6); for a velocity/rate trigger
+    // they are suppressed (the `ContextEvent` below still surfaces the outcome).
+    if durable {
+        // First the failure record, then the escalation record. Both go to
+        // the durable log before the receive buffer push.
+        let failed_payload = consequence_event_payload(
+            member_did,
+            consequence.rule_index,
+            trigger_kind,
+            action_type,
+        );
+        append_consequence_event(
+            args.event_log,
+            context_id,
+            context_id_bytes,
+            scp_event_log::EventType::ConsequenceEnforcementFailed,
+            member_did,
+            &failed_payload,
+        );
+        *state.checkpoint_events_since += 1;
+        let escalation_payload = consequence_event_payload(
+            member_did,
+            consequence.rule_index,
+            trigger_kind,
+            "SuspendAll",
+        );
+        append_consequence_event(
+            args.event_log,
+            context_id,
+            context_id_bytes,
+            scp_event_log::EventType::ConsequenceEscalatedToSuspendAll,
+            member_did,
+            &escalation_payload,
+        );
+        *state.checkpoint_events_since += 1;
+    }
     let event = ContextEvent::ConsequenceEnforced {
         context_id: context_id.to_owned(),
         member_did: member_did.clone(),
@@ -664,6 +713,15 @@ pub fn event_log_entries_for_consequences(
             // consequence enforcement, enabling rules like "if member has
             // been auto-suspended N times, demote".
             let event_type = match entry.event_type {
+                // DORMANT: per ADR-051 §6 / the phase-2.md ADR-011 amendment
+                // exclusion taxonomy §2, `MessageSent` / `ToolInvoked` are
+                // per-author, non-convergent events no longer appended to the
+                // durable log — Source 1 will not yield them in the interim.
+                // Velocity / tool-rate evaluation continues to read them from
+                // the receive buffer (Source 2, below), which is correct and
+                // intended (local, per-receiver flow control needs no
+                // convergence). These arms re-activate when ADR-051 §2's causal
+                // DAG re-enters application events into the canonical log.
                 EventType::MessageSent => EventType::MessageSent,
                 EventType::MemberJoined => EventType::MemberJoined,
                 EventType::MemberLeft => EventType::MemberLeft,
@@ -790,4 +848,168 @@ pub fn event_log_entries_for_consequences(
         });
     }
     events
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod convergence_tests {
+    //! Durability-discriminator proof for the consequence-leaf convergence gate
+    //! (ADR-051 §6 / phase-2.md ADR-011 amendment "Consequence emission"):
+    //! a velocity/rate-triggered consequence (`MessageVelocity`) emits a
+    //! `ContextEvent` but mints NO durable Merkle leaf (root unchanged), while a
+    //! governance-count-triggered consequence (`WarningCount`) DOES mint durable
+    //! leaves (root changes). Keyed on the enum via `is_convergent_trigger`,
+    //! never on a string.
+
+    use super::{
+        ConsequenceStateSplit, EnforceConsequencesCtx, enforce_triggered_consequences,
+    };
+    use crate::context::actor::state::PerContextState;
+    use crate::context::builder::ContextEventLogProvider;
+    use crate::context::providers::MerkleEventLogProvider;
+    use scp_identity::DID;
+    use scp_primitives::SystemClock;
+    use scp_protocol::context::membership::ContextEvent;
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        TriggeredConsequence,
+    };
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+
+    const ADMIN: &str = "did:dht:z6MkAdminConverge";
+    const SUBJECT: &str = "did:dht:z6MkSubjectConverge";
+    const CTX_BYTES: [u8; 32] = [0x7au8; 32];
+
+    /// Builds a rule with the given trigger and a `SuspendAccess` action
+    /// (`SuspendAccess` always succeeds via `role_state.suspend_all`, so the
+    /// success path — `emit_consequence_enforced_success` — is exercised; both
+    /// it and the prior `emit_consequence_triggered` are durability-gated).
+    fn rule(trigger: ConsequenceTrigger) -> ConsequenceRule {
+        ConsequenceRule {
+            trigger,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: Duration::from_secs(3600),
+        }
+    }
+
+    /// Drives one already-triggered consequence through the enforcement chain
+    /// against a fresh `PerContextState` + a `scp_event_log`-backed provider,
+    /// returning `(merkle_root_delta_nonzero, consequence_triggered_event_seen)`.
+    fn run_one(trigger: ConsequenceTrigger) -> (bool, bool) {
+        let mut state =
+            PerContextState::new_for_test_encrypted(CTX_BYTES, 1_700_000_000, DID(ADMIN.to_owned()));
+        // The subject must be a member for enforcement to run; a non-member
+        // would only emit `ConsequenceTriggered` and bail.
+        state
+            .membership
+            .add_member(DID(SUBJECT.to_owned()), "member".to_owned(), Vec::new());
+
+        // The enforcement chain keys event-log storage by
+        // `context_id_bytes(context_id_str)` (a SHA-256 of the hex string, NOT
+        // the raw 32-byte id), so the test provider must init/query that exact
+        // derived key — otherwise the durable append targets a different,
+        // uninitialised context and is silently dropped.
+        let context_id_str = hex::encode(CTX_BYTES);
+        let storage_key = scp_protocol::context::context_id_bytes(&context_id_str);
+
+        let event_log = MerkleEventLogProvider::new();
+        event_log.init_event_log(&storage_key).expect("init log");
+        let root_before = event_log
+            .event_log_merkle_root(&storage_key)
+            .expect("root before");
+
+        let (tx, mut rx) = broadcast::channel(16);
+        let clock = SystemClock;
+        let rules = vec![rule(trigger)];
+        let triggered = vec![TriggeredConsequence {
+            rule_index: 0,
+            action: rules[0].action.clone(),
+            evidence: Vec::new(),
+        }];
+
+        {
+            let mut split = ConsequenceStateSplit::from_state(&mut state);
+            enforce_triggered_consequences(
+                &mut split,
+                &EnforceConsequencesCtx {
+                    context_id: &context_id_str,
+                    member_did: &DID(SUBJECT.to_owned()),
+                    now: 1_700_000_100,
+                    triggered: &triggered,
+                    rules: &rules,
+                    clock: &clock,
+                    event_log: &event_log,
+                    event_tx: Some(&tx),
+                },
+            );
+        }
+
+        let root_after = event_log
+            .event_log_merkle_root(&storage_key)
+            .expect("root after");
+
+        // A `ConsequenceTriggered` ContextEvent must always be surfaced,
+        // regardless of durability.
+        let mut saw_triggered = false;
+        while let Ok((_ctx, event)) = rx.try_recv() {
+            if matches!(event, ContextEvent::ConsequenceTriggered { .. }) {
+                saw_triggered = true;
+            }
+        }
+
+        (root_before != root_after, saw_triggered)
+    }
+
+    #[test]
+    fn velocity_triggered_consequence_adds_no_durable_leaf() {
+        let (root_changed, saw_triggered) = run_one(ConsequenceTrigger::MessageVelocity);
+        assert!(
+            !root_changed,
+            "a MessageVelocity-triggered consequence is non-convergent (ADR-051 §6) \
+             and MUST NOT mint a durable Merkle leaf — the root must be unchanged"
+        );
+        assert!(
+            saw_triggered,
+            "a non-durable consequence MUST still surface a ConsequenceTriggered \
+             ContextEvent (local enforcement is unchanged)"
+        );
+    }
+
+    #[test]
+    fn warning_count_triggered_consequence_adds_durable_leaf() {
+        let (root_changed, saw_triggered) = run_one(ConsequenceTrigger::WarningCount);
+        assert!(
+            root_changed,
+            "a WarningCount-triggered consequence is convergent (ADR-051 §6) and \
+             MUST mint durable Merkle leaves — the root must change"
+        );
+        assert!(
+            saw_triggered,
+            "a durable consequence also surfaces its ConsequenceTriggered ContextEvent"
+        );
+    }
+
+    #[test]
+    fn tool_rate_triggered_consequence_adds_no_durable_leaf() {
+        // The second non-convergent trigger — same posture as MessageVelocity.
+        let (root_changed, _) = run_one(ConsequenceTrigger::ToolRateExceeded);
+        assert!(
+            !root_changed,
+            "a ToolRateExceeded-triggered consequence is non-convergent (ADR-051 §6) \
+             and MUST NOT mint a durable Merkle leaf"
+        );
+    }
+
+    #[test]
+    fn custom_triggered_consequence_adds_durable_leaf() {
+        // The second convergent trigger — same posture as WarningCount.
+        let (root_changed, _) = run_one(ConsequenceTrigger::Custom("abuse".to_owned()));
+        assert!(
+            root_changed,
+            "a Custom-triggered consequence is convergent (ADR-051 §6) and MUST \
+             mint durable Merkle leaves"
+        );
+    }
 }

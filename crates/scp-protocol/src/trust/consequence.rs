@@ -103,6 +103,37 @@ pub enum ConsequenceTrigger {
     Custom(String),
 }
 
+/// Whether a consequence triggered by this condition may be recorded as a
+/// **durable Merkle leaf** in the canonical event log.
+///
+/// This is the single source of truth for the consequence-durability gate
+/// (keyed on the enum, never on a string). Per ADR-051 §6 and the phase-2.md
+/// ADR-011 amendment ("Consequence emission"), a derived record is automatic
+/// *and* convergent iff its trigger **input** is convergent:
+///
+/// - **Convergent triggers** — `WarningCount` (governance-action counts) and
+///   `Custom` (matched against convergent governance-action events). These
+///   auto-derive identically on every honest member from the convergent log, so
+///   their consequence leaf converges and is durable.
+/// - **Non-convergent triggers** — `MessageVelocity` and `ToolRateExceeded`. A
+///   *rate* (count ÷ time) needs a convergent clock, which the protocol neither
+///   has (no operator / transport-independent / offline) nor needs. Rate-limiting
+///   is local flow control (§23.16.8), not a recorded consequence; a durable
+///   suspension rides governance (ADR-031), where the commit *is* both the
+///   execution and the record. Velocity-triggered consequences therefore add no
+///   durable leaf — they remain buffer-only `ContextEvent`s while still driving
+///   local enforcement.
+///
+/// A consequence whose rule is missing or whose trigger cannot be resolved is
+/// treated as **non-durable** (fail-safe: never mint an unconvergent leaf).
+#[must_use]
+pub const fn is_convergent_trigger(trigger: &ConsequenceTrigger) -> bool {
+    match trigger {
+        ConsequenceTrigger::WarningCount | ConsequenceTrigger::Custom(_) => true,
+        ConsequenceTrigger::MessageVelocity | ConsequenceTrigger::ToolRateExceeded => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EnforcementSeverity
 // ---------------------------------------------------------------------------

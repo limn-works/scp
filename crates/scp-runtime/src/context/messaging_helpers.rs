@@ -1597,7 +1597,8 @@ pub async fn capture_send_payment(
             context_id,
             "payment capture failed after successful send: {e}"
         );
-        // H19: append durable audit record.
+        // H19: surface the capture failure as a local `ContextEvent` (no durable
+        // Merkle leaf — per-payee, non-convergent; ADR-051 §6 / phase-2.md §2).
         record_payment_capture_failure(
             state,
             deps,
@@ -1610,9 +1611,18 @@ pub async fn capture_send_payment(
     }
 }
 
-/// Append a `PaymentCaptureFailed` durable event log entry plus the
-/// matching receive-buffer push. Actor-shape inline replacement for
+/// Surface a `PaymentCaptureFailed` as a local `ContextEvent` (receive-buffer
+/// push + `event_tx` notification). Actor-shape inline replacement for
 /// `manager_methods::record_payment_capture_failure`.
+///
+/// Per ADR-051 §6 / the phase-2.md ADR-011 amendment exclusion taxonomy §2, the
+/// payment receipts (`PaymentReceived` / `PaymentCaptureFailed`) are per-payee,
+/// non-convergent events appended by their payee alone — they are excluded from
+/// the canonical Merkle log so two honest members derive the same
+/// `event_log_merkle_root` (§9.9.3). The former durable
+/// `EventType::PaymentCaptureFailed` append (and its `checkpoint_events_since`
+/// increment) is removed; the `ContextEvent::PaymentCaptureFailed` emission
+/// below is the sole surfacing of a capture failure.
 #[allow(clippy::too_many_arguments)]
 fn record_payment_capture_failure(
     state: &mut PerContextState,
@@ -1623,27 +1633,6 @@ fn record_payment_capture_failure(
     error_msg: &str,
     cost: Option<scp_protocol::economy::types::Amount>,
 ) {
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-    let payload_json = serde_json::json!({
-        "action": action,
-        "error": error_msg,
-        "cost": cost.map(scp_protocol::economy::types::Amount::value),
-    });
-    let payload = scp_event_log::EventPayload {
-        data: serde_json::to_vec(&payload_json).unwrap_or_default(),
-    };
-    if let Err(log_err) = deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::PaymentCaptureFailed,
-        actor_did.as_ref(),
-        payload,
-    ) {
-        tracing::warn!(
-            context_id,
-            "failed to append PaymentCaptureFailed to event log: {log_err}"
-        );
-    }
-    state.checkpoint_events_since += 1;
     let event = ContextEvent::PaymentCaptureFailed {
         action: action.to_owned(),
         actor_did: actor_did.clone(),
@@ -1661,31 +1650,6 @@ fn record_payment_capture_failure(
 // ---------------------------------------------------------------------------
 // 12. finalize_send
 // ---------------------------------------------------------------------------
-
-/// Appends the `MessageSent` event log entry and, on a log-append failure,
-/// rolls the reserved per-sender sequence back (gated `!is_broadcast`) before
-/// surfacing the error. This is the FIRST of [`finalize_send`]'s rollback
-/// sites; it shares the single sequence-rollback ownership invariant documented
-/// on [`finalize_send`] (the caller must not double-revert).
-fn append_message_sent_or_rollback_sequence(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    context_id_bytes: &[u8; 32],
-    sender_did: &DID,
-    is_broadcast: bool,
-) -> Result<(), ContextError> {
-    if let Err(e) = deps.event_log.append_context_event(
-        context_id_bytes,
-        scp_event_log::EventType::MessageSent,
-        sender_did.as_ref(),
-    ) {
-        if !is_broadcast {
-            state.membership.rollback_sequence_number(sender_did);
-        }
-        return Err(e);
-    }
-    Ok(())
-}
 
 /// Computes and caches the sender's participation record after a send.
 /// Factored out of [`finalize_send`] to keep that function within the line
@@ -1742,9 +1706,13 @@ fn record_send_participation(
 /// # Sequence-rollback ownership (ADR-049 §9, round-9 leak fix)
 ///
 /// `finalize_send` OWNS the per-sender sequence rollback on ALL of its error
-/// exits — the FIRST `append_context_event` (delegated to
-/// [`append_message_sent_or_rollback_sequence`]), the TTL early-return below,
-/// and the final persist failure (in [`persist_finalized_send`]). The
+/// exits — the TTL early-return below and the final persist failure (in
+/// [`persist_finalized_send`]). (The former FIRST `MessageSent` durable-append
+/// rollback site is gone: per ADR-051 §6 / the phase-2.md ADR-011 amendment
+/// exclusion taxonomy §2, `MessageSent` is a per-author, non-convergent event
+/// excluded from the canonical Merkle log — there is no durable append to fail,
+/// so the local `ContextEvent::MessageSent` emission below is now the sole
+/// surfacing of a send.) The
 /// `send_message` caller deliberately does NOT roll the sequence back when
 /// `finalize_send` returns `Err`: doing so would double-revert, a `+1`
 /// reservation undone by a `−2` via `saturating_sub`, leaving a per-sender gap
@@ -1768,15 +1736,12 @@ pub fn finalize_send(
     spending_nonce_committed: bool,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
-    // M12: append event log BEFORE consequence evaluation; on failure roll the
-    // reserved sequence back (round-9 leak fix — see the helper doc).
-    append_message_sent_or_rollback_sequence(
-        state,
-        deps,
-        context_id_bytes,
-        sender_did,
-        is_broadcast,
-    )?;
+    // M12: `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 /
+    // the phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,
+    // non-convergent event surfaced only as the local `ContextEvent::MessageSent`
+    // emitted below. The former pre-consequence durable append (and its
+    // sequence-rollback-on-append-failure) is removed so two honest members
+    // derive the same `event_log_merkle_root` (§9.9.3).
 
     // Phase 3 reacquire-and-mutate is unnecessary in the actor model;
     // the actor owns state for the duration of the command. We DO
@@ -3168,10 +3133,11 @@ mod pseudonym_routing_tests {
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     /// Event-log provider that flags which `EventType`s were appended so the
-    /// test can prove (a) consequence evaluation/enforcement DID append a
-    /// `ConsequenceTriggered` event and (b) the application message itself
-    /// appended NO `MessageSent` Merkle leaf for a `None` event type. Uses
-    /// atomics only (no `Mutex`) per ADR-049's runtime-state model.
+    /// test can prove (a) a non-convergent (velocity-triggered) consequence
+    /// appends NO durable `ConsequenceTriggered` Merkle leaf (ADR-051 §6) and
+    /// (b) the application message itself appends NO `MessageSent` Merkle leaf
+    /// for a `None` event type (§9.9.3). Uses atomics only (no `Mutex`) per
+    /// ADR-049's runtime-state model.
     #[derive(Default)]
     struct RecordingEventLog {
         saw_consequence_triggered: AtomicBool,
@@ -3270,32 +3236,52 @@ mod pseudonym_routing_tests {
             "buffered application message must record sender velocity (was skipped by the gated bug)"
         );
 
-        // (b) Consequence evaluation + enforcement ran: a `ConsequenceTriggered`
-        // event was appended to the durable log. The `None` event type means the
-        // application message itself appended NO message leaf (§9.9.3 — there is
-        // no `MessageReceived` variant in the closed event taxonomy precisely
-        // because received app messages are never durably logged); the only
-        // appends come from consequence enforcement.
+        // (b) Consequence evaluation + enforcement ran, but a MessageVelocity
+        // trigger is NON-CONVERGENT (ADR-051 §6 / phase-2.md ADR-011 amendment):
+        // it must NOT mint a durable `ConsequenceTriggered` Merkle leaf (a
+        // per-receiver, velocity-derived leaf cannot converge across honest
+        // members — §9.9.3), and the application message itself appends no
+        // `MessageSent` leaf. That governance DID run is proven by the recorded
+        // velocity (a) above and the buffered `ContextEvent::ConsequenceTriggered`
+        // surfaced below — local enforcement is unchanged; only the durable leaf
+        // is suppressed.
         assert!(
-            event_log
+            !event_log
                 .saw_consequence_triggered
                 .load(AtomicOrdering::SeqCst),
-            "buffered application message must run consequence evaluation/enforcement \
-             (gated bug skipped it)"
+            "a MessageVelocity-triggered consequence is non-convergent and MUST NOT \
+             append a durable ConsequenceTriggered Merkle leaf (ADR-051 §6)"
         );
         assert!(
             !event_log.saw_message_sent.load(AtomicOrdering::SeqCst),
             "a received application message must NOT append a MessageSent Merkle leaf (§9.9.3)"
         );
+        // The non-durable consequence is still surfaced as a local `ContextEvent`
+        // in the receive buffer (the sole surfacing for velocity triggers).
+        let saw_triggered_ctx_event = state
+            .receive_buffer
+            .event_log_entries()
+            .iter()
+            .any(|e| matches!(
+                e,
+                scp_protocol::context::membership::ContextEvent::ConsequenceTriggered { .. }
+            ));
+        assert!(
+            saw_triggered_ctx_event,
+            "the non-durable velocity consequence must still emit a \
+             ContextEvent::ConsequenceTriggered into the receive buffer"
+        );
 
         // (c) The checkpoint counter advanced for the delivered application
-        // message. `run_buffered_post_delivery` increments it once for the
-        // message itself; consequence enforcement increments it again per
-        // emitted `Consequence*` event, so the total is strictly greater than
-        // the pre-delivery value. The gated bug left it UNCHANGED.
+        // message: `run_buffered_post_delivery` increments it once unconditionally
+        // for the buffered delivery itself. The velocity consequence adds NO
+        // durable leaf and so does NOT additionally advance it (the counter now
+        // tracks the true durable-leaf count). The pre-change gated bug left it
+        // UNCHANGED entirely.
         assert!(
             state.checkpoint_events_since > checkpoint_before,
-            "buffered application message must advance checkpoint_events_since (was skipped by the gated bug): \
+            "buffered application message must advance checkpoint_events_since once \
+             for the delivery (was skipped by the gated bug): \
              before={checkpoint_before}, after={}",
             state.checkpoint_events_since
         );
@@ -3318,11 +3304,13 @@ mod pseudonym_routing_tests {
     // that times out, forcing the call site to run
     // `deliver_plaintext_or_announcement` (→ `None`) followed by
     // `run_buffered_post_delivery`. It asserts the governance side effects fire
-    // (velocity recorded + `ConsequenceTriggered` appended + checkpoint
-    // advanced) WITHOUT a `MessageSent` Merkle leaf. Re-adding an `if let Some`
-    // gate around the call site makes this test FAIL (governance is skipped for
-    // the `None`-typed application message), which the helper-contract test
-    // would not catch.
+    // (velocity recorded + a buffered `ContextEvent::ConsequenceTriggered` +
+    // the delivery checkpoint increment) WITHOUT any durable leaf — neither a
+    // `MessageSent` leaf nor (for the non-convergent velocity trigger) a durable
+    // `ConsequenceTriggered` leaf (ADR-051 §6). Re-adding an `if let Some` gate
+    // around the call site makes this test FAIL (governance is skipped for the
+    // `None`-typed application message), which the helper-contract test would not
+    // catch.
     // -----------------------------------------------------------------------
 
     /// Event-log provider that records appended `EventType`s through shared
@@ -3529,24 +3517,47 @@ mod pseudonym_routing_tests {
             "buffered-drain call site must record sender velocity (a re-added `if let Some` gate skips it)"
         );
 
-        // (b) Consequence evaluation/enforcement ran (a `ConsequenceTriggered`
-        // event was appended) and the application message itself appended NO
-        // `MessageSent` Merkle leaf (§9.9.3 — received app messages are never
-        // durably logged).
+        // (b) Consequence evaluation/enforcement ran, but a MessageVelocity
+        // trigger is NON-CONVERGENT (ADR-051 §6 / phase-2.md ADR-011 amendment):
+        // it must NOT append a durable `ConsequenceTriggered` Merkle leaf, and the
+        // application message itself appends no `MessageSent` leaf (§9.9.3). That
+        // governance DID run is proven by the recorded velocity (a) above and the
+        // buffered `ContextEvent::ConsequenceTriggered` (below) — a re-added
+        // `if let Some` gate around the call site would skip BOTH.
         assert!(
-            saw_consequence_triggered.load(AtomicOrdering::SeqCst),
-            "buffered-drain call site must run consequence evaluation/enforcement (a re-added `if let Some` gate skips it)"
+            !saw_consequence_triggered.load(AtomicOrdering::SeqCst),
+            "a MessageVelocity-triggered consequence is non-convergent and MUST NOT \
+             append a durable ConsequenceTriggered Merkle leaf (ADR-051 §6)"
         );
         assert!(
             !saw_message_sent.load(AtomicOrdering::SeqCst),
             "a received application message must NOT append a MessageSent Merkle leaf (§9.9.3)"
         );
+        // Governance still surfaced the consequence as a local `ContextEvent`,
+        // proving the buffered-drain call site DID run enforcement (a re-added
+        // `if let Some` gate would leave the buffer without it).
+        let saw_triggered_ctx_event = state
+            .receive_buffer
+            .event_log_entries()
+            .iter()
+            .any(|e| matches!(
+                e,
+                scp_protocol::context::membership::ContextEvent::ConsequenceTriggered { .. }
+            ));
+        assert!(
+            saw_triggered_ctx_event,
+            "the buffered-drain call site must surface a ContextEvent::ConsequenceTriggered \
+             for the velocity consequence (a re-added `if let Some` gate skips governance)"
+        );
 
         // (c) The checkpoint counter advanced for the drained application
-        // message. The gated bug left it unchanged.
+        // message: the buffered-delivery path increments it once unconditionally.
+        // The non-durable velocity consequence adds no leaf and so does not
+        // additionally advance it. The gated bug left it unchanged entirely.
         assert!(
             state.checkpoint_events_since > checkpoint_before,
-            "buffered-drain call site must advance checkpoint_events_since (a re-added `if let Some` gate skips it): \
+            "buffered-drain call site must advance checkpoint_events_since once for the \
+             delivery (a re-added `if let Some` gate skips it): \
              before={checkpoint_before}, after={}",
             state.checkpoint_events_since
         );
