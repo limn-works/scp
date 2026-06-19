@@ -55,7 +55,7 @@ use crate::context::actor::commands::{
     PreparedAFields, PreparedBFields, SagaPhaseMessage, SigningKeyBytes,
 };
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::outcome::Outcome;
+use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
 use crate::context::actor::state::PerContextState;
 use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
 use crate::context::messaging_helpers::persist_state_fail_closed;
@@ -65,37 +65,15 @@ use crate::context::supervisor::saga_prepared_state::{
 };
 use crate::context::tools_helpers::reserve_tool_economy;
 
-/// Lightweight [`Outcome`]-error projection of a real [`ContextError`].
-///
-/// The actor only inspects `Outcome::mutated` for dirty-tracking; the canonical
-/// error goes to the caller's oneshot. This mirrors the per-handler
-/// `outcome_error_sketch` shape across the actor handler modules (the error
-/// type is intentionally not `Clone`, so the real error is moved into the reply
-/// and a faithful sketch is returned to the actor).
-fn outcome_error_sketch(err: &ContextError) -> ContextError {
-    match err {
-        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
-        ContextError::PersistenceFailed(msg) => ContextError::PersistenceFailed(msg.clone()),
-        ContextError::RateLimited { resource, message } => ContextError::RateLimited {
-            resource: resource.clone(),
-            message: message.clone(),
-        },
-        ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
-        other => ContextError::CryptoFailed(format!("{other}")),
-    }
-}
-
 /// Lowercase-hex encode a raw 32-byte context-id digest (the wire / role-state
 /// id-form, never the `"standing-"`-prefixed display string — spec §6.2.4
 /// id-form rule).
+///
+/// Delegates to [`hex::encode`] (the same lowercase encoding the supervisor side
+/// of this path uses) so caller / target context ids render byte-identically
+/// across both layers — a divergence here would split a saga's log lines.
 fn hex_context_id(id: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for b in id {
-        use std::fmt::Write as _;
-        // `write!` to a `String` is infallible; the result is discarded.
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    hex::encode(id)
 }
 
 /// Dispatch a [`SagaPhaseMessage`] against actor state.
@@ -1590,6 +1568,56 @@ mod tests {
     const CALLER: &str = "did:dht:z6MkCallerPrincipalXX";
     const OTHER: &str = "did:dht:z6MkOtherPrincipalXXX";
     const TOOL: &str = "calculator-v1";
+
+    /// Documented configuration ceiling for an inbound §6.2.0.2 rate limit
+    /// (`InboundPolicy::max_calls_per_minute`) such that B's per-target nonce
+    /// dedup cache stays bounded by its TTL, not by capacity eviction. Derived
+    /// in [`nonce_dedup_replay_bound_holds`] from the cache capacity, the TTL,
+    /// and the required ≥2× safety margin. A higher inbound ceiling than this
+    /// would let a sustained accept rate land more than `NONCE_DEDUP_CAPACITY`
+    /// distinct nonces within `NONCE_EXPIRY_SECS`, evicting still-fresh nonces
+    /// and eroding the replay bound.
+    const MAX_SAFE_INBOUND_CALLS_PER_MINUTE: u64 = 1_000;
+
+    /// Defense-in-depth: the §6.2.4 per-target nonce dedup cache
+    /// ([`PerContextState::xctx_nonce_dedup`]) must be bounded by its TTL
+    /// (`NONCE_EXPIRY_SECS`), never by capacity eviction, for the replay
+    /// guarantee to hold. The worst-case number of distinct nonces a caller can
+    /// land within the TTL window is the configured inbound accept rate
+    /// (`InboundPolicy::max_calls_per_minute`) scaled to the window. Assert that
+    /// (a) the DEFAULT inbound ceiling holds with a ≥2× margin, and (b) the
+    /// documented configuration ceiling [`MAX_SAFE_INBOUND_CALLS_PER_MINUTE`]
+    /// still holds with a ≥2× margin — so a config-time check (or this
+    /// invariant) catches a future high ceiling before it erodes the bound.
+    #[test]
+    fn nonce_dedup_replay_bound_holds() {
+        use scp_protocol::context::tools::interface::DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE;
+        use scp_protocol::crypto::sender_keys::{NONCE_DEDUP_CAPACITY, NONCE_EXPIRY_SECS};
+
+        // Distinct nonces a caller can land within one TTL window at a given
+        // per-minute accept ceiling.
+        let window_minutes = NONCE_EXPIRY_SECS / 60;
+        assert_eq!(window_minutes, 5, "TTL window is 5 minutes (300s)");
+
+        let capacity = NONCE_DEDUP_CAPACITY as u64;
+
+        let worst_case_default = u64::from(DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE) * window_minutes;
+        assert!(
+            worst_case_default.saturating_mul(2) <= capacity,
+            "default inbound ceiling ({DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE}/min ⇒ \
+             {worst_case_default} nonces over the TTL) must leave a ≥2× margin under the \
+             {capacity}-entry dedup capacity, else eviction (not TTL) bounds replay",
+        );
+
+        let worst_case_ceiling = MAX_SAFE_INBOUND_CALLS_PER_MINUTE * window_minutes;
+        assert!(
+            worst_case_ceiling.saturating_mul(2) <= capacity,
+            "the documented inbound ceiling ({MAX_SAFE_INBOUND_CALLS_PER_MINUTE}/min ⇒ \
+             {worst_case_ceiling} nonces over the TTL) must leave a ≥2× margin under the \
+             {capacity}-entry dedup capacity; raise the cache capacity before raising this \
+             ceiling",
+        );
+    }
 
     // --- test event-log / persistence stubs -------------------------------
 

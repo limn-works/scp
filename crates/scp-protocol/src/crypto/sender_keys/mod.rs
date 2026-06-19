@@ -42,13 +42,13 @@ pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 // build_sender_header, parse_sender_header, and SENDER_HEADER_SIZE are wire-format
 // internals used by crypto providers — access via encrypt:: submodule directly.
 pub use key_protocol_verify::{
-    BlockNotification, BridgeShadowKeyParams, HandleRequestParams, NonceDedup,
-    RotateForBlockParams, RotateForBlockResult, SenderKeyDistributionMessage,
-    SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse, expand_block_list,
-    generate_wrapping_keypair, handle_bridge_shadow_key_request, hpke_open_sender_key,
-    hpke_seal_sender_key, list_shadow_sender_key_dids, validate_block_notification_freshness,
-    validate_sender_key_request_freshness, verify_block_notification, verify_epoch_advance,
-    verify_sender_key_request,
+    BlockNotification, BridgeShadowKeyParams, HandleRequestParams, NONCE_DEDUP_CAPACITY,
+    NONCE_EXPIRY_SECS, NonceDedup, RotateForBlockParams, RotateForBlockResult,
+    SenderKeyDistributionMessage, SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse,
+    expand_block_list, generate_wrapping_keypair, handle_bridge_shadow_key_request,
+    hpke_open_sender_key, hpke_seal_sender_key, list_shadow_sender_key_dids,
+    validate_block_notification_freshness, validate_sender_key_request_freshness,
+    verify_block_notification, verify_epoch_advance, verify_sender_key_request,
 };
 
 // ---------------------------------------------------------------------------

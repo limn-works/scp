@@ -86,6 +86,45 @@ impl<T> Outcome<T> {
     }
 }
 
+/// Best-effort clone-equivalent projection of a [`ContextError`] for a handler's
+/// [`Outcome`] error sink.
+///
+/// [`ContextError`] is intentionally **not** `Clone` (it embeds non-`Clone`
+/// foreign error types), but a mutating handler must surface the *real* error to
+/// the caller's oneshot reply AND mark its [`Outcome`] result `Err` so the actor
+/// records the partial state. The real error is moved into the reply; this
+/// faithful **sketch** — same variant + message where the variant carries one —
+/// is what goes into the `Outcome`. The actor only inspects `Outcome::mutated`,
+/// so the sketch never needs to be more than variant-faithful.
+///
+/// Every variant that any handler distinguishes is preserved here so the single
+/// canonical sketch never silently coarsens an error a caller's
+/// `Outcome`-inspecting code might switch on; any other variant collapses to a
+/// `CryptoFailed` carrying the `Display` text (lossless for logging). Hoisted to
+/// one definition so the saga and tools handlers cannot diverge on which
+/// variants survive (a `ContextError`-not-`Clone` workaround that had drifted
+/// into two divergent copies).
+#[must_use]
+pub fn outcome_error_sketch(err: &ContextError) -> ContextError {
+    match err {
+        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
+        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
+        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
+        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
+        ContextError::PersistenceFailed(msg) => ContextError::PersistenceFailed(msg.clone()),
+        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
+        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
+        ContextError::ContextNotActive => ContextError::ContextNotActive,
+        ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
+        ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
+        ContextError::RateLimited { resource, message } => ContextError::RateLimited {
+            resource: resource.clone(),
+            message: message.clone(),
+        },
+        other => ContextError::CryptoFailed(format!("{other}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

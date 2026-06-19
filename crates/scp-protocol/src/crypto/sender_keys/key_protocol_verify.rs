@@ -74,7 +74,15 @@ pub const GRACE_PERIOD_SECS: u64 = 30;
 pub const REQUEST_NONCE_SIZE: usize = 16;
 
 /// Duration in seconds for which a seen nonce is remembered to prevent replay.
-const NONCE_EXPIRY_SECS: u64 = 300; // 5 minutes
+///
+/// This is the eviction TTL of the [`NonceDedup`] cache: an entry older than
+/// this is pruned. Exported so consumers that gate accepts in front of a
+/// `NonceDedup` (e.g. the cross-context saga's per-target nonce cache) can
+/// statically reason about the window — the maximum number of distinct nonces a
+/// caller can land within `NONCE_EXPIRY_SECS` must stay safely below
+/// [`NONCE_DEDUP_CAPACITY`] or eviction, not TTL expiry, would bound the cache
+/// and erode the replay guarantee.
+pub const NONCE_EXPIRY_SECS: u64 = 300; // 5 minutes
 
 /// Maximum age in milliseconds for a block notification to be considered fresh.
 pub const BLOCK_NOTIFICATION_FRESHNESS_MS: u64 = 30_000; // 30 seconds
@@ -86,8 +94,14 @@ pub const BLOCK_NOTIFICATION_FRESHNESS_MS: u64 = 30_000; // 30 seconds
 /// freshness check, and vice versa.
 pub const REQUEST_FRESHNESS_SECS: u64 = NONCE_EXPIRY_SECS;
 
-/// Maximum number of nonces tracked by [`NonceDedup`] to prevent memory exhaustion.
-const NONCE_DEDUP_CAPACITY: usize = 10_000;
+/// Maximum number of nonces tracked by [`NonceDedup`] to prevent memory
+/// exhaustion. Once full, [`NonceDedup::record`] evicts the oldest entry.
+///
+/// Exported so a consumer that fronts the cache with its own accept gate (e.g.
+/// the §6.2.4 cross-context saga) can assert that its configured inbound accept
+/// rate over [`NONCE_EXPIRY_SECS`] cannot fill the cache — keeping eviction out
+/// of the replay window so the TTL, not the capacity, is what bounds replay.
+pub const NONCE_DEDUP_CAPACITY: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // Wire types

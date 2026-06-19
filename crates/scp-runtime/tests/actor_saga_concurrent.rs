@@ -131,7 +131,7 @@ fn cross_context(caller: [u8; 32], target: [u8; 32]) -> SagaInput {
 /// Assert a saga terminated at a NON-busy terminal. Driving a
 /// `CrossContextToolInvocation` through `start_saga` (no executor / signing
 /// key) aborts at Prepare-A with `InvalidState` (the executor-context misuse
-/// guard, SCP-SAGA-13002) — BEFORE the co-resident lookup — so the FSM never
+/// guard, SCP-SAGA-13051) — BEFORE the co-resident lookup — so the FSM never
 /// reaches `ContextNotRegistered` here; the spec-gapped variants abort with
 /// `NotImplemented`. Any of these is a valid "reservation released" terminal —
 /// the gating property under test is the ABSENCE of `ActorBusy`, not the

@@ -620,6 +620,44 @@ pub struct PendingSagaProjection {
     reserved: (),
 }
 
+/// Flat, named-field request for
+/// [`Supervisor::start_cross_context_tool_invocation_saga`] (spec §6.2.4).
+///
+/// Carries the §6.2.4 invocation envelope field set by **value**. Replaces a
+/// long positional argument list whose adjacent `[u8; 32]` ids
+/// (`caller_context_id` / `target_context_id`) and asserted-provenance scalars
+/// were transposable at a call site — a swap compiled and would silently sign
+/// and record the saga under the wrong context, the confused-deputy footgun the
+/// named fields foreclose. Per the project's Agent-first API tenet: one flat
+/// config object, every field named, no builder, no ordering to track.
+///
+/// The two Active Signing Keys and the supervisor-side tool executor stay
+/// explicit parameters of the entry point — they are not envelope data (the
+/// keys are custody material the actor never holds; the executor is a non-`Send`
+/// closure), so folding them in would mix wire fields with capabilities.
+#[derive(Debug, Clone)]
+pub struct CrossContextToolInvocationRequest {
+    /// Raw 32-byte id of the caller (initiating) context.
+    pub caller_context_id: [u8; 32],
+    /// Raw 32-byte id of the target (executing) context.
+    pub target_context_id: [u8; 32],
+    /// Channel-authenticated DID of the initiator.
+    pub caller_did: DID,
+    /// Registration id of the tool being invoked across the interface.
+    pub tool_registration_id: String,
+    /// Optional id of the spending UCAN proof, resolved target-side at
+    /// Prepare-B. `None` for an ungated tool.
+    pub ucan_proof_id: Option<String>,
+    /// Tool input payload (JSON), schema-checked target-side.
+    pub input: serde_json::Value,
+    /// Caller-asserted inbound provenance chain depth; B re-derives `+1`.
+    pub asserted_chain_depth: u8,
+    /// Caller-asserted 16-byte envelope nonce, checked against B's dedup cache.
+    pub asserted_nonce: [u8; 16],
+    /// Caller-asserted send-time (Unix ms), checked against §9.14 skew.
+    pub asserted_timestamp_ms: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Supervisor
 // ---------------------------------------------------------------------------
@@ -4790,18 +4828,9 @@ impl Supervisor {
     ///   co-resident.
     /// - [`ContextError::InvalidState`] on journal I/O failure or a saga driven
     ///   to `NeedsRepair`.
-    #[allow(clippy::too_many_arguments)] // mirrors the §6.2.4 envelope field set
     pub async fn start_cross_context_tool_invocation_saga<F, Fut>(
         &self,
-        caller_context_id: [u8; 32],
-        target_context_id: [u8; 32],
-        caller_did: DID,
-        tool_registration_id: String,
-        ucan_proof_id: Option<String>,
-        input: serde_json::Value,
-        asserted_chain_depth: u8,
-        asserted_nonce: [u8; 16],
-        asserted_timestamp_ms: u64,
+        request: CrossContextToolInvocationRequest,
         target_signing_key: &ed25519_dalek::SigningKey,
         caller_signing_key: &ed25519_dalek::SigningKey,
         executor: F,
@@ -4810,6 +4839,17 @@ impl Supervisor {
         F: FnOnce(serde_json::Value) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'static,
     {
+        let CrossContextToolInvocationRequest {
+            caller_context_id,
+            target_context_id,
+            caller_did,
+            tool_registration_id,
+            ucan_proof_id,
+            input,
+            asserted_chain_depth,
+            asserted_nonce,
+            asserted_timestamp_ms,
+        } = request;
         // Authorize-before-reserve gate 1 (caller axis, forward obligation): the
         // initiator MUST be a member of the caller context it names. Reject
         // WITHOUT reserving so a non-member cannot reserve (and thereby deny) a
@@ -4817,7 +4857,7 @@ impl Supervisor {
         let caller_hex = hex::encode(caller_context_id);
         if !self.is_member(&caller_hex, caller_did.as_ref()).await {
             return Err(ContextError::PermissionDenied(format!(
-                "SCP-SAGA-13001: cross-context saga initiator '{caller_did}' is not a member \
+                "SCP-SAGA-13050: cross-context saga initiator '{caller_did}' is not a member \
                  of caller context '{caller_hex}' — not authorized to initiate over it"
             )));
         }
@@ -5666,7 +5706,7 @@ impl Supervisor {
                 SagaInput::CrossContextToolInvocation { .. } => {
                     let Some(ctx) = xctx else {
                         return Err(ContextError::InvalidState(format!(
-                            "SCP-SAGA-13002: saga Prepare{phase:?} — CrossContextToolInvocation \
+                            "SCP-SAGA-13051: saga Prepare{phase:?} — CrossContextToolInvocation \
                              requires the supervisor-side executor + signing key; call \
                              start_cross_context_tool_invocation_saga, not start_saga"
                         )));
@@ -5711,7 +5751,7 @@ impl Supervisor {
         let caller_hex = hex::encode(ctx.caller_context_id);
         let actor = self.lookup(&caller_hex).ok_or_else(|| {
             ContextError::ContextNotRegistered(format!(
-                "SCP-SAGA-13003: cross-context saga Prepare-A — caller context '{caller_hex}' \
+                "SCP-SAGA-13052: cross-context saga Prepare-A — caller context '{caller_hex}' \
                  is not a co-resident actor (cross-node child-bridge transport is future work)"
             ))
         })?;
@@ -5747,7 +5787,7 @@ impl Supervisor {
         let target_hex = hex::encode(ctx.target_context_id);
         let actor = self.lookup(&target_hex).ok_or_else(|| {
             ContextError::ContextNotRegistered(format!(
-                "SCP-SAGA-13004: cross-context saga Prepare-B — target context '{target_hex}' \
+                "SCP-SAGA-13053: cross-context saga Prepare-B — target context '{target_hex}' \
                  is not a co-resident actor (cross-node child-bridge transport is future work)"
             ))
         })?;
@@ -5855,7 +5895,7 @@ impl Supervisor {
                 SagaInput::CrossContextToolInvocation { .. } => {
                     let Some(ctx) = xctx else {
                         return Err(ContextError::InvalidState(
-                            "SCP-SAGA-13005: saga Commit — CrossContextToolInvocation requires \
+                            "SCP-SAGA-13054: saga Commit — CrossContextToolInvocation requires \
                              the supervisor-side executor context (start_saga misuse)"
                                 .to_owned(),
                         ));
@@ -5976,7 +6016,7 @@ impl Supervisor {
         let target_hex = hex::encode(ctx.target_context_id);
         let target = self.lookup(&target_hex).ok_or_else(|| {
             ContextError::ContextNotRegistered(format!(
-                "SCP-SAGA-13006: cross-context saga Commit-B — target context '{target_hex}' \
+                "SCP-SAGA-13055: cross-context saga Commit-B — target context '{target_hex}' \
                  is not a co-resident actor"
             ))
         })?;
@@ -6040,7 +6080,7 @@ impl Supervisor {
         } else {
             let executor = ctx.executor.take().ok_or_else(|| {
                 ContextError::InvalidState(
-                    "SCP-SAGA-13007: cross-context saga Commit-B — executor already consumed but \
+                    "SCP-SAGA-13056: cross-context saga Commit-B — executor already consumed but \
                      no output was stashed (a non-replay Commit attempt after the tool ran is a \
                      coordinator bug)"
                         .to_owned(),
@@ -6048,13 +6088,13 @@ impl Supervisor {
             })?;
             let output_value = executor(ctx.input.clone()).await.map_err(|e| {
                 ContextError::CryptoFailed(format!(
-                    "SCP-SAGA-13008: cross-context tool executor failed for saga '{}': {e}",
+                    "SCP-SAGA-13057: cross-context tool executor failed for saga '{}': {e}",
                     saga_id.0
                 ))
             })?;
             let bytes = serde_json::to_vec(&output_value).map_err(|e| {
                 ContextError::CryptoFailed(format!(
-                    "SCP-SAGA-13009: cross-context tool output is not serializable for saga \
+                    "SCP-SAGA-13058: cross-context tool output is not serializable for saga \
                      '{}': {e}",
                     saga_id.0
                 ))
@@ -6070,7 +6110,7 @@ impl Supervisor {
         // handle survives an interleaved respawn).
         let target = self.lookup(target_hex).ok_or_else(|| {
             ContextError::ContextNotRegistered(format!(
-                "SCP-SAGA-13006: cross-context saga Commit-B settle — target context \
+                "SCP-SAGA-13060: cross-context saga Commit-B settle — target context \
                  '{target_hex}' is not a co-resident actor"
             ))
         })?;
@@ -6122,7 +6162,7 @@ impl Supervisor {
     ///   ticket). We re-ack from the durable `xctx_committed_invocations` witness
     ///   (spec §17.16.4 "A re-acks … as a no-op"): if the caller actor confirms
     ///   the witness, the saga resolves to `Committed` rather than a spurious
-    ///   `SCP-SAGA-13007` `NeedsRepair`. If the witness is absent the Commit-A
+    ///   `SCP-SAGA-13059` `NeedsRepair`. If the witness is absent the Commit-A
     ///   genuinely did not commit (a real divergence), surfaced as a typed error.
     ///
     /// `receipt` carries B's VERIFIED signed receipt bytes; the caller records
@@ -6141,7 +6181,7 @@ impl Supervisor {
         let caller_hex = hex::encode(ctx.caller_context_id);
         let caller = self.lookup(&caller_hex).ok_or_else(|| {
             ContextError::ContextNotRegistered(format!(
-                "SCP-SAGA-13006: cross-context saga Commit-A — caller context '{caller_hex}' \
+                "SCP-SAGA-13061: cross-context saga Commit-A — caller context '{caller_hex}' \
                  is not a co-resident actor"
             ))
         })?;
@@ -6216,7 +6256,7 @@ impl Supervisor {
     /// Re-ack Commit-A from the durable `xctx_committed_invocations` witness when
     /// the held reservation is gone (spec §17.16.4). Queries the caller actor
     /// read-only; a recorded witness resolves the saga to `Committed`, an absent
-    /// witness surfaces a typed `SCP-SAGA-13007` (the Commit-A genuinely did not
+    /// witness surfaces a typed `SCP-SAGA-13059` (the Commit-A genuinely did not
     /// commit — a real divergence the FSM carries to `NeedsRepair`).
     async fn commit_a_reack_from_witness(
         &self,
@@ -6245,7 +6285,7 @@ impl Supervisor {
             Ok(())
         } else {
             Err(ContextError::InvalidState(format!(
-                "SCP-SAGA-13007: cross-context saga Commit-A — no held Prepare-A reservation for \
+                "SCP-SAGA-13059: cross-context saga Commit-A — no held Prepare-A reservation for \
                  saga '{}' and the caller witness does not record a committed Commit-A (Commit-A \
                  did not durably land)",
                 saga_id.0
@@ -14088,15 +14128,17 @@ mod tests {
         let nonce = [0x42u8; 16];
         let output = supervisor
             .start_cross_context_tool_invocation_saga(
-                XCTX_CALLER,
-                XCTX_TARGET,
-                DID(caller_did.to_owned()),
-                XCTX_TOOL.to_owned(),
-                None, // ungated tool — no UCAN proof
-                serde_json::json!({ "a": 1, "b": 2 }),
-                2, // asserted_chain_depth
-                nonce,
-                now_ms,
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None, // ungated tool — no UCAN proof
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: nonce,
+                    asserted_timestamp_ms: now_ms,
+                },
                 &target_signing,
                 &caller_signing,
                 executor,
@@ -14248,15 +14290,17 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let err = supervisor
             .start_cross_context_tool_invocation_saga(
-                XCTX_CALLER,
-                XCTX_TARGET,
-                DID(caller_did.to_owned()),
-                XCTX_TOOL.to_owned(),
-                Some("proof-other".to_owned()),
-                serde_json::json!({ "a": 1, "b": 2 }),
-                1,
-                [0x43u8; 16],
-                now_ms,
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: Some("proof-other".to_owned()),
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x43u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
                 &target_signing,
                 &caller_signing,
                 executor,
@@ -14279,15 +14323,17 @@ mod tests {
         let now_ms2 = supervisor.clock_ref().expect("clock").now_millis();
         let err2 = supervisor
             .start_cross_context_tool_invocation_saga(
-                XCTX_CALLER,
-                XCTX_TARGET,
-                DID(caller_did.to_owned()),
-                XCTX_TOOL.to_owned(),
-                Some("proof-other".to_owned()),
-                serde_json::json!({ "a": 1, "b": 2 }),
-                1,
-                [0x44u8; 16],
-                now_ms2,
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: Some("proof-other".to_owned()),
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x44u8; 16],
+                    asserted_timestamp_ms: now_ms2,
+                },
                 &target_signing,
                 &caller_signing,
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
@@ -14339,15 +14385,17 @@ mod tests {
         // with. The saga MUST reject at the target-axis gate, before reserving.
         let err = supervisor
             .start_cross_context_tool_invocation_saga(
-                XCTX_CALLER,
-                XCTX_VICTIM,
-                DID(caller_did.to_owned()),
-                XCTX_TOOL.to_owned(),
-                None,
-                serde_json::json!({ "a": 1, "b": 2 }),
-                1,
-                [0x4Au8; 16],
-                now_ms,
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_VICTIM,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x4Au8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
                 &target_signing,
                 &caller_signing,
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
@@ -14419,15 +14467,17 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let err = supervisor
             .start_cross_context_tool_invocation_saga(
-                XCTX_CALLER,
-                XCTX_TARGET,
-                DID(caller_did.to_owned()),
-                XCTX_TOOL.to_owned(),
-                None,
-                serde_json::json!({ "a": 1, "b": 2 }),
-                1,
-                [0x45u8; 16],
-                now_ms,
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x45u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
                 &target_signing,
                 &caller_signing,
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
@@ -14478,15 +14528,17 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let output = supervisor
             .start_cross_context_tool_invocation_saga(
-                XCTX_CALLER,
-                XCTX_TARGET,
-                DID(caller_did.to_owned()),
-                XCTX_TOOL.to_owned(),
-                None,
-                serde_json::json!({ "a": 1, "b": 2 }),
-                1,
-                [0x46u8; 16],
-                now_ms,
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x46u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
                 &target_signing,
                 &caller_signing,
                 executor,
@@ -14881,15 +14933,17 @@ mod tests {
         let nonce = [0x42u8; 16];
         let output = supervisor
             .start_cross_context_tool_invocation_saga(
-                XCTX_CALLER,
-                XCTX_TARGET,
-                DID(caller_did.to_owned()),
-                XCTX_TOOL.to_owned(),
-                None,
-                serde_json::json!({ "a": 1, "b": 2 }),
-                2,
-                nonce,
-                now_ms,
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: nonce,
+                    asserted_timestamp_ms: now_ms,
+                },
                 &target_signing,
                 &caller_signing,
                 executor,
@@ -14978,15 +15032,17 @@ mod tests {
         let nonce = [0x42u8; 16];
         let out = supervisor
             .start_cross_context_tool_invocation_saga(
-                XCTX_CALLER,
-                XCTX_TARGET,
-                DID(caller_did.to_owned()),
-                XCTX_TOOL.to_owned(),
-                None,
-                serde_json::json!({ "a": 1, "b": 2 }),
-                2,
-                nonce,
-                now_ms,
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: nonce,
+                    asserted_timestamp_ms: now_ms,
+                },
                 &target_signing,
                 &caller_signing,
                 executor,
@@ -15164,15 +15220,17 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let output = supervisor
             .start_cross_context_tool_invocation_saga(
-                XCTX_CALLER,
-                XCTX_TARGET,
-                DID(caller_did.to_owned()),
-                XCTX_TOOL.to_owned(),
-                None,
-                serde_json::json!({ "a": 1, "b": 2 }),
-                2,
-                [0x42u8; 16],
-                now_ms,
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: [0x42u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
                 &target_signing,
                 &caller_signing,
                 executor,

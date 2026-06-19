@@ -1011,6 +1011,20 @@ pub struct PerContextState {
     /// dedup against B's state. Prepare-B rejects a duplicate nonce and records
     /// a fresh one on accept. Reconstructable freshness state, not in the
     /// Class-S snapshot.
+    ///
+    /// **Replay-bound invariant (defense-in-depth).** The cache is bounded by
+    /// `NONCE_DEDUP_CAPACITY` (10,000) with oldest-first eviction; the replay
+    /// guarantee holds only while the *TTL* (`NONCE_EXPIRY_SECS`, 300 s), not
+    /// eviction, is what drops an entry. That requires the maximum number of
+    /// distinct nonces a caller can land within the TTL window to stay safely
+    /// below the capacity. The per-interface §6.2.0.2 inbound rate limit
+    /// (`InboundPolicy::max_calls_per_minute`) caps that accept rate: worst-case
+    /// `max_calls_per_minute × (NONCE_EXPIRY_SECS / 60)` distinct nonces over
+    /// the window. The default (60/min ⇒ 300 over 5 min) holds with a ~33×
+    /// margin; the [`crate::context::actor::handlers::saga`] tests assert a ≥2×
+    /// margin against the default and a documented configuration ceiling so a
+    /// future high `max_calls_per_minute` cannot silently erode the
+    /// eviction-based bound.
     pub xctx_nonce_dedup: NonceDedup,
 
     /// Target-side (B-owned) durable capture of COMMITTED cross-context tool
@@ -1028,6 +1042,19 @@ pub struct PerContextState {
     /// reproducibility guarantees. Survives same-node restore; dropped (like
     /// `saga_pending`) on cross-node export/import — a foreign node must never
     /// drive local Commit replay.
+    ///
+    /// **Retention bound.** A `SagaId`-keyed idempotency witness; one entry per
+    /// committed cross-context invocation, retained for the lifetime of the
+    /// context. It is intentionally append-only over the saga-journal retention
+    /// horizon: an entry is load-bearing only while a crash-replayed Commit
+    /// could still re-drive this saga (§17.16.4), i.e. until the saga journal
+    /// itself can no longer surface the saga for replay. Past that horizon an
+    /// entry is dead weight, so this map's compaction is tied to (and must not
+    /// outlive) saga-journal compaction — when the journal gains a retention cut
+    /// (the point past which replay is impossible), this map is pruned to the
+    /// same horizon. Until that seam exists the map grows with committed-saga
+    /// count; this note exists so that growth is a tracked retention decision,
+    /// not a silent leak. No speculative compaction is built here.
     pub xctx_committed_outputs:
         HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedToolInvocation>,
 
@@ -1043,6 +1070,16 @@ pub struct PerContextState {
     /// it, a crash that rolled the witness back behind an acked Commit-A would
     /// double-settle the escrow on replay. Survives same-node restore; dropped
     /// on cross-node export/import (a foreign saga must never drive local replay).
+    ///
+    /// **Retention bound.** Same discipline as
+    /// [`Self::xctx_committed_outputs`]: one `SagaId` per committed Commit-A,
+    /// retained for the context's lifetime and load-bearing only while a
+    /// crash-replayed Commit-A could still re-drive the saga (§17.16.4). Its
+    /// compaction is tied to saga-journal retention — pruned to the journal's
+    /// retention horizon once that horizon exists. Until then it grows with
+    /// committed-saga count; documented here so the growth is a tracked
+    /// retention decision rather than a silent memory-growth vector. No
+    /// speculative compaction is built here.
     pub xctx_committed_invocations: std::collections::HashSet<SagaId>,
 
     /// In-flight broadcast-publish reservations awaiting their apply
