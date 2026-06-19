@@ -739,6 +739,29 @@ pub struct Event {
    on `generate_checkpoint` in criterion 8 is a *checkpoint*-signing argument and
    is unaffected.)
 
+   **Timestamp assignment (committer-assigned, copied by every member).** The
+   `timestamp` field is convergent by *assignment*, parallel to `sequence`: for a
+   commit-ordered event the committing member sets it to the `created_at` of the signed
+   SCP envelope carrying the commit (§9.8.2), and every member copies that one value
+   into its own leaf. Because all members hold the identical committed value, the leaf
+   is agreed by all of them — it is byte-identical across honest members (so the §9.9.3
+   equal-count/equal-root test stays sound), tamper-evident (covered by the committer's
+   envelope signature and the leaf hash), and bounded to real time within the ±5-minute
+   future skew tolerance of §9.8.2. The one thing members do *not* agree on is their
+   private physical clocks, which is precisely why a per-member local `now()` reading is
+   wrong here: there is no single such reading to agree on. This is the same convergence
+   principle stated for derived records in the amendment below (a field is convergent iff
+   its source is convergent): the source here is one signed envelope timestamp, not N
+   local clocks. For the timer-triggered events that carry no
+   commit envelope (TTL expiry/close, governance-freeze expiry, deferred
+   economic-policy application), the convergent `timestamp` is the pre-computed
+   deadline already held in convergent context state (the TTL deadline, the
+   freeze-expiry instant, the policy-application time), never local `now()` — for the
+   same reason velocity/rate-triggered consequences are excluded (a wall clock the
+   protocol neither has nor needs). The leaf timestamp's convergence does not make it
+   authoritative over log *order* (§9.8.3): the Merkle order is the orderer; the
+   timestamp is a convergent, bounded annotation carried on that order.
+
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventType {
