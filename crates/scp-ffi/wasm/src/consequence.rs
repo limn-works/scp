@@ -119,16 +119,6 @@ const MAX_FUTURE_TOLERANCE_SECS: u64 = 5;
 /// trigger). Mirrors the native runtime's `MAX_BUFFER_EVENTS_FOR_EVAL`.
 const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 
-/// Encodes a governance target DID into the JSON payload shape the shared
-/// `WarningCount` / `Custom` trigger matcher decodes (`{"target_did": "..."}`).
-/// Mirrors the native runtime's `target_did_to_payload`.
-fn target_did_to_payload(did: Option<&scp_event_log::DID>) -> Vec<u8> {
-    did.map(|d| {
-        serde_json::to_vec(&serde_json::json!({ "target_did": d.as_ref() })).unwrap_or_default()
-    })
-    .unwrap_or_default()
-}
-
 /// Collects the event history for consequence evaluation, merging the durable
 /// Merkle log with the recent receive buffer — the WASM analogue of the native
 /// runtime's `event_log_entries_for_consequences`.
@@ -199,8 +189,27 @@ fn merged_consequence_events(ctx: &PerContextState, now_secs: u64) -> Vec<scp_ev
         });
     }
 
-    // Source 2: receive buffer (recent local `ContextEvent`s). Only accept
-    // events newer than the last durable entry to avoid double-counting.
+    // Source 2: receive buffer (recent local `ContextEvent`s).
+    //
+    // CONVERGENCE INVARIANT (ADR-051 §6 / phase-2.md ADR-011 amendment §2 /
+    // spec §9.9.3 equivocation detection): the buffer may ONLY contribute
+    // per-author / velocity-class event types that are NOT in the durable
+    // log — i.e. `MessageSent` alone. `MessageSent` is per-author and is
+    // excluded from the canonical Merkle log (Source 1), so the receive
+    // buffer is its only source; velocity / rate triggers legitimately need
+    // it, and per-member variation is by-design local flow control that
+    // never feeds a convergent or durable leaf.
+    //
+    // Convergent events (membership, governance, consequence) are durably
+    // logged BEFORE being pushed to the receive buffer, so they ALWAYS appear
+    // in Source 1 on every honest member identically. Sourcing them ALSO from
+    // the per-member buffer here would double-count them on quiet members and
+    // skip them on busy ones (the dedup below is keyed on the member-local
+    // `buffer_len`), producing divergent `WarningCount` / `Custom` counts and
+    // therefore a divergent durable `ConsequenceTriggered` leaf — a
+    // false-positive equivocation that defeats the convergence guarantee.
+    // Those events MUST come exclusively from Source 1, so the match below
+    // omits them (they fall through to `_ => continue`).
     let last_log_ts = events.last().map_or(0, |e| e.timestamp);
     let buffer = ctx.event_buffer_events();
     let buffer_len = buffer.len() as u64;
@@ -209,25 +218,17 @@ fn merged_consequence_events(ctx: &PerContextState, now_secs: u64) -> Vec<scp_ev
 
     for (idx, ctx_event) in buffer.iter().enumerate() {
         let (event_type, actor_did, payload_data) = match ctx_event {
+            // Only per-author / velocity-class events are sourced from the
+            // buffer (see the CONVERGENCE INVARIANT comment above).
+            // `MessageSent` is excluded from the durable log, so the buffer is
+            // its only source. All convergent events (MemberJoined/MemberLeft/
+            // GovernanceActionExecuted/consequence) are intentionally NOT
+            // matched here — they come exclusively from Source 1 to preserve
+            // durable-leaf convergence — and fall through to `_ => continue`.
             ContextEvent::MessageSent { sender_did, .. }
             | ContextEvent::MessageReceived { sender_did, .. } => {
                 (EventType::MessageSent, sender_did.clone(), Vec::new())
             }
-            ContextEvent::MemberJoined { member_did, .. } => {
-                (EventType::MemberJoined, member_did.clone(), Vec::new())
-            }
-            ContextEvent::MemberLeft { member_did } => {
-                (EventType::MemberLeft, member_did.clone(), Vec::new())
-            }
-            ContextEvent::GovernanceActionExecuted {
-                executor_did,
-                target_did,
-                ..
-            } => (
-                EventType::GovernanceAction,
-                executor_did.clone(),
-                target_did_to_payload(target_did.as_ref()),
-            ),
             _ => continue,
         };
 
@@ -410,7 +411,7 @@ fn apply_assign_role(ctx: &mut PerContextState, subject_did: &str, to_role: &str
 mod tests {
     use super::{
         WasmConsequenceDispatcher, apply_assign_role, apply_suspend, apply_suspend_all,
-        dispatch_consequences_for_subject,
+        dispatch_consequences_for_subject, merged_consequence_events,
     };
     use crate::manager::make_bare_per_context_state;
     use scp_event_log::{DID as LogDID, EventType};
@@ -873,5 +874,97 @@ mod tests {
         let applied = apply_suspend_all(&mut ctx, "did:test:admin");
         assert!(!applied);
         assert!(ctx.test_suspended_capabilities("did:test:admin").is_none());
+    }
+
+    // ----------------- EL01: convergent-source soundness -----------------
+
+    const SUBJECT: &str = "did:test:subject";
+
+    /// Builds a context whose durable Merkle log holds exactly ONE
+    /// `GovernanceAction` targeting `SUBJECT` (the convergent `WarningCount`
+    /// bucket), then pushes `message_count` per-author `MessageSent` events
+    /// PLUS one `GovernanceActionExecuted` `ContextEvent` into the receive
+    /// buffer. Differing `message_count` simulates members with different
+    /// local activity / buffer lengths.
+    fn ctx_with_local_activity(message_count: usize) -> super::PerContextState {
+        use scp_protocol::context::membership::ContextEvent;
+
+        let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
+        // Durable convergent governance event (the only source from which a
+        // convergent event may be drawn).
+        let payload = serde_json::to_vec(&serde_json::json!({ "target_did": SUBJECT })).unwrap();
+        ctx.test_append_log_event_at(EventType::GovernanceAction, "did:test:admin", 990, &payload);
+
+        for seq in 0..message_count {
+            ctx.push_event_pub(ContextEvent::MessageSent {
+                sender_did: LogDID(SUBJECT.to_owned()),
+                sequence_number: seq as u64,
+                payload: Vec::new(),
+            });
+        }
+        // The same convergent governance event each honest member buffers
+        // locally after it is durably logged. Before the EL01 fix this was
+        // re-projected from the buffer and double-counted depending on buffer
+        // length; after the fix it is ignored here (Source 1 only).
+        ctx.push_event_pub(ContextEvent::GovernanceActionExecuted {
+            proposal_id: [0x11u8; 32],
+            action_summary: "SuspendMember".to_owned(),
+            executor_did: LogDID("did:test:admin".to_owned()),
+            resulting_epoch: Some(1),
+            target_did: Some(LogDID(SUBJECT.to_owned())),
+        });
+        ctx
+    }
+
+    fn governance_bucket_count(ctx: &super::PerContextState) -> usize {
+        merged_consequence_events(ctx, 1000)
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceAction)
+            .count()
+    }
+
+    /// **EL01 (WASM mirror):** two honest members with the SAME durable
+    /// governance history but DIFFERENT receive-buffer lengths MUST compute the
+    /// SAME governance-bucket count from `merged_consequence_events`, so a
+    /// `WarningCount` / `Custom` consequence fires (or not) identically and
+    /// mints the SAME durable leaf — preserving the §9.9.3 convergence
+    /// guarantee. Before the fix, the buffer's `GovernanceActionExecuted`
+    /// projection was double-counted on the quiet member and skipped on the
+    /// busy one (dedup keyed on member-local `buffer_len`).
+    #[test]
+    fn convergent_governance_count_is_independent_of_buffer_length() {
+        let quiet = governance_bucket_count(&ctx_with_local_activity(2));
+        let busy = governance_bucket_count(&ctx_with_local_activity(50));
+
+        assert_eq!(
+            quiet, busy,
+            "EL01: governance-bucket count MUST be identical across members \
+             regardless of receive-buffer length — convergent events come only \
+             from the durable log, never the per-member buffer (§9.9.3; ADR-051 §6)"
+        );
+        // Non-vacuity: exactly the single durable GovernanceAction is counted;
+        // the buffer's GovernanceActionExecuted contributes zero.
+        assert_eq!(
+            quiet, 1,
+            "EL01: exactly the single durable GovernanceAction must be counted; \
+             the per-member buffer must contribute zero convergent events"
+        );
+    }
+
+    /// Pins that per-author `MessageSent` events DO still flow from the buffer
+    /// (velocity/rate must keep working) — the EL01 fix narrowed the buffer
+    /// projection without disabling it.
+    #[test]
+    fn per_author_messages_still_flow_from_buffer() {
+        let ctx = ctx_with_local_activity(3);
+        let message_count = merged_consequence_events(&ctx, 1000)
+            .iter()
+            .filter(|e| e.event_type == EventType::MessageSent)
+            .count();
+        assert!(
+            message_count > 0,
+            "MessageSent is per-author and excluded from the durable log, so the \
+             receive buffer MUST remain its source for velocity/rate evaluation"
+        );
     }
 }

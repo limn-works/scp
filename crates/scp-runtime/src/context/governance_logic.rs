@@ -626,15 +626,6 @@ fn emit_failure_escalation(
     emit_event_into(state.receive_buffer, event, context_id, args.event_tx);
 }
 
-/// Serializes an optional target DID into JSON payload bytes for event log
-/// consumption by consequence triggers and participation records.
-fn target_did_to_payload(did: Option<&DID>) -> Vec<u8> {
-    did.map(|d| {
-        serde_json::to_vec(&serde_json::json!({"target_did": d.as_ref()})).unwrap_or_default()
-    })
-    .unwrap_or_default()
-}
-
 /// Maximum age (in seconds) for receive-buffer events used in consequence
 /// evaluation. Events estimated to be older than this are discarded as
 /// stale, preventing manipulation via timestamp back-dating.
@@ -759,11 +750,34 @@ pub fn event_log_entries_for_consequences(
         }
     }
 
-    // Source 2: Receive buffer events (recent, may not be in event log yet).
-    // Only add buffer events that are not already covered by the event log.
-    // We use a simple heuristic: if the event log already has events, we
-    // only add buffer events whose estimated timestamp is newer than the
-    // last event log entry.
+    // Source 2: Receive buffer events.
+    //
+    // CONVERGENCE INVARIANT (ADR-051 §6 / phase-2.md ADR-011 amendment §2 /
+    // spec §9.9.3 equivocation detection): the buffer may ONLY contribute
+    // per-author / velocity-class event types that are NOT in the durable
+    // log — i.e. `MessageSent` alone. `MessageSent` is per-author and is
+    // excluded from the canonical Merkle log (Source 1), so the receive
+    // buffer is its only source; velocity / rate triggers legitimately need
+    // it, and per-member variation is by-design local flow control that
+    // never feeds a convergent or durable leaf.
+    //
+    // Convergent events (membership, governance, consequence) are appended
+    // to the durable log BEFORE being pushed to the receive buffer (see
+    // `governance_helpers.rs`), so they ALWAYS appear in Source 1 on every
+    // honest member identically. Sourcing them ALSO from the per-member
+    // buffer here would double-count them on quiet members and skip them on
+    // busy ones (the dedup below is keyed on the member-local `buffer_len`),
+    // producing divergent `WarningCount` / `Custom` counts and therefore a
+    // divergent durable `ConsequenceTriggered` leaf — a false-positive
+    // equivocation that defeats the entire convergence guarantee. Those
+    // events MUST come exclusively from Source 1, so the match below omits
+    // them (they fall through to `_ => continue`).
+    //
+    // The dedup / age / skew / cap logic below now only ever gates
+    // `MessageSent` buffer events. Because `MessageSent` is not in Source 1,
+    // the `estimated_ts <= last_log_ts` dedup may still skip some of them;
+    // that is acceptable — velocity / rate is non-durable, per-receiver
+    // local flow control where per-member variation is by design.
     let last_log_ts = events.last().map_or(0, |e| e.timestamp);
     let all_buffer_events = receive_buffer.event_log_entries();
     let buffer_len = all_buffer_events.len() as u64;
@@ -779,30 +793,18 @@ pub fn event_log_entries_for_consequences(
 
     for (idx, ctx_event) in all_buffer_events.iter().enumerate() {
         let (event_type, actor_did, payload_data) = match ctx_event {
+            // Only per-author / velocity-class events are sourced from the
+            // buffer (see the CONVERGENCE INVARIANT comment above).
+            // `MessageSent` is excluded from the durable log, so the buffer is
+            // its only source. All convergent events (MemberJoined/MemberLeft/
+            // GovernanceActionExecuted/consequence) are intentionally NOT
+            // matched here — they come exclusively from Source 1 to preserve
+            // durable-leaf convergence — and fall through to `_ => continue`.
             ContextEvent::MessageSent { sender_did, .. }
             | ContextEvent::MessageReceived { sender_did, .. } => (
                 scp_event_log::EventType::MessageSent,
                 sender_did.clone(),
                 Vec::new(),
-            ),
-            ContextEvent::MemberJoined { member_did, .. } => (
-                scp_event_log::EventType::MemberJoined,
-                member_did.clone(),
-                Vec::new(),
-            ),
-            ContextEvent::MemberLeft { member_did } => (
-                scp_event_log::EventType::MemberLeft,
-                member_did.clone(),
-                Vec::new(),
-            ),
-            ContextEvent::GovernanceActionExecuted {
-                executor_did,
-                target_did,
-                ..
-            } => (
-                scp_event_log::EventType::GovernanceAction,
-                executor_did.clone(),
-                target_did_to_payload(target_did.as_ref()),
             ),
             _ => continue,
         };
@@ -1009,6 +1011,151 @@ mod convergence_tests {
             root_changed,
             "a Custom-triggered consequence is convergent (ADR-051 §6) and MUST \
              mint durable Merkle leaves"
+        );
+    }
+
+    // -- EL01: convergent-source soundness for consequence evaluation ----------
+
+    use super::event_log_entries_for_consequences;
+    use scp_event_log::EventType;
+    use scp_protocol::context::membership::ReceiveBuffer;
+
+    /// Builds a [`MerkleEventLogProvider`] seeded with the SAME convergent
+    /// durable history every honest member observes: one `GovernanceAction`
+    /// targeting `SUBJECT` (the `WarningCount` bucket). This is the only
+    /// source from which convergent governance/consequence events may be drawn.
+    fn convergent_log() -> (MerkleEventLogProvider, String) {
+        let context_id_str = hex::encode(CTX_BYTES);
+        let storage_key = scp_protocol::context::context_id_bytes(&context_id_str);
+        let log = MerkleEventLogProvider::new();
+        log.init_event_log(&storage_key).expect("init log");
+        log.append_context_event_with_payload(
+            &storage_key,
+            EventType::GovernanceAction,
+            ADMIN,
+            scp_event_log::EventPayload {
+                data: serde_json::to_vec(&serde_json::json!({ "target_did": SUBJECT }))
+                    .expect("encode target payload"),
+            },
+        )
+        .expect("append governance action");
+        (log, context_id_str)
+    }
+
+    /// A member-local receive buffer carrying `message_count` per-author
+    /// `MessageSent` events PLUS one `GovernanceActionExecuted` `ContextEvent`
+    /// (the convergent event that is ALSO mirrored into the durable log).
+    /// Differing `message_count` simulates members with different local
+    /// activity / buffer lengths.
+    fn buffer_with_local_activity(message_count: usize) -> ReceiveBuffer {
+        let mut buffer = ReceiveBuffer::new();
+        for seq in 0..message_count {
+            buffer.push(ContextEvent::MessageSent {
+                sender_did: DID(SUBJECT.to_owned()),
+                sequence_number: seq as u64,
+                payload: Vec::new(),
+            });
+        }
+        // The same convergent governance event each honest member buffers
+        // locally after it is durably logged. Before the EL01 fix this was
+        // re-projected from the buffer and double-counted depending on
+        // buffer length; after the fix it is ignored here (Source 1 only).
+        buffer.push(ContextEvent::GovernanceActionExecuted {
+            proposal_id: [0x11u8; 32],
+            action_summary: "SuspendMember".to_owned(),
+            executor_did: DID(ADMIN.to_owned()),
+            resulting_epoch: Some(1),
+            target_did: Some(DID(SUBJECT.to_owned())),
+        });
+        buffer
+    }
+
+    /// Counts the `GovernanceAction`-bucket events (the bucket `WarningCount` /
+    /// `Custom` triggers match) in the merged consequence-evaluation event list.
+    fn governance_bucket_count(buffer: &ReceiveBuffer) -> usize {
+        let (log, ctx) = convergent_log();
+        let merged = event_log_entries_for_consequences(buffer, &ctx, 1_700_000_100, &log);
+        merged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceAction)
+            .count()
+    }
+
+    /// EL01 regression pin: two honest members with the SAME durable
+    /// governance history but DIFFERENT receive-buffer lengths MUST compute the
+    /// SAME governance-bucket count from `event_log_entries_for_consequences`,
+    /// so a `WarningCount` / `Custom` consequence fires (or not) identically and
+    /// mints the SAME durable `ConsequenceTriggered` leaf — preserving the
+    /// §9.9.3 convergence guarantee. Before the fix, the buffer's
+    /// `GovernanceActionExecuted` projection was double-counted on the quiet
+    /// member and skipped on the busy one (dedup keyed on member-local
+    /// `buffer_len`), diverging the count and the durable leaf.
+    #[test]
+    fn convergent_governance_count_is_independent_of_buffer_length() {
+        // Member A: quiet (2 local messages). Member B: busy (50 local messages).
+        let quiet = governance_bucket_count(&buffer_with_local_activity(2));
+        let busy = governance_bucket_count(&buffer_with_local_activity(50));
+
+        assert_eq!(
+            quiet, busy,
+            "EL01: governance-bucket count for consequence evaluation MUST be \
+             identical across members regardless of receive-buffer length — a \
+             convergent event must be sourced only from the durable log, never \
+             re-projected from the per-member buffer (§9.9.3; ADR-051 §6)"
+        );
+
+        // Non-vacuity: the durable log holds exactly ONE GovernanceAction, so
+        // the convergent count MUST be exactly 1 — the buffer's
+        // GovernanceActionExecuted ContextEvent contributes nothing. If the
+        // convergent buffer arm were re-introduced, the busy member would count
+        // 2 (durable + buffer) and the quiet member's dedup would differ,
+        // breaking the equality above.
+        assert_eq!(
+            quiet, 1,
+            "EL01: exactly the single durable GovernanceAction must be counted; \
+             the per-member buffer must contribute zero convergent events"
+        );
+    }
+
+    /// Pins that the per-author `MessageSent` events DO flow from the buffer
+    /// (the velocity/rate path must keep working), so the EL01 fix narrowed the
+    /// buffer projection without disabling it. Uses an EMPTY durable log so the
+    /// `last_log_ts > 0` dedup gate is bypassed and the buffer source is
+    /// isolated (the durable provider stamps appends with the real system
+    /// clock, which would otherwise dedup all buffer events against it).
+    #[test]
+    fn per_author_messages_still_flow_from_buffer() {
+        let context_id_str = hex::encode(CTX_BYTES);
+        let storage_key = scp_protocol::context::context_id_bytes(&context_id_str);
+        let log = MerkleEventLogProvider::new();
+        log.init_event_log(&storage_key).expect("init log");
+
+        let buffer = buffer_with_local_activity(3);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let merged = event_log_entries_for_consequences(&buffer, &context_id_str, now, &log);
+        let message_count = merged
+            .iter()
+            .filter(|e| e.event_type == EventType::MessageSent)
+            .count();
+        assert!(
+            message_count > 0,
+            "MessageSent is per-author and excluded from the durable log, so the \
+             receive buffer MUST remain its source for velocity/rate evaluation"
+        );
+        // And no convergent governance event leaked from the buffer (the
+        // durable log is empty, so the count must be zero).
+        let gov_count = merged
+            .iter()
+            .filter(|e| e.event_type == EventType::GovernanceAction)
+            .count();
+        assert_eq!(
+            gov_count, 0,
+            "EL01: the buffer's GovernanceActionExecuted must NOT be projected \
+             into the consequence event list (convergent events come only from \
+             the durable log)"
         );
     }
 }
