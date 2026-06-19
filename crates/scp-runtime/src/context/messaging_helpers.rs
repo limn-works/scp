@@ -2123,6 +2123,10 @@ pub fn build_snapshot_from_state(
         saga_pending: saga_pending_snapshot(state),
         xctx_committed_outputs: xctx_committed_outputs_snapshot(state),
         xctx_committed_invocations: state.xctx_committed_invocations.clone(),
+        // ADR-049 §9 Class S (spec §6.2.4): persist the caller-side durable
+        // reservation reversal records so a `PreparingB`-window crash can reverse
+        // the caller deduction + void the escrow without the in-memory carrier.
+        xctx_caller_reservations: state.xctx_caller_reservations.clone(),
         xctx_nonce_dedup: xctx_nonce_dedup_snapshot(state),
     }
 }

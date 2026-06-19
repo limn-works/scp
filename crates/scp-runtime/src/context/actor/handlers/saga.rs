@@ -140,6 +140,7 @@ async fn dispatch_prepare_phase(
 ) -> Outcome<()> {
     match cmd {
         SagaPhaseMessage::PrepareA {
+            saga_id,
             caller_context_id,
             caller_did,
             tool_registration_id,
@@ -148,6 +149,7 @@ async fn dispatch_prepare_phase(
             prepare_a(
                 state,
                 deps,
+                &saga_id,
                 &caller_context_id,
                 &caller_did,
                 &tool_registration_id,
@@ -337,6 +339,7 @@ fn misrouted<T>(
 async fn prepare_a(
     state: &mut PerContextState,
     deps: &ActorDeps,
+    saga_id: &SagaId,
     caller_context_id: &[u8; 32],
     caller_did: &DID,
     tool_registration_id: &str,
@@ -413,15 +416,38 @@ async fn prepare_a(
         }
     };
 
-    // 4. Class-S sync-persist fail-closed BEFORE replying (ADR-049 §9): the
-    //    reserve mutated actor-owned velocity / rate-limit / budget bookkeeping;
-    //    a crash in the coalesce window must not acknowledge a Prepare-A whose
-    //    staged reservation did not durably land. On persist failure the
-    //    reservation is ROLLED BACK (the §6.2.4 "Reservation release on every
-    //    terminal path" RAII contract: the ToolEconomyTicket MUST be settled or
-    //    rolled back, never merely dropped) so the staged escrow/rate-limit/
-    //    velocity/budget are released — nothing applied.
+    // 4. Stage the DURABLE caller-reservation reversal record (spec §6.2.4
+    //    "Reservation release on every terminal path"), keyed by `SagaId`,
+    //    BEFORE the fail-closed persist so the deduction and the means to
+    //    reverse it land atomically in the SAME Class-S snapshot. The live
+    //    `ToolEconomyReservation` RAII carrier (held by the FSM) is the
+    //    AUTHORITATIVE reversal on the live abort / Commit-A paths and dies with
+    //    an actor/process crash; this record is the crash-only fallback the
+    //    §17.16.4 recovery sweep's `Abort { reservation: None }` uses to reverse
+    //    the caller deduction + void the escrow WITHOUT the carrier. Inserting
+    //    it does not double-charge: the live paths CONSUME (remove without
+    //    re-reversing) the record, and the record's own reversal runs only when
+    //    the carrier is absent — the two paths are mutually exclusive.
+    let record = reservation
+        .ticket
+        .to_caller_reservation_record(now_secs, reservation.generation);
+    state
+        .xctx_caller_reservations
+        .insert(saga_id.clone(), record);
+
+    // 5. Class-S sync-persist fail-closed BEFORE replying (ADR-049 §9): the
+    //    reserve mutated actor-owned velocity / rate-limit / budget bookkeeping
+    //    and the durable reversal record above; a crash in the coalesce window
+    //    must not acknowledge a Prepare-A whose staged reservation did not
+    //    durably land. On persist failure the reservation is ROLLED BACK (the
+    //    §6.2.4 "Reservation release on every terminal path" RAII contract: the
+    //    ToolEconomyTicket MUST be settled or rolled back, never merely dropped)
+    //    so the staged escrow/rate-limit/velocity/budget are released — nothing
+    //    applied — and the just-staged record is removed (it described a
+    //    reservation that is now reversed in-memory and was never durably
+    //    persisted, so leaving it would let a later crash-abort double-reverse).
     if let Err(persist_err) = persist_state_fail_closed(state, deps, &context_id_hex) {
+        state.xctx_caller_reservations.remove(saga_id);
         crate::context::tools_helpers::rollback_tool_economy(state, deps, reservation.ticket).await;
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
@@ -1484,6 +1510,12 @@ async fn commit_a(
             req.reservation.reservation.ticket,
         )
         .await;
+        // The durable reversal record (if still present) was consumed at the
+        // FIRST Commit-A; remove any straggler so it cannot reverse settled
+        // state. A removal here is rare (the first Commit-A already removed it),
+        // so it is not folded into a persist decision — `xctx_committed_invocations`
+        // already witnesses the committed terminal durably.
+        let _ = state.xctx_caller_reservations.remove(&req.saga_id);
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
@@ -1523,8 +1555,20 @@ async fn commit_a(
     // is no orphan log entry — the FSM retry re-acks from the (now-absent) witness
     // and the saga resolves correctly with no silent one-sided A-record.
     state.xctx_committed_invocations.insert(req.saga_id.clone());
+    // Consume the durable caller-reservation record in the SAME Class-S snapshot
+    // as the commit witness: the reservation has just been SETTLED via the
+    // carrier, so a surviving record would let a later spurious abort reverse
+    // already-settled state. Re-stash it on a persist failure so the
+    // witness-insert + record-removal roll back together (both are part of the
+    // single fail-closed snapshot — the saga is then retried from a clean state).
+    let consumed_record = state.xctx_caller_reservations.remove(&req.saga_id);
     if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
         state.xctx_committed_invocations.remove(&req.saga_id);
+        if let Some(record) = consumed_record {
+            state
+                .xctx_caller_reservations
+                .insert(req.saga_id.clone(), record);
+        }
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
@@ -1598,18 +1642,36 @@ fn commit_a_check_witness(
 /// Runs on EITHER side's local actor.
 ///
 /// RAII-releases the staged reservations — escrow / outbound-RL on the CALLER
-/// side (handed back via `reservation`, rolled back through the existing
-/// generation-checked rollback path); the tool-session on the TARGET side is
-/// released by clearing the staged `saga_pending` slot (B stages no
-/// `ToolEconomyTicket`). Class-S sync-persists fail-closed whenever an
-/// OWNED-state mutation occurred — the caller refund (the rollback ran against
-/// matching-generation owned state) OR a cleared target slot — then acks.
-/// Persisting the caller refund is mandatory: Prepare-A durably persisted the
-/// matching deduction, so skipping the refund persist would permanently
-/// over-charge the caller on a crash-after-ack (the saga is Aborted, nothing
-/// re-drives it). Idempotent: an already-terminal saga (no slot) on which the
-/// generation-mismatch path ran (no owned mutation) — or a bare re-Abort with
-/// no reservation and no slot — is a clean no-op with no redundant persist.
+/// side; the tool-session on the TARGET side is released by clearing the staged
+/// `saga_pending` slot (B stages no `ToolEconomyTicket`).
+///
+/// On the CALLER side the reversal source depends on whether the in-memory
+/// carrier survived:
+///
+/// * **Live abort** (`Some(reservation)`): the carrier is authoritative — it
+///   reverses through the generation-checked ticket rollback (precise
+///   velocity-token rollback + escrow void). The durable
+///   `xctx_caller_reservations` record is then CONSUMED (removed) WITHOUT
+///   re-reversing.
+/// * **Crash-recovery abort** (`None`, the §17.16.4 re-drive): the carrier died
+///   with the crash, so the reversal runs FROM the durable record —
+///   generation-checked budget / hard-rate-limit / velocity (by the persisted
+///   timestamp) reversal + external escrow void. This is the path the HIGH
+///   finding exposed: it previously no-op'd, durably over-charging the caller
+///   and leaking the escrow.
+///
+/// The two paths are mutually exclusive (carrier present ⟺ `Some`), so a saga
+/// is never double-reversed.
+///
+/// Class-S sync-persists fail-closed whenever an OWNED-state mutation occurred —
+/// the caller refund (the rollback ran against matching-generation owned state),
+/// a consumed durable record (its removal must outlive a crash), OR a cleared
+/// target slot — then acks. Persisting the caller refund is mandatory:
+/// Prepare-A durably persisted the matching deduction, so skipping the refund
+/// persist would permanently over-charge the caller on a crash-after-ack (the
+/// saga is Aborted, nothing re-drives it). Idempotent: an already-terminal saga
+/// (no slot, no record) — or a generation-mismatch caller Abort that touched
+/// nothing — is a clean no-op with no redundant persist.
 async fn abort(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -1619,52 +1681,88 @@ async fn abort(
 ) -> Outcome<()> {
     let context_hex = hex_context_id(&state.context_id);
 
-    // CALLER side: release the held escrow + outbound-RL reservation (RAII).
-    // Route through the GENERATION-CHECKED rollback: an actor despawn+respawn
-    // (e.g. an import replace) between Prepare-A and this in-flight Abort would
-    // otherwise let the unconditional rollback refund velocity / budget /
-    // hard-rate-limit into the WRONG (respawned) instance's owned state. On a
-    // generation MISMATCH the helper voids only the external escrow and consumes
-    // the ticket, mirroring `settle_tool_economy`'s guard (the prior instance's
-    // local bookkeeping died with it).
+    // CALLER side: release the held escrow + outbound-RL reservation (RAII). The
+    // durable `xctx_caller_reservations` record is CONSUMED on every caller-side
+    // terminal path (here and Commit-A) so it can never double-reverse. Which
+    // path REVERSES depends on whether the in-memory carrier survived:
     //
-    // `rollback_tool_economy_generation_checked` returns whether the LOCAL
-    // rollback ran (`true` = generations matched ⇒ this actor's OWNED velocity /
-    // budget / hard-rate-limit were mutated back; `false` = generation mismatch
-    // ⇒ only the EXTERNAL escrow was voided, owned state untouched). We MUST
-    // persist when the local rollback ran, because Prepare-A durably persisted
-    // the matching DEDUCTION — without persisting the refund, a crash after this
-    // ack loses the in-memory refund while the deduction survives, permanently
-    // over-charging the caller (the saga is Aborted, so nothing re-drives it).
-    let local_rollback_ran = match reservation {
+    //   * `Some(reservation)` — the LIVE abort. The carrier is authoritative: it
+    //     reverses via the GENERATION-CHECKED ticket rollback (precise
+    //     velocity-token rollback + escrow void; a despawn+respawn between
+    //     Prepare-A and this Abort makes it void only the external escrow and
+    //     consume the ticket, never touching the respawned instance's owned
+    //     state). We then REMOVE the durable record WITHOUT re-reversing — the
+    //     carrier already did the reversal.
+    //
+    //   * `None` — the §17.16.4 crash-recovery abort. The carrier died with the
+    //     crash, so we reverse FROM the durable record (generation-checked):
+    //     budget / hard-rate-limit / velocity (by the persisted timestamp) +
+    //     external escrow void. This is the path the HIGH finding exposed — it
+    //     previously no-op'd, durably over-charging the caller and leaking the
+    //     escrow.
+    //
+    // The two reversal paths are mutually exclusive by construction (carrier
+    // present ⟺ `Some`; record-reversal only on `None`), so a saga is never
+    // double-reversed.
+    //
+    // `local_rollback_ran` — the LOCAL owned economy (velocity/budget/hard-rate-
+    // limit) was reversed against THIS actor instance (Prepare-A durably
+    // persisted the matching DEDUCTION, so the refund MUST be persisted or a
+    // crash-after-ack permanently over-charges). `had_caller_record_consumed` —
+    // a durable record was REMOVED on this path (even if no local reversal ran,
+    // e.g. a generation mismatch), an owned-state mutation that must be persisted
+    // so the removal outlives a crash and cannot reverse a released reservation.
+    let (local_rollback_ran, had_caller_record_consumed) = match reservation {
         Some(prepared) => {
-            crate::context::tools_helpers::rollback_tool_economy_generation_checked(
+            let ran = crate::context::tools_helpers::rollback_tool_economy_generation_checked(
                 state,
                 deps,
                 prepared.reservation.generation,
                 prepared.reservation.ticket,
             )
-            .await
+            .await;
+            // Consume the durable record (the carrier was authoritative). Its
+            // removal is an owned mutation that MUST be persisted so a later
+            // spurious crash-abort cannot reverse an already-released reservation
+            // from a stale record.
+            let consumed = state.xctx_caller_reservations.remove(saga_id).is_some();
+            (ran, consumed)
         }
-        None => false,
+        None => {
+            // Crash-recovery abort: reverse from the durable record if present.
+            // `reverse_caller_reservation_record` voids the external escrow
+            // regardless of generation and reverses the LOCAL economy only on a
+            // generation match (confused-deputy guard), returning whether the
+            // local reversal ran.
+            match state.xctx_caller_reservations.remove(saga_id) {
+                Some(record) => {
+                    let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
+                        state, deps, &record,
+                    )
+                    .await;
+                    (ran, true)
+                }
+                None => (false, false),
+            }
+        }
     };
 
     // TARGET side: clear the staged tool-session slot (releases the session
     // reservation). Idempotent — a missing slot is a clean no-op.
     let had_slot = state.saga_pending.remove(saga_id).is_some();
 
-    // Persist if EITHER the caller-side owned economy was refunded
-    // (`local_rollback_ran`) OR a target-side slot was cleared (`had_slot`):
-    // both are owned-state mutations whose loss on a crash-after-ack would
-    // corrupt durable state — an unpersisted caller refund permanently
-    // over-charges (the deduction WAS persisted at Prepare-A); an unpersisted
-    // slot clear re-stages a stale saga on respawn. The ONLY no-persist path is
-    // the generation-mismatch caller Abort with no slot (`local_rollback_ran ==
-    // false && !had_slot`): the mismatch voids external escrow + consumes the
-    // ticket WITHOUT touching this instance's owned state (the prior instance's
-    // bookkeeping died with it), so there is no owned mutation to persist, and
-    // an idempotent already-terminal Abort is likewise a clean no-op.
-    if !local_rollback_ran && !had_slot {
+    // Persist if the caller-side owned economy was refunded (`local_rollback_ran`),
+    // a durable caller record was consumed (`had_caller_record_consumed` — its
+    // removal must outlive a crash so it cannot reverse a released reservation),
+    // OR a target-side slot was cleared (`had_slot`): each is an owned-state
+    // mutation whose loss on a crash-after-ack would corrupt durable state — an
+    // unpersisted caller refund permanently over-charges (the deduction WAS
+    // persisted at Prepare-A); a surviving stale record could double-reverse; an
+    // unpersisted slot clear re-stages a stale saga on respawn. The ONLY
+    // no-persist path is a caller Abort that touched nothing (generation-mismatch
+    // with no record + no slot) or an idempotent already-terminal Abort — both
+    // clean no-ops.
+    if !local_rollback_ran && !had_caller_record_consumed && !had_slot {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
@@ -2430,6 +2528,7 @@ mod tests {
         let out = prepare_a(
             &mut st,
             &deps,
+            &SagaId("prep-a-accepts".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -2472,6 +2571,7 @@ mod tests {
         let _ = prepare_a(
             &mut st,
             &deps,
+            &SagaId("prep-a-no-iface".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -2515,6 +2615,7 @@ mod tests {
         let _ = prepare_a(
             &mut st,
             &deps,
+            &SagaId("prep-a-not-allowed".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -2541,6 +2642,7 @@ mod tests {
         let out = prepare_a(
             &mut st,
             &deps,
+            &SagaId("prep-a-failclose".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -2582,6 +2684,7 @@ mod tests {
         let out = prepare_a(
             &mut st,
             &deps,
+            &SagaId("prep-a-cost".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -2657,6 +2760,7 @@ mod tests {
         let _ = prepare_a(
             &mut st,
             &deps,
+            &SagaId("prep-a-iface-rl".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -2706,6 +2810,7 @@ mod tests {
         let _ = prepare_a(
             &mut st,
             &deps,
+            &SagaId("prep-a-caller-rl".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -3455,11 +3560,15 @@ mod tests {
         )
         .await;
 
-        // Stage Prepare-A to obtain the held reservation (FSM carries it).
+        // Stage Prepare-A to obtain the held reservation (FSM carries it). The
+        // saga id is shared across Prepare-A / Commit-A so the durable
+        // reservation record staged at Prepare-A is the one Commit-A consumes.
+        let saga = SagaId("saga-commit-a-1".to_owned());
         let (tx, rx) = oneshot::channel();
         prepare_a(
             &mut st,
             &deps,
+            &saga,
             &[0xC4; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -3468,7 +3577,6 @@ mod tests {
         .await;
         let prepared_a = rx.await.unwrap().expect("prepared-A");
 
-        let saga = SagaId("saga-commit-a-1".to_owned());
         let nonce = [0x42; 16];
         let req = CommitARequest {
             saga_id: saga.clone(),
@@ -3493,6 +3601,7 @@ mod tests {
         prepare_a(
             &mut st,
             &deps,
+            &saga,
             &[0xC4; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -3541,10 +3650,12 @@ mod tests {
             Box::new(OkPersistence),
         )
         .await;
+        let saga = SagaId("saga-commit-a-witness-failclose".to_owned());
         let (tx, rx) = oneshot::channel();
         prepare_a(
             &mut st,
             &stage_deps,
+            &saga,
             &[0xC7; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -3571,7 +3682,6 @@ mod tests {
         )
         .await;
 
-        let saga = SagaId("saga-commit-a-witness-failclose".to_owned());
         let req = CommitARequest {
             saga_id: saga.clone(),
             reservation: prepared_a,
@@ -3655,10 +3765,14 @@ mod tests {
         .await;
 
         // The caller starts with a finite budget; reserve, then abort releases it.
+        // The saga id is shared across Prepare-A / abort so the abort consumes
+        // the durable reservation record Prepare-A staged.
+        let saga = SagaId("saga-abort-a".to_owned());
         let (tx, rx) = oneshot::channel();
         prepare_a(
             &mut st,
             &deps,
+            &saga,
             &[0xC6; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -3669,7 +3783,6 @@ mod tests {
 
         // No staged slot on A (B stages the slot); abort releases the held
         // escrow/rate-limit reservation via the rollback path and acks.
-        let saga = SagaId("saga-abort-a".to_owned());
         let (tx, rx) = oneshot::channel();
         let out = abort(&mut st, &deps, &saga, Some(prepared_a), tx).await;
         assert!(out.result.is_ok(), "abort-a: {:?}", out.result);
@@ -3706,6 +3819,9 @@ mod tests {
         .await;
 
         let caller = DID(CALLER.to_owned());
+        // Shared across Prepare-A / abort so the abort consumes the durable
+        // reservation record Prepare-A staged.
+        let saga = SagaId("saga-abort-a-persist".to_owned());
         // The token-bucket burst capacity, in the limiter's internal milli-token
         // units (1000 milli-tokens per token) — a fresh caller starts FULL and a
         // reserve drains exactly one token; a refund restores it.
@@ -3720,7 +3836,7 @@ mod tests {
         // Prepare-A consumes a hard-rate-limit token + records velocity (and
         // persists the deduction once via the spy).
         let (tx, rx) = oneshot::channel();
-        prepare_a(&mut st, &deps, &[0xC8; 32], &caller, TOOL, tx).await;
+        prepare_a(&mut st, &deps, &saga, &[0xC8; 32], &caller, TOOL, tx).await;
         let prepared_a = rx.await.unwrap().expect("prepared-A");
 
         // Reserve actually moved owned economy state (else the test proves
@@ -3754,7 +3870,6 @@ mod tests {
         // Caller-side abort (no staged slot — Prepare-A stages none). The refund
         // runs against MATCHING generation, so it mutates owned economy state
         // and MUST persist.
-        let saga = SagaId("saga-abort-a-persist".to_owned());
         let (tx, rx) = oneshot::channel();
         let out = abort(&mut st, &deps, &saga, Some(prepared_a), tx).await;
         assert!(out.result.is_ok(), "abort-a: {:?}", out.result);
@@ -3824,6 +3939,7 @@ mod tests {
         prepare_a(
             &mut st,
             &deps,
+            &SagaId("genmismatch-1".to_owned()),
             &[0xD1; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -3853,6 +3969,7 @@ mod tests {
         prepare_a(
             &mut st,
             &deps,
+            &SagaId("genmismatch-2".to_owned()),
             &[0xD1; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -3900,10 +4017,12 @@ mod tests {
         )
         .await;
 
+        let saga = SagaId("saga-abort-stale-gen".to_owned());
         let (tx, rx) = oneshot::channel();
         prepare_a(
             &mut st,
             &deps,
+            &saga,
             &[0xD2; 32],
             &DID(CALLER.to_owned()),
             TOOL,
@@ -3916,7 +4035,6 @@ mod tests {
         // reservation's.
         st.generation = st.generation.wrapping_add(1);
 
-        let saga = SagaId("saga-abort-stale-gen".to_owned());
         let (tx, rx) = oneshot::channel();
         let out = abort(&mut st, &deps, &saga, Some(prepared), tx).await;
         assert!(out.result.is_ok(), "abort with stale gen: {:?}", out.result);
@@ -4170,5 +4288,525 @@ mod tests {
         assert_eq!(p.recorded_nonce, [0x42; 16]);
         assert_eq!(p.recorded_chain_depth, 3);
         assert!(!st.xctx_committed_outputs.contains_key(&saga));
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable caller-reservation record (spec §6.2.4 "Reservation release on
+    // every terminal path") — the PreparingB-crash over-charge / escrow-leak fix.
+    // -----------------------------------------------------------------------
+
+    /// A `PaymentAdapter` that counts `void` calls, so the crash-recovery and
+    /// reversal tests can assert the external escrow hold was actually voided.
+    struct VoidCountingPaymentAdapter {
+        voided: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::economy::adapter::PaymentAdapter for VoidCountingPaymentAdapter {
+        fn adapter_id(&self) -> &'static str {
+            "void-counting"
+        }
+        fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
+            crate::economy::adapter::AdapterCapabilities {
+                supported_currencies: vec![scp_protocol::economy::types::CurrencyCode::from("USD")],
+                supports_streaming: false,
+                supports_batch_auth: false,
+                supports_single_step: false,
+                min_amount: None,
+                max_amount: None,
+                typical_settlement_ms: 0,
+                requires_facilitator: false,
+            }
+        }
+        async fn authorize(
+            &self,
+            from_did: &DID,
+            to_did: &DID,
+            amount: scp_protocol::economy::types::Amount,
+            currency: scp_protocol::economy::types::CurrencyCode,
+            _metadata: crate::economy::adapter::PaymentMetadata,
+        ) -> Result<
+            crate::economy::adapter::PaymentAuthorization,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::PaymentAuthorization {
+                auth_id: [7u8; 32],
+                payer: from_did.clone(),
+                payee: to_did.clone(),
+                amount,
+                currency,
+                adapter_id: "void-counting".to_owned(),
+                created_at: 1_000_000,
+                expires_at: 2_000_000,
+                adapter_state: vec![],
+            })
+        }
+        async fn capture(
+            &self,
+            auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
+        {
+            Ok(crate::economy::adapter::PaymentReceipt {
+                receipt_id: [9u8; 32],
+                payer: auth.payer.clone(),
+                payee: auth.payee.clone(),
+                amount: auth.amount,
+                currency: auth.currency,
+                action_type: scp_protocol::economy::types::PaidActionType::ToolInvoke,
+                context_id: None,
+                adapter_id: "void-counting".to_owned(),
+                adapter_proof: vec![],
+                timestamp: 1_000_001,
+                signature: vec![],
+            })
+        }
+        async fn void(
+            &self,
+            _auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<(), crate::economy::adapter::PaymentError> {
+            self.voided
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn verify_authorization(
+            &self,
+            _auth: &crate::economy::adapter::PaymentAuthorization,
+        ) -> Result<(), crate::economy::adapter::PaymentError> {
+            Ok(())
+        }
+        async fn verify(
+            &self,
+            _receipt: &crate::economy::adapter::PaymentReceipt,
+        ) -> Result<
+            crate::economy::adapter::VerificationResult,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::VerificationResult {
+                valid: true,
+                adapter_id: "void-counting".to_owned(),
+                verified_amount: scp_protocol::economy::types::Amount(0),
+                verified_currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                verification_timestamp: 1_000_002,
+            })
+        }
+        async fn refund(
+            &self,
+            _receipt: &crate::economy::adapter::PaymentReceipt,
+            _amount: Option<scp_protocol::economy::types::Amount>,
+        ) -> Result<
+            crate::economy::adapter::RefundConfirmation,
+            crate::economy::adapter::PaymentError,
+        > {
+            Ok(crate::economy::adapter::RefundConfirmation {
+                refund_id: [0u8; 32],
+                original_receipt_id: [9u8; 32],
+                refunded_amount: scp_protocol::economy::types::Amount(0),
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                adapter_proof: vec![],
+            })
+        }
+    }
+
+    /// Build deps carrying a payment adapter (the default `build_deps` passes
+    /// `None`), so a reversal that voids the external escrow can be observed.
+    async fn build_deps_with_payment(
+        issuer_did: String,
+        issuer_key: ed25519_dalek::VerifyingKey,
+        payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
+    ) -> ActorDeps {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestSagaActor".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(TestEventLog);
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+            if did.as_ref() == issuer_did {
+                Some(issuer_key)
+            } else {
+                None
+            }
+        });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(Box::new(OkPersistence)),
+            Some(payment_adapter),
+            None,
+            None,
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// CRASH-RECOVERY REFUND (the HIGH finding): a `PreparingB`-window crash
+    /// drives the §17.16.4 recovery sweep's CLEAN abort — `Abort { None }` — to
+    /// the caller actor. With no in-memory carrier, the reversal MUST come from
+    /// the durable `xctx_caller_reservations` record Prepare-A staged: the
+    /// caller's velocity + hard-rate-limit (the currently-reachable durable
+    /// deductions) MUST be reversed. Before the fix this path no-op'd, durably
+    /// over-charging the caller. Asserts the durable refund actually moved owned
+    /// state — not merely that the abort acked.
+    #[tokio::test]
+    async fn crash_recovery_abort_none_reverses_caller_deduction_from_record() {
+        use std::sync::atomic::Ordering;
+
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xD8, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let persist_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(SpyPersistence {
+                persist_calls: Arc::clone(&persist_calls),
+            }),
+        )
+        .await;
+
+        let caller = DID(CALLER.to_owned());
+        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let now_secs = deps.clock.now_secs();
+        let velocity_before = st
+            .governance
+            .velocity_tracker
+            .get_velocity(&caller, now_secs);
+
+        // Prepare-A persists the deduction AND stages the durable record under
+        // `saga`.
+        let saga = SagaId("saga-crash-recovery-refund".to_owned());
+        let (tx, rx) = oneshot::channel();
+        prepare_a(&mut st, &deps, &saga, &[0xD8; 32], &caller, TOOL, tx).await;
+        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        // The durable record landed.
+        assert!(
+            st.xctx_caller_reservations.contains_key(&saga),
+            "Prepare-A must stage a durable caller-reservation record"
+        );
+        // The reservation moved owned economy state.
+        let hrl_after_reserve = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("reserve created a hard-rate-limit entry");
+        assert!(hrl_after_reserve < burst_milli);
+        assert!(
+            st.governance
+                .velocity_tracker
+                .get_velocity(&caller, now_secs)
+                > velocity_before
+        );
+
+        // Simulate the crash: the in-memory carrier is GONE. We release the
+        // carrier's ticket explicitly (a crash would drop it; the test must keep
+        // the unbalanced-drop guard quiet) WITHOUT touching owned economy via the
+        // generation-checked path is not what a crash does — so instead drop it
+        // through the same external-only consume a despawn uses.
+        prepared_a
+            .reservation
+            .ticket
+            .void_external_and_consume(deps.payment_adapter.as_ref())
+            .await;
+
+        // Reset the persist counter so we measure ONLY the recovery abort.
+        persist_calls.store(0, Ordering::SeqCst);
+
+        // The §17.16.4 recovery abort: `Abort { None }`. The fix reverses from
+        // the durable record.
+        let (tx, rx) = oneshot::channel();
+        let out = abort(&mut st, &deps, &saga, None, tx).await;
+        assert!(out.result.is_ok(), "crash-recovery abort: {:?}", out.result);
+        assert!(
+            out.mutated,
+            "reversing the caller deduction from the record mutates owned state ⇒ mutated"
+        );
+        rx.await.unwrap().expect("abort ack");
+
+        // The durable refund was Class-S persisted (the deduction was persisted
+        // at Prepare-A; skipping this persist permanently over-charges).
+        assert!(
+            persist_calls.load(Ordering::SeqCst) >= 1,
+            "crash-recovery abort MUST persist the refunded economy"
+        );
+        // The record is consumed.
+        assert!(
+            !st.xctx_caller_reservations.contains_key(&saga),
+            "the durable record must be consumed on the recovery abort"
+        );
+        // The durable deductions are reversed: hard-rate-limit back to full
+        // burst, velocity back to its pre-reserve value.
+        let hrl_after_abort = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after abort");
+        assert_eq!(
+            hrl_after_abort, burst_milli,
+            "crash-recovery abort must refund the hard-rate-limit token from the record"
+        );
+        assert_eq!(
+            st.governance
+                .velocity_tracker
+                .get_velocity(&caller, now_secs),
+            velocity_before,
+            "crash-recovery abort must roll back the recorded velocity from the record"
+        );
+    }
+
+    /// CRASH-RECOVERY ESCROW VOID: a `reverse_caller_reservation_record` on a
+    /// record carrying an external escrow authorization VOIDS that hold via the
+    /// payment adapter (closing the escrow leak), and reverses local economy on
+    /// a generation match. Exercises the escrow handle directly (the outbound
+    /// caller leg carries no spending UCAN today, so the Prepare-A escrow path
+    /// is forward-looking — this asserts the reversal that fires once it is).
+    #[tokio::test]
+    async fn reverse_caller_reservation_record_voids_external_escrow() {
+        use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
+        use std::sync::atomic::Ordering;
+
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xD9, OTHER, CALLER).await;
+        let caller = DID(CALLER.to_owned());
+        let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
+            Arc::new(VoidCountingPaymentAdapter {
+                voided: Arc::clone(&voided),
+            });
+        let deps =
+            build_deps_with_payment(CALLER.to_owned(), issuer.verifying_key(), adapter).await;
+
+        // Seed a deduction we can observe being reversed (record a velocity
+        // entry the record will reverse by timestamp).
+        let now_secs = deps.clock.now_secs();
+        st.governance
+            .velocity_tracker
+            .record_message(&caller, now_secs);
+        let velocity_seeded = st
+            .governance
+            .velocity_tracker
+            .get_velocity(&caller, now_secs);
+        assert_eq!(velocity_seeded, 1);
+
+        let record = CallerReservationRecord {
+            actor_did: caller.clone(),
+            deducted_cost: None,
+            needs_hard_rate_limit_refund: false,
+            recorded_at_secs: now_secs,
+            escrow_authorization: Some(crate::economy::adapter::PaymentAuthorization {
+                auth_id: [3u8; 32],
+                payer: caller.clone(),
+                payee: DID("did:example:payee".to_owned()),
+                amount: scp_protocol::economy::types::Amount(10),
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                adapter_id: "void-counting".to_owned(),
+                created_at: 1_000_000,
+                expires_at: 2_000_000,
+                adapter_state: vec![],
+            }),
+            generation: st.generation,
+        };
+
+        let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
+            &mut st, &deps, &record,
+        )
+        .await;
+        assert!(ran, "matching generation ⇒ local reversal ran");
+        // The external escrow hold was voided (no leak).
+        assert_eq!(
+            voided.load(Ordering::SeqCst),
+            1,
+            "the external escrow authorization must be voided exactly once"
+        );
+        // The local velocity entry was reversed by timestamp.
+        assert_eq!(
+            st.governance
+                .velocity_tracker
+                .get_velocity(&caller, now_secs),
+            0,
+            "the seeded velocity entry must be reversed by timestamp"
+        );
+    }
+
+    /// LIVE ABORT NO-DOUBLE-REVERSE: a live `Abort { Some(reservation) }`
+    /// reverses via the carrier and CONSUMES the durable record WITHOUT
+    /// re-reversing. The reversal happens exactly once (carrier), the record is
+    /// removed, and a subsequent crash-recovery `Abort { None }` for the same
+    /// saga is a clean no-op (no second reversal).
+    #[tokio::test]
+    async fn live_abort_consumes_record_without_double_reverse() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xDA, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        let caller = DID(CALLER.to_owned());
+        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let now_secs = deps.clock.now_secs();
+        let velocity_before = st
+            .governance
+            .velocity_tracker
+            .get_velocity(&caller, now_secs);
+
+        let saga = SagaId("saga-live-no-double".to_owned());
+        let (tx, rx) = oneshot::channel();
+        prepare_a(&mut st, &deps, &saga, &[0xDA; 32], &caller, TOOL, tx).await;
+        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        assert!(st.xctx_caller_reservations.contains_key(&saga));
+
+        // Live abort via the carrier.
+        let (tx, rx) = oneshot::channel();
+        let out = abort(&mut st, &deps, &saga, Some(prepared_a), tx).await;
+        assert!(out.result.is_ok(), "live abort: {:?}", out.result);
+        rx.await.unwrap().expect("abort ack");
+
+        // The record is consumed and the reversal ran EXACTLY once (state back
+        // to pre-reserve, not over-refunded).
+        assert!(
+            !st.xctx_caller_reservations.contains_key(&saga),
+            "the live abort must consume the durable record"
+        );
+        let hrl_after = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after abort");
+        assert_eq!(
+            hrl_after, burst_milli,
+            "the carrier reversal restored exactly one token (full burst)"
+        );
+        assert_eq!(
+            st.governance
+                .velocity_tracker
+                .get_velocity(&caller, now_secs),
+            velocity_before,
+            "the carrier reversal rolled velocity back exactly once"
+        );
+
+        // A subsequent crash-recovery `Abort { None }` for the same saga is a
+        // clean no-op — the record is gone, so nothing is double-reversed.
+        let (tx, rx) = oneshot::channel();
+        let out = abort(&mut st, &deps, &saga, None, tx).await;
+        assert!(out.result.is_ok(), "redundant abort: {:?}", out.result);
+        assert!(
+            !out.mutated,
+            "a second abort on a consumed record must NOT mutate (no double-reverse)"
+        );
+        rx.await.unwrap().expect("redundant abort ack");
+        // State unchanged from the single reversal.
+        assert_eq!(
+            st.governance
+                .hard_rate_limit
+                .snapshot_entries()
+                .get(CALLER)
+                .map(|(tokens, _)| *tokens),
+            Some(burst_milli),
+            "a second abort must not over-refund the hard-rate-limit"
+        );
+    }
+
+    /// COMMIT-A REMOVES RECORD: after a successful Commit-A the durable record
+    /// is consumed, so a subsequent spurious `Abort { None }` is a no-op and
+    /// does NOT reverse the already-settled reservation.
+    #[tokio::test]
+    async fn commit_a_consumes_record_so_later_abort_is_noop() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xDB, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        let caller = DID(CALLER.to_owned());
+        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+
+        let saga = SagaId("saga-commit-a-consumes".to_owned());
+        let (tx, rx) = oneshot::channel();
+        prepare_a(&mut st, &deps, &saga, &[0xDB; 32], &caller, TOOL, tx).await;
+        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        assert!(st.xctx_caller_reservations.contains_key(&saga));
+        // After Prepare-A the hard-rate-limit token is consumed (below burst).
+        let hrl_after_reserve = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry");
+        assert!(hrl_after_reserve < burst_milli);
+
+        // Commit-A settles via the carrier and consumes the record.
+        let req = CommitARequest {
+            saga_id: saga.clone(),
+            reservation: prepared_a,
+            caller_context_id: [0xDB; 32],
+            caller_did: caller.clone(),
+            target_context_id: [0xEE; 32],
+            nonce: [0x42; 16],
+            receipt: br#"{"sig":"x"}"#.to_vec(),
+            output_bytes: br#"{"result":1}"#.to_vec(),
+        };
+        let (tx, rx) = oneshot::channel();
+        let out = commit_a(&mut st, &deps, req, tx).await;
+        assert!(out.result.is_ok(), "commit_a: {:?}", out.result);
+        rx.await.unwrap().expect("commit-a ack");
+        assert!(st.xctx_committed_invocations.contains(&saga));
+        assert!(
+            !st.xctx_caller_reservations.contains_key(&saga),
+            "Commit-A must consume the durable reservation record"
+        );
+        // Capture the settled hard-rate-limit state (the settle does NOT refund
+        // — the token stays consumed for a committed invocation).
+        let hrl_after_commit = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry after commit");
+
+        // A spurious crash-recovery `Abort { None }` is a clean no-op: the
+        // record is gone, so the settled reservation is NOT reversed.
+        let (tx, rx) = oneshot::channel();
+        let out = abort(&mut st, &deps, &saga, None, tx).await;
+        assert!(out.result.is_ok(), "spurious abort: {:?}", out.result);
+        assert!(
+            !out.mutated,
+            "a spurious abort after Commit-A must NOT mutate (settled state untouched)"
+        );
+        rx.await.unwrap().expect("spurious abort ack");
+        assert_eq!(
+            st.governance
+                .hard_rate_limit
+                .snapshot_entries()
+                .get(CALLER)
+                .map(|(tokens, _)| *tokens),
+            Some(hrl_after_commit),
+            "a spurious abort must not reverse the already-settled reservation"
+        );
     }
 }

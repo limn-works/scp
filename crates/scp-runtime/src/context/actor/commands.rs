@@ -2683,6 +2683,12 @@ pub enum SagaPhaseMessage {
     /// NOT any caller-asserted value), persists Class-S fail-closed, and replies
     /// the `Send` reservation handles.
     PrepareA {
+        /// Durable saga identifier (the `xctx_caller_reservations` key). The
+        /// caller-side Prepare-A stages a durable reversal record under this id
+        /// so a `PreparingB`-window crash recovery (`Abort { None }`, keyed by
+        /// the same `SagaId`) can reverse the reservation without the in-memory
+        /// carrier (spec §6.2.4 "Reservation release on every terminal path").
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
         /// Caller context id (raw 32-byte digest) — the actor's own context.
         caller_context_id: [u8; 32],
         /// Caller DID — the channel-authenticated initiator (spec §6.2.4

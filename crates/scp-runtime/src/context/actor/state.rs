@@ -1094,6 +1094,48 @@ pub struct PerContextState {
     /// speculative compaction is built here.
     pub xctx_committed_invocations: std::collections::HashSet<SagaId>,
 
+    /// Caller-side (A-owned) durable reversal records for in-flight
+    /// cross-context tool-invocation Prepare-A reservations, keyed by `SagaId`
+    /// (spec §6.2.4 "Reservation release on every terminal path"). Prepare-A
+    /// inserts a [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord)
+    /// here in the SAME Class-S snapshot as the velocity / budget /
+    /// hard-rate-limit deduction + escrow authorization it persists, so the
+    /// deduction and the means to reverse it land atomically.
+    ///
+    /// **Why this exists.** The live
+    /// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)
+    /// RAII carrier that normally reverses a caller reservation lives ONLY in
+    /// the supervisor's in-memory saga context and dies with an actor/process
+    /// crash. A `PreparingB`-window crash drives a CLEAN abort
+    /// (`Abort { reservation: None }`) to the caller actor; without a durable
+    /// record the persisted deduction could never be reversed and the external
+    /// escrow never voided — a durable over-charge + escrow leak. This map lets
+    /// the crash-recovery abort reverse the reservation BY `SagaId`, without the
+    /// carrier.
+    ///
+    /// **Carrier-authoritative; record is the crash-only fallback.** The live
+    /// `Abort { Some(reservation) }` and Commit-A paths reverse / settle via the
+    /// carrier, then CONSUME the record (remove without re-reversing). The
+    /// record's own reversal runs ONLY on the carrier-absent `Abort { None }`
+    /// path, so the two reversal paths are mutually exclusive by construction —
+    /// a saga is never double-reversed.
+    ///
+    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9): a crash
+    /// that rolled an inserted record back behind an acked Prepare-A would lose
+    /// the only durable reversal handle for a deduction that DID persist.
+    /// Survives same-node restore; dropped on cross-node export/import (caller
+    /// economy is local — a foreign node must never drive local reversal),
+    /// exactly like [`Self::xctx_committed_invocations`].
+    ///
+    /// **Retention bound.** One entry per in-flight caller Prepare-A; consumed
+    /// (removed) on EVERY terminal path — Commit-A success, live abort, and
+    /// crash-recovery abort — so the map holds only genuinely in-flight caller
+    /// reservations and does not accumulate over the context lifetime.
+    pub xctx_caller_reservations: std::collections::HashMap<
+        SagaId,
+        crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+    >,
+
     /// In-flight broadcast-publish reservations awaiting their apply
     /// phase (ADR-049 §SequenceReservation). Phase 1
     /// (`ReserveBroadcastPublish`) reserves a broadcast sequence and
@@ -1266,6 +1308,7 @@ impl PerContextState {
             ),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
+            xctx_caller_reservations: std::collections::HashMap::new(),
             pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
             lifecycle_state: ContextLifecycleState::Open,
@@ -1482,6 +1525,7 @@ mod tests {
             xctx_nonce_dedup,
             xctx_committed_outputs,
             xctx_committed_invocations,
+            xctx_caller_reservations,
             pending_broadcast_publishes,
             welcome_scratchpad,
             lifecycle_state,
@@ -1549,6 +1593,8 @@ mod tests {
         // (target-side durable output capture + caller-side commit witness).
         assert!(xctx_committed_outputs.is_empty());
         assert!(xctx_committed_invocations.is_empty());
+        // No in-flight caller-side cross-context reservations on a fresh context.
+        assert!(xctx_caller_reservations.is_empty());
         assert!(pending_broadcast_publishes.is_empty());
         assert!(welcome_scratchpad.is_none());
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);
@@ -1599,6 +1645,7 @@ mod tests {
             xctx_nonce_dedup: _,
             xctx_committed_outputs: _,
             xctx_committed_invocations: _,
+            xctx_caller_reservations: _,
             pending_broadcast_publishes: _,
             welcome_scratchpad: _,
             lifecycle_state: _,

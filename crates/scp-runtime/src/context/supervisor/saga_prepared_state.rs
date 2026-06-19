@@ -624,6 +624,89 @@ pub struct CommittedToolInvocation {
     pub tool_invoked_event_id: String,
 }
 
+/// Caller-side (A-owned) durable reversal record for a cross-context tool
+/// invocation's Prepare-A economy reservation (spec §6.2.4 "Reservation release
+/// on every terminal path").
+///
+/// Prepare-A durably persists the caller's velocity / budget / hard-rate-limit
+/// deductions and authorizes the external payment escrow, but the live
+/// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)
+/// RAII carrier that holds the means to reverse them lives ONLY in the
+/// supervisor's in-memory saga context — it dies with an actor/process crash.
+/// On a `PreparingB`-window crash the §17.16.4 recovery sweep re-drives the
+/// saga to a CLEAN abort by sending `Abort { reservation: None }` to the caller
+/// actor; with no carrier, the persisted deductions could never be reversed and
+/// the escrow could never be voided, durably OVER-CHARGING the caller and
+/// LEAKING the external payment hold. This record is the durable, by-`SagaId`
+/// reversal evidence that closes that gap: it carries exactly what is needed to
+/// reverse THIS saga's caller-side contribution without the volatile carrier.
+///
+/// **Carrier-authoritative; record is the crash-only fallback.** The live
+/// `Abort { Some(reservation) }` and Commit-A paths still reverse / settle via
+/// the carrier (whose `VelocityRollbackToken` is valid in-process and whose
+/// escrow handle is live), then CONSUME this record (remove without
+/// re-reversing). The record's own reversal runs ONLY when the carrier is
+/// absent (`Abort { None }`), so the two reversal paths are mutually exclusive
+/// by construction and a saga is never double-reversed.
+///
+/// **Class S** — synchronously persisted fail-closed (ADR-049 §9): inserted at
+/// Prepare-A in the SAME Class-S snapshot as the deduction it reverses, so the
+/// deduction and its reversal evidence land (and roll back) atomically. Survives
+/// same-node restore; dropped on cross-node export/import (caller economy is
+/// local — a foreign node must never drive local reversal).
+///
+/// **`NeedsRepair` interaction (spec §6.2.4 "`NeedsRepair` reservation
+/// semantics").** The record's reversal is reached ONLY through the
+/// crash-recovery `Abort { None }`, which the §17.16.4 recovery sweep drives
+/// EXCLUSIVELY for a `PreparingB`-journal entry (the pre-Commit crash window). A
+/// saga that progressed to Committing / `NeedsRepair` is NEVER re-driven through
+/// that abort — `NeedsRepair` is a terminal carryover that holds the escrow for
+/// operator repair (via the carrier's `hold_external_for_repair`), so this
+/// record is never auto-reversed for it and the held escrow is never wrongly
+/// voided. Its compaction is therefore tied to saga-journal retention, like
+/// [`CommittedToolInvocation`] — a `NeedsRepair` saga's inert leftover record is
+/// pruned with the journal entry it belongs to.
+///
+/// **Not bearer-bearing.** Every field is public economy metadata —
+/// [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization) is
+/// the same serde type the payment rail issues, and the velocity entry is
+/// reversed by its TIMESTAMP (the non-durable `VelocityRollbackToken` is
+/// deliberately NOT stored — a restored tracker re-synthesizes sequence numbers,
+/// so a persisted token could never match). There is no §9.4.3 secret, so this
+/// type derives `Serialize`/`Clone` directly and rides the public
+/// [`ContextSnapshot`](crate::context::state::ContextSnapshot) surface without a
+/// separate mirror, exactly like [`CommittedToolInvocation`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerReservationRecord {
+    /// The caller DID the reservation was made for — the key for budget /
+    /// velocity / hard-rate-limit reversal against the actor's owned trackers.
+    pub actor_did: DID,
+    /// The budget amount deducted at Prepare-A (`None` for a free action).
+    /// Reversed via `budget_tracker.reverse_spend` on the crash-abort path.
+    pub deducted_cost: Option<scp_protocol::economy::types::Amount>,
+    /// Whether the hard-rate-limit token consumed at Prepare-A must be refunded
+    /// on reversal (mirrors `ToolEconomyTicket::needs_hard_rate_limit_refund`).
+    pub needs_hard_rate_limit_refund: bool,
+    /// Unix-seconds timestamp of the Prepare-A velocity entry. The velocity
+    /// reversal removes the single entry recorded at this timestamp via
+    /// `SenderVelocityTracker::rollback_one_at` — durable across a restore where
+    /// the original rollback token is meaningless.
+    pub recorded_at_secs: u64,
+    /// The external payment escrow authorization to void on reversal (`None`
+    /// when no economic policy / payment adapter is configured). Serde-safe; the
+    /// `PreparedAction`/`ActionEnvelope` wrappers are NOT, so only the
+    /// authorization handle is persisted.
+    pub escrow_authorization: Option<crate::economy::adapter::PaymentAuthorization>,
+    /// Spawn-generation of the actor instance the reservation was made against
+    /// (`PerContextState::generation`). The crash-abort reversal is
+    /// generation-checked: on a MISMATCH (the actor was despawned + respawned —
+    /// e.g. an import replace — between Prepare-A and the recovery abort) the
+    /// local budget / velocity / hard-rate-limit MUST NOT be touched (that would
+    /// be a confused-deputy write to the WRONG instance); only the external
+    /// escrow is voided.
+    pub generation: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

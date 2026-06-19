@@ -1293,6 +1293,10 @@ pub async fn create_context(
         saga_pending: HashMap::new(),
         xctx_committed_outputs: HashMap::new(),
         xctx_committed_invocations: std::collections::HashSet::new(),
+        // Caller-side cross-context reservation reversal records (spec §6.2.4):
+        // fresh on create; cross-node import DROPS them (caller economy is
+        // local — a foreign saga must never drive local reversal).
+        xctx_caller_reservations: std::collections::HashMap::new(),
         // B-owned cross-context tool-invoke validation state (spec §6.2.4):
         // fresh on creation/import; repopulated when a gated tool interface is
         // established. Not rehydrated from any snapshot — reconstructable
@@ -1875,6 +1879,10 @@ pub async fn import_context(
         saga_pending: HashMap::new(),
         xctx_committed_outputs: HashMap::new(),
         xctx_committed_invocations: std::collections::HashSet::new(),
+        // Caller-side cross-context reservation reversal records (spec §6.2.4):
+        // fresh on create; cross-node import DROPS them (caller economy is
+        // local — a foreign saga must never drive local reversal).
+        xctx_caller_reservations: std::collections::HashMap::new(),
         // B-owned cross-context tool-invoke validation state (spec §6.2.4):
         // fresh on creation/import; repopulated when a gated tool interface is
         // established. Not rehydrated from any snapshot — reconstructable
@@ -2338,6 +2346,11 @@ pub async fn restore_context(
         // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
         xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
         xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
+        // ADR-049 §9 Class S (spec §6.2.4): same-node restore REHYDRATES the
+        // caller-side durable reservation reversal records so a crash-recovery
+        // abort can reverse the caller deduction + void the escrow from the
+        // record. Dropped on cross-node import (caller economy is local).
+        xctx_caller_reservations: ctx_snapshot.xctx_caller_reservations,
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,

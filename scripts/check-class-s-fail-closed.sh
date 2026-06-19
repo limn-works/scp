@@ -122,6 +122,25 @@
 #                                    would re-admit a replay (BLACK-624-01). The
 #                                    Prepare-B handler records then persists
 #                                    fail-closed BEFORE acking.
+#     xctx_caller_reservations.insert( — STAGES (Prepare-A) the caller-side
+#                                    durable reservation reversal record (spec
+#                                    §6.2.4 "Reservation release on every terminal
+#                                    path"). It is the ONLY durable handle that
+#                                    lets a `PreparingB`-window crash recovery
+#                                    (`Abort { None }`) reverse the caller's
+#                                    persisted velocity/budget/hard-rate-limit
+#                                    deduction and void the escrow without the
+#                                    in-memory carrier; a coalesce-window rollback
+#                                    that lost it behind an acked Prepare-A would
+#                                    leave the deduction durable with no reversal
+#                                    handle — a permanent over-charge + escrow
+#                                    leak. Prepare-A inserts it then persists
+#                                    fail-closed BEFORE acking. (Only `.insert(`
+#                                    is a marker: the Commit-A / abort `.remove(`
+#                                    consumes ride the same fail-closed persist as
+#                                    the witness/refund they accompany, or — on
+#                                    the idempotent-replay branch — are redundant
+#                                    with the already-durable commit witness.)
 #
 # ---------------------------------------------------------------------------
 # HOW A MUTATING FUNCTION IS SATISFIED
@@ -306,6 +325,7 @@ threshold_signers.retain( \
 saga_pending.insert( \
 saga_pending.remove( \
 xctx_nonce_dedup.record( \
+xctx_caller_reservations.insert( \
 threshold_value= \
 role_state.ceiling="
 

@@ -5847,7 +5847,7 @@ impl Supervisor {
                         )));
                     };
                     match phase {
-                        SagaPhase::A => self.dispatch_xctx_prepare_a(ctx).await,
+                        SagaPhase::A => self.dispatch_xctx_prepare_a(saga_id, ctx).await,
                         SagaPhase::B => self.dispatch_xctx_prepare_b(saga_id, ctx).await,
                     }
                 }
@@ -5879,6 +5879,7 @@ impl Supervisor {
     /// [`PreparedAFields`] reservation in `ctx` for Commit-A / abort.
     async fn dispatch_xctx_prepare_a(
         &self,
+        saga_id: &SagaId,
         ctx: &mut CrossContextSagaCtx<'_>,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::SagaPhaseMessage;
@@ -5891,6 +5892,7 @@ impl Supervisor {
             ))
         })?;
 
+        let saga_id = saga_id.clone();
         let caller_context_id = ctx.caller_context_id;
         let caller_did = ctx.caller_did.clone();
         let tool_registration_id = ctx.tool_registration_id.clone();
@@ -5898,6 +5900,7 @@ impl Supervisor {
         let prepared = actor
             .send(move |reply| {
                 ContextCommand::SagaPhase(SagaPhaseMessage::PrepareA {
+                    saga_id,
                     caller_context_id,
                     caller_did,
                     tool_registration_id,
@@ -10848,6 +10851,7 @@ mod tests {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
+            xctx_caller_reservations: HashMap::new(),
             xctx_nonce_dedup: HashMap::new(),
         }
     }
@@ -15820,7 +15824,7 @@ mod tests {
             reached_needs_repair: false,
         };
         supervisor
-            .dispatch_xctx_prepare_a(&mut ctx)
+            .dispatch_xctx_prepare_a(&SagaId::new(), &mut ctx)
             .await
             .expect("Prepare-A stages a real reservation");
         assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
@@ -15932,7 +15936,7 @@ mod tests {
             reached_needs_repair: false,
         };
         supervisor
-            .dispatch_xctx_prepare_a(&mut ctx)
+            .dispatch_xctx_prepare_a(&SagaId::new(), &mut ctx)
             .await
             .expect("Prepare-A stages a real reservation");
         assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");

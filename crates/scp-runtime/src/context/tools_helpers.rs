@@ -286,6 +286,100 @@ impl ToolEconomyTicket {
         // refunds it (anti-griefing, §6.2.4).
         self.needs_hard_rate_limit_refund = false;
     }
+
+    /// Project this in-flight ticket onto a durable, serde-safe
+    /// [`CallerReservationRecord`] (spec §6.2.4) so a cross-context saga's
+    /// caller-side Prepare-A reservation can be reversed after an actor crash
+    /// WITHOUT the volatile RAII carrier (which dies with the crash).
+    ///
+    /// Reads — does NOT consume — the reversal-relevant fields: the budget
+    /// delta, the hard-rate-limit refund flag, the external escrow
+    /// authorization handle (the serde-safe
+    /// [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization)
+    /// inside the non-serde [`PreparedAction`]), and the velocity-entry
+    /// timestamp. The non-durable [`VelocityRollbackToken`] is intentionally
+    /// dropped — a restored tracker re-synthesizes sequence numbers, so the
+    /// durable reversal removes the velocity entry by TIMESTAMP via
+    /// [`SenderVelocityTracker::rollback_one_at`](scp_protocol::economy::antispam::SenderVelocityTracker::rollback_one_at)
+    /// instead. The ticket remains live and authoritative for the in-process
+    /// (carrier) reversal path; this record is the crash-only fallback.
+    pub(crate) fn to_caller_reservation_record(
+        &self,
+        recorded_at_secs: u64,
+        generation: u64,
+    ) -> crate::context::supervisor::saga_prepared_state::CallerReservationRecord {
+        crate::context::supervisor::saga_prepared_state::CallerReservationRecord {
+            actor_did: self.actor_did.clone(),
+            deducted_cost: self.deducted_cost,
+            needs_hard_rate_limit_refund: self.needs_hard_rate_limit_refund,
+            recorded_at_secs,
+            escrow_authorization: self
+                .escrow
+                .as_ref()
+                .and_then(|prepared| prepared.envelope.authorization.clone()),
+            generation,
+        }
+    }
+}
+
+/// Reverse a cross-context saga's caller-side Prepare-A reservation from its
+/// durable [`CallerReservationRecord`] (spec §6.2.4 "Reservation release on
+/// every terminal path"), used by the crash-recovery abort path
+/// (`Abort { None }`) where the in-memory RAII carrier died with the crash.
+///
+/// Generation-checked, mirroring
+/// [`rollback_tool_economy_generation_checked`]: when `record.generation`
+/// matches the live actor's `state.generation` the local budget / velocity /
+/// hard-rate-limit are reversed AND the external escrow is voided; on a MISMATCH
+/// (the actor was despawned + respawned for the same context between Prepare-A
+/// and this abort) ONLY the external escrow is voided — the prior instance's
+/// context-local bookkeeping died with it and writing this instance's owned
+/// state would be a confused-deputy corruption. Returns `true` when the local
+/// reversal ran (generations matched), `false` when only the external escrow
+/// was voided (mismatch). The caller folds a `true` into its Class-S
+/// fail-closed persist decision exactly as it does for a carrier rollback.
+pub async fn reverse_caller_reservation_record(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    record: &crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+) -> bool {
+    // External escrow void is always safe (and required to avoid a leak),
+    // regardless of generation: the payment hold the prior instance authorized
+    // is real and external to any actor instance.
+    if let (Some(adapter), Some(auth)) = (
+        deps.payment_adapter.as_ref(),
+        record.escrow_authorization.as_ref(),
+    ) && let Err(e) = adapter.void_dyn(auth).await
+    {
+        tracing::warn!(
+            actor_did = %record.actor_did,
+            "failed to void caller cross-context saga payment escrow on crash-recovery abort: {e}"
+        );
+    }
+
+    if record.generation != state.generation {
+        // Confused-deputy guard: the reservation belongs to a now-replaced
+        // actor instance. The external escrow is already voided above; the
+        // context-local bookkeeping lived in the gone instance and MUST NOT be
+        // touched here.
+        return false;
+    }
+
+    // Generations match — reverse this actor's OWNED economy bookkeeping.
+    state
+        .governance
+        .velocity_tracker
+        .rollback_one_at(&record.actor_did, record.recorded_at_secs);
+    if let Some(cost) = record.deducted_cost {
+        state
+            .governance
+            .budget_tracker
+            .reverse_spend(&record.actor_did, cost);
+    }
+    if record.needs_hard_rate_limit_refund {
+        state.governance.hard_rate_limit.refund(&record.actor_did);
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------

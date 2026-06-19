@@ -940,6 +940,37 @@ pub struct ContextSnapshot {
     pub xctx_committed_invocations:
         std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId>,
 
+    /// Caller-side (A-owned) durable reversal records for in-flight
+    /// cross-context tool-invocation Prepare-A reservations, keyed by `SagaId`
+    /// (spec §6.2.4 "Reservation release on every terminal path"). **Class S** —
+    /// synchronously-persisted, fail-closed, mirroring [`Self::saga_pending`].
+    ///
+    /// The live slot is
+    /// [`PerContextState::xctx_caller_reservations`](crate::context::actor::state::PerContextState::xctx_caller_reservations).
+    /// Prepare-A inserts a record here in the same Class-S snapshot as the
+    /// deduction it reverses; on a `PreparingB`-window crash the recovery sweep's
+    /// clean abort (`Abort { reservation: None }`) reverses the caller's
+    /// velocity / budget / hard-rate-limit and voids the external escrow FROM
+    /// this record — the in-memory RAII carrier died with the crash, so without
+    /// it the caller would be durably over-charged and the escrow would leak. A
+    /// coalesce-window rollback of an inserted record would lose the only durable
+    /// reversal handle, the exact hazard the synchronous persist forecloses.
+    /// Same-node restore REHYDRATES it; cross-node export/import DROP it to empty
+    /// (caller economy is local). `#[serde(default)]` so legacy / stripped
+    /// snapshots deserialize as empty.
+    ///
+    /// Like `xctx_committed_outputs` this carries no §9.4.3 non-derive barrier —
+    /// every field is public economy metadata (the escrow handle is the same
+    /// serde [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization)
+    /// the payment rail issues), so the snapshot stores the live
+    /// [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord)
+    /// directly.
+    #[serde(default)]
+    pub xctx_caller_reservations: std::collections::HashMap<
+        crate::context::supervisor::saga_journal::SagaId,
+        crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+    >,
+
     /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
     /// tool invocation (spec §6.2.4 "Freshness / anti-replay"). The serialized
     /// projection of

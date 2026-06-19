@@ -824,6 +824,10 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         saga_pending: HashMap::new(),
         xctx_committed_outputs: HashMap::new(),
         xctx_committed_invocations: std::collections::HashSet::new(),
+        // Caller-side reservation reversal records are local-instance economy
+        // state with no authority on any other node — ALWAYS dropped from the
+        // public export.
+        xctx_caller_reservations: HashMap::new(),
         // B's freshness/replay cache has no authority on a foreign node and a
         // fresh node starts its own replay window — dropped from the export.
         xctx_nonce_dedup: HashMap::new(),
@@ -1017,6 +1021,9 @@ mod tests {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
+            // Caller-side reservation reversal records are local-instance
+            // economy state — dropped from the export (no foreign authority).
+            xctx_caller_reservations: HashMap::new(),
             // B's freshness/replay cache has no authority on a foreign node and
             // a fresh node starts its own replay window — dropped from export.
             xctx_nonce_dedup: HashMap::new(),
