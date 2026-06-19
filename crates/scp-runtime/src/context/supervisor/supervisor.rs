@@ -5471,14 +5471,39 @@ impl Supervisor {
         prepared: &XctxPrepared,
     ) -> CommitInProgressResolution {
         use crate::context::actor::commands::SagaPhaseMessage;
+        use scp_protocol::context::tools::cross_context_saga::CommittedSide;
         let caller_hex = hex::encode(prepared.caller_context_id);
+        // This fn is only reached after Commit-B re-emitted `AlreadyCommitted` —
+        // the TARGET side has durably committed `ToolInvoked`. Every arm below
+        // that does NOT confirm Commit-A is therefore a genuine ONE-SIDED
+        // commit (Target committed, Caller did not / cannot be confirmed). The
+        // signing keys died with the crash, so the per-side signed
+        // `CrossContextDivergenceMarker` cannot be appended — but the
+        // supervisor-level repair journal IS available post-crash, so the
+        // divergence MUST be recorded there before returning `NeedsRepair`
+        // (spec §6.2.4 "Dual event-log recording" — "or a supervisor-level
+        // repair journal if one side is unreachable"). The committed event id
+        // is the SagaId-stable `ToolInvoked:{saga_id}` (the id B signed into the
+        // receipt and wrote into its log); the nonce is B's staged
+        // `recorded_nonce` reconstructed from the journal evidence.
+        let committed_event_id = format!("ToolInvoked:{}", saga_id.0);
+        let record_one_sided_repair = || {
+            self.record_supervisor_repair(
+                saga_id,
+                &caller_hex,
+                CommittedSide::Target,
+                &committed_event_id,
+                prepared.recorded_nonce,
+            );
+        };
         let Some(caller) = self.lookup(&caller_hex) else {
             tracing::error!(
                 saga_id = %saga_id.0,
                 context = %caller_hex,
                 "saga recovery — Commit-in-progress: caller actor unreachable; cannot confirm the \
-                 A-side witness — NeedsRepair (possible one-sided commit)"
+                 A-side witness — recording supervisor repair (Target committed) and NeedsRepair"
             );
+            record_one_sided_repair();
             return CommitInProgressResolution::NeedsRepair;
         };
         let witness_saga_id = saga_id.clone();
@@ -5503,8 +5528,10 @@ impl Supervisor {
                 tracing::error!(
                     saga_id = %saga_id.0,
                     "saga recovery — Commit-in-progress: target committed but the caller witness \
-                     is absent (Commit-A never landed) — one-sided commit, NeedsRepair"
+                     is absent (Commit-A never landed) — one-sided commit; recording supervisor \
+                     repair and NeedsRepair"
                 );
+                record_one_sided_repair();
                 CommitInProgressResolution::NeedsRepair
             }
             Err(err) => {
@@ -5512,8 +5539,10 @@ impl Supervisor {
                     saga_id = %saga_id.0,
                     %err,
                     "saga recovery — Commit-in-progress: A-side witness query failed; cannot \
-                     confirm Commit-A — NeedsRepair"
+                     confirm Commit-A — recording supervisor repair (Target committed) and \
+                     NeedsRepair"
                 );
+                record_one_sided_repair();
                 CommitInProgressResolution::NeedsRepair
             }
         }
@@ -6308,6 +6337,26 @@ impl Supervisor {
         }
     }
 
+    /// Extract the held Prepare-A reservation back out of a recovered
+    /// (un-delivered) caller-side `Abort` command so the abort path can void its
+    /// external escrow + consume the ticket. Returns `None` if the command is
+    /// not an `Abort` carrying a reservation (unreachable for the command built
+    /// in [`Self::abort_xctx_participants`]).
+    fn extract_abort_reservation(
+        cmd: Box<ContextCommand>,
+    ) -> Option<crate::context::actor::commands::PreparedAFields> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        if let ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
+            reservation: Some(reservation),
+            ..
+        }) = *cmd
+        {
+            Some(*reservation)
+        } else {
+            None
+        }
+    }
+
     /// Emit the dual `CrossContextDivergenceMarker`s on a `NeedsRepair`
     /// outcome (spec §6.2.4 "Dual event-log recording").
     ///
@@ -6596,10 +6645,18 @@ impl Supervisor {
             let caller_hex = hex::encode(ctx.caller_context_id);
             if let Some(caller) = self.lookup(&caller_hex) {
                 let abort_saga_id = saga_id.clone();
-                // Move the reservation's ticket into a holder we can recover if
-                // the send fails (the actor consumes it on success).
-                let result = caller
-                    .send(move |reply| {
+                // The Abort command carries the `#[must_use]` reservation (whose
+                // `ToolEconomyTicket` debug-asserts on an unbalanced drop). Use
+                // `send_recover_on_failure` — NOT the plain `send`, which drops
+                // the built command (and its ticket) INSIDE the send on a
+                // full/closed mailbox → a Drop panic under `--features testing`
+                // and an escrow leak in release. On a send failure we get the
+                // un-delivered command back, extract the reservation, and void
+                // its external escrow here (the caller actor's per-context
+                // rollback can never run for a command it never received — same
+                // reasoning as the unreachable-actor branch below).
+                let send_result = caller
+                    .send_recover_on_failure(move |reply| {
                         ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
                             saga_id: abort_saga_id,
                             reservation: Some(Box::new(reservation)),
@@ -6607,19 +6664,55 @@ impl Supervisor {
                         })
                     })
                     .await;
-                if let Err(err) = result {
-                    // The command may not have been delivered; we no longer hold
-                    // the ticket (it moved into the boxed command). The actor's
-                    // rollback either ran or never received the command — we
-                    // cannot tell. Log; the journal Aborted marker is the
-                    // authoritative rollback record and the next crash-recovery
-                    // sweep reconciles any orphaned actor-side staged state.
-                    tracing::warn!(
-                        saga_id = %saga_id.0,
-                        %err,
-                        "cross-context saga abort — caller-side Abort send failed; rollback may \
-                         not have run, crash-recovery sweep will reconcile"
-                    );
+                match send_result {
+                    // Delivered (the actor owns + balanced the ticket) — done.
+                    Ok(()) => {}
+                    // Send NEVER delivered: recover the reservation out of the
+                    // returned command and void the external escrow + consume the
+                    // ticket so its unbalanced-drop guard does not fire.
+                    Err((err, Some(recovered_cmd))) => {
+                        if let Some(reservation) = Self::extract_abort_reservation(recovered_cmd) {
+                            reservation
+                                .reservation
+                                .ticket
+                                .void_external_and_consume(self.payment_adapter_ref())
+                                .await;
+                            tracing::warn!(
+                                saga_id = %saga_id.0,
+                                %err,
+                                "cross-context saga abort — caller-side Abort send failed; \
+                                 recovered the held reservation and voided its external escrow \
+                                 (the actor never received the command, so its per-context \
+                                 rollback could not run)"
+                            );
+                        } else {
+                            // Unreachable in practice: the recovered command IS
+                            // the Abort we built (carrying `Some` reservation). If
+                            // a future refactor changes that, the ticket has
+                            // nowhere to go — log loudly rather than silently leak
+                            // (the carrier's drop guard then surfaces the bug).
+                            tracing::error!(
+                                saga_id = %saga_id.0,
+                                %err,
+                                "cross-context saga abort — recovered a non-Abort (or \
+                                 reservation-less) command on send failure; the held \
+                                 reservation could not be balanced"
+                            );
+                        }
+                    }
+                    // Delivered but the handler errored (or dropped the reply):
+                    // the actor already owns/consumed the ticket — nothing to
+                    // recover. The journal Aborted marker is the authoritative
+                    // rollback record.
+                    Err((err, None)) => {
+                        tracing::warn!(
+                            saga_id = %saga_id.0,
+                            %err,
+                            "cross-context saga abort — caller-side Abort delivered but the \
+                             handler errored; the actor owns the reservation, journal Aborted \
+                             marker is authoritative"
+                        );
+                    }
                 }
             } else {
                 // Caller actor is gone: its per-context rollback can never run.
@@ -15100,6 +15193,124 @@ mod tests {
         );
     }
 
+    /// FIX 4 (crash-recovery one-sided divergence): a Commit-in-progress recovery
+    /// where the TARGET committed (B replays `AlreadyCommitted`) but the A side
+    /// is UNREACHABLE (caller actor gone post-crash) is a genuine one-sided
+    /// commit. The signing keys died with the crash, so a signed
+    /// `CrossContextDivergenceMarker` cannot be appended — but the SUPERVISOR
+    /// REPAIR JOURNAL is available, so the divergence MUST be durably recorded
+    /// there (spec §6.2.4 "or a supervisor-level repair journal if one side is
+    /// unreachable") rather than silently resolving to a bare `NeedsRepair`.
+    #[tokio::test]
+    async fn xctx_commit_in_progress_one_sided_records_supervisor_repair() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxOneSidedCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxOneSidedCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |_input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "result": 3 }))
+            }
+        };
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let nonce = [0x77u8; 16];
+        let out = supervisor
+            .start_cross_context_tool_invocation_saga(
+                CrossContextToolInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: nonce,
+                    asserted_timestamp_ms: now_ms,
+                },
+                &target_signing,
+                &caller_signing,
+                executor,
+            )
+            .await
+            .expect("saga commits");
+
+        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+            serde_json::from_slice(&out.receipt.expect("receipt")).expect("decode");
+        let saga_id_str = receipt
+            .tool_invoked_event_id
+            .strip_prefix("ToolInvoked:")
+            .expect("event id carries saga id")
+            .to_owned();
+        let saga_id = SagaId(saga_id_str);
+
+        // Despawn the CALLER (A) actor: post-crash it is unreachable, so the
+        // A-side witness cannot be confirmed even though B durably committed.
+        assert!(
+            supervisor.despawn_actor(&hex::encode(XCTX_CALLER)).await,
+            "despawn caller actor (A unreachable post-crash)"
+        );
+
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: now_ms,
+            recorded_nonce: nonce,
+            recorded_chain_depth: 3,
+        };
+
+        // B re-emits AlreadyCommitted; A is unreachable ⇒ genuine one-sided
+        // commit ⇒ NeedsRepair AND a supervisor repair record.
+        let resolution =
+            Box::pin(supervisor.redrive_xctx_commit_in_progress(&saga_id, &prepared)).await;
+        assert_eq!(
+            resolution,
+            CommitInProgressResolution::NeedsRepair,
+            "target committed + caller unreachable is a one-sided commit ⇒ NeedsRepair"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "recovery must not re-invoke"
+        );
+
+        // FIX 4: the divergence is durably recorded in the supervisor repair
+        // journal (the post-crash fallback for the unreachable signing side).
+        let repair = supervisor.saga_repair_records_for(&saga_id);
+        assert_eq!(
+            repair.len(),
+            1,
+            "a one-sided crash-recovery divergence MUST record exactly one supervisor repair \
+             record, got {repair:?}"
+        );
+        assert_eq!(repair[0].unreachable_context_hex, hex::encode(XCTX_CALLER));
+        assert_eq!(
+            repair[0].committed_event_id,
+            format!("ToolInvoked:{}", saga_id.0)
+        );
+        assert_eq!(repair[0].nonce, nonce);
+        assert_eq!(
+            repair[0].committed_side,
+            scp_protocol::context::tools::cross_context_saga::CommittedSide::Target
+        );
+    }
+
     /// FIX 3 (crypto, §6.2.4 "Signer authorization"): the Commit-A path verifies
     /// B's receipt signature against the key authorized for `target_context_id`
     /// BEFORE settling. A receipt signed by a DIFFERENT key is rejected — the
@@ -15356,6 +15567,92 @@ mod tests {
                 .void_external_and_consume(supervisor.payment_adapter_ref())
                 .await;
         }
+    }
+
+    /// FIX 1 (abort ticket-safe send): a caller-side `Abort` whose mailbox SEND
+    /// fails (the caller handle is FOUND in the registry but its mailbox is
+    /// closed) must NOT drop the `#[must_use]` reservation ticket carried in the
+    /// boxed command — that would trip the ticket's unbalanced-`Drop`
+    /// debug-assert under `--features testing` (and leak escrow in release).
+    /// `abort_xctx_participants` uses `send_recover_on_failure`, recovers the
+    /// un-delivered `Abort` command via `extract_abort_reservation`, and voids
+    /// its external escrow + consumes the ticket. This injects a registered-but-
+    /// dead handle (closed mailbox) so the lookup HITS and the SEND fails —
+    /// exercising the recover path, not the lookup-miss branch. Reaching the end
+    /// without a drop-guard panic IS the guarantee.
+    #[tokio::test]
+    async fn xctx_abort_send_failure_voids_ticket_no_panic() {
+        use crate::context::actor::ContextActorHandle;
+
+        let creator_did = "did:dht:z6MkXctxAbortSendFailCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxAbortSendFailCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x42u8; 16];
+
+        // Run the REAL Prepare-A (on the still-live caller actor) so `prepared_a`
+        // holds a genuine must-use reservation whose ticket Drop guard fires if
+        // it is ever dropped unbalanced.
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: nonce,
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing.clone(),
+            caller_signing_key: caller_signing.clone(),
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+        supervisor
+            .dispatch_xctx_prepare_a(&mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+
+        // REPLACE the live caller handle with a registered-but-DEAD one: a
+        // channel whose receiver is dropped. `lookup` now HITS, but the mailbox
+        // is closed, so `send_recover_on_failure` fails the send and returns the
+        // un-delivered `Abort` command for ticket recovery — the exact path FIX 1
+        // hardens (the old plain `send` would drop the command + ticket here).
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(dead_rx);
+        supervisor.actors.insert(
+            hex::encode(XCTX_CALLER),
+            ContextActorHandle::from_sender(dead_tx),
+        );
+
+        // Abort: the caller-side send fails on the closed mailbox. The held
+        // reservation's ticket must be recovered + voided + consumed, never
+        // dropped unbalanced. `abort_xctx_participants` takes `prepared_a` out.
+        let saga_id = SagaId("abort-send-fail-saga".to_owned());
+        Box::pin(supervisor.abort_xctx_participants(&saga_id, &mut ctx)).await;
+
+        // The reservation was taken out of ctx and balanced (voided+consumed) by
+        // the abort path — not left in ctx and not dropped unbalanced.
+        assert!(
+            ctx.prepared_a.is_none(),
+            "the abort path must take and balance the reservation (no leftover in ctx)"
+        );
+        // Reaching here without a ticket-drop panic IS the FIX-1 guarantee.
     }
 
     /// §17.16.4 Prepare-in-progress replay aborts the Prepared side(s) and

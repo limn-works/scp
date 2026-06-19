@@ -723,6 +723,43 @@ pub async fn settle_tool_economy_capture(
 /// the per-context actor on owned state. Voids any payment escrow hold,
 /// then reverses the velocity entry, budget deduction, and hard-rate-limit
 /// token consumed by [`reserve_tool_economy`].
+/// Generation-checked Phase-3 rollback. Reverses the reservation against THIS
+/// actor's owned state ONLY if the reservation's `generation` still matches the
+/// live actor's `state.generation`; on a MISMATCH the actor was despawned and a
+/// new instance respawned for the same `context_id` between reserve and this
+/// rollback (e.g. an import replace), so refunding velocity / budget /
+/// hard-rate-limit against THIS instance's owned state would be a
+/// confused-deputy write to the WRONG context instance. On mismatch it voids
+/// only the EXTERNAL escrow (the real payment hold the prior instance authorized
+/// at reserve) and consumes the ticket — exactly mirroring
+/// [`settle_tool_economy`]'s generation guard, but for the failure/abort path.
+///
+/// This is the rollback-path counterpart the saga abort handler and the
+/// Commit-A idempotency-replay branch use: those paths previously called
+/// [`rollback_tool_economy`] directly, which writes local state
+/// unconditionally and would corrupt a respawned (gen N→N+1) instance's economy
+/// state. Returns `true` when the local rollback ran (generations matched),
+/// `false` when only the external escrow was voided (mismatch).
+pub async fn rollback_tool_economy_generation_checked(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    reservation_generation: u64,
+    ticket: ToolEconomyTicket,
+) -> bool {
+    if reservation_generation != state.generation {
+        // Confused-deputy guard (mirrors `settle_tool_economy`): the reservation
+        // belongs to a now-replaced actor instance. Void only the external
+        // escrow and consume; the context-local bookkeeping lived in the gone
+        // instance's `PerContextState` and must NOT be touched here.
+        ticket
+            .void_external_and_consume(deps.payment_adapter.as_ref())
+            .await;
+        return false;
+    }
+    rollback_tool_economy(state, deps, ticket).await;
+    true
+}
+
 pub async fn rollback_tool_economy(
     state: &mut PerContextState,
     deps: &ActorDeps,

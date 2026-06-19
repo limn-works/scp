@@ -669,34 +669,69 @@ pub fn hpke_open_sender_key(
 
 /// Bounded nonce deduplication cache for sender key request replay protection.
 ///
-/// Tracks seen request nonces for up to `NONCE_EXPIRY_SECS` seconds and
-/// caps the stored count at `NONCE_DEDUP_CAPACITY` entries to prevent
-/// memory exhaustion from `DoS` attacks.
+/// Tracks seen request nonces for up to the cache's configured TTL
+/// (`ttl_secs`, defaulting to [`NONCE_EXPIRY_SECS`]) and caps the stored
+/// count at `NONCE_DEDUP_CAPACITY` entries to prevent memory exhaustion from
+/// `DoS` attacks.
+///
+/// The TTL is per-instance so that a consumer whose anti-replay window must
+/// strictly exceed its own freshness/skew tolerance can configure a longer
+/// retention than the default. The §6.2.4 cross-context saga uses
+/// [`Self::with_ttl`] to set its nonce-dedup window to **strictly more than**
+/// its clock-skew tolerance: an in-window (still-fresh) envelope's `nonce`
+/// must always still be remembered, or a post-skew replay carrying a refreshed
+/// timestamp could slip past both the freshness and the dedup gates (the
+/// coterminous-window gap, BLACK-XCTX-01). The sender-key request path keeps
+/// the default ([`NONCE_EXPIRY_SECS`]), where freshness and dedup windows are
+/// deliberately aligned ([`REQUEST_FRESHNESS_SECS`]).
 ///
 /// Callers should call [`NonceDedup::is_replayed`] before processing a
 /// request, then [`NonceDedup::record`] once the request is accepted.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct NonceDedup {
     /// Nonce bytes → Unix timestamp (seconds) when first seen.
     seen: HashMap<[u8; REQUEST_NONCE_SIZE], u64>,
+    /// Eviction TTL in seconds: an entry older than this is pruned and no
+    /// longer counts as a replay. Per-instance so the saga can retain longer
+    /// than the sender-key default (see the type doc).
+    ttl_secs: u64,
+}
+
+impl Default for NonceDedup {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NonceDedup {
-    /// Creates a new, empty dedup cache.
+    /// Creates a new, empty dedup cache with the default
+    /// [`NONCE_EXPIRY_SECS`] TTL (the sender-key request path).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_ttl(NONCE_EXPIRY_SECS)
+    }
+
+    /// Creates a new, empty dedup cache with an explicit eviction TTL in
+    /// seconds. Used by a consumer (e.g. the §6.2.4 cross-context saga) whose
+    /// anti-replay window must strictly exceed its own freshness/skew
+    /// tolerance, so a still-fresh envelope's `nonce` is always still
+    /// remembered.
+    #[must_use]
+    pub fn with_ttl(ttl_secs: u64) -> Self {
         Self {
             seen: HashMap::new(),
+            ttl_secs,
         }
     }
 
-    /// Returns `true` if `nonce` has been seen within `NONCE_EXPIRY_SECS`
-    /// of `now_secs`, indicating a replay attempt.
+    /// Returns `true` if `nonce` has been seen within this cache's TTL
+    /// (`ttl_secs`) of `now_secs`, indicating a replay attempt.
     ///
-    /// Also evicts entries older than `NONCE_EXPIRY_SECS`.
+    /// Also evicts entries older than the TTL.
     pub fn is_replayed(&mut self, nonce: &[u8; REQUEST_NONCE_SIZE], now_secs: u64) -> bool {
+        let ttl = self.ttl_secs;
         self.seen
-            .retain(|_, seen_at| now_secs.saturating_sub(*seen_at) < NONCE_EXPIRY_SECS);
+            .retain(|_, seen_at| now_secs.saturating_sub(*seen_at) < ttl);
         self.seen.contains_key(nonce)
     }
 
@@ -724,14 +759,32 @@ impl NonceDedup {
         self.seen.clone()
     }
 
-    /// Reconstruct a dedup cache from persisted [`Self::entries`]. Entries past
-    /// the TTL are pruned lazily on the next [`Self::is_replayed`] call (no
+    /// Reconstruct a dedup cache from persisted [`Self::entries`] with the
+    /// default [`NONCE_EXPIRY_SECS`] TTL (the sender-key request path). Entries
+    /// past the TTL are pruned lazily on the next [`Self::is_replayed`] call (no
     /// eager prune here — the restoring caller may not have a clock). If the
     /// persisted set somehow exceeds `NONCE_DEDUP_CAPACITY`, the next
     /// [`Self::record`] evicts oldest-first back toward the cap.
     #[must_use]
     pub const fn from_entries(seen: HashMap<[u8; REQUEST_NONCE_SIZE], u64>) -> Self {
-        Self { seen }
+        Self {
+            seen,
+            ttl_secs: NONCE_EXPIRY_SECS,
+        }
+    }
+
+    /// Reconstruct a dedup cache from persisted [`Self::entries`] with an
+    /// explicit eviction TTL in seconds. The §6.2.4 cross-context saga uses
+    /// this on crash-restore so the rehydrated cache keeps the same
+    /// longer-than-skew anti-replay window it had before the crash (the same
+    /// TTL it was created with via [`Self::with_ttl`]). Lazy pruning and
+    /// capacity eviction behave identically to [`Self::from_entries`].
+    #[must_use]
+    pub const fn from_entries_with_ttl(
+        seen: HashMap<[u8; REQUEST_NONCE_SIZE], u64>,
+        ttl_secs: u64,
+    ) -> Self {
+        Self { seen, ttl_secs }
     }
 }
 

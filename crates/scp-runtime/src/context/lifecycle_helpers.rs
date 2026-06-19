@@ -1266,7 +1266,9 @@ pub async fn create_context(
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::new(),
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
+            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+        ),
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
@@ -1845,7 +1847,9 @@ pub async fn import_context(
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::new(),
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
+            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+        ),
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
@@ -2281,13 +2285,16 @@ pub async fn restore_context(
         // ADR-049 §9 Class S: same-node restore REHYDRATES B's anti-replay
         // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
         // ONLY gate against a fresh-`SagaId` replay of a `CrossContextToolInvoke`
-        // within the 5-minute TTL; reinitializing it empty on restore would let
+        // within the dedup TTL; reinitializing it empty on restore would let
         // a crash inside the window re-open a charging-tool replay (BLACK-624-01).
         // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
         // import drops it (the snapshot field is empty), so a foreign node starts
-        // its own window.
-        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::from_entries(
+        // its own window. Rehydrated with the SAGA dedup TTL (strictly longer
+        // than the freshness skew tolerance) so the restored window matches the
+        // live one — see `SAGA_NONCE_DEDUP_TTL_SECS` (BLACK-XCTX-01).
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
             ctx_snapshot.xctx_nonce_dedup,
+            crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
         ),
         // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
         // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution

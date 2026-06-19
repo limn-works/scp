@@ -65,6 +65,23 @@ use crate::context::supervisor::saga_prepared_state::{
 };
 use crate::context::tools_helpers::reserve_tool_economy;
 
+/// Eviction TTL for B's per-target cross-context-saga nonce-dedup cache
+/// ([`PerContextState::xctx_nonce_dedup`]).
+///
+/// Set to **strictly more than** the §9.14 clock-skew tolerance the Prepare-B
+/// freshness check applies (`DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`) — here exactly
+/// twice it. The two windows must NOT be coterminous: were the dedup TTL equal
+/// to the skew tolerance, a `nonce` recorded at the trailing edge of its
+/// freshness window could expire from the dedup cache while a replay carrying a
+/// *refreshed* `asserted_timestamp_ms` is still inside the freshness window —
+/// slipping past both gates (BLACK-XCTX-01). With the TTL strictly exceeding
+/// the skew tolerance, any envelope that passes the freshness check has its
+/// `nonce` still remembered by the dedup cache, closing the coterminous-window
+/// gap for the in-window case. See the *Freshness / anti-replay* clause of
+/// spec §6.2.4 for the forward obligation this leaves for an untrusted
+/// cross-node transport.
+pub(crate) const SAGA_NONCE_DEDUP_TTL_SECS: u64 = DEFAULT_CLOCK_SKEW_TOLERANCE_SECS * 2;
+
 /// Lowercase-hex encode a raw 32-byte context-id digest (the wire / role-state
 /// id-form, never the `"standing-"`-prefixed display string — spec §6.2.4
 /// id-form rule).
@@ -876,6 +893,29 @@ fn validate_input_specificity(
 /// send-time is outside §9.14 clock-skew tolerance OR the nonce is already in
 /// B's TTL dedup cache. Performs the dedup READ only; the accept-path record
 /// happens in [`prepare_b`] after every check passes.
+///
+/// **Window relationship (BLACK-XCTX-01).** The nonce-dedup TTL
+/// ([`SAGA_NONCE_DEDUP_TTL_SECS`]) STRICTLY exceeds this freshness check's
+/// skew tolerance (`DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`), so a `nonce` recorded
+/// at the trailing edge of its freshness window is still remembered by the
+/// dedup cache through the rest of that window — a replay carrying a *refreshed*
+/// `asserted_timestamp_ms` therefore still hits the dedup gate rather than
+/// slipping past a coterminous (equal-length) window.
+///
+/// **Forward obligation (untrusted transport).** `asserted_timestamp_ms` is
+/// caller-asserted and, in the co-resident SDK seam this code implements, the
+/// caller leg is **channel-authenticated** (`caller_did`/`caller_context_id`
+/// are the transport-leg identity, not envelope-asserted — see the §6.2.4
+/// *Cache-eviction bound* clause) and there is no capturable wire envelope, so
+/// exactly-once-per-envelope holds by construction. A future cross-node
+/// child-bridge transport carrying this envelope over an UNTRUSTED link does
+/// NOT satisfy that by construction: the longer-than-skew window bounds, but
+/// does not eliminate, a replay that refreshes the timestamp once the original
+/// `nonce` finally ages out. Before such a transport ships, the asserted
+/// timestamp MUST be AUTHENTICATED/BOUND — signed by the caller, or the dedup
+/// keyed so a replay cannot refresh the freshness window. This forward
+/// obligation is recorded in the spec §6.2.4 *Freshness / anti-replay* clause,
+/// mirroring the ADR-049 §3a forward-obligation discipline.
 fn validate_freshness(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -1128,38 +1168,22 @@ fn commit_b_first_settle(
     let tool_registration_id = prepared.tool_registration_id.clone();
     let target_hex = hex_context_id(&target_context_id);
 
-    // Append `ToolInvoked` to the local (target) log (spec §6.2.4 "Commit"):
-    // caller ctx id / caller DID actor / B's re-derived depth + staged
-    // timestamp. The SagaId-stable event id makes the append idempotent — a
-    // replay short-circuits before reaching here.
-    let tool_invoked_payload = serde_json::json!({
-        "saga_id": saga_id.0,
-        "tool_invoked_event_id": event_id,
-        "caller_context_id": hex_context_id(&caller_context_id),
-        "tool_registration_id": tool_registration_id,
-        "chain_depth": receipt.chain_depth,
-        "timestamp_ms": receipt.timestamp_ms,
-    });
-    // At-append onward: the event log is touched, so any failure is `mutated`.
-    // The staged slot was moved out up front; re-insert the OWNED original on an
-    // append failure so a retry re-runs settle cleanly (no lossy reconstruction).
-    if let Err(e) = deps.event_log.append_context_event_with_payload(
-        &target_context_id,
-        &event_id,
-        &caller_did_str,
-        Some(&tool_invoked_payload),
-    ) {
-        state.saga_pending.insert(
-            saga_id.clone(),
-            SagaPreparedState::CrossContextToolInvocation(prepared),
-        );
-        return Err((true, e));
-    }
+    // Order matters (provenance-integrity): the durable output capture +
+    // Class-S persist land BEFORE the `ToolInvoked` event-log append. The
+    // event log is a SEPARATE provider not covered by `persist_state_fail_closed`
+    // and the append is NOT provider-idempotent, so appending FIRST would
+    // double-append on a persist-failure retry: a persist failure rolls the
+    // capture back and re-stages the slot, the next reserve reports
+    // `ReadyToExecute`, and `commit_b_first_settle` re-runs — re-appending a
+    // SECOND `ToolInvoked` for one saga. Appending only after the capture +
+    // persist succeed makes a persist failure leave NO orphan log entry, so the
+    // retry produces exactly one `ToolInvoked`.
 
     // Durably capture the output + signed receipt keyed by SagaId (§6.2.4
     // "Exactly-once execution with durable output capture"). The staged slot was
     // already removed up front (the session reservation is now applied via the
-    // capture).
+    // capture). No event-log mutation yet — a failure before the append is
+    // recoverable by re-inserting the owned staged slot.
     state.xctx_committed_outputs.insert(
         saga_id.clone(),
         CommittedToolInvocation {
@@ -1173,18 +1197,59 @@ fn commit_b_first_settle(
     // output capture MUST land before the caller learns Commit-B succeeded, or a
     // crash in the coalesce window would re-invoke the tool on replay. On persist
     // failure roll the capture back and RE-INSERT the OWNED original staged slot
-    // verbatim so a retry re-runs settle.
+    // verbatim so a retry re-runs settle. No `ToolInvoked` was appended yet, so
+    // the retry cannot double-append. `mutated = false`: nothing durable landed
+    // (the in-memory capture was just rolled back, no event-log touch).
     if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
         state.xctx_committed_outputs.remove(saga_id);
         state.saga_pending.insert(
             saga_id.clone(),
             SagaPreparedState::CrossContextToolInvocation(prepared),
         );
-        return Err((true, persist_err));
+        return Err((false, persist_err));
     }
 
-    // The capture + persist landed; serializing the receipt for the reply is a
-    // pure encode of already-committed state — a failure here is `mutated`.
+    // Append `ToolInvoked` to the local (target) log (spec §6.2.4 "Commit"):
+    // caller ctx id / caller DID actor / B's re-derived depth + staged
+    // timestamp. Runs ONLY after the capture + persist landed, so it appears
+    // exactly once across retries.
+    let tool_invoked_payload = serde_json::json!({
+        "saga_id": saga_id.0,
+        "tool_invoked_event_id": event_id,
+        "caller_context_id": hex_context_id(&caller_context_id),
+        "tool_registration_id": tool_registration_id,
+        "chain_depth": receipt.chain_depth,
+        "timestamp_ms": receipt.timestamp_ms,
+    });
+    if let Err(e) = deps.event_log.append_context_event_with_payload(
+        &target_context_id,
+        &event_id,
+        &caller_did_str,
+        Some(&tool_invoked_payload),
+    ) {
+        // The append failed AFTER the capture+persist landed. Roll the capture
+        // back and re-stage the owned slot, then RE-PERSIST so the rolled-back
+        // state is durable — otherwise the next reserve would see the
+        // already-persisted capture, report `AlreadyCommitted`, and SKIP the
+        // append forever (a missing `ToolInvoked`). With the compensating
+        // re-persist, the retry sees `ReadyToExecute` and re-runs settle,
+        // appending exactly once. If the compensating persist ALSO fails the
+        // capture stays durable (a genuine fail-closed terminal — the operator /
+        // crash-recovery sweep reconciles), reported `mutated`.
+        state.xctx_committed_outputs.remove(saga_id);
+        state.saga_pending.insert(
+            saga_id.clone(),
+            SagaPreparedState::CrossContextToolInvocation(prepared),
+        );
+        if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
+            return Err((true, persist_err));
+        }
+        return Err((false, e));
+    }
+
+    // The capture + persist + append all landed; serializing the receipt for the
+    // reply is a pure encode of already-committed state — a failure here is
+    // `mutated`.
     let receipt_bytes = jcs_receipt_bytes(&receipt).map_err(|e| (true, e))?;
     Ok(CommitBSettleOutcome {
         receipt: receipt_bytes,
@@ -1289,9 +1354,15 @@ async fn commit_a(
     // than double-settled. (`xctx_committed_invocations` records committed A-side
     // sagas; absent ⇒ first Commit-A.)
     if state.xctx_committed_invocations.contains(&req.saga_id) {
-        crate::context::tools_helpers::rollback_tool_economy(
+        // GENERATION-CHECKED rollback of the handed-back reservation: if this
+        // actor was despawned+respawned between Prepare-A and this replayed
+        // Commit-A, refunding against the new instance's owned state would
+        // corrupt the WRONG context. On a mismatch the helper voids only the
+        // external escrow and consumes the ticket (mirrors `settle_tool_economy`).
+        crate::context::tools_helpers::rollback_tool_economy_generation_checked(
             state,
             deps,
+            req.reservation.reservation.generation,
             req.reservation.reservation.ticket,
         )
         .await;
@@ -1392,10 +1463,18 @@ async fn abort(
     let context_hex = hex_context_id(&state.context_id);
 
     // CALLER side: release the held escrow + outbound-RL reservation (RAII).
+    // Route through the GENERATION-CHECKED rollback: an actor despawn+respawn
+    // (e.g. an import replace) between Prepare-A and this in-flight Abort would
+    // otherwise let the unconditional rollback refund velocity / budget /
+    // hard-rate-limit into the WRONG (respawned) instance's owned state. On a
+    // generation MISMATCH the helper voids only the external escrow and consumes
+    // the ticket, mirroring `settle_tool_economy`'s guard (the prior instance's
+    // local bookkeeping died with it).
     if let Some(prepared) = reservation {
-        crate::context::tools_helpers::rollback_tool_economy(
+        crate::context::tools_helpers::rollback_tool_economy_generation_checked(
             state,
             deps,
+            prepared.reservation.generation,
             prepared.reservation.ticket,
         )
         .await;
@@ -1572,12 +1651,16 @@ mod tests {
     /// Documented configuration ceiling for an inbound §6.2.0.2 rate limit
     /// (`InboundPolicy::max_calls_per_minute`) such that B's per-target nonce
     /// dedup cache stays bounded by its TTL, not by capacity eviction. Derived
-    /// in [`nonce_dedup_replay_bound_holds`] from the cache capacity, the TTL,
-    /// and the required ≥2× safety margin. A higher inbound ceiling than this
-    /// would let a sustained accept rate land more than `NONCE_DEDUP_CAPACITY`
-    /// distinct nonces within `NONCE_EXPIRY_SECS`, evicting still-fresh nonces
-    /// and eroding the replay bound.
-    const MAX_SAFE_INBOUND_CALLS_PER_MINUTE: u64 = 1_000;
+    /// in [`nonce_dedup_replay_bound_holds`] from the cache capacity, the saga
+    /// dedup TTL ([`SAGA_NONCE_DEDUP_TTL_SECS`]), and the required ≥2× safety
+    /// margin. A higher inbound ceiling than this would let a sustained accept
+    /// rate land more than `NONCE_DEDUP_CAPACITY` distinct nonces within
+    /// [`SAGA_NONCE_DEDUP_TTL_SECS`], evicting still-fresh nonces and eroding
+    /// the replay bound. (This ceiling is half of what it would be under the
+    /// sender-key 5-minute TTL: the saga's dedup window is twice the skew
+    /// tolerance — see [`SAGA_NONCE_DEDUP_TTL_SECS`] — so the same capacity
+    /// admits half the per-minute rate at the ≥2× margin.)
+    const MAX_SAFE_INBOUND_CALLS_PER_MINUTE: u64 = 500;
 
     /// Defense-in-depth: the §6.2.4 per-target nonce dedup cache
     /// ([`PerContextState::xctx_nonce_dedup`]) must be bounded by its TTL
@@ -1592,12 +1675,29 @@ mod tests {
     #[test]
     fn nonce_dedup_replay_bound_holds() {
         use scp_protocol::context::tools::interface::DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE;
-        use scp_protocol::crypto::sender_keys::{NONCE_DEDUP_CAPACITY, NONCE_EXPIRY_SECS};
+        use scp_protocol::crypto::sender_keys::NONCE_DEDUP_CAPACITY;
+
+        // The bound is computed against the SAGA dedup TTL — the cache this
+        // invariant protects is `PerContextState::xctx_nonce_dedup`, which is
+        // built with `SAGA_NONCE_DEDUP_TTL_SECS` (strictly longer than the
+        // freshness skew tolerance, BLACK-XCTX-01), NOT the sender-key
+        // `NONCE_EXPIRY_SECS`. A longer window admits more nonces, so the safe
+        // per-minute ceiling is correspondingly lower.
+        const {
+            assert!(
+                SAGA_NONCE_DEDUP_TTL_SECS > DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                "the saga dedup TTL must strictly exceed the freshness skew tolerance \
+                 so an in-window envelope's nonce is always still remembered"
+            );
+        }
 
         // Distinct nonces a caller can land within one TTL window at a given
         // per-minute accept ceiling.
-        let window_minutes = NONCE_EXPIRY_SECS / 60;
-        assert_eq!(window_minutes, 5, "TTL window is 5 minutes (300s)");
+        let window_minutes = SAGA_NONCE_DEDUP_TTL_SECS / 60;
+        assert_eq!(
+            window_minutes, 10,
+            "saga dedup TTL window is 10 minutes (600s)"
+        );
 
         let capacity = NONCE_DEDUP_CAPACITY as u64;
 
@@ -1703,6 +1803,92 @@ mod tests {
     impl_persistence!(OkPersistence, Ok(()));
     impl_persistence!(FailPersistence, Err("induced persist failure".into()));
 
+    /// Event log that COUNTS `ToolInvoked:`-prefixed appends — used to assert a
+    /// Commit-B persist-retry produces EXACTLY ONE `ToolInvoked` (FIX 3).
+    struct CountingEventLog {
+        tool_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
+        fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event: &str,
+            _actor: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            if event.starts_with("ToolInvoked:") {
+                self.tool_invoked_appends
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Persistence that FAILS its first `persist_context` call, then SUCCEEDS —
+    /// drives the Commit-B persist-failure-then-retry path (FIX 3).
+    struct FailFirstPersistence {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ContextPersistence for FailFirstPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err("induced first-persist failure".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
     // --- deps + state fixtures --------------------------------------------
 
     /// Build an `ActorDeps` whose `key_resolver` resolves `issuer_did` to
@@ -1719,6 +1905,50 @@ mod tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+            if did.as_ref() == issuer_did {
+                Some(issuer_key)
+            } else {
+                None
+            }
+        });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            None,
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// Like [`build_deps`] but with caller-supplied event-log + persistence
+    /// providers, so a test can observe event-log appends and drive a
+    /// fail-once persistence (FIX 3 Commit-B persist-retry).
+    async fn build_deps_with_providers(
+        issuer_did: String,
+        issuer_key: ed25519_dalek::VerifyingKey,
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+        persistence: Box<dyn ContextPersistence>,
+    ) -> ActorDeps {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestSagaActor".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
             if did.as_ref() == issuer_did {
                 Some(issuer_key)
@@ -2451,10 +2681,15 @@ mod tests {
         );
 
         // Simulate restore: a FRESH actor state whose nonce-dedup is rehydrated
-        // from the snapshot (mirrors `restore_context`'s `NonceDedup::from_entries`).
+        // from the snapshot (mirrors `restore_context`'s
+        // `NonceDedup::from_entries_with_ttl` — the saga dedup TTL, strictly
+        // longer than the freshness skew tolerance, is preserved on restore).
         let mut restored = target_state(0x6A, OTHER, CALLER).await;
         restored.xctx_nonce_dedup =
-            scp_protocol::crypto::sender_keys::NonceDedup::from_entries(snapshot.xctx_nonce_dedup);
+            scp_protocol::crypto::sender_keys::NonceDedup::from_entries_with_ttl(
+                snapshot.xctx_nonce_dedup,
+                SAGA_NONCE_DEDUP_TTL_SECS,
+            );
 
         // Re-submit the SAME envelope under a FRESH SagaId after the "crash".
         let mut replay = prepare_b_request(0x6A, None, 2, now_ms);
@@ -2868,6 +3103,132 @@ mod tests {
         rx.await.unwrap().expect("abort-a ack");
     }
 
+    /// FIX 2 (confused-deputy): the abort handler rolls back the held
+    /// reservation through the GENERATION-CHECKED path. If the actor was
+    /// despawned+respawned (generation bumped) between Prepare-A and an
+    /// in-flight Abort, the rollback MUST NOT refund velocity/budget/rate-limit
+    /// against the new instance's owned state — it voids only the external
+    /// escrow and consumes the ticket (no panic). A MATCHING generation rolls
+    /// back locally as before.
+    #[tokio::test]
+    async fn rollback_generation_checked_voids_external_not_local_on_mismatch() {
+        use crate::context::tools_helpers::rollback_tool_economy_generation_checked;
+
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xD1, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        // Reservation made at the live generation (0).
+        let (tx, rx) = oneshot::channel();
+        prepare_a(
+            &mut st,
+            &deps,
+            &[0xD1; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            tx,
+        )
+        .await;
+        let prepared_match = rx.await.unwrap().expect("prepared-A (match)");
+        let gen_match = prepared_match.reservation.generation;
+        assert_eq!(
+            gen_match, st.generation,
+            "reservation made at live generation"
+        );
+
+        // Generations MATCH ⇒ local rollback runs.
+        let ran_local = rollback_tool_economy_generation_checked(
+            &mut st,
+            &deps,
+            prepared_match.reservation.generation,
+            prepared_match.reservation.ticket,
+        )
+        .await;
+        assert!(ran_local, "matching generation must run the local rollback");
+
+        // A second reservation, then SIMULATE a despawn+respawn by bumping the
+        // live generation. The reservation now carries the STALE generation.
+        let (tx, rx) = oneshot::channel();
+        prepare_a(
+            &mut st,
+            &deps,
+            &[0xD1; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            tx,
+        )
+        .await;
+        let prepared_stale = rx.await.unwrap().expect("prepared-A (stale)");
+        let stale_gen = prepared_stale.reservation.generation;
+        st.generation = st.generation.wrapping_add(1);
+        assert_ne!(
+            stale_gen, st.generation,
+            "the respawn bumped the live generation past the reservation's"
+        );
+
+        // Generations MISMATCH ⇒ external-only (local untouched), ticket consumed
+        // (no unbalanced-drop panic). Routing through the saga `abort` handler
+        // would call `rollback_tool_economy` directly without this guard.
+        let ran_local = rollback_tool_economy_generation_checked(
+            &mut st,
+            &deps,
+            stale_gen,
+            prepared_stale.reservation.ticket,
+        )
+        .await;
+        assert!(
+            !ran_local,
+            "a generation mismatch must NOT run the local rollback (confused-deputy guard)"
+        );
+        // Reaching here without a Drop panic ⇒ the ticket was consumed on the
+        // external-only path.
+    }
+
+    /// FIX 2 end-to-end: the saga `abort` handler tolerates a
+    /// generation-mismatched reservation (despawn+respawn between Prepare-A and
+    /// Abort) without panicking on the ticket's unbalanced-drop guard, and acks.
+    #[tokio::test]
+    async fn abort_a_side_with_stale_generation_does_not_panic() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xD2, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        let (tx, rx) = oneshot::channel();
+        prepare_a(
+            &mut st,
+            &deps,
+            &[0xD2; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            tx,
+        )
+        .await;
+        let prepared = rx.await.unwrap().expect("prepared-A");
+
+        // Simulate the despawn+respawn: bump the live generation past the
+        // reservation's.
+        st.generation = st.generation.wrapping_add(1);
+
+        let saga = SagaId("saga-abort-stale-gen".to_owned());
+        let (tx, rx) = oneshot::channel();
+        let out = abort(&mut st, &deps, &saga, Some(prepared), tx).await;
+        assert!(out.result.is_ok(), "abort with stale gen: {:?}", out.result);
+        rx.await.unwrap().expect("abort ack");
+        // No panic ⇒ the generation-checked rollback voided external + consumed.
+    }
+
     #[tokio::test]
     async fn emit_divergence_marker_appends_verifiable_marker() {
         use scp_protocol::context::tools::cross_context_saga::CrossContextDivergenceMarker;
@@ -2965,6 +3326,82 @@ mod tests {
         // The capture was rolled back; the staged slot restored for a retry.
         assert!(!st.xctx_committed_outputs.contains_key(&saga));
         assert!(st.saga_pending.contains_key(&saga));
+    }
+
+    /// FIX 3 (provenance-integrity): a Commit-B persist FAILURE followed by a
+    /// successful RETRY appends EXACTLY ONE `ToolInvoked`. The `ToolInvoked`
+    /// event-log append (a separate, non-idempotent provider) is sequenced AFTER
+    /// the durable capture + Class-S persist succeed, so a persist failure leaves
+    /// no orphan log entry to double-append on retry.
+    #[tokio::test]
+    async fn commit_b_persist_retry_appends_tool_invoked_exactly_once() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut st = target_state(0xCD, OTHER, CALLER).await;
+        let saga = SagaId("saga-persist-retry-once".to_owned());
+
+        // Stage Prepare-B with an Ok persistence + a throwaway event log (the
+        // stage append is a `Prepared`-class event, not `ToolInvoked`).
+        let stage_deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = stage_deps.clock.now_millis();
+        stage_prepared_b(&mut st, &stage_deps, 0xCD, &saga.0, now_ms).await;
+
+        // Settle deps: a counting event log + a persistence that FAILS the first
+        // call then succeeds. Both providers live behind the same shared counter.
+        let tool_invoked_appends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let settle_deps = build_deps_with_providers(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(CountingEventLog {
+                tool_invoked_appends: Arc::clone(&tool_invoked_appends),
+            }),
+            Box::new(FailFirstPersistence {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        )
+        .await;
+        let output = br#"{"result":7}"#.to_vec();
+        let signing = signing_key_bytes(0xAA);
+
+        // FIRST settle: the persist fails BEFORE the append — capture rolled back,
+        // staged slot restored, and (FIX 3) NO `ToolInvoked` appended.
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_settle(&mut st, &settle_deps, &saga, output.clone(), &signing, tx).await;
+        assert!(
+            out.result.is_err(),
+            "first settle must fail-close on persist"
+        );
+        let err = rx.await.unwrap().expect_err("first settle persist failure");
+        assert!(matches!(err, ContextError::PersistenceFailed(_)));
+        assert_eq!(
+            tool_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a persist failure must NOT append ToolInvoked (append is sequenced after persist)"
+        );
+        assert!(!st.xctx_committed_outputs.contains_key(&saga));
+        assert!(st.saga_pending.contains_key(&saga));
+
+        // RETRY settle on the SAME deps (the persistence now succeeds): capture
+        // lands, persist succeeds, and `ToolInvoked` appends EXACTLY ONCE.
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_settle(&mut st, &settle_deps, &saga, output, &signing, tx).await;
+        assert!(
+            out.result.is_ok(),
+            "retry settle must succeed: {:?}",
+            out.result
+        );
+        rx.await.unwrap().expect("retry settle ack");
+        assert_eq!(
+            tool_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a persist-failure-then-retry Commit-B must append ToolInvoked EXACTLY ONCE"
+        );
+        assert!(st.xctx_committed_outputs.contains_key(&saga));
+        assert!(!st.saga_pending.contains_key(&saga));
     }
 
     /// FIX 6 (simplifier): a Commit-B settle persist-failure rollback RE-INSERTS
