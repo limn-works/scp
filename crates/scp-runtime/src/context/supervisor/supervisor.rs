@@ -5403,10 +5403,13 @@ impl Supervisor {
 
     async fn recover_saga_entry(&self, entry: JournalEntry) {
         match entry.state {
-            SagaState::Initiated | SagaState::PreparingA => {
-                // No remote side-effects yet — discard by marking
-                // Aborted. `secret_bearing` classifies the resolution
-                // marker for secure-evidence overwrite.
+            SagaState::Initiated => {
+                // Truly no remote side-effects: Prepare-A was never
+                // dispatched. The FSM journals `Initiated` (seq 0) BEFORE the
+                // first `dispatch_prepare_phase`, so an `Initiated` crash leaves
+                // the durable economy untouched — discard by marking Aborted.
+                // `secret_bearing` classifies the resolution marker for
+                // secure-evidence overwrite.
                 let _ = self
                     .saga_journal
                     .mark_resolved(
@@ -5418,8 +5421,34 @@ impl Supervisor {
                 tracing::info!(
                     saga_id = %entry.saga_id,
                     state = ?entry.state,
-                    "saga recovery — discarded (no remote side-effects)"
+                    "saga recovery — discarded (Initiated: Prepare-A never dispatched, no \
+                     remote side-effects)"
                 );
+            }
+            SagaState::PreparingA => {
+                // Prepare-A DURABLY persisted the caller deduction + the
+                // `CallerReservationRecord` (actor `prepare_a`) into the
+                // per-context Class-S snapshot BEFORE the FSM appended the
+                // `PreparingB` journal entry, so a crash in that window can
+                // leave a LIVE durable reservation while the journal's latest
+                // state is `PreparingA`. Marking terminal-`Aborted` here (which
+                // asserts "fully compensated") would STRAND that deduction +
+                // record forever (the §17.16.4 sweep re-drives only NON-terminal
+                // journals → a permanent silent over-charge).
+                //
+                // A `PreparingA` xctx entry journals the SAME caller-provenance
+                // triple as `PreparingB` (`saga_input_participants`), so route it
+                // through the SAME record-keyed reversal-and-confirm path. With
+                // empty `PreparingA` evidence (`&[]`), `reconstruct_xctx_prepared`
+                // returns `None` → the path falls to
+                // `xctx_caller_hex_from_participants` →
+                // `redrive_caller_local_reversal`: it reverses the caller's LOCAL
+                // economy from the durable record and marks terminal ONLY on a
+                // confirmed `SettledOrAbsent` (or a persistence-deleted caller),
+                // else leaves the journal non-terminal for a later sweep. A
+                // non-xctx `PreparingA` (no caller participant triple) →
+                // `SettledOrAbsent` → safe terminal.
+                self.recover_preparing_b_entry(&entry).await;
             }
             SagaState::PreparingB => {
                 self.recover_preparing_b_entry(&entry).await;
@@ -5461,7 +5490,17 @@ impl Supervisor {
         }
     }
 
-    /// §17.16.4 Prepare-in-progress recovery for a `PreparingB` journal entry.
+    /// §17.16.4 Prepare-in-progress recovery for a `PreparingA` OR `PreparingB`
+    /// journal entry.
+    ///
+    /// Both states share the same record-keyed reversal-and-confirm reconciliation:
+    /// `PreparingA` already DURABLY staged the caller deduction + reservation record
+    /// (actor `prepare_a`, before the FSM's `PreparingB` journal append), so a crash
+    /// at either state can leave a live durable reservation. The `recover_saga_entry`
+    /// `PreparingA` arm routes here precisely because a `PreparingA` xctx entry
+    /// journals the SAME caller-provenance triple as `PreparingB`; with empty
+    /// `PreparingA` evidence the `reconstruct_xctx_prepared` path is skipped and the
+    /// participant-keyed `redrive_caller_local_reversal` performs the reversal.
     ///
     /// Actor A (and possibly B) staged reservations but the Commit never left the
     /// coordinator. Abort the Prepared side(s) — releasing the staged
@@ -5579,9 +5618,10 @@ impl Supervisor {
                     .await;
                 tracing::warn!(
                     saga_id = %entry.saga_id,
+                    state = ?entry.state,
                     context = %caller_hex,
-                    "saga recovery — PreparingB (Prepare-in-progress) observed but the \
-                     caller context is ABSENT from durable persistence (permanently \
+                    "saga recovery — Prepare-in-progress (PreparingA/PreparingB) observed but \
+                     the caller context is ABSENT from durable persistence (permanently \
                      deleted): its caller reservation record died with the context, so \
                      there is nothing to reverse — reaping the saga as terminal-Aborted \
                      (NOT leaving it to never-reap)"
@@ -5599,7 +5639,8 @@ impl Supervisor {
             tracing::warn!(
                 event = "xctx_caller_reversal_outstanding",
                 saga_id = %entry.saga_id,
-                "saga recovery — PreparingB (Prepare-in-progress) observed but the \
+                state = ?entry.state,
+                "saga recovery — Prepare-in-progress (PreparingA/PreparingB) observed but the \
                  caller-side LOCAL-economy reversal could not be delivered (caller not \
                  yet restored / backpressure); leaving the journal NON-terminal so a \
                  later crash-recovery sweep re-drives it (NOT marking terminal-Aborted \
@@ -5618,8 +5659,9 @@ impl Supervisor {
             .await;
         tracing::warn!(
             saga_id = %entry.saga_id,
-            "saga recovery — PreparingB (Prepare-in-progress) observed; aborted the \
-             Prepared side(s), confirmed the caller reversal, and discarded (never \
+            state = ?entry.state,
+            "saga recovery — Prepare-in-progress (PreparingA/PreparingB) observed; aborted \
+             the Prepared side(s), confirmed the caller reversal, and discarded (never \
              re-Prepared)"
         );
     }
@@ -5767,8 +5809,10 @@ impl Supervisor {
     ///
     /// To avoid misclassifying a `BroadcastHostingHandshake` (also length 3,
     /// also `hex(...)` first element) as a cross-context caller, this is used
-    /// ONLY on a `PreparingB` entry whose evidence FAILED to reconstruct as the
-    /// xctx prepared wire: the broadcast-hosting saga journals NO
+    /// ONLY on a `PreparingA` or `PreparingB` entry whose evidence FAILED to
+    /// reconstruct as the xctx prepared wire (a `PreparingA` entry ALWAYS has
+    /// empty evidence, so it always reaches this participant-keyed discriminant):
+    /// the broadcast-hosting saga journals NO
     /// `CrossContextToolInvocationPrepared` evidence at all (its evidence either
     /// decodes as xctx — handled by the `Some` arm — or is genuinely a different
     /// saga). The length-3 + 64-hex shape is therefore a sound discriminant for
@@ -17598,6 +17642,310 @@ mod tests {
             !unresolved.iter().any(|e| e.saga_id == saga_id),
             "a CONFIRMED caller reversal lets recovery mark the journal terminal-Aborted (the \
              saga is resolved, no longer in load_unresolved)"
+        );
+    }
+
+    /// §6.2.4 review wave-23 — CRASH-RECOVERY in the `PreparingA` window.
+    /// The FSM journals `PreparingA` (seq 1) BEFORE dispatching Prepare-A, and
+    /// Prepare-A DURABLY persists the caller deduction + the
+    /// `CallerReservationRecord` into the Class-S snapshot BEFORE the FSM appends
+    /// the `PreparingB` entry (seq 2). A crash in that window leaves the journal's
+    /// latest state at `PreparingA` over a LIVE durable reservation.
+    ///
+    /// PRE-FIX the `recover_saga_entry` arm treated `Initiated | PreparingA`
+    /// identically and marked terminal-`Aborted` UNCONDITIONALLY ("no remote
+    /// side-effects yet"). For `PreparingA` that is FALSE: the terminal marker
+    /// asserts "fully compensated" while the caller deduction + record are still
+    /// live, so the §17.16.4 sweep (which re-drives ONLY non-terminal journals)
+    /// can never reverse them — a permanent silent over-charge + leaked record.
+    ///
+    /// The fix routes `PreparingA` through the SAME record-keyed reversal-and-
+    /// confirm path as `PreparingB` (`recover_preparing_b_entry`). A `PreparingA`
+    /// xctx entry journals the SAME caller-provenance TRIPLE
+    /// (`saga_input_participants`: `[caller_hex, caller_did, tool_id]`) and EMPTY
+    /// evidence (`&[]`), so `reconstruct_xctx_prepared` returns `None` and the
+    /// participant-keyed `redrive_caller_local_reversal` reverses the caller's
+    /// LOCAL economy from the durable record. RESIDENT caller (this test): the
+    /// re-drive DELIVERS, the record is reversed + consumed, and ONLY THEN the
+    /// journal is marked terminal-`Aborted`. PRE-FIX the deduction was stranded
+    /// and the record leaked.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full recovery E2E: reserve + journal + recover + assert
+    async fn crash_recovery_preparing_a_resident_caller_reverses_then_marks_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkXctxWave23PrepACreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWave23PrepACaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("wave23-preparing-a-resident-saga".to_owned());
+        // The REAL FSM journals a cross-context entry's participants as the
+        // caller-provenance TRIPLE `[caller_hex, caller_did, tool_id]`
+        // (`saga_input_participants`), NOT the 2-element `[caller, target]` set
+        // the wave-15 PreparingB tests hand-built (they relied on the
+        // evidence-reconstruction path). A PreparingA entry has EMPTY evidence, so
+        // the reversal MUST come through the participant-keyed path — which
+        // REQUIRES the genuine length-3 triple here.
+        let participants = vec![
+            caller_hex.clone(),
+            caller_did.to_owned(),
+            XCTX_TOOL.to_owned(),
+        ];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        // Journal `Initiated` (seq 0) then `PreparingA` (seq 1) with EMPTY
+        // evidence — EXACTLY the FSM's pre-dispatch journal shape (the FSM appends
+        // `PreparingA` with `&[]` BEFORE `dispatch_prepare_phase(A)`).
+        supervisor
+            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await
+            .expect("journal Initiated");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
+            .await
+            .expect("journal PreparingA");
+
+        // Real Prepare-A: durably stages the caller deduction + reservation
+        // record on the live caller actor (the durable state a crash in the
+        // PreparingA window leaves behind). Balance the returned carrier
+        // immediately (lost-reply shape) so its #[must_use] drop guard does not
+        // fire; the durable record is what recovery reverses.
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        let burst_milli = {
+            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+            let token_after_reserve = snap
+                .hard_rate_limit_state
+                .get(caller_did)
+                .map(|(tokens, _)| *tokens)
+                .expect("reserve created a hard-rate-limit entry");
+            assert!(
+                snap.xctx_caller_reservations.contains_key(&saga_id),
+                "Prepare-A staged the durable caller reservation record"
+            );
+            token_after_reserve + 1000 // one token = 1000 milli-tokens
+        };
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+
+        // Drive the REAL crash-recovery dispatcher on a `PreparingA` entry with
+        // EMPTY evidence (the genuine FSM journal shape). The caller stays
+        // RESIDENT (restore-before-replay ordering).
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingA,
+            participants: participants.clone(),
+            evidence: Zeroizing::new(Vec::new()),
+            timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            seq_per_saga: 1,
+        };
+        supervisor.recover_saga_entry(entry).await;
+
+        // CORE: the record-based reversal RAN — the hard-rate-limit token is
+        // refunded to full burst and the durable record is consumed. PRE-FIX the
+        // PreparingA arm marked terminal-Aborted WITHOUT reversing, so the token
+        // stayed deducted and the record leaked ⇒ these assertions FAIL.
+        let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        let token_after = snap
+            .hard_rate_limit_state
+            .get(caller_did)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after recovery");
+        assert_eq!(
+            token_after, burst_milli,
+            "the resident-caller PreparingA recovery MUST reverse the caller's LOCAL economy from \
+             the durable record (refund to full burst) — the caller is NOT over-charged. PRE-FIX \
+             the unconditional-Aborted PreparingA arm stranded this deduction forever"
+        );
+        assert!(
+            !snap.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable CallerReservationRecord MUST be consumed by the PreparingA recovery \
+             reversal (PRE-FIX it leaked — the arm never touched it)"
+        );
+
+        // The reversal was CONFIRMED, so the journal IS marked terminal-Aborted
+        // and the saga drops out of load_unresolved.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga_id),
+            "a CONFIRMED caller reversal lets PreparingA recovery mark the journal terminal-\
+             Aborted (the saga is resolved, no longer in load_unresolved)"
+        );
+    }
+
+    /// §6.2.4 review wave-23 companion — `PreparingA` crash with a NON-RESIDENT
+    /// caller (despawned before recovery, modelling `replay_unresolved_sagas`
+    /// running before the caller is restored). The record-keyed re-drive `lookup`
+    /// misses ⇒ the reversal is outstanding ⇒ the journal MUST be LEFT
+    /// non-terminal at `PreparingA` so a later sweep re-drives it after a respawn.
+    /// PRE-FIX the unconditional-Aborted arm marked it terminal, dropping it out
+    /// of `load_unresolved` and stranding the durable deduction forever.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full recovery E2E: reserve + journal + despawn + recover + assert
+    async fn crash_recovery_preparing_a_non_resident_caller_left_non_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkXctxWave23PrepANonResCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWave23PrepANonResCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("wave23-preparing-a-nonresident-saga".to_owned());
+        let participants = vec![
+            caller_hex.clone(),
+            caller_did.to_owned(),
+            XCTX_TOOL.to_owned(),
+        ];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        supervisor
+            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await
+            .expect("journal Initiated");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
+            .await
+            .expect("journal PreparingA");
+
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+        let snap_before = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        assert!(
+            snap_before.xctx_caller_reservations.contains_key(&saga_id),
+            "Prepare-A staged the durable caller reservation record"
+        );
+
+        // Despawn the caller BEFORE recovery so the record-keyed re-drive lookup
+        // misses (restore-after-replay ordering). The caller context's snapshot
+        // is STILL PRESENT in persistence (it was not deleted), so recovery must
+        // distinguish "not yet restored" from "permanently deleted" and leave the
+        // journal non-terminal (NOT reap it).
+        assert!(
+            supervisor.actors.remove(&caller_hex).is_some(),
+            "caller actor despawned to simulate restore-after-replay ordering"
+        );
+
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingA,
+            participants: participants.clone(),
+            evidence: Zeroizing::new(Vec::new()),
+            timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            seq_per_saga: 1,
+        };
+        supervisor.recover_saga_entry(entry).await;
+
+        // The journal MUST stay NON-terminal at PreparingA (still in
+        // load_unresolved) so the next sweep — after the caller is restored —
+        // re-drives the reversal. PRE-FIX recover_saga_entry marked terminal-
+        // Aborted UNCONDITIONALLY, stranding the durable deduction forever.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        let found = unresolved.iter().find(|e| e.saga_id == saga_id).expect(
+            "the non-resident-caller PreparingA saga MUST remain UNRESOLVED (not terminal-Aborted) \
+             so a later crash-recovery sweep re-drives the caller's LOCAL economy reversal",
+        );
+        assert_eq!(
+            found.state,
+            SagaState::PreparingA,
+            "the journal must stay at the sweep-redrivable PreparingA state, not advance to \
+             terminal-Aborted while the caller reversal is outstanding"
+        );
+        // The durable record is UNTOUCHED (reversal never ran against the missing
+        // actor), so a respawn + sweep can still reverse it.
+        let snap_after = persistence
+            .snapshots
+            .get(&caller_hex)
+            .map(|e| e.value().clone())
+            .expect("the despawned caller's last persisted snapshot is retained");
+        assert!(
+            snap_after.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable record survives a non-resident-caller PreparingA recovery so the next \
+             sweep can still reverse it (the reversal did not silently run against a missing actor)"
         );
     }
 

@@ -317,6 +317,32 @@ fi
 # acknowledging (or be allowlisted). Space-separated awk-regex tokens; each is
 # matched literally as a substring (regex metachars escaped where present).
 # Keep this list and the header in sync.
+#
+# RECEIVER-ALIAS RESISTANCE (wave-23). A receiver-prefixed marker like
+# `role_state.ceiling=` or `membership.remove_member(` is DEFEATED by idiomatic
+# mutable-alias rebinding: `let rs = &mut state.role_state; rs.ceiling = ...` or
+# `let m = &mut state.membership; m.remove_member(...)` carry NO
+# `role_state.`/`membership.` prefix on the mutation line, so the receiver-pinned
+# marker misses while the non-`execute_` Class-S handlers (prepare_a / prepare_b /
+# apply_pending_ceiling_modification) have NO GOVHIT backstop. Closed two ways:
+#   - The CEILING assignment marker is now ALSO present receiver-AGNOSTICALLY as
+#     `.ceiling=` (every `.ceiling =` in the scan dir is a `role_state.ceiling`
+#     write; reads normalize to `.ceiling(`/`.ceiling\x01` so cannot match). The
+#     original `role_state.ceiling=` is retained (a redundant subset) so coverage
+#     is only ever ADDED.
+#   - The UNIQUELY-named state-field MUTATION markers (membership.remove_member,
+#     executed_proposals.insert, threshold_signers.retain, saga_pending.insert/
+#     remove, xctx_nonce_dedup.record, xctx_caller_reservations.insert) each gain
+#     a `&mut.<field>` companion that matches the MUTABLE-ALIAS BORROW at its
+#     borrow site. `normalize_borrow` collapses `&mut <recv>.<field>` (any
+#     receiver path) to the canonical `&mut.<field>` token before the marker
+#     scan, so the borrow that creates the alias is caught regardless of the
+#     later mutation methods name. This is mutation-specific: a READ alias borrows
+#     `&<recv>.<field>` (SHARED, no `&mut`) and so never collapses — read-only
+#     accessors (`.get`/`.clone`/`.contains_key`/snapshot rehydration) are NOT
+#     false-flagged. The `&mut.<field>` form also dodges the method-name collision
+#     that a receiver-agnostic `.remove_member(` would have with the unrelated MLS
+#     `crypto.remove_member(` (a different method on a different receiver).
 # ---------------------------------------------------------------------------
 MUTATORS="commit_spending_ucan_nonce( \
 enforce_economy( \
@@ -334,7 +360,14 @@ saga_pending.remove( \
 xctx_nonce_dedup.record( \
 xctx_caller_reservations.insert( \
 threshold_value= \
-role_state.ceiling="
+role_state.ceiling= \
+.ceiling= \
+&mut.membership \
+&mut.executed_proposals \
+&mut.threshold_signers \
+&mut.saga_pending \
+&mut.xctx_nonce_dedup \
+&mut.xctx_caller_reservations"
 
 # Allowlisted pass-through MUTATION HELPERS (acknowledging caller persists).
 # Those that are CALL-STYLE pass-throughs (callers route a Class-S mutation
@@ -769,6 +802,30 @@ scan_file() {
         gsub(/[[:space:]]*=[[:space:]]*/, "=", t)
         return t
     }
+    # normalize_borrow — collapse a MUTABLE-ALIAS BORROW of a uniquely-named
+    # Class-S state field, `&mut <recv-path>.<field>`, to the canonical
+    # receiver-agnostic token `&mut.<field>`, so the field-mutation markers catch
+    # the alias at its BORROW site regardless of how the alias is later spelled
+    # (`let m = &mut state.membership; m.remove_member(...)`). Only the EXCLUSIVE
+    # borrow form is collapsed: a SHARED read alias is `&<recv>.<field>` (no
+    # `mut`), so reads / read accessors (`.get` / `.clone` / `.contains_key` /
+    # snapshot rehydration) never match. The receiver path
+    # (`[A-Za-z_][A-Za-z0-9_.]*`) is consumed greedily up to the FINAL `.<field>`
+    # segment, so `&mut self.state.membership` collapses the same as
+    # `&mut state.membership`. The replacement spec `\&...` emits a literal `&`
+    # (an unescaped `&` in gsub means the matched text). Applied to the
+    # assignment-normalized COPY only, so consuming a trailing boundary byte here
+    # cannot perturb the statement-termination recount (it runs on chain_buf).
+    function normalize_borrow(s,   t) {
+        t = s
+        gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.membership/, "\\&mut.membership", t)
+        gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.executed_proposals/, "\\&mut.executed_proposals", t)
+        gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.threshold_signers/, "\\&mut.threshold_signers", t)
+        gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.saga_pending/, "\\&mut.saga_pending", t)
+        gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.xctx_nonce_dedup/, "\\&mut.xctx_nonce_dedup", t)
+        gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.xctx_caller_reservations/, "\\&mut.xctx_caller_reservations", t)
+        return t
+    }
     # strip_code — return the CODE SKELETON of one physical line: the line with
     # the CONTENT of every comment and literal removed, so that braces, parens,
     # quotes, and the `;` terminator that live INSIDE a literal or comment are
@@ -1003,6 +1060,17 @@ scan_file() {
     }
     BEGIN {
         SQ = sprintf("%c", 39)   # single-quote char (kept out of awk source)
+        # FNQUAL — the FULL fn-qualifier-run PREFIX an item-defining fn signature
+        # may carry: optional `pub` / `pub(..)` visibility, then any run of
+        # `const` / `unsafe` / `async` / `extern "ABI"` qualifiers, then `fn` and
+        # its trailing space. Hoisted to a single BEGIN-assigned string (the same
+        # idiom is_column0_mod_decl uses for `vis`) so the fn-DETECT match and the
+        # fn-NAME-strip below cannot silently desync — a prior copy-paste kept this
+        # run written verbatim TWICE, where editing one copy and not the other
+        # would break match-vs-extract agreement. The string form needs DOUBLED
+        # backslashes (`\\(`) and escaped quotes (`\"`) so the awk regex compiles
+        # to the byte-identical pattern the two inline literals used.
+        FNQUAL = "^(pub[[:space:]]*(\\([^)]*\\))?[[:space:]]+)?((const|unsafe|async)[[:space:]]+|extern([[:space:]]+\"[^\"]*\")?[[:space:]]+)*fn[[:space:]]+"
         block_depth = 0
         in_raw_string = 0
         raw_hash = 0
@@ -1428,9 +1496,9 @@ scan_file() {
         # not the non-convergent one-more-spelling pattern.
         if (!in_fn) {
             det = peel_leading_attrs(line)
-            if (det ~ /^(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?((const|unsafe|async)[[:space:]]+|extern([[:space:]]+"[^"]*")?[[:space:]]+)*fn[[:space:]]+[A-Za-z0-9_]+/) {
+            if (det ~ (FNQUAL "[A-Za-z0-9_]+")) {
                 tmp = det
-                sub(/^(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?((const|unsafe|async)[[:space:]]+|extern([[:space:]]+"[^"]*")?[[:space:]]+)*fn[[:space:]]+/, "", tmp)
+                sub(FNQUAL, "", tmp)
                 sub(/[^A-Za-z0-9_].*$/, "", tmp)
                 pending_fn = tmp
                 pending_line = NR
@@ -1549,7 +1617,7 @@ scan_file() {
                 chain_buf = line
             }
 
-            mline = normalize_assign(chain_buf)
+            mline = normalize_borrow(normalize_assign(chain_buf))
             for (mi = 1; mi <= nm; mi++) {
                 if (marr[mi] != "" && index(mline, marr[mi]) > 0) { fn_mutates = 1; break }
             }
@@ -2030,6 +2098,82 @@ self_test() {
         printf '    persist_state_best_effort(state, deps, ctx);\n'
         printf '}\n'
     } > "$fdir/match_arm_guard.rs"
+
+    # (60) RECEIVER-ALIASED CEILING WRITE (wave-23 black-hat bypass). A ceiling
+    # lowering through a `let rs = &mut state.role_state; rs.ceiling = ...` alias
+    # carries NO `role_state.ceiling=` prefix on the write line, so PRE-fix the
+    # receiver-pinned marker missed it (a non-execute_ handler with no GOVHIT
+    # backstop). The receiver-AGNOSTIC `.ceiling=` marker MUST catch the aliased
+    # best-effort write (HIT). Named non-execute_ so GOVHIT cannot mask it.
+    {
+        printf 'pub fn aliased_ceiling_fixture() {\n'
+        printf '    let rs = &mut state.role_state;\n'
+        printf '    rs.ceiling = CapabilityCeiling::new(lowered);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/aliased_ceiling.rs"
+
+    # (61) RECEIVER-ALIASED xctx_caller_reservations INSERT. The reservation is
+    # staged through a `let resv = &mut state.xctx_caller_reservations;
+    # resv.insert(...)` alias, so the `xctx_caller_reservations.insert(` marker
+    # misses on the insert line. The `&mut.xctx_caller_reservations` companion
+    # MUST catch the mutable-alias BORROW (HIT). Best-effort persist.
+    {
+        printf 'pub fn aliased_xctx_reservation_fixture() {\n'
+        printf '    let resv = &mut state.xctx_caller_reservations;\n'
+        printf '    resv.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/aliased_xctx_reservation.rs"
+
+    # (62) RECEIVER-ALIASED saga_pending INSERT — same evasion via `let sp = &mut
+    # state.saga_pending; sp.insert(...)`. The `&mut.saga_pending` companion MUST
+    # catch the borrow (HIT). Best-effort persist.
+    {
+        printf 'pub fn aliased_saga_pending_fixture() {\n'
+        printf '    let sp = &mut state.saga_pending;\n'
+        printf '    sp.insert(saga_id, pending);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/aliased_saga_pending.rs"
+
+    # (63) RECEIVER-ALIASED membership REMOVE — `let m = &mut state.membership;
+    # m.remove_member(...)`. A receiver-agnostic `.remove_member(` marker would
+    # collide with the unrelated MLS `crypto.remove_member(`; the
+    # `&mut.membership` borrow companion catches the alias WITHOUT that collision
+    # (HIT). Best-effort persist.
+    {
+        printf 'pub fn aliased_membership_remove_fixture() {\n'
+        printf '    let m = &mut state.membership;\n'
+        printf '    m.remove_member(member_did);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/aliased_membership_remove.rs"
+
+    # (64) READ-ALIAS CONTROL — a SHARED borrow `let r = &state.membership;`
+    # followed by a READ (`r.contains_key`) MUST NOT be flagged: the borrow is
+    # `&` (shared), not `&mut`, so `normalize_borrow` leaves it untouched and no
+    # `&mut.membership` token appears. Guards the read-vs-write precision of the
+    # companion markers. Best-effort persist (a pure read need not fail-close).
+    {
+        printf 'pub fn read_alias_membership_fixture() {\n'
+        printf '    let r = &state.membership;\n'
+        printf '    let present = r.contains_key(member_did);\n'
+        printf '    let _ = present;\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/read_alias_membership.rs"
+
+    # (65) RECEIVER-ALIASED xctx_caller_reservations INSERT that DOES fail-close
+    # MUST NOT be flagged — the companion borrow marker must still honour a
+    # fail-closed persist (no false positive on a correctly-persisted alias).
+    {
+        printf 'pub fn aliased_xctx_reservation_fixed_fixture() {\n'
+        printf '    let resv = &mut state.xctx_caller_reservations;\n'
+        printf '    resv.insert(saga_id, record);\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+    } > "$fdir/aliased_xctx_reservation_fixed.rs"
 
     # (8) Round-9 keystone — a governance leaf that persists BEST-EFFORT and is
     # NOT in CLASS_C_GOVERNANCE_LEAVES MUST be caught (GOVHIT). This models a
@@ -3127,6 +3271,64 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'flagged — the `=>` guard in normalize_assign is missing (a fat-arrow arm\n' >&2
         printf 'collapsed to a bare `=` and false-matched an assignment marker).\n' >&2
+        rc=1
+    fi
+    # (60) RECEIVER-ALIASED CEILING write (`rs.ceiling =` via a `&mut
+    # state.role_state` alias, best-effort) MUST be caught by the receiver-
+    # agnostic `.ceiling=` marker. PRE-fix the receiver-pinned `role_state.ceiling=`
+    # marker missed it (the black-hat wave-23 bypass).
+    if ! grep -q $'^HIT\t.*\taliased_ceiling_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a receiver-aliased best-effort ceiling write\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '(`rs.ceiling =`) was NOT caught — the receiver-agnostic `.ceiling=` marker\n' >&2
+        printf 'is not wired (the alias-evasion bypass is open).\n' >&2
+        rc=1
+    fi
+    # (61) RECEIVER-ALIASED xctx_caller_reservations insert (`resv.insert(` via a
+    # `&mut state.xctx_caller_reservations` alias, best-effort) MUST be caught by
+    # the `&mut.xctx_caller_reservations` borrow companion. PRE-fix missed.
+    if ! grep -q $'^HIT\t.*\taliased_xctx_reservation_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a receiver-aliased best-effort xctx reservation insert\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'was NOT caught — the `&mut.xctx_caller_reservations` borrow companion is not\n' >&2
+        printf 'wired (the mutable-alias borrow bypass is open).\n' >&2
+        rc=1
+    fi
+    # (62) RECEIVER-ALIASED saga_pending insert MUST be caught by the
+    # `&mut.saga_pending` borrow companion.
+    if ! grep -q $'^HIT\t.*\taliased_saga_pending_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a receiver-aliased best-effort saga_pending insert was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'NOT caught — the `&mut.saga_pending` borrow companion is not wired.\n' >&2
+        rc=1
+    fi
+    # (63) RECEIVER-ALIASED membership remove (`m.remove_member(` via a `&mut
+    # state.membership` alias) MUST be caught by the `&mut.membership` borrow
+    # companion (NOT a receiver-agnostic `.remove_member(`, which would collide
+    # with the unrelated MLS `crypto.remove_member(`).
+    if ! grep -q $'^HIT\t.*\taliased_membership_remove_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a receiver-aliased best-effort membership removal was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'NOT caught — the `&mut.membership` borrow companion is not wired.\n' >&2
+        rc=1
+    fi
+    # (64) READ-ALIAS CONTROL: a SHARED `&state.membership` read alias MUST NOT be
+    # flagged — `normalize_borrow` collapses only `&mut` (exclusive) borrows, so a
+    # read accessor (`r.contains_key`) leaves no `&mut.membership` token. Guards
+    # the read-vs-write precision the wave-23 markers require.
+    if grep -q $'^HIT\t.*\tread_alias_membership_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a SHARED (`&`, read-only) membership alias was wrongly\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'flagged — `normalize_borrow` is collapsing a read borrow as if it were `&mut`\n' >&2
+        printf '(read accessors would be false-positived).\n' >&2
+        rc=1
+    fi
+    # (65) RECEIVER-ALIASED xctx reservation insert that DOES fail-close MUST NOT
+    # be flagged — the borrow companion must honour a fail-closed persist.
+    if grep -q $'^HIT\t.*\taliased_xctx_reservation_fixed_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a receiver-aliased reservation insert that DOES persist\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'fail-closed was wrongly flagged — the borrow companion ignored the persist.\n' >&2
         rc=1
     fi
     # (8) Round-9 keystone: a best-effort governance leaf NOT in the allowlist
