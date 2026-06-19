@@ -29,78 +29,33 @@ use super::state::{GovernanceState, PerContextState, context_id_to_bytes, emit_e
 /// against the same target.
 pub(super) const CONSEQUENCE_ACTOR_DID: &str = "system";
 
-/// Formats a [`ConsequenceTrigger`] into the canonical wire-stable string
-/// used both in `ContextEvent::ConsequenceTriggered.trigger_type` and in the
-/// structured durable event log payload (H4, PR #1606).
-///
-/// The format is intentionally simple and forward-compatible:
-/// `MessageVelocity`, `ToolRateExceeded`, `WarningCount`, or `Custom:<key>`.
-/// Downstream rules and audit consumers parse on the `Custom:` prefix.
-fn trigger_kind_str(trigger: &scp_protocol::trust::consequence::ConsequenceTrigger) -> String {
-    use scp_protocol::trust::consequence::ConsequenceTrigger;
-    match trigger {
-        ConsequenceTrigger::MessageVelocity => "MessageVelocity".to_owned(),
-        ConsequenceTrigger::ToolRateExceeded => "ToolRateExceeded".to_owned(),
-        ConsequenceTrigger::WarningCount => "WarningCount".to_owned(),
-        ConsequenceTrigger::Custom(key) => format!("Custom:{key}"),
-    }
-}
-
-/// Builds the structured JSON payload for a `ConsequenceTriggered` /
-/// `ConsequenceEnforced` / `ConsequenceEnforcementFailed` /
-/// `ConsequenceEscalatedToSuspendAll` durable event log entry (H4, PR #1606).
-///
-/// The shape matches the H4 spec:
-/// ```json
-/// {
-///   "target_did": "did:key:alice",
-///   "rule_index": 3,
-///   "trigger_kind": "MessageVelocity" | "WarningCount" | "Custom:..."
-///                   | "ToolRateExceeded",
-///   "action_type": "SuspendCapability" | "SuspendAccess" | "SuspendAll"
-///                  | "RevokeAccess" | "RemoveMember" | "AssignRole"
-/// }
-/// ```
-///
-/// `target_did` mirrors the `payload_target_is` convention used by the
-/// `WarningCount` trigger so subsequent rule evaluation can match these
-/// entries against the affected member, closing the recursive blind spot
-/// from the white-hat review.
-fn consequence_event_payload(
-    target_did: &DID,
-    rule_index: usize,
-    trigger_kind: &str,
-    action_type: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "target_did": target_did.as_ref(),
-        "rule_index": rule_index,
-        "trigger_kind": trigger_kind,
-        "action_type": action_type,
-    })
-}
+// The canonical wire-stable `trigger_kind` / `action_type` labels and the
+// durable consequence-leaf payload bytes are produced by SHARED code so the
+// native runtime and the WASM bridge emit byte-identical Merkle-leaf preimages
+// (§9.9.3 convergence): `scp_protocol::trust::consequence::{trigger_kind_str,
+// consequence_action_type}` for the labels and
+// `scp_event_log::payload::consequence_event_payload` for the JSON bytes.
+use scp_event_log::payload::consequence_event_payload;
+use scp_protocol::trust::consequence::{consequence_action_type, trigger_kind_str};
 
 /// Best-effort durable append of one consequence event log entry. A failed
 /// append is logged via `tracing::warn!` but never blocks the matching
 /// `receive_buffer.push(...)` call — the receive buffer remains a useful
 /// in-session signal even when the durable log is unavailable. Returns
 /// nothing because the failure mode is observed via tracing, not callers.
+///
+/// `payload` is the shared [`consequence_event_payload`] output — JSON bytes
+/// wrapped in an [`scp_event_log::EventPayload`]. The consequence engine reads
+/// `target_did` back out of these bytes via
+/// `scp_protocol::trust::consequence::payload_target_is`.
 fn append_consequence_event(
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     event_type: scp_event_log::EventType,
     member_did: &DID,
-    payload: &serde_json::Value,
+    payload: scp_event_log::EventPayload,
 ) {
-    // Consequence-enforcement records keep a JSON-object payload (rule_index,
-    // trigger_kind, action_type, target_did) because the consequence engine
-    // reads target_did out of it via `payload_target_is`, which decodes both
-    // JSON objects and the typed positional structs. Wrap the JSON bytes in an
-    // EventPayload for the typed event-log substrate.
-    let payload = scp_event_log::EventPayload {
-        data: serde_json::to_vec(payload).unwrap_or_default(),
-    };
     if let Err(e) = event_log.append_context_event_with_payload(
         context_id_bytes,
         event_type,
@@ -339,16 +294,6 @@ fn process_one_triggered_consequence(
     );
 }
 
-/// Resolves the `action_type` string label for a [`TriggeredConsequence`].
-const fn consequence_action_type(
-    action: &scp_protocol::trust::consequence::ConsequenceAction,
-) -> &'static str {
-    match action {
-        scp_protocol::trust::consequence::ConsequenceAction::Enforcement(sev) => sev.variant_name(),
-        scp_protocol::trust::consequence::ConsequenceAction::AssignRole { .. } => "AssignRole",
-    }
-}
-
 /// Emits a `ConsequenceTriggered` event. When `durable`, appends the durable
 /// Merkle leaf (and bumps `checkpoint_events_since`) BEFORE the matching
 /// receive-buffer push (H4 ordering invariant); when `!durable` (a
@@ -366,7 +311,7 @@ fn emit_consequence_triggered(
 ) {
     if durable {
         let payload = consequence_event_payload(
-            args.member_did,
+            args.member_did.as_ref(),
             consequence.rule_index,
             trigger_kind,
             action_type,
@@ -377,7 +322,7 @@ fn emit_consequence_triggered(
             context_id_bytes,
             scp_event_log::EventType::ConsequenceTriggered,
             args.member_did,
-            &payload,
+            payload,
         );
         *state.checkpoint_events_since += 1;
     }
@@ -407,7 +352,7 @@ fn emit_absent_member_enforcement_failed(
 ) {
     if durable {
         let payload = consequence_event_payload(
-            args.member_did,
+            args.member_did.as_ref(),
             consequence.rule_index,
             trigger_kind,
             action_type,
@@ -418,7 +363,7 @@ fn emit_absent_member_enforcement_failed(
             context_id_bytes,
             scp_event_log::EventType::ConsequenceEnforcementFailed,
             args.member_did,
-            &payload,
+            payload,
         );
         *state.checkpoint_events_since += 1;
     }
@@ -444,7 +389,7 @@ fn emit_consequence_enforced_success(
 ) {
     if durable {
         let payload = consequence_event_payload(
-            args.member_did,
+            args.member_did.as_ref(),
             consequence.rule_index,
             trigger_kind,
             action_type,
@@ -455,7 +400,7 @@ fn emit_consequence_enforced_success(
             context_id_bytes,
             scp_event_log::EventType::ConsequenceEnforced,
             args.member_did,
-            &payload,
+            payload,
         );
         *state.checkpoint_events_since += 1;
     }
@@ -587,7 +532,7 @@ fn emit_failure_escalation(
         // First the failure record, then the escalation record. Both go to
         // the durable log before the receive buffer push.
         let failed_payload = consequence_event_payload(
-            member_did,
+            member_did.as_ref(),
             consequence.rule_index,
             trigger_kind,
             action_type,
@@ -598,11 +543,11 @@ fn emit_failure_escalation(
             context_id_bytes,
             scp_event_log::EventType::ConsequenceEnforcementFailed,
             member_did,
-            &failed_payload,
+            failed_payload,
         );
         *state.checkpoint_events_since += 1;
         let escalation_payload = consequence_event_payload(
-            member_did,
+            member_did.as_ref(),
             consequence.rule_index,
             trigger_kind,
             "SuspendAll",
@@ -613,7 +558,7 @@ fn emit_failure_escalation(
             context_id_bytes,
             scp_event_log::EventType::ConsequenceEscalatedToSuspendAll,
             member_did,
-            &escalation_payload,
+            escalation_payload,
         );
         *state.checkpoint_events_since += 1;
     }

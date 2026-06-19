@@ -193,6 +193,70 @@ pub struct GovernanceActionExecutedPayload {
     pub action_type: String,
 }
 
+/// Builds the durable Merkle-leaf payload bytes for a consequence-enforcement
+/// event.
+///
+/// The event is one of
+/// [`ConsequenceTriggered`](crate::EventType::ConsequenceTriggered),
+/// [`ConsequenceEnforced`](crate::EventType::ConsequenceEnforced),
+/// [`ConsequenceEnforcementFailed`](crate::EventType::ConsequenceEnforcementFailed),
+/// or
+/// [`ConsequenceEscalatedToSuspendAll`](crate::EventType::ConsequenceEscalatedToSuspendAll)
+/// (ADR-017, ADR-051 §6, H4 / `.docs/adrs/phase-2.md` ADR-011 amendment).
+///
+/// # Why this is the single source
+///
+/// Both the native runtime (`scp-runtime`) and the WASM bridge (`scp-ffi-wasm`)
+/// mint these leaves for convergent-trigger consequences. The leaf preimage is
+/// `SHA-256(0x00 ‖ rmp_serde(Event))`, and `Event.payload` is
+/// `EventPayload { data }` — so the `data` bytes MUST be byte-identical across
+/// platforms or §9.9.3 equivocation detection produces false positives. This
+/// function is the shared producer of those bytes.
+///
+/// # Encoding — JSON, NOT positional `MessagePack`
+///
+/// Unlike the structured payload structs above (which use positional
+/// `MessagePack` via [`encode_payload`]), consequence payloads are encoded as a
+/// **JSON object**. `serde_json::json!` builds a `BTreeMap` (the workspace does
+/// not enable `serde_json`'s `preserve_order` feature), so the keys are emitted in
+/// SORTED order — `action_type`, `rule_index`, `target_did`, `trigger_kind`:
+///
+/// ```json
+/// {"action_type":"SuspendCapability","rule_index":3,"target_did":"…","trigger_kind":"WarningCount"}
+/// ```
+///
+/// That sorted order is deterministic and implementation-independent (same
+/// `serde_json`, same default features on both native and WASM), which is exactly
+/// why it converges. The JSON shape is also load-bearing because the consequence
+/// engine reads `target_did` back out of these bytes via
+/// `scp_protocol::trust::consequence::payload_target_is` to close the recursive
+/// `WarningCount` blind spot.
+///
+/// `target_did` is the affected member (mirrors the `payload_target_is`
+/// convention). `trigger_kind` is the `ConsequenceTrigger` label (e.g.
+/// `"WarningCount"`, `"Custom:key"`) and `action_type` is the
+/// `EnforcementSeverity` / consequence-action label (e.g. `"SuspendCapability"`,
+/// `"SuspendAll"`). Both labels are produced by the shared functions in
+/// `scp_protocol::trust::consequence` so the two platforms emit identical
+/// strings.
+#[must_use]
+pub fn consequence_event_payload(
+    target_did: &str,
+    rule_index: usize,
+    trigger_kind: &str,
+    action_type: &str,
+) -> EventPayload {
+    let value = serde_json::json!({
+        "target_did": target_did,
+        "rule_index": rule_index,
+        "trigger_kind": trigger_kind,
+        "action_type": action_type,
+    });
+    EventPayload {
+        data: serde_json::to_vec(&value).unwrap_or_default(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

@@ -313,6 +313,29 @@ impl ConsequenceDispatcher for WasmConsequenceDispatcher<'_> {
     fn set_cooldown(&mut self, rule_index: usize, until: u64) {
         self.ctx.cooldown_until_insert(rule_index, until);
     }
+
+    fn append_durable_consequence_leaf(
+        &mut self,
+        event_type: scp_event_log::EventType,
+        subject_did: &str,
+        rule_index: usize,
+        trigger_kind: &str,
+        action_type: &str,
+    ) {
+        // Mint the durable Merkle leaf via the shared payload builder so the
+        // preimage is byte-identical to the native runtime's
+        // (`scp_event_log::payload::consequence_event_payload`, actor "system").
+        // The shared `enforce_triggered` loop only invokes this for
+        // convergent-trigger consequences (ADR-051 §6) and BEFORE the matching
+        // `push_event` (H4 ordering), mirroring native's `emit_*` functions.
+        self.ctx.append_consequence_leaf(
+            event_type,
+            subject_did,
+            rule_index,
+            trigger_kind,
+            action_type,
+        );
+    }
 }
 
 /// Enforces `EnforcementSeverity::SuspendCapability` by adding each
@@ -966,5 +989,106 @@ mod tests {
             "MessageSent is per-author and excluded from the durable log, so the \
              receive buffer MUST remain its source for velocity/rate evaluation"
         );
+    }
+}
+
+// ===========================================================================
+// Cross-impl leaf-byte parity (WASM side) — §9.9.3
+//
+// These assert the WASM bridge's REAL leaf-payload producer paths reproduce the
+// SAME canonical fixture bytes that the native scp-runtime test
+// (`crates/scp-runtime/tests/wasm_conformance.rs`,
+// `cross_impl_*_leaf_bytes`) pins from native's real producer paths. The split
+// is necessary because the scp-runtime test crate cannot dev-depend on this
+// wasm cdylib. Each side drives its OWN production code against the same known
+// answer; together they prove the two impls emit byte-identical leaves.
+// ===========================================================================
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cross_impl_leaf_parity {
+    /// `GovernanceActionExecuted`: WASM's real value extraction + shared
+    /// `GovernanceActionExecutedPayload` + `encode_payload` (the exact code at
+    /// `manager.rs`'s `execute_governance_action` append site) MUST reproduce
+    /// the positional-MessagePack fixture the native test pins.
+    #[test]
+    fn cross_impl_governance_action_executed_leaf_bytes_wasm() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        // Same logical action as the native fixture: RemoveMember(BOB).
+        let action = GovernanceAction::RemoveMember {
+            did: scp_event_log::DID::from("did:dht:z6MkBobConverge".to_owned()),
+            reason: None,
+        };
+        // The EXACT extraction the WASM append site performs.
+        let target_did = action
+            .target_did()
+            .map(|d| d.as_ref().to_owned())
+            .unwrap_or_default();
+        let action_type = action.variant_name().to_owned();
+
+        let payload = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::GovernanceActionExecutedPayload {
+                target_did,
+                action_type,
+            },
+        )
+        .unwrap()
+        .data;
+
+        // Positional MessagePack 2-element fixarray. Decoding recovers the
+        // native fixture's fields exactly — proving byte parity with native.
+        let decoded: scp_event_log::payload::GovernanceActionExecutedPayload =
+            scp_event_log::payload::decode_payload(&scp_event_log::EventPayload {
+                data: payload.clone(),
+            })
+            .unwrap();
+        assert_eq!(decoded.target_did, "did:dht:z6MkBobConverge");
+        assert_eq!(decoded.action_type, "RemoveMember");
+        assert_eq!(payload[0] & 0xf0, 0x90, "must be a MessagePack fixarray");
+        assert_eq!(payload[0] & 0x0f, 2, "fixarray of 2 fields");
+    }
+
+    /// `TokenRevoked`: WASM's real producer (the same
+    /// `scp_protocol::crypto::ucan::revoke::token_revoked_payload` call its
+    /// `ucan_revoke` makes) MUST reproduce the native fixture JSON bytes.
+    #[test]
+    fn cross_impl_token_revoked_leaf_bytes_wasm() {
+        let payload = scp_protocol::crypto::ucan::revoke::token_revoked_payload(
+            "ctx-revoke-x",
+            "bafyTokenCidExample",
+            "did:dht:z6MkRevoker",
+        );
+        // SORTED-key JSON (serde_json BTreeMap; no preserve_order) — identical
+        // to the native test's pinned fixture.
+        let expected =
+            br#"{"context_id":"ctx-revoke-x","revoker_did":"did:dht:z6MkRevoker","token_cid":"bafyTokenCidExample"}"#;
+        assert_eq!(payload, expected);
+    }
+
+    /// Convergent `ConsequenceTriggered`: WASM's real producer (the same
+    /// `consequence_event_payload` + shared label functions its
+    /// `WasmConsequenceDispatcher::append_durable_consequence_leaf` uses) MUST
+    /// reproduce the native fixture JSON bytes.
+    #[test]
+    fn cross_impl_consequence_triggered_leaf_bytes_wasm() {
+        use scp_protocol::trust::consequence::{
+            ConsequenceAction, ConsequenceTrigger, EnforcementSeverity, consequence_action_type,
+            trigger_kind_str,
+        };
+
+        let trigger = ConsequenceTrigger::WarningCount;
+        let action = ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess);
+        let trigger_kind = trigger_kind_str(&trigger);
+        let action_type = consequence_action_type(&action);
+
+        let payload = scp_event_log::payload::consequence_event_payload(
+            "did:dht:z6MkSubject",
+            3,
+            &trigger_kind,
+            action_type,
+        );
+        let expected =
+            br#"{"action_type":"SuspendAccess","rule_index":3,"target_did":"did:dht:z6MkSubject","trigger_kind":"WarningCount"}"#;
+        assert_eq!(payload.data, expected);
     }
 }

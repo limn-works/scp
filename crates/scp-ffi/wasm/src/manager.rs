@@ -638,6 +638,36 @@ impl PerContextState {
         &self.ceiling_strings
     }
 
+    /// Appends a durable consequence-enforcement Merkle leaf (ADR-017, ADR-051
+    /// §6, H4). Called by [`crate::consequence::WasmConsequenceDispatcher`]'s
+    /// [`scp_protocol::trust::consequence::ConsequenceDispatcher::append_durable_consequence_leaf`]
+    /// override for convergent-trigger consequences only.
+    ///
+    /// The actor is the stable system sentinel `"system"` (matching the native
+    /// runtime's `CONSEQUENCE_ACTOR_DID`), and the payload is the shared
+    /// [`scp_event_log::payload::consequence_event_payload`] output, so the leaf
+    /// preimage is byte-identical to the native runtime's
+    /// (§9.9.3 equivocation-detection convergence).
+    pub(crate) fn append_consequence_leaf(
+        &mut self,
+        event_type: EventType,
+        subject_did: &str,
+        rule_index: usize,
+        trigger_kind: &str,
+        action_type: &str,
+    ) {
+        // Native uses CONSEQUENCE_ACTOR_DID = "system" as the actor for these
+        // leaves so the `WarningCount` trigger's `actor_did != subject_did`
+        // requirement holds for recursive rule evaluation.
+        let payload = scp_event_log::payload::consequence_event_payload(
+            subject_did,
+            rule_index,
+            trigger_kind,
+            action_type,
+        );
+        self.append_log_event(event_type, "system", &payload.data);
+    }
+
     // ---- Test-only helpers (compiled away in release builds) -------------
     //
     // These expose a minimal subset of the private internals needed by the
@@ -1898,7 +1928,11 @@ impl WasmContextManager {
         )?;
 
         let actor = ctx.creator_did.clone();
-        ctx.append_log_event(EventType::ToolRegistered, &actor, tool_id.as_bytes());
+        // Native appends ToolRegistered with an EMPTY payload
+        // (`append_context_event`, no payload) — match it so the leaf preimage
+        // is byte-identical across platforms (§9.9.3). The tool_id is NOT part
+        // of the canonical leaf.
+        ctx.append_log_event(EventType::ToolRegistered, &actor, b"");
 
         Ok(tool_id)
     }
@@ -2587,7 +2621,17 @@ impl WasmContextManager {
 
         ctx.revoked_tokens.insert(token_cid.to_owned());
 
-        ctx.append_log_event(EventType::TokenRevoked, revoker_did, token_cid.as_bytes());
+        // Durable TokenRevoked leaf. The payload MUST be the shared JSON
+        // {token_cid, revoker_did, context_id} producer so the leaf preimage is
+        // byte-identical to the native/PyO3/UniFFI/NAPI bridge path
+        // (`scp-ffi-common`'s `BridgeRevocationEventLogger`) — §9.9.3
+        // cross-platform convergence.
+        let payload = scp_protocol::crypto::ucan::revoke::token_revoked_payload(
+            context_id,
+            token_cid,
+            revoker_did,
+        );
+        ctx.append_log_event(EventType::TokenRevoked, revoker_did, &payload);
 
         Ok(())
     }
@@ -2735,10 +2779,28 @@ impl WasmContextManager {
                 resulting_epoch: None,
                 target_did: target_did.clone(),
             });
+            // Durable GovernanceActionExecuted leaf. The payload MUST be the
+            // shared `GovernanceActionExecutedPayload` (positional MessagePack
+            // via `encode_payload`) — byte-identical to the native runtime's
+            // `finalize_governance_action` construction — so cross-platform
+            // members derive equal Merkle roots (§9.9.3). `target_did` is the
+            // action's target (empty when untargeted); `action_type` is the
+            // `GovernanceAction` variant name.
+            let executed_payload = scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::GovernanceActionExecutedPayload {
+                    target_did: target_did
+                        .as_ref()
+                        .map(|d| d.as_ref().to_owned())
+                        .unwrap_or_default(),
+                    action_type: action.variant_name().to_owned(),
+                },
+            )
+            .map(|p| p.data)
+            .unwrap_or_default();
             ctx.append_log_event(
                 EventType::GovernanceActionExecuted,
                 initiator_did,
-                proposal_id.as_bytes(),
+                &executed_payload,
             );
 
             // Evaluate and enforce consequence rules. Mirrors

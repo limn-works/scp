@@ -585,6 +585,41 @@ pub trait RevocationEventLogger {
     ) -> Result<(), UcanError>;
 }
 
+/// Builds the durable `TokenRevoked` Merkle-leaf payload bytes.
+///
+/// # Why this is the single source
+///
+/// A `TokenRevoked` leaf is minted by the FFI bridge layer
+/// (`scp-ffi-common`'s `BridgeRevocationEventLogger`) on the native/PyO3/UniFFI/
+/// NAPI bridges and by the WASM bridge's `ucan_revoke`. The leaf preimage is
+/// `SHA-256(0x00 ‖ rmp_serde(Event))` with `Event.payload = EventPayload { data }`
+/// — so the `data` bytes MUST be byte-identical across platforms, or §9.9.3
+/// equivocation detection produces false positives when a native member and a
+/// WASM member revoke the same token. This function is the shared producer.
+///
+/// # Encoding — JSON
+///
+/// The payload is a JSON object. `serde_json::json!` builds a `BTreeMap` (the
+/// workspace does not enable `serde_json`'s `preserve_order` feature), so keys are
+/// emitted in SORTED order — `context_id`, `revoker_did`, `token_cid`:
+///
+/// ```json
+/// {"context_id":"…","revoker_did":"did:…","token_cid":"…"}
+/// ```
+///
+/// That sorted order is deterministic and identical across the native/PyO3/
+/// UniFFI/NAPI bridge path and the WASM bridge (same `serde_json`, same default
+/// features), which is what makes the leaf converge.
+#[must_use]
+pub fn token_revoked_payload(context_id: &str, token_cid: &str, revoker_did: &str) -> Vec<u8> {
+    let value = serde_json::json!({
+        "token_cid": token_cid,
+        "revoker_did": revoker_did,
+        "context_id": context_id,
+    });
+    serde_json::to_vec(&value).unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Revocation CID computation
 // ---------------------------------------------------------------------------

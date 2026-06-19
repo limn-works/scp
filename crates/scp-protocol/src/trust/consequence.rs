@@ -134,6 +134,42 @@ pub const fn is_convergent_trigger(trigger: &ConsequenceTrigger) -> bool {
     }
 }
 
+/// Stable string label for a [`ConsequenceTrigger`], used as the `trigger_kind`
+/// field of a durable consequence Merkle-leaf payload
+/// (`scp_event_log::payload::consequence_event_payload`).
+///
+/// This is the single source of the label so that the native runtime and the
+/// WASM bridge produce byte-identical leaf payloads (§9.9.3 convergence). Note
+/// the `Custom(key)` arm emits `"Custom:{key}"` — NOT the `{:?}` Debug form
+/// `Custom("{key}")` — because the durable leaf preimage must be a stable,
+/// implementation-independent string.
+#[must_use]
+pub fn trigger_kind_str(trigger: &ConsequenceTrigger) -> String {
+    match trigger {
+        ConsequenceTrigger::MessageVelocity => "MessageVelocity".to_owned(),
+        ConsequenceTrigger::ToolRateExceeded => "ToolRateExceeded".to_owned(),
+        ConsequenceTrigger::WarningCount => "WarningCount".to_owned(),
+        ConsequenceTrigger::Custom(key) => format!("Custom:{key}"),
+    }
+}
+
+/// Stable string label for a [`ConsequenceAction`], used as the `action_type`
+/// field of a durable consequence Merkle-leaf payload
+/// (`scp_event_log::payload::consequence_event_payload`).
+///
+/// Shared by the native runtime and the WASM bridge so both produce
+/// byte-identical leaf payloads (§9.9.3 convergence). For an
+/// [`ConsequenceAction::Enforcement`] this delegates to
+/// [`EnforcementSeverity::variant_name`]; an [`ConsequenceAction::AssignRole`]
+/// is labelled `"AssignRole"`.
+#[must_use]
+pub const fn consequence_action_type(action: &ConsequenceAction) -> &'static str {
+    match action {
+        ConsequenceAction::Enforcement(sev) => sev.variant_name(),
+        ConsequenceAction::AssignRole { .. } => "AssignRole",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EnforcementSeverity
 // ---------------------------------------------------------------------------
@@ -737,6 +773,52 @@ pub trait ConsequenceDispatcher {
     /// Records a cooldown for rule `rule_index` that expires at `until`
     /// (Unix seconds).
     fn set_cooldown(&mut self, rule_index: usize, until: u64);
+
+    /// Appends a durable consequence-enforcement Merkle leaf to the context's
+    /// canonical event log.
+    ///
+    /// [`enforce_triggered`] calls this — BEFORE the matching
+    /// [`push_event`](Self::push_event) (the H4 ordering invariant) — at each
+    /// emit point, but ONLY for **convergent-trigger** consequences (gated on
+    /// [`is_convergent_trigger`]). Non-convergent (velocity / rate) consequences
+    /// drive local enforcement and `push_event` only, never a durable leaf,
+    /// because a rate leaf would diverge across honest members and break §9.9.3
+    /// equivocation detection.
+    ///
+    /// `event_type` is one of [`ConsequenceTriggered`], [`ConsequenceEnforced`],
+    /// [`ConsequenceEnforcementFailed`], or
+    /// [`ConsequenceEscalatedToSuspendAll`]. `trigger_kind` / `action_type` are
+    /// the shared labels from [`trigger_kind_str`] / [`consequence_action_type`].
+    /// Implementations MUST build the leaf payload with
+    /// `scp_event_log::payload::consequence_event_payload(subject_did, rule_index,
+    /// trigger_kind, action_type)` so native and WASM leaves are byte-identical.
+    ///
+    /// The default body is a no-op: the native runtime mints these leaves in its
+    /// own enforcement loop and does not route through this trait, so only the
+    /// WASM bridge (which uses [`enforce_triggered`]) overrides it.
+    ///
+    /// [`ConsequenceTriggered`]: scp_event_log::EventType::ConsequenceTriggered
+    /// [`ConsequenceEnforced`]: scp_event_log::EventType::ConsequenceEnforced
+    /// [`ConsequenceEnforcementFailed`]: scp_event_log::EventType::ConsequenceEnforcementFailed
+    /// [`ConsequenceEscalatedToSuspendAll`]: scp_event_log::EventType::ConsequenceEscalatedToSuspendAll
+    fn append_durable_consequence_leaf(
+        &mut self,
+        event_type: scp_event_log::EventType,
+        subject_did: &str,
+        rule_index: usize,
+        trigger_kind: &str,
+        action_type: &str,
+    ) {
+        // Default: no durable leaf. See doc comment — native does not use this
+        // path; WASM overrides it.
+        let _ = (
+            event_type,
+            subject_did,
+            rule_index,
+            trigger_kind,
+            action_type,
+        );
+    }
 }
 
 /// Enforces a pre-evaluated set of triggered consequences using a
@@ -781,92 +863,203 @@ pub fn enforce_triggered<D: ConsequenceDispatcher>(
             continue;
         }
 
-        let action_type = match &consequence.action {
-            ConsequenceAction::Enforcement(sev) => sev.variant_name(),
-            ConsequenceAction::AssignRole { .. } => "AssignRole",
-        };
-        let trigger_type = rules
-            .get(consequence.rule_index)
-            .map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
+        if enforce_one_triggered(
+            dispatcher,
+            context_id,
+            subject_did,
+            now_secs,
+            consequence,
+            rules,
+            member_present,
+        ) {
+            count += 1;
+        }
+    }
 
-        dispatcher.push_event(
-            crate::context::membership::ContextEvent::ConsequenceTriggered {
-                context_id: context_id.to_owned(),
-                member_did: DID::from(subject_did.to_owned()),
-                rule_index: consequence.rule_index,
-                trigger_type,
-                action_type: action_type.to_owned(),
-            },
+    count
+}
+
+/// Bundles the per-consequence leaf labels so [`enforce_one_triggered`] can mint
+/// a durable leaf in one call per branch (keeps the function within the
+/// `clippy::too_many_lines` budget without changing behaviour).
+struct LeafCtx<'a> {
+    durable: bool,
+    subject_did: &'a str,
+    rule_index: usize,
+    trigger_kind: &'a str,
+}
+
+/// Mints one durable consequence leaf via the dispatcher hook IFF the trigger is
+/// convergent (`ctx.durable`). A no-op otherwise — the gate that keeps
+/// non-convergent (velocity/rate) consequences out of the canonical Merkle log.
+fn mint_leaf<D: ConsequenceDispatcher>(
+    dispatcher: &mut D,
+    ctx: &LeafCtx<'_>,
+    event_type: EventType,
+    action_type: &str,
+) {
+    if ctx.durable {
+        dispatcher.append_durable_consequence_leaf(
+            event_type,
+            ctx.subject_did,
+            ctx.rule_index,
+            ctx.trigger_kind,
+            action_type,
         );
+    }
+}
 
-        // Emit-and-skip for absent members with evidence.
-        if !member_present {
-            dispatcher.push_event(
-                crate::context::membership::ContextEvent::ConsequenceEnforced {
-                    context_id: context_id.to_owned(),
-                    member_did: DID::from(subject_did.to_owned()),
-                    action_type: action_type.to_owned(),
-                    success: false,
-                },
-            );
-            count += 1;
-            continue;
-        }
+/// Enforces a SINGLE triggered consequence past the cooldown / ghost-DID
+/// guards, minting durable leaves (when convergent) before each buffer push
+/// (H4 ordering). Returns `true` if it counted as dispatched.
+///
+/// Extracted from [`enforce_triggered`] so the public loop stays within the
+/// `clippy::too_many_lines` budget; the branch structure mirrors the native
+/// runtime's `process_one_triggered_consequence`.
+fn enforce_one_triggered<D: ConsequenceDispatcher>(
+    dispatcher: &mut D,
+    context_id: &str,
+    subject_did: &str,
+    now_secs: u64,
+    consequence: &TriggeredConsequence,
+    rules: &[ConsequenceRule],
+    member_present: bool,
+) -> bool {
+    let action_type = consequence_action_type(&consequence.action);
+    let rule = rules.get(consequence.rule_index);
+    let trigger_type = rule.map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
 
-        let success = match &consequence.action {
-            ConsequenceAction::Enforcement(severity) => match severity {
-                EnforcementSeverity::SuspendCapability { capabilities } => {
-                    dispatcher.suspend_capabilities(subject_did, capabilities)
-                }
-                EnforcementSeverity::SuspendAccess => dispatcher.suspend_all(subject_did),
-                EnforcementSeverity::RevokeAccess { .. }
-                | EnforcementSeverity::RemoveMember { .. } => {
-                    // Cryptographic tiers must not reach consequence dispatch
-                    // without the opt-in flag. Fail here; escalation to
-                    // SuspendAll happens below.
-                    false
-                }
-            },
-            ConsequenceAction::AssignRole { to_role } => {
-                dispatcher.assign_role(subject_did, to_role)
+    // Durability gate (ADR-051 §6 / phase-2.md ADR-011 amendment, H4): a
+    // consequence leaf is a durable Merkle entry ONLY when its trigger input is
+    // convergent (`WarningCount` / `Custom`), keyed on the enum via
+    // `is_convergent_trigger` — never on a string. A missing or unresolvable
+    // rule is treated as non-durable (fail-safe). The durable-leaf
+    // `trigger_kind` label uses the wire-stable `trigger_kind_str` (`Custom:key`),
+    // NOT the `{:?}` Debug `trigger_type` used for the local `ContextEvent`, so
+    // native and WASM leaf preimages match.
+    let leaf_trigger_kind =
+        rule.map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
+    let leaf = LeafCtx {
+        durable: rule.is_some_and(|r| is_convergent_trigger(&r.trigger)),
+        subject_did,
+        rule_index: consequence.rule_index,
+        trigger_kind: &leaf_trigger_kind,
+    };
+
+    // ConsequenceTriggered: durable leaf (when convergent) BEFORE the local
+    // push (H4 ordering), unconditional buffer push.
+    mint_leaf(
+        dispatcher,
+        &leaf,
+        EventType::ConsequenceTriggered,
+        action_type,
+    );
+    dispatcher.push_event(
+        crate::context::membership::ContextEvent::ConsequenceTriggered {
+            context_id: context_id.to_owned(),
+            member_did: DID::from(subject_did.to_owned()),
+            rule_index: consequence.rule_index,
+            trigger_type,
+            action_type: action_type.to_owned(),
+        },
+    );
+
+    // Emit-and-skip for absent members with evidence: durable
+    // ConsequenceEnforcementFailed (when convergent) then buffer push.
+    if !member_present {
+        mint_leaf(
+            dispatcher,
+            &leaf,
+            EventType::ConsequenceEnforcementFailed,
+            action_type,
+        );
+        push_enforced(dispatcher, context_id, subject_did, action_type, false);
+        return true;
+    }
+
+    let success = match &consequence.action {
+        ConsequenceAction::Enforcement(severity) => match severity {
+            EnforcementSeverity::SuspendCapability { capabilities } => {
+                dispatcher.suspend_capabilities(subject_did, capabilities)
             }
-        };
+            EnforcementSeverity::SuspendAccess => dispatcher.suspend_all(subject_did),
+            EnforcementSeverity::RevokeAccess { .. } | EnforcementSeverity::RemoveMember { .. } => {
+                // Cryptographic tiers must not reach consequence dispatch
+                // without the opt-in flag. Fail here; escalation to
+                // SuspendAll happens below.
+                false
+            }
+        },
+        ConsequenceAction::AssignRole { to_role } => dispatcher.assign_role(subject_did, to_role),
+    };
 
-        if !success {
-            // Escalate to SuspendAll on enforcement failure.
-            let _ = dispatcher.suspend_all(subject_did);
-            dispatcher.push_event(
-                crate::context::membership::ContextEvent::ConsequenceEnforced {
-                    context_id: context_id.to_owned(),
-                    member_did: DID::from(subject_did.to_owned()),
-                    action_type: "SuspendAll(escalated)".to_owned(),
-                    success: true,
-                },
-            );
-            count += 1;
-            continue;
-        }
-
-        // Record cooldown.
-        if let Some(rule) = rules.get(consequence.rule_index) {
-            dispatcher.set_cooldown(
-                consequence.rule_index,
-                now_secs.saturating_add(rule.window.as_secs()),
-            );
-        }
-
+    if !success {
+        // Escalate to SuspendAll on enforcement failure (H10). The local
+        // enforcement is unconditional. The two audit records (failure then
+        // escalation) are durable Merkle leaves only for convergent triggers —
+        // failure first, then escalation, both BEFORE the buffer push.
+        let _ = dispatcher.suspend_all(subject_did);
+        mint_leaf(
+            dispatcher,
+            &leaf,
+            EventType::ConsequenceEnforcementFailed,
+            action_type,
+        );
+        mint_leaf(
+            dispatcher,
+            &leaf,
+            EventType::ConsequenceEscalatedToSuspendAll,
+            "SuspendAll",
+        );
         dispatcher.push_event(
             crate::context::membership::ContextEvent::ConsequenceEnforced {
                 context_id: context_id.to_owned(),
                 member_did: DID::from(subject_did.to_owned()),
-                action_type: action_type.to_owned(),
-                success,
+                action_type: "SuspendAll(escalated)".to_owned(),
+                success: true,
             },
         );
-        count += 1;
+        return true;
     }
 
-    count
+    // Record cooldown.
+    if let Some(rule) = rules.get(consequence.rule_index) {
+        dispatcher.set_cooldown(
+            consequence.rule_index,
+            now_secs.saturating_add(rule.window.as_secs()),
+        );
+    }
+
+    // ConsequenceEnforced { success: true }: durable leaf (when convergent)
+    // BEFORE the buffer push.
+    mint_leaf(
+        dispatcher,
+        &leaf,
+        EventType::ConsequenceEnforced,
+        action_type,
+    );
+    push_enforced(dispatcher, context_id, subject_did, action_type, success);
+    true
+}
+
+/// Pushes a `ConsequenceEnforced` buffer event (SDK observability). Extracted to
+/// keep [`enforce_one_triggered`] within the line budget without changing
+/// behaviour.
+fn push_enforced<D: ConsequenceDispatcher>(
+    dispatcher: &mut D,
+    context_id: &str,
+    subject_did: &str,
+    action_type: &str,
+    success: bool,
+) {
+    dispatcher.push_event(
+        crate::context::membership::ContextEvent::ConsequenceEnforced {
+            context_id: context_id.to_owned(),
+            member_did: DID::from(subject_did.to_owned()),
+            action_type: action_type.to_owned(),
+            success,
+        },
+    );
 }
 
 /// Checks whether an event matches a trigger condition for the given subject.
@@ -1976,5 +2169,236 @@ mod tests {
             panic!("expected SuspendCapability");
         };
         assert_eq!(capabilities, &caps);
+    }
+
+    // -----------------------------------------------------------------------
+    // enforce_triggered — durable-leaf hook gating, ordering, per-branch
+    // EventType (the WASM-side leaf-minting path; native uses its own loop).
+    // -----------------------------------------------------------------------
+
+    /// Records every interaction so the test can assert the interleaving of
+    /// durable-leaf appends and buffer pushes (the H4 ordering invariant) and
+    /// which `EventType` is minted in each branch.
+    #[derive(Default)]
+    struct RecordingDispatcher {
+        present: bool,
+        suspend_succeeds: bool,
+        /// Ordered trace: `("leaf", EventType)` for a durable append,
+        /// `("push", "<ConsequenceTriggered|ConsequenceEnforced>")` for a buffer push.
+        trace: Vec<(&'static str, String)>,
+        /// Captured `(subject, rule_index, trigger_kind, action_type)` for the
+        /// first leaf, to verify the labels passed to the producer.
+        first_leaf_args: Option<(String, usize, String, String)>,
+    }
+
+    impl ConsequenceDispatcher for RecordingDispatcher {
+        fn is_member_present(&self, _subject_did: &str) -> bool {
+            self.present
+        }
+        fn suspend_capabilities(&mut self, _s: &str, _c: &[Capability]) -> bool {
+            self.suspend_succeeds
+        }
+        fn suspend_all(&mut self, _s: &str) -> bool {
+            true
+        }
+        fn assign_role(&mut self, _s: &str, _r: &str) -> bool {
+            self.suspend_succeeds
+        }
+        fn push_event(&mut self, event: crate::context::membership::ContextEvent) {
+            let label = match event {
+                crate::context::membership::ContextEvent::ConsequenceTriggered { .. } => {
+                    "ConsequenceTriggered"
+                }
+                crate::context::membership::ContextEvent::ConsequenceEnforced { .. } => {
+                    "ConsequenceEnforced"
+                }
+                _ => "Other",
+            };
+            self.trace.push(("push", label.to_owned()));
+        }
+        fn get_cooldown(&self, _rule_index: usize) -> Option<u64> {
+            None
+        }
+        fn set_cooldown(&mut self, _rule_index: usize, _until: u64) {}
+        fn append_durable_consequence_leaf(
+            &mut self,
+            event_type: EventType,
+            subject_did: &str,
+            rule_index: usize,
+            trigger_kind: &str,
+            action_type: &str,
+        ) {
+            if self.first_leaf_args.is_none() {
+                self.first_leaf_args = Some((
+                    subject_did.to_owned(),
+                    rule_index,
+                    trigger_kind.to_owned(),
+                    action_type.to_owned(),
+                ));
+            }
+            self.trace.push(("leaf", format!("{event_type:?}")));
+        }
+    }
+
+    fn warning_rule(action: ConsequenceAction) -> ConsequenceRule {
+        ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action,
+            threshold: 1,
+            window: Duration::from_mins(1),
+        }
+    }
+
+    fn velocity_rule(action: ConsequenceAction) -> ConsequenceRule {
+        ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action,
+            threshold: 1,
+            window: Duration::from_mins(1),
+        }
+    }
+
+    fn triggered(rule_index: usize, action: ConsequenceAction) -> TriggeredConsequence {
+        TriggeredConsequence {
+            rule_index,
+            action,
+            evidence: vec![ConsequenceEvidence {
+                event_sequence: 0,
+                timestamp: 100,
+                actor_did: "did:key:gov".into(),
+                event_type: EventType::GovernanceAction,
+            }],
+        }
+    }
+
+    /// Convergent (`WarningCount`) + successful enforcement: durable
+    /// `ConsequenceTriggered` BEFORE its push, then durable `ConsequenceEnforced`
+    /// BEFORE its push (H4 ordering). Labels are the shared producer labels.
+    #[test]
+    fn enforce_triggered_convergent_success_mints_ordered_leaves() {
+        let rules = vec![warning_rule(suspend_all())];
+        let mut d = RecordingDispatcher {
+            present: true,
+            suspend_succeeds: true,
+            ..Default::default()
+        };
+        enforce_triggered(
+            &mut d,
+            "ctx",
+            "did:key:subject",
+            1000,
+            &[triggered(0, suspend_all())],
+            &rules,
+        );
+        assert_eq!(
+            d.trace,
+            vec![
+                ("leaf", "ConsequenceTriggered".to_owned()),
+                ("push", "ConsequenceTriggered".to_owned()),
+                ("leaf", "ConsequenceEnforced".to_owned()),
+                ("push", "ConsequenceEnforced".to_owned()),
+            ],
+            "durable leaf must precede each matching buffer push (H4 ordering)"
+        );
+        assert_eq!(
+            d.first_leaf_args,
+            Some((
+                "did:key:subject".to_owned(),
+                0,
+                "WarningCount".to_owned(),
+                "SuspendAccess".to_owned()
+            )),
+            "leaf must carry the shared trigger_kind / action_type labels"
+        );
+    }
+
+    /// Non-convergent (MessageVelocity): NO durable leaf is minted, only buffer
+    /// pushes — the gate that keeps velocity/rate out of the canonical log.
+    #[test]
+    fn enforce_triggered_non_convergent_mints_no_leaf() {
+        let rules = vec![velocity_rule(suspend_all())];
+        let mut d = RecordingDispatcher {
+            present: true,
+            suspend_succeeds: true,
+            ..Default::default()
+        };
+        enforce_triggered(
+            &mut d,
+            "ctx",
+            "did:key:subject",
+            1000,
+            &[triggered(0, suspend_all())],
+            &rules,
+        );
+        assert!(
+            d.trace.iter().all(|(kind, _)| *kind == "push"),
+            "a non-convergent trigger must mint NO durable leaf, got: {:?}",
+            d.trace
+        );
+        assert!(d.first_leaf_args.is_none());
+    }
+
+    /// Convergent + enforcement FAILURE: durable `ConsequenceTriggered`, then on
+    /// failure durable `ConsequenceEnforcementFailed` THEN
+    /// `ConsequenceEscalatedToSuspendAll`, both before the escalation push.
+    #[test]
+    fn enforce_triggered_convergent_failure_mints_failure_then_escalation() {
+        let rules = vec![warning_rule(suspend_write())];
+        let mut d = RecordingDispatcher {
+            present: true,
+            suspend_succeeds: false, // force enforcement failure -> escalation
+            ..Default::default()
+        };
+        enforce_triggered(
+            &mut d,
+            "ctx",
+            "did:key:subject",
+            1000,
+            &[triggered(0, suspend_write())],
+            &rules,
+        );
+        assert_eq!(
+            d.trace,
+            vec![
+                ("leaf", "ConsequenceTriggered".to_owned()),
+                ("push", "ConsequenceTriggered".to_owned()),
+                ("leaf", "ConsequenceEnforcementFailed".to_owned()),
+                ("leaf", "ConsequenceEscalatedToSuspendAll".to_owned()),
+                ("push", "ConsequenceEnforced".to_owned()),
+            ],
+            "failure path: triggered leaf+push, then failure+escalation leaves \
+             before the escalation push (H4/H10)"
+        );
+    }
+
+    /// Convergent + absent member WITH evidence: durable `ConsequenceTriggered`
+    /// then durable `ConsequenceEnforcementFailed` (no escalation — nothing to
+    /// enforce against), each before its push.
+    #[test]
+    fn enforce_triggered_convergent_absent_member_mints_triggered_then_failed() {
+        let rules = vec![warning_rule(suspend_all())];
+        let mut d = RecordingDispatcher {
+            present: false, // absent, but evidence present (triggered() supplies it)
+            suspend_succeeds: true,
+            ..Default::default()
+        };
+        enforce_triggered(
+            &mut d,
+            "ctx",
+            "did:key:subject",
+            1000,
+            &[triggered(0, suspend_all())],
+            &rules,
+        );
+        assert_eq!(
+            d.trace,
+            vec![
+                ("leaf", "ConsequenceTriggered".to_owned()),
+                ("push", "ConsequenceTriggered".to_owned()),
+                ("leaf", "ConsequenceEnforcementFailed".to_owned()),
+                ("push", "ConsequenceEnforced".to_owned()),
+            ],
+            "absent-with-evidence path mints Triggered then EnforcementFailed, no escalation"
+        );
     }
 }
