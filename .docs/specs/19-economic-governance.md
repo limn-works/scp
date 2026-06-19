@@ -208,7 +208,7 @@ The critical flow — how payment interleaves with SCP actions:
 5. Receiving side verifies authorization via its own adapter instance (adapter.verify)
 6. Action is processed (message delivered, tool invoked, etc.)
 7. Receiving side calls adapter.capture(auth)
-8. PaymentReceipt recorded in context event log as provenance
+8. PaymentReceipt recorded as provenance (per-payee local `ContextEvent` until ADR-051; a convergent Merkle leaf thereafter — see the ADR-011 amendment, exclusion taxonomy §2)
 9. On failure at step 5-7: adapter.void(auth) — funds released
 ```
 
@@ -352,7 +352,9 @@ pub enum PricingVariable {
 
 pub enum PricingMetric {
     ContextMessageRate,    // messages/min in this context (measurement: count of MessageSent events
-                           // in the context's event log within the last 60 seconds, divided by 1.
+                           // within the last 60 seconds, measured LOCALLY per instance — economic
+                           // pricing is enforced at authorize() against the payer's local ledger;
+                           // there is no convergent velocity clock (ADR-051 §6).
                            // Window: trailing 60-second sliding window, evaluated at action time.)
     MemberCount,           // current member count (measurement: count of active memberships in
                            // context state at evaluation time. No window — point-in-time snapshot.)
@@ -361,7 +363,9 @@ pub enum PricingMetric {
     TimeOfDay,             // UTC hour (0-23), enables off-peak pricing (measurement: current UTC
                            // hour truncated to integer. No window — point-in-time.)
     SenderVelocity,        // sender's messages in sliding window (measurement: count of MessageSent
-                           // events by the specific sender DID within the last 60 seconds.
+                           // events by the specific sender DID within the last 60 seconds, measured
+                           // LOCALLY per instance — pricing is enforced at authorize() against the
+                           // payer's local ledger; there is no convergent velocity clock (ADR-051 §6).
                            // Window: trailing 60-second sliding window, evaluated at action time.)
     StorageUsage,          // context storage in bytes (measurement: sum of value sizes for all keys
                            // under context/{context_id}/ in ProtocolRepository. Measured on the payer's
@@ -422,7 +426,7 @@ pub struct SpendingCapability {
 
 ## 19.6 Payment Receipts and Provenance
 
-Every paid action generates a `PaymentReceipt` recorded in the context event log as a provenance record (§7.7).
+Every paid action generates a `PaymentReceipt` provenance record (§7.7). `PaymentReceipt` is appended by the payee on capture — per-payee application activity, so it is a local `ContextEvent` until ADR-051 and a convergent Merkle leaf thereafter (ADR-011 amendment, exclusion taxonomy §2).
 
 ```rust
 pub struct PaymentReceipt {
@@ -439,6 +443,7 @@ pub struct PaymentReceipt {
                                       //   Lightning: preimage
                                       //   SPL: tx signature
     pub timestamp: u64,
+    pub anchored: bool,               // false until ADR-051: per-payee ContextEvent, not a convergent Merkle leaf — consumers MUST NOT treat provenance as Merkle-proven
     pub signature: Vec<u8>,           // Ed25519 signature by payer (see signature scope below)
 }
 ```
@@ -477,7 +482,7 @@ Economic governance introduces new event types for the verifiable event log (ADR
 | `SpendingUcanGranted` | Human grants spending UCAN to agent | Agent key `#agent` on human's DID, `SpendingCapability` summary (amounts, window), UCAN token ID |
 | `SpendingUcanRevoked` | Human revokes spending UCAN | UCAN token ID, revocation reason |
 
-These extend the existing event type enum alongside `MessageSent`, `MemberJoined`, `RoleAssigned`, `ToolInvoked`, etc. All economic events carry the same Merkle-tree inclusion guarantees as other event types.
+Of these, the economic *governance/policy* events (`EconomicPolicyChanged`, `EconomicPolicyApplied`, `SpendingUcanGranted`, `SpendingUcanRevoked`) are commit-ordered and convergent, and carry the same Merkle-tree inclusion guarantees as the other convergent `EventType` variants (governance, membership, lifecycle). `PaymentReceived` / `PaymentCaptureFailed`, by contrast, are appended by the payee on `adapter.capture()` — per-author application activity, convergent and Merkle-anchored only under ADR-051 (see the ADR-011 amendment, exclusion taxonomy §2); until then they are local `ContextEvent`s. The velocity metrics below (`ContextMessageRate`, `SenderVelocity`) are **local and self-metered** — enforced at `authorize()` by the payer's own SDK against a local spending ledger. There is no convergent velocity clock (ADR-051 §6: rate-limiting is local flow control, and a durable suspension is a governance commit whose execution *is* its record); these pricing metrics are not convergent Merkle records.
 
 ## 19.7 Anti-Spam via Cost Escalation
 
@@ -586,7 +591,7 @@ SCP.Identity.grantSpending(agent, SpendingCapability, expiry) → UcanToken
 SCP.Identity.configureAdapter(adapter) → ()
 ```
 
-`estimateCost` evaluates the context's pricing formula against current observable metrics. `paymentHistory` retrieves receipts from the context's event log. `grantSpending` mints a spending UCAN. `configureAdapter` registers a payment adapter with the identity's SDK instance.
+`estimateCost` evaluates the context's pricing formula against current observable metrics. `paymentHistory` retrieves receipts (per-payee `ContextEvent`s in the interim; convergent Merkle leaves under ADR-051 — see the ADR-011 amendment, exclusion taxonomy §2). `grantSpending` mints a spending UCAN. `configureAdapter` registers a payment adapter with the identity's SDK instance.
 
 ## 19.12 Security Considerations
 
@@ -613,7 +618,7 @@ Community payment adapters (x402, Lightning, SPL, Stripe) are **Phase 4+** — e
 1. **Economic policy visible before opt-in (legibility).** Economic terms are part of context metadata (§5.7), visible to any identity that inspects the context before joining.
 2. **No implicit spending — spending UCAN always required.** Protocol NEVER authorizes expenditure without an explicit, valid spending UCAN from the payer's delegation chain.
 3. **Free operation is default — no economic policy = free.** Contexts without `EconomicPolicy` are free. Relays without `economic` in `relay_config` are free. Tools without cost metadata are free.
-4. **Receipts are provenance records — every payment is traceable and verifiable.** Payment receipts are recorded in context event logs and participate in the provenance chain (§7.7).
+4. **Receipts are provenance records — every payment is traceable and (under ADR-051) Merkle-verifiable.** Payment receipts participate in the provenance chain (§7.7). Authorship is non-repudiable via the receipt's signature regardless; `PaymentReceipt` is per-payee application activity, so its *convergent Merkle anchoring* (tamper-evident ordering/completeness) is a local `ContextEvent` until ADR-051 and a canonical leaf thereafter (ADR-011 amendment, exclusion taxonomy §2).
 5. **Payment adapters are substitutable — no single rail privileged.** The `PaymentAdapter` trait treats all payment rails equally. Protocol correctness does not depend on any specific adapter.
 6. **Economic policy mutable by default, optional immutability lock is voluntary.** Unlike ceiling policy (immutable by default), economic policy is governed by default. Creators may voluntarily lock pricing at creation.
 7. **Payment data inside encrypted envelope — relays never see payment metadata** for context-level economics. Relay-level payments are visible to the relay (necessary for relay to verify) but not to other relays or contexts.
@@ -754,7 +759,7 @@ This section tabulates the wire format for all economy protocol types that cross
 | `expires_at` | `u64` | Yes | Authorization expiry. Payment must be captured before this. |
 | `adapter_state` | `Vec<u8>` (serde_bytes) | Yes | Adapter-specific opaque state. |
 
-**`PaymentReceipt`** — Proof of completed payment. Recorded in context event log.
+**`PaymentReceipt`** — Proof of completed payment. Per-payee provenance record: a local `ContextEvent` until ADR-051, a convergent Merkle leaf thereafter (ADR-011 amendment, exclusion taxonomy §2).
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|

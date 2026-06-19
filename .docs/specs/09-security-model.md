@@ -725,11 +725,11 @@ The past-bound is relative, not absolute, to handle offline delivery: if Bob com
 
 Within a context, messages are ordered by: `(epoch, sender_generation_number, timestamp)`. This gives a total order per-sender and a causal order across senders — epoch boundaries are synchronization points.
 
-The Merkle event log records events in append order. Each event references the previous event's hash, creating a hash chain. If two events reference the same parent, the log has forked — possible equivocation (see §9.9).
+The canonical Merkle event log records the **convergent** (MLS-commit-ordered) events as a single-parent hash chain in append order; for that totally-ordered prefix, two events referencing the same parent indicate a fork — possible equivocation (§9.9). **Application events** (messages, tool invocations) are NOT part of this chain: in the interim they are excluded local `ContextEvent`s (ADR-011 amendment), and in the end state they are ordered by a **causal DAG** (ADR-051) in which multiple events legitimately reference a shared frontier and are deterministically linearized — concurrent branches are normal, not a fork.
 
 **Interaction with relay ordering:** Relays do not guarantee message ordering. The SDK MUST re-order messages locally using `(epoch, generation, timestamp)` before presenting them to the application layer.
 
-**Authoritative ordering:** The Merkle log order is authoritative, not timestamps. Timestamps are hints for the SDK to reconstruct order in real-time. Once events are committed to the log, the log order is the permanent record.
+**Authoritative ordering:** The Merkle log order is authoritative, not timestamps. Timestamps are hints for the SDK to reconstruct order in real-time. Once events are committed to the log, the log order is the permanent record. For the convergent commit-ordered prefix this is the single-parent chain above; for DAG-ordered application events (ADR-051) the authoritative order is the deterministic linearization of the causal DAG (ADR-051 §2). The per-sender `(epoch, generation, timestamp)` reconstruction remains a delivery/display hint only.
 
 ### 9.8.4 Forgery Prevention
 
@@ -743,7 +743,7 @@ The Merkle event log records events in append order. Each event references the p
 
 ### 9.8.5 Sequence Validation
 
-Each sender in a context maintains a monotonically increasing SCP sequence number (distinct from MLS generation numbers, which are MLS-internal). This sequence number is included in the envelope and the Merkle event log entry.
+Each sender in a context maintains a monotonically increasing SCP sequence number (distinct from MLS generation numbers, which are MLS-internal). This sequence number is included in the envelope. For *application messages* it is no longer a Merkle event-log entry: in the interim they are excluded local `ContextEvent`s (ADR-011 amendment), and in the ADR-051 end state the DAG leaf carries causal head-references in place of a committer sequence (§7.3.1; ADR-051). Commit-ordered events retain the committer-assigned sequence in their leaf.
 
 Recipients MUST accept all authenticated messages regardless of sequence order and apply reorder-before-delivery semantics. Multi-relay delivery (§10.4, ADR-012) guarantees that messages may arrive out of order; strict rejection would cause guaranteed message loss.
 
@@ -810,6 +810,8 @@ ConsistencyCheckpoint {
 
 Checkpoints are sent as regular MLS application messages (encrypted, authenticated).
 
+**DAG-leaf extension (ADR-051).** For contexts with DAG-ordered application leaves, the checkpoint additionally carries a canonical `frontierRoot` (a commitment to the member's observed DAG frontier), and the equivocation test compares `merkleRoot` at equal `frontierRoot` rather than equal `eventCount` (a frontier is a *set* of head hashes, not derivable from the scalar count; see ADR-051 §5). The scalar fields above remain authoritative for the totally-ordered commit prefix.
+
 **Checkpoint comparison:** On receiving a checkpoint from another member, each member compares:
 
 - `eventCount`: Must match (within tolerance for in-flight messages). Divergence of more than 5 events indicates inconsistency.
@@ -817,6 +819,8 @@ Checkpoints are sent as regular MLS application messages (encrypted, authenticat
 - `epoch`: Must match. Divergence indicates a missed MLS Commit (possible suppression).
 
 **Cryptographic equivocation test vs. application-layer heuristics.** The "divergence of more than 5 events" / "within tolerance" language on `eventCount` is an application-layer heuristic for distinguishing benign catch-up lag (a peer that is merely Behind or Ahead because it has not yet observed all in-flight events) from an alarm condition worth surfacing. It is NOT the cryptographic equivocation test. The cryptographic equivocation test is unambiguous and conservative: **equal `eventCount` with different `merkleRoot`**. Two honest members reporting the same event count but different roots cannot be reconciled by any ordering of in-flight messages — one of them was served a forged history. Implementations MUST NOT loosen the equal-count test (e.g., by tolerating root divergence within the 5-event window); the count tolerance applies only to deciding whether a count gap is alarming, never to weakening the equal-count-different-root signal.
+
+**Convergent-log requirement.** The equal-count/equal-root test is sound only if honest members build the *same* log. The canonical event log MUST therefore contain only **convergent** events — those every honest member derives identically from the MLS-commit-ordered stream (governance, membership, lifecycle, role, access, attestation, provenance, economic *governance* actions, compromise recovery, app-binding), as enumerated by the canonical `EventType` taxonomy (ADR-011). Per-recipient or detection signals (`MessageReceived`, `EquivocationDetected`) and routing-bootstrap signals (`PseudonymAnnounced`) are local `ContextEvent`s, never log entries. Per-author application activity (`MessageSent`, `ToolInvoked`, `PaymentReceived`) has no global order on its own and is brought into a convergent canonical order by the causal-DAG ordering of ADR-051; until that lands it is excluded from the canonical log (surfaced as a local `ContextEvent`), so the equal-count/equal-root invariant holds over the convergent subset. For the DAG-ordered application leaves specifically, the equivocation test is taken at **equal frontier** — a causally-stable cut — not equal scalar count: two honest members can have observed different in-flight application events, so equal count need not mean equal leaf set, and the `ConsistencyCheckpoint` therefore commits to the DAG frontier and roots are compared at equal frontier (ADR-051 §5). The totally-ordered commit prefix continues to use position directly.
 
 **Divergence resolution:** If Merkle roots diverge, members exchange event log proofs to identify the first divergent event. This reveals which relay served which version. The context's governance model handles the response.
 

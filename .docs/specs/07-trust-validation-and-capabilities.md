@@ -120,9 +120,9 @@ This is the layer that replaces trust with evidence. It grows as the network acc
 
 ### 7.3.1 Verifiable Event Logs
 
-Every context maintains a verifiable event log — a Merkle tree (or equivalent authenticated data structure) of all protocol events: messages, tool invocations, membership changes, role assignments, governance actions. Events are signed by the acting agent and sequenced.
+Every context maintains a verifiable event log — a Merkle tree (or equivalent authenticated data structure) of the context's convergent protocol events: membership changes, role assignments, governance actions, lifecycle, access, attestation, and provenance (the MLS-commit-ordered stream; ADR-011). Application events — messages and tool invocations — are per-author and enter this convergent log under the causal-DAG ordering of ADR-051; until then they are local `ContextEvent`s, not canonical leaves (see the ADR-011 amendment, exclusion taxonomy). Events are signed by the acting agent.
 
-**Event sequencing mechanism.** Events in the Merkle tree are sequenced using a per-context monotonic counter maintained by the context's governance authority (admin in SingleAdmin; the committing member in other models). Sequence numbers are 64-bit unsigned integers starting at 0, incremented by 1 for each event. The counter is stored at `context/{context_id}/event_meta/count` (§17.3). Concurrent events from different members are serialized through the MLS commit mechanism — only one Commit can succeed per epoch, and the committing member assigns the sequence number. In broadcast contexts, each author maintains their own sequence counter (independent per-author sequencing). The sequence number is included in the event's Merkle leaf hash: `leaf_hash = SHA-256(sequence || event_type || actor_did || timestamp || event_data_hash)`.
+**Event sequencing mechanism.** Events in the Merkle tree are sequenced using a per-context monotonic counter maintained by the context's governance authority (admin in SingleAdmin; the committing member in other models). Sequence numbers are 64-bit unsigned integers starting at 0, incremented by 1 for each event. The counter is stored at `context/{context_id}/event_meta/count` (§17.3). Concurrent events from different members are serialized through the MLS commit mechanism — only one Commit can succeed per epoch, and the committing member assigns the sequence number. In broadcast contexts, each author maintains their own sequence counter (independent per-author sequencing). The canonical Merkle leaf is `leaf_hash = SHA-256(0x00 ‖ rmp_serde(Event))` over the typed `Event` (ADR-011 / §25), whose serialized fields include the event type, actor DID, timestamp, and payload; commit-ordered events also carry the committer-assigned sequence, while DAG-ordered application events carry causal head-references in its place (ADR-051).
 
 Any participant can verify claims about context history against the Merkle root:
 
@@ -144,7 +144,7 @@ The protocol defines a standard participation record format derivable from conte
 - Attestation history (endorsements issued, endorsements received, endorsement accuracy)
 - Context creation history
 
-Each fact is verifiable against the relevant context's Merkle root. The participation record is not stored centrally — it is computed by any agent from the set of context logs they can access.
+Each fact is verifiable against the relevant context's Merkle root. Facts derived from convergent events — participation duration (`MemberJoined`), governance actions (`GovernanceActionExecuted`), role progression (`RoleAssigned`), context-creation (`ChildContextCreated`), and attestations — are Merkle-anchored today. The `tool_invocation_count` fact derives from `ToolInvoked`, per-author application activity that becomes Merkle-anchored under the causal-DAG ordering of ADR-051 (computed locally until then; see the ADR-011 amendment, exclusion taxonomy). The participation record is not stored centrally — it is computed by any agent from the set of context logs they can access.
 
 **Participation record computation algorithm.** An agent computing a participation record for a target DID across N accessible context logs follows this deterministic procedure:
 
@@ -153,7 +153,7 @@ Each fact is verifiable against the relevant context's Merkle root. The particip
    - `participation_duration_secs`: `(latest_event_timestamp - MemberJoined_timestamp)` for the target DID. If the member has left and rejoined, sum all intervals.
    - `governance_actions_against`: Count of events with type `GovernanceActionExecuted` where `subject_did == target_did`.
    - `governance_actions_by`: Count of events with type `GovernanceActionExecuted` where `actor_did == target_did`.
-   - `tool_invocation_count`: Count of events with type `ToolInvoked` where `actor_did == target_did`.
+   - `tool_invocation_count`: Count of events with type `ToolInvoked` where `actor_did == target_did`. (Per-author application activity: computed from local `ContextEvent`s, not the Merkle log, until ADR-051 makes `ToolInvoked` a convergent leaf; it needs the convergent DAG *count* — no clock.)
    - `context_creation_count`: Count of events with type `ChildContextCreated` where `actor_did == target_did`. This is per-context (counts child contexts created within this context only, not globally).
    - `role_progression_count`: Count of events with type `RoleAssigned` where `subject_did == target_did`.
    - `attestation_count`: Count of events with type `AttestationPublished` where `actor_did == target_did`.
@@ -211,11 +211,12 @@ ParticipationProfile {
     governance_actions_against: u64,   // governance actions taken against this identity
     governance_actions_by: u64,        // governance actions initiated by this identity
     tool_invocation_count: u64,        // total tool invocations
+    tool_invocation_count_anchored: bool, // false until ADR-051: derived from local ContextEvents, not the Merkle log — consumers MUST NOT treat as Merkle-proven
     context_creation_count: u64,       // contexts created
     role_progression_count: u64,       // role transitions
     attestation_count: u64,            // attestation events
     updated_at: u64,                   // timestamp of last update
-    event_log_root: [u8; 32],         // Merkle root for verifiability
+    event_log_root: [u8; 32],         // Merkle root; convergent-derived facts verifiable against it (tool_invocation_count is context-signed-only until ADR-051)
     // NOTE: no context_id — this is the privacy guarantee
     signer_public_key: [u8; 32],      // context-specific signing key
     signature: Ed25519Signature,       // over all fields above
@@ -710,8 +711,8 @@ If misbehavior has automatic, protocol-enforced consequences, trust in an indivi
 
 Contexts can define **automated consequence rules** as part of their governance model:
 
-- Message velocity exceeds threshold → capability suspension for defined period
-- Tool invocation rate exceeds threshold → tool access revoked pending governance review
+- Message velocity exceeds threshold → capability suspension for defined period (rate-limiting is the local throttle; the durable suspension is a governance commit whose execution *is* its record — ADR-051 §6; no convergent velocity clock)
+- Tool invocation rate exceeds threshold → tool access revoked pending governance review (a per-author *rate*, like message velocity: local-throttle flow control + a governance-commit suspension whose execution *is* its record — ADR-051 §6)
 - Multiple governance warnings → automatic role demotion
 - Capability ceiling violation attempt → action rejected and logged
 
@@ -723,6 +724,8 @@ These rules are:
 - **Sanitized at creation.** All string fields in consequence rules (`Custom` trigger keys, `AssignRole` target roles) are validated when the context is created. Implementations MUST reject strings containing control characters (U+0000-U+001F, U+007F-U+009F), HTML-special characters (`<`, `>`, `&`, `"`, `'`), or strings exceeding 256 bytes. Role-typed fields (`AssignRole` target roles) use the role name limit of 64 bytes (§9.18.6) rather than the general 256-byte cap. Capability fields use the typed `Capability` enum (not raw strings). Consequence rules with `RevokeAccess` actions require the context-level `allow_automatic_access_revocation` opt-in; `RemoveMember` is governance-only and always rejected in consequence rules. This prevents injection attacks when consequence events are serialized for SDK consumers or rendered in user interfaces.
 
 Consequence mechanisms transform "do I trust this agent to behave?" into "are the consequences of misbehaving sufficient to make it irrational?" The latter is a validation question, not a trust question.
+
+**Convergent emission (how "automatic" and "verifiable" coexist).** A consequence is emitted by deterministic auto-derivation from the context's convergent Merkle log: every honest member, processing the same convergent event, evaluates the same rules over the same state and appends the identical consequence record at the identical position — mechanical, automatic, and identical for all members, with no proposer, vote, or per-receiver evaluation. By the convergence rule (ADR-011), a consequence is automatic *and* verifiable in the Merkle log iff its trigger input is convergent: rules keyed on convergent events (governance warning counts, role / lifecycle) produce durable, Merkle-verifiable records today; rules keyed on per-author **velocity** (message or tool *rate*, §19.7) are NOT auto-derived convergent records: a rate needs a convergent clock the protocol neither has nor needs. Rate-limiting is **local flow control** (the per-member throttle, §23.16.8 — the live spam defense, not a recorded consequence), and a durable **suspension** is a **governance consequence** (ADR-031) whose commit is both its execution and its record (ADR-051 §6) — there is no convergent velocity clock and no execute/record split. A member observing sustained local throttling auto-proposes the suspension; it commits per the context's *declared* governance model — mechanical, never an ad-hoc vote, so "automatic, not governance-discretion" holds at every stage. Honest scoping: the *trigger* is a proposer-side local observation (not a convergent input others re-verify), and the durable record forms only when the declared governance model commits — so in a SingleAdmin-abuser or sub-quorum-honest-minority configuration no durable suspension forms, though the local throttle still protects each member unconditionally.
 
 **Economic consequences** compose with participation consequences. Contexts with economic policy (§19.3) add a cost tier: escalating pricing via `SenderVelocity` (§19.7) makes high-velocity behavior increasingly expensive before participation consequences trigger. Economic and participation tiers operate independently — an agent might exhaust its spending UCAN before participation suspension, or vice versa.
 
