@@ -30,7 +30,14 @@
 # THE CLASS-S MUTATION MARKERS (the single source of truth: MUTATORS)
 # ---------------------------------------------------------------------------
 # A function whose body contains ANY of these markers performs a Class-S
-# mutation and MUST persist fail-closed before acknowledging:
+# mutation and MUST persist fail-closed before acknowledging. Markers are
+# matched against the in-flight LOGICAL line, not the bare physical line: a
+# method-chain continuation (a line beginning with `.`) or an argument list with
+# unclosed call-parens is coalesced onto the running statement before matching,
+# so a marker whose contiguous token is split across physical lines (e.g. the
+# `prepare_a` shape `state` / `.xctx_caller_reservations` / `.insert(..)`) still
+# fires. See "MULTI-LINE MARKER MATCHING" in `scan_file` for the exact rule;
+# self-test fixtures (16)/(17) regression-guard it.
 #
 #   Spending-nonce consume (replay / double-spend):
 #     commit_spending_ucan_nonce(  — the durable nonce insertion chokepoint
@@ -481,6 +488,14 @@ scan_file() {
         fn_failclosed = 0
         fn_besteffort = 0
         scanned = 0
+        # chain_buf — the in-flight LOGICAL line: physical continuation lines (a
+        # method-chain line beginning with `.`, or a line whose call-parens are
+        # still unclosed) are coalesced into it before marker matching, so a
+        # marker such as `xctx_caller_reservations.insert(` fires even when the
+        # real call is split across `state` / `.xctx_caller_reservations` /
+        # `.insert(..)` physical lines. Reset on a statement terminator and at
+        # each function-body open. See the "MULTI-LINE MARKER MATCHING" header.
+        chain_buf = ""
         n = split(HELPERS, harr, " ")
         for (i = 1; i <= n; i++) if (harr[i] != "") helper[harr[i]] = 1
         c = split(CLASSC, carr, " ")
@@ -569,6 +584,7 @@ scan_file() {
             fn_mutates = 0
             fn_failclosed = 0
             fn_besteffort = 0
+            chain_buf = ""
             pending = 0
             scanned++
         }
@@ -576,23 +592,78 @@ scan_file() {
         # Within a function body, look for Class-S mutation markers, the
         # fail-closed persist, AND the best-effort persist (round-9 keystone:
         # a governance leaf that best-effort-persists must be allowlisted).
-        # Markers are matched as literal substrings against an
-        # assignment-normalized copy of the line: whitespace around a bare `=`
-        # is collapsed (`x = y` -> `x=y`) so a space-free ASSIGNMENT marker
-        # (e.g. `threshold_value=`, `role_state.ceiling=`) matches the
-        # downward-auth write while NOT matching a read or a comparison. The
-        # relational/equality operators `== != >= <=` are protected first, so an
-        # assignment marker can never false-match a comparison (e.g.
-        # `threshold_value == n`). Markers without `=` (the original tracker /
-        # suspend / remove_member / executed_proposals set) are unaffected —
-        # collapsing `=` spacing cannot newly match a marker that has no `=`.
+        #
+        # MULTI-LINE MARKER MATCHING. Markers are matched against the in-flight
+        # LOGICAL line (`chain_buf`), not the bare physical line, so a marker
+        # whose contiguous token is split across a method-chain (e.g.
+        #     state
+        #         .xctx_caller_reservations
+        #         .insert(saga_id.clone(), record);
+        # — no single physical line contains `xctx_caller_reservations.insert(`)
+        # still fires. A physical line is COALESCED onto the running buffer when
+        # it is a continuation — its trimmed form begins with `.` (a method-chain
+        # link), OR the buffer so far has more `(` than `)` (an argument list
+        # spanning lines). Otherwise the buffer restarts at this line. The buffer
+        # is reset on a statement terminator (a trailing `;`, `{`, or `}` once
+        # call-parens are balanced) so an unrelated later statement cannot be
+        # glued onto a stale prefix. This is a pure SUPERSET of the old
+        # per-physical-line match: a marker that already matched one physical line
+        # still matches (that line is always its own logical line or a prefix of
+        # one), so no existing detection is weakened — only previously-dead
+        # multi-line markers become live.
+        #
+        # The buffer is then assignment-normalized (whitespace around a bare `=`
+        # collapsed, `x = y` -> `x=y`) so a space-free ASSIGNMENT marker (e.g.
+        # `threshold_value=`, `role_state.ceiling=`) matches the downward-auth
+        # write while NOT matching a read or a comparison. The relational/equality
+        # operators `== != >= <=` are protected first, so an assignment marker can
+        # never false-match a comparison (e.g. `threshold_value == n`). Markers
+        # without `=` (the original tracker / suspend / remove_member /
+        # executed_proposals set) are unaffected — collapsing `=` spacing cannot
+        # newly match a marker that has no `=`.
         if (in_fn) {
-            mline = normalize_assign(line)
+            # Build the logical line. `trimmed` is the line with leading
+            # whitespace removed (used only to detect a leading-`.` continuation).
+            trimmed = line
+            sub(/^[[:space:]]+/, "", trimmed)
+            # Is the buffer mid-statement with an open call-paren? (more `(` than
+            # `)` so far). Counted on the comment-stripped buffer.
+            buf_opens = gsub(/\(/, "(", chain_buf)   # gsub returns the count
+            buf_closes = gsub(/\)/, ")", chain_buf)  # (chain_buf itself unchanged
+            chain_unclosed = (buf_opens > buf_closes) # in value — only counts)
+            if (chain_buf != "" && (trimmed ~ /^\./ || chain_unclosed)) {
+                # Continuation: append this physical line to the logical line,
+                # with its LEADING whitespace stripped (the `trimmed` form) so a
+                # marker token contiguous in source (`x.insert(`) is not split by
+                # the continuation line indentation. Rust permits no whitespace
+                # *inside* a `.method(` token, so a leading-`.` chain link glues
+                # directly onto the receiver, and an arg-list continuation glues
+                # directly after the open `(` — concatenating the trimmed forms
+                # reproduces the single-line spelling for marker purposes.
+                chain_buf = chain_buf trimmed
+            } else {
+                # New logical statement starts here.
+                chain_buf = line
+            }
+
+            mline = normalize_assign(chain_buf)
             for (mi = 1; mi <= nm; mi++) {
                 if (marr[mi] != "" && index(mline, marr[mi]) > 0) { fn_mutates = 1; break }
             }
             if (line ~ /persist_state_fail_closed[[:space:]]*\(/) fn_failclosed = 1
             if (line ~ /persist_state_best_effort[[:space:]]*\(/) fn_besteffort = 1
+
+            # Reset the logical-line buffer at a statement terminator, but only
+            # once call-parens are balanced (a `;`/`}` INSIDE an unclosed arg list
+            # — e.g. a closure body — does not end the outer statement). Recount
+            # on the freshly-extended buffer.
+            r_opens = gsub(/\(/, "(", chain_buf)
+            r_closes = gsub(/\)/, ")", chain_buf)
+            if (r_opens <= r_closes && chain_buf ~ /[;{}][[:space:]]*$/) {
+                chain_buf = ""
+            }
+        } else {
+            chain_buf = ""
         }
 
         depth += opens - closes
@@ -1000,6 +1071,44 @@ self_test() {
         printf '}\n'
     } > "$fdir/govleaf_ok.rs"
 
+    # (16) MULTI-LINE MARKER — a Class-S mutation whose marker token
+    # (`xctx_caller_reservations.insert(`) is split across a method-chain (the
+    # `prepare_a` shape: a bare receiver line + two `.`-continuation lines, so NO
+    # single physical line contains the contiguous token) WITHOUT a following
+    # fail-closed persist MUST be caught. This fixture is the regression guard for
+    # the continuation-join: before the join, this marker was DEAD (it never
+    # matched any physical line); after it, the joined logical line reproduces the
+    # single-line spelling and the marker fires. A best-effort persist here models
+    # the hazard — a staged caller reversal record that could roll back behind an
+    # acked Prepare-A. (Named non-`execute_` so the GOVHIT rule does not mask the
+    # HIT — only the multi-line MUTATORS marker may catch it.)
+    {
+        printf 'pub async fn multiline_insert_missed_fixture() {\n'
+        printf '    let record = ticket.to_caller_reservation_record(now);\n'
+        printf '    state\n'
+        printf '        .xctx_caller_reservations\n'
+        printf '        .insert(saga_id.clone(), record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/multiline_missed.rs"
+
+    # (17) MULTI-LINE MARKER, SATISFIED — the same split-across-lines
+    # `xctx_caller_reservations.insert(` chain, but the function DOES persist
+    # fail-closed in its own body. The continuation-join must NOT make this a
+    # false positive: the marker fires (mutation detected) but the fail-closed
+    # persist satisfies it, so it is NOT flagged. This guards against an
+    # over-aggressive join that would HIT every multi-line mutator regardless of
+    # its (correct) fail-closed persist.
+    {
+        printf 'pub async fn multiline_insert_fixed_fixture() {\n'
+        printf '    let record = ticket.to_caller_reservation_record(now);\n'
+        printf '    state\n'
+        printf '        .xctx_caller_reservations\n'
+        printf '        .insert(saga_id.clone(), record);\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+    } > "$fdir/multiline_fixed.rs"
+
     local rc=0
     local out
     out=$(
@@ -1032,6 +1141,29 @@ self_test() {
         printf '%sSELF-TEST FAILED%s: a direct spending_nonce_tracker.record() bypass was\n' \
             "$C_RED" "$C_RESET" >&2
         printf 'NOT caught — the P1-B chokepoint-bypass marker is not wired.\n' >&2
+        rc=1
+    fi
+    # (16) MULTI-LINE MARKER: a Class-S mutation whose marker token is split
+    # across a method-chain (NO single physical line carries the contiguous
+    # token) and which does NOT fail-close MUST be caught — the continuation-join
+    # reproduces the single-line spelling so a previously-dead multi-line marker
+    # fires. Regression guard for the `xctx_caller_reservations.insert(` (and
+    # every multi-line marker) coverage.
+    if ! grep -q $'^HIT\t.*\tmultiline_insert_missed_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation whose marker is split across a\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'method-chain (no single line carries the contiguous token) was NOT caught\n' >&2
+        printf '— the continuation-join is not coalescing logical lines before marker match.\n' >&2
+        rc=1
+    fi
+    # (17) MULTI-LINE MARKER, SATISFIED: the same split-across-lines mutation that
+    # DOES persist fail-closed MUST NOT be flagged — the join must not turn a
+    # correctly-persisted multi-line mutator into a false positive.
+    if grep -q $'^HIT\t.*\tmultiline_insert_fixed_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a multi-line Class-S mutation that DOES persist\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'fail-closed was wrongly flagged — the continuation-join is over-aggressive\n' >&2
+        printf '(it ignored the fail-closed persist on the joined statement chain).\n' >&2
         rc=1
     fi
     # (11) Seam-1/black-hat: a best-effort NON-`execute_` ceiling-lowering leaf

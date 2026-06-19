@@ -7021,7 +7021,18 @@ impl Supervisor {
         // the local economy from the durable record. The FSM still surfaces the
         // original abort error to its caller.
         if matches!(caller_reversal, CallerAbortReversal::ReversalOutstanding) {
+            // Observability: the producing site inside `abort_xctx_participants` /
+            // `redrive_caller_local_reversal` already routed its verdict through
+            // `Self::reversal_outstanding()`, which incremented
+            // `scp_saga_caller_reversal_outstanding_total` and (at the site) emitted
+            // the stable `event = "xctx_caller_reversal_outstanding"` warn. This
+            // coordinator branch re-emits the SAME stable field (so a log query on
+            // it surfaces the terminal "left non-terminal" decision too) but does
+            // NOT re-increment the counter — that would double-count a single
+            // stranded reversal. Log-based alerting on that stable field
+            // (thresholding the per-`saga_id` rate) is the intended signal.
             tracing::warn!(
+                event = "xctx_caller_reversal_outstanding",
                 saga_id = %saga_id.0,
                 "cross-context saga abort — caller-side local-economy reversal could not be \
                  delivered (persistent backpressure / closed inbox); leaving the journal \
@@ -7038,6 +7049,20 @@ impl Supervisor {
             .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, secret_bearing)
             .await
             .map_err(|e| ContextError::InvalidState(format!("saga journal mark_resolved: {e}")))
+    }
+
+    /// Record a stranded caller-side cross-context-saga reversal and return the
+    /// [`CallerAbortReversal::ReversalOutstanding`] verdict. Bumps the
+    /// `scp_saga_caller_reversal_outstanding_total` counter once per stranded
+    /// reversal so log-based / metric alerting can threshold the rate (each call
+    /// site additionally emits a stable `event = "xctx_caller_reversal_outstanding"`
+    /// structured warn carrying `saga_id`). Centralizing the counter here keeps
+    /// every producing site in lockstep — a new outstanding path cannot forget to
+    /// count itself — and avoids double-counting at the coordinator that consumes
+    /// the verdict.
+    fn reversal_outstanding() -> CallerAbortReversal {
+        crate::metrics::record_saga_caller_reversal_outstanding();
+        CallerAbortReversal::ReversalOutstanding
     }
 
     /// Send [`SagaPhaseMessage::Abort`] to the prepared participant actors of a
@@ -7153,6 +7178,7 @@ impl Supervisor {
                             // The LOCAL economy was NOT reversed: report it
                             // outstanding so the journal stays non-terminal.
                             tracing::error!(
+                                event = "xctx_caller_reversal_outstanding",
                                 saga_id = %saga_id.0,
                                 %err,
                                 "cross-context saga abort — recovered a non-Abort (or \
@@ -7160,7 +7186,7 @@ impl Supervisor {
                                  reservation could not be balanced and the caller's LOCAL \
                                  economy reversal is outstanding"
                             );
-                            CallerAbortReversal::ReversalOutstanding
+                            Self::reversal_outstanding()
                         }
                     }
                     // Delivered but the handler errored (or dropped the reply):
@@ -7173,13 +7199,14 @@ impl Supervisor {
                     // non-terminal and the (idempotent) sweep re-drives it.
                     Err((err, None)) => {
                         tracing::warn!(
+                            event = "xctx_caller_reversal_outstanding",
                             saga_id = %saga_id.0,
                             %err,
                             "cross-context saga abort — caller-side Abort delivered but the \
                              handler errored; the caller's LOCAL economy reversal is not \
                              confirmed durable, leaving the journal non-terminal for the sweep"
                         );
-                        CallerAbortReversal::ReversalOutstanding
+                        Self::reversal_outstanding()
                     }
                 }
             } else {
@@ -7198,45 +7225,61 @@ impl Supervisor {
                     .void_external_and_consume(self.payment_adapter_ref())
                     .await;
                 tracing::warn!(
+                    event = "xctx_caller_reversal_outstanding",
                     saga_id = %saga_id.0,
                     "cross-context saga abort — caller actor not co-resident; voided the external \
                      escrow and consumed the reservation ticket, leaving the journal non-terminal \
                      so a respawn + crash-recovery sweep reverses the caller's LOCAL economy from \
                      the durable record"
                 );
-                CallerAbortReversal::ReversalOutstanding
+                Self::reversal_outstanding()
             }
         } else {
             // No staged caller reservation ⇒ no caller LOCAL economy to reverse.
             CallerAbortReversal::SettledOrAbsent
         };
 
-        // TARGET side (only if Prepare-B may have staged a slot).
+        // TARGET side (only if Prepare-B may have staged a slot). The target
+        // carries no caller LOCAL economy, so its release is best-effort and
+        // orthogonal to the returned `caller_reversal`.
         if ctx.prepared_b.is_some() {
-            let target_hex = hex::encode(ctx.target_context_id);
-            if let Some(target) = self.lookup(&target_hex) {
-                let abort_saga_id = saga_id.clone();
-                let result = target
-                    .send(move |reply| {
-                        ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
-                            saga_id: abort_saga_id,
-                            reservation: None,
-                            reply,
-                        })
-                    })
-                    .await;
-                if let Err(err) = result {
-                    tracing::warn!(
-                        saga_id = %saga_id.0,
-                        %err,
-                        "cross-context saga abort — target-side Abort send failed; the staged \
-                         slot will be cleared on the next crash-recovery sweep"
-                    );
-                }
-            }
+            self.abort_target_leg(saga_id, ctx.target_context_id).await;
         }
 
         caller_reversal
+    }
+
+    /// Best-effort TARGET-side leg of a cross-context-saga abort: send
+    /// `Abort { reservation: None }` so the target actor clears its staged
+    /// `saga_pending` slot (releasing the session reservation). The target stages
+    /// no `ToolEconomyTicket`, so a failed/undelivered send strands nothing — the
+    /// next §17.16.4 crash-recovery sweep clears the slot — hence this never
+    /// affects the caller-side reversal verdict. A `lookup` miss is a clean no-op
+    /// (the despawned actor's snapshot carries the staged slot for the sweep).
+    async fn abort_target_leg(&self, saga_id: &SagaId, target_context_id: [u8; 32]) {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        let target_hex = hex::encode(target_context_id);
+        let Some(target) = self.lookup(&target_hex) else {
+            return;
+        };
+        let abort_saga_id = saga_id.clone();
+        let result = target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
+                    saga_id: abort_saga_id,
+                    reservation: None,
+                    reply,
+                })
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                saga_id = %saga_id.0,
+                %err,
+                "cross-context saga abort — target-side Abort send failed; the staged \
+                 slot will be cleared on the next crash-recovery sweep"
+            );
+        }
     }
 
     /// Re-drive a caller-side cross-context-saga abort as `Abort { None }` so the
@@ -7272,6 +7315,7 @@ impl Supervisor {
         use crate::context::actor::commands::SagaPhaseMessage;
         let Some(caller) = self.lookup(caller_hex) else {
             tracing::warn!(
+                event = "xctx_caller_reversal_outstanding",
                 saga_id = %saga_id.0,
                 context = %caller_hex,
                 "cross-context saga abort — caller actor not co-resident on Abort{{None}} \
@@ -7279,7 +7323,7 @@ impl Supervisor {
                  journal non-terminal so a respawn + crash-recovery sweep reverses it from \
                  the durable record"
             );
-            return CallerAbortReversal::ReversalOutstanding;
+            return Self::reversal_outstanding();
         };
         let abort_saga_id = saga_id.clone();
         let result = caller
@@ -7295,13 +7339,14 @@ impl Supervisor {
             Ok(()) => CallerAbortReversal::SettledOrAbsent,
             Err(err) => {
                 tracing::warn!(
+                    event = "xctx_caller_reversal_outstanding",
                     saga_id = %saga_id.0,
                     %err,
                     "cross-context saga abort — caller-side Abort{{None}} re-drive also failed \
                      (persistent backpressure / closed inbox); the caller's LOCAL economy \
                      reversal is outstanding, leaving the journal non-terminal for the sweep"
                 );
-                CallerAbortReversal::ReversalOutstanding
+                Self::reversal_outstanding()
             }
         }
     }
@@ -16762,5 +16807,115 @@ mod tests {
         ticket.hold_external_for_repair();
         // Reaching here without a drop-guard panic proves the carrier was marked
         // consumed (held for repair), not leaked.
+    }
+
+    /// Build a real `PreparedAFields` carrying a `#[must_use]` no-escrow ticket —
+    /// the exact carrier the Prepare-A handler hands the FSM. Used by the
+    /// extractor round-trip tests below so the recovered reservation is a genuine
+    /// ticket-bearing reservation (not a synthetic stand-in), making the
+    /// round-trip assertion meaningful.
+    fn build_prepared_a_fields_for_test() -> crate::context::actor::commands::PreparedAFields {
+        use scp_protocol::context::params::ContextParams;
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+
+        let invoker = DID("did:example:xctx-extractor".to_owned());
+        let handle = crate::context::ContextHandle::new(
+            "ctx-extractor".to_owned(),
+            ContextParams::default(),
+        );
+        let role_state = ContextRoleState::new(
+            "ctx-extractor",
+            "did:example:xctx-extractor",
+            default_ceiling(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        let ticket =
+            crate::context::tools_helpers::ToolEconomyTicket::new_for_test_no_escrow(invoker);
+        let reservation = crate::context::tools_helpers::ToolEconomyReservation {
+            handle,
+            role_state,
+            generation: 1,
+            ticket,
+        };
+        crate::context::actor::commands::PreparedAFields { reservation }
+    }
+
+    /// `extract_abort_reservation` must recover the `#[must_use]` ticket-bearing
+    /// reservation from the EXACT `Abort { reservation: Some(..) }` command that
+    /// `abort_xctx_participants` builds. The `else`/`None` arm is "unreachable in
+    /// practice" but was previously enforced only by a comment; this test makes a
+    /// future command-shape refactor that breaks the lockstep fail HERE (a
+    /// returned `None` that silently drops the ticket) instead of leaking a
+    /// reservation at runtime. The recovered ticket is consumed so its drop guard
+    /// does not fire under `--features testing`.
+    #[test]
+    fn extract_abort_reservation_round_trips_the_exact_built_command() {
+        let prepared = build_prepared_a_fields_for_test();
+        let (reply, _rx) = tokio::sync::oneshot::channel::<Result<(), ContextError>>();
+        // The EXACT command shape `abort_xctx_participants` constructs for the
+        // caller-side abort (carrying `Some(Box::new(reservation))`).
+        let cmd = Box::new(ContextCommand::SagaPhase(
+            crate::context::actor::commands::SagaPhaseMessage::Abort {
+                saga_id: SagaId("saga-extract-abort".to_owned()),
+                reservation: Some(Box::new(prepared)),
+                reply,
+            },
+        ));
+
+        let recovered = Supervisor::extract_abort_reservation(cmd);
+        assert!(
+            recovered.is_some(),
+            "extract_abort_reservation must recover the reservation from the exact \
+             Abort {{ reservation: Some(..) }} command abort_xctx_participants builds — \
+             a None here means the extractor/builder command shape drifted out of lockstep \
+             and a held ticket would be silently dropped"
+        );
+        // Consume the recovered ticket so the `#[must_use]` drop guard does not
+        // fire (mirrors the real abort path's void+consume).
+        recovered
+            .unwrap()
+            .reservation
+            .ticket
+            .consume_abandoning_escrow();
+    }
+
+    /// `extract_commit_a_reservation` must recover the reservation from the EXACT
+    /// `CommitA { reservation: Box::new(..), .. }` command that `commit_a_settle`
+    /// builds. Same lockstep guarantee as the abort extractor: a command-shape
+    /// refactor that breaks the re-pattern-match fails this test rather than
+    /// silently dropping the held ticket on the recovery path.
+    #[test]
+    fn extract_commit_a_reservation_round_trips_the_exact_built_command() {
+        let prepared = build_prepared_a_fields_for_test();
+        let (reply, _rx) = tokio::sync::oneshot::channel::<Result<(), ContextError>>();
+        // The EXACT command shape `commit_a_settle` constructs.
+        let cmd = Box::new(ContextCommand::SagaPhase(
+            crate::context::actor::commands::SagaPhaseMessage::CommitA {
+                saga_id: SagaId("saga-extract-commit-a".to_owned()),
+                reservation: Box::new(prepared),
+                caller_context_id: [0x11; 32],
+                caller_did: DID("did:example:caller".to_owned()),
+                target_context_id: [0x22; 32],
+                nonce: [0x33; 16],
+                receipt: vec![1, 2, 3],
+                output_bytes: vec![4, 5, 6],
+                reply,
+            },
+        ));
+
+        let recovered = Supervisor::extract_commit_a_reservation(cmd);
+        assert!(
+            recovered.is_some(),
+            "extract_commit_a_reservation must recover the reservation from the exact \
+             CommitA command commit_a_settle builds — a None here means the extractor/builder \
+             command shape drifted out of lockstep and a held ticket would be silently dropped"
+        );
+        recovered
+            .unwrap()
+            .reservation
+            .ticket
+            .consume_abandoning_escrow();
     }
 }

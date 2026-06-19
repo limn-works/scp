@@ -15,6 +15,7 @@
 //! | `scp_mls_decrypt_duration_seconds`| Histogram | MLS + sender key decryption latency            |
 //! | `scp_persistence_failures_total`  | Counter   | Persistence write failures (best-effort saves) |
 //! | `scp_saga_repair_needed_total`    | Counter   | Cross-context sagas landed in `NeedsRepair` requiring operator repair (§17.16.4) |
+//! | `scp_saga_caller_reversal_outstanding_total` | Counter | Cross-context saga aborts that could not confirm the caller-side reversal; the journal stays non-terminal for the §17.16.4 sweep (§6.2.4) |
 //! | `scp_pseudonym_announcements_rejected_total` | Counter | Rejected pseudonym announcements (forged DID, reserved value, or cross-DID RID collision, §9.10.4) |
 //! | `scp_active_contexts`             | Gauge     | Number of registered (active) contexts         |
 //! | `scp_buffer_occupancy`            | Gauge     | Total events buffered across all contexts      |
@@ -57,6 +58,24 @@ pub fn record_persistence_failure() {
 /// — a nonzero rate is the operator-alerting signal §17.16.4 names.
 pub(crate) fn record_saga_repair_needed() {
     metrics::counter!("scp_saga_repair_needed_total").increment(1);
+}
+
+/// Records a cross-context saga caller-side reversal left OUTSTANDING (§6.2.4).
+///
+/// Incremented at every abort site that returns
+/// `CallerAbortReversal::ReversalOutstanding` — where the caller-side LOCAL
+/// economy reversal (budget / velocity / hard-rate-limit) could NOT be confirmed
+/// delivered: the carrier `Abort` send failed and the `Abort{None}` re-drive
+/// also failed, the caller actor was despawned, the delivered handler errored
+/// before persisting, or a command-shape drift prevented recovering the held
+/// reservation. Each such site leaves the saga journal NON-TERMINAL so the
+/// §17.16.4 crash-recovery sweep re-drives the reversal; until it does, the
+/// caller stays over-charged. A nonzero rate here is the operator-alerting signal
+/// that reversals are stranding — paired with a stable
+/// `event = "xctx_caller_reversal_outstanding"` structured warn at each site so
+/// log-based alerting can additionally attribute by `saga_id`.
+pub(crate) fn record_saga_caller_reversal_outstanding() {
+    metrics::counter!("scp_saga_caller_reversal_outstanding_total").increment(1);
 }
 
 /// Records a rejected pseudonym announcement (§9.10.4).

@@ -1682,10 +1682,14 @@ fn commit_a_check_witness(
 ///   re-reversing.
 /// * **Crash-recovery abort** (`None`, the §17.16.4 re-drive): the carrier died
 ///   with the crash, so the reversal runs FROM the durable record —
-///   generation-checked budget / hard-rate-limit / velocity (by the persisted
-///   timestamp) reversal + external escrow void. This is the path the HIGH
-///   finding exposed: it previously no-op'd, durably over-charging the caller
-///   and leaking the escrow.
+///   UNCONDITIONAL budget / hard-rate-limit / velocity (by the persisted
+///   timestamp) reversal + external escrow void. The reversal is NOT gated on a
+///   generation match: the record AND the deductions it reverses are rehydrated
+///   from ONE consistent snapshot into the same `context_id`-routed actor, keyed
+///   by `record.actor_did` + the `SagaId`, so a fresh respawn-stamped generation
+///   never matches the pre-crash record — a gate here would wrongly SKIP every
+///   real crash-recovery refund. This is the path the HIGH finding exposed: it
+///   previously no-op'd, durably over-charging the caller and leaking the escrow.
 ///
 /// The two paths are mutually exclusive (carrier present ⟺ `Some`), so a saga
 /// is never double-reversed.
@@ -1722,11 +1726,15 @@ async fn abort(
     //     carrier already did the reversal.
     //
     //   * `None` — the §17.16.4 crash-recovery abort. The carrier died with the
-    //     crash, so we reverse FROM the durable record (generation-checked):
-    //     budget / hard-rate-limit / velocity (by the persisted timestamp) +
-    //     external escrow void. This is the path the HIGH finding exposed — it
-    //     previously no-op'd, durably over-charging the caller and leaking the
-    //     escrow.
+    //     crash, so we reverse FROM the durable record UNCONDITIONALLY (NO
+    //     generation gate): budget / hard-rate-limit / velocity (by the persisted
+    //     timestamp) + external escrow void. A gate would be wrong here — a fresh
+    //     respawn stamps a new generation that never matches the pre-crash
+    //     record, so gating would skip every real refund. Safety rests on the
+    //     record + its deductions being rehydrated from ONE snapshot into the
+    //     same `context_id`-routed actor, keyed by `record.actor_did` + the
+    //     `SagaId`. This is the path the HIGH finding exposed — it previously
+    //     no-op'd, durably over-charging the caller and leaking the escrow.
     //
     // The two reversal paths are mutually exclusive by construction (carrier
     // present ⟺ `Some`; record-reversal only on `None`), so a saga is never
@@ -1757,10 +1765,16 @@ async fn abort(
         }
         None => {
             // Crash-recovery abort: reverse from the durable record if present.
-            // `reverse_caller_reservation_record` voids the external escrow
-            // regardless of generation and reverses the LOCAL economy only on a
-            // generation match (confused-deputy guard), returning whether the
-            // local reversal ran.
+            // `reverse_caller_reservation_record` voids the external escrow AND
+            // reverses the LOCAL economy UNCONDITIONALLY — there is no generation
+            // gate (and a gate would be wrong: a fresh respawn stamps a new
+            // generation that never matches the pre-crash record, so gating would
+            // SKIP every real refund and over-charge the caller). Its safety
+            // rests on the invariant that the record and the deductions it
+            // reverses are rehydrated from ONE snapshot into the same
+            // `context_id`-routed actor, keyed by `record.actor_did` + the
+            // `SagaId` — not on a generation check. Returns whether the local
+            // reversal ran (always `true` for a present record on this path).
             match state.xctx_caller_reservations.remove(saga_id) {
                 Some(record) => {
                     let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
