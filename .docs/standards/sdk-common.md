@@ -87,6 +87,8 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13023` | handler | Per-interface §6.2.0.2 rate limit exceeded |
 | `SCP-SAGA-13024` | handler | Per-caller §6.2.0.2 rate limit exceeded |
 | `SCP-SAGA-13025` | handler | Caller role not in inbound `allowed_source_roles` |
+| `SCP-SAGA-13026` | handler | Per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B |
+| `SCP-SAGA-13027` | handler | Configured inbound rate exceeds the cache-eviction-safe ceiling (§6.2.4 sizing-vs-ceiling) |
 | `SCP-SAGA-13030` | handler | Commit-B reserve found no staged cross-context invocation |
 | `SCP-SAGA-13031` | handler | Commit-B settle found no staged cross-context invocation |
 | `SCP-SAGA-13032` | handler | Commit-B tool output is not valid JSON |

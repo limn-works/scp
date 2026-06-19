@@ -103,6 +103,38 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 // `spawn_actor_with_state`.
 
 // ---------------------------------------------------------------------------
+// §6.2.4 cross-context saga nonce-dedup TTL construction guard
+// ---------------------------------------------------------------------------
+
+/// Mechanically assert that a freshly-constructed cross-context nonce-dedup
+/// cache carries the PRODUCTION saga TTL
+/// ([`SAGA_NONCE_DEDUP_TTL_SECS`](crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS))
+/// — the longer-than-skew anti-replay window the spec REQUIRES (spec §6.2.4
+/// *Window relationship*, BLACK-XCTX-01).
+///
+/// Called at every spawn / restore site here that builds B's
+/// `xctx_nonce_dedup`, so a future regression to the default-TTL
+/// [`NonceDedup::new`](scp_protocol::crypto::sender_keys::NonceDedup::new) —
+/// whose 300s window is COTERMINOUS with the skew tolerance, the exact
+/// coterminous condition the spec forbids — is caught at construction rather
+/// than silently re-opening the replay gap. A `debug_assert` survives
+/// refactors: any builder that swaps in the wrong TTL trips it under test /
+/// debug builds. Lives in this (non-handler) lifecycle module — never on the
+/// actor handler path — so it does not run inside an actor's mailbox future
+/// (ADR-049 §10 handler panic ban applies to handlers, not these bootstrap
+/// constructors).
+#[track_caller]
+fn debug_assert_saga_dedup_ttl(dedup: &scp_protocol::crypto::sender_keys::NonceDedup) {
+    debug_assert_eq!(
+        dedup.ttl_secs(),
+        crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+        "cross-context nonce-dedup cache MUST be built with the production saga TTL \
+         (strictly longer than the freshness skew); a default-TTL NonceDedup::new() re-opens \
+         the coterminous-window replay gap (spec §6.2.4 Window relationship, BLACK-XCTX-01)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // §9.10.4 routing construction helpers
 // ---------------------------------------------------------------------------
 
@@ -1275,6 +1307,7 @@ pub async fn create_context(
         event_log: None,
         mode,
     };
+    debug_assert_saga_dedup_ttl(&per_context.xctx_nonce_dedup);
 
     // ADR-049 Phase 2A finalization owned-state spawn: the create path
     // no longer writes the legacy contexts DashMap. It hands the freshly
@@ -1856,6 +1889,7 @@ pub async fn import_context(
         event_log: None,
         mode: ContextModeState::Encrypted(Box::<ContextCryptoState>::default()),
     };
+    debug_assert_saga_dedup_ttl(&per_context.xctx_nonce_dedup);
 
     // 7. Register the imported context as an owned-state actor.
     //
@@ -2310,6 +2344,7 @@ pub async fn restore_context(
         event_log: None,
         mode,
     };
+    debug_assert_saga_dedup_ttl(&per_context.xctx_nonce_dedup);
 
     // ADR-049 Phase 2A finalization owned-state spawn: restore mirrors
     // create — hand the rehydrated `PerContextState` directly to

@@ -724,6 +724,19 @@ impl NonceDedup {
         }
     }
 
+    /// Returns this cache's eviction TTL in seconds (the window within which a
+    /// re-seen `nonce` counts as a replay). Exposed so a consumer can
+    /// mechanically assert it was constructed with the expected window — e.g.
+    /// the §6.2.4 cross-context saga asserts every spawn / restore site builds
+    /// the cache with `SAGA_NONCE_DEDUP_TTL_SECS` (strictly longer than the
+    /// freshness skew), so a future regression to the default-TTL
+    /// [`Self::new`] is caught at the construction site rather than silently
+    /// re-opening the coterminous-window replay gap (BLACK-XCTX-01).
+    #[must_use]
+    pub const fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
     /// Returns `true` if `nonce` has been seen within this cache's TTL
     /// (`ttl_secs`) of `now_secs`, indicating a replay attempt.
     ///

@@ -47,8 +47,8 @@ use scp_protocol::crypto::ucan::validate::{
 };
 
 use scp_protocol::context::tools::cross_context_saga::{
-    CommittedSide, CrossContextDivergenceMarker, CrossContextToolReceipt,
-    CrossContextToolReceiptFields,
+    CommittedSide, CrossContextDivergenceMarker, CrossContextDivergenceMarkerFields,
+    CrossContextToolReceipt, CrossContextToolReceiptFields,
 };
 
 use crate::context::actor::commands::{
@@ -82,6 +82,26 @@ use crate::context::tools_helpers::reserve_tool_economy;
 /// spec §6.2.4 for the forward obligation this leaves for an untrusted
 /// cross-node transport.
 pub(crate) const SAGA_NONCE_DEDUP_TTL_SECS: u64 = DEFAULT_CLOCK_SKEW_TOLERANCE_SECS * 2;
+
+/// Runtime configuration ceiling for an interface's inbound §6.2.0.2 rate
+/// (`InboundPolicy::max_calls_per_minute`) — the highest inbound rate B will
+/// admit at Prepare-B before rejecting the interface as cache-eviction-unsafe
+/// (spec §6.2.4 "Cache-eviction bound", normative "Sizing relative to the
+/// configured ceiling").
+///
+/// Derived from the dedup cache capacity, the saga dedup TTL window
+/// ([`SAGA_NONCE_DEDUP_TTL_SECS`] = 600s = 10 min), and the required ≥2× safety
+/// margin: at this per-minute rate the worst-case distinct-nonce volume over
+/// the TTL window stays at or below half the
+/// [`NONCE_DEDUP_CAPACITY`](scp_protocol::crypto::sender_keys::NONCE_DEDUP_CAPACITY)
+/// (10 000), so a sustained in-budget inbound stream can NEVER fill the cache
+/// and evict a still-within-TTL `nonce` — TTL expiry, not capacity eviction,
+/// bounds the replay window. `500/min × 10 min × 2 = 10 000 = capacity`. A
+/// higher ceiling would let in-budget traffic erode the replay bound, so an
+/// interface configuring an inbound rate above this is REJECTED at Prepare-B
+/// (`consume_inbound_interface_rate_limit`, `SCP-SAGA-13027`). The
+/// `nonce_dedup_replay_bound_holds` test asserts this derivation mechanically.
+pub(crate) const MAX_SAFE_INBOUND_CALLS_PER_MINUTE: u64 = 500;
 
 /// Lowercase-hex encode a raw 32-byte context-id digest (the wire / role-state
 /// id-form, never the `"standing-"`-prefixed display string — spec §6.2.4
@@ -169,12 +189,16 @@ async fn dispatch_prepare_phase(
         // this helper, so these arms are statically unreachable; return a typed
         // error (NEVER panic — ADR-049 §10 handler panic ban) rather than
         // `unreachable!`, routing each phase's reply to its typed sender.
-        SagaPhaseMessage::CommitBReserve { reply, .. } => misrouted_reserve(reply),
-        SagaPhaseMessage::CommitBSettle { reply, .. } => misrouted_settle(reply),
-        SagaPhaseMessage::CommitACheckWitness { reply, .. } => misrouted_witness(reply),
-        SagaPhaseMessage::CommitA { reply, .. }
-        | SagaPhaseMessage::Abort { reply, .. }
-        | SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => misrouted_unit(reply),
+        SagaPhaseMessage::CommitBReserve { reply, .. } => misrouted(reply, "CommitBReserve"),
+        SagaPhaseMessage::CommitBSettle { reply, .. } => misrouted(reply, "CommitBSettle"),
+        SagaPhaseMessage::CommitACheckWitness { reply, .. } => {
+            misrouted(reply, "CommitACheckWitness")
+        }
+        SagaPhaseMessage::CommitA { reply, .. } => misrouted(reply, "CommitA"),
+        SagaPhaseMessage::Abort { reply, .. } => misrouted(reply, "Abort"),
+        SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => {
+            misrouted(reply, "EmitDivergenceMarker")
+        }
     }
 }
 
@@ -257,18 +281,8 @@ async fn dispatch_commit_phase(
         // Prepare arms are matched in `dispatch` and never routed here. They
         // are statically unreachable; return a typed error per their reply
         // shape (NEVER panic — ADR-049 §10 handler panic ban).
-        SagaPhaseMessage::PrepareA { reply, .. } => {
-            let err = misrouted_err("PrepareA");
-            let sketch = outcome_error_sketch(&err);
-            let _ = reply.send(Err(err));
-            Outcome::err(sketch)
-        }
-        SagaPhaseMessage::PrepareB { reply, .. } => {
-            let err = misrouted_err("PrepareB");
-            let sketch = outcome_error_sketch(&err);
-            let _ = reply.send(Err(err));
-            Outcome::err(sketch)
-        }
+        SagaPhaseMessage::PrepareA { reply, .. } => misrouted(reply, "PrepareA"),
+        SagaPhaseMessage::PrepareB { reply, .. } => misrouted(reply, "PrepareB"),
     }
 }
 
@@ -284,35 +298,18 @@ fn misrouted_err(phase: &str) -> ContextError {
     ))
 }
 
-/// Mis-route reply for [`SagaPhaseMessage::CommitBReserve`]'s typed sender.
-fn misrouted_reserve(reply: CommitBReserveReply) -> Outcome<()> {
-    let err = misrouted_err("CommitBReserve");
-    let sketch = outcome_error_sketch(&err);
-    let _ = reply.send(Err(err));
-    Outcome::err(sketch)
-}
-
-/// Mis-route reply for [`SagaPhaseMessage::CommitBSettle`]'s typed sender.
-fn misrouted_settle(reply: CommitBSettleReply) -> Outcome<()> {
-    let err = misrouted_err("CommitBSettle");
-    let sketch = outcome_error_sketch(&err);
-    let _ = reply.send(Err(err));
-    Outcome::err(sketch)
-}
-
-/// Mis-route reply for a unit-reply saga phase's typed sender.
-fn misrouted_unit(reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    let err = misrouted_err("CommitA/Abort/EmitDivergenceMarker");
-    let sketch = outcome_error_sketch(&err);
-    let _ = reply.send(Err(err));
-    Outcome::err(sketch)
-}
-
-/// Mis-route reply for [`SagaPhaseMessage::CommitACheckWitness`]'s bool sender.
-fn misrouted_witness(
-    reply: tokio::sync::oneshot::Sender<Result<bool, ContextError>>,
+/// Mis-route reply for ANY saga phase's typed `oneshot` sender. Every saga
+/// phase reply is an `oneshot::Sender<Result<T, ContextError>>`; this single
+/// generic collapses the per-phase reply helpers (which were byte-identical
+/// except the reply payload type `T` and the phase label) into one. The
+/// statically-unreachable mis-routed branch sends the typed error to its sender
+/// and returns `Outcome::err` — NEVER `panic!`/`unreachable!` (ADR-049 §10
+/// handler panic ban).
+fn misrouted<T>(
+    reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+    phase: &str,
 ) -> Outcome<()> {
-    let err = misrouted_err("CommitACheckWitness");
+    let err = misrouted_err(phase);
     let sketch = outcome_error_sketch(&err);
     let _ = reply.send(Err(err));
     Outcome::err(sketch)
@@ -550,6 +547,97 @@ fn consume_outbound_interface_rate_limit(
     Ok(())
 }
 
+/// Consume one §6.2.0.2 sliding-window unit on B's INBOUND interface window at
+/// Prepare-B (spec §6.2.4 "Prepare-B validates `InboundPolicy` (… inbound rate
+/// …)"; §6.2.0 effective `min(outbound, inbound)`). The OUTBOUND window is
+/// consumed by the caller (A) at Prepare-A; this is the symmetric TARGET-side
+/// (B-owned) window, so both ends enforce their respective per-interface limit
+/// and the effective rate is their `min`.
+///
+/// The window is materialized LAZILY from
+/// [`InboundPolicy::max_calls_per_minute`](scp_protocol::context::tools::interface::InboundPolicy)
+/// into `ToolInterface::inbound_rate_limit` the first time B prepares an
+/// invocation over the interface, then carried with the interface so the
+/// window state persists. An interface with no inbound policy (unbounded by
+/// design) consumes nothing.
+///
+/// The consume is NON-REFUNDABLE — consistent with the §6.2.4
+/// "initiation-consumes" discipline: an exhausted window rejects with a typed
+/// `SCP-SAGA-13026` and NO terminal outcome decrements it back.
+///
+/// **Config-time eviction guard (spec §6.2.4 "Cache-eviction bound", normative
+/// "Sizing relative to the configured ceiling").** Before materializing the
+/// window, the configured inbound rate is checked against
+/// [`MAX_SAFE_INBOUND_CALLS_PER_MINUTE`]: an interface whose configured inbound
+/// rate over the dedup-TTL window would approach `NONCE_DEDUP_CAPACITY` (the
+/// ≥2× margin) is REJECTED (`SCP-SAGA-13027`) — a high inbound ceiling must not
+/// erode the replay bound the §6.2.4 dedup cache provides. This makes the
+/// eviction bound a mechanical function of the configured ceiling at runtime,
+/// not merely a `cfg(test)` invariant.
+fn consume_inbound_interface_rate_limit(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    tool_registration_id: &str,
+) -> Result<(), ContextError> {
+    use scp_protocol::context::tools::interface::{DEFAULT_WINDOW_SECONDS, RateLimit};
+
+    let clock = deps.clock.as_ref();
+
+    let Some(interface) = state
+        .governance
+        .tool_interfaces
+        .iter_mut()
+        .find(|i| i.tool_id == tool_registration_id)
+    else {
+        // No interface row ⇒ no configured inbound window to consume (the
+        // authorize-before-reserve gate already proved an established interface
+        // exists; a missing row here is the unbounded-by-design case).
+        return Ok(());
+    };
+
+    // No inbound policy ⇒ unbounded inbound by design; consume nothing.
+    let Some(inbound) = interface.inbound_policy.as_ref() else {
+        return Ok(());
+    };
+    let max_per_min = u64::from(inbound.max_calls_per_minute);
+
+    // Config-time eviction guard (spec §6.2.4 "Sizing relative to the configured
+    // ceiling"): an inbound ceiling whose TTL-window volume approaches the dedup
+    // capacity (below the ≥2× margin) would let in-budget traffic evict a
+    // still-within-TTL nonce. Reject such an interface rather than admit it.
+    if max_per_min > MAX_SAFE_INBOUND_CALLS_PER_MINUTE {
+        return Err(ContextError::PermissionDenied(format!(
+            "SCP-SAGA-13027: interface inbound rate {max_per_min}/min for tool \
+             '{tool_registration_id}' exceeds the cache-eviction-safe ceiling \
+             ({MAX_SAFE_INBOUND_CALLS_PER_MINUTE}/min): its dedup-TTL-window volume would \
+             approach the nonce-dedup capacity and erode the §6.2.4 replay bound"
+        )));
+    }
+
+    // Materialize the inbound window lazily from the inbound policy (same
+    // RateLimit mechanism + default 60s window the outbound side uses).
+    let window = interface.inbound_rate_limit.get_or_insert_with(|| {
+        RateLimit::new(
+            max_per_min,
+            std::time::Duration::from_secs(DEFAULT_WINDOW_SECONDS),
+            clock,
+        )
+    });
+
+    if !window.check_and_increment(clock) {
+        let retry_after_secs = window.retry_after_secs(clock);
+        return Err(ContextError::RateLimited {
+            resource: "tool_interface_inbound".to_owned(),
+            message: format!(
+                "SCP-SAGA-13026: per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B \
+                 for tool '{tool_registration_id}' (retry after {retry_after_secs}s)"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Prepare-B — target-context actor
 // ---------------------------------------------------------------------------
@@ -654,9 +742,15 @@ async fn prepare_b(
     Outcome::ok_mutated(())
 }
 
-/// Run the six read-only Prepare-B checks in spec order. Returns `Ok(())` if
-/// every check passes; a typed `SCP-SAGA-13xxx` rejection otherwise. Performs
-/// no state mutation, so the caller stages only on success.
+/// Run the Prepare-B checks in spec order. Returns `Ok(())` if every check
+/// passes; a typed `SCP-SAGA-13xxx` rejection otherwise.
+///
+/// All checks except the inbound-rate consume are read-only. Step (2b) consumes
+/// B's INBOUND §6.2.0.2 sliding window — a NON-REFUNDABLE mutation that, by the
+/// "initiation-consumes" discipline, stays consumed even if a LATER check
+/// rejects (an arrival reaching the inbound-rate gate is inbound load whether or
+/// not it ultimately validates). It runs as part of the InboundPolicy gate, so
+/// it precedes the freshness/chain-depth checks deliberately.
 fn run_prepare_b_checks(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -666,11 +760,12 @@ fn run_prepare_b_checks(
     //     full §7 validation RE-BOUND to caller_did + tool_registration_id.
     validate_ucan_rebind(state, deps, req)?;
 
-    // (2) Inbound policy: require_spending_ucan (the gated-proof requirement is
-    //     satisfied by (1) above when a proof is present). Source-role / inbound
-    //     rate are advisory at this layer (enforced source-side / by the
-    //     per-interface RateLimit, per §6.2.0.1) — the binding inbound gate here
-    //     is `require_spending_ucan`.
+    // (2) Inbound policy: source role + require_spending_ucan (the gated-proof
+    //     requirement is satisfied by (1) above when a proof is present). The
+    //     third InboundPolicy axis — inbound RATE — is consumed LAST (step 7),
+    //     because it is the only state-MUTATING gate: all the read-only
+    //     rejections below must fire first so a rejected call never consumes
+    //     (and durably persists) the inbound window.
     validate_inbound_policy(state, req)?;
 
     // (3) Input schema specificity floor (§9.2.1): degenerate broad-schema
@@ -695,6 +790,21 @@ fn run_prepare_b_checks(
     // (6) Chain-depth: reject if asserted_chain_depth + 1 would exceed the
     //     context-configured max (spec §6.2.4 "Chain-depth enforcement").
     validate_chain_depth(state, req)?;
+
+    // (7) Inbound RATE (the ONLY mutating check — runs LAST): consume B's INBOUND
+    //     §6.2.0.2 sliding window (spec §6.2.4 "Prepare-B validates InboundPolicy
+    //     (… inbound rate …)"; §6.2.0 effective min(outbound,inbound)). The
+    //     TARGET-side counterpart to Prepare-A's outbound consume; non-refundable.
+    //     ALSO enforces the cache-eviction config guard (rejects a configured
+    //     inbound ceiling above MAX_SAFE_INBOUND_CALLS_PER_MINUTE before
+    //     materializing the window) so a high inbound rate cannot erode the
+    //     §6.2.4 replay bound. Placed last so every read-only reject above fires
+    //     before any window mutation — a rejected call never consumes the budget,
+    //     and the only successful-consume mutation is followed by the staging +
+    //     Class-S persist in `prepare_b` (the window durably lands). The
+    //     over-budget / over-ceiling reject paths do NOT mutate (no increment),
+    //     so an `Outcome::err` (un-persisted) on those is correct.
+    consume_inbound_interface_rate_limit(state, deps, &req.tool_registration_id)?;
 
     Ok(())
 }
@@ -779,9 +889,9 @@ fn validate_ucan_rebind(
     })
 }
 
-/// (2) Inbound policy (spec §6.2.4 "Prepare-B... validates `InboundPolicy`
-/// (source role, inbound rate, `require_spending_ucan`)"). Two binding gates at
-/// this layer:
+/// (2a) Inbound policy — source role + `require_spending_ucan` (spec §6.2.4
+/// "Prepare-B... validates `InboundPolicy` (source role, inbound rate,
+/// `require_spending_ucan`)"). Two binding gates at this layer:
 ///
 /// - **`allowed_source_roles`** — the channel-authenticated caller's role
 ///   (`req.caller_source_role`, resolved supervisor-side from the caller
@@ -791,8 +901,10 @@ fn validate_ucan_rebind(
 /// - **`require_spending_ucan`** — when set, a proof MUST be present (validated
 ///   in step (1)).
 ///
-/// The per-interface inbound rate is enforced by the per-interface `RateLimit`
-/// (the §6.2.0.2 sliding window) on the consume path, not re-checked here.
+/// The third InboundPolicy axis — the per-interface INBOUND **rate** — is
+/// consumed separately in [`consume_inbound_interface_rate_limit`] (step (2b) of
+/// `run_prepare_b_checks`), because it is a state mutation (a non-refundable
+/// sliding-window decrement) and this function is read-only.
 fn validate_inbound_policy(
     state: &PerContextState,
     req: &PrepareBRequest,
@@ -1399,7 +1511,7 @@ async fn commit_a(
     let invoked_payload = serde_json::json!({
         "saga_id": req.saga_id.0,
         "target_context_id": hex_context_id(&req.target_context_id),
-        "nonce": hex_nonce(&req.nonce),
+        "nonce": hex::encode(req.nonce),
         "output_hash": hex_output_hash(&req.output_bytes),
         "receipt_len": req.receipt.len(),
     });
@@ -1455,10 +1567,17 @@ fn commit_a_check_witness(
 ///
 /// RAII-releases the staged reservations — escrow / outbound-RL on the CALLER
 /// side (handed back via `reservation`, rolled back through the existing
-/// rollback path); the tool-session on the TARGET side is released by clearing
-/// the staged `saga_pending` slot (B stages no `ToolEconomyTicket`). Class-S
-/// sync-persists fail-closed and acks. Idempotent: if the saga is already
-/// terminal (no slot, no reservation) it is a clean no-op.
+/// generation-checked rollback path); the tool-session on the TARGET side is
+/// released by clearing the staged `saga_pending` slot (B stages no
+/// `ToolEconomyTicket`). Class-S sync-persists fail-closed whenever an
+/// OWNED-state mutation occurred — the caller refund (the rollback ran against
+/// matching-generation owned state) OR a cleared target slot — then acks.
+/// Persisting the caller refund is mandatory: Prepare-A durably persisted the
+/// matching deduction, so skipping the refund persist would permanently
+/// over-charge the caller on a crash-after-ack (the saga is Aborted, nothing
+/// re-drives it). Idempotent: an already-terminal saga (no slot) on which the
+/// generation-mismatch path ran (no owned mutation) — or a bare re-Abort with
+/// no reservation and no slot — is a clean no-op with no redundant persist.
 async fn abort(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -1476,29 +1595,51 @@ async fn abort(
     // generation MISMATCH the helper voids only the external escrow and consumes
     // the ticket, mirroring `settle_tool_economy`'s guard (the prior instance's
     // local bookkeeping died with it).
-    if let Some(prepared) = reservation {
-        crate::context::tools_helpers::rollback_tool_economy_generation_checked(
-            state,
-            deps,
-            prepared.reservation.generation,
-            prepared.reservation.ticket,
-        )
-        .await;
-    }
+    //
+    // `rollback_tool_economy_generation_checked` returns whether the LOCAL
+    // rollback ran (`true` = generations matched ⇒ this actor's OWNED velocity /
+    // budget / hard-rate-limit were mutated back; `false` = generation mismatch
+    // ⇒ only the EXTERNAL escrow was voided, owned state untouched). We MUST
+    // persist when the local rollback ran, because Prepare-A durably persisted
+    // the matching DEDUCTION — without persisting the refund, a crash after this
+    // ack loses the in-memory refund while the deduction survives, permanently
+    // over-charging the caller (the saga is Aborted, so nothing re-drives it).
+    let local_rollback_ran = match reservation {
+        Some(prepared) => {
+            crate::context::tools_helpers::rollback_tool_economy_generation_checked(
+                state,
+                deps,
+                prepared.reservation.generation,
+                prepared.reservation.ticket,
+            )
+            .await
+        }
+        None => false,
+    };
 
     // TARGET side: clear the staged tool-session slot (releases the session
     // reservation). Idempotent — a missing slot is a clean no-op.
     let had_slot = state.saga_pending.remove(saga_id).is_some();
 
-    // If nothing was staged and no reservation was handed back, the saga was
-    // already terminal — ack without a (redundant) persist.
-    if !had_slot {
+    // Persist if EITHER the caller-side owned economy was refunded
+    // (`local_rollback_ran`) OR a target-side slot was cleared (`had_slot`):
+    // both are owned-state mutations whose loss on a crash-after-ack would
+    // corrupt durable state — an unpersisted caller refund permanently
+    // over-charges (the deduction WAS persisted at Prepare-A); an unpersisted
+    // slot clear re-stages a stale saga on respawn. The ONLY no-persist path is
+    // the generation-mismatch caller Abort with no slot (`local_rollback_ran ==
+    // false && !had_slot`): the mismatch voids external escrow + consumes the
+    // ticket WITHOUT touching this instance's owned state (the prior instance's
+    // bookkeeping died with it), so there is no owned mutation to persist, and
+    // an idempotent already-terminal Abort is likewise a clean no-op.
+    if !local_rollback_ran && !had_slot {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
     }
 
-    // Class-S sync-persist fail-closed before acking: the cleared slot MUST
-    // durably land so a crash respawn does not re-stage a stale saga.
+    // Class-S sync-persist fail-closed before acking: the refunded economy
+    // and/or cleared slot MUST durably land so a crash respawn neither
+    // over-charges the caller nor re-stages a stale saga.
     if let Err(persist_err) = persist_state_fail_closed(state, deps, &context_hex) {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
@@ -1541,10 +1682,12 @@ fn emit_divergence_marker(
     let key = signing_key.to_signing_key();
     let marker = match CrossContextDivergenceMarker::sign(
         &key,
-        saga_id.0.clone(),
-        nonce,
-        committed_side,
-        committed_event_id.to_owned(),
+        CrossContextDivergenceMarkerFields {
+            saga_id: saga_id.0.clone(),
+            nonce,
+            committed_side,
+            committed_event_id: committed_event_id.to_owned(),
+        },
     ) {
         Ok(m) => m,
         Err(e) => {
@@ -1596,12 +1739,6 @@ fn emit_divergence_marker(
     Outcome::ok_mutated(())
 }
 
-/// Lowercase-hex encode a 16-byte nonce (the join key between the two
-/// event-log records, recorded on both for the §6.2.4 auditor).
-fn hex_nonce(nonce: &[u8; 16]) -> String {
-    hex::encode(nonce)
-}
-
 /// Lowercase-hex of `SHA-256(jcs(output))` — the verifiable link from the
 /// caller's `CrossContextToolInvoked` record to the receipt's `output_hash`
 /// without journaling the (possibly large/sensitive) output (§6.2.4).
@@ -1643,20 +1780,6 @@ mod tests {
     const CALLER: &str = "did:dht:z6MkCallerPrincipalXX";
     const OTHER: &str = "did:dht:z6MkOtherPrincipalXXX";
     const TOOL: &str = "calculator-v1";
-
-    /// Documented configuration ceiling for an inbound §6.2.0.2 rate limit
-    /// (`InboundPolicy::max_calls_per_minute`) such that B's per-target nonce
-    /// dedup cache stays bounded by its TTL, not by capacity eviction. Derived
-    /// in [`nonce_dedup_replay_bound_holds`] from the cache capacity, the saga
-    /// dedup TTL ([`SAGA_NONCE_DEDUP_TTL_SECS`]), and the required ≥2× safety
-    /// margin. A higher inbound ceiling than this would let a sustained accept
-    /// rate land more than `NONCE_DEDUP_CAPACITY` distinct nonces within
-    /// [`SAGA_NONCE_DEDUP_TTL_SECS`], evicting still-fresh nonces and eroding
-    /// the replay bound. (This ceiling is half of what it would be under the
-    /// sender-key 5-minute TTL: the saga's dedup window is twice the skew
-    /// tolerance — see [`SAGA_NONCE_DEDUP_TTL_SECS`] — so the same capacity
-    /// admits half the per-minute rate at the ≥2× margin.)
-    const MAX_SAFE_INBOUND_CALLS_PER_MINUTE: u64 = 500;
 
     /// Defense-in-depth: the §6.2.4 per-target nonce dedup cache
     /// ([`PerContextState::xctx_nonce_dedup`]) must be bounded by its TTL
@@ -1712,6 +1835,24 @@ mod tests {
              {worst_case_ceiling} nonces over the TTL) must leave a ≥2× margin under the \
              {capacity}-entry dedup capacity; raise the cache capacity before raising this \
              ceiling",
+        );
+    }
+
+    /// FIX 4 (test/prod TTL parity): the handler-test fixture
+    /// (`new_for_test_*` → `new_for_test_with_mode`) MUST seed the PRODUCTION
+    /// saga dedup TTL (`SAGA_NONCE_DEDUP_TTL_SECS`), not `NonceDedup::new()`'s
+    /// default 300s (which equals the skew tolerance — the coterminous window the
+    /// spec FORBIDS). Without this, handler tests would run a different
+    /// anti-replay window than production. Also asserts the `debug_assert`
+    /// helper the spawn / restore sites call accepts the fixture's cache.
+    #[tokio::test]
+    async fn test_fixture_seeds_production_saga_dedup_ttl() {
+        let st = target_state(0x5B, OTHER, CALLER).await;
+        assert_eq!(
+            st.xctx_nonce_dedup.ttl_secs(),
+            SAGA_NONCE_DEDUP_TTL_SECS,
+            "the test fixture must seed the production saga dedup TTL, not NonceDedup::new()'s \
+             default (which is coterminous with the skew tolerance)"
         );
     }
 
@@ -1849,6 +1990,59 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Persistence SPY: accepts every write but records the number of
+    /// `persist_context` calls through a shared counter, so a test can assert a
+    /// handler actually performed its Class-S persist (FIX 1: the caller-side
+    /// abort refund MUST durably land). The counter is `Arc`-shared so the test
+    /// reads it after the spy has been boxed into `ActorDeps`.
+    struct SpyPersistence {
+        persist_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ContextPersistence for SpyPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.persist_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
         fn load_context(
             &self,
@@ -2176,6 +2370,7 @@ mod tests {
             target_context: hex_context_id(&[0x22; 32]),
             tool_id: TOOL.to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2326,6 +2521,7 @@ mod tests {
             target_context: hex_context_id(&[0x22; 32]),
             tool_id: TOOL.to_owned(),
             rate_limit: Some(zero_budget),
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2374,6 +2570,7 @@ mod tests {
             target_context: hex_context_id(&[0x22; 32]),
             tool_id: TOOL.to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: Some(zero_caller_budget),
             approved_by_source: true,
             approved_by_target: true,
@@ -2475,6 +2672,7 @@ mod tests {
             target_context: hex_context_id(&[0x55; 32]),
             tool_id: TOOL.to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2524,6 +2722,7 @@ mod tests {
             target_context: hex_context_id(&[0x56; 32]),
             tool_id: TOOL.to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2546,6 +2745,163 @@ mod tests {
         let out = prepare_b(&mut st, &deps, req, tx).await;
         assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
         rx.await.unwrap().expect("an allowed role must be admitted");
+    }
+
+    /// Push a `TOOL` interface with the given inbound `max_calls_per_minute`
+    /// onto `st` (target context `ctx_byte`), approved both sides — the fixture
+    /// for the inbound-rate consume tests.
+    fn push_inbound_interface(st: &mut PerContextState, ctx_byte: u8, inbound_per_min: u32) {
+        use scp_protocol::context::tools::interface::{InboundPolicy, ToolInterface};
+        st.governance.tool_interfaces.push(ToolInterface {
+            source_context: hex_context_id(&[0x99; 32]),
+            target_context: hex_context_id(&[ctx_byte; 32]),
+            tool_id: TOOL.to_owned(),
+            rate_limit: None,
+            inbound_rate_limit: None,
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: Some(InboundPolicy {
+                max_calls_per_minute: inbound_per_min,
+                ..InboundPolicy::default()
+            }),
+        });
+    }
+
+    /// FIX 3 (B-side inbound rate enforced). Prepare-B consumes B's OWN INBOUND
+    /// §6.2.0.2 sliding window; once it is exhausted the consume rejects with a
+    /// typed `SCP-SAGA-13026`. The window is materialized lazily from
+    /// `InboundPolicy.max_calls_per_minute` and the consume is non-refundable.
+    #[tokio::test]
+    async fn prepare_b_inbound_rate_limit_rejects_when_exhausted() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0x57, OTHER, CALLER).await;
+        // Inbound ceiling 1/min: base allows 1 call, then up to the default
+        // burst allowance (5) within the burst window, then rejects.
+        push_inbound_interface(&mut st, 0x57, 1);
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        // Drain the base + burst budget (1 base + 5 burst = 6 admitted).
+        for i in 0..6 {
+            consume_inbound_interface_rate_limit(&mut st, &deps, TOOL)
+                .unwrap_or_else(|e| panic!("call {i} within budget must be admitted: {e:?}"));
+        }
+        // The next consume exhausts the window ⇒ typed SCP-SAGA-13026.
+        let err = consume_inbound_interface_rate_limit(&mut st, &deps, TOOL)
+            .expect_err("inbound window exhausted must reject");
+        assert!(
+            matches!(err, ContextError::RateLimited { ref message, .. } if message.contains("SCP-SAGA-13026")),
+            "expected inbound-rate rejection (SCP-SAGA-13026), got {err:?}"
+        );
+    }
+
+    /// FIX 3 (cache-eviction config guard, runtime — NOT cfg(test)). An interface
+    /// whose configured inbound rate exceeds the eviction-safe ceiling
+    /// (`MAX_SAFE_INBOUND_CALLS_PER_MINUTE`) is REJECTED at Prepare-B with a typed
+    /// `SCP-SAGA-13027` BEFORE the window is materialized — a high inbound ceiling
+    /// (e.g. the §6.2.0.2-permitted 6000/min) must not erode the §6.2.4 replay
+    /// bound. This is the runtime config guard the spec requires, not merely the
+    /// `nonce_dedup_replay_bound_holds` cfg(test) invariant.
+    #[tokio::test]
+    async fn prepare_b_inbound_rate_above_eviction_ceiling_is_rejected() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0x58, OTHER, CALLER).await;
+        // 6000/min is §6.2.0.2-permissible but far above the eviction-safe
+        // ceiling (500/min) — its TTL-window volume would approach the dedup
+        // capacity and erode the replay bound.
+        let over_ceiling = u32::try_from(MAX_SAFE_INBOUND_CALLS_PER_MINUTE + 1).unwrap();
+        push_inbound_interface(&mut st, 0x58, over_ceiling);
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        let err = consume_inbound_interface_rate_limit(&mut st, &deps, TOOL)
+            .expect_err("an inbound ceiling above the eviction-safe limit must reject");
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref m) if m.contains("SCP-SAGA-13027")),
+            "expected cache-eviction config-guard rejection (SCP-SAGA-13027), got {err:?}"
+        );
+        // The guard fires BEFORE materializing the window — nothing was created.
+        let iface = st
+            .governance
+            .tool_interfaces
+            .iter()
+            .find(|i| i.tool_id == TOOL)
+            .expect("interface present");
+        assert!(
+            iface.inbound_rate_limit.is_none(),
+            "the config guard must reject BEFORE materializing the inbound window"
+        );
+    }
+
+    /// FIX 3 (boundary): an inbound rate EXACTLY at the eviction-safe ceiling is
+    /// admitted (the guard rejects only ABOVE it), confirming the guard does not
+    /// over-block the maximum safe configuration.
+    #[tokio::test]
+    async fn prepare_b_inbound_rate_at_eviction_ceiling_is_admitted() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0x59, OTHER, CALLER).await;
+        let at_ceiling = u32::try_from(MAX_SAFE_INBOUND_CALLS_PER_MINUTE).unwrap();
+        push_inbound_interface(&mut st, 0x59, at_ceiling);
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        consume_inbound_interface_rate_limit(&mut st, &deps, TOOL)
+            .expect("the maximum safe inbound ceiling must be admitted");
+    }
+
+    /// FIX 3 (end-to-end): an accepted Prepare-B over an interface with a
+    /// (safe) inbound policy materializes B's inbound window and consumes one
+    /// unit — proving the consume is wired into the Prepare-B path, not just the
+    /// standalone helper.
+    #[tokio::test]
+    async fn prepare_b_through_path_materializes_and_consumes_inbound_window() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0x5A, OTHER, CALLER).await;
+        // Ungated tool with a safe inbound ceiling.
+        push_inbound_interface(&mut st, 0x5A, 60);
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = deps.clock.now_millis();
+
+        let req = prepare_b_request_with_role(0x5A, None, 2, now_ms, Some("member".to_owned()));
+        let (tx, rx) = oneshot::channel();
+        let out = prepare_b(&mut st, &deps, req, tx).await;
+        assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
+        rx.await.unwrap().expect("prepared-B");
+
+        // The inbound window was materialized and one unit consumed.
+        let iface = st
+            .governance
+            .tool_interfaces
+            .iter()
+            .find(|i| i.tool_id == TOOL)
+            .expect("interface present");
+        let window = iface
+            .inbound_rate_limit
+            .as_ref()
+            .expect("Prepare-B materialized B's inbound window");
+        assert_eq!(
+            window.current_count, 1,
+            "Prepare-B consumed exactly one inbound unit"
+        );
     }
 
     #[tokio::test]
@@ -3099,6 +3455,128 @@ mod tests {
         rx.await.unwrap().expect("abort-a ack");
     }
 
+    /// FIX 1 (regression): a CALLER-side abort that refunds the held economy
+    /// reservation MUST Class-S PERSIST that refund — Prepare-A durably
+    /// persisted the matching DEDUCTION, so without a refund persist a
+    /// crash-after-ack loses the in-memory refund while the deduction survives,
+    /// permanently over-charging the caller (the saga is Aborted, nothing
+    /// re-drives it). Prepare-A never stages a `saga_pending` slot on the caller
+    /// (only Prepare-B does), so the old `had_slot`-gated persist short-circuited
+    /// to `Outcome::ok(())` with NO persist on this exact path. This drives the
+    /// abort through a PERSISTENCE SPY and asserts (a) `persist_context` was
+    /// invoked, and (b) the hard-rate-limit token + velocity the reserve consumed
+    /// are durably restored. The existing `abort_a_side_releases_escrow_reservation`
+    /// uses `OkPersistence` and asserts only the ack — it cannot catch this.
+    #[tokio::test]
+    async fn abort_a_side_persists_caller_refund() {
+        use std::sync::atomic::Ordering;
+
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xC8, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let persist_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(SpyPersistence {
+                persist_calls: Arc::clone(&persist_calls),
+            }),
+        )
+        .await;
+
+        let caller = DID(CALLER.to_owned());
+        // The token-bucket burst capacity, in the limiter's internal milli-token
+        // units (1000 milli-tokens per token) — a fresh caller starts FULL and a
+        // reserve drains exactly one token; a refund restores it.
+        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        // Observe pre-reserve velocity for `caller`.
+        let now_secs = deps.clock.now_secs();
+        let velocity_before = st
+            .governance
+            .velocity_tracker
+            .get_velocity(&caller, now_secs);
+
+        // Prepare-A consumes a hard-rate-limit token + records velocity (and
+        // persists the deduction once via the spy).
+        let (tx, rx) = oneshot::channel();
+        prepare_a(&mut st, &deps, &[0xC8; 32], &caller, TOOL, tx).await;
+        let prepared_a = rx.await.unwrap().expect("prepared-A");
+
+        // Reserve actually moved owned economy state (else the test proves
+        // nothing): the hard-rate-limit token bucket dropped exactly one token
+        // below full burst, and velocity rose.
+        let hrl_after_reserve = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("reserve created a hard-rate-limit entry for the caller");
+        assert!(
+            hrl_after_reserve < burst_milli,
+            "reserve must have consumed a hard-rate-limit token \
+             (burst_milli={burst_milli}, after_reserve={hrl_after_reserve})"
+        );
+        let velocity_after_reserve = st
+            .governance
+            .velocity_tracker
+            .get_velocity(&caller, now_secs);
+        assert!(
+            velocity_after_reserve > velocity_before,
+            "reserve must have recorded velocity \
+             (before={velocity_before}, after_reserve={velocity_after_reserve})"
+        );
+
+        // Reset the persist counter so we measure ONLY the abort's persist.
+        persist_calls.store(0, Ordering::SeqCst);
+
+        // Caller-side abort (no staged slot — Prepare-A stages none). The refund
+        // runs against MATCHING generation, so it mutates owned economy state
+        // and MUST persist.
+        let saga = SagaId("saga-abort-a-persist".to_owned());
+        let (tx, rx) = oneshot::channel();
+        let out = abort(&mut st, &deps, &saga, Some(prepared_a), tx).await;
+        assert!(out.result.is_ok(), "abort-a: {:?}", out.result);
+        assert!(out.mutated, "the abort refunded owned state ⇒ mutated");
+        rx.await.unwrap().expect("abort-a ack");
+
+        // (a) the refund was Class-S persisted — the core regression assertion.
+        assert!(
+            persist_calls.load(Ordering::SeqCst) >= 1,
+            "caller-side abort MUST persist the refunded economy (Prepare-A persisted the \
+             matching deduction; skipping this persist permanently over-charges the caller \
+             on a crash-after-ack)"
+        );
+
+        // (b) the refund durably restored the consumed hard-rate-limit token
+        // (back to full burst) and rolled the velocity back to its pre-reserve
+        // value.
+        let hrl_after_abort = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after abort");
+        assert_eq!(
+            hrl_after_abort, burst_milli,
+            "abort must refund the consumed hard-rate-limit token (restore to full burst)"
+        );
+        assert!(
+            hrl_after_abort > hrl_after_reserve,
+            "the abort refund restored a token the reserve had consumed \
+             (after_reserve={hrl_after_reserve}, after_abort={hrl_after_abort})"
+        );
+        let velocity_after_abort = st
+            .governance
+            .velocity_tracker
+            .get_velocity(&caller, now_secs);
+        assert_eq!(
+            velocity_after_abort, velocity_before,
+            "abort must roll back the recorded velocity"
+        );
+    }
+
     /// FIX 2 (confused-deputy): the abort handler rolls back the held
     /// reservation through the GENERATION-CHECKED path. If the actor was
     /// despawned+respawned (generation bumped) between Prepare-A and an
@@ -3256,10 +3734,12 @@ mod tests {
         // The marker the handler signed verifies against the emitting key.
         let marker = CrossContextDivergenceMarker::sign(
             &signing.to_signing_key(),
-            saga.0.clone(),
-            [0xAB; 16],
-            CommittedSide::Target,
-            "evt-committed-9".to_owned(),
+            CrossContextDivergenceMarkerFields {
+                saga_id: saga.0.clone(),
+                nonce: [0xAB; 16],
+                committed_side: CommittedSide::Target,
+                committed_event_id: "evt-committed-9".to_owned(),
+            },
         )
         .expect("marker");
         marker

@@ -1253,7 +1253,15 @@ impl PerContextState {
             recv_tracker: RecvSequenceTracker::new(),
             saga_pending: HashMap::new(),
             xctx_ucan_proofs: InMemoryProofResolver::new(),
-            xctx_nonce_dedup: NonceDedup::new(),
+            // Seed the PRODUCTION saga dedup TTL (strictly longer than the
+            // freshness skew, BLACK-XCTX-01) in the test fixture too, so handler
+            // tests run the same anti-replay window the prod spawn / restore
+            // sites build — `NonceDedup::new()`'s default 300s TTL is coterminous
+            // with the skew tolerance, the condition the spec FORBIDS, and would
+            // make test-window behaviour diverge from production.
+            xctx_nonce_dedup: NonceDedup::with_ttl(
+                crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+            ),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
             pending_broadcast_publishes: HashMap::new(),

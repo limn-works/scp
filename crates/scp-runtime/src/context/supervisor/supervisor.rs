@@ -58,6 +58,7 @@ use crate::context::supervisor::saga_journal::{
 };
 use crate::economy::adapter::PaymentAdapterDyn;
 use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -354,12 +355,15 @@ struct CommittedSagaArtifacts {
 /// is unreachable" — so operator repair still has a durable account of which
 /// side committed, the saga id, the nonce, and the committed-side event id.
 ///
-/// This is the in-memory projection; a restart loses it exactly as the
-/// in-memory reservation set does. The reachable side's marker (when one side
-/// IS reachable) lives durably in that side's event log, so a one-reachable /
-/// one-unreachable divergence is still half-recorded durably plus
-/// supervisor-recorded for the unreachable half.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// In-memory it is a fast read cache, but it is ALSO durably journaled (see
+/// [`Supervisor::record_supervisor_repair`]): each record is appended to the
+/// supervisor's saga journal as the `evidence` of a `NeedsRepair`
+/// [`JournalEntry`], so a supervisor restart REHYDRATES it from the journal
+/// rather than losing the unreachable-leg divergence account — preserving the
+/// spec's "durably auditable" guarantee for that leg. The reachable side's
+/// marker (when one side IS reachable) lives durably in that side's event log;
+/// the unreachable half is durably recorded here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SagaDivergenceRepairRecord {
     /// The context id (raw 32-byte digest, hex) of the UNREACHABLE side whose
     /// marker could not be appended into its own log.
@@ -369,7 +373,26 @@ pub struct SagaDivergenceRepairRecord {
     /// The committed-side `ToolInvoked` / `CrossContextToolInvoked` event id.
     pub committed_event_id: String,
     /// The 16-byte correlation nonce joining the two event-log records.
+    #[serde(with = "scp_protocol::serde_util::serde_nonce_16")]
     pub nonce: [u8; 16],
+}
+
+/// `MessagePack` (`rmp_serde::to_vec_named`) of the full accumulated repair-record
+/// set for one saga, carried as the `evidence` of a durable `NeedsRepair`
+/// [`JournalEntry`]. A NON-EMPTY `NeedsRepair` evidence is, by this convention,
+/// the supervisor-level divergence repair journal (the plain `NeedsRepair`
+/// transition appended on commit-retry exhaustion carries EMPTY evidence); the
+/// recovery path decodes it to rehydrate [`Supervisor::saga_repair_records`].
+fn encode_repair_records_evidence(
+    records: &[SagaDivergenceRepairRecord],
+) -> Result<Vec<u8>, String> {
+    rmp_serde::to_vec_named(records).map_err(|e| format!("encode repair records: {e}"))
+}
+
+/// Decode the `MessagePack` repair-record set from a durable `NeedsRepair`
+/// journal entry's `evidence` (the inverse of [`encode_repair_records_evidence`]).
+fn decode_repair_records_evidence(bytes: &[u8]) -> Result<Vec<SagaDivergenceRepairRecord>, String> {
+    rmp_serde::from_slice(bytes).map_err(|e| format!("decode repair records: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -5288,6 +5311,29 @@ impl Supervisor {
                     saga_id = %entry.saga_id,
                     "saga recovery — NeedsRepair carryover; operator intervention required"
                 );
+                // Rehydrate the supervisor-level divergence repair records
+                // (spec §6.2.4 "Dual event-log recording") so the unreachable-leg
+                // divergence account survives a supervisor restart. A NON-EMPTY
+                // `NeedsRepair` evidence is, by convention, the MessagePack of the
+                // full accumulated repair-record set (the plain NeedsRepair
+                // transition carries EMPTY evidence); `load_unresolved` returns
+                // the LATEST entry per saga, so this is the most complete set.
+                if !entry.evidence.is_empty() {
+                    match decode_repair_records_evidence(&entry.evidence) {
+                        Ok(records) if !records.is_empty() => {
+                            self.saga_repair_records
+                                .insert(entry.saga_id.clone(), records);
+                        }
+                        Ok(_) => {}
+                        Err(err) => tracing::error!(
+                            saga_id = %entry.saga_id,
+                            %err,
+                            "saga recovery — NeedsRepair entry carried non-empty evidence that \
+                             did not decode as a supervisor repair-record set; the durable \
+                             divergence account could not be rehydrated"
+                        ),
+                    }
+                }
             }
             SagaState::Committed | SagaState::Aborted => {
                 // Terminal — not returned by load_unresolved but
@@ -5532,15 +5578,6 @@ impl Supervisor {
         // receipt and wrote into its log); the nonce is B's staged
         // `recorded_nonce` reconstructed from the journal evidence.
         let committed_event_id = format!("ToolInvoked:{}", saga_id.0);
-        let record_one_sided_repair = || {
-            self.record_supervisor_repair(
-                saga_id,
-                &caller_hex,
-                CommittedSide::Target,
-                &committed_event_id,
-                prepared.recorded_nonce,
-            );
-        };
         let Some(caller) = self.lookup(&caller_hex) else {
             tracing::error!(
                 saga_id = %saga_id.0,
@@ -5548,7 +5585,14 @@ impl Supervisor {
                 "saga recovery — Commit-in-progress: caller actor unreachable; cannot confirm the \
                  A-side witness — recording supervisor repair (Target committed) and NeedsRepair"
             );
-            record_one_sided_repair();
+            self.record_supervisor_repair(
+                saga_id,
+                &caller_hex,
+                CommittedSide::Target,
+                &committed_event_id,
+                prepared.recorded_nonce,
+            )
+            .await;
             return CommitInProgressResolution::NeedsRepair;
         };
         let witness_saga_id = saga_id.clone();
@@ -5576,7 +5620,14 @@ impl Supervisor {
                      is absent (Commit-A never landed) — one-sided commit; recording supervisor \
                      repair and NeedsRepair"
                 );
-                record_one_sided_repair();
+                self.record_supervisor_repair(
+                    saga_id,
+                    &caller_hex,
+                    CommittedSide::Target,
+                    &committed_event_id,
+                    prepared.recorded_nonce,
+                )
+                .await;
                 CommitInProgressResolution::NeedsRepair
             }
             Err(err) => {
@@ -5587,7 +5638,14 @@ impl Supervisor {
                      confirm Commit-A — recording supervisor repair (Target committed) and \
                      NeedsRepair"
                 );
-                record_one_sided_repair();
+                self.record_supervisor_repair(
+                    saga_id,
+                    &caller_hex,
+                    CommittedSide::Target,
+                    &committed_event_id,
+                    prepared.recorded_nonce,
+                )
+                .await;
                 CommitInProgressResolution::NeedsRepair
             }
         }
@@ -6024,18 +6082,24 @@ impl Supervisor {
         // Commit B (execute-or-replay) then A, per §6.2.4.
         let (receipt, output) = self.commit_b_execute_or_replay(saga_id, ctx).await?;
 
-        // Verify-before-settle (spec §6.2.4 "Signer authorization", normative
-        // MUST): before Commit-A settles escrow + records the provenance edge,
-        // verify B's signature over the receipt against the Active Signing Key
-        // AUTHORIZED for `target_context_id`. The FSM already holds that
-        // resolved key (`ctx.target_signing_key` — the same key it PASSED to
-        // Commit-B to sign the receipt), so verification here is equivalent to
-        // "signed by the key authorized for the target context". A verify
-        // failure aborts the Commit WITHOUT settling or recording — a forged /
-        // tampered receipt must never charge the caller or write a provenance
-        // edge. This also pins the bytes A records: the verified receipt's
-        // SIGNED `output_hash` is what Commit-A binds, not an independently
-        // recomputed hash.
+        // Verify-before-settle (spec §6.2.4 "Signer authorization"): before
+        // Commit-A settles escrow + records the provenance edge, the FSM
+        // re-verifies B's signature over the receipt against the SAME key it
+        // gave B to sign with (`ctx.target_signing_key`). This is an in-saga
+        // integrity check — it proves the receipt was not corrupted/forged in
+        // transit back from Commit-B — NOT the spec's independent
+        // signer-authorization (governance-resolution) step. That step — confirm
+        // the signing key is in fact the Active Signing Key authorized to act for
+        // `target_context_id`, resolved via that context's membership/governance
+        // (§3, §7) — is the DOWNSTREAM receipt CONSUMER's burden (an auditor, or
+        // A re-presenting the receipt as provenance), discharged at the FFI/SDK
+        // boundary, not here: the FSM trivially holds the right key because it
+        // just handed it to B, so this check cannot stand in for an independent
+        // resolution. A verify failure aborts the Commit WITHOUT settling or
+        // recording — a corrupted / tampered receipt must never charge the caller
+        // or write a provenance edge. This also pins the bytes A records: the
+        // verified receipt's SIGNED `output_hash` is what Commit-A binds, not an
+        // independently recomputed hash.
         let parsed = Self::verify_commit_b_receipt(saga_id, ctx, &receipt)?;
 
         self.commit_a_settle(saga_id, ctx, &receipt, &parsed)
@@ -6489,7 +6553,8 @@ impl Supervisor {
                             committed_side,
                             &committed_event_id,
                             nonce,
-                        );
+                        )
+                        .await;
                     }
                 }
             } else {
@@ -6508,7 +6573,8 @@ impl Supervisor {
                     committed_side,
                     &committed_event_id,
                     nonce,
-                );
+                )
+                .await;
             }
         }
     }
@@ -6538,15 +6604,40 @@ impl Supervisor {
                 SigningKeyBytes::from_signing_key(&ctx.caller_signing_key),
             ),
         ];
-        Some((committed_event_id, ctx.asserted_nonce, sides))
+        // Source the STAGED `recorded_nonce` (B's captured copy of the wire
+        // value) for symmetry with the signed receipt, which draws its `nonce`
+        // from the same staged value (spec §6.2.4 *Staged nonce and recorded
+        // chain-depth*). A divergence marker can only exist once Commit-B landed
+        // (`committed_event_id` is `Some`), which implies Prepare-B ran and
+        // `prepared_b` is set — so this is the staged nonce in practice; the
+        // `asserted_nonce` fallback is defensive and equals the staged value by
+        // design (the nonce is a public correlation token B copies, not derives).
+        let marker_nonce = ctx
+            .prepared_b
+            .as_ref()
+            .map_or(ctx.asserted_nonce, |b| b.recorded_nonce);
+        Some((committed_event_id, marker_nonce, sides))
     }
 
     /// Record a supervisor-level divergence repair witness for an UNREACHABLE
     /// (or append-failed) side of a `NeedsRepair` saga (spec §6.2.4 "Dual
     /// event-log recording" — "or a supervisor-level repair journal if one side
-    /// is unreachable"). Appends to [`Self::saga_repair_records`] keyed by saga
-    /// id; a single diverged saga may accumulate multiple records.
-    fn record_supervisor_repair(
+    /// is unreachable").
+    ///
+    /// Two-tier durability: pushes the record into the in-memory
+    /// [`Self::saga_repair_records`] read cache (keyed by saga id; a single
+    /// diverged saga may accumulate multiple records), AND durably appends the
+    /// FULL accumulated record set for the saga as the `evidence` of a
+    /// `NeedsRepair` [`JournalEntry`]. The durable write is the load-bearing
+    /// half: without it a supervisor crash before an operator reads the cache
+    /// would LOSE the unreachable-leg divergence account, weakening the spec's
+    /// "durably auditable" guarantee for that leg. On restart the recovery path
+    /// (`recover_saga_entry`'s `NeedsRepair` arm) decodes the latest such entry
+    /// and rehydrates the cache. A durable-append failure is logged (the
+    /// in-memory cache still holds the record for an operator reading a live
+    /// supervisor) but cannot itself be repaired here — it is the same
+    /// best-effort-then-surface posture the reachable-side marker append takes.
+    async fn record_supervisor_repair(
         &self,
         saga_id: &SagaId,
         unreachable_context_hex: &str,
@@ -6554,15 +6645,58 @@ impl Supervisor {
         committed_event_id: &str,
         nonce: [u8; 16],
     ) {
-        self.saga_repair_records
-            .entry(saga_id.clone())
-            .or_default()
-            .push(SagaDivergenceRepairRecord {
+        // Push into the in-memory read cache and snapshot the full accumulated
+        // set + the per-saga append seq (vec length after the push) WITHOUT
+        // holding the DashMap guard across the `.await` below.
+        let (records, append_seq) = {
+            let mut entry = self.saga_repair_records.entry(saga_id.clone()).or_default();
+            entry.push(SagaDivergenceRepairRecord {
                 unreachable_context_hex: unreachable_context_hex.to_owned(),
                 committed_side,
                 committed_event_id: committed_event_id.to_owned(),
                 nonce,
             });
+            // seq 4 is the plain NeedsRepair transition (empty evidence); the
+            // repair-record appends follow it monotonically (5, 6, …), one per
+            // accumulated record, so the LATEST-per-saga entry load_unresolved
+            // returns carries the full set.
+            (entry.clone(), 4 + entry.len() as u64)
+        };
+
+        let evidence = match encode_repair_records_evidence(&records) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "cross-context saga NeedsRepair — failed to ENCODE the supervisor repair \
+                     record set for the durable journal; the divergence stays in the in-memory \
+                     read cache only"
+                );
+                return;
+            }
+        };
+
+        // The participants are the two saga contexts; reuse the committed-side
+        // event id linkage carried inside the evidence. Durably append.
+        if let Err(err) = self
+            .append_journal(
+                saga_id,
+                SagaState::NeedsRepair,
+                &[unreachable_context_hex.to_owned()],
+                append_seq,
+                &evidence,
+            )
+            .await
+        {
+            tracing::error!(
+                saga_id = %saga_id.0,
+                %err,
+                "cross-context saga NeedsRepair — failed to DURABLY journal the supervisor \
+                 repair record; it remains in the in-memory read cache but will not survive a \
+                 supervisor restart"
+            );
+        }
     }
 
     /// Read the supervisor-level divergence repair records for a saga (operator
@@ -14128,6 +14262,7 @@ mod tests {
                 target_context: hex::encode(XCTX_TARGET),
                 tool_id: XCTX_TOOL.to_owned(),
                 rate_limit: None,
+                inbound_rate_limit: None,
                 per_caller_rate_limit: None,
                 approved_by_source: true,
                 approved_by_target: true,
@@ -14961,6 +15096,97 @@ mod tests {
                 .any(|(id, name, _, _)| *id == XCTX_TARGET && *name == marker_name),
             "the reachable target side must still record its marker into its own log"
         );
+    }
+
+    /// FIX 2 (durable repair journal): a supervisor-level divergence repair
+    /// record (recorded when a `NeedsRepair` side is unreachable) MUST survive a
+    /// supervisor restart — the spec's "durably auditable" guarantee for the
+    /// unreachable leg. `record_supervisor_repair` durably appends the record to
+    /// the saga journal; a fresh supervisor over the SAME storage rehydrates it
+    /// from the journal via `replay_unresolved_sagas`. Without the durable write
+    /// the in-memory DashMap would be empty after restart and the divergence
+    /// account lost.
+    #[tokio::test]
+    async fn supervisor_repair_record_survives_restart() {
+        use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaId};
+        use scp_protocol::context::tools::cross_context_saga::CommittedSide;
+
+        // Shared durable storage so a second supervisor sees the first's writes.
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let persistence: Arc<dyn ContextPersistence> =
+            Arc::new(crate::context::persistence::NoopContextPersistence);
+        let supervisor = Supervisor::new(persistence, journal, SupervisorConfig::default());
+
+        let saga_id = SagaId("saga-durable-repair".to_owned());
+        let unreachable_hex = hex::encode([0x9Au8; 32]);
+        let committed_event_id = format!("ToolInvoked:{}", saga_id.0);
+        let nonce = [0x9Bu8; 16];
+
+        // Record the unreachable-side divergence (durably journals it).
+        supervisor
+            .record_supervisor_repair(
+                &saga_id,
+                &unreachable_hex,
+                CommittedSide::Target,
+                &committed_event_id,
+                nonce,
+            )
+            .await;
+
+        // The in-memory read cache holds it on the live supervisor.
+        let live = supervisor.saga_repair_records_for(&saga_id);
+        assert_eq!(live.len(), 1, "live supervisor caches the repair record");
+
+        // The journal durably retains a NeedsRepair entry whose evidence decodes
+        // to the record set — the durable half of the two-tier write.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        let entry = unresolved
+            .iter()
+            .find(|e| e.saga_id == saga_id)
+            .expect("a NeedsRepair entry for the saga is durably retained");
+        assert_eq!(entry.state, SagaState::NeedsRepair);
+        assert!(
+            !entry.evidence.is_empty(),
+            "the durable repair entry carries non-empty repair-record evidence"
+        );
+        let decoded = decode_repair_records_evidence(&entry.evidence).expect("evidence decodes");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].unreachable_context_hex, unreachable_hex);
+        assert_eq!(decoded[0].committed_event_id, committed_event_id);
+        assert_eq!(decoded[0].nonce, nonce);
+        assert_eq!(decoded[0].committed_side, CommittedSide::Target);
+
+        // RESTART: a fresh supervisor over the SAME storage starts with an EMPTY
+        // in-memory cache, then rehydrates it from the durable journal.
+        let journal2: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let persistence2: Arc<dyn ContextPersistence> =
+            Arc::new(crate::context::persistence::NoopContextPersistence);
+        let restarted = Supervisor::new(persistence2, journal2, SupervisorConfig::default());
+        assert!(
+            restarted.saga_repair_records_for(&saga_id).is_empty(),
+            "a fresh supervisor starts with an empty in-memory repair cache"
+        );
+        restarted
+            .replay_unresolved_sagas()
+            .await
+            .expect("replay rehydrates");
+        let rehydrated = restarted.saga_repair_records_for(&saga_id);
+        assert_eq!(
+            rehydrated.len(),
+            1,
+            "the repair record MUST be rehydrated from the durable journal on restart"
+        );
+        assert_eq!(rehydrated[0].unreachable_context_hex, unreachable_hex);
+        assert_eq!(rehydrated[0].committed_event_id, committed_event_id);
+        assert_eq!(rehydrated[0].nonce, nonce);
+        assert_eq!(rehydrated[0].committed_side, CommittedSide::Target);
     }
 
     /// NeedsRepair concurrency-slot release: a `TestForceNeedsRepair` saga

@@ -334,6 +334,32 @@ pub struct CrossContextDivergenceMarker {
     pub signature: [u8; 64],
 }
 
+/// The unsigned field set for [`CrossContextDivergenceMarker::sign`], named so
+/// the call site cannot transpose its two adjacent `String` arguments.
+///
+/// [`CrossContextDivergenceMarker::sign`] otherwise takes `saga_id` and
+/// `committed_event_id` as positional `String`s — a swap compiles and signs a
+/// self-consistent-but-wrong marker (the saga id and the committed-side event
+/// id reversed). Naming every field at the call site makes a swap a
+/// compile-visible field-name error, symmetric with
+/// [`CrossContextToolReceiptFields`]. Per the Agent-first API tenet: one flat
+/// named-field object, no builder, no ordering to track.
+///
+/// The emitting side's signing key stays a SEPARATE parameter of
+/// [`CrossContextDivergenceMarker::sign`] — it is signing capability material,
+/// not a marker field.
+pub struct CrossContextDivergenceMarkerFields {
+    /// The saga identifier shared by both sides of the cross-context invocation.
+    pub saga_id: String,
+    /// The 16-byte correlation nonce joining the two event-log records (B's
+    /// staged `recorded_nonce`, identical to the receipt's `nonce`).
+    pub nonce: [u8; 16],
+    /// Which side committed (the other side's record is absent).
+    pub committed_side: CommittedSide,
+    /// The committed side's event-log entry id.
+    pub committed_event_id: String,
+}
+
 impl CrossContextDivergenceMarker {
     /// Build the §9.5.1 canonical signing preimage for this divergence marker.
     ///
@@ -367,11 +393,14 @@ impl CrossContextDivergenceMarker {
     /// cannot be built (unreachable in practice).
     pub fn sign(
         signing_key: &SigningKey,
-        saga_id: String,
-        nonce: [u8; 16],
-        committed_side: CommittedSide,
-        committed_event_id: String,
+        fields: CrossContextDivergenceMarkerFields,
     ) -> Result<Self, CrossContextSagaError> {
+        let CrossContextDivergenceMarkerFields {
+            saga_id,
+            nonce,
+            committed_side,
+            committed_event_id,
+        } = fields;
         let mut marker = Self {
             saga_id,
             nonce,
@@ -687,10 +716,12 @@ mod tests {
         let sk = test_signing_key(0xCC);
         let marker = CrossContextDivergenceMarker::sign(
             &sk,
-            "saga-123".to_owned(),
-            [0x44; 16],
-            CommittedSide::Target,
-            "evt-committed-9".to_owned(),
+            CrossContextDivergenceMarkerFields {
+                saga_id: "saga-123".to_owned(),
+                nonce: [0x44; 16],
+                committed_side: CommittedSide::Target,
+                committed_event_id: "evt-committed-9".to_owned(),
+            },
         )
         .expect("sign");
         marker
@@ -704,10 +735,12 @@ mod tests {
         let vk = sk.verifying_key();
         let base = CrossContextDivergenceMarker::sign(
             &sk,
-            "saga-123".to_owned(),
-            [0x44; 16],
-            CommittedSide::Target,
-            "evt-committed-9".to_owned(),
+            CrossContextDivergenceMarkerFields {
+                saga_id: "saga-123".to_owned(),
+                nonce: [0x44; 16],
+                committed_side: CommittedSide::Target,
+                committed_event_id: "evt-committed-9".to_owned(),
+            },
         )
         .expect("sign");
 
@@ -735,10 +768,12 @@ mod tests {
         let sk = test_signing_key(0xCC);
         let marker = CrossContextDivergenceMarker::sign(
             &sk,
-            "saga-123".to_owned(),
-            [0x44; 16],
-            CommittedSide::Caller,
-            "evt".to_owned(),
+            CrossContextDivergenceMarkerFields {
+                saga_id: "saga-123".to_owned(),
+                nonce: [0x44; 16],
+                committed_side: CommittedSide::Caller,
+                committed_event_id: "evt".to_owned(),
+            },
         )
         .expect("sign");
         let wrong = test_signing_key(0xDD).verifying_key();
@@ -750,10 +785,12 @@ mod tests {
         let sk = test_signing_key(0xCC);
         let marker = CrossContextDivergenceMarker::sign(
             &sk,
-            "saga-123".to_owned(),
-            [0x44; 16],
-            CommittedSide::Target,
-            "evt-committed-9".to_owned(),
+            CrossContextDivergenceMarkerFields {
+                saga_id: "saga-123".to_owned(),
+                nonce: [0x44; 16],
+                committed_side: CommittedSide::Target,
+                committed_event_id: "evt-committed-9".to_owned(),
+            },
         )
         .expect("sign");
 
