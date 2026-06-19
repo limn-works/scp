@@ -2,6 +2,8 @@
 
 ## Project: SCP Protocol Core
 
+- [Event-log unification Phase 2](eventlog-unification-phase2.md) — ADR-011 runtime onto RFC 6962 substrate; export-root migration (truncation forgery CLOSED) + §9.9.3 equivocation dedup (per-sender (count,root) set, no durable receiver-minted leaves); round-4 APPROVE
+- PseudonymAnnounced removal (f438acf0f) APPROVE: taxonomy 76->75; tag 59 RETIRED as gap (no renumber) so all other event_type_tag stable -> §25 KAT 32/33 root 39e50b87 byte-unchanged (verified). EventType serializes by NAME-string via rmp_serde (no int repr), so removal can't shift other leaves. Convergence RESTORED: receive path deliver_plaintext_or_announcement returns None for ALL 3 arms; Some-append channel DEAD in prod. 3 non-convergent classes (MessageReceived, EquivocationDetected, PseudonymAnnounced) have NO EventType variant -> type-level un-appendable. All prod append sites sender-authored (MessageSent) or commit/governance-driven. GOTCHA: bare `-p scp-event-log` FAILS 116 (hex did:key gated behind scp-primitives `testing` feature, identity.rs:118) — run with --features testing.
 - [HPKE RFC 9180 conformance](hpke-rfc9180-conformance.md) — FIXED the custom-ECIES finding: one hand-impl RFC 9180 core in scp-protocol/src/crypto/hpke.rs (A.1 KAT + hpke-rs oracle), custody Decap variant, 60->48 wire, all 5 paths conformed; C5 platform custody verified OK
 
 ### Merkle Tree (event_log/)

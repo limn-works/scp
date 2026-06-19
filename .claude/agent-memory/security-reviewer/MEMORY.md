@@ -156,6 +156,14 @@
 - MEDIUM x7: sender key AAD zeros (#1422 -- FIXED in PR#1606); access key wrapping AAD zeros; bridge trust level discarded; SequenceTracker not persisted; SequenceTracker validate() TOCTOU; snapshot key bytes not Zeroizing; FFI access key ops lack authorization
 - GOOD: Sig verify before anti-replay; cross-context injection defense; MLS credential match; constant-time hash; domain-sep routing IDs; fail-closed defaults; correct timestamp validator; sequence 0 rejection; bounded reorder buffer; correct sign order
 
+### ADR-051 Convergent Clock / Causal-DAG (2026-06-19)
+- See `adr051-convergent-clock.md`. APPROVE + 1 MEDIUM. Multi-vantage median (sender/node/relay/receiver-quorum),
+  clamped >= max(sender,relay-ingest), receiver-quorum anchored. Soft signal honestly stated; size-independent
+  (spread=latency not N); vantage stamps signed in SCP-CHECKPOINT-V2 preimage (forge-proof).
+- MEDIUM (track into impl program): ADR req#6 mandates machine-readable `anchored` flag but spec07
+  ParticipationProfile (L218) + spec19 PaymentReceipt got PROSE COMMENT only — no field. Interim is shipping
+  state, so anchored=false surfacing is load-bearing NOW. Add per-fact bool/bitmask when interim lands.
+
 ### General Patterns
 - clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
 - zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no
