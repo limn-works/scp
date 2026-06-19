@@ -2126,7 +2126,7 @@ pub fn build_snapshot_from_state(
         // ADR-049 §9 Class S (spec §6.2.4): persist the caller-side durable
         // reservation reversal records so a `PreparingB`-window crash can reverse
         // the caller deduction + void the escrow without the in-memory carrier.
-        xctx_caller_reservations: state.xctx_caller_reservations.clone(),
+        xctx_caller_reservations: xctx_caller_reservations_snapshot(state),
         xctx_nonce_dedup: xctx_nonce_dedup_snapshot(state),
     }
 }
@@ -2186,15 +2186,39 @@ pub(in crate::context) fn xctx_committed_outputs_snapshot(
 /// is a `{SagaId}` idempotency-witness set carrying no §9.4.3 bearer bytes, so —
 /// like [`xctx_committed_outputs_snapshot`] — the snapshot stores it directly
 /// via `Clone`. Exists so EVERY snapshot builder projects this Class-S saga
-/// field through ONE helper, exactly like its three siblings
+/// field through ONE helper, exactly like its siblings
 /// (`saga_pending_snapshot` / `xctx_committed_outputs_snapshot` /
-/// `xctx_nonce_dedup_snapshot`) — no Class-S saga field is centralized by
-/// convention alone. Without persisting it, a crash that rolled the witness back
-/// behind an acked Commit-A would double-settle the caller escrow on replay.
+/// `xctx_caller_reservations_snapshot` / `xctx_nonce_dedup_snapshot`) — no
+/// Class-S saga field is centralized by convention alone. Without persisting it,
+/// a crash that rolled the witness back behind an acked Commit-A would
+/// double-settle the caller escrow on replay.
 pub(in crate::context) fn xctx_committed_invocations_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId> {
     state.xctx_committed_invocations.clone()
+}
+
+/// Build the Class-S snapshot projection of the actor's caller-side durable
+/// reservation reversal records (spec §6.2.4 "Reservation release on every
+/// terminal path"; §17.16.4 crash recovery; ADR-049 §9). The live
+/// [`PerContextState::xctx_caller_reservations`](crate::context::actor::state::PerContextState::xctx_caller_reservations)
+/// is a `{SagaId → CallerReservationRecord}` map whose values carry no §9.4.3
+/// bearer bytes (public economy metadata), so — like
+/// [`xctx_committed_invocations_snapshot`] — the snapshot stores it directly via
+/// `Clone`. Exists so EVERY snapshot builder projects this Class-S saga field
+/// through ONE helper, exactly like its siblings (`saga_pending_snapshot` /
+/// `xctx_committed_outputs_snapshot` / `xctx_committed_invocations_snapshot` /
+/// `xctx_nonce_dedup_snapshot`) — no Class-S saga field is centralized by
+/// convention alone. Without persisting it, a `PreparingB`-window crash could
+/// never reverse the caller's deduction or void the escrow from the durable
+/// record, durably over-charging the caller.
+pub(in crate::context) fn xctx_caller_reservations_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<
+    crate::context::supervisor::saga_journal::SagaId,
+    crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
+> {
+    state.xctx_caller_reservations.clone()
 }
 
 /// Build the Class-S snapshot projection of the actor's B-owned cross-context

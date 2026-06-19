@@ -457,9 +457,7 @@ async fn prepare_a(
     //    it does not double-charge: the live paths CONSUME (remove without
     //    re-reversing) the record, and the record's own reversal runs only when
     //    the carrier is absent — the two paths are mutually exclusive.
-    let record = reservation
-        .ticket
-        .to_caller_reservation_record(now_secs, reservation.generation);
+    let record = reservation.ticket.to_caller_reservation_record(now_secs);
     state
         .xctx_caller_reservations
         .insert(saga_id.clone(), record);
@@ -3340,6 +3338,72 @@ mod tests {
         );
     }
 
+    /// SAME-NODE RESTORE: the caller-side durable reservation record Prepare-A
+    /// stages survives a crash. We project the live state to its Class-S snapshot
+    /// (through the shared `xctx_caller_reservations_snapshot` helper) and
+    /// rehydrate a FRESH actor state from that snapshot (mirroring
+    /// `restore_context`), asserting the record lands in the restored
+    /// `xctx_caller_reservations` value-stable — so the crash-recovery abort can
+    /// reverse the caller deduction + void the escrow from it without the
+    /// in-memory carrier.
+    #[tokio::test]
+    async fn caller_reservation_record_survives_same_node_restore() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0x6B, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        let caller = DID(CALLER.to_owned());
+        let saga = SagaId("saga-same-node-restore".to_owned());
+        let (tx, rx) = oneshot::channel();
+        prepare_a(&mut st, &deps, &saga, &[0x6B; 32], &caller, TOOL, tx).await;
+        let prepared_a = rx.await.unwrap().expect("prepared-A");
+        let staged = st
+            .xctx_caller_reservations
+            .get(&saga)
+            .expect("Prepare-A staged the durable record")
+            .clone();
+
+        // This test exercises only the DURABLE record's restore path, not the
+        // carrier; release the in-memory ticket explicitly so its RAII
+        // must-settle-or-rollback guard stays quiet (a real crash would drop it,
+        // and the §17.16.4 abort reverses from the durable record instead).
+        prepared_a
+            .reservation
+            .ticket
+            .void_external_and_consume(deps.payment_adapter.as_ref())
+            .await;
+
+        // Project the live state to its Class-S snapshot — the persisted form a
+        // restore rehydrates from. The record MUST be carried (through the shared
+        // snapshot helper).
+        let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(&st);
+        assert_eq!(
+            snapshot.xctx_caller_reservations.get(&saga),
+            Some(&staged),
+            "the caller-reservation record MUST be in the Class-S snapshot (crash-surviving)"
+        );
+
+        // Simulate same-node restore: a FRESH actor state whose
+        // `xctx_caller_reservations` is rehydrated from the snapshot (mirrors
+        // `restore_context`, which assigns `ctx_snapshot.xctx_caller_reservations`
+        // directly — caller economy is local, so same-node restore rehydrates it
+        // verbatim).
+        let mut restored = target_state(0x6B, OTHER, CALLER).await;
+        restored.xctx_caller_reservations = snapshot.xctx_caller_reservations.clone();
+
+        assert_eq!(
+            restored.xctx_caller_reservations.get(&saga),
+            Some(&staged),
+            "the restored state MUST rehydrate the caller-reservation record value-stable"
+        );
+    }
+
     #[tokio::test]
     async fn prepare_b_rejects_chain_depth_overflow() {
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
@@ -4511,6 +4575,18 @@ mod tests {
     /// deductions) MUST be reversed. Before the fix this path no-op'd, durably
     /// over-charging the caller. Asserts the durable refund actually moved owned
     /// state — not merely that the abort acked.
+    ///
+    /// CRITICAL — this drives a REAL crash-recovery generation bump. A real
+    /// §17.16.4 restore rehydrates the snapshot into a freshly spawned actor,
+    /// and EVERY spawn stamps a fresh monotonic `state.generation` via
+    /// `spawn_generation.fetch_add(1) + 1` (`spawn_actor_with_watchdog`), while
+    /// the restored record carries the PRE-CRASH generation. So
+    /// `record.generation != state.generation` ALWAYS holds post-restart. We
+    /// reproduce that exact condition by bumping `st.generation` to a fresh value
+    /// distinct from the staged record's BEFORE the `Abort { None }`. A
+    /// spawn-generation gate on the local reversal would therefore SKIP the
+    /// refund on every real restart, leaving the caller over-charged — this test
+    /// FAILS against that gated code and PASSES once the gate is removed.
     #[tokio::test]
     async fn crash_recovery_abort_none_reverses_caller_deduction_from_record() {
         use std::sync::atomic::Ordering;
@@ -4574,6 +4650,17 @@ mod tests {
             .void_external_and_consume(deps.payment_adapter.as_ref())
             .await;
 
+        // Reproduce the REAL crash-recovery generation bump: a §17.16.4 restore
+        // rehydrates this snapshot into a freshly spawned actor whose
+        // `state.generation` is re-stamped by `spawn_generation.fetch_add(1) + 1`
+        // (`spawn_actor_with_watchdog`), distinct from the generation in force
+        // when Prepare-A staged the record. Bump `st.generation` to a fresh value
+        // so the post-restart "live generation differs from the reservation's"
+        // condition holds. A spawn-generation gate on the local reversal would
+        // SKIP the refund here (over-charging the caller); the fix removes it, so
+        // the refund runs regardless of generation.
+        st.generation = st.generation.wrapping_add(7);
+
         // Reset the persist counter so we measure ONLY the recovery abort.
         persist_calls.store(0, Ordering::SeqCst);
 
@@ -4623,10 +4710,16 @@ mod tests {
 
     /// CRASH-RECOVERY ESCROW VOID: a `reverse_caller_reservation_record` on a
     /// record carrying an external escrow authorization VOIDS that hold via the
-    /// payment adapter (closing the escrow leak), and reverses local economy on
-    /// a generation match. Exercises the escrow handle directly (the outbound
-    /// caller leg carries no spending UCAN today, so the Prepare-A escrow path
-    /// is forward-looking — this asserts the reversal that fires once it is).
+    /// payment adapter (closing the escrow leak), AND reverses the local economy
+    /// UNCONDITIONALLY. Exercises the escrow handle directly (the outbound caller
+    /// leg carries no spending UCAN today, so the Prepare-A escrow path is
+    /// forward-looking — this asserts the reversal that fires once it is).
+    ///
+    /// The live `st.generation` is bumped to a fresh value distinct from the
+    /// generation in force when the reservation was staged — exactly what a real
+    /// crash-recovery respawn produces — to prove the reversal does NOT gate on
+    /// spawn-generation: the escrow is still voided and the local velocity entry
+    /// is still reversed even though the live actor's generation has moved on.
     #[tokio::test]
     async fn reverse_caller_reservation_record_voids_external_escrow() {
         use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
@@ -4671,14 +4764,20 @@ mod tests {
                 expires_at: 2_000_000,
                 adapter_state: vec![],
             }),
-            generation: st.generation,
         };
+
+        // Move the live actor generation on, as a crash-recovery respawn would.
+        // The reversal must still run — it is NOT generation-gated.
+        st.generation = st.generation.wrapping_add(11);
 
         let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
             &mut st, &deps, &record,
         )
         .await;
-        assert!(ran, "matching generation ⇒ local reversal ran");
+        assert!(
+            ran,
+            "crash-recovery reversal runs unconditionally (no spawn-generation gate)"
+        );
         // The external escrow hold was voided (no leak).
         assert_eq!(
             voided.load(Ordering::SeqCst),

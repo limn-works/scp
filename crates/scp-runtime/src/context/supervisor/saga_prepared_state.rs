@@ -649,6 +649,23 @@ pub struct CommittedToolInvocation {
 /// absent (`Abort { None }`), so the two reversal paths are mutually exclusive
 /// by construction and a saga is never double-reversed.
 ///
+/// **Reversal is unconditional on the crash path** — see
+/// [`reverse_caller_reservation_record`](crate::context::tools_helpers::reverse_caller_reservation_record).
+/// The record and the deductions it reverses are rehydrated from ONE consistent
+/// snapshot into the SAME restored context, so there is no "replaced instance"
+/// to confuse: routing by `context_id` plus keying every reversal by
+/// `actor_did` is what guarantees only this actor's OWNED bookkeeping is
+/// touched. (A spawn-generation comparison would be a FALSE mismatch — every
+/// respawn stamps a fresh `state.generation`, so it never equals the pre-crash
+/// value — and would wrongly SKIP the refund on every real restart.)
+///
+/// **Escrow void MUST be idempotent across a recovery re-drive.** The crash
+/// abort voids the escrow BEFORE its Class-S persist; if that persist fails the
+/// record stays durable, so the next recovery sweep voids the SAME
+/// [`PaymentAuthorization`](crate::economy::adapter::PaymentAuthorization)
+/// again. This is the same idempotency the carrier's `void_external_and_consume`
+/// already relies on and the payment-adapter `void` contract guarantees.
+///
 /// **Class S** — synchronously persisted fail-closed (ADR-049 §9): inserted at
 /// Prepare-A in the SAME Class-S snapshot as the deduction it reverses, so the
 /// deduction and its reversal evidence land (and roll back) atomically. Survives
@@ -697,14 +714,6 @@ pub struct CallerReservationRecord {
     /// `PreparedAction`/`ActionEnvelope` wrappers are NOT, so only the
     /// authorization handle is persisted.
     pub escrow_authorization: Option<crate::economy::adapter::PaymentAuthorization>,
-    /// Spawn-generation of the actor instance the reservation was made against
-    /// (`PerContextState::generation`). The crash-abort reversal is
-    /// generation-checked: on a MISMATCH (the actor was despawned + respawned —
-    /// e.g. an import replace — between Prepare-A and the recovery abort) the
-    /// local budget / velocity / hard-rate-limit MUST NOT be touched (that would
-    /// be a confused-deputy write to the WRONG instance); only the external
-    /// escrow is voided.
-    pub generation: u64,
 }
 
 // ---------------------------------------------------------------------------

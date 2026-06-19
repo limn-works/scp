@@ -306,7 +306,6 @@ impl ToolEconomyTicket {
     pub(crate) fn to_caller_reservation_record(
         &self,
         recorded_at_secs: u64,
-        generation: u64,
     ) -> crate::context::supervisor::saga_prepared_state::CallerReservationRecord {
         crate::context::supervisor::saga_prepared_state::CallerReservationRecord {
             actor_did: self.actor_did.clone(),
@@ -317,35 +316,58 @@ impl ToolEconomyTicket {
                 .escrow
                 .as_ref()
                 .and_then(|prepared| prepared.envelope.authorization.clone()),
-            generation,
         }
     }
 }
 
 /// Reverse a cross-context saga's caller-side Prepare-A reservation from its
 /// durable [`CallerReservationRecord`] (spec §6.2.4 "Reservation release on
-/// every terminal path"), used by the crash-recovery abort path
+/// every terminal path"), used EXCLUSIVELY by the crash-recovery abort path
 /// (`Abort { None }`) where the in-memory RAII carrier died with the crash.
+/// (The LIVE `Abort { Some }` and Commit-A paths reverse via the carrier
+/// through [`rollback_tool_economy_generation_checked`], NOT this function — so
+/// this is the crash-recovery-only path and has exactly one production caller.)
 ///
-/// Generation-checked, mirroring
-/// [`rollback_tool_economy_generation_checked`]: when `record.generation`
-/// matches the live actor's `state.generation` the local budget / velocity /
-/// hard-rate-limit are reversed AND the external escrow is voided; on a MISMATCH
-/// (the actor was despawned + respawned for the same context between Prepare-A
-/// and this abort) ONLY the external escrow is voided — the prior instance's
-/// context-local bookkeeping died with it and writing this instance's owned
-/// state would be a confused-deputy corruption. Returns `true` when the local
-/// reversal ran (generations matched), `false` when only the external escrow
-/// was voided (mismatch). The caller folds a `true` into its Class-S
-/// fail-closed persist decision exactly as it does for a carrier rollback.
+/// Reverses the local budget / velocity / hard-rate-limit AND voids the
+/// external escrow UNCONDITIONALLY — it does NOT gate on `state.generation`. On
+/// the crash-recovery path the record AND the deductions it reverses are
+/// rehydrated from ONE consistent Class-S snapshot into the SAME context's
+/// restored state (`restore_context`), and the restored actor is routed by
+/// `context_id` to the correct caller context (`record.actor_did` keys the very
+/// trackers being reversed). A spawn-generation comparison here is therefore a
+/// FALSE mismatch: every spawn — including a crash-recovery respawn — stamps a
+/// fresh monotonic `state.generation` via `spawn_generation.fetch_add(1) + 1`
+/// (resetting to 0 on a fresh process), while the restored record carries the
+/// PRE-CRASH generation, so `record.generation != state.generation` ALWAYS
+/// holds post-restart. Gating the refund on it would SKIP the local reversal on
+/// every real restart and leave the caller durably over-charged on
+/// budget / velocity / hard-rate-limit (the matching deductions are rehydrated
+/// from the same snapshot) — exactly the over-charge this record exists to
+/// close.
+///
+/// The confused-deputy concern the generation check addresses — a DIFFERENT
+/// instance replacing the state between reserve and settle — belongs to the
+/// LIVE reserve→settle race, which the carrier path
+/// ([`rollback_tool_economy_generation_checked`]) handles. It does not apply
+/// here: there is no "replaced instance" on the crash path, only the same
+/// context's state restored from its own consistent snapshot. Routing by
+/// `context_id` and keying every reversal by `record.actor_did` is what
+/// guarantees this writes only this actor's OWNED bookkeeping.
+///
+/// Always returns `true` (a present record on this path always drives a local
+/// reversal); the caller folds that into its Class-S fail-closed persist
+/// decision exactly as it does for a carrier rollback.
 pub async fn reverse_caller_reservation_record(
     state: &mut PerContextState,
     deps: &ActorDeps,
     record: &crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
 ) -> bool {
-    // External escrow void is always safe (and required to avoid a leak),
-    // regardless of generation: the payment hold the prior instance authorized
-    // is real and external to any actor instance.
+    // External escrow void is always safe (and required to avoid a leak): the
+    // payment hold authorized at Prepare-A is real and external to any actor
+    // instance. MUST be idempotent across a recovery re-drive — a persist
+    // failure after this void leaves the record durable, so the next recovery
+    // sweep voids the SAME `PaymentAuthorization` again (the same assumption
+    // the carrier's `void_external_and_consume` already relies on).
     if let (Some(adapter), Some(auth)) = (
         deps.payment_adapter.as_ref(),
         record.escrow_authorization.as_ref(),
@@ -357,15 +379,12 @@ pub async fn reverse_caller_reservation_record(
         );
     }
 
-    if record.generation != state.generation {
-        // Confused-deputy guard: the reservation belongs to a now-replaced
-        // actor instance. The external escrow is already voided above; the
-        // context-local bookkeeping lived in the gone instance and MUST NOT be
-        // touched here.
-        return false;
-    }
-
-    // Generations match — reverse this actor's OWNED economy bookkeeping.
+    // Reverse this restored actor's OWNED economy bookkeeping. Keyed by
+    // `record.actor_did`; routing already guarantees this is the right context's
+    // restored state, so there is no instance to confuse. No spawn-generation
+    // gate (see the doc-comment): a fresh respawn-stamped generation never
+    // matches the pre-crash record, so gating would wrongly skip every real
+    // crash-recovery refund and durably over-charge the caller.
     state
         .governance
         .velocity_tracker

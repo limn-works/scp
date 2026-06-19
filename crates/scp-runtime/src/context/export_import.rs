@@ -2533,6 +2533,103 @@ mod tests {
         );
     }
 
+    /// A caller-side durable reservation reversal record (spec §6.2.4; Class S)
+    /// round-trips through `MessagePack` persistence value-stable, so a
+    /// `PreparingB`-window crash restores exactly the budget / hard-rate-limit /
+    /// velocity-timestamp / external-escrow facts the recovery abort needs to
+    /// reverse the caller deduction and void the escrow. Mirrors the
+    /// `xctx_nonce_dedup` round-trip above for the other Class-S saga field.
+    #[test]
+    fn caller_reservation_record_persistence_roundtrips_value_stable() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
+        use crate::economy::adapter::PaymentAuthorization;
+
+        let mut snapshot = test_snapshot("ctx-caller-reservation-roundtrip");
+        let caller = DID::from("did:key:caller-roundtrip");
+
+        // A record carrying a budget delta, a hard-rate-limit refund flag, a
+        // velocity timestamp, and a populated external escrow authorization —
+        // every reversal-relevant field set so the round-trip exercises them all.
+        let record = CallerReservationRecord {
+            actor_did: caller.clone(),
+            deducted_cost: Some(scp_protocol::economy::types::Amount(42)),
+            needs_hard_rate_limit_refund: true,
+            recorded_at_secs: 1_700_000_999,
+            escrow_authorization: Some(PaymentAuthorization {
+                auth_id: [9u8; 32],
+                payer: caller,
+                payee: DID::from("did:key:payee-roundtrip"),
+                amount: scp_protocol::economy::types::Amount(42),
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                adapter_id: "roundtrip-adapter".to_owned(),
+                created_at: 1_000_000,
+                expires_at: 2_000_000,
+                adapter_state: vec![1, 2, 3, 4],
+            }),
+        };
+        let saga = SagaId("saga-roundtrip".to_owned());
+        snapshot
+            .xctx_caller_reservations
+            .insert(saga.clone(), record.clone());
+
+        // MessagePack persistence round-trip (the path used by
+        // ContextPersistence::persist_context / load).
+        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let decoded: ContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(decoded.xctx_caller_reservations.len(), 1);
+        let decoded_record = decoded
+            .xctx_caller_reservations
+            .get(&saga)
+            .expect("the caller-reservation record survives the round-trip");
+        // Value-stable: the whole record (including the nested escrow auth)
+        // is byte-for-byte equal via the derived `PartialEq`.
+        assert_eq!(decoded_record, &record);
+    }
+
+    /// Caller-side reservation records are LOCAL-node economy state with no
+    /// authority on a foreign node, so `strip_snapshot_for_public` MUST drop
+    /// them — a public observer / importer must never be handed the means to
+    /// drive a local economy reversal (caller economy is local, exactly like
+    /// `xctx_committed_invocations` and `xctx_nonce_dedup`). A same-node FULL
+    /// snapshot, by contrast, RETAINS them so a crash-recovery abort can reverse
+    /// from the record. Asserts both halves of the asymmetry.
+    #[test]
+    fn caller_reservation_records_retained_full_dropped_public() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::CallerReservationRecord;
+
+        let mut snapshot = test_snapshot("ctx-caller-reservation-strip");
+        let caller = DID::from("did:key:caller-strip");
+        let saga = SagaId("saga-strip".to_owned());
+        snapshot.xctx_caller_reservations.insert(
+            saga.clone(),
+            CallerReservationRecord {
+                actor_did: caller,
+                deducted_cost: Some(scp_protocol::economy::types::Amount(7)),
+                needs_hard_rate_limit_refund: true,
+                recorded_at_secs: 1_700_000_111,
+                escrow_authorization: None,
+            },
+        );
+
+        // FULL same-node snapshot retains the record (crash-recovery reversal
+        // depends on it).
+        assert!(
+            snapshot.xctx_caller_reservations.contains_key(&saga),
+            "the full snapshot must retain the caller-reservation record"
+        );
+
+        // PUBLIC strip drops it (no foreign authority over local economy).
+        let stripped =
+            strip_snapshot_for_public(&snapshot).expect("public strip builds a minimal role state");
+        assert!(
+            stripped.xctx_caller_reservations.is_empty(),
+            "public strip MUST drop caller-reservation records (local economy has no foreign authority)"
+        );
+    }
+
     /// The signed-export digest (§23.16.8) uses its OWN domain separator,
     /// `"SCP-CONTEXT-EXPORT-V1:"`, which is DISTINCT from the §23.16.4
     /// sync-delta separator `"SCP-CONTEXT-SNAPSHOT-V1:"`. Both digests are
