@@ -5424,13 +5424,56 @@ impl Supervisor {
                 // reservations but the Commit never left the coordinator. Abort
                 // the Prepared side(s) — releasing the staged rate/escrow/session
                 // reservations — and discard; NEVER re-Prepare. For a
-                // reconstructible cross-context entry this sends a real `Abort`
-                // to the prepared actors (release); otherwise the journal abort
+                // reconstructible cross-context entry this re-drives a real
+                // `Abort { None }` to the prepared actors (release); otherwise
+                // there is no caller reservation to reverse and the journal abort
                 // marker IS the rollback record.
-                if let Some(prepared) = Self::reconstruct_xctx_prepared(&entry) {
-                    self.redrive_xctx_prepare_in_progress(&entry.saga_id, &prepared)
-                        .await;
+                //
+                // The terminal-`Aborted` marker asserts "fully compensated", so
+                // it MUST NOT be written while the caller's durable LOCAL-economy
+                // reversal is still outstanding — exactly the invariant
+                // [`Self::abort_saga`] enforces on the LIVE abort path. If the
+                // caller context is not yet resident when this startup sweep runs
+                // (a `lookup` miss — ordering of context restore vs.
+                // `replay_unresolved_sagas` is not enforced in-tree) OR the
+                // `Abort { None }` send fails, the record-based reversal was NOT
+                // delivered: leave the journal NON-terminal at `PreparingB` so a
+                // later sweep (after the caller is restored) re-drives it. Marking
+                // terminal here would strand the caller's durable deduction
+                // forever (the sweep re-drives ONLY non-terminal journals → a
+                // permanent over-charge).
+                let caller_reversal = match Self::reconstruct_xctx_prepared(&entry) {
+                    Some(prepared) => {
+                        self.redrive_xctx_prepare_in_progress(&entry.saga_id, &prepared)
+                            .await
+                    }
+                    // Non-reconstructible entry: no cross-context caller
+                    // reservation to reverse, so the journal abort marker is the
+                    // authoritative (and only needed) rollback record — safe to
+                    // mark terminal.
+                    None => CallerAbortReversal::SettledOrAbsent,
+                };
+
+                if matches!(caller_reversal, CallerAbortReversal::ReversalOutstanding) {
+                    // The producing site inside `redrive_caller_local_reversal`
+                    // already routed its verdict through `Self::reversal_outstanding()`
+                    // (incrementing the counter + emitting the stable
+                    // `event = "xctx_caller_reversal_outstanding"` warn). Re-emit the
+                    // SAME stable field here so a log query on it surfaces the
+                    // "left non-terminal" decision too, but do NOT re-increment the
+                    // counter (that would double-count a single stranded reversal).
+                    tracing::warn!(
+                        event = "xctx_caller_reversal_outstanding",
+                        saga_id = %entry.saga_id,
+                        "saga recovery — PreparingB (Prepare-in-progress) observed but the \
+                         caller-side LOCAL-economy reversal could not be delivered (caller not \
+                         yet restored / backpressure); leaving the journal NON-terminal so a \
+                         later crash-recovery sweep re-drives it (NOT marking terminal-Aborted \
+                         with the caller refund outstanding)"
+                    );
+                    return;
                 }
+
                 let _ = self
                     .saga_journal
                     .mark_resolved(
@@ -5442,7 +5485,8 @@ impl Supervisor {
                 tracing::warn!(
                     saga_id = %entry.saga_id,
                     "saga recovery — PreparingB (Prepare-in-progress) observed; aborted the \
-                     Prepared side(s) and discarded (never re-Prepared)"
+                     Prepared side(s), confirmed the caller reversal, and discarded (never \
+                     re-Prepared)"
                 );
             }
             SagaState::Committing => {
@@ -5606,46 +5650,52 @@ impl Supervisor {
 
     /// §17.16.4 Prepare-in-progress re-drive: abort the Prepared side(s) of a
     /// cross-context saga, releasing the staged reservations, then discard
-    /// (NEVER re-Prepare). Sends a best-effort [`SagaPhaseMessage::Abort`] to
-    /// the caller actor (whose Prepare-A staged the escrow/outbound-RL slot —
-    /// `None` reservation, so the actor releases its own held slot if present)
-    /// and the target actor (whose Prepare-B staged the `saga_pending` session
-    /// slot). A lookup miss / send failure is logged; the journal abort marker
-    /// (written by the caller) is the authoritative rollback record.
+    /// (NEVER re-Prepare). The carrier `PreparedAFields` died with the crashed
+    /// coordinator, so BOTH legs are driven as `Abort { None }` — the actor
+    /// reverses its OWN staged state keyed by `SagaId`.
+    ///
+    /// - CALLER side: drives the record-based `Abort { None }` through
+    ///   [`Self::redrive_caller_local_reversal`] — the SAME helper the live
+    ///   abort path uses — so the caller reverses its LOCAL economy (budget /
+    ///   velocity / hard-rate-limit) from the durable `CallerReservationRecord`
+    ///   Prepare-A staged. The returned [`CallerAbortReversal`] reflects whether
+    ///   that reversal was CONFIRMED delivered: `SettledOrAbsent` iff the
+    ///   `Abort { None }` was delivered-and-acked (or there was genuinely no
+    ///   caller reservation to reverse — a clean record no-op);
+    ///   `ReversalOutstanding` on a `lookup` miss (caller not yet restored) or a
+    ///   send failure (persistent backpressure / closed inbox). This is the SOLE
+    ///   input to the coordinator's terminal-marker decision: a terminal-`Aborted`
+    ///   journal asserts "fully compensated" and MUST NOT be written while the
+    ///   caller refund is still outstanding (symmetric with [`Self::abort_saga`]).
+    ///
+    /// - TARGET side: released best-effort via [`Self::abort_target_leg`]
+    ///   (clears the staged `saga_pending` session slot). The target carries no
+    ///   caller LOCAL economy, so its release is orthogonal to the returned
+    ///   verdict — a failed/undelivered send strands nothing (the next sweep
+    ///   clears the slot).
     ///
     /// Invoked by [`Self::recover_saga_entry`] on a `PreparingB` entry, which is
     /// driven by the Phase-2D startup replay loop
     /// ([`Self::replay_unresolved_sagas`]).
-    async fn redrive_xctx_prepare_in_progress(&self, saga_id: &SagaId, prepared: &XctxPrepared) {
-        use crate::context::actor::commands::SagaPhaseMessage;
-        for context_id in [prepared.caller_context_id, prepared.target_context_id] {
-            let context_hex = hex::encode(context_id);
-            if let Some(actor) = self.lookup(&context_hex) {
-                let abort_saga_id = saga_id.clone();
-                // `None` reservation: the post-crash coordinator no longer holds
-                // the Prepare-A `PreparedAFields` carrier (it died with the
-                // crash); the actor releases its OWN staged slot (caller: held
-                // escrow/RL; target: `saga_pending` session) keyed by SagaId.
-                let result = actor
-                    .send(move |reply| {
-                        ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
-                            saga_id: abort_saga_id,
-                            reservation: None,
-                            reply,
-                        })
-                    })
-                    .await;
-                if let Err(err) = result {
-                    tracing::warn!(
-                        saga_id = %saga_id.0,
-                        context = %context_hex,
-                        %err,
-                        "saga recovery — Prepare-in-progress Abort send failed; journal abort \
-                         marker is the authoritative rollback record"
-                    );
-                }
-            }
-        }
+    async fn redrive_xctx_prepare_in_progress(
+        &self,
+        saga_id: &SagaId,
+        prepared: &XctxPrepared,
+    ) -> CallerAbortReversal {
+        // CALLER side: record-based `Abort { None }` re-drive — reverses the
+        // caller's LOCAL economy from the durable record and yields the verdict
+        // that gates the terminal marker (warns + counts on miss/failure).
+        let caller_hex = hex::encode(prepared.caller_context_id);
+        let caller_reversal = self
+            .redrive_caller_local_reversal(saga_id, &caller_hex)
+            .await;
+
+        // TARGET side: best-effort session-slot release, orthogonal to the
+        // caller verdict (the target stages no caller LOCAL economy).
+        self.abort_target_leg(saga_id, prepared.target_context_id)
+            .await;
+
+        caller_reversal
     }
 
     /// §17.16.4 Commit-in-progress re-drive: re-send the idempotent Commit-B,
@@ -16734,6 +16784,332 @@ mod tests {
         );
     }
 
+    /// Build a supervisor over a REAL durable saga journal (in-memory storage) +
+    /// a capturing persistence, so the crash-recovery terminal-marker decision is
+    /// observable via `load_unresolved` (the default `with_providers` journal is a
+    /// no-op stub). Returns the supervisor and the live persistence double.
+    fn xctx_supervisor_with_real_journal(
+        creator_did: String,
+        creator_key: ed25519_dalek::VerifyingKey,
+    ) -> (Arc<Supervisor>, CapturingPersistence) {
+        use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
+        let persistence = CapturingPersistence::default();
+        let journal_storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
+            Arc::clone(&journal_storage),
+        ));
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestXctxWave15".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+            if did.as_ref() == creator_did {
+                Some(creator_key)
+            } else {
+                None
+            }
+        });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = Supervisor::with_providers_and_journal(
+            crypto,
+            transport,
+            Box::new(TestEventLog),
+            key_resolver,
+            Some(Box::new(persistence.clone())),
+            None,
+            None,
+            None,
+            mls_storage,
+            journal,
+        );
+        (supervisor, persistence)
+    }
+
+    /// §6.2.4 review wave-15 — CRASH-RECOVERY symmetry with the live abort path.
+    /// The startup `recover_saga_entry` `PreparingB` arm re-drives the prepared
+    /// side(s) and then marks the journal terminal-`Aborted`. But the caller-side
+    /// record-based `Abort { None }` re-drive can FAIL to deliver: if
+    /// `replay_unresolved_sagas` runs BEFORE the caller context is restored
+    /// (ordering is not enforced in-tree), the `lookup` misses. Pre-fix the arm
+    /// marked terminal-`Aborted` UNCONDITIONALLY — so the caller's durable
+    /// LOCAL-economy deduction was NEVER reversed AND the §17.16.4 sweep (which
+    /// re-drives ONLY non-terminal journals) could never re-drive a terminal
+    /// entry: a permanent over-charge. The fix makes the arm honour the SAME
+    /// invariant the live abort path (`abort_saga`) enforces — terminal-`Aborted`
+    /// MUST NOT be written until the caller reversal is CONFIRMED delivered.
+    ///
+    /// NON-RESIDENT caller (this test): the durable record is staged (real
+    /// Prepare-A), then the caller actor is despawned BEFORE recovery so the
+    /// re-drive `lookup` misses ⇒ the journal MUST be LEFT non-terminal (the
+    /// sweep re-drives it after a respawn). PRE-FIX this marked terminal-Aborted.
+    #[tokio::test]
+    async fn crash_recovery_preparing_b_non_resident_caller_left_non_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkXctxWave15NonResCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWave15NonResCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("wave15-nonresident-saga".to_owned());
+        let participants = vec![caller_hex.clone(), hex::encode(XCTX_TARGET)];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        // Real Prepare-A: durably stages the caller deduction + reservation
+        // record on the live caller actor. (We balance the returned carrier
+        // immediately — like a lost-reply supervisor would — so its #[must_use]
+        // drop guard does not fire; the durable record is what recovery reverses.)
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+        let snap_before = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        assert!(
+            snap_before.xctx_caller_reservations.contains_key(&saga_id),
+            "Prepare-A staged the durable caller reservation record"
+        );
+
+        // Journal up to a RECONSTRUCTIBLE PreparingB carrying the full
+        // caller+target evidence (the real post-Prepare-B-failure state).
+        let evidence = Supervisor::xctx_prepared_evidence_bytes(
+            &SagaInput::test_cross_context_for_gating(XCTX_CALLER, XCTX_TARGET),
+            &ctx,
+        )
+        .expect("xctx evidence");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &evidence)
+            .await
+            .expect("journal PreparingB");
+
+        // Despawn the caller BEFORE recovery: this models `replay_unresolved_sagas`
+        // running before the caller context is restored. The re-drive `lookup`
+        // now misses ⇒ the record-based reversal cannot be delivered.
+        assert!(
+            supervisor.actors.remove(&caller_hex).is_some(),
+            "caller actor despawned to simulate restore-after-replay ordering"
+        );
+
+        // Drive the REAL crash-recovery path on the PreparingB entry.
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingB,
+            participants: participants.clone(),
+            evidence: Zeroizing::new(evidence),
+            timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            seq_per_saga: 2,
+        };
+        supervisor.recover_saga_entry(entry).await;
+
+        // CORE: the journal MUST stay NON-terminal at PreparingB (still in
+        // load_unresolved) so the next sweep — after the caller is restored —
+        // re-drives the reversal. PRE-FIX recover_saga_entry marked terminal-
+        // Aborted UNCONDITIONALLY, dropping the saga out of load_unresolved and
+        // stranding the caller's durable deduction forever.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        let found = unresolved.iter().find(|e| e.saga_id == saga_id).expect(
+            "the non-resident-caller PreparingB saga MUST remain UNRESOLVED (not terminal-Aborted) \
+             so a later crash-recovery sweep re-drives the caller's LOCAL economy reversal",
+        );
+        assert_eq!(
+            found.state,
+            SagaState::PreparingB,
+            "the journal must stay at the sweep-redrivable PreparingB state, not advance to \
+             terminal-Aborted while the caller reversal is outstanding"
+        );
+        // The durable record is UNTOUCHED (reversal never ran against the missing
+        // actor), so a respawn + sweep can still reverse it — the over-charge is
+        // recoverable, not permanent. The caller actor is despawned, so we read
+        // its LAST persisted snapshot directly from the persistence double (it
+        // still carries the record Prepare-A staged before despawn).
+        let snap_after = persistence
+            .snapshots
+            .get(&caller_hex)
+            .map(|e| e.value().clone())
+            .expect("the despawned caller's last persisted snapshot is retained");
+        assert!(
+            snap_after.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable record survives a non-resident-caller recovery so the next sweep can \
+             still reverse it (the reversal did not silently run against a missing actor)"
+        );
+    }
+
+    /// §6.2.4 review wave-15 companion — RESIDENT caller with a durable record:
+    /// the crash-recovery `PreparingB` re-drive DELIVERS the record-based
+    /// `Abort { None }`, reverses the caller's LOCAL economy from the durable
+    /// record, AND (only then) marks the journal terminal-`Aborted`. This proves
+    /// the fix still resolves the happy case — it gates the terminal marker on a
+    /// CONFIRMED reversal, it does not block it unconditionally.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full recovery E2E: reserve + journal + recover + assert
+    async fn crash_recovery_preparing_b_resident_caller_reverses_then_marks_terminal() {
+        use crate::context::supervisor::saga_journal::{SagaId, SagaState};
+
+        let creator_did = "did:dht:z6MkXctxWave15ResCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let (supervisor, persistence) =
+            xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWave15ResCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("wave15-resident-saga".to_owned());
+        let participants = vec![caller_hex.clone(), hex::encode(XCTX_TARGET)];
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing,
+            caller_signing_key: caller_signing,
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        // Recover the burst ceiling + balance the carrier (lost-reply shape).
+        let burst_milli = {
+            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+            let token_after_reserve = snap
+                .hard_rate_limit_state
+                .get(caller_did)
+                .map(|(tokens, _)| *tokens)
+                .expect("reserve created a hard-rate-limit entry");
+            assert!(
+                snap.xctx_caller_reservations.contains_key(&saga_id),
+                "Prepare-A staged the durable caller reservation record"
+            );
+            token_after_reserve + 1000 // one token = 1000 milli-tokens
+        };
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+
+        let evidence = Supervisor::xctx_prepared_evidence_bytes(
+            &SagaInput::test_cross_context_for_gating(XCTX_CALLER, XCTX_TARGET),
+            &ctx,
+        )
+        .expect("xctx evidence");
+        supervisor
+            .append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &evidence)
+            .await
+            .expect("journal PreparingB");
+
+        // The caller stays RESIDENT (as a restore-before-replay ordering would
+        // surface it). Drive the REAL crash-recovery path.
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingB,
+            participants: participants.clone(),
+            evidence: Zeroizing::new(evidence),
+            timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            seq_per_saga: 2,
+        };
+        supervisor.recover_saga_entry(entry).await;
+
+        // The record-based reversal RAN: the hard-rate-limit token is refunded to
+        // full burst and the durable record is consumed.
+        let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        let token_after = snap
+            .hard_rate_limit_state
+            .get(caller_did)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after recovery");
+        assert_eq!(
+            token_after, burst_milli,
+            "the resident-caller PreparingB recovery MUST reverse the caller's LOCAL economy from \
+             the durable record (refund to full burst) — the caller is NOT over-charged"
+        );
+        assert!(
+            !snap.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable record MUST be consumed by the record-based reversal"
+        );
+
+        // The reversal was CONFIRMED, so the journal IS marked terminal-Aborted:
+        // the saga drops out of load_unresolved.
+        let unresolved = supervisor
+            .saga_journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved");
+        assert!(
+            !unresolved.iter().any(|e| e.saga_id == saga_id),
+            "a CONFIRMED caller reversal lets recovery mark the journal terminal-Aborted (the \
+             saga is resolved, no longer in load_unresolved)"
+        );
+    }
+
     /// HIGH 2 (§6.2.4 review wave-14): `abort_xctx_participants` with
     /// `ctx.prepared_a == None` MUST still reconcile the durable
     /// `CallerReservationRecord`. The carrier is `None` whenever the Prepare-A
@@ -16933,7 +17309,17 @@ mod tests {
             recorded_nonce: [0x99u8; 16],
             recorded_chain_depth: 3,
         };
-        Box::pin(supervisor.redrive_xctx_prepare_in_progress(&saga_id, &prepared)).await;
+        let verdict =
+            Box::pin(supervisor.redrive_xctx_prepare_in_progress(&saga_id, &prepared)).await;
+        // The caller actor is resident and Prepare-A never staged a reservation
+        // here, so the caller-side `Abort { None }` is delivered to a clean
+        // record no-op: the reversal is settled (`SettledOrAbsent`), which is the
+        // verdict that lets `recover_saga_entry` mark the journal terminal.
+        assert_eq!(
+            verdict,
+            CallerAbortReversal::SettledOrAbsent,
+            "a resident caller with no staged reservation settles the reversal (clean no-op)"
+        );
 
         // The staged slot was RELEASED: a Commit-B reserve for this saga now
         // finds NO staged prepared (the recovery discarded it; it was never

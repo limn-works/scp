@@ -844,8 +844,20 @@ scan_file() {
         # rather than silently trusted. Matched against the STRIPPED `line` so a
         # `fn` / `impl` / `pub` token inside a string / comment cannot
         # false-positive. Emitted once per file.
+        #
+        # The production-item alternation covers every column-0 item-start shape
+        # that can resume a production region after a trailing test module:
+        #   - pub item / impl block / unsafe impl block
+        #   - a free fn in any qualifier combination: (async )?fn, unsafe fn,
+        #     const fn, and the const+unsafe orderings (const unsafe fn /
+        #     unsafe const fn) — caught by the const[[:space:]]+unsafe and
+        #     unsafe[[:space:]]+const prefixes.
+        # An un-`pub` column-0 unsafe/const fn cannot do a runtime Class-S
+        # mutation today (forbid(unsafe_code) on this crate; const fn cannot run
+        # state.x.insert()), but the vacuum guard hardens against a future change
+        # by firing on them regardless.
         if (seen_test && !nontrailing_hit \
-            && line ~ /^(pub([[:space:]]|\()|impl([[:space:]]|<)|(async[[:space:]]+)?fn[[:space:]]|unsafe[[:space:]]+impl[[:space:]])/) {
+            && line ~ /^(pub([[:space:]]|\()|impl([[:space:]]|<)|(async[[:space:]]+)?fn[[:space:]]|unsafe[[:space:]]+impl[[:space:]]|unsafe[[:space:]]+fn[[:space:]]|const[[:space:]]+fn[[:space:]]|const[[:space:]]+unsafe[[:space:]]|unsafe[[:space:]]+const[[:space:]])/) {
             printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
             nontrailing_hit = 1
         }
@@ -1867,6 +1879,32 @@ self_test() {
         printf '}\n'
     } > "$fdir/interspersed_item_gate.rs"
 
+    # (38) NON-TRAILING TEST MODULE resuming with a column-0 `const fn` /
+    # `unsafe fn` (wave-15) — the prior NTTEST regex matched `unsafe impl` but
+    # NOT a bare column-0 `unsafe fn`, and missed `const fn` entirely, so a
+    # production region resuming with one of those after a trailing test module
+    # would NOT raise NTTEST (an un-scanned vacuum). Both shapes here MUST emit an
+    # NTTEST HIT now. (Non-exploitable today — forbid(unsafe_code) + const fn
+    # cannot run a runtime state mutation — but the vacuum guard fires regardless.)
+    {
+        printf 'pub fn const_unsafe_prod_before_test_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod const_unsafe_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf 'const fn prod_const_fn_after_test_fixture() -> u8 {\n'
+        printf '    0\n'
+        printf '}\n'
+        printf '\n'
+        printf 'unsafe fn prod_unsafe_fn_after_test_fixture() {\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/nontrailing_const_unsafe_fn.rs"
+
     local rc=0
     local out
     out=$(
@@ -2214,6 +2252,18 @@ self_test() {
         printf '%sSELF-TEST FAILED%s: a column-0 interspersed single-item test gate was\n' \
             "$C_RED" "$C_RESET" >&2
         printf 'wrongly flagged as a non-trailing test MODULE (it gates an item, not a mod).\n' >&2
+        rc=1
+    fi
+    # (38) NON-TRAILING test module resuming with a column-0 `const fn` /
+    # `unsafe fn` (wave-15) — the production region after a trailing test module
+    # resumes with a bare `const fn` / `unsafe fn` (no `pub`), which the prior
+    # NTTEST regex did not match. It MUST now emit an NTTEST HIT (the un-scanned
+    # vacuum guard, hardened for the const/unsafe fn shapes).
+    if ! grep -q $'^NTTEST\t.*/nontrailing_const_unsafe_fn\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a NON-trailing test module resuming with a column-0\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`const fn` / `unsafe fn` was NOT flagged — the un-scanned-vacuum guard regex\n' >&2
+        printf 'misses the const/unsafe fn item-start shapes.\n' >&2
         rc=1
     fi
 
