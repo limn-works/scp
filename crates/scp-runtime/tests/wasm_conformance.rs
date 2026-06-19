@@ -2080,10 +2080,18 @@ fn golden_event_leaf_hash() {
 /// Appends the convergent, commit-ordered stream every honest member appends
 /// identically and in the same order. Mirrors `append_convergent_stream` in
 /// the native `eventlog_convergence.rs`.
-fn append_convergent_stream_shared(log: &mut scp_event_log::EventLog) {
+fn append_convergent_stream_shared(log: &mut scp_event_log::EventLog, local_clock_offset: u64) {
     use scp_event_log::tree::append_unsigned_event;
     use scp_event_log::{DID, Event, EventPayload, EventType};
 
+    // `local_clock_offset` is IGNORED for the leaf timestamp: every member
+    // records the committer-assigned timestamp (here the deterministic
+    // `1_700_000_000 + sequence`, standing in for the signed commit envelope's
+    // `created_at`), so two members with different physical-clock skews still
+    // produce byte-identical leaves (§7.3.1, §9.9.3). The negative control feeds
+    // the offset into the leaf instead to prove per-member-local stamping
+    // diverges.
+    let _ = local_clock_offset;
     let entries = [
         (EventType::ContextCreated, "did:dht:zAlice"),
         (EventType::MemberJoined, "did:dht:zAlice"),
@@ -2112,6 +2120,45 @@ fn append_convergent_stream_shared(log: &mut scp_event_log::EventLog) {
     }
 }
 
+/// Like [`append_convergent_stream_shared`] but (incorrectly) stamps each leaf
+/// with a per-member LOCAL timestamp = committer value + the member's clock
+/// offset. Used only by the negative control to prove that per-member-local
+/// stamping — the pre-fix behavior — diverges at equal event count.
+fn append_stream_with_local_timestamps_shared(
+    log: &mut scp_event_log::EventLog,
+    local_clock_offset: u64,
+) {
+    use scp_event_log::tree::append_unsigned_event;
+    use scp_event_log::{DID, Event, EventPayload, EventType};
+
+    let entries = [
+        (EventType::ContextCreated, "did:dht:zAlice"),
+        (EventType::MemberJoined, "did:dht:zAlice"),
+        (EventType::MemberJoined, "did:dht:zBob"),
+    ];
+    for (event_type, actor) in entries {
+        let sequence = scp_event_log::tree::event_count(log);
+        let prev_hash = if log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            log.leaves()[log.leaves().len() - 1]
+        };
+        append_unsigned_event(
+            log,
+            &Event {
+                event_type,
+                actor_did: DID::from(actor.to_owned()),
+                timestamp: 1_700_000_000 + sequence + local_clock_offset,
+                sequence,
+                payload: EventPayload { data: Vec::new() },
+                prev_hash,
+                signature: Vec::new(),
+            },
+        )
+        .expect("convergent append must succeed");
+    }
+}
+
 #[test]
 fn wasm_and_native_members_converge_despite_divergent_per_author_activity() {
     use scp_event_log::tree::root;
@@ -2119,14 +2166,17 @@ fn wasm_and_native_members_converge_despite_divergent_per_author_activity() {
     // Member A — the WASM-shaped member. Performs 3 local sends + 1 local
     // tool-invoke: under the exclusion taxonomy these surface as local
     // `ContextEvent`s only, so NOTHING is appended to A's durable log here.
+    // Member A's physical clock is +0s; member B's is skewed +250s. Under the
+    // committer-assigned rule the skew is IGNORED for the leaf, so it must not
+    // perturb either root.
     let mut log_a = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
-    append_convergent_stream_shared(&mut log_a);
+    append_convergent_stream_shared(&mut log_a, 0);
     // (3 sends + 1 tool-invoke happen as local ContextEvents — no durable leaf.)
 
     // Member B — the native-shaped member. Performs 5 local sends + 2 local
     // tool-invokes — also durable-leaf-free.
     let mut log_b = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
-    append_convergent_stream_shared(&mut log_b);
+    append_convergent_stream_shared(&mut log_b, 250);
     // (5 sends + 2 tool-invokes happen as local ContextEvents — no durable leaf.)
 
     let root_a = root(&log_a);
@@ -2136,11 +2186,38 @@ fn wasm_and_native_members_converge_despite_divergent_per_author_activity() {
         root_a, root_b,
         "a WASM member and a native member with the same convergent stream MUST \
          derive an identical Merkle root regardless of divergent per-author \
-         send / tool-invoke activity (§9.9.3 cross-impl convergence)"
+         send / tool-invoke activity AND per-member physical-clock skew, because \
+         every leaf carries the committer-assigned timestamp (§9.9.3 cross-impl \
+         convergence)"
     );
     assert_ne!(
         root_a, [0u8; 32],
         "the convergent stream is non-empty, so the shared root must be non-zero"
+    );
+}
+
+#[test]
+fn wasm_and_native_members_diverge_under_per_member_local_timestamps() {
+    use scp_event_log::tree::root;
+
+    // Negative control / non-vacuity: if a WASM member and a native member
+    // stamped leaves with their OWN local clocks (committer value + per-member
+    // skew) instead of the committer-assigned timestamp — the pre-fix behavior —
+    // they would compute DIFFERENT roots at the SAME event count, the §9.9.3
+    // false positive the fix removes. Same event types, order, and count; only
+    // the timestamp source differs.
+    let mut log_a = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_stream_with_local_timestamps_shared(&mut log_a, 0);
+
+    let mut log_b = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_stream_with_local_timestamps_shared(&mut log_b, 250);
+
+    assert_ne!(
+        root(&log_a),
+        root(&log_b),
+        "per-member-local leaf timestamps MUST diverge at equal event count — \
+         the §9.9.3 false positive that committer-assigned timestamps eliminate \
+         across the WASM⇄native boundary"
     );
 }
 
@@ -2229,6 +2306,7 @@ fn cross_impl_governance_action_executed_leaf_bytes() {
         EventPayload {
             data: native_payload.clone(),
         },
+        1_700_000_000,
     )
     .unwrap();
     let entries = log.event_log_entries(&ctx).unwrap().unwrap();
@@ -2436,11 +2514,11 @@ fn cross_impl_per_author_leaf_would_break_convergence() {
     };
 
     let mut log_a = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
-    append_convergent_stream_shared(&mut log_a);
+    append_convergent_stream_shared(&mut log_a, 0);
     append_message_sent(&mut log_a, "did:dht:zAlice");
 
     let mut log_b = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
-    append_convergent_stream_shared(&mut log_b);
+    append_convergent_stream_shared(&mut log_b, 0);
     append_message_sent(&mut log_b, "did:dht:zBob");
     append_message_sent(&mut log_b, "did:dht:zBob");
 

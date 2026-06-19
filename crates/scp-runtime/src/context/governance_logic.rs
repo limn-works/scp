@@ -38,6 +38,24 @@ pub(super) const CONSEQUENCE_ACTOR_DID: &str = "system";
 use scp_event_log::payload::consequence_event_payload;
 use scp_protocol::trust::consequence::{consequence_action_type, trigger_kind_str};
 
+/// The convergent leaf timestamp for a durable consequence leaf.
+///
+/// This is the timestamp of the highest-sequence piece of evidence that
+/// triggered the consequence — i.e. the convergent log event that crossed the
+/// trigger threshold. Because the evidence is drawn from the shared convergent
+/// event log, every honest member derives the identical value, so the durable
+/// leaf stays byte-identical across members (§7.3.1, §9.9.3). Only
+/// convergent-trigger consequences reach a durable leaf (`is_convergent_trigger`),
+/// so the evidence is always convergent here; an evidence-less consequence
+/// (which never produces a durable leaf) yields 0.
+fn convergent_consequence_timestamp(consequence: &TriggeredConsequence) -> u64 {
+    consequence
+        .evidence
+        .iter()
+        .max_by_key(|e| e.event_sequence)
+        .map_or(0, |e| e.timestamp)
+}
+
 /// Best-effort durable append of one consequence event log entry. A failed
 /// append is logged via `tracing::warn!` but never blocks the matching
 /// `receive_buffer.push(...)` call — the receive buffer remains a useful
@@ -55,12 +73,17 @@ fn append_consequence_event(
     event_type: scp_event_log::EventType,
     member_did: &DID,
     payload: scp_event_log::EventPayload,
+    // Convergent leaf timestamp: the `timestamp` of the convergent triggering
+    // event (see [`convergent_consequence_timestamp`]). Copied identically by
+    // every member, never a per-member evaluation `now()` (§7.3.1, §9.9.3).
+    trigger_timestamp_secs: u64,
 ) {
     if let Err(e) = event_log.append_context_event_with_payload(
         context_id_bytes,
         event_type,
         CONSEQUENCE_ACTOR_DID,
         payload,
+        trigger_timestamp_secs,
     ) {
         tracing::warn!(
             context_id,
@@ -323,6 +346,7 @@ fn emit_consequence_triggered(
             scp_event_log::EventType::ConsequenceTriggered,
             args.member_did,
             payload,
+            convergent_consequence_timestamp(consequence),
         );
         *state.checkpoint_events_since += 1;
     }
@@ -364,6 +388,7 @@ fn emit_absent_member_enforcement_failed(
             scp_event_log::EventType::ConsequenceEnforcementFailed,
             args.member_did,
             payload,
+            convergent_consequence_timestamp(consequence),
         );
         *state.checkpoint_events_since += 1;
     }
@@ -401,6 +426,7 @@ fn emit_consequence_enforced_success(
             scp_event_log::EventType::ConsequenceEnforced,
             args.member_did,
             payload,
+            convergent_consequence_timestamp(consequence),
         );
         *state.checkpoint_events_since += 1;
     }
@@ -544,6 +570,7 @@ fn emit_failure_escalation(
             scp_event_log::EventType::ConsequenceEnforcementFailed,
             member_did,
             failed_payload,
+            convergent_consequence_timestamp(consequence),
         );
         *state.checkpoint_events_since += 1;
         let escalation_payload = consequence_event_payload(
@@ -559,6 +586,7 @@ fn emit_failure_escalation(
             scp_event_log::EventType::ConsequenceEscalatedToSuspendAll,
             member_did,
             escalation_payload,
+            convergent_consequence_timestamp(consequence),
         );
         *state.checkpoint_events_since += 1;
     }
@@ -982,6 +1010,7 @@ mod convergence_tests {
                 data: serde_json::to_vec(&serde_json::json!({ "target_did": SUBJECT }))
                     .expect("encode target payload"),
             },
+            1_700_000_000,
         )
         .expect("append governance action");
         (log, context_id_str)

@@ -147,6 +147,28 @@ pub const fn is_convergent_trigger(trigger: &ConsequenceTrigger) -> bool {
     }
 }
 
+/// The convergent Merkle-leaf timestamp for a durable consequence leaf.
+///
+/// This is the `timestamp` of the highest-sequence piece of evidence that
+/// triggered the consequence — i.e. the convergent log event that crossed the
+/// trigger threshold.
+///
+/// Because the evidence is drawn from the shared convergent event log, every
+/// honest member (native or WASM) derives the identical value, keeping the
+/// durable leaf byte-identical across members for the §9.9.3
+/// equal-count/equal-root equivocation test. Only convergent-trigger
+/// consequences reach a durable leaf ([`is_convergent_trigger`]), so the
+/// evidence is convergent here; an evidence-less consequence (which never
+/// produces a durable leaf) yields 0.
+#[must_use]
+pub fn convergent_consequence_timestamp(consequence: &TriggeredConsequence) -> u64 {
+    consequence
+        .evidence
+        .iter()
+        .max_by_key(|e| e.event_sequence)
+        .map_or(0, |e| e.timestamp)
+}
+
 /// Stable string label for a [`ConsequenceTrigger`], used as the `trigger_kind`
 /// field of a durable consequence Merkle-leaf payload
 /// (`scp_event_log::payload::consequence_event_payload`).
@@ -821,6 +843,10 @@ pub trait ConsequenceDispatcher {
         rule_index: usize,
         trigger_kind: &str,
         action_type: &str,
+        // Convergent leaf timestamp: the triggering event's `created_at` (see
+        // [`convergent_consequence_timestamp`]), copied identically by every
+        // member so native and WASM leaves are byte-identical (§7.3.1, §9.9.3).
+        trigger_timestamp_secs: u64,
     ) {
         // Default: no durable leaf. See doc comment — native does not use this
         // path; WASM overrides it.
@@ -830,6 +856,7 @@ pub trait ConsequenceDispatcher {
             rule_index,
             trigger_kind,
             action_type,
+            trigger_timestamp_secs,
         );
     }
 }
@@ -900,6 +927,10 @@ struct LeafCtx<'a> {
     subject_did: &'a str,
     rule_index: usize,
     trigger_kind: &'a str,
+    /// Convergent leaf timestamp — the triggering event's `created_at` (see
+    /// [`convergent_consequence_timestamp`]), copied identically by every
+    /// member (§7.3.1, §9.9.3).
+    trigger_timestamp_secs: u64,
 }
 
 /// Mints one durable consequence leaf via the dispatcher hook IFF the trigger is
@@ -918,6 +949,7 @@ fn mint_leaf<D: ConsequenceDispatcher>(
             ctx.rule_index,
             ctx.trigger_kind,
             action_type,
+            ctx.trigger_timestamp_secs,
         );
     }
 }
@@ -957,6 +989,7 @@ fn enforce_one_triggered<D: ConsequenceDispatcher>(
         subject_did,
         rule_index: consequence.rule_index,
         trigger_kind: &leaf_trigger_kind,
+        trigger_timestamp_secs: convergent_consequence_timestamp(consequence),
     };
 
     // ConsequenceTriggered: durable leaf (when convergent) BEFORE the local
@@ -2240,6 +2273,7 @@ mod tests {
             rule_index: usize,
             trigger_kind: &str,
             action_type: &str,
+            _trigger_timestamp_secs: u64,
         ) {
             if self.first_leaf_args.is_none() {
                 self.first_leaf_args = Some((

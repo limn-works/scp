@@ -633,6 +633,11 @@ pub fn run_buffered_post_delivery(
     context_id_bytes: &[u8; 32],
     sender_did: &str,
     event_name: Option<scp_event_log::EventType>,
+    // Committer-assigned leaf timestamp copied from the inbound message
+    // envelope's `created_at` (seconds), for the sender-authenticated received
+    // event the `Some(event_name)` branch would append. Convergent by copy —
+    // never a per-member local `now()` (§7.3.1, §9.9.3).
+    event_timestamp_secs: u64,
     clock: &dyn Clock,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     event_tx: Option<&ContextEventSender>,
@@ -648,7 +653,12 @@ pub fn run_buffered_post_delivery(
     // Durable Merkle append ONLY for sender-authenticated events. Application
     // messages (`None`) skip the append but still run governance below.
     if let Some(event_name) = event_name
-        && let Err(e) = event_log.append_context_event(context_id_bytes, event_name, sender_did)
+        && let Err(e) = event_log.append_context_event(
+            context_id_bytes,
+            event_name,
+            sender_did,
+            event_timestamp_secs,
+        )
     {
         tracing::warn!(
             context_id,
@@ -2351,6 +2361,7 @@ pub fn validate_and_drain_timeouts(
                 &context_id_bytes,
                 &msg.sender_did,
                 event_name,
+                msg.inner.timestamp / 1000,
                 &*deps.clock,
                 &*deps.event_log,
                 deps.event_tx.as_ref(),
@@ -2431,6 +2442,7 @@ pub fn buffer_ahead_message(
                 &context_id_bytes,
                 &msg.sender_did,
                 event_name,
+                msg.inner.timestamp / 1000,
                 &*deps.clock,
                 &*deps.event_log,
                 deps.event_tx.as_ref(),
@@ -2547,6 +2559,7 @@ pub fn deliver_message_and_drain_buffered(
                     context_id_bytes,
                     &msg.sender_did,
                     event_name,
+                    msg.inner.timestamp / 1000,
                     &*deps.clock,
                     &*deps.event_log,
                     deps.event_tx.as_ref(),
@@ -2647,6 +2660,7 @@ pub fn deliver_message_and_drain_buffered(
             context_id_bytes,
             &msg.sender_did,
             event_name,
+            msg.inner.timestamp / 1000,
             &*deps.clock,
             &*deps.event_log,
             deps.event_tx.as_ref(),
@@ -3156,6 +3170,7 @@ mod pseudonym_routing_tests {
             event: scp_event_log::EventType,
             _actor: &str,
             _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             match event {
                 scp_event_log::EventType::ConsequenceTriggered => {
@@ -3224,7 +3239,15 @@ mod pseudonym_routing_tests {
         // in-order path — this is exactly the call shape the four buffered-drain
         // sites now use.
         run_buffered_post_delivery(
-            &mut state, &ctx, &ctx_bytes, ALICE, event_name, &clock, &event_log, None,
+            &mut state,
+            &ctx,
+            &ctx_bytes,
+            ALICE,
+            event_name,
+            1_700_000_000,
+            &clock,
+            &event_log,
+            None,
         );
 
         // (a) Velocity was recorded for the sender.
@@ -3338,6 +3361,7 @@ mod pseudonym_routing_tests {
             event: scp_event_log::EventType,
             _actor: &str,
             _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             self.any_append
                 .store(true, std::sync::atomic::Ordering::SeqCst);

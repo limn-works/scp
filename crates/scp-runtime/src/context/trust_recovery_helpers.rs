@@ -259,6 +259,10 @@ pub fn recovery_advance_epoch(
             new_epoch,
         },
     );
+    // Committer-assigned timestamp for the recovery epoch-advance commit: the
+    // initiator's clock — the source of the `created_at` on the broadcast MLS
+    // Commit, copied by every member (§7.3.1, §9.9.3).
+    let recovery_ts = deps.clock.now_secs();
     if let Err(e) = recovery_payload
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))
         .and_then(|payload| {
@@ -267,6 +271,7 @@ pub fn recovery_advance_epoch(
                 scp_event_log::EventType::RecoveryEpochAdvanced,
                 "system:recovery",
                 payload,
+                recovery_ts,
             )
         })
     {

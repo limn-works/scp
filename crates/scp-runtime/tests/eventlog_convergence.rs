@@ -31,15 +31,38 @@ const CTX: [u8; 32] = [0x5cu8; 32];
 const ALICE: &str = "did:dht:z6MkAliceConverge";
 const BOB: &str = "did:dht:z6MkBobConverge";
 
+/// The committer-assigned timestamps for each event in the convergent stream.
+/// These are the values carried on the inbound signed commit envelopes — every
+/// member copies them, so they are byte-identical across members regardless of
+/// when each member processes the commit (§7.3.1, §9.9.3).
+const TS_CREATED: u64 = 1_700_000_000;
+const TS_JOIN_ALICE: u64 = 1_700_000_060;
+const TS_JOIN_BOB: u64 = 1_700_000_120;
+const TS_GOV: u64 = 1_700_000_180;
+
 /// The convergent stream every honest member appends identically and in the
 /// same order: context creation + two joins + a governance action. These are
 /// MLS-commit-ordered, so both members observe the same sequence.
-fn append_convergent_stream(log: &MerkleEventLogProvider) {
-    log.append_context_event(&CTX, EventType::ContextCreated, ALICE)
+///
+/// Each event is stamped with the **committer-assigned** timestamp (the signed
+/// commit envelope's `created_at`), NOT each member's local clock — so two
+/// honest members processing the same commit stream at different wall-clock
+/// times still produce byte-identical leaves. `local_clock_offset` simulates a
+/// member whose physical clock is skewed: under the (correct) committer-assigned
+/// rule it is IGNORED for the leaf, so it must not perturb the root. The
+/// negative-control test below feeds the offset into the leaf instead to prove
+/// per-member-local stamping would diverge.
+fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offset: u64) {
+    // `local_clock_offset` is intentionally unused for the leaf timestamp: the
+    // committer-assigned value is what every member records. It exists so the
+    // two members in the positive test can be given DIFFERENT skews and still
+    // converge.
+    let _ = local_clock_offset;
+    log.append_context_event(&CTX, EventType::ContextCreated, ALICE, TS_CREATED)
         .unwrap();
-    log.append_context_event(&CTX, EventType::MemberJoined, ALICE)
+    log.append_context_event(&CTX, EventType::MemberJoined, ALICE, TS_JOIN_ALICE)
         .unwrap();
-    log.append_context_event(&CTX, EventType::MemberJoined, BOB)
+    log.append_context_event(&CTX, EventType::MemberJoined, BOB, TS_JOIN_BOB)
         .unwrap();
     log.append_context_event_with_payload(
         &CTX,
@@ -48,25 +71,69 @@ fn append_convergent_stream(log: &MerkleEventLogProvider) {
         EventPayload {
             data: b"{\"target_did\":\"did:dht:z6MkBobConverge\"}".to_vec(),
         },
+        TS_GOV,
+    )
+    .unwrap();
+}
+
+/// Like [`append_convergent_stream`] but (incorrectly) stamps each leaf with a
+/// per-member LOCAL timestamp = committer value + the member's clock offset.
+/// This is the pre-fix behavior the convergent rule replaces; used only by the
+/// negative control to prove divergence.
+fn append_stream_with_local_timestamps(log: &MerkleEventLogProvider, local_clock_offset: u64) {
+    log.append_context_event(
+        &CTX,
+        EventType::ContextCreated,
+        ALICE,
+        TS_CREATED + local_clock_offset,
+    )
+    .unwrap();
+    log.append_context_event(
+        &CTX,
+        EventType::MemberJoined,
+        ALICE,
+        TS_JOIN_ALICE + local_clock_offset,
+    )
+    .unwrap();
+    log.append_context_event(
+        &CTX,
+        EventType::MemberJoined,
+        BOB,
+        TS_JOIN_BOB + local_clock_offset,
+    )
+    .unwrap();
+    log.append_context_event_with_payload(
+        &CTX,
+        EventType::GovernanceAction,
+        ALICE,
+        EventPayload {
+            data: b"{\"target_did\":\"did:dht:z6MkBobConverge\"}".to_vec(),
+        },
+        TS_GOV + local_clock_offset,
     )
     .unwrap();
 }
 
 #[test]
 fn two_honest_members_converge_despite_divergent_application_streams() {
-    // Member A's local view.
+    // Member A's local view. A's physical clock is +0s from "true" time.
     let log_a = MerkleEventLogProvider::new();
     log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a);
+    append_convergent_stream(&log_a, 0);
     // A's local application activity: 3 messages. Under the unification these
     // are local `ContextEvent`s only — NO durable leaf is appended, so they do
     // not perturb A's Merkle root.
     //   (intentionally append nothing to the durable log here — 3 local sends)
 
-    // Member B's local view.
+    // Member B's local view. B's physical clock is skewed +250s — but because
+    // each leaf carries the COMMITTER-ASSIGNED timestamp (not B's local clock),
+    // this skew must NOT perturb B's root. Under the old per-member `now()`
+    // behavior B's four leaves would each differ from A's by 250s and the roots
+    // would diverge at equal event count — the §9.9.3 false positive this fix
+    // removes.
     let log_b = MerkleEventLogProvider::new();
     log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b);
+    append_convergent_stream(&log_b, 250);
     // B's local application activity: 5 messages — also durable-leaf-free.
 
     let root_a = log_a.event_log_merkle_root(&CTX).unwrap();
@@ -98,19 +165,19 @@ fn negative_control_per_author_appends_break_convergence() {
     // per-author `MessageSent` durable append.
     let log_a = MerkleEventLogProvider::new();
     log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a);
+    append_convergent_stream(&log_a, 0);
     for _ in 0..3 {
         log_a
-            .append_context_event(&CTX, EventType::MessageSent, ALICE)
+            .append_context_event(&CTX, EventType::MessageSent, ALICE, 1_700_000_200)
             .unwrap();
     }
 
     let log_b = MerkleEventLogProvider::new();
     log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b);
+    append_convergent_stream(&log_b, 250);
     for _ in 0..5 {
         log_b
-            .append_context_event(&CTX, EventType::MessageSent, BOB)
+            .append_context_event(&CTX, EventType::MessageSent, BOB, 1_700_000_200)
             .unwrap();
     }
 
@@ -134,12 +201,12 @@ fn two_honest_members_converge_despite_divergent_payment_captures() {
     // number of per-payee payments MUST still derive identical Merkle roots.
     let log_a = MerkleEventLogProvider::new();
     log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a);
+    append_convergent_stream(&log_a, 0);
     // A captures 2 payments — local-only, no durable leaf.
 
     let log_b = MerkleEventLogProvider::new();
     log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b);
+    append_convergent_stream(&log_b, 250);
     // B captures 4 payments — also durable-leaf-free.
 
     let root_a = log_a.event_log_merkle_root(&CTX).unwrap();
@@ -166,19 +233,19 @@ fn negative_control_per_payee_payment_appends_break_convergence() {
     // re-introduced the per-payee `PaymentReceived` durable append.
     let log_a = MerkleEventLogProvider::new();
     log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a);
+    append_convergent_stream(&log_a, 0);
     for _ in 0..2 {
         log_a
-            .append_context_event(&CTX, EventType::PaymentReceived, ALICE)
+            .append_context_event(&CTX, EventType::PaymentReceived, ALICE, 1_700_000_300)
             .unwrap();
     }
 
     let log_b = MerkleEventLogProvider::new();
     log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b);
+    append_convergent_stream(&log_b, 250);
     for _ in 0..4 {
         log_b
-            .append_context_event(&CTX, EventType::PaymentReceived, BOB)
+            .append_context_event(&CTX, EventType::PaymentReceived, BOB, 1_700_000_300)
             .unwrap();
     }
 
@@ -190,5 +257,54 @@ fn negative_control_per_payee_payment_appends_break_convergence() {
         "with per-payee PaymentReceived leaves durably appended, divergent \
          counts (2 vs 4) MUST make the roots differ — this is the \
          non-convergence the unification removes"
+    );
+}
+
+#[test]
+fn committer_assigned_timestamp_converges_despite_clock_skew() {
+    // The core property of the committer-assigned-timestamp fix: two honest
+    // members who append the SAME convergent stream but whose physical clocks
+    // are skewed relative to each other (A +0s, B +250s) MUST derive identical
+    // Merkle roots, because every leaf carries the committer-assigned timestamp
+    // (the signed commit envelope's `created_at`) — never each member's local
+    // `now()`.
+    let log_a = MerkleEventLogProvider::new();
+    log_a.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_a, 0);
+
+    let log_b = MerkleEventLogProvider::new();
+    log_b.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_b, 250);
+
+    assert_eq!(
+        log_a.event_log_merkle_root(&CTX).unwrap(),
+        log_b.event_log_merkle_root(&CTX).unwrap(),
+        "committer-assigned leaf timestamps MUST converge across honest members \
+         regardless of per-member physical-clock skew (§7.3.1, §9.9.3)"
+    );
+}
+
+#[test]
+fn negative_control_per_member_local_timestamps_break_convergence() {
+    // Proves the positive test is not vacuous: if each member stamped leaves
+    // with its OWN local clock (committer value + per-member skew) — the
+    // pre-fix behavior — two honest members at the SAME event count would
+    // compute DIFFERENT roots with no equivocation present, the §9.9.3 false
+    // positive the committer-assigned rule removes. Same event types, same
+    // order, same count; only the timestamp source differs.
+    let log_a = MerkleEventLogProvider::new();
+    log_a.init_event_log(&CTX).unwrap();
+    append_stream_with_local_timestamps(&log_a, 0);
+
+    let log_b = MerkleEventLogProvider::new();
+    log_b.init_event_log(&CTX).unwrap();
+    append_stream_with_local_timestamps(&log_b, 250);
+
+    assert_ne!(
+        log_a.event_log_merkle_root(&CTX).unwrap(),
+        log_b.event_log_merkle_root(&CTX).unwrap(),
+        "per-member-local leaf timestamps MUST diverge at equal event count — \
+         this is exactly the §9.9.3 false positive that committer-assigned \
+         timestamps eliminate"
     );
 }

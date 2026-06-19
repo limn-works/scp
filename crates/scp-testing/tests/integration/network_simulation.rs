@@ -1046,6 +1046,7 @@ impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
         event_type: scp_event_log::EventType,
         _actor_did: &str,
         _payload: scp_event_log::EventPayload,
+        _timestamp_secs: u64,
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         self.events.lock().unwrap().push(format!("{event_type:?}"));
         Ok(())

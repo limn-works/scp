@@ -1096,6 +1096,7 @@ mod tests {
                 scp_event_log::EventPayload {
                     data: label.as_bytes().to_vec(),
                 },
+                1_700_000_000,
             )
             .unwrap();
     }

@@ -372,6 +372,10 @@ pub async fn leave_context(
         &context_id_bytes,
         scp_event_log::EventType::MemberLeft,
         member_did.as_ref(),
+        // Committer-assigned: the leaving member's clock — the source of the
+        // `created_at` on its outgoing leave commit, copied by every member
+        // (§7.3.1, §9.9.3).
+        deps.clock.now_secs(),
     )?;
     state.checkpoint_events_since += 1;
 
@@ -512,9 +516,17 @@ pub async fn close_context_with_key(
     let role_state = state.role_state.clone();
 
     // Delegate to ttl::close_context for the lifecycle transition + role
-    // gate (async).
-    let result =
-        ttl::close_context(handle, initiator_did, &role_state, deps.event_log.as_ref()).await?;
+    // gate (async). The initiator assigns the convergent `ContextClosing` leaf
+    // timestamp from its own clock — the same value stamped on the outgoing
+    // close commit, copied by every member (§7.3.1, §9.9.3).
+    let result = ttl::close_context(
+        handle,
+        initiator_did,
+        &role_state,
+        deps.event_log.as_ref(),
+        deps.clock.now_secs(),
+    )
+    .await?;
 
     // Fix C: Re-check ContextClose capability after the state transition
     // committed. If capability was revoked between the gate and the
@@ -867,6 +879,10 @@ pub async fn join_context(
         &context_id_bytes,
         scp_event_log::EventType::MemberJoined,
         member_did.as_ref(),
+        // Committer-assigned: the joining member's clock (captured once above as
+        // `now_secs`) — the source of the `created_at` on its outgoing join
+        // commit, copied by every member (§7.3.1, §9.9.3).
+        now_secs,
     ) {
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
@@ -1158,6 +1174,9 @@ pub async fn create_context(
         deps.transport.as_ref(),
         deps.event_log.as_ref(),
         creator_did.as_ref(),
+        // Creator assigns the convergent ContextCreated leaf timestamp from its
+        // own clock; every member copies it (§7.3.1, §9.9.3).
+        deps.clock.now_secs(),
     )
     .await?;
     let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
@@ -2737,6 +2756,7 @@ mod restore_reconcile_tests {
             _event: scp_event_log::EventType,
             _actor: &str,
             _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
@@ -2761,6 +2781,7 @@ mod restore_reconcile_tests {
             _event: scp_event_log::EventType,
             _actor: &str,
             _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), ContextCreationError> {
             Err(ContextCreationError::EventLogFailed(
                 "fixture: event-log append deliberately fails".to_owned(),

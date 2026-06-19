@@ -107,6 +107,9 @@ where
         &context_id_bytes,
         scp_event_log::EventType::MemberJoined,
         subscriber_did.as_ref(),
+        // Committer-assigned: the subscriber's signed subscribe-request
+        // timestamp, copied by every member (§7.3.1, §9.9.3).
+        timestamp,
     )?;
     state.checkpoint_events_since += 1;
 
@@ -163,6 +166,10 @@ pub fn unsubscribe_broadcast(
         &context_id_bytes,
         scp_event_log::EventType::MemberLeft,
         subscriber_did.as_ref(),
+        // Committer-assigned: the unsubscribing author's clock — the source of
+        // the `created_at` on its outgoing leave message, copied by every
+        // member (§7.3.1, §9.9.3).
+        deps.clock.now_secs(),
     )?;
     state.checkpoint_events_since += 1;
 
@@ -526,6 +533,10 @@ pub fn block_broadcast_subscriber(
         &context_id_bytes,
         scp_event_log::EventType::MemberBlocked,
         author_did.as_ref(),
+        // Committer-assigned: the blocking author's clock — the source of the
+        // `created_at` on its outgoing block message, copied by every member
+        // (§7.3.1, §9.9.3).
+        deps.clock.now_secs(),
     )?;
     state.checkpoint_events_since += 1;
 
@@ -582,6 +593,10 @@ pub fn unblock_broadcast_subscriber(
         &context_id_bytes,
         scp_event_log::EventType::MemberUnblocked,
         author_did.as_ref(),
+        // Committer-assigned: the unblocking author's clock — the source of the
+        // `created_at` on its outgoing unblock message, copied by every member
+        // (§7.3.1, §9.9.3).
+        deps.clock.now_secs(),
     )?;
     state.checkpoint_events_since += 1;
 

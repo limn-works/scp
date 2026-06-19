@@ -1316,6 +1316,7 @@ impl ContextEventLogProvider for NoOpEventLogProvider {
         _event_type: scp_event_log::EventType,
         _actor_did: &str,
         _payload: scp_event_log::EventPayload,
+        _timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }

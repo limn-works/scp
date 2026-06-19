@@ -10931,6 +10931,7 @@ mod tests {
             _event: scp_event_log::EventType,
             _actor_did: &str,
             _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
@@ -11919,6 +11920,7 @@ mod tests {
                     *event_type,
                     "",
                     scp_event_log::EventPayload::default(),
+                    1_700_000_000,
                 )
                 .unwrap();
         }
@@ -13640,8 +13642,11 @@ mod tests {
             &ctx_key,
             &target,
             scp_protocol::context::governance::AccessScope::Both,
-            [1u8; 32],
-            admin.as_ref(),
+            crate::context::governance_helpers::CommitMeta {
+                pid: [1u8; 32],
+                actor_did: admin.as_ref(),
+                timestamp_secs: 1_700_000_000,
+            },
         )
         .expect("execute_revoke (Both scope) must succeed");
 

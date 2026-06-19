@@ -427,7 +427,21 @@ impl PerContextState {
     ///
     /// This helper replaces the old `WasmEventLog::append_event(tag, did, payload)`
     /// API with the canonical scp-event-log implementation.
-    fn append_log_event(&mut self, event_type: EventType, actor_did: &str, payload: &[u8]) {
+    /// `timestamp_secs` is the **committer-assigned** convergent leaf timestamp
+    /// (Unix seconds), matching the native runtime: for a commit-ordered event
+    /// it is the `created_at` of the signed SCP envelope carrying the commit
+    /// (copied by every member); for a timer-triggered event it is the
+    /// pre-computed convergent deadline. It is NEVER each member's local
+    /// `crate::time::now_secs()`, which would diverge and break the
+    /// equal-count/equal-root equivocation test a WASM member and a native
+    /// member must both satisfy (§7.3.1, §9.9.3).
+    fn append_log_event(
+        &mut self,
+        event_type: EventType,
+        actor_did: &str,
+        payload: &[u8],
+        timestamp_secs: u64,
+    ) {
         let sequence = event_count(&self.event_log);
         let prev_hash = if self.event_log.leaves().is_empty() {
             scp_event_log::tree::GENESIS_PREV_HASH
@@ -437,7 +451,7 @@ impl PerContextState {
         let event = Event {
             event_type,
             actor_did: DID::from(actor_did.to_owned()),
-            timestamp: crate::time::now_secs(),
+            timestamp: timestamp_secs,
             sequence,
             payload: EventPayload {
                 data: payload.to_vec(),
@@ -655,6 +669,7 @@ impl PerContextState {
         rule_index: usize,
         trigger_kind: &str,
         action_type: &str,
+        trigger_timestamp_secs: u64,
     ) {
         // Native uses CONSEQUENCE_ACTOR_DID = "system" as the actor for these
         // leaves so the `WarningCount` trigger's `actor_did != subject_did`
@@ -665,7 +680,7 @@ impl PerContextState {
             trigger_kind,
             action_type,
         );
-        self.append_log_event(event_type, "system", &payload.data);
+        self.append_log_event(event_type, "system", &payload.data, trigger_timestamp_secs);
     }
 
     // ---- Test-only helpers (compiled away in release builds) -------------
@@ -1394,7 +1409,14 @@ impl WasmContextManager {
         // Append ContextCreated event to event log.
         // Safe: we just inserted the context above, so the key is present.
         if let Some(ctx) = self.contexts.get_mut(context_id) {
-            ctx.append_log_event(EventType::ContextCreated, creator_did, b"");
+            ctx.append_log_event(
+                EventType::ContextCreated,
+                creator_did,
+                b"",
+                // Creator-assigned creation time (this member is the creator);
+                // copied by every member (§7.3.1, §9.9.3).
+                crate::time::now_secs(),
+            );
         }
 
         Ok(())
@@ -1471,7 +1493,14 @@ impl WasmContextManager {
             role_name: "member".to_owned(),
         });
 
-        ctx.append_log_event(EventType::MemberJoined, member_did, b"");
+        ctx.append_log_event(
+            EventType::MemberJoined,
+            member_did,
+            b"",
+            // Committer-assigned: this member's clock, the source of the
+            // join commit's `created_at` (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -1512,7 +1541,13 @@ impl WasmContextManager {
             member_did: DID(member_did.to_owned()),
         });
 
-        ctx.append_log_event(EventType::MemberLeft, member_did, b"");
+        ctx.append_log_event(
+            EventType::MemberLeft,
+            member_did,
+            b"",
+            // Committer-assigned: the leaving member's clock (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         // Auto-close if no members remain.
         if ctx.members.is_empty() {
@@ -1684,7 +1719,14 @@ impl WasmContextManager {
             initiator_did: DID(initiator_did.to_owned()),
         });
 
-        ctx.append_log_event(EventType::ContextClosing, initiator_did, b"");
+        ctx.append_log_event(
+            EventType::ContextClosing,
+            initiator_did,
+            b"",
+            // Committer-assigned: the initiator's clock, source of the close
+            // commit's `created_at` (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -1885,7 +1927,13 @@ impl WasmContextManager {
                 code: codes::CTX_2060.to_owned(),
             })?;
 
-        ctx.append_log_event(event_type, actor_did, prov_hash);
+        ctx.append_log_event(
+            event_type,
+            actor_did,
+            prov_hash,
+            // Committer-assigned: the attaching member's clock (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -1932,7 +1980,13 @@ impl WasmContextManager {
         // (`append_context_event`, no payload) — match it so the leaf preimage
         // is byte-identical across platforms (§9.9.3). The tool_id is NOT part
         // of the canonical leaf.
-        ctx.append_log_event(EventType::ToolRegistered, &actor, b"");
+        ctx.append_log_event(
+            EventType::ToolRegistered,
+            &actor,
+            b"",
+            // Committer-assigned: the registering member's clock (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(tool_id)
     }
@@ -2631,7 +2685,13 @@ impl WasmContextManager {
             token_cid,
             revoker_did,
         );
-        ctx.append_log_event(EventType::TokenRevoked, revoker_did, &payload);
+        ctx.append_log_event(
+            EventType::TokenRevoked,
+            revoker_did,
+            &payload,
+            // Committer-assigned: the revoker's clock (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -2763,6 +2823,18 @@ impl WasmContextManager {
         if result.is_ok()
             && let Some(ctx) = self.contexts.get_mut(context_id)
         {
+            // Convergent leaf timestamp for `GovernanceActionExecuted`: the
+            // executed proposal's signed `created_at`, copied identically by
+            // every member — byte-identical to the native runtime's
+            // proposal-derived value (`finalize_governance_action`). The
+            // proposal is in `pending_proposals` (pre-resolution) or
+            // `resolved_proposals` (post-resolution). Never local `now()`
+            // (§7.3.1, §9.9.3).
+            let proposal_created_at = ctx
+                .pending_proposals
+                .get(proposal_id)
+                .or_else(|| ctx.resolved_proposals.get(proposal_id))
+                .map_or(0, |p| p.created_at);
             let action_summary = action.variant_name().to_owned();
             let proposal_id_bytes: [u8; 32] = {
                 let bytes = hex::decode(proposal_id).unwrap_or_default();
@@ -2801,6 +2873,7 @@ impl WasmContextManager {
                 EventType::GovernanceActionExecuted,
                 initiator_did,
                 &executed_payload,
+                proposal_created_at,
             );
 
             // Evaluate and enforce consequence rules. Mirrors
@@ -3853,6 +3926,10 @@ impl WasmContextManager {
             EventType::GovernanceProposalCreated,
             proposer_did,
             proposal_id.as_bytes(),
+            // Convergent: the proposal's signed `created_at` (set to `now_secs`
+            // above), copied by every member — matches the native runtime's
+            // proposal-derived leaf timestamp (§7.3.1, §9.9.3).
+            now_secs,
         );
 
         if meets_quorum {
@@ -3955,12 +4032,10 @@ impl WasmContextManager {
                 });
             }
 
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
             proposal.approvals.push(SignedVote {
                 voter_did: DID(voter_did.to_owned()),
                 vote: VoteType::Approve,
-                timestamp: vote_ts,
+                timestamp: now_secs,
                 signature: Vec::new(),
             });
             proposal.approvals.len() >= required
@@ -3970,6 +4045,10 @@ impl WasmContextManager {
             EventType::GovernanceVoteCast,
             voter_did,
             proposal_id.as_bytes(),
+            // Convergent: the voter's signed vote `created_at` (= `now_secs`,
+            // the same value stamped on the SignedVote), copied by every member
+            // (§7.3.1, §9.9.3).
+            now_secs,
         );
 
         let pid = proposal_id.to_owned();
@@ -4065,12 +4144,10 @@ impl WasmContextManager {
                 });
             }
 
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
             proposal.rejections.push(SignedVote {
                 voter_did: DID(voter_did.to_owned()),
                 vote: VoteType::Reject,
-                timestamp: vote_ts,
+                timestamp: now_secs,
                 signature: Vec::new(),
             });
             total.saturating_sub(proposal.approvals.len() + proposal.rejections.len())
@@ -4080,6 +4157,10 @@ impl WasmContextManager {
             EventType::GovernanceVoteCast,
             voter_did,
             proposal_id.as_bytes(),
+            // Convergent: the voter's signed vote `created_at` (= `now_secs`,
+            // the same value stamped on the SignedVote), copied by every member
+            // (§7.3.1, §9.9.3).
+            now_secs,
         );
 
         let can_still_reach_quorum = {
@@ -4149,6 +4230,9 @@ impl WasmContextManager {
             EventType::GovernanceVoteWithdrawn,
             voter_did,
             proposal_id.as_bytes(),
+            // Committer-assigned: the withdrawing voter's clock, the source of
+            // the withdrawal commit's `created_at` (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
         );
 
         Ok(serde_json::json!({ "status": "Pending" }))
@@ -4896,7 +4980,16 @@ impl WasmContextManager {
         "expired".clone_into(&mut ctx.state);
         ctx.push_event(ContextEvent::Expired);
 
-        ctx.append_log_event(EventType::ContextExpired, "", b"");
+        ctx.append_log_event(
+            EventType::ContextExpired,
+            "",
+            b"",
+            // Timer-triggered expiry: WASM tracks no separate convergent TTL
+            // deadline, so the expiry instant is the member's clock reading at
+            // fire time; a mixed native/WASM context derives the deadline
+            // identically from the shared TTL policy (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }
@@ -5778,7 +5871,13 @@ impl WasmContextManager {
         "closed".clone_into(&mut ctx.state);
         ctx.broadcast_context = None;
 
-        ctx.append_log_event(EventType::ContextClosed, "system", b"");
+        ctx.append_log_event(
+            EventType::ContextClosed,
+            "system",
+            b"",
+            // Convergent close instant (§7.3.1, §9.9.3).
+            crate::time::now_secs(),
+        );
 
         Ok(())
     }

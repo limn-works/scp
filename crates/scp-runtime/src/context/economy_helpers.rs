@@ -239,9 +239,7 @@ pub async fn complete_paid_action(
     // `receive_buffer` so a long-lived paid context cannot grow this buffer
     // without limit (memory-growth DoS). Evict the oldest before pushing the
     // newest once the buffer is full.
-    if state.payment_receipts.len()
-        >= scp_protocol::context::membership::DEFAULT_BUFFER_CAPACITY
-    {
+    if state.payment_receipts.len() >= scp_protocol::context::membership::DEFAULT_BUFFER_CAPACITY {
         state.payment_receipts.pop_front();
     }
     state.payment_receipts.push_back(receipt.clone());

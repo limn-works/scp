@@ -321,6 +321,7 @@ impl ConsequenceDispatcher for WasmConsequenceDispatcher<'_> {
         rule_index: usize,
         trigger_kind: &str,
         action_type: &str,
+        trigger_timestamp_secs: u64,
     ) {
         // Mint the durable Merkle leaf via the shared payload builder so the
         // preimage is byte-identical to the native runtime's
@@ -328,12 +329,16 @@ impl ConsequenceDispatcher for WasmConsequenceDispatcher<'_> {
         // The shared `enforce_triggered` loop only invokes this for
         // convergent-trigger consequences (ADR-051 §6) and BEFORE the matching
         // `push_event` (H4 ordering), mirroring native's `emit_*` functions.
+        // `trigger_timestamp_secs` is the convergent triggering-event timestamp
+        // (shared `convergent_consequence_timestamp`), so the leaf timestamp is
+        // byte-identical to native (§7.3.1, §9.9.3).
         self.ctx.append_consequence_leaf(
             event_type,
             subject_did,
             rule_index,
             trigger_kind,
             action_type,
+            trigger_timestamp_secs,
         );
     }
 }

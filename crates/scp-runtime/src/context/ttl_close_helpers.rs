@@ -82,6 +82,16 @@ pub async fn handle_ttl_expiry(
 ) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
 
+    // Timer-triggered expiry: the convergent leaf timestamp is the pre-computed
+    // TTL deadline held in convergent state (every member holds the identical
+    // value), never local `now()` (§7.3.1, §9.9.3). Fall back to the clock only
+    // if no deadline was recorded (defensive; the timer fires off a deadline).
+    let expiry_deadline_secs = state
+        .ttl
+        .timer
+        .deadline_unix_secs
+        .unwrap_or_else(|| deps.clock.now_secs());
+
     // Async TTL expiry logic. Pass transport for best-effort relay
     // ciphertext deletion (§5.11).
     let result = ttl::try_ttl_expiry_cleanup(
@@ -90,6 +100,7 @@ pub async fn handle_ttl_expiry(
         Some(deps.transport.as_ref()),
         deps.event_log.as_ref(),
         0,
+        expiry_deadline_secs,
     )
     .await;
 
@@ -353,17 +364,28 @@ async fn spawn_ttl_timer(
 /// actor-shape contract so a future expansion can mutate per-context
 /// state without changing the signature.
 pub async fn finalize_close(
-    _state: &mut PerContextState,
+    state: &mut PerContextState,
     deps: &ActorDeps,
     handle: &ContextHandle,
 ) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
+
+    // Convergent `ContextClosed` leaf timestamp: the pre-computed TTL deadline
+    // held in convergent state when this is a timer-driven close; fall back to
+    // the closer's clock for a governance/explicit close with no TTL deadline.
+    // Never a per-member local `now()` for the timer case (§7.3.1, §9.9.3).
+    let close_ts = state
+        .ttl
+        .timer
+        .deadline_unix_secs
+        .unwrap_or_else(|| deps.clock.now_secs());
 
     ttl::finalize_close(
         handle,
         deps.crypto.as_ref(),
         deps.transport.as_ref(),
         deps.event_log.as_ref(),
+        close_ts,
     )
     .await?;
 

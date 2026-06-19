@@ -2746,6 +2746,7 @@ mod tests {
             _: scp_event_log::EventType,
             _: &str,
             _: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }

@@ -76,12 +76,8 @@ impl ContextLog {
         event_type: EventType,
         actor_did: &str,
         payload: EventPayload,
+        timestamp: u64,
     ) -> Result<Event, ContextCreationError> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         let sequence = scp_event_log::tree::event_count(&self.log);
         let leaves = self.log.leaves();
         let prev_hash = if leaves.is_empty() {
@@ -678,6 +674,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         event_type: EventType,
         actor_did: &str,
         payload: EventPayload,
+        timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
         let mut logs = self
             .logs
@@ -689,7 +686,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                 hex::encode(context_id)
             ))
         })?;
-        let event = log.append(event_type, actor_did, payload)?;
+        let event = log.append(event_type, actor_did, payload, timestamp_secs)?;
         #[allow(clippy::cast_possible_truncation)]
         let seq = event.sequence as usize;
 
@@ -839,6 +836,7 @@ mod tests {
                 EventType::ContextCreated,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
         provider
@@ -847,6 +845,7 @@ mod tests {
                 EventType::MemberJoined,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
 
@@ -870,8 +869,13 @@ mod tests {
         let provider = MerkleEventLogProvider::new();
         let ctx_id = [3u8; 32];
 
-        let result =
-            provider.append_event(&ctx_id, EventType::MessageSent, "", EventPayload::default());
+        let result = provider.append_event(
+            &ctx_id,
+            EventType::MessageSent,
+            "",
+            EventPayload::default(),
+            1_700_000_000,
+        );
         assert!(result.is_err());
     }
 
@@ -887,6 +891,7 @@ mod tests {
                 EventType::ContextCreated,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
 
@@ -908,6 +913,7 @@ mod tests {
                 EventType::MessageSent,
                 "did:key:a",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
         let one_root = provider.merkle_root(&ctx_id).unwrap();
@@ -925,6 +931,7 @@ mod tests {
                 EventType::ContextCreated,
                 "did:key:a",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
         source
@@ -933,6 +940,7 @@ mod tests {
                 EventType::GovernanceActionExecuted,
                 "did:key:admin",
                 payload_bytes(b"some-payload"),
+                1_700_000_000,
             )
             .unwrap();
         let exported = source.export_event_log_entries(&ctx_id).unwrap();
@@ -957,6 +965,7 @@ mod tests {
                 EventType::ContextCreated,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
         source
@@ -965,6 +974,7 @@ mod tests {
                 EventType::MemberJoined,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
         let mut entries = source.entries(&ctx_id).unwrap();
@@ -1071,6 +1081,7 @@ mod tests {
                 EventType::ContextCreated,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
         provider
@@ -1079,6 +1090,7 @@ mod tests {
                 EventType::MemberJoined,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
 
@@ -1103,6 +1115,7 @@ mod tests {
                     EventType::ContextCreated,
                     "",
                     EventPayload::default(),
+                    1_700_000_000,
                 )
                 .unwrap();
             provider
@@ -1111,10 +1124,17 @@ mod tests {
                     EventType::MemberJoined,
                     "",
                     EventPayload::default(),
+                    1_700_000_000,
                 )
                 .unwrap();
             provider
-                .append_event(&ctx_id, EventType::MessageSent, "", EventPayload::default())
+                .append_event(
+                    &ctx_id,
+                    EventType::MessageSent,
+                    "",
+                    EventPayload::default(),
+                    1_700_000_000,
+                )
                 .unwrap();
 
             assert_eq!(
@@ -1134,7 +1154,13 @@ mod tests {
 
             // Appending after restore chains correctly.
             provider
-                .append_event(&ctx_id, EventType::MemberLeft, "", EventPayload::default())
+                .append_event(
+                    &ctx_id,
+                    EventType::MemberLeft,
+                    "",
+                    EventPayload::default(),
+                    1_700_000_000,
+                )
                 .unwrap();
             let entries = provider.entries(&ctx_id).unwrap();
             assert_eq!(entries.len(), 4);
@@ -1166,6 +1192,7 @@ mod tests {
                 EventType::ContextCreated,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
 
@@ -1191,6 +1218,7 @@ mod tests {
                 EventType::ContextCreated,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
         provider
@@ -1199,6 +1227,7 @@ mod tests {
                 EventType::MemberJoined,
                 "",
                 EventPayload::default(),
+                1_700_000_000,
             )
             .unwrap();
 
@@ -1218,7 +1247,7 @@ mod tests {
 
         provider.init_event_log(&ctx_id).unwrap();
         provider
-            .append_context_event(&ctx_id, EventType::MemberLeft, "")
+            .append_context_event(&ctx_id, EventType::MemberLeft, "", 1_700_000_000)
             .unwrap();
 
         let entries = provider.entries(&ctx_id).unwrap();

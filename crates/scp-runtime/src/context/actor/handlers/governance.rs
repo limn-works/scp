@@ -1057,7 +1057,11 @@ async fn handle_process_pending_commits_actor(
     for label in event_log_writes {
         if let Err(e) = deps
             .event_log
-            .append_context_event(&context_id_bytes, label, "system")
+            // Committer-assigned timestamp for this member's own commit-retry
+            // lifecycle leaf: the committer's clock, the same source as the
+            // `created_at` it stamps on the (re)broadcast commit envelope
+            // (§7.3.1, §9.9.3).
+            .append_context_event(&context_id_bytes, label, "system", now)
         {
             tracing::warn!(
                 context_id = %context_id,

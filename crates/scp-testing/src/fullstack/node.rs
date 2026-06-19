@@ -143,8 +143,10 @@ impl ContextEventLogProvider for ArcEventLogProvider {
         event_type: scp_event_log::EventType,
         actor_did: &str,
         payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
-        self.0.append_event(id, event_type, actor_did, payload)
+        self.0
+            .append_event(id, event_type, actor_did, payload, timestamp_secs)
     }
     fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.destroy_event_log(id)

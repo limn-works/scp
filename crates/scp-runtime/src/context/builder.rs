@@ -143,6 +143,15 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// `MessagePack` bytes built via [`scp_event_log::payload::encode_payload`];
     /// non-parameterized events carry an empty [`scp_event_log::EventPayload`].
     ///
+    /// `timestamp_secs` is the **committer-assigned** leaf timestamp in seconds
+    /// since the Unix epoch. For a commit-ordered event it is the `created_at`
+    /// of the signed SCP envelope carrying the commit, copied by every member
+    /// so that all honest members hash the identical leaf preimage (§7.3.1,
+    /// §9.9.3). For timer-triggered events (TTL/close, governance-freeze expiry,
+    /// deferred economic-policy application) it is the pre-computed convergent
+    /// deadline already held in context state — never a per-member local clock
+    /// reading, which would diverge and break the equal-count/equal-root test.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if the append fails.
@@ -152,6 +161,7 @@ pub trait ContextEventLogProvider: Send + Sync {
         event_type: scp_event_log::EventType,
         actor_did: &str,
         payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
     ) -> Result<(), ContextCreationError>;
 
     /// Destroys the event log for the given context (rollback).
@@ -179,12 +189,14 @@ pub trait ContextEventLogProvider: Send + Sync {
         context_id: &[u8; 32],
         event_type: scp_event_log::EventType,
         actor_did: &str,
+        timestamp_secs: u64,
     ) -> Result<(), ContextError> {
         self.append_event(
             context_id,
             event_type,
             actor_did,
             scp_event_log::EventPayload::default(),
+            timestamp_secs,
         )
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
@@ -204,8 +216,9 @@ pub trait ContextEventLogProvider: Send + Sync {
         event_type: scp_event_log::EventType,
         actor_did: &str,
         payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
     ) -> Result<(), ContextError> {
-        self.append_event(context_id, event_type, actor_did, payload)
+        self.append_event(context_id, event_type, actor_did, payload, timestamp_secs)
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
@@ -722,6 +735,7 @@ pub async fn create_context(
     transport: &dyn ContextTransportProvider,
     event_log_provider: &dyn ContextEventLogProvider,
     creator_did: &str,
+    creation_timestamp_secs: u64,
 ) -> Result<ContextHandle, ContextCreationError> {
     // ------------------------------------------------------------------
     // Phase 1 -- Validate (no side effects)
@@ -819,6 +833,9 @@ pub async fn create_context(
         scp_event_log::EventType::ContextCreated,
         creator_did,
         scp_event_log::EventPayload::default(),
+        // Creator-assigned creation time, copied by every member (§7.3.1,
+        // §9.9.3) — not each member's local `now()`.
+        creation_timestamp_secs,
     ) {
         // Even though the handle is Active, we must roll back everything.
         receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
@@ -886,6 +903,7 @@ mod tests {
             _event_type: scp_event_log::EventType,
             _actor_did: &str,
             _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
