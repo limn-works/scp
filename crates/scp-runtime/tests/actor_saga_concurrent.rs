@@ -10,15 +10,20 @@
 //!
 //! # Determinism
 //!
-//! The three production saga variants are spec-gapped (their Prepare
-//! dispatch returns `NotImplemented`), so a real saga over them terminates
-//! instantly via the PreparingA → Aborting → Aborted arm — too fast to hold
-//! "in flight" by racing. To test the gating semantics deterministically we
-//! use `Supervisor::test_reserve_saga_context_set`, which exercises the
-//! SAME `try_reserve_context_set` critical section that `start_saga` uses
-//! (not a parallel mock), and the test-only `SagaInput::TestForceNeedsRepair`
-//! variant, whose Commit always fails so the FSM drives a real `NeedsRepair`
-//! terminal.
+//! `StandingPairCreate` / `BroadcastHostingHandshake` remain spec-gapped
+//! (their Prepare dispatch returns `NotImplemented`). `CrossContextToolInvocation`
+//! is wired, but driving it through `start_saga` (no executor / signing key)
+//! over contexts with NO co-resident actors aborts INSTANTLY at Prepare-A with
+//! a typed `ContextNotRegistered` (co-resident scope) — the PreparingA →
+//! Aborting → Aborted arm — too fast to hold "in flight" by racing. The
+//! load-bearing gating assertion is the ABSENCE of `ActorBusy` and that the
+//! reservation is RELEASED on every terminal; the exact terminal error class
+//! is incidental (it just must not be `ActorBusy`). To test the gating
+//! semantics deterministically we use
+//! `Supervisor::test_reserve_saga_context_set`, which exercises the SAME
+//! `try_reserve_context_set` critical section that `start_saga` uses (not a
+//! parallel mock), and the test-only `SagaInput::TestForceNeedsRepair` variant,
+//! whose Commit always fails so the FSM drives a real `NeedsRepair` terminal.
 
 #![allow(
     clippy::unwrap_used,
@@ -105,13 +110,48 @@ fn standing_pair(a: &str, b: &str) -> SagaInput {
 }
 
 /// A cross-context tool-invocation saga over the given caller/target
-/// contexts. Its participant context set is `{caller, target}`.
+/// contexts. Its participant context set is `{caller, target}`. The
+/// envelope fields are placeholders — these gating tests never reach
+/// Prepare-B (no co-resident actors), so only the two context ids (the
+/// reservation key) are load-bearing.
 fn cross_context(caller: [u8; 32], target: [u8; 32]) -> SagaInput {
     SagaInput::CrossContextToolInvocation {
         caller_context_id: caller,
         target_context_id: target,
         caller_did: DID("did:example:caller".to_owned()),
         tool_registration_id: "tool-1".to_owned(),
+        ucan_proof_id: None,
+        input: serde_json::json!({}),
+        declared_cost: 0,
+        asserted_chain_depth: 0,
+        asserted_nonce: [0u8; 16],
+        asserted_timestamp_ms: 0,
+    }
+}
+
+/// Assert a saga terminated at a NON-busy terminal. Driving a
+/// `CrossContextToolInvocation` through `start_saga` (no executor / signing
+/// key) aborts at Prepare-A with `InvalidState` (the executor-context misuse
+/// guard, SCP-SAGA-13002) — BEFORE the co-resident lookup — so the FSM never
+/// reaches `ContextNotRegistered` here; the spec-gapped variants abort with
+/// `NotImplemented`. Any of these is a valid "reservation released" terminal —
+/// the gating property under test is the ABSENCE of `ActorBusy`, not the
+/// specific terminal error.
+#[track_caller]
+fn assert_non_busy_terminal(
+    result: &Result<scp_runtime::context::supervisor::SagaOutput, ContextError>,
+    ctx: &str,
+) {
+    match result {
+        Err(
+            ContextError::ContextNotRegistered(_)
+            | ContextError::NotImplemented(_)
+            | ContextError::InvalidState(_),
+        ) => {}
+        Err(ContextError::ActorBusy(msg)) => {
+            panic!("{ctx}: must NOT serialize/wedge — got ActorBusy: {msg}")
+        }
+        other => panic!("{ctx}: unexpected saga terminal: {other:?}"),
     }
 }
 
@@ -138,15 +178,8 @@ async fn disjoint_participant_sets_run_concurrently() {
     let r1 = h1.await.unwrap();
     let r2 = h2.await.unwrap();
 
-    for r in [&r1, &r2] {
-        match r {
-            Err(ContextError::NotImplemented(_)) => {}
-            Err(ContextError::ActorBusy(msg)) => {
-                panic!("disjoint participant sets must NOT serialize — got ActorBusy: {msg}")
-            }
-            other => panic!("unexpected disjoint-saga result: {other:?}"),
-        }
-    }
+    assert_non_busy_terminal(&r1, "disjoint saga 1");
+    assert_non_busy_terminal(&r2, "disjoint saga 2");
 }
 
 /// OVERLAPPING participant sets serialize: while one saga's set is held in
@@ -184,13 +217,10 @@ async fn overlapping_participant_sets_reject_busy() {
     // through (proves the rejection was the reservation, not some other
     // failure).
     drop(held);
-    let err2 = supervisor
-        .start_saga(cross_context(ctx(2), ctx(9)))
-        .await
-        .expect_err("after release the saga proceeds to its spec-gapped terminal");
-    assert!(
-        matches!(err2, ContextError::NotImplemented(_)),
-        "after release the overlapping set must reserve and run, got: {err2:?}"
+    let r2 = supervisor.start_saga(cross_context(ctx(2), ctx(9))).await;
+    assert_non_busy_terminal(
+        &r2,
+        "after release the overlapping set must reserve and run (not ActorBusy)",
     );
 }
 
@@ -243,13 +273,12 @@ async fn overlap_is_set_membership_across_saga_types() {
     // cross-context saga through — proving the rejection WAS the shared raw
     // digest (the reservation), not some unrelated failure.
     drop(held);
-    let err2 = supervisor
+    let r2 = supervisor
         .start_saga(cross_context(standing_digest, ctx(9)))
-        .await
-        .expect_err("after release the cross-context saga runs to its spec-gapped terminal");
-    assert!(
-        matches!(err2, ContextError::NotImplemented(_)),
-        "after release the cross-type set must reserve and run, got: {err2:?}"
+        .await;
+    assert_non_busy_terminal(
+        &r2,
+        "after release the cross-type set must reserve and run (not ActorBusy)",
     );
 }
 
@@ -283,14 +312,10 @@ async fn needs_repair_releases_reservation() {
     // A second saga sharing context 0x07 must now reserve successfully —
     // proving the NeedsRepair terminal RELEASED the slot. If the slot were
     // still held, this would return ActorBusy.
-    let err2 = supervisor
-        .start_saga(cross_context(ctx(7), ctx(8)))
-        .await
-        .expect_err("the follow-up saga runs to its spec-gapped terminal");
-    assert!(
-        matches!(err2, ContextError::NotImplemented(_)),
-        "NeedsRepair must release context 0x07 so a sharing saga reserves \
-         (no ActorBusy), got: {err2:?}"
+    let r2 = supervisor.start_saga(cross_context(ctx(7), ctx(8))).await;
+    assert_non_busy_terminal(
+        &r2,
+        "NeedsRepair must release context 0x07 so a sharing saga reserves (no ActorBusy)",
     );
 }
 
@@ -303,14 +328,10 @@ async fn needs_repair_releases_reservation() {
 async fn same_set_sequential_rearm() {
     let supervisor = test_supervisor();
     for i in 0..5 {
-        let err = supervisor
-            .start_saga(cross_context(ctx(1), ctx(2)))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ContextError::NotImplemented(_)),
-            "sequential same-set saga {i} must terminate (reservation re-arm \
-             failed) — got {err:?}"
+        let r = supervisor.start_saga(cross_context(ctx(1), ctx(2))).await;
+        assert_non_busy_terminal(
+            &r,
+            &format!("sequential same-set saga {i} must terminate (reservation re-arm)"),
         );
     }
 }
