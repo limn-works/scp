@@ -454,6 +454,63 @@ scan_file() {
         -v DELEGATES="$PERSIST_DELEGATES" -v FC_FUNCS="${FC_FUNCS:-}" \
         -v MUTATORS="$MUTATORS" -v CLASSC="$CLASS_C_EXCEPTIONS" \
         -v GOVLEAVES="$CLASS_C_GOVERNANCE_LEAVES" '
+    # is_column0_item_start — the SINGLE shared classifier for "this STRIPPED
+    # line opens a column-0 Rust ITEM". BOTH the trailing-test-module DETECTOR
+    # (mod-vs-item decision after a test gate) AND the NTTEST un-scanned-vacuum
+    # GUARD call this one function so the two can NEVER drift apart — a new item
+    # spelling is recognised by both the instant it is added here (convergent by
+    # construction, not a hand-maintained denylist of fn permutations).
+    #
+    # The alternation covers every column-0 Rust item keyword, each in any
+    # leading visibility / qualifier combination:
+    #   - visibility: (none) | pub | pub(<path>)
+    #   - item keyword: mod impl trait struct enum union fn const static type use
+    #                   macro_rules extern
+    #   - fn qualifier prefixes (in any order Rust permits):
+    #       async fn | const fn | unsafe fn | extern "C" fn |
+    #       async unsafe fn | const unsafe fn | unsafe const fn |
+    #       pub(crate) async unsafe fn | ... (the qualifier run is matched
+    #       generically as a sequence of {async,const,unsafe,extern "..."} tokens
+    #       before the `fn` keyword)
+    #   - item-producing macro invocation at column 0: `name! {` / `name!(` /
+    #     `name![` (e.g. a `make_things!{}` that expands to items) — these can
+    #     resume a production region after a trailing test module just like a
+    #     real item, so they MUST count as an item start for the vacuum guard.
+    #
+    # `s` is assumed already STRIPPED (comment/string content removed) by the
+    # caller, so a keyword inside a literal or comment cannot match.
+    function is_column0_item_start(s,   vis, qual) {
+        # Optional leading visibility: `pub ` or `pub(<...>) `.
+        vis = "(pub[[:space:]]*(\\([^)]*\\))?[[:space:]]+)?"
+        # Optional run of fn qualifiers: async / const / unsafe / extern "ABI".
+        qual = "((async|const|unsafe|extern([[:space:]]+\"[^\"]*\")?)[[:space:]]+)*"
+        # 1. A plain item keyword (with optional visibility), boundary-guarded by
+        #    a following space, `!`, `<`, or `(` so e.g. `constant` / `typeof`
+        #    cannot false-match `const` / `type`.
+        if (s ~ ("^" vis "(mod|impl|trait|struct|enum|union|fn|const|static|type|use|macro_rules|extern)([[:space:]]|!|<|\\()"))
+            return 1
+        # 2. A `fn` preceded by a qualifier run (async/const/unsafe/extern "ABI"),
+        #    with optional visibility — `unsafe fn`, `const fn`, `async unsafe fn`,
+        #    `extern \"C\" fn`, `pub(crate) const unsafe fn`, etc.
+        if (s ~ ("^" vis qual "fn[[:space:]]"))
+            return 1
+        # 3. A column-0 item-producing MACRO invocation: `ident! {` / `ident!(` /
+        #    `ident![`. (A statement macro inside a fn body is never at column 0
+        #    in this codebase, so the column-0 anchor keeps this precise.)
+        if (s ~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*![[:space:]]*[({[]/)
+            return 1
+        return 0
+    }
+    # is_column0_reopening_test_gate — TRUE iff the STRIPPED line is a column-0
+    # `#[cfg(test)]` / `#[cfg(all(test..))]` / `#[cfg(any(test..))]` attribute,
+    # i.e. a gate that may LEGITIMATELY re-open a SECOND test module after the
+    # first. Used by the NTTEST guard to NOT fire on a second test gate (which is
+    # not a production-region resume).
+    function is_column0_reopening_test_gate(s) {
+        return (s ~ /^#\[cfg\(test\)\]/ \
+            || s ~ /^#\[cfg\(all\(test[,)]/ \
+            || s ~ /^#\[cfg\(any\(test[,)]/)
+    }
     # normalize_assign — collapse whitespace around a bare assignment `=` so a
     # space-free ASSIGNMENT marker (`threshold_value=`, `role_state.ceiling=`)
     # matches the downward-auth write `x = y` but NOT a read, a comparison, or a
@@ -718,8 +775,10 @@ scan_file() {
         seen_test = 0
         test_gate_line = 0
         nontrailing_hit = 0
+        seen_test_set_nr = 0
         pending_test_gate = 0
         pending_test_line = 0
+        pending_second_test_gate = 0
         depth = 0
         in_fn = 0
         fn_name = ""
@@ -814,52 +873,70 @@ scan_file() {
         # ⇒ trailing-module cutoff; anything else ⇒ interspersed item (no cutoff).
         # All matched against the STRIPPED `line` so a token inside a literal /
         # comment cannot trip either path.
-        if (line ~ /^#\[cfg\(test\)\]/ \
-            || line ~ /^#\[cfg\(all\(test[,)]/ \
-            || line ~ /^#\[cfg\(any\(test[,)]/) { pending_test_gate = 1; pending_test_line = NR }
-        else if (pending_test_gate \
-            && line ~ /^(pub[[:space:]]+)?(mod|impl|trait|struct|enum|union|fn|const|static|type|use|macro_rules|extern|unsafe)([[:space:]]|!|<|\()/ \
-            || (pending_test_gate && line ~ /^(pub[[:space:]]*\([^)]*\)[[:space:]]+)(mod|use|fn|const|static|type|struct|enum|trait)([[:space:]]|<|\()/)) {
+        if (is_column0_reopening_test_gate(line)) { pending_test_gate = 1; pending_test_line = NR }
+        else if (pending_test_gate && is_column0_item_start(line)) {
             # First real column-0 ITEM-START line after the gate decides
-            # mod-vs-item. (Blank lines and multi-line `#[..]` attribute
+            # mod-vs-item — recognised by the SHARED `is_column0_item_start`
+            # classifier (the SAME one the NTTEST guard uses below, so the two can
+            # never drift). (Blank lines and multi-line `#[..]` attribute
             # continuations — neither of which start with an item keyword — are
             # implicitly skipped: they fall through to neither branch and the gate
             # stays pending until a real item line is reached.)
             if (line ~ /^(pub[[:space:]]+)?mod[[:space:]]/) {
                 # Trailing test MODULE — the legitimate "skip rest of file" shape.
-                seen_test = 1; test_gate_line = pending_test_line
+                # Record the NR so the NTTEST guard below does NOT treat THIS very
+                # `mod` line (a column-0 item start) as a production resume.
+                seen_test = 1; test_gate_line = pending_test_line; seen_test_set_nr = NR
             }
             # else: interspersed single-item test gate — NOT a cutoff. The item
             # falls through into the normal production scan stream below.
             pending_test_gate = 0
         }
 
-        # NON-TRAILING test-module structural assertion (wave-14): the cutoff
-        # above TRUSTS that the trailing `mod`-form test gate is the LAST thing in
-        # the file. If a column-0 PRODUCTION item — `fn` / `impl` / a `pub` item —
-        # follows the test MODULE (the module closed and production code resumes at
-        # column 0), the gate is NOT trailing: the cutoff would skip that
-        # production region (an un-scanned vacuum) and any Class-S mutation in it
-        # would go undetected. Flag it (HIT) so the un-scanned vacuum is surfaced
-        # rather than silently trusted. Matched against the STRIPPED `line` so a
-        # `fn` / `impl` / `pub` token inside a string / comment cannot
-        # false-positive. Emitted once per file.
+        # NON-TRAILING test-module structural assertion: the cutoff above TRUSTS
+        # that the trailing `mod`-form test gate is the LAST thing in the file. If
+        # ANY column-0 PRODUCTION ITEM follows the test MODULE (the module closed
+        # and production code resumes at column 0), the gate is NOT trailing: the
+        # cutoff would skip that production region (an un-scanned vacuum) and any
+        # Class-S mutation in it would go undetected. Flag it (HIT) so the
+        # un-scanned vacuum is surfaced rather than silently trusted. Matched
+        # against the STRIPPED `line` so a token inside a string / comment cannot
+        # false-positive.
         #
-        # The production-item alternation covers every column-0 item-start shape
-        # that can resume a production region after a trailing test module:
-        #   - pub item / impl block / unsafe impl block
-        #   - a free fn in any qualifier combination: (async )?fn, unsafe fn,
-        #     const fn, and the const+unsafe orderings (const unsafe fn /
-        #     unsafe const fn) — caught by the const[[:space:]]+unsafe and
-        #     unsafe[[:space:]]+const prefixes.
-        # An un-`pub` column-0 unsafe/const fn cannot do a runtime Class-S
-        # mutation today (forbid(unsafe_code) on this crate; const fn cannot run
-        # state.x.insert()), but the vacuum guard hardens against a future change
-        # by firing on them regardless.
-        if (seen_test && !nontrailing_hit \
-            && line ~ /^(pub([[:space:]]|\()|impl([[:space:]]|<)|(async[[:space:]]+)?fn[[:space:]]|unsafe[[:space:]]+impl[[:space:]]|unsafe[[:space:]]+fn[[:space:]]|const[[:space:]]+fn[[:space:]]|const[[:space:]]+unsafe[[:space:]]|unsafe[[:space:]]+const[[:space:]])/) {
-            printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
-            nontrailing_hit = 1
+        # CONVERGENT GUARD (wave-16): the item-start recogniser is the SHARED
+        # `is_column0_item_start` — the SAME classifier the trailing-module
+        # DETECTOR above uses — so the guard can NEVER miss a "new spelling" of an
+        # item the detector already recognises (column-0 `mod resumed_prod {`,
+        # `extern "C" fn`, `async unsafe fn`, an item-producing `make_things!{}`,
+        # etc.). This REPLACES the prior hand-maintained denylist of fn
+        # permutations (`unsafe fn` / `const fn` / `unsafe impl` …), which was a
+        # SUBSET that drifted from the detector — a non-convergent
+        # "one-more-spelling" shape. Now a single shared function is the one source
+        # of truth for "what is a column-0 item start", used by both sites.
+        #
+        # The ONE shape that legitimately resumes at column 0 after a test module
+        # WITHOUT being a production vacuum is a SECOND `#[cfg(test)]`-gated test
+        # `mod` (a file may carry several test modules). So: a column-0 re-opening
+        # test gate ARMS `pending_second_test_gate`; the column-0 `mod` that
+        # follows it is consumed as that legitimate second test module (no HIT) and
+        # re-arms the trailing-module state. Any OTHER column-0 item start — or a
+        # non-`mod` item even after a re-opening gate — fires NTTEST.
+        if (seen_test && !nontrailing_hit && NR != seen_test_set_nr) {
+            if (is_column0_reopening_test_gate(line)) {
+                pending_second_test_gate = 1
+            } else if (is_column0_item_start(line)) {
+                if (pending_second_test_gate && line ~ /^(pub[[:space:]]+)?mod[[:space:]]/) {
+                    # Legitimate SECOND test module — not a production resume.
+                    test_gate_line = NR
+                    pending_second_test_gate = 0
+                } else {
+                    # Production item (or a non-mod item after a re-opening gate):
+                    # the test module was NOT trailing — an un-scanned vacuum.
+                    printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
+                    nontrailing_hit = 1
+                    pending_second_test_gate = 0
+                }
+            }
         }
         if (seen_test) next
 
@@ -1905,6 +1982,89 @@ self_test() {
         printf '}\n'
     } > "$fdir/nontrailing_const_unsafe_fn.rs"
 
+    # (39) NON-TRAILING TEST MODULE resuming with a column-0 `mod resumed_prod {`
+    # (wave-16) — a NON-test column-0 `mod` after a trailing test module re-opens
+    # an entire INDENTED production region whose Class-S mutations the cutoff would
+    # skip. This is the MOST material missed shape (an indented `state.x.insert()`
+    # is invisible to the cutoff, never to a real scan). The prior NTTEST denylist
+    # of fn permutations missed it entirely. It MUST now emit an NTTEST HIT.
+    {
+        printf 'pub fn mod_resume_prod_before_test_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod mod_resume_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf 'mod resumed_prod {\n'
+        printf '    pub fn f() {\n'
+        printf '        state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '        persist_state_best_effort(state, deps, ctx);\n'
+        printf '    }\n'
+        printf '}\n'
+    } > "$fdir/nontrailing_mod_resume.rs"
+
+    # (40) NON-TRAILING TEST MODULE resuming with a column-0 `extern "C" fn`
+    # (wave-16) — an `extern "ABI" fn` is a column-0 item start the prior denylist
+    # did not list. It MUST now emit an NTTEST HIT (the shared item-start
+    # classifier recognises the `extern "..."` qualifier run before `fn`).
+    {
+        printf 'pub fn extern_c_prod_before_test_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod extern_c_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf 'extern "C" fn prod_extern_c_after_test_fixture() {\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/nontrailing_extern_c_fn.rs"
+
+    # (41) NON-TRAILING TEST MODULE resuming with a column-0 item-producing MACRO
+    # invocation `make_things!{}` (wave-16) — a column-0 `ident! { .. }` can expand
+    # to items, so a production region can resume through one. The prior denylist
+    # missed it entirely. It MUST now emit an NTTEST HIT.
+    {
+        printf 'pub fn macro_item_prod_before_test_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod macro_item_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf 'make_things!{}\n'
+    } > "$fdir/nontrailing_item_macro.rs"
+
+    # (42) LEGITIMATE SECOND TEST MODULE (wave-16 over-restriction guard) — a file
+    # may carry MORE THAN ONE `#[cfg(test)]`-gated test `mod`. A second test gate +
+    # `mod` after the first is NOT a production resume and MUST NOT emit an NTTEST
+    # HIT (else the convergent guard would over-fire on perfectly legitimate
+    # multi-test-module files).
+    {
+        printf 'pub fn second_test_mod_prod_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod first_tests {\n'
+        printf '    #[test]\n'
+        printf '    fn it_works() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod more_tests {\n'
+        printf '    #[test]\n'
+        printf '    fn it_also_works() {}\n'
+        printf '}\n'
+    } > "$fdir/second_test_module.rs"
+
     local rc=0
     local out
     out=$(
@@ -2264,6 +2424,44 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf '`const fn` / `unsafe fn` was NOT flagged — the un-scanned-vacuum guard regex\n' >&2
         printf 'misses the const/unsafe fn item-start shapes.\n' >&2
+        rc=1
+    fi
+    # (39) NON-TRAILING test module resuming with a column-0 NON-test `mod` (the
+    # most material missed shape — re-opens an entire indented production region).
+    # The convergent guard MUST flag it (the shared item-start classifier
+    # recognises `mod`).
+    if ! grep -q $'^NTTEST\t.*/nontrailing_mod_resume\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a NON-trailing test module resuming with a column-0\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'NON-test `mod resumed_prod {` was NOT flagged — the convergent vacuum guard\n' >&2
+        printf 'misses a re-opened indented production region (the most material bypass).\n' >&2
+        rc=1
+    fi
+    # (40) NON-TRAILING test module resuming with a column-0 `extern "C" fn`.
+    if ! grep -q $'^NTTEST\t.*/nontrailing_extern_c_fn\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a NON-trailing test module resuming with a column-0\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`extern "C" fn` was NOT flagged — the convergent guard misses the extern-ABI\n' >&2
+        printf 'fn item-start shape.\n' >&2
+        rc=1
+    fi
+    # (41) NON-TRAILING test module resuming with a column-0 item-producing MACRO
+    # invocation `make_things!{}`.
+    if ! grep -q $'^NTTEST\t.*/nontrailing_item_macro\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a NON-trailing test module resuming with a column-0\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'item-producing macro invocation `make_things!{}` was NOT flagged — the convergent\n' >&2
+        printf 'guard misses the item-macro item-start shape.\n' >&2
+        rc=1
+    fi
+    # (42) LEGITIMATE SECOND test module (over-restriction guard) — a file with two
+    # `#[cfg(test)]`-gated test `mod`s must NOT raise NTTEST: the second module is
+    # a legitimate test module, not a production resume.
+    if grep -q $'^NTTEST\t.*/second_test_module\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a LEGITIMATE second `#[cfg(test)]` test module was wrongly\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'flagged as a non-trailing production resume — the convergent guard over-fires on\n' >&2
+        printf 'multi-test-module files.\n' >&2
         rc=1
     fi
 

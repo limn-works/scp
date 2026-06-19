@@ -310,7 +310,9 @@ enum CommitInProgressResolution {
 /// input to the coordinator's terminal-marker decision (spec §6.2.4
 /// "Reservation release on every terminal path"): a terminal-`Aborted` journal
 /// asserts "fully compensated" and MUST NOT be written while a caller refund is
-/// still outstanding. Produced by [`Supervisor::abort_xctx_participants`].
+/// still outstanding. Produced by [`Supervisor::abort_xctx_participants`] (the
+/// live abort path) and by [`Supervisor::redrive_xctx_prepare_in_progress`] (the
+/// §17.16.4 crash-recovery `PreparingB` re-drive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallerAbortReversal {
     /// The caller-side LOCAL economy was reversed (the `Abort` was delivered and
@@ -5420,74 +5422,7 @@ impl Supervisor {
                 );
             }
             SagaState::PreparingB => {
-                // §17.16.4 Prepare-in-progress: actor A (and possibly B) staged
-                // reservations but the Commit never left the coordinator. Abort
-                // the Prepared side(s) — releasing the staged rate/escrow/session
-                // reservations — and discard; NEVER re-Prepare. For a
-                // reconstructible cross-context entry this re-drives a real
-                // `Abort { None }` to the prepared actors (release); otherwise
-                // there is no caller reservation to reverse and the journal abort
-                // marker IS the rollback record.
-                //
-                // The terminal-`Aborted` marker asserts "fully compensated", so
-                // it MUST NOT be written while the caller's durable LOCAL-economy
-                // reversal is still outstanding — exactly the invariant
-                // [`Self::abort_saga`] enforces on the LIVE abort path. If the
-                // caller context is not yet resident when this startup sweep runs
-                // (a `lookup` miss — ordering of context restore vs.
-                // `replay_unresolved_sagas` is not enforced in-tree) OR the
-                // `Abort { None }` send fails, the record-based reversal was NOT
-                // delivered: leave the journal NON-terminal at `PreparingB` so a
-                // later sweep (after the caller is restored) re-drives it. Marking
-                // terminal here would strand the caller's durable deduction
-                // forever (the sweep re-drives ONLY non-terminal journals → a
-                // permanent over-charge).
-                let caller_reversal = match Self::reconstruct_xctx_prepared(&entry) {
-                    Some(prepared) => {
-                        self.redrive_xctx_prepare_in_progress(&entry.saga_id, &prepared)
-                            .await
-                    }
-                    // Non-reconstructible entry: no cross-context caller
-                    // reservation to reverse, so the journal abort marker is the
-                    // authoritative (and only needed) rollback record — safe to
-                    // mark terminal.
-                    None => CallerAbortReversal::SettledOrAbsent,
-                };
-
-                if matches!(caller_reversal, CallerAbortReversal::ReversalOutstanding) {
-                    // The producing site inside `redrive_caller_local_reversal`
-                    // already routed its verdict through `Self::reversal_outstanding()`
-                    // (incrementing the counter + emitting the stable
-                    // `event = "xctx_caller_reversal_outstanding"` warn). Re-emit the
-                    // SAME stable field here so a log query on it surfaces the
-                    // "left non-terminal" decision too, but do NOT re-increment the
-                    // counter (that would double-count a single stranded reversal).
-                    tracing::warn!(
-                        event = "xctx_caller_reversal_outstanding",
-                        saga_id = %entry.saga_id,
-                        "saga recovery — PreparingB (Prepare-in-progress) observed but the \
-                         caller-side LOCAL-economy reversal could not be delivered (caller not \
-                         yet restored / backpressure); leaving the journal NON-terminal so a \
-                         later crash-recovery sweep re-drives it (NOT marking terminal-Aborted \
-                         with the caller refund outstanding)"
-                    );
-                    return;
-                }
-
-                let _ = self
-                    .saga_journal
-                    .mark_resolved(
-                        entry.saga_id.clone(),
-                        SagaTerminalState::Aborted,
-                        /*secret_bearing=*/ false,
-                    )
-                    .await;
-                tracing::warn!(
-                    saga_id = %entry.saga_id,
-                    "saga recovery — PreparingB (Prepare-in-progress) observed; aborted the \
-                     Prepared side(s), confirmed the caller reversal, and discarded (never \
-                     re-Prepared)"
-                );
+                self.recover_preparing_b_entry(&entry).await;
             }
             SagaState::Committing => {
                 self.recover_committing_entry(&entry).await;
@@ -5517,40 +5452,191 @@ impl Supervisor {
                 );
             }
             SagaState::NeedsRepair => {
-                // §17.16.4 operator-alerting metric: a NeedsRepair saga is
-                // re-surfaced at process start until an operator repairs it.
-                crate::metrics::record_saga_repair_needed();
-                tracing::error!(
-                    saga_id = %entry.saga_id,
-                    "saga recovery — NeedsRepair carryover; operator intervention required"
-                );
-                // Rehydrate the supervisor-level divergence repair records
-                // (spec §6.2.4 "Dual event-log recording") so the unreachable-leg
-                // divergence account survives a supervisor restart. A NON-EMPTY
-                // `NeedsRepair` evidence is, by convention, the MessagePack of the
-                // full accumulated repair-record set (the plain NeedsRepair
-                // transition carries EMPTY evidence); `load_unresolved` returns
-                // the LATEST entry per saga, so this is the most complete set.
-                if !entry.evidence.is_empty() {
-                    match decode_repair_records_evidence(&entry.evidence) {
-                        Ok(records) if !records.is_empty() => {
-                            self.saga_repair_records
-                                .insert(entry.saga_id.clone(), records);
-                        }
-                        Ok(_) => {}
-                        Err(err) => tracing::error!(
-                            saga_id = %entry.saga_id,
-                            %err,
-                            "saga recovery — NeedsRepair entry carried non-empty evidence that \
-                             did not decode as a supervisor repair-record set; the durable \
-                             divergence account could not be rehydrated"
-                        ),
-                    }
-                }
+                self.recover_needs_repair_entry(&entry);
             }
             SagaState::Committed | SagaState::Aborted => {
                 // Terminal — not returned by load_unresolved but
                 // defensively handled here.
+            }
+        }
+    }
+
+    /// §17.16.4 Prepare-in-progress recovery for a `PreparingB` journal entry.
+    ///
+    /// Actor A (and possibly B) staged reservations but the Commit never left the
+    /// coordinator. Abort the Prepared side(s) — releasing the staged
+    /// rate/escrow/session reservations — and discard; NEVER re-Prepare. For a
+    /// reconstructible cross-context entry this re-drives a real `Abort { None }`
+    /// to the prepared actors (release); otherwise there is no caller reservation
+    /// to reverse and the journal abort marker IS the rollback record.
+    ///
+    /// The terminal-`Aborted` marker asserts "fully compensated", so it MUST NOT
+    /// be written while the caller's durable LOCAL-economy reversal is still
+    /// outstanding — exactly the invariant [`Self::abort_saga`] enforces on the
+    /// LIVE abort path. If the caller context is not yet resident when this
+    /// startup sweep runs (a `lookup` miss — ordering of context restore vs.
+    /// `replay_unresolved_sagas` is not enforced in-tree) OR the `Abort { None }`
+    /// send fails, the record-based reversal was NOT delivered: leave the journal
+    /// NON-terminal at `PreparingB` so a later sweep (after the caller is restored)
+    /// re-drives it. Marking terminal here would strand the caller's durable
+    /// deduction forever (the sweep re-drives ONLY non-terminal journals → a
+    /// permanent over-charge). The ONE exception is a PERMANENTLY-DELETED caller
+    /// context (absent from durable persistence): its reservation record died with
+    /// the context, so there is nothing to reverse and the saga is reaped instead
+    /// of looping forever — see [`Self::caller_context_deleted_from_persistence`].
+    async fn recover_preparing_b_entry(&self, entry: &JournalEntry) {
+        // `caller_hex_from_participants` is `Some(hex)` iff THIS journal
+        // entry names a caller context in `participants[0]` — i.e. it is a
+        // real cross-context entry (per `saga_input_participants`, an xctx
+        // entry is the triple `[hex(caller_context_id), caller_did,
+        // tool_registration_id]`: length 3 with a 64-hex first element).
+        // This identity is carried by the PLAINTEXT participant record,
+        // INDEPENDENT of the (separately-serialized) evidence blob, so it
+        // survives an evidence that is corrupt / truncated / unparseable.
+        let caller_hex_from_participants = Self::xctx_caller_hex_from_participants(entry);
+
+        let caller_reversal = match Self::reconstruct_xctx_prepared(entry) {
+            Some(prepared) => {
+                self.redrive_xctx_prepare_in_progress(&entry.saga_id, &prepared)
+                    .await
+            }
+            // Evidence did NOT reconstruct. Two sub-cases:
+            //
+            //   (a) a REAL xctx entry whose evidence blob is corrupt /
+            //       truncated / unserializable. Its caller context is still
+            //       named in `participants[0]` and its durable
+            //       `CallerReservationRecord` may still be live, so a
+            //       terminal-`Aborted` here (asserting "fully compensated")
+            //       would STRAND the caller deduction. Drive the verdict via
+            //       the RECORD-keyed `redrive_caller_local_reversal` (which
+            //       reverses the caller's LOCAL economy from the durable
+            //       record, independent of the evidence) — the same helper
+            //       the reconstructible path's target-clearing redrive uses
+            //       for its caller leg.
+            //
+            //   (b) a genuinely participant-less / non-xctx entry (standing
+            //       pair / broadcast / test). There is no cross-context
+            //       caller reservation to reverse, so the journal abort
+            //       marker is the authoritative (and only needed) rollback
+            //       record — safe to mark terminal.
+            None => match caller_hex_from_participants.as_deref() {
+                Some(caller_hex) => {
+                    self.redrive_caller_local_reversal(&entry.saga_id, caller_hex)
+                        .await
+                }
+                None => CallerAbortReversal::SettledOrAbsent,
+            },
+        };
+
+        if matches!(caller_reversal, CallerAbortReversal::ReversalOutstanding) {
+            // The caller reversal could not be confirmed delivered. Before
+            // leaving the journal non-terminal (the wave-15 invariant),
+            // distinguish a PERMANENTLY-DELETED caller context from a
+            // merely not-yet-restored one — durable persistence is the
+            // source of truth regardless of restore/spawn state:
+            //
+            //   - ABSENT from persistence ⇒ the context was deleted; its
+            //     `CallerReservationRecord` died with it, so there is
+            //     NOTHING left to reverse. Leaving the saga non-terminal
+            //     would make it NEVER reap (every sweep re-misses the
+            //     lookup). Mark it terminal-`Aborted` (reaped).
+            //   - PRESENT in persistence ⇒ not-yet-restored. The reversal
+            //     is genuinely still outstanding; leave the journal
+            //     non-terminal so a later sweep (after the caller respawns)
+            //     re-drives it from the durable record.
+            //
+            // The existence check is only meaningful for an entry that
+            // NAMES a caller context AND only when a persistence backend is
+            // configured (`persistence_ref`); absent either, fall through
+            // to the conservative wave-15 leave-non-terminal.
+            if let Some(caller_hex) = caller_hex_from_participants.as_deref()
+                && self.caller_context_deleted_from_persistence(caller_hex)
+            {
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(
+                        entry.saga_id.clone(),
+                        SagaTerminalState::Aborted,
+                        /*secret_bearing=*/ false,
+                    )
+                    .await;
+                tracing::warn!(
+                    saga_id = %entry.saga_id,
+                    context = %caller_hex,
+                    "saga recovery — PreparingB (Prepare-in-progress) observed but the \
+                     caller context is ABSENT from durable persistence (permanently \
+                     deleted): its caller reservation record died with the context, so \
+                     there is nothing to reverse — reaping the saga as terminal-Aborted \
+                     (NOT leaving it to never-reap)"
+                );
+                return;
+            }
+
+            // The producing site inside `redrive_caller_local_reversal`
+            // already routed its verdict through `Self::reversal_outstanding()`
+            // (incrementing the counter + emitting the stable
+            // `event = "xctx_caller_reversal_outstanding"` warn). Re-emit the
+            // SAME stable field here so a log query on it surfaces the
+            // "left non-terminal" decision too, but do NOT re-increment the
+            // counter (that would double-count a single stranded reversal).
+            tracing::warn!(
+                event = "xctx_caller_reversal_outstanding",
+                saga_id = %entry.saga_id,
+                "saga recovery — PreparingB (Prepare-in-progress) observed but the \
+                 caller-side LOCAL-economy reversal could not be delivered (caller not \
+                 yet restored / backpressure); leaving the journal NON-terminal so a \
+                 later crash-recovery sweep re-drives it (NOT marking terminal-Aborted \
+                 with the caller refund outstanding)"
+            );
+            return;
+        }
+
+        let _ = self
+            .saga_journal
+            .mark_resolved(
+                entry.saga_id.clone(),
+                SagaTerminalState::Aborted,
+                /*secret_bearing=*/ false,
+            )
+            .await;
+        tracing::warn!(
+            saga_id = %entry.saga_id,
+            "saga recovery — PreparingB (Prepare-in-progress) observed; aborted the \
+             Prepared side(s), confirmed the caller reversal, and discarded (never \
+             re-Prepared)"
+        );
+    }
+
+    /// §17.16.4 `NeedsRepair` carryover recovery: re-surface the operator-repair
+    /// alert at process start and rehydrate the supervisor-level divergence
+    /// repair records (spec §6.2.4 "Dual event-log recording") so the
+    /// unreachable-leg divergence account survives a supervisor restart. A
+    /// NON-EMPTY `NeedsRepair` evidence is, by convention, the `MessagePack` of
+    /// the full accumulated repair-record set (the plain `NeedsRepair` transition
+    /// carries EMPTY evidence); `load_unresolved` returns the LATEST entry per
+    /// saga, so this is the most complete set.
+    fn recover_needs_repair_entry(&self, entry: &JournalEntry) {
+        // §17.16.4 operator-alerting metric: a NeedsRepair saga is
+        // re-surfaced at process start until an operator repairs it.
+        crate::metrics::record_saga_repair_needed();
+        tracing::error!(
+            saga_id = %entry.saga_id,
+            "saga recovery — NeedsRepair carryover; operator intervention required"
+        );
+        if !entry.evidence.is_empty() {
+            match decode_repair_records_evidence(&entry.evidence) {
+                Ok(records) if !records.is_empty() => {
+                    self.saga_repair_records
+                        .insert(entry.saga_id.clone(), records);
+                }
+                Ok(_) => {}
+                Err(err) => tracing::error!(
+                    saga_id = %entry.saga_id,
+                    %err,
+                    "saga recovery — NeedsRepair entry carried non-empty evidence that \
+                     did not decode as a supervisor repair-record set; the durable \
+                     divergence account could not be rehydrated"
+                ),
             }
         }
     }
@@ -5646,6 +5732,85 @@ impl Supervisor {
             return None;
         }
         CrossContextToolInvocationPrepared::from_evidence_bytes(entry.evidence.as_slice()).ok()
+    }
+
+    /// Returns the caller context id (raw-digest hex) named in a journal
+    /// entry's PLAINTEXT participant record iff the entry is a cross-context
+    /// tool-invocation saga, else `None`.
+    ///
+    /// Per [`saga_input_participants`], a `CrossContextToolInvocation` entry's
+    /// participants are exactly the triple
+    /// `[hex(caller_context_id), caller_did, tool_registration_id]` — length 3
+    /// with a 64-char lowercase-hex first element (the caller's raw-digest
+    /// context id, the canonical `lookup` / persistence key). The other saga
+    /// variants either record a different-length set (`StandingPairCreate` ⇒ 2,
+    /// `BroadcastHostingHandshake` ⇒ 3 but with a DID/hex shape whose
+    /// `participants[0]` is the host context hex — see below) or a single-element
+    /// set (`TestForceNeedsRepair`).
+    ///
+    /// To avoid misclassifying a `BroadcastHostingHandshake` (also length 3,
+    /// also `hex(...)` first element) as a cross-context caller, this is used
+    /// ONLY on a `PreparingB` entry whose evidence FAILED to reconstruct as the
+    /// xctx prepared wire: the broadcast-hosting saga journals NO
+    /// `CrossContextToolInvocationPrepared` evidence at all (its evidence either
+    /// decodes as xctx — handled by the `Some` arm — or is genuinely a different
+    /// saga). The length-3 + 64-hex shape is therefore a sound discriminant for
+    /// "a cross-context entry whose evidence is corrupt"; a broadcast entry that
+    /// reaches here drives a record-keyed `Abort { None }` against its host
+    /// context, which is a clean no-op (the host holds no caller
+    /// `CallerReservationRecord` keyed by this saga id), so a false-positive
+    /// classification cannot strand or mis-reverse anything — it is at worst a
+    /// harmless extra lookup.
+    fn xctx_caller_hex_from_participants(entry: &JournalEntry) -> Option<String> {
+        const RAW_DIGEST_HEX_LEN: usize = 64;
+        if entry.participants.len() != 3 {
+            return None;
+        }
+        let first = &entry.participants[0];
+        if first.len() == RAW_DIGEST_HEX_LEN && first.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Some(first.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` iff a caller context (`caller_hex`, the raw-digest hex
+    /// `lookup` / persistence key) is PERMANENTLY ABSENT from durable
+    /// persistence — i.e. it was deleted, not merely not-yet-restored.
+    ///
+    /// Durable persistence is the source of truth for context existence
+    /// regardless of in-memory spawn / restore state: a deleted context has had
+    /// its snapshot removed (`load_context` ⇒ `Ok(None)`), while a context that
+    /// merely has not been restored into an actor yet is still PRESENT in
+    /// storage (`load_context` ⇒ `Ok(Some(_))`). This mirrors the existence
+    /// check the actor-respawn path performs before re-hydrating
+    /// ([`Self::respawn_actor`]).
+    ///
+    /// Conservative on uncertainty — returns `false` (treat as "still present")
+    /// when no persistence backend is configured (`persistence_ref` is `None`,
+    /// so existence is unknowable) OR when the `load_context` read itself errors
+    /// (a transient storage failure must NOT be mistaken for deletion). In both
+    /// cases the saga is left non-terminal for a later sweep, never reaped on a
+    /// guess — reaping only on a CONFIRMED `Ok(None)` absence.
+    fn caller_context_deleted_from_persistence(&self, caller_hex: &str) -> bool {
+        let Some(persistence) = self.persistence_ref() else {
+            // No backend ⇒ existence is unknowable; do not reap on a guess.
+            return false;
+        };
+        match persistence.load_context(caller_hex) {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(err) => {
+                tracing::warn!(
+                    context = %caller_hex,
+                    %err,
+                    "saga recovery — durable persistence existence check for a permanently-deleted \
+                     caller context errored; treating the context as STILL PRESENT (not reaping the \
+                     saga) so a transient storage failure cannot be mistaken for deletion"
+                );
+                false
+            }
+        }
     }
 
     /// §17.16.4 Prepare-in-progress re-drive: abort the Prepared side(s) of a
@@ -15769,6 +15934,205 @@ mod tests {
             !entry.participants.contains(&hex::encode(XCTX_TARGET)),
             "the journal participant triple deliberately omits the target — the evidence closes \
              the gap"
+        );
+    }
+
+    /// Build a `with_providers_and_journal` supervisor over a SHARED durable
+    /// saga journal + a `MapPersistence` pre-seeded with the given `present`
+    /// context hexes. No xctx actors are spawned, so a caller-reversal re-drive
+    /// `lookup`-misses (the caller is non-resident) and yields
+    /// `ReversalOutstanding` — exactly the crash-recovery sweep ordering the
+    /// §17.16.4 invariant reasons about (`replay_unresolved_sagas` running before
+    /// the caller context is restored). The returned journal handle lets the test
+    /// assert terminal-vs-non-terminal via `load_unresolved`.
+    fn xctx_recovery_supervisor_with_present_contexts(
+        present: &[String],
+    ) -> (Arc<Supervisor>, Arc<dyn SagaJournal>) {
+        use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+
+        let contexts: Arc<DashMap<String, crate::context::state::ContextSnapshot>> =
+            Arc::new(DashMap::new());
+        for hex_id in present {
+            contexts.insert(
+                hex_id.clone(),
+                import_test_snapshot(hex_id, "did:dht:z6MkRecoveryCreator"),
+            );
+        }
+        let persistence: Box<dyn ContextPersistence> = Box::new(MapPersistence {
+            contexts: Arc::clone(&contexts),
+        });
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkRecoverySupervisor".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(|_: &DID| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = Supervisor::with_providers_and_journal(
+            crypto,
+            transport,
+            Box::new(TestEventLog),
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            None,
+            mls_storage,
+            Arc::clone(&journal),
+        );
+        (supervisor, journal)
+    }
+
+    /// Inject a `PreparingB` xctx journal entry whose PLAINTEXT participant
+    /// triple names the caller in `participants[0]` but whose EVIDENCE blob is
+    /// deliberately mangled (non-empty but unparseable), then drive
+    /// `replay_unresolved_sagas`. Returns whether the saga survived as a
+    /// non-terminal `PreparingB` entry (true) or was marked terminal (false).
+    async fn replay_corrupt_evidence_preparing_b(
+        supervisor: &Arc<Supervisor>,
+        journal: &Arc<dyn SagaJournal>,
+        saga_id: &crate::context::supervisor::saga_journal::SagaId,
+        caller_hex: &str,
+    ) -> bool {
+        use crate::context::supervisor::saga_journal::{JournalEntry, SagaState};
+
+        // A real xctx PreparingB entry: `participants = [hex(caller), did, tool]`
+        // (length 3, 64-hex first element) but with corrupt/unparseable evidence
+        // (NON-empty so `reconstruct_xctx_prepared` reaches the decode path and
+        // fails there, rather than short-circuiting on the empty-evidence guard).
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::PreparingB,
+            participants: vec![
+                caller_hex.to_owned(),
+                "did:dht:z6MkCorruptEvidenceCaller".to_owned(),
+                XCTX_TOOL.to_owned(),
+            ],
+            evidence: Zeroizing::new(vec![0xFFu8, 0x00, 0x13, 0x37]),
+            timestamp_ms: 1_700_000_222,
+            seq_per_saga: 1,
+        };
+        journal
+            .append(entry)
+            .await
+            .expect("append PreparingB entry");
+
+        // Pre-condition: the corrupt evidence does NOT reconstruct, so the wave-15
+        // `None` arm is exercised.
+        let probe = journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved")
+            .into_iter()
+            .find(|e| &e.saga_id == saga_id)
+            .expect("PreparingB entry present pre-replay");
+        assert!(
+            Supervisor::reconstruct_xctx_prepared(&probe).is_none(),
+            "the mangled evidence must NOT reconstruct (exercises the None arm)"
+        );
+
+        supervisor.replay_unresolved_sagas().await.expect("replay");
+
+        journal
+            .load_unresolved()
+            .await
+            .expect("load_unresolved post-replay")
+            .iter()
+            .any(|e| &e.saga_id == saga_id && e.state == SagaState::PreparingB)
+    }
+
+    /// FIX 1 (bug-catcher LOW): a `PreparingB` cross-context entry whose EVIDENCE
+    /// is corrupt — but whose PLAINTEXT `participants[0]` still names a LIVE caller
+    /// context — must NOT be marked terminal-`Aborted` (which would falsely assert
+    /// "fully compensated" and STRAND the caller's durable deduction). The
+    /// crash-recovery sweep must instead reconcile the caller via the record-keyed
+    /// `redrive_caller_local_reversal`; with the caller non-resident (and PRESENT
+    /// in persistence — not deleted) the reversal is outstanding and the journal
+    /// stays NON-terminal for a later sweep.
+    ///
+    /// PRE-FIX this stranded the caller: the `None` arm collapsed to
+    /// `SettledOrAbsent` → terminal-`Aborted`. POST-FIX it stays `PreparingB`.
+    #[tokio::test]
+    async fn xctx_corrupt_evidence_preparing_b_reconciles_caller_not_stranded() {
+        use crate::context::supervisor::saga_journal::SagaId;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        // Caller PRESENT in persistence (not-yet-restored, not deleted) so the
+        // FIX-3 deleted-context reaping does NOT apply — the saga must stay
+        // non-terminal purely on the outstanding-reversal invariant.
+        let (supervisor, journal) =
+            xctx_recovery_supervisor_with_present_contexts(std::slice::from_ref(&caller_hex));
+        let saga_id = SagaId("saga-corrupt-evidence-live-caller".to_owned());
+
+        let stayed_non_terminal =
+            replay_corrupt_evidence_preparing_b(&supervisor, &journal, &saga_id, &caller_hex).await;
+
+        assert!(
+            stayed_non_terminal,
+            "a corrupt-evidence PreparingB xctx entry naming a LIVE (present, non-resident) caller \
+             must stay NON-terminal (caller reversal outstanding) — NOT be marked terminal-Aborted \
+             and strand the caller deduction"
+        );
+    }
+
+    /// FIX 3 (black-hat LOW): a `PreparingB` xctx entry whose caller context is
+    /// PERMANENTLY DELETED (ABSENT from durable persistence) must be REAPED
+    /// (marked terminal-`Aborted`) instead of looping forever non-terminal — its
+    /// `CallerReservationRecord` died with the context, so there is nothing to
+    /// reverse. Contrast with the present-but-not-restored case, which stays
+    /// non-terminal (the prior test).
+    #[tokio::test]
+    async fn xctx_corrupt_evidence_preparing_b_deleted_caller_is_reaped() {
+        use crate::context::supervisor::saga_journal::SagaId;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        // Caller ABSENT from persistence (deleted): `present` is empty.
+        let (supervisor, journal) = xctx_recovery_supervisor_with_present_contexts(&[]);
+        let saga_id = SagaId("saga-corrupt-evidence-deleted-caller".to_owned());
+
+        let stayed_non_terminal =
+            replay_corrupt_evidence_preparing_b(&supervisor, &journal, &saga_id, &caller_hex).await;
+
+        assert!(
+            !stayed_non_terminal,
+            "a corrupt-evidence PreparingB xctx entry whose caller context is ABSENT from durable \
+             persistence (permanently deleted) must be REAPED as terminal-Aborted — NOT left to \
+             never-reap"
+        );
+    }
+
+    /// FIX 3 over-restriction guard: a caller context that is PRESENT in durable
+    /// persistence (not-yet-restored, NOT deleted) must NOT be reaped — the
+    /// reversal is genuinely still outstanding and a later sweep (after respawn)
+    /// must re-drive it. This is the same shape as the FIX-1 test but asserted
+    /// against the deleted-context distinction specifically: present ⇒ keep
+    /// non-terminal, absent ⇒ reap.
+    #[tokio::test]
+    async fn xctx_corrupt_evidence_preparing_b_present_caller_not_reaped() {
+        use crate::context::supervisor::saga_journal::SagaId;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        let (supervisor, journal) =
+            xctx_recovery_supervisor_with_present_contexts(std::slice::from_ref(&caller_hex));
+        let saga_id = SagaId("saga-corrupt-evidence-present-caller".to_owned());
+
+        let stayed_non_terminal =
+            replay_corrupt_evidence_preparing_b(&supervisor, &journal, &saga_id, &caller_hex).await;
+
+        assert!(
+            stayed_non_terminal,
+            "a present-but-not-restored caller context must NOT be reaped (its reversal is still \
+             outstanding) — only an ABSENT (deleted) caller is reaped"
         );
     }
 
