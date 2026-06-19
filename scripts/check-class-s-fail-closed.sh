@@ -547,6 +547,11 @@ scan_file() {
     # over `[`/`]`/`(`/`)` from the leading `#[`; returns the tail past the `]`
     # that closes the attribute to depth 0. Only fires for a balanced
     # single-physical-line attribute (a multi-line head returns "").
+    # NOTE: this scanner does NOT need to be string-aware: every caller receives a
+    # line that `strip_code` has already run over (`line = strip_code(raw)` precedes
+    # fn-detection), so all string-literal content — including any `[`/`]` inside a
+    # doc string — is removed before this function ever sees it. A `[`/`]` reaching
+    # here is therefore always a real attribute bracket.
     function strip_leading_attr(s,   t, i, ch, d, started) {
         t = s
         sub(/^[[:space:]]+/, "", t)
@@ -1410,11 +1415,22 @@ scan_file() {
         # `#[rustfmt::skip]` and is not a shape any formatted code produces; per
         # the convergence ceiling we do not chase it (an insider who can craft it can
         # equally edit this gate).
+        # The optional leading qualifier run accepts the COMPLETE, bounded Rust
+        # fn-qualifier grammar — `pub`/`pub(path)`, then any order/repetition of
+        # `const` / `unsafe` / `async` / `extern "ABI"`. Earlier this anchor took
+        # only `pub`/`async`, so `pub extern "C" fn evil() { ..class-s mutation.. }`
+        # — fmt-clean and compiling under `#![forbid(unsafe_code)]` — was NOT
+        # recognised and its mutation hid (a CLASS-A fail-open). `const fn`/`unsafe
+        # fn` are non-carriers (const cannot do a `&mut` mutation; unsafe fn is
+        # forbidden tree-wide), but recognising them is harmless (their bodies are
+        # merely scanned) and `extern "C" fn` IS a live carrier. This is the same
+        # finite qualifier grammar the NTTEST classifier already enumerates — bounded,
+        # not the non-convergent one-more-spelling pattern.
         if (!in_fn) {
             det = peel_leading_attrs(line)
-            if (det ~ /^(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+            if (det ~ /^(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?((const|unsafe|async)[[:space:]]+|extern([[:space:]]+"[^"]*")?[[:space:]]+)*fn[[:space:]]+[A-Za-z0-9_]+/) {
                 tmp = det
-                sub(/^(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+/, "", tmp)
+                sub(/^(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?((const|unsafe|async)[[:space:]]+|extern([[:space:]]+"[^"]*")?[[:space:]]+)*fn[[:space:]]+/, "", tmp)
                 sub(/[^A-Za-z0-9_].*$/, "", tmp)
                 pending_fn = tmp
                 pending_line = NR
@@ -2053,6 +2069,17 @@ self_test() {
         printf '    persist_state_best_effort(state, deps, ctx);\n'
         printf '}\n'
     } > "$fdir/skip_gov.rs"
+
+    # (59) QUALIFIER-RUN: a `pub extern "C" fn` (fmt-clean, compiles under
+    # `#![forbid(unsafe_code)]`) with a best-effort `suspend_all` mutation MUST be
+    # caught — the fn-anchor must accept the `extern "ABI"` qualifier, not only
+    # `pub`/`async`. (Pre-fix the extern fn was unrecognised and its mutation hid.)
+    {
+        printf 'pub extern "C" fn extern_abi_fixture() {\n'
+        printf '    state.role_state.suspend_all(did.as_ref());\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/extern_abi.rs"
 
     # (9) Round-9 keystone — an allowlisted governance leaf that persists
     # best-effort MUST NOT be flagged. `execute_add_member` is a real
@@ -3132,6 +3159,15 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'leaf was NOT caught — the `execute_*` name is lost when the fn-detector does\n' >&2
         printf 'not peel a same-line leading attribute (fail-open: a downward leaf hides).\n' >&2
+        rc=1
+    fi
+    # (59) `pub extern "C" fn` with a best-effort mutation MUST be caught — the
+    # fn-anchor must accept the extern "ABI" qualifier (not only pub/async).
+    if ! grep -q $'^HIT\t.*\textern_abi_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `pub extern "C" fn` with a best-effort Class-S\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'mutation was NOT caught — the fn-detector anchor rejects the extern "ABI"\n' >&2
+        printf 'qualifier (fail-open: an extern-fn mutation hides).\n' >&2
         rc=1
     fi
     # (9) Round-9 keystone: an allowlisted (upward) governance leaf that persists
