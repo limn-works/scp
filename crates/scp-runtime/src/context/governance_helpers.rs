@@ -153,8 +153,15 @@ pub fn build_governance_context(state: &PerContextState, clock: &dyn Clock) -> G
 const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
 
 /// Commit-provenance for a governance-action leaf: the approved proposal id,
-/// the acting DID, and the convergent committer-assigned leaf timestamp
-/// (`proposal.created_at`, copied by every member; §7.3.1, §9.9.3).
+/// the acting DID, and the committer-assigned leaf timestamp.
+///
+/// The timestamp is `proposal.created_at` — a value bound into the SIGNED
+/// proposal, so it is identical and tamper-evident for every member that
+/// processes the proposal (convergent-by-construction). The leaf carrying it,
+/// however, is currently appended ONLY by the committing member: the
+/// receive-side append path is dormant, so governance leaves are not yet
+/// replicated cross-member. Cross-member leaf replication is the forward step
+/// under ADR-051 (§7.3.1, §9.9.3).
 ///
 /// Bundled so the per-action `execute_*` helpers carry one provenance value
 /// instead of three loose trailing parameters (keeps each helper within the
@@ -539,9 +546,10 @@ pub fn detect_and_handle_conflicts(
     use scp_protocol::context::governance::actions_conflict;
 
     let mut events = Vec::new();
-    // Wall-clock timestamp — used ONLY for the audit slot of
-    // `approved_proposals` and for the freeze start time. Never
-    // used for sequence comparison (H10).
+    // Wall-clock timestamp — used ONLY for the local audit slot of
+    // `approved_proposals`. NOT used for the freeze start time (that is
+    // derived convergently from the conflicting proposals' signed
+    // `created_at`, below) and never used for sequence comparison (H10).
     let current_timestamp = deps.clock.now_secs();
 
     // H10: assign the monotonic seq for the new proposal up front, and
@@ -570,13 +578,22 @@ pub fn detect_and_handle_conflicts(
         }
     }
 
-    for (conflicting_id, conflicting_seq, _conflicting_timestamp, _conflicting_proposal) in
-        conflicts
+    for (conflicting_id, conflicting_seq, _conflicting_timestamp, conflicting_proposal) in conflicts
     {
         match new_seq.cmp(&conflicting_seq) {
             std::cmp::Ordering::Equal => {
+                // Convergent freeze start: derive from the conflicting proposals'
+                // signed `created_at` values, never local `now()`. Every member
+                // observes the same two signed proposals, so
+                // `max(created_at_a, created_at_b)` is identical across members and
+                // tamper-evident (it is bound into the signed proposals). The
+                // `GovernanceFreezeExpired` leaf (`freeze_start + FREEZE_TIMEOUT`)
+                // is thus convergent-by-construction (§7.3.1, §9.9.3), matching the
+                // committer-assigned-timestamp treatment of other governance leaves.
+                let freeze_start =
+                    new_proposal.created_at.max(conflicting_proposal.created_at);
                 state.governance.freeze =
-                    Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
+                    Some((new_proposal.proposal_id, conflicting_id, freeze_start));
                 events.push(GovernanceEvent::ConflictDetected {
                     proposal_a: new_proposal.proposal_id,
                     proposal_b: conflicting_id,
@@ -1360,11 +1377,17 @@ pub fn execute_modify_ceiling(
         ));
     }
 
-    let now = deps.clock.now_secs();
-    let effective_at = now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
+    // Convergent notification/activation window: anchor on the committer-
+    // assigned proposal timestamp (`CommitMeta::timestamp_secs`, every member
+    // copies the same value), never local `now()`. `effective_at =
+    // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
+    // members, so the deferred ceiling change activates at the same instant
+    // everywhere (§7.3.1, §9.9.3).
+    let notified_at = timestamp_secs;
+    let effective_at = notified_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
     state.governance.pending_ceiling_modification = Some(PendingCeilingModification {
         new_capabilities: new_ceiling.to_vec(),
-        notified_at: now,
+        notified_at,
         effective_at,
         proposal_id,
     });
@@ -1373,7 +1396,7 @@ pub fn execute_modify_ceiling(
         state,
         ContextEvent::CeilingChangeNotification {
             new_capabilities: new_ceiling.to_vec(),
-            notified_at: now,
+            notified_at,
             effective_at,
             proposal_id,
         },
@@ -1521,6 +1544,12 @@ pub async fn execute_extend_ttl(
             deps,
             context_id,
             std::time::Duration::from_secs(secs),
+            // The extended deadline `new_dl` was computed convergently above as
+            // `old_deadline + additional_secs` (anchored on the prior
+            // convergent deadline). Pass it through as the override so the
+            // re-armed timer records that convergent value — not the local
+            // arm-time `now + remaining` — on the `ContextExpired` leaf.
+            Some(new_dl),
             handle,
         )
         .await;
@@ -2445,11 +2474,17 @@ pub fn execute_set_economic_policy(
         ));
     }
 
-    let now = deps.clock.now_secs();
-    let effective_at = now + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
+    // Convergent notification/activation window: anchor on the committer-
+    // assigned proposal timestamp (`CommitMeta::timestamp_secs`, every member
+    // copies the same value), never local `now()`. `effective_at =
+    // proposal.created_at + NOTIFICATION_PERIOD` is therefore identical across
+    // members, so the deferred economic-policy change activates at the same
+    // instant everywhere (§7.3.1, §9.9.3).
+    let notified_at = timestamp_secs;
+    let effective_at = notified_at + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
     state.governance.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
         new_policy: policy.clone(),
-        notified_at: now,
+        notified_at,
         effective_at,
         proposal_id,
     });
@@ -2457,7 +2492,7 @@ pub fn execute_set_economic_policy(
     emit(
         state,
         ContextEvent::EconomicPolicyChangeNotification {
-            notified_at: now,
+            notified_at,
             effective_at,
             proposal_id,
         },
@@ -3878,9 +3913,12 @@ pub async fn dispatch_governance_action(
 ) -> Result<GovernanceActionResult, ContextError> {
     let pid = proposal.proposal_id;
     let actor = proposal.proposer_did.as_ref();
-    // Committer-assigned convergent leaf timestamp: the proposal's signed
-    // `created_at` (copied identically by every member) — never local `now()`
-    // (§7.3.1, §9.9.3).
+    // Committer-assigned leaf timestamp: the proposal's signed `created_at`.
+    // The value is identical and tamper-evident for every member that
+    // processes the signed proposal (convergent-by-construction), never local
+    // `now()`. The leaf itself is currently committer-appended-only — the
+    // receive-side append path is dormant, so cross-member leaf replication is
+    // the forward step under ADR-051 (§7.3.1, §9.9.3).
     let ts = proposal.created_at;
     match &proposal.action {
         GovernanceAction::SuspendCapability { did, capabilities } => {
@@ -4185,8 +4223,11 @@ pub fn finalize_governance_action(
         governance_event_label(&executed_event),
         proposal.proposer_did.as_ref(),
         executed_payload,
-        // Convergent committer-assigned timestamp: the proposal's signed
-        // `created_at`, copied identically by every member (§7.3.1, §9.9.3).
+        // Committer-assigned timestamp: the proposal's signed `created_at` —
+        // identical and tamper-evident for every member that processes the
+        // signed proposal (convergent-by-construction), never local `now()`.
+        // The leaf is currently committer-appended-only; cross-member leaf
+        // replication is the forward step under ADR-051 (§7.3.1, §9.9.3).
         proposal.created_at,
     )?;
 

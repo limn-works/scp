@@ -12615,6 +12615,9 @@ impl Scp {
                 context_id: handle.context_id.clone(),
                 params: scp_core::context::ContextParams::default(),
                 duration,
+                // Ignored by ResetTtlTimer (extension reset never anchors to
+                // creation).
+                anchor_deadline_to_creation: false,
             }),
             reply: tx,
         };

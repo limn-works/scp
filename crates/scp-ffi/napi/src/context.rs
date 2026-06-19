@@ -4032,6 +4032,9 @@ pub(crate) async fn context_reset_ttl_timer_on(
             context_id: core_handle.context_id().to_owned(),
             params: core_handle.params().clone(),
             duration,
+            // Ignored by ResetTtlTimer (extension reset never anchors to
+            // creation).
+            anchor_deadline_to_creation: false,
         }),
         reply: tx,
     };

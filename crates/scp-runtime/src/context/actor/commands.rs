@@ -2052,6 +2052,17 @@ pub struct TtlTimerPayload {
     /// `StartTtlTimer`; the replacement duration for
     /// `ResetTtlTimer`.
     pub duration: std::time::Duration,
+    /// When `true` (the initial-create `StartTtlTimer` path), the handler
+    /// records a CONVERGENT expiry deadline anchored on the actor's
+    /// `creation_timestamp_secs + params.ttl` — every member computes the
+    /// identical absolute deadline, so the `ContextExpired`/`ContextClosed`
+    /// leaf timestamp is convergent-by-construction (§7.3.1, §9.9.3). When
+    /// `false` (e.g. the restore/import path, whose persisted snapshot does
+    /// not yet carry the convergent creation time — a forward step under
+    /// ADR-051), the deadline is armed relative to the local clock (the prior
+    /// behaviour). Ignored by `ResetTtlTimer`, which never anchors to
+    /// creation.
+    pub anchor_deadline_to_creation: bool,
 }
 
 /// See [`ContextCommand::TtlClose`]. Real variants land in commit 9 of

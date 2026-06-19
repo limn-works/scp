@@ -2789,8 +2789,22 @@ impl WasmContextManager {
             }
         }
 
-        // Replay protection: check+mark atomically.
-        {
+        // Resolve the CONVERGENT `GovernanceActionExecuted` leaf timestamp
+        // BEFORE dispatch, while the proposal is still tracked. This is the
+        // executed proposal's signed `created_at`, copied identically by every
+        // member — byte-identical to the native runtime's
+        // `finalize_governance_action`, which sources `proposal.created_at`
+        // (§7.3.1, §9.9.3). The proposal lives in `pending_proposals`
+        // (pre-resolution) or `resolved_proposals` (post-resolution).
+        //
+        // Native CANNOT reach this leaf without a real proposal
+        // (`finalize_governance_action` takes `&GovernanceProposal`). WASM
+        // therefore guards the same invariant rather than silently stamping
+        // `0`: a missing proposal here would mint a leaf whose timestamp
+        // diverges from native's `created_at`, breaking cross-platform Merkle
+        // equivocation detection. Fail loudly so a future regression surfaces
+        // instead of corrupting the convergent log.
+        let proposal_created_at = {
             let ctx = self.require_active_context_mut(context_id)?;
             let now = crate::time::now_ms();
 
@@ -2801,6 +2815,19 @@ impl WasmContextManager {
                 });
             }
 
+            let created_at = ctx
+                .pending_proposals
+                .get(proposal_id)
+                .or_else(|| ctx.resolved_proposals.get(proposal_id))
+                .map(|p| p.created_at)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: format!(
+                        "governance proposal '{proposal_id}' is not tracked (pending or resolved); \
+                         cannot derive the convergent GovernanceActionExecuted leaf timestamp"
+                    ),
+                    code: codes::CTX_2041.to_owned(),
+                })?;
+
             // Evict expired proposals when over capacity.
             if ctx.executed_proposals.len() >= WASM_PROPOSAL_CAP {
                 let cutoff = now - WASM_PROPOSAL_TTL_MS;
@@ -2808,7 +2835,8 @@ impl WasmContextManager {
             }
 
             ctx.executed_proposals.insert(proposal_id.to_owned(), now);
-        }
+            created_at
+        };
 
         let result = self.dispatch_governance_action(context_id, action);
 
@@ -2824,17 +2852,11 @@ impl WasmContextManager {
             && let Some(ctx) = self.contexts.get_mut(context_id)
         {
             // Convergent leaf timestamp for `GovernanceActionExecuted`: the
-            // executed proposal's signed `created_at`, copied identically by
-            // every member — byte-identical to the native runtime's
-            // proposal-derived value (`finalize_governance_action`). The
-            // proposal is in `pending_proposals` (pre-resolution) or
-            // `resolved_proposals` (post-resolution). Never local `now()`
-            // (§7.3.1, §9.9.3).
-            let proposal_created_at = ctx
-                .pending_proposals
-                .get(proposal_id)
-                .or_else(|| ctx.resolved_proposals.get(proposal_id))
-                .map_or(0, |p| p.created_at);
+            // executed proposal's signed `created_at`, captured above before
+            // dispatch (guarded against a missing proposal so this can never be
+            // a divergent `0`). Byte-identical to the native runtime's
+            // proposal-derived value (`finalize_governance_action`); never
+            // local `now()` (§7.3.1, §9.9.3).
             let action_summary = action.variant_name().to_owned();
             let proposal_id_bytes: [u8; 32] = {
                 let bytes = hex::decode(proposal_id).unwrap_or_default();

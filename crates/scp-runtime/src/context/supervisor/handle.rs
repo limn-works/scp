@@ -649,6 +649,12 @@ impl SupervisorHandle {
         context_id: &str,
         params: scp_protocol::context::params::ContextParams,
         duration: std::time::Duration,
+        // `true` for the initial-create path (anchor the convergent expiry
+        // deadline on the actor's `creation_timestamp_secs + params.ttl`);
+        // `false` for restore/import (arm relative to the local clock — the
+        // persisted snapshot does not yet carry the convergent creation time,
+        // a forward step under ADR-051). See `TtlTimerPayload`.
+        anchor_deadline_to_creation: bool,
     ) {
         use crate::context::actor::commands::{ContextCommand, TtlCloseCommand, TtlTimerPayload};
 
@@ -665,6 +671,7 @@ impl SupervisorHandle {
                 context_id: context_id.to_owned(),
                 params,
                 duration,
+                anchor_deadline_to_creation,
             }),
             reply: reply_tx,
         });

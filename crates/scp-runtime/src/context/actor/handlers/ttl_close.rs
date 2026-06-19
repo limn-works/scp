@@ -68,7 +68,16 @@ pub async fn dispatch(
         TtlCloseCommand::FireTimer { reply } => handle_fire_timer(state, deps, reply).await,
         TtlCloseCommand::StartTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_start_ttl_timer(state, deps, p.context_id, p.params, p.duration, reply).await
+            handle_start_ttl_timer(
+                state,
+                deps,
+                p.context_id,
+                p.params,
+                p.duration,
+                p.anchor_deadline_to_creation,
+                reply,
+            )
+            .await
         }
         TtlCloseCommand::ExtendTtl {
             context_id,
@@ -119,8 +128,25 @@ async fn handle_start_ttl_timer(
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     duration: std::time::Duration,
+    anchor_deadline_to_creation: bool,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Initial-create path: derive the CONVERGENT expiry deadline from the
+    // actor-owned convergent creation timestamp + the TTL duration in the
+    // context params (both convergent across members), so the timer-fired
+    // `ContextExpired`/`ContextClosed` leaf timestamp converges
+    // (§7.3.1, §9.9.3). Restore/import pass `false` because their persisted
+    // snapshot does not yet carry the convergent creation time (ADR-051);
+    // those arm relative to the local clock (`None`).
+    let deadline_override = if anchor_deadline_to_creation {
+        crate::context::ttl_close_helpers::convergent_ttl_deadline_secs(
+            state.creation_timestamp_secs,
+            params.ttl.map(|ttl| ttl.as_secs()),
+        )
+    } else {
+        None
+    };
+
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -136,6 +162,7 @@ async fn handle_start_ttl_timer(
         deps,
         &context_id,
         duration,
+        deadline_override,
         handle,
     );
 

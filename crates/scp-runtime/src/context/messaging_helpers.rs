@@ -635,8 +635,15 @@ pub fn run_buffered_post_delivery(
     event_name: Option<scp_event_log::EventType>,
     // Committer-assigned leaf timestamp copied from the inbound message
     // envelope's `created_at` (seconds), for the sender-authenticated received
-    // event the `Some(event_name)` branch would append. Convergent by copy —
-    // never a per-member local `now()` (§7.3.1, §9.9.3).
+    // event the `Some(event_name)` branch would append. It would be convergent
+    // by copy — never a per-member local `now()` (§7.3.1, §9.9.3).
+    //
+    // DORMANT: every current caller passes `event_name = None`, so this
+    // timestamp is not yet consumed — the receive-side append branch that
+    // would replicate a committer's leaf onto a receiving member's log is not
+    // wired. Until that lands (the cross-member leaf-replication forward step
+    // under ADR-051), membership/governance leaves remain committer-appended
+    // only and do NOT converge cross-member. Do not assume this value is live.
     event_timestamp_secs: u64,
     clock: &dyn Clock,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
@@ -2361,6 +2368,11 @@ pub fn validate_and_drain_timeouts(
                 &context_id_bytes,
                 &msg.sender_did,
                 event_name,
+                // Dormant: `event_name` here is always `None`
+                // (`deliver_plaintext_or_announcement` never appends on
+                // receive), so this committer-copied timestamp is not yet
+                // consumed. Live only once cross-member leaf replication lands
+                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
                 msg.inner.timestamp / 1000,
                 &*deps.clock,
                 &*deps.event_log,
@@ -2442,6 +2454,11 @@ pub fn buffer_ahead_message(
                 &context_id_bytes,
                 &msg.sender_did,
                 event_name,
+                // Dormant: `event_name` here is always `None`
+                // (`deliver_plaintext_or_announcement` never appends on
+                // receive), so this committer-copied timestamp is not yet
+                // consumed. Live only once cross-member leaf replication lands
+                // (ADR-051). See `run_buffered_post_delivery`'s param doc.
                 msg.inner.timestamp / 1000,
                 &*deps.clock,
                 &*deps.event_log,
@@ -2559,6 +2576,12 @@ pub fn deliver_message_and_drain_buffered(
                     context_id_bytes,
                     &msg.sender_did,
                     event_name,
+                    // Dormant: `event_name` here is always `None`
+                    // (`deliver_plaintext_or_announcement` never appends on
+                    // receive), so this committer-copied timestamp is not yet
+                    // consumed. Live only once cross-member leaf replication
+                    // lands (ADR-051). See `run_buffered_post_delivery`'s param
+                    // doc.
                     msg.inner.timestamp / 1000,
                     &*deps.clock,
                     &*deps.event_log,
@@ -2660,6 +2683,11 @@ pub fn deliver_message_and_drain_buffered(
             context_id_bytes,
             &msg.sender_did,
             event_name,
+            // Dormant: `event_name` here is always `None`
+            // (`deliver_plaintext_or_announcement` never appends on receive),
+            // so this committer-copied timestamp is not yet consumed. Live only
+            // once cross-member leaf replication lands (ADR-051). See
+            // `run_buffered_post_delivery`'s param doc.
             msg.inner.timestamp / 1000,
             &*deps.clock,
             &*deps.event_log,

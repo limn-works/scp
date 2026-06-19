@@ -373,8 +373,12 @@ pub async fn leave_context(
         scp_event_log::EventType::MemberLeft,
         member_did.as_ref(),
         // Committer-assigned: the leaving member's clock — the source of the
-        // `created_at` on its outgoing leave commit, copied by every member
-        // (§7.3.1, §9.9.3).
+        // `created_at` on its outgoing leave commit. This is the
+        // convergent-by-construction value WHEN cross-member leaf replication
+        // lands: the receive-side append path is currently dormant, so this
+        // leaf is committer-appended-only and is NOT yet replicated to other
+        // members. Cross-member convergence of membership leaves is the
+        // forward step under ADR-051 (§7.3.1, §9.9.3).
         deps.clock.now_secs(),
     )?;
     state.checkpoint_events_since += 1;
@@ -516,9 +520,13 @@ pub async fn close_context_with_key(
     let role_state = state.role_state.clone();
 
     // Delegate to ttl::close_context for the lifecycle transition + role
-    // gate (async). The initiator assigns the convergent `ContextClosing` leaf
-    // timestamp from its own clock — the same value stamped on the outgoing
-    // close commit, copied by every member (§7.3.1, §9.9.3).
+    // gate (async). The initiator assigns the `ContextClosing` leaf timestamp
+    // from its own clock — the same value stamped on the outgoing close
+    // commit. This is the convergent-by-construction value WHEN cross-member
+    // leaf replication lands; the receive-side append path is currently
+    // dormant, so the leaf is committer-appended-only and is NOT yet
+    // replicated to other members. Cross-member convergence is the forward
+    // step under ADR-051 (§7.3.1, §9.9.3).
     let result = ttl::close_context(
         handle,
         initiator_did,
@@ -881,7 +889,11 @@ pub async fn join_context(
         member_did.as_ref(),
         // Committer-assigned: the joining member's clock (captured once above as
         // `now_secs`) — the source of the `created_at` on its outgoing join
-        // commit, copied by every member (§7.3.1, §9.9.3).
+        // commit. Convergent-by-construction WHEN cross-member leaf replication
+        // lands; the receive-side append path is currently dormant, so this
+        // leaf is committer-appended-only and is NOT yet replicated to other
+        // members. Cross-member convergence is the forward step under ADR-051
+        // (§7.3.1, §9.9.3).
         now_secs,
     ) {
         if let Some(a) = auth {
@@ -1167,6 +1179,16 @@ pub async fn create_context(
         &creator_did,
         Arc::clone(&deps.key_resolver),
     )?;
+    // Creator assigns the ContextCreated leaf timestamp from its own clock.
+    // This is the convergent-by-construction value WHEN cross-member leaf
+    // replication lands (every member would copy it); the receive-side append
+    // path is currently dormant, so the leaf is committer-appended-only —
+    // cross-member convergence is the forward step under ADR-051 (§7.3.1,
+    // §9.9.3). Independently of replication, the same value is stored on
+    // `PerContextState::creation_timestamp_secs` below and used LOCALLY by
+    // every member as the base for the TTL expiry deadline
+    // (= creation + params.ttl), which IS computed identically on each member.
+    let creation_timestamp_secs = deps.clock.now_secs();
     let handle = crate::context::builder::create_context(
         context_id.clone(),
         params.clone(),
@@ -1174,9 +1196,7 @@ pub async fn create_context(
         deps.transport.as_ref(),
         deps.event_log.as_ref(),
         creator_did.as_ref(),
-        // Creator assigns the convergent ContextCreated leaf timestamp from its
-        // own clock; every member copies it (§7.3.1, §9.9.3).
-        deps.clock.now_secs(),
+        creation_timestamp_secs,
     )
     .await?;
     let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
@@ -1219,6 +1239,9 @@ pub async fn create_context(
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
+        // Convergent creator-assigned creation time — the same value stamped on
+        // the ContextCreated leaf above. Base for the convergent TTL deadline.
+        creation_timestamp_secs,
         generation: 0, // assigned by SupervisorHandle::insert_context.
         handle: handle.clone(),
         membership,
@@ -1387,7 +1410,9 @@ pub async fn finalize_create(
         // installs the timer task on its own state (registry + mailbox
         // tick — no DashMap reach).
         deps.supervisor
-            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration)
+            // Create path: anchor the convergent expiry deadline on the
+            // creator-assigned creation timestamp + params.ttl.
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, true)
             .await;
     }
 }
@@ -1770,6 +1795,12 @@ pub async fn import_context(
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
+        // The signed export snapshot does not yet carry the convergent
+        // creation timestamp (a forward step under ADR-051), so set this to
+        // the local instantiation time. It is NOT used as a convergent
+        // deadline base on the import path: the TTL timer is armed with
+        // `anchor_deadline_to_creation = false` (local-clock arming) below.
+        creation_timestamp_secs: deps.clock.now_secs(),
         generation: 0, // assigned by SupervisorHandle on insert.
         handle: handle.clone(),
         membership: export.snapshot.membership,
@@ -1947,7 +1978,12 @@ pub async fn import_context(
     if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
         let duration = std::time::Duration::from_secs(remaining_secs);
         deps.supervisor
-            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), duration)
+            // Import path: arm relative to the local clock. The signed export
+            // snapshot does not yet carry the convergent creation timestamp, so
+            // the importer cannot reconstruct the convergent `creation + ttl`
+            // deadline; carrying it through the signed snapshot (and its
+            // cross-bridge byte-parity + KAT) is a forward step under ADR-051.
+            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), duration, false)
             .await;
     }
 
@@ -2231,6 +2267,12 @@ pub async fn restore_context(
     let per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
+        // The persisted snapshot does not yet carry the convergent creation
+        // timestamp (a forward step under ADR-051), so set this to the local
+        // instantiation time. It is NOT used as a convergent deadline base on
+        // the restore path: the TTL timer is re-armed with
+        // `anchor_deadline_to_creation = false` (local-clock arming) below.
+        creation_timestamp_secs: deps.clock.now_secs(),
         // Placeholder — `spawn_actor_with_state` overwrites this
         // unconditionally with a fresh monotonic `spawn_generation`
         // (AtomicU64; first spawn = 1) before the state crosses into the
@@ -2394,7 +2436,11 @@ pub async fn restore_context(
     if let Some(remaining_secs) = ttl_remaining {
         let duration = std::time::Duration::from_secs(remaining_secs);
         deps.supervisor
-            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration)
+            // Restore path: arm relative to the local clock. The persisted
+            // snapshot does not yet carry the convergent creation timestamp, so
+            // the convergent `creation + ttl` deadline cannot be reconstructed
+            // on reload; persisting it is a forward step under ADR-051.
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, false)
             .await;
     }
 

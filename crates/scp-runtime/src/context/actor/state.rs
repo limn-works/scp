@@ -768,7 +768,25 @@ pub struct PerContextState {
     /// Unix-ms timestamp of first actor instantiation for this context.
     /// Preserved across respawn via snapshot — new actor instances for
     /// the same context share one `created_at`.
+    ///
+    /// This is a LOCAL instantiation timestamp (the creating/restoring
+    /// member's clock) and is NOT convergent across members — do not use
+    /// it as a base for any cross-member deadline. The convergent
+    /// creator-assigned creation time lives in
+    /// [`Self::creation_timestamp_secs`].
     pub created_at: u64,
+
+    /// Convergent creator-assigned context-creation timestamp (Unix
+    /// seconds). This is the identical value the creator stamped on the
+    /// `ContextCreated` event-log leaf and that every member copies
+    /// (§7.3.1, §9.9.3) — NOT each member's local `now()`. It is the
+    /// convergent base for deadlines derived from creation time (e.g. the
+    /// TTL expiry deadline = `creation_timestamp_secs + params.ttl`), so
+    /// every member computes the identical absolute deadline regardless of
+    /// when their local timer was armed. Carried through the export
+    /// snapshot so restore/import preserve the convergent base rather than
+    /// re-deriving from importer-local `now()`.
+    pub creation_timestamp_secs: u64,
 
     /// Monotonic generation counter inherited from legacy
     /// [`crate::context::state::PerContextState::generation`]
@@ -1285,6 +1303,10 @@ impl PerContextState {
         Self {
             context_id,
             created_at,
+            // Test fixtures reuse the local instantiation timestamp as the
+            // convergent creation time; production sources it from the
+            // creator-assigned `ContextCreated` leaf value.
+            creation_timestamp_secs: created_at,
             generation: 0,
             handle,
             membership: MembershipState::new(),
@@ -1510,6 +1532,7 @@ mod tests {
         let PerContextState {
             context_id,
             created_at,
+            creation_timestamp_secs,
             generation,
             handle,
             membership,
@@ -1550,6 +1573,9 @@ mod tests {
         // Identity + lifetime.
         assert_eq!(context_id, [3u8; 32]);
         assert_eq!(created_at, 12);
+        // Test fixture mirrors the convergent creation time onto the local
+        // instantiation timestamp.
+        assert_eq!(creation_timestamp_secs, 12);
         assert_eq!(generation, 0);
         assert_eq!(handle.context_id().len(), 64);
 
@@ -1630,6 +1656,7 @@ mod tests {
         let PerContextState {
             context_id: _,
             created_at: _,
+            creation_timestamp_secs: _,
             generation: _,
             handle: _,
             membership: _,

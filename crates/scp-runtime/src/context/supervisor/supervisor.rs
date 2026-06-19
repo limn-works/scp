@@ -11162,6 +11162,7 @@ mod tests {
                 &ctx_key,
                 scp_protocol::context::ContextParams::default(),
                 std::time::Duration::from_millis(50),
+                true,
             )
             .await;
         assert_eq!(

@@ -1086,9 +1086,16 @@ impl TtlTimer {
         transport: Option<Arc<dyn ContextTransportProvider>>,
         event_log: Arc<dyn ContextEventLogProvider>,
     ) {
-        // Record absolute deadline for persistence snapshots. This pre-computed
-        // deadline is also the convergent `ContextExpired` leaf timestamp every
-        // member records when the timer fires (§7.3.1, §9.9.3).
+        // Record the absolute deadline for persistence snapshots.
+        //
+        // NOTE: this `TtlTimer::spawn_with_transport` path computes the deadline
+        // from local arm-time `now + duration`, which is NOT convergent across
+        // members. The live actor timer
+        // (`ttl_close_helpers::spawn_ttl_timer`) supersedes this for production
+        // and anchors the convergent deadline on `creation_timestamp_secs +
+        // params.ttl` (§7.3.1, §9.9.3). This method survives only as a
+        // self-contained `TtlTimer` unit-test helper; do not treat its deadline
+        // as the convergent leaf timestamp.
         let now_secs = self.clock.now_secs();
         let expiry_deadline_secs = now_secs.saturating_add(duration.as_secs());
         self.deadline_unix_secs = Some(expiry_deadline_secs);
