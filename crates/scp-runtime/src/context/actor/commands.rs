@@ -2786,6 +2786,21 @@ pub enum SagaPhaseMessage {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+    /// Commit-A witness check — runs on the LOCAL caller-context actor. READ-ONLY
+    /// (no mutation, no Class-S persist): reports whether this `SagaId` is already
+    /// recorded in `xctx_committed_invocations` (the durable Commit-A idempotency
+    /// witness). The FSM uses it to re-drive a Commit-A whose reply was lost AFTER
+    /// the handler durably committed: the held Prepare-A reservation is gone (the
+    /// command was delivered, the actor consumed the ticket), so a retry cannot
+    /// re-send `CommitA` — but the witness lets the FSM resolve the saga to
+    /// `Committed` instead of a spurious `NeedsRepair` (spec §17.16.4 "A re-acks
+    /// its `CrossContextToolInvoked` … as a no-op"; the witness IS that re-ack).
+    CommitACheckWitness {
+        /// Durable saga identifier (the `xctx_committed_invocations` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Oneshot reply: `true` iff Commit-A is durably recorded for this saga.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
     /// Abort — runs on EITHER side's local actor. RAII-releases the staged
     /// reservations (escrow / outbound-RL on A — carried back via
     /// `reservation`; tool-session on B — the staged `saga_pending` slot), clears

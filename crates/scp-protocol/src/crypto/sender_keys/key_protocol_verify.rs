@@ -698,6 +698,27 @@ impl NonceDedup {
         }
         self.seen.insert(nonce, now_secs);
     }
+
+    /// Project the live cache to its serializable `{nonce → first-seen secs}`
+    /// entries, for durable persistence (e.g. a crash-survival snapshot). The
+    /// map IS the entire dedup state — restoring it via [`Self::from_entries`]
+    /// reconstructs an equivalent cache (the TTL prune in [`Self::is_replayed`]
+    /// drops any entry that has since expired). Cloned rather than borrowed so a
+    /// snapshot builder need not hold a borrow across its persist.
+    #[must_use]
+    pub fn entries(&self) -> HashMap<[u8; REQUEST_NONCE_SIZE], u64> {
+        self.seen.clone()
+    }
+
+    /// Reconstruct a dedup cache from persisted [`Self::entries`]. Entries past
+    /// the TTL are pruned lazily on the next [`Self::is_replayed`] call (no
+    /// eager prune here — the restoring caller may not have a clock). If the
+    /// persisted set somehow exceeds `NONCE_DEDUP_CAPACITY`, the next
+    /// [`Self::record`] evicts oldest-first back toward the cap.
+    #[must_use]
+    pub const fn from_entries(seen: HashMap<[u8; REQUEST_NONCE_SIZE], u64>) -> Self {
+        Self { seen }
+    }
 }
 
 // ---------------------------------------------------------------------------

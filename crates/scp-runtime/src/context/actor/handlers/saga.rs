@@ -175,6 +175,7 @@ async fn dispatch_prepare_phase(
         // `unreachable!`, routing each phase's reply to its typed sender.
         SagaPhaseMessage::CommitBReserve { reply, .. } => misrouted_reserve(reply),
         SagaPhaseMessage::CommitBSettle { reply, .. } => misrouted_settle(reply),
+        SagaPhaseMessage::CommitACheckWitness { reply, .. } => misrouted_witness(reply),
         SagaPhaseMessage::CommitA { reply, .. }
         | SagaPhaseMessage::Abort { reply, .. }
         | SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => misrouted_unit(reply),
@@ -231,6 +232,9 @@ async fn dispatch_commit_phase(
                 output_bytes,
             };
             commit_a(state, deps, req, reply).await
+        }
+        SagaPhaseMessage::CommitACheckWitness { saga_id, reply } => {
+            commit_a_check_witness(state, &saga_id, reply)
         }
         SagaPhaseMessage::Abort {
             saga_id,
@@ -303,6 +307,16 @@ fn misrouted_settle(reply: CommitBSettleReply) -> Outcome<()> {
 /// Mis-route reply for a unit-reply saga phase's typed sender.
 fn misrouted_unit(reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
     let err = misrouted_err("CommitA/Abort/EmitDivergenceMarker");
+    let sketch = outcome_error_sketch(&err);
+    let _ = reply.send(Err(err));
+    Outcome::err(sketch)
+}
+
+/// Mis-route reply for [`SagaPhaseMessage::CommitACheckWitness`]'s bool sender.
+fn misrouted_witness(
+    reply: tokio::sync::oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    let err = misrouted_err("CommitACheckWitness");
     let sketch = outcome_error_sketch(&err);
     let _ = reply.send(Err(err));
     Outcome::err(sketch)
@@ -938,11 +952,19 @@ fn commit_b_first_settle(
     output_bytes: &[u8],
     target_signing_key: &SigningKeyBytes,
 ) -> Result<CommitBSettleOutcome, (bool, ContextError)> {
-    // The staged prepared carries the B-recorded provenance the receipt
-    // preimage MUST be signed over (never re-read from the wire).
-    let Some(SagaPreparedState::CrossContextToolInvocation(prepared)) =
-        state.saga_pending.get(saga_id)
-    else {
+    // MOVE the staged slot OUT up front so we own the original
+    // `SagaPreparedState` — on a persist-failure rollback we RE-INSERT the owned
+    // original verbatim (no lossy reconstruction). The slot is restored on every
+    // failure path below, so a rejected settle leaves `saga_pending` exactly as
+    // it was found.
+    let removed = state.saga_pending.remove(saga_id);
+    let Some(SagaPreparedState::CrossContextToolInvocation(prepared)) = removed else {
+        // Not a cross-context staged slot (or absent): put back whatever we
+        // removed (an unrelated variant) and reject. `mutated = false` — the
+        // remove+reinsert is a no-op round-trip.
+        if let Some(other) = removed {
+            state.saga_pending.insert(saga_id.clone(), other);
+        }
         return Err((
             false,
             ContextError::InvalidState(format!(
@@ -954,15 +976,24 @@ fn commit_b_first_settle(
     };
 
     // Build the signed receipt from STAGED provenance + the captured output.
-    // Pre-append: a signing failure leaves state untouched (mutated = false).
+    // Pre-append: a signing failure leaves state untouched (mutated = false) —
+    // re-insert the owned original first.
     let event_id = tool_invoked_event_id(saga_id);
-    let receipt = build_signed_receipt(prepared, output_bytes, &event_id, target_signing_key)
-        .map_err(|e| (false, e))?;
+    let receipt = match build_signed_receipt(&prepared, output_bytes, &event_id, target_signing_key)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state.saga_pending.insert(
+                saga_id.clone(),
+                SagaPreparedState::CrossContextToolInvocation(prepared),
+            );
+            return Err((false, e));
+        }
+    };
     // The receipt's JCS output bytes are the canonical preimage A re-hashes.
     let canonical_output = receipt.output_jcs.clone();
 
-    // Snapshot the fields the ToolInvoked record needs before we drop the
-    // `&prepared` borrow by mutating state. `recorded_chain_depth` /
+    // Snapshot the fields the ToolInvoked record needs. `recorded_chain_depth` /
     // `recorded_timestamp_ms` are B's staged values (never re-read from wire).
     let caller_did_str = prepared.caller_did.0.clone();
     let target_context_id = prepared.target_context_id;
@@ -983,18 +1014,25 @@ fn commit_b_first_settle(
         "timestamp_ms": receipt.timestamp_ms,
     });
     // At-append onward: the event log is touched, so any failure is `mutated`.
-    deps.event_log
-        .append_context_event_with_payload(
-            &target_context_id,
-            &event_id,
-            &caller_did_str,
-            Some(&tool_invoked_payload),
-        )
-        .map_err(|e| (true, e))?;
+    // The staged slot was moved out up front; re-insert the OWNED original on an
+    // append failure so a retry re-runs settle cleanly (no lossy reconstruction).
+    if let Err(e) = deps.event_log.append_context_event_with_payload(
+        &target_context_id,
+        &event_id,
+        &caller_did_str,
+        Some(&tool_invoked_payload),
+    ) {
+        state.saga_pending.insert(
+            saga_id.clone(),
+            SagaPreparedState::CrossContextToolInvocation(prepared),
+        );
+        return Err((true, e));
+    }
 
     // Durably capture the output + signed receipt keyed by SagaId (§6.2.4
-    // "Exactly-once execution with durable output capture") and clear the
-    // staged slot (the session reservation is now applied via the capture).
+    // "Exactly-once execution with durable output capture"). The staged slot was
+    // already removed up front (the session reservation is now applied via the
+    // capture).
     state.xctx_committed_outputs.insert(
         saga_id.clone(),
         CommittedToolInvocation {
@@ -1003,20 +1041,17 @@ fn commit_b_first_settle(
             tool_invoked_event_id: event_id.clone(),
         },
     );
-    state.saga_pending.remove(saga_id);
 
     // Class-S sync-persist fail-closed BEFORE acking (ADR-049 §9): the durable
     // output capture MUST land before the caller learns Commit-B succeeded, or a
-    // crash in the coalesce window would re-invoke the tool on replay. On
-    // persist failure roll the capture + slot back so a retry re-runs settle.
+    // crash in the coalesce window would re-invoke the tool on replay. On persist
+    // failure roll the capture back and RE-INSERT the OWNED original staged slot
+    // verbatim so a retry re-runs settle.
     if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
         state.xctx_committed_outputs.remove(saga_id);
         state.saga_pending.insert(
             saga_id.clone(),
-            SagaPreparedState::CrossContextToolInvocation(reprepare_from_receipt(
-                &receipt,
-                &tool_registration_id,
-            )),
+            SagaPreparedState::CrossContextToolInvocation(prepared),
         );
         return Err((true, persist_err));
     }
@@ -1074,30 +1109,6 @@ fn build_signed_receipt(
             "SCP-SAGA-13034: Commit-B receipt signing failed: {e}"
         ))
     })
-}
-
-/// Reconstruct the staged [`CrossContextToolInvocationPrepared`] from a built
-/// receipt, used ONLY to roll the `saga_pending` slot back on a Commit-B
-/// persist failure (so a retry re-runs settle cleanly). Every field is
-/// recoverable from the receipt (which is built from the staged prepared).
-fn reprepare_from_receipt(
-    receipt: &CrossContextToolReceipt,
-    tool_registration_id: &str,
-) -> CrossContextToolInvocationPrepared {
-    CrossContextToolInvocationPrepared {
-        caller_context_id: receipt.caller_context_id,
-        target_context_id: receipt.target_context_id,
-        caller_did: DID(receipt.caller_did.clone()),
-        tool_registration_id: tool_registration_id.to_owned(),
-        // The UCAN proof id is not carried on the receipt; the rolled-back slot
-        // only needs to be a well-formed cross-context prepared so a retried
-        // settle re-signs. The proof was already validated at Prepare-B and the
-        // re-signed receipt does not depend on it.
-        ucan_proof_id: String::new(),
-        recorded_timestamp_ms: receipt.timestamp_ms,
-        recorded_nonce: receipt.nonce,
-        recorded_chain_depth: receipt.chain_depth,
-    }
 }
 
 /// JCS-encode a [`CrossContextToolReceipt`] to the wire bytes the FSM forwards.
@@ -1212,6 +1223,23 @@ async fn commit_a(
 
     let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
+}
+
+/// Commit-A witness check (spec §17.16.4). Runs on the LOCAL caller-context
+/// actor. READ-ONLY: reports whether this `SagaId`'s Commit-A is already durably
+/// recorded in `xctx_committed_invocations`. The FSM calls this to resolve a
+/// Commit-A whose ACK was lost AFTER the handler durably committed (the held
+/// reservation is gone, so a fresh `CommitA` send cannot re-drive it). A `true`
+/// reply IS the idempotent A-side re-ack — the saga resolves to `Committed`
+/// rather than a spurious `NeedsRepair`. No mutation, no Class-S persist.
+fn commit_a_check_witness(
+    state: &PerContextState,
+    saga_id: &SagaId,
+    reply: tokio::sync::oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    let recorded = state.xctx_committed_invocations.contains(saga_id);
+    let _ = reply.send(Ok(recorded));
+    Outcome::ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1935,6 +1963,73 @@ mod tests {
         assert!(matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13019")));
     }
 
+    /// FIX 4 (BLACK-624-01): the nonce-dedup replay protection SURVIVES a crash.
+    /// A `CrossContextToolInvoke` whose nonce was accepted, then the actor
+    /// crashes and restores from its snapshot, then the SAME envelope is
+    /// re-submitted under a FRESH `SagaId`, MUST be rejected by the rehydrated
+    /// nonce-dedup cache. Before this fix the cache reinitialized EMPTY on
+    /// restore, so a crash inside the 5-minute TTL re-opened the replay.
+    ///
+    /// We accept a nonce via `prepare_b`, project the live state to a snapshot
+    /// (the Class-S persistence path), simulate restore by rehydrating a FRESH
+    /// state's nonce-dedup from that snapshot (mirroring `restore_context`), then
+    /// re-submit the same nonce under a new `SagaId` — it is rejected.
+    #[tokio::test]
+    async fn nonce_dedup_survives_crash_and_blocks_fresh_saga_replay() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut st = target_state(0x6A, OTHER, CALLER).await;
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = deps.clock.now_millis();
+        let now_secs = deps.clock.now_secs();
+
+        // Accept the envelope under its original SagaId — records the nonce.
+        let replay_nonce = [0x42u8; 16];
+        let mut first = prepare_b_request(0x6A, None, 2, now_ms);
+        first.saga_id = SagaId("original-saga".to_owned());
+        first.asserted_nonce = replay_nonce;
+        let (tx, rx) = oneshot::channel();
+        let out = prepare_b(&mut st, &deps, first, tx).await;
+        assert!(out.result.is_ok(), "first prepare_b: {:?}", out.result);
+        rx.await.unwrap().expect("first prepare_b accepts");
+        assert!(
+            st.xctx_nonce_dedup.entries().contains_key(&replay_nonce),
+            "the accepted nonce was recorded"
+        );
+
+        // Project the live state to its Class-S snapshot — the persisted form a
+        // restore rehydrates from. The nonce-dedup cache must be carried.
+        let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(&st);
+        assert!(
+            snapshot.xctx_nonce_dedup.contains_key(&replay_nonce),
+            "the nonce-dedup cache MUST be in the Class-S snapshot (crash-surviving)"
+        );
+
+        // Simulate restore: a FRESH actor state whose nonce-dedup is rehydrated
+        // from the snapshot (mirrors `restore_context`'s `NonceDedup::from_entries`).
+        let mut restored = target_state(0x6A, OTHER, CALLER).await;
+        restored.xctx_nonce_dedup =
+            scp_protocol::crypto::sender_keys::NonceDedup::from_entries(snapshot.xctx_nonce_dedup);
+
+        // Re-submit the SAME envelope under a FRESH SagaId after the "crash".
+        let mut replay = prepare_b_request(0x6A, None, 2, now_ms);
+        replay.saga_id = SagaId("fresh-replay-saga".to_owned());
+        replay.asserted_nonce = replay_nonce;
+        let _ = now_secs; // freshness uses the clock; nonce dedup is the gate here.
+        let (tx, rx) = oneshot::channel();
+        let out = prepare_b(&mut restored, &deps, replay, tx).await;
+        assert!(out.result.is_err(), "fresh-SagaId replay must be rejected");
+        let err = rx.await.unwrap().expect_err("replay rejected");
+        assert!(
+            matches!(err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13019")),
+            "the rehydrated nonce-dedup cache MUST reject the cross-crash fresh-SagaId replay"
+        );
+    }
+
     #[tokio::test]
     async fn prepare_b_rejects_chain_depth_overflow() {
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
@@ -2432,5 +2527,76 @@ mod tests {
         // The capture was rolled back; the staged slot restored for a retry.
         assert!(!st.xctx_committed_outputs.contains_key(&saga));
         assert!(st.saga_pending.contains_key(&saga));
+    }
+
+    /// FIX 6 (simplifier): a Commit-B settle persist-failure rollback RE-INSERTS
+    /// the OWNED ORIGINAL staged slot verbatim — no lossy reconstruction. The
+    /// deleted `reprepare_from_receipt` rebuilt the slot from the receipt and
+    /// DROPPED `ucan_proof_id` (the receipt does not carry it), so a gated tool's
+    /// restored slot lost its proof index. This stages a slot with a non-empty
+    /// `ucan_proof_id`, fails the settle persist, and asserts the restored slot
+    /// preserves the proof index byte-for-byte.
+    #[tokio::test]
+    async fn commit_b_settle_persist_failure_restores_full_original_slot() {
+        use crate::context::supervisor::saga_prepared_state::{
+            CrossContextToolInvocationPrepared, SagaPreparedState,
+        };
+
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut st = target_state(0xCB, OTHER, CALLER).await;
+        let saga = SagaId("saga-settle-restore-full".to_owned());
+
+        // Stage a slot DIRECTLY with a non-empty `ucan_proof_id` (a gated tool's
+        // proof index) — the field the lossy inverse used to drop.
+        let original = CrossContextToolInvocationPrepared {
+            caller_context_id: [0xCC; 32],
+            target_context_id: [0xCB; 32],
+            caller_did: DID(CALLER.to_owned()),
+            tool_registration_id: TOOL.to_owned(),
+            ucan_proof_id: "gated-proof-index-42".to_owned(),
+            recorded_timestamp_ms: 1_700_000_000_000,
+            recorded_nonce: [0x42; 16],
+            recorded_chain_depth: 3,
+        };
+        st.saga_pending.insert(
+            saga.clone(),
+            SagaPreparedState::CrossContextToolInvocation(original),
+        );
+
+        // Settle with a FAILING persistence: the capture rolls back and the slot
+        // is re-inserted.
+        let fail_deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_settle(
+            &mut st,
+            &fail_deps,
+            &saga,
+            br#"{"result":5}"#.to_vec(),
+            &signing_key_bytes(0xBB),
+            tx,
+        )
+        .await;
+        assert!(out.result.is_err());
+        let err = rx.await.unwrap().expect_err("persist must fail-close");
+        assert!(matches!(err, ContextError::PersistenceFailed(_)));
+
+        // The restored slot preserves the FULL original — including the
+        // `ucan_proof_id` the deleted lossy inverse would have dropped.
+        let restored = st.saga_pending.get(&saga).expect("slot restored");
+        let SagaPreparedState::CrossContextToolInvocation(p) = restored else {
+            panic!("restored slot must be a cross-context prepared");
+        };
+        assert_eq!(
+            p.ucan_proof_id, "gated-proof-index-42",
+            "the restored slot must preserve ucan_proof_id (no lossy reconstruction)"
+        );
+        assert_eq!(p.recorded_nonce, [0x42; 16]);
+        assert_eq!(p.recorded_chain_depth, 3);
+        assert!(!st.xctx_committed_outputs.contains_key(&saga));
     }
 }

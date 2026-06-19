@@ -939,6 +939,33 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub xctx_committed_invocations:
         std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId>,
+
+    /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
+    /// tool invocation (spec §6.2.4 "Freshness / anti-replay"). The serialized
+    /// projection of
+    /// [`PerContextState::xctx_nonce_dedup`](crate::context::actor::state::PerContextState::xctx_nonce_dedup):
+    /// `{16-byte nonce → first-seen Unix secs}`.
+    ///
+    /// **Class S** — synchronously-persisted, fail-closed, mirroring
+    /// [`Self::saga_pending`]. This cache is the ONLY gate against a replayed
+    /// `CrossContextToolInvoke` envelope re-submitted under a FRESH `SagaId`
+    /// within the 5-minute TTL (the `SagaId` idempotency witnesses and the
+    /// `xctx_committed_outputs` short-circuit only catch a SAME-`SagaId` replay).
+    /// If it reinitialized empty on restore, an actor crash inside the TTL window
+    /// would let an attacker re-run a charging tool (BLACK-624-01). Persisting it
+    /// makes Prepare-B's recorded-nonce rejection actually survive a restart —
+    /// the recorded nonce is already deliberately KEPT on the reject path "for
+    /// replay protection", and this is what makes that intent durable.
+    ///
+    /// Same-node restore REHYDRATES it (via
+    /// [`NonceDedup::from_entries`](scp_protocol::crypto::sender_keys::NonceDedup::from_entries),
+    /// with the per-entry TTL pruned lazily on the next check); cross-node
+    /// `import_context` / `strip_snapshot_for_public` DROP it to empty — B's
+    /// freshness state has no authority on a foreign node, and a fresh node
+    /// starts its own replay window. `#[serde(default)]` so legacy / stripped
+    /// snapshots deserialize as an empty cache.
+    #[serde(default)]
+    pub xctx_nonce_dedup: HashMap<[u8; 16], u64>,
 }
 
 /// Default routing variant for degraded / pre-routing-field snapshots.

@@ -2123,6 +2123,7 @@ pub fn build_snapshot_from_state(
         saga_pending: saga_pending_snapshot(state),
         xctx_committed_outputs: xctx_committed_outputs_snapshot(state),
         xctx_committed_invocations: state.xctx_committed_invocations.clone(),
+        xctx_nonce_dedup: xctx_nonce_dedup_snapshot(state),
     }
 }
 
@@ -2172,6 +2173,21 @@ pub(in crate::context) fn xctx_committed_outputs_snapshot(
     crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
 > {
     state.xctx_committed_outputs.clone()
+}
+
+/// Build the Class-S snapshot projection of the actor's B-owned cross-context
+/// nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"; ADR-049 §9). The
+/// live [`NonceDedup`](scp_protocol::crypto::sender_keys::NonceDedup) projects
+/// to a plain `{nonce → first-seen secs}` map via `entries()`. Persisting it at
+/// every snapshot builder makes the replay-protection cache CRASH-SURVIVING: a
+/// restart no longer reopens the 5-minute window for a fresh-`SagaId` replay of
+/// a `CrossContextToolInvoke` (BLACK-624-01). Same-node restore rehydrates it;
+/// cross-node export/import drops it to empty (B's freshness state has no
+/// authority on a foreign node).
+pub(in crate::context) fn xctx_nonce_dedup_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<[u8; 16], u64> {
+    state.xctx_nonce_dedup.entries()
 }
 
 // ---------------------------------------------------------------------------

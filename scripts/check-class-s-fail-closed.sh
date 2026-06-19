@@ -112,6 +112,16 @@
 #                                    method call, so they are NOT flagged — only
 #                                    the live-state `.insert(` / `.remove(`
 #                                    mutations are.)
+#     xctx_nonce_dedup.record(     — RECORDS an accepted cross-context invoke
+#                                    nonce in B's anti-replay dedup cache
+#                                    (spec §6.2.4 "Freshness / anti-replay").
+#                                    The cache is Class-S persisted (it is the
+#                                    only gate against a fresh-SagaId replay
+#                                    within the 5-min TTL); a coalesce-window
+#                                    rollback that re-opened a recorded nonce
+#                                    would re-admit a replay (BLACK-624-01). The
+#                                    Prepare-B handler records then persists
+#                                    fail-closed BEFORE acking.
 #
 # ---------------------------------------------------------------------------
 # HOW A MUTATING FUNCTION IS SATISFIED
@@ -295,6 +305,7 @@ executed_proposals.insert( \
 threshold_signers.retain( \
 saga_pending.insert( \
 saga_pending.remove( \
+xctx_nonce_dedup.record( \
 threshold_value= \
 role_state.ceiling="
 

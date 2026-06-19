@@ -143,6 +143,92 @@ impl ContextActorHandle {
         }
     }
 
+    /// Like [`Self::send`], but RECOVERS the un-delivered command when the
+    /// mailbox send itself fails, so a caller that moved an unbalanced,
+    /// must-consume payload (e.g. a `ToolEconomyTicket`-bearing reservation)
+    /// into the command can reclaim and balance it instead of dropping it.
+    ///
+    /// [`Self::send`] builds the command, then on a full/closed mailbox drops
+    /// the built command INSIDE the send — the caller never gets it back. For a
+    /// command carrying a `#[must_use]` ticket whose `Drop` debug-asserts on an
+    /// unbalanced drop, that is a panic under `--features testing` (and an
+    /// escrow leak in release). This variant instead returns the built command
+    /// back on a send failure so the caller can extract and reverse the ticket.
+    ///
+    /// Returns:
+    /// - `Ok(T)` — the command was delivered and the handler replied `Ok`.
+    /// - `Err((error, Some(cmd)))` — the mailbox send FAILED (full for the full
+    ///   [`SEND_TIMEOUT`], or the inbox is closed); `cmd` is the un-delivered
+    ///   command (boxed — `ContextCommand` is large), returned for ticket
+    ///   recovery. The command NEVER reached the actor, so no handler-side
+    ///   effect occurred.
+    /// - `Err((error, None))` — the command WAS delivered but the handler
+    ///   replied with a typed error (or dropped the reply channel). There is no
+    ///   command to recover (the actor owns its outcome); the handler-side
+    ///   effect, if any, is the handler's responsibility.
+    ///
+    /// # Errors
+    ///
+    /// Same error classes as [`Self::send`]; the `Option<Box<ContextCommand>>`
+    /// half distinguishes a never-delivered send (recoverable) from a delivered
+    /// handler error (not recoverable).
+    pub async fn send_recover_on_failure<T, F>(
+        &self,
+        cmd_factory: F,
+    ) -> Result<T, (ContextError, Option<Box<ContextCommand>>)>
+    where
+        F: FnOnce(oneshot::Sender<Result<T, ContextError>>) -> ContextCommand,
+    {
+        // Reserve a mailbox slot BEFORE building the command, so the command is
+        // never moved into a cancellable send future. `reserve()` is cancel-safe
+        // and yields a `Permit` (or a closed error) WITHOUT consuming any value;
+        // the timeout therefore cannot strand a built command. Only once a slot
+        // is secured do we build the reply-bearing command and `permit.send` it
+        // (a synchronous, infallible enqueue). On reserve timeout / closed inbox
+        // we build the command anyway and hand it BACK for ticket recovery —
+        // the actor never saw it, so no handler-side effect occurred.
+        let permit = match tokio::time::timeout(SEND_TIMEOUT, self.inbox.reserve()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => {
+                let (tx, _rx) = oneshot::channel::<Result<T, ContextError>>();
+                return Err((
+                    ContextError::ActorBusy(
+                        "actor inbox is closed — actor has terminated".to_owned(),
+                    ),
+                    Some(Box::new(cmd_factory(tx))),
+                ));
+            }
+            Err(_elapsed) => {
+                let (tx, _rx) = oneshot::channel::<Result<T, ContextError>>();
+                return Err((
+                    ContextError::ActorBusy(format!(
+                        "mailbox full for {} seconds",
+                        SEND_TIMEOUT.as_secs()
+                    )),
+                    Some(Box::new(cmd_factory(tx))),
+                ));
+            }
+        };
+
+        let (tx, rx) = oneshot::channel::<Result<T, ContextError>>();
+        permit.send(cmd_factory(tx));
+
+        // Delivered: the command reached the actor. A reply error (or a dropped
+        // reply channel) is NOT recoverable — the actor owns the outcome — so
+        // the un-delivered slot is `None`.
+        rx.await.map_or_else(
+            |_| {
+                Err((
+                    ContextError::ActorBusy(
+                        "actor dropped reply channel before replying".to_owned(),
+                    ),
+                    None,
+                ))
+            },
+            |reply| reply.map_err(|e| (e, None)),
+        )
+    }
+
     /// Submits a pre-built command to the actor's mailbox with a
     /// caller-supplied send-side timeout. **Does NOT wait for the
     /// reply.** Reply consumption is the caller's responsibility — the
@@ -270,6 +356,58 @@ mod tests {
             ),
             other => panic!("expected ActorBusy, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_recover_on_failure_returns_command_on_closed_mailbox() {
+        // FIX 1 core: a send to a closed mailbox RETURNS the un-delivered
+        // command instead of dropping it, so a caller that moved a must-use
+        // payload (a ToolEconomyTicket-bearing reservation) into the command can
+        // reclaim and balance it rather than tripping the ticket's drop guard.
+        let (tx, rx) = mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        let handle = ContextActorHandle::from_sender(tx);
+        let result: Result<(), _> = handle
+            .send_recover_on_failure(|reply| {
+                ContextCommand::Messaging(MessagingCommand::Placeholder { reply })
+            })
+            .await;
+        let (err, recovered) = result.expect_err("closed mailbox must error");
+        match err {
+            ContextError::ActorBusy(msg) => {
+                assert!(msg.contains("closed"), "expected 'closed', got {msg:?}");
+            }
+            other => panic!("expected ActorBusy, got {other:?}"),
+        }
+        let cmd = recovered.expect("the un-delivered command must be returned for recovery");
+        assert!(
+            matches!(
+                *cmd,
+                ContextCommand::Messaging(MessagingCommand::Placeholder { .. })
+            ),
+            "the recovered command must be the SAME command we attempted to send"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_recover_on_failure_delivers_and_returns_ok() {
+        // The happy path: a live actor receives the command and replies Ok.
+        let (tx, mut rx) = mpsc::channel::<ContextCommand>(1);
+        let handle = ContextActorHandle::from_sender(tx);
+        let actor = tokio::spawn(async move {
+            if let Some(ContextCommand::Messaging(MessagingCommand::Placeholder { reply })) =
+                rx.recv().await
+            {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        let result: Result<(), _> = handle
+            .send_recover_on_failure(|reply| {
+                ContextCommand::Messaging(MessagingCommand::Placeholder { reply })
+            })
+            .await;
+        assert!(result.is_ok(), "delivered command must return Ok");
+        actor.await.unwrap();
     }
 
     #[tokio::test]

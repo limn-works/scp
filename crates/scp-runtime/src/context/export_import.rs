@@ -824,6 +824,9 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         saga_pending: HashMap::new(),
         xctx_committed_outputs: HashMap::new(),
         xctx_committed_invocations: std::collections::HashSet::new(),
+        // B's freshness/replay cache has no authority on a foreign node and a
+        // fresh node starts its own replay window — dropped from the export.
+        xctx_nonce_dedup: HashMap::new(),
     })
 }
 
@@ -1014,6 +1017,9 @@ mod tests {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
+            // B's freshness/replay cache has no authority on a foreign node and
+            // a fresh node starts its own replay window — dropped from export.
+            xctx_nonce_dedup: HashMap::new(),
         }
     }
 
@@ -2474,6 +2480,15 @@ mod tests {
             .insert(Capability::MemberInvite);
         snapshot.role_state.members.insert("did:key:m1".to_owned());
         snapshot.role_state.members.insert("did:key:m2".to_owned());
+        // Cross-context anti-replay nonce-dedup cache (Class-S, FIX 4): an
+        // accepted-nonce entry must round-trip so the replay window survives a
+        // restart (BLACK-624-01).
+        snapshot
+            .xctx_nonce_dedup
+            .insert([0xABu8; 16], 1_700_000_123);
+        snapshot
+            .xctx_nonce_dedup
+            .insert([0xCDu8; 16], 1_700_000_456);
 
         // MessagePack persistence round-trip (the path used by
         // ContextPersistence::persist_context / load).
@@ -2498,6 +2513,16 @@ mod tests {
                 .ceiling
                 .capabilities
                 .contains(&Capability::MemberInvite)
+        );
+        // The nonce-dedup cache survives the persistence round-trip value-stable.
+        assert_eq!(decoded.xctx_nonce_dedup.len(), 2);
+        assert_eq!(
+            decoded.xctx_nonce_dedup.get(&[0xABu8; 16]).copied(),
+            Some(1_700_000_123)
+        );
+        assert_eq!(
+            decoded.xctx_nonce_dedup.get(&[0xCDu8; 16]).copied(),
+            Some(1_700_000_456)
         );
     }
 

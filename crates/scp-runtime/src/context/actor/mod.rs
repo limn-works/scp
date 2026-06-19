@@ -723,6 +723,11 @@ impl ContextActor {
             ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle { reply, .. }) => {
                 ack_not_impl(reply, "saga_phase");
             }
+            // CommitACheckWitness replies a distinct `bool` outcome shape, so it
+            // is acked separately from the unit-reply phase arms.
+            ContextCommand::SagaPhase(SagaPhaseMessage::CommitACheckWitness { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
             ContextCommand::SagaPhase(
                 SagaPhaseMessage::CommitA { reply, .. }
                 | SagaPhaseMessage::Abort { reply, .. }

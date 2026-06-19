@@ -534,5 +534,6 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
             state,
         ),
         xctx_committed_invocations: state.xctx_committed_invocations.clone(),
+        xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(state),
     }
 }

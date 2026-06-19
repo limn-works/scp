@@ -2274,14 +2274,21 @@ pub async fn restore_context(
             .into_iter()
             .map(|(id, mirror)| (id, mirror.into_prepared()))
             .collect(),
-        // B-owned cross-context tool-invoke validation state (spec §6.2.4) is
-        // NOT in the Class-S snapshot: it is reconstructable interface state
-        // (UCAN proof index) and freshness/replay cache, repopulated when the
-        // tool interface is (re-)established. A coalesce-window rollback of
-        // freshness state is bounded by the §6.2.4 budget, not authorization
-        // secrecy, so restore starts both fresh.
+        // B-owned UCAN proof index (spec §6.2.4) is NOT in the Class-S snapshot:
+        // it is reconstructable interface state, repopulated when the tool
+        // interface is (re-)established.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
-        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::new(),
+        // ADR-049 §9 Class S: same-node restore REHYDRATES B's anti-replay
+        // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
+        // ONLY gate against a fresh-`SagaId` replay of a `CrossContextToolInvoke`
+        // within the 5-minute TTL; reinitializing it empty on restore would let
+        // a crash inside the window re-open a charging-tool replay (BLACK-624-01).
+        // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
+        // import drops it (the snapshot field is empty), so a foreign node starts
+        // its own window.
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::from_entries(
+            ctx_snapshot.xctx_nonce_dedup,
+        ),
         // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
         // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
         // with durable output capture") so a Commit replayed after a crash

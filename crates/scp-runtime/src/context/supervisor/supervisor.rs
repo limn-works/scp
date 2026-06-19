@@ -57,6 +57,7 @@ use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
 use crate::economy::adapter::PaymentAdapterDyn;
+use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -206,6 +207,20 @@ type SagaToolExecutor<'a> = Box<
 type XctxPrepared =
     crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
 
+/// Outcome of a §17.16.4 Commit-in-progress recovery re-drive. The crash
+/// recovery re-drives the idempotent Commit-B and re-acks Commit-A from the
+/// durable witness, then journals the resolved terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitInProgressResolution {
+    /// BOTH sides committed (B re-emitted the stored output AND the A-side
+    /// `xctx_committed_invocations` witness is present): the saga is fully
+    /// committed — resolve to `Committed`, NOT a false `NeedsRepair`.
+    Committed,
+    /// Genuinely unresolvable divergence (B committed but A did not, B never
+    /// landed, or a side is unreachable): stays `NeedsRepair` for operator repair.
+    NeedsRepair,
+}
+
 /// The owned per-side plan [`Supervisor::divergence_marker_plan`] produces for
 /// a `NeedsRepair` divergence: `(committed_event_id, nonce, [(side-label,
 /// context_id, that side's Active Signing Key); 2])`. Each side signs + appends
@@ -276,6 +291,15 @@ struct CrossContextSagaCtx<'a> {
     caller_signing_key: ed25519_dalek::SigningKey,
     /// The supervisor-side tool executor, taken once at Commit-B.
     executor: Option<SagaToolExecutor<'a>>,
+    /// The captured tool output bytes, stashed the moment the executor runs
+    /// ONCE (Commit-B first execute), so a transient Commit-B SETTLE failure is
+    /// retryable WITHOUT re-invoking the tool (spec §6.2.4 "Exactly-once
+    /// execution"). On a retry the reserve returns `ReadyToExecute` (the capture
+    /// was rolled back by the failed settle's persist), but the tool already ran
+    /// and had side effects — so the FSM re-sends `CommitBSettle` with THESE
+    /// stashed bytes rather than calling the (already-taken) executor again.
+    /// `Some` ⇒ the tool has executed; never call the executor when this is set.
+    executor_output: Option<Vec<u8>>,
     /// Prepare-A's held reservation (settled at Commit-A, released on abort).
     prepared_a: Option<crate::context::actor::commands::PreparedAFields>,
     /// Prepare-B's recorded provenance (B's clock / nonce / re-derived depth).
@@ -4796,6 +4820,7 @@ impl Supervisor {
             target_signing_key: target_signing_key.clone(),
             caller_signing_key: caller_signing_key.clone(),
             executor: Some(boxed_executor),
+            executor_output: None,
             prepared_a: None,
             prepared_b: None,
             committed: None,
@@ -5097,38 +5122,7 @@ impl Supervisor {
                 );
             }
             SagaState::Committing => {
-                // §17.16.4 Commit-in-progress: re-send Commit, idempotent by
-                // SagaId. B re-acks the existing `ToolInvoked` and re-emits the
-                // STORED output (NEVER re-invoking the tool); A re-acks its
-                // `CrossContextToolInvoked` and re-settles escrow as a no-op. For
-                // a reconstructible cross-context entry this re-drives the
-                // idempotent Commit-B reserve (asserting `AlreadyCommitted`); the
-                // saga then stays unresolved as `NeedsRepair` for operator review
-                // because the post-crash coordinator no longer holds the Prepare-A
-                // reservation handle the A-side settle consumes (that handle is
-                // re-supplied by the Phase-2D startup loop, which threads the
-                // per-call signing key + reservation; see
-                // [`Self::redrive_xctx_commit_in_progress`]).
-                if let Some(prepared) = Self::reconstruct_xctx_prepared(&entry) {
-                    self.redrive_xctx_commit_in_progress(&entry.saga_id, &prepared)
-                        .await;
-                }
-                let _ = self
-                    .saga_journal
-                    .append(JournalEntry {
-                        saga_id: entry.saga_id.clone(),
-                        state: SagaState::NeedsRepair,
-                        participants: entry.participants.clone(),
-                        evidence: Zeroizing::new(Vec::new()),
-                        timestamp_ms: current_timestamp_ms(),
-                        seq_per_saga: entry.seq_per_saga.saturating_add(1),
-                    })
-                    .await;
-                tracing::error!(
-                    saga_id = %entry.saga_id,
-                    "saga recovery — Committing (Commit-in-progress) observed; re-drove the \
-                     idempotent Commit-B (no re-invoke) and marked NeedsRepair for operator review"
-                );
+                self.recover_committing_entry(&entry).await;
             }
             SagaState::Aborting => {
                 // An Aborting entry's rollback never completed; re-resolve to
@@ -5160,6 +5154,64 @@ impl Supervisor {
             SagaState::Committed | SagaState::Aborted => {
                 // Terminal — not returned by load_unresolved but
                 // defensively handled here.
+            }
+        }
+    }
+
+    /// §17.16.4 Commit-in-progress recovery for a `Committing` journal entry.
+    /// Re-drives the idempotent Commit (NEVER re-invoking the tool): B re-acks
+    /// the existing `ToolInvoked` and re-emits the STORED output; A re-acks from
+    /// the durable `xctx_committed_invocations` witness (keyed on the Class-S
+    /// witness, NOT the in-memory reservation that died with the crash). If BOTH
+    /// sides committed the saga is FULLY committed and resolves to `Committed`;
+    /// only a genuinely-unresolvable divergence (one-sided commit / unreachable
+    /// side / non-reconstructible entry) stays `NeedsRepair` for operator repair.
+    async fn recover_committing_entry(&self, entry: &JournalEntry) {
+        let resolution = match Self::reconstruct_xctx_prepared(entry) {
+            Some(prepared) => {
+                self.redrive_xctx_commit_in_progress(&entry.saga_id, &prepared)
+                    .await
+            }
+            None => CommitInProgressResolution::NeedsRepair,
+        };
+        match resolution {
+            CommitInProgressResolution::Committed => {
+                // Fully committed: mark the journal resolved (overwrite the
+                // resolution marker as secure evidence — same as the live commit
+                // path). `secret_bearing=false`: the §6.2.4 saga resolution
+                // markers carry no bearer secret.
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(
+                        entry.saga_id.clone(),
+                        SagaTerminalState::Committed,
+                        /*secret_bearing=*/ false,
+                    )
+                    .await;
+                tracing::info!(
+                    saga_id = %entry.saga_id,
+                    "saga recovery — Commit-in-progress resolved to Committed (B re-emitted, A \
+                     witness present); no operator repair required"
+                );
+            }
+            CommitInProgressResolution::NeedsRepair => {
+                let _ = self
+                    .saga_journal
+                    .append(JournalEntry {
+                        saga_id: entry.saga_id.clone(),
+                        state: SagaState::NeedsRepair,
+                        participants: entry.participants.clone(),
+                        evidence: Zeroizing::new(Vec::new()),
+                        timestamp_ms: current_timestamp_ms(),
+                        seq_per_saga: entry.seq_per_saga.saturating_add(1),
+                    })
+                    .await;
+                tracing::error!(
+                    saga_id = %entry.saga_id,
+                    "saga recovery — Commit-in-progress observed; re-drove the idempotent Commit-B \
+                     (no re-invoke) but could not confirm both sides committed — marked \
+                     NeedsRepair for operator review"
+                );
             }
         }
     }
@@ -5234,22 +5286,24 @@ impl Supervisor {
     /// the actor replies `AlreadyCommitted` with the stored receipt/output, so
     /// the tool is not re-run.
     ///
-    /// The A-side re-ack (re-settle escrow as a no-op) is a journal-driven step
-    /// the Phase-2D startup loop completes: re-driving the A-side
-    /// `CrossContextToolInvoked` re-ack requires the per-call caller Active
-    /// Signing Key and the Prepare-A reservation handle — neither survives a
-    /// crash, so the 2D loop re-supplies them (exactly as
-    /// [`Self::start_cross_context_tool_invocation_saga`] supplies them on the
-    /// live path). Until that handle is re-threaded the saga remains unresolved
-    /// as `NeedsRepair` (the caller marks it so), which an operator reconciles
-    /// against B's re-emitted (idempotent) output. The B-side re-emission is the
-    /// security-critical half (no re-invoke); the A-side re-ack is an
-    /// idempotency no-op the operator/2D-loop settles.
+    /// Then re-acks the A side FROM THE DURABLE WITNESS: `commit_a` keys
+    /// idempotency on the Class-S `xctx_committed_invocations` witness (not the
+    /// in-memory reservation that died with the crash), so a Commit-A that
+    /// durably landed before the crash is observable NOW. This re-drive queries
+    /// the caller actor's witness ([`SagaPhaseMessage::CommitACheckWitness`]); if
+    /// BOTH sides are committed (B `AlreadyCommitted` + the A witness present)
+    /// the saga is FULLY committed and resolves to `Committed` — not a spurious
+    /// `NeedsRepair`. Only a genuinely-unresolvable divergence (B committed but A
+    /// did not, or a side is unreachable) stays `NeedsRepair`.
     ///
-    /// Invoked by [`Self::recover_saga_entry`] on a `Committing` entry, which is
-    /// driven by the Phase-2D startup replay loop
-    /// ([`Self::replay_unresolved_sagas`]).
-    async fn redrive_xctx_commit_in_progress(&self, saga_id: &SagaId, prepared: &XctxPrepared) {
+    /// Returns the resolution so [`Self::recover_saga_entry`] journals the right
+    /// terminal. Invoked by `recover_saga_entry` on a `Committing` entry, driven
+    /// by the Phase-2D startup replay loop ([`Self::replay_unresolved_sagas`]).
+    async fn redrive_xctx_commit_in_progress(
+        &self,
+        saga_id: &SagaId,
+        prepared: &XctxPrepared,
+    ) -> CommitInProgressResolution {
         use crate::context::actor::commands::{CommitBReserveOutcome, SagaPhaseMessage};
         let target_hex = hex::encode(prepared.target_context_id);
         let Some(target) = self.lookup(&target_hex) else {
@@ -5259,7 +5313,7 @@ impl Supervisor {
                 "saga recovery — Commit-in-progress re-drive: target actor unreachable; operator \
                  repair required"
             );
-            return;
+            return CommitInProgressResolution::NeedsRepair;
         };
         let reserve_saga_id = saga_id.clone();
         let reserve = target
@@ -5275,20 +5329,25 @@ impl Supervisor {
                 tracing::info!(
                     saga_id = %saga_id.0,
                     "saga recovery — Commit-in-progress re-drive: target re-emitted the STORED \
-                     output (no re-invoke), idempotent by SagaId"
+                     output (no re-invoke), idempotent by SagaId; checking the A-side witness"
                 );
+                // B committed. Re-ack the A side from the durable witness: if
+                // Commit-A also landed before the crash the saga is fully
+                // committed — resolve to Committed, not a false NeedsRepair.
+                self.redrive_commit_a_witness(saga_id, prepared).await
             }
             Ok(CommitBReserveOutcome::ReadyToExecute) => {
                 // Commit-B had NOT durably landed before the crash; the tool was
                 // never executed, so there is no stored output to re-emit. NEVER
                 // re-invoke on the recovery path — the live initiator retries
-                // fresh (spec §17.16.4 "the initiator retries fresh"). Leave it
-                // for operator/NeedsRepair review.
+                // fresh (spec §17.16.4 "the initiator retries fresh"). No side
+                // committed, so this is a clean abort-equivalent, not a divergence.
                 tracing::warn!(
                     saga_id = %saga_id.0,
                     "saga recovery — Commit-in-progress re-drive: target reports ReadyToExecute \
                      (Commit-B never durably landed); NOT re-invoking — initiator retries fresh"
                 );
+                CommitInProgressResolution::NeedsRepair
             }
             Err(err) => {
                 tracing::warn!(
@@ -5297,6 +5356,69 @@ impl Supervisor {
                     "saga recovery — Commit-in-progress re-drive: Commit-B reserve send failed; \
                      operator repair required"
                 );
+                CommitInProgressResolution::NeedsRepair
+            }
+        }
+    }
+
+    /// Re-ack the A side of a Commit-in-progress recovery from the durable
+    /// `xctx_committed_invocations` witness (spec §17.16.4). Queries the caller
+    /// actor read-only; a present witness means Commit-A durably landed before
+    /// the crash, so the (B-committed) saga is FULLY committed →
+    /// [`CommitInProgressResolution::Committed`]. An absent witness, an
+    /// unreachable caller, or a send failure means the A side did NOT commit (or
+    /// cannot be confirmed) — a genuine one-sided divergence that stays
+    /// [`CommitInProgressResolution::NeedsRepair`] for operator repair.
+    async fn redrive_commit_a_witness(
+        &self,
+        saga_id: &SagaId,
+        prepared: &XctxPrepared,
+    ) -> CommitInProgressResolution {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        let caller_hex = hex::encode(prepared.caller_context_id);
+        let Some(caller) = self.lookup(&caller_hex) else {
+            tracing::error!(
+                saga_id = %saga_id.0,
+                context = %caller_hex,
+                "saga recovery — Commit-in-progress: caller actor unreachable; cannot confirm the \
+                 A-side witness — NeedsRepair (possible one-sided commit)"
+            );
+            return CommitInProgressResolution::NeedsRepair;
+        };
+        let witness_saga_id = saga_id.clone();
+        match caller
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitACheckWitness {
+                    saga_id: witness_saga_id,
+                    reply,
+                })
+            })
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    saga_id = %saga_id.0,
+                    "saga recovery — Commit-in-progress: BOTH sides committed (B re-emitted, A \
+                     witness present); resolving to Committed (no false NeedsRepair)"
+                );
+                CommitInProgressResolution::Committed
+            }
+            Ok(false) => {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    "saga recovery — Commit-in-progress: target committed but the caller witness \
+                     is absent (Commit-A never landed) — one-sided commit, NeedsRepair"
+                );
+                CommitInProgressResolution::NeedsRepair
+            }
+            Err(err) => {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "saga recovery — Commit-in-progress: A-side witness query failed; cannot \
+                     confirm Commit-A — NeedsRepair"
+                );
+                CommitInProgressResolution::NeedsRepair
             }
         }
     }
@@ -5728,10 +5850,61 @@ impl Supervisor {
     ) -> Result<(), ContextError> {
         // Commit B (execute-or-replay) then A, per §6.2.4.
         let (receipt, output) = self.commit_b_execute_or_replay(saga_id, ctx).await?;
-        self.commit_a_settle(saga_id, ctx, &receipt, &output)
+
+        // Verify-before-settle (spec §6.2.4 "Signer authorization", normative
+        // MUST): before Commit-A settles escrow + records the provenance edge,
+        // verify B's signature over the receipt against the Active Signing Key
+        // AUTHORIZED for `target_context_id`. The FSM already holds that
+        // resolved key (`ctx.target_signing_key` — the same key it PASSED to
+        // Commit-B to sign the receipt), so verification here is equivalent to
+        // "signed by the key authorized for the target context". A verify
+        // failure aborts the Commit WITHOUT settling or recording — a forged /
+        // tampered receipt must never charge the caller or write a provenance
+        // edge. This also pins the bytes A records: the verified receipt's
+        // SIGNED `output_hash` is what Commit-A binds, not an independently
+        // recomputed hash.
+        let parsed = Self::verify_commit_b_receipt(saga_id, ctx, &receipt)?;
+
+        self.commit_a_settle(saga_id, ctx, &receipt, &parsed)
             .await?;
         ctx.committed = Some(CommittedSagaArtifacts { receipt, output });
         Ok(())
+    }
+
+    /// Verify B's signed [`CrossContextToolReceipt`] against the Active Signing
+    /// Key authorized for `target_context_id` (spec §6.2.4 "Signer
+    /// authorization", normative MUST) and return the parsed receipt for the
+    /// Commit-A binding.
+    ///
+    /// The FSM holds the resolved target key (`ctx.target_signing_key` — the key
+    /// it supplied to Commit-B for signing), so verifying the receipt's
+    /// signature against `verifying_key()` is exactly "signed by the key
+    /// authorized for `target_context_id`". On a parse or signature failure this
+    /// returns a typed error BEFORE Commit-A runs, so a forged / tampered
+    /// receipt never settles escrow or writes the provenance edge.
+    fn verify_commit_b_receipt(
+        saga_id: &SagaId,
+        ctx: &CrossContextSagaCtx<'_>,
+        receipt_bytes: &[u8],
+    ) -> Result<CrossContextToolReceipt, ContextError> {
+        let receipt: CrossContextToolReceipt =
+            serde_json::from_slice(receipt_bytes).map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "SCP-SAGA-13040: cross-context saga Commit — target receipt for saga '{}' \
+                     is not a decodable CrossContextToolReceipt: {e}",
+                    saga_id.0
+                ))
+            })?;
+        let authorized_target_key = ctx.target_signing_key.verifying_key();
+        receipt.verify(&authorized_target_key).map_err(|e| {
+            ContextError::CryptoFailed(format!(
+                "SCP-SAGA-13041: cross-context saga Commit — target receipt signature for saga \
+                 '{}' does not verify under the key authorized for the target context (forged or \
+                 tampered receipt — aborting before settle): {e}",
+                saga_id.0
+            ))
+        })?;
+        Ok(receipt)
     }
 
     /// Commit-B (target side, §6.2.4): reserve, and either replay the stored
@@ -5783,8 +5956,18 @@ impl Supervisor {
     }
 
     /// First (non-replay) Commit-B: run the supervisor-side executor (off the
-    /// actor mailbox per ADR-049 §3), then send [`SagaPhaseMessage::CommitBSettle`]
-    /// with the captured output and the target's Active Signing Key.
+    /// actor mailbox per ADR-049 §3) EXACTLY ONCE, stash its output in `ctx`, and
+    /// send [`SagaPhaseMessage::CommitBSettle`] with the captured output and the
+    /// target's Active Signing Key.
+    ///
+    /// Retryable settle (review wave-1): the tool runs only when no output is yet
+    /// stashed (`ctx.executor_output == None`). Once it has run, the output is
+    /// stashed; a transient settle FAILURE leaves `executor_output == Some` while
+    /// the actor's persist-rolled-back capture makes the next reserve report
+    /// `ReadyToExecute` again — so this is re-entered, but it RE-SENDS the settle
+    /// with the stashed bytes rather than re-invoking the tool (exactly-once
+    /// execution preserved; settle becomes retryable). The executor handle is
+    /// taken only on the genuine first execution.
     async fn commit_b_first_execute(
         &self,
         saga_id: &SagaId,
@@ -5793,25 +5976,39 @@ impl Supervisor {
     ) -> Result<(Vec<u8>, Vec<u8>), ContextError> {
         use crate::context::actor::commands::{CommitBSettleOutcome, SagaPhaseMessage};
 
-        let executor = ctx.executor.take().ok_or_else(|| {
-            ContextError::InvalidState(
-                "SCP-SAGA-13007: cross-context saga Commit-B — executor already consumed \
-                 (a non-replay Commit attempt after the tool ran is a coordinator bug)"
-                    .to_owned(),
-            )
-        })?;
-        let output_value = executor(ctx.input.clone()).await.map_err(|e| {
-            ContextError::CryptoFailed(format!(
-                "SCP-SAGA-13008: cross-context tool executor failed for saga '{}': {e}",
-                saga_id.0
-            ))
-        })?;
-        let exec_output_bytes = serde_json::to_vec(&output_value).map_err(|e| {
-            ContextError::CryptoFailed(format!(
-                "SCP-SAGA-13009: cross-context tool output is not serializable for saga '{}': {e}",
-                saga_id.0
-            ))
-        })?;
+        // Run the executor ONCE and stash its output. On a settle retry the
+        // output is already stashed — NEVER re-invoke (the tool had side
+        // effects); re-send the settle with the stashed bytes.
+        let exec_output_bytes = if let Some(stashed) = ctx.executor_output.clone() {
+            stashed
+        } else {
+            let executor = ctx.executor.take().ok_or_else(|| {
+                ContextError::InvalidState(
+                    "SCP-SAGA-13007: cross-context saga Commit-B — executor already consumed but \
+                     no output was stashed (a non-replay Commit attempt after the tool ran is a \
+                     coordinator bug)"
+                        .to_owned(),
+                )
+            })?;
+            let output_value = executor(ctx.input.clone()).await.map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "SCP-SAGA-13008: cross-context tool executor failed for saga '{}': {e}",
+                    saga_id.0
+                ))
+            })?;
+            let bytes = serde_json::to_vec(&output_value).map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "SCP-SAGA-13009: cross-context tool output is not serializable for saga \
+                     '{}': {e}",
+                    saga_id.0
+                ))
+            })?;
+            // Stash BEFORE the settle send, so a settle failure (and the actor's
+            // rolled-back capture) leaves the output recoverable for the retry —
+            // the tool is never re-invoked.
+            ctx.executor_output = Some(bytes.clone());
+            bytes
+        };
 
         // Re-resolve the target actor (the executor ran off the mailbox; a fresh
         // handle survives an interleaved respawn).
@@ -5847,14 +6044,41 @@ impl Supervisor {
     }
 
     /// Commit-A (caller side, §6.2.4): hand the held Prepare-A reservation +
-    /// the target's receipt/output to the caller actor, which settles the
+    /// the target's VERIFIED receipt to the caller actor, which settles the
     /// escrow and records `CrossContextToolInvoked` (sharing the nonce).
+    ///
+    /// Ticket-safe + witness-driven re-drive (review wave-1):
+    ///
+    /// - **Held reservation present** — the normal path. The `#[must_use]`
+    ///   reservation (holding the `ToolEconomyTicket` whose `Drop` debug-asserts
+    ///   on an unbalanced drop) is sent via [`ContextActorHandle::send_recover_on_failure`].
+    ///   If the mailbox SEND itself fails (the actor died between `lookup` and
+    ///   send, or the mailbox stayed full for the 30s `SEND_TIMEOUT`), the
+    ///   un-delivered command is returned so we RECOVER the reservation and put
+    ///   it BACK into `ctx.prepared_a`: Commit-A never landed, so the FSM retry
+    ///   re-drives Commit-B (replay, no re-invoke) → Commit-A cleanly, and the
+    ///   ticket is never dropped unbalanced. `lookup` is NOT a delivery
+    ///   guarantee — that was the unsound assumption the old code made.
+    ///
+    /// - **Reservation already consumed (`prepared_a == None`)** — a prior
+    ///   Commit-A whose ACK was LOST after the handler durably committed (the
+    ///   reservation moved into the delivered command and the actor consumed the
+    ///   ticket). We re-ack from the durable `xctx_committed_invocations` witness
+    ///   (spec §17.16.4 "A re-acks … as a no-op"): if the caller actor confirms
+    ///   the witness, the saga resolves to `Committed` rather than a spurious
+    ///   `SCP-SAGA-13007` `NeedsRepair`. If the witness is absent the Commit-A
+    ///   genuinely did not commit (a real divergence), surfaced as a typed error.
+    ///
+    /// `receipt` carries B's VERIFIED signed receipt bytes; the caller records
+    /// the receipt's SIGNED `output_jcs` as the bound output (FIX 3 MED — A's
+    /// logged `output_hash` is the receipt's signed hash, not an independent
+    /// recompute).
     async fn commit_a_settle(
         &self,
         saga_id: &SagaId,
         ctx: &mut CrossContextSagaCtx<'_>,
-        receipt: &[u8],
-        output: &[u8],
+        receipt_bytes: &[u8],
+        receipt: &CrossContextToolReceipt,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::SagaPhaseMessage;
 
@@ -5865,26 +6089,30 @@ impl Supervisor {
                  is not a co-resident actor"
             ))
         })?;
-        // The held Prepare-A reservation is consumed by Commit-A. Take it so the
-        // RAII carrier moves into the mailbox command (settle, not release). The
-        // lookup above already succeeded, so the live handle accepts the send;
-        // on a residual NeedsRepair the `run_saga` tail voids any leftover.
-        let reservation = ctx.prepared_a.take().ok_or_else(|| {
-            ContextError::InvalidState(format!(
-                "SCP-SAGA-13007: cross-context saga Commit-A — no held Prepare-A reservation \
-                 for saga '{}' (Prepare-A never ran, or it was already consumed)",
-                saga_id.0
-            ))
-        })?;
+
+        // The reservation was already consumed by a delivered Commit-A whose ACK
+        // was lost. Re-ack from the durable witness instead of re-sending (we no
+        // longer hold a ticket to send): a recorded witness IS the idempotent
+        // A-side re-ack → Committed, not a false NeedsRepair (spec §17.16.4).
+        let Some(reservation) = ctx.prepared_a.take() else {
+            return self
+                .commit_a_reack_from_witness(saga_id, &caller, &caller_hex)
+                .await;
+        };
+
+        // Bind A's recorded output to the receipt's SIGNED bytes (FIX 3 MED): the
+        // receipt's `output_jcs` is the exact preimage of the signed
+        // `output_hash`, so A hashes precisely what B signed.
+        let output_for_a = receipt.output_jcs.clone();
         let commit_a_saga_id = saga_id.clone();
         let caller_context_id = ctx.caller_context_id;
         let caller_did = ctx.caller_did.clone();
         let target_context_id = ctx.target_context_id;
         let nonce = ctx.asserted_nonce;
-        let receipt_for_a = receipt.to_vec();
-        let output_for_a = output.to_vec();
-        caller
-            .send(move |reply| {
+        let receipt_for_a = receipt_bytes.to_vec();
+
+        let send_result = caller
+            .send_recover_on_failure(move |reply| {
                 ContextCommand::SagaPhase(SagaPhaseMessage::CommitA {
                     saga_id: commit_a_saga_id,
                     reservation: Box::new(reservation),
@@ -5897,7 +6125,91 @@ impl Supervisor {
                     reply,
                 })
             })
-            .await
+            .await;
+
+        match send_result {
+            Ok(()) => Ok(()),
+            // Send NEVER delivered — recover the reservation and restore it to
+            // `ctx.prepared_a` so the FSM retry re-drives Commit-A (and the
+            // ticket is never dropped unbalanced). Commit-A did not land, so the
+            // retry's Commit-B replay + fresh Commit-A is exactly correct.
+            Err((err, Some(recovered_cmd))) => {
+                if let Some(reservation) = Self::extract_commit_a_reservation(recovered_cmd) {
+                    ctx.prepared_a = Some(reservation);
+                } else {
+                    // Unreachable in practice: the recovered command IS the
+                    // CommitA we built. If a future refactor changes that, the
+                    // reservation has nowhere to go — log loudly rather than
+                    // silently leak (the carrier's drop guard then fires under
+                    // testing, surfacing the bug instead of hiding it).
+                    tracing::error!(
+                        saga_id = %saga_id.0,
+                        "cross-context saga Commit-A — recovered a non-CommitA command on send \
+                         failure; the held reservation could not be restored"
+                    );
+                }
+                Err(err)
+            }
+            // Delivered but the handler errored (or dropped the reply): the actor
+            // already owns/consumed the ticket, so there is nothing to recover.
+            // `prepared_a` stays `None`; a retry re-acks from the witness above.
+            Err((err, None)) => Err(err),
+        }
+    }
+
+    /// Re-ack Commit-A from the durable `xctx_committed_invocations` witness when
+    /// the held reservation is gone (spec §17.16.4). Queries the caller actor
+    /// read-only; a recorded witness resolves the saga to `Committed`, an absent
+    /// witness surfaces a typed `SCP-SAGA-13007` (the Commit-A genuinely did not
+    /// commit — a real divergence the FSM carries to `NeedsRepair`).
+    async fn commit_a_reack_from_witness(
+        &self,
+        saga_id: &SagaId,
+        caller: &crate::context::actor::ContextActorHandle,
+        caller_hex: &str,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+
+        let witness_saga_id = saga_id.clone();
+        let recorded = caller
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitACheckWitness {
+                    saga_id: witness_saga_id,
+                    reply,
+                })
+            })
+            .await?;
+        if recorded {
+            tracing::info!(
+                saga_id = %saga_id.0,
+                context = %caller_hex,
+                "cross-context saga Commit-A — reservation consumed but the durable witness \
+                 confirms Commit-A landed; re-acking as Committed (lost-reply recovery, §17.16.4)"
+            );
+            Ok(())
+        } else {
+            Err(ContextError::InvalidState(format!(
+                "SCP-SAGA-13007: cross-context saga Commit-A — no held Prepare-A reservation for \
+                 saga '{}' and the caller witness does not record a committed Commit-A (Commit-A \
+                 did not durably land)",
+                saga_id.0
+            )))
+        }
+    }
+
+    /// Extract the held Prepare-A reservation back out of a recovered
+    /// (un-delivered) `CommitA` command so the FSM can restore it to `ctx` for a
+    /// retry. Returns `None` if the command is not a `CommitA` (unreachable for
+    /// the command built in [`Self::commit_a_settle`]).
+    fn extract_commit_a_reservation(
+        cmd: Box<ContextCommand>,
+    ) -> Option<crate::context::actor::commands::PreparedAFields> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        if let ContextCommand::SagaPhase(SagaPhaseMessage::CommitA { reservation, .. }) = *cmd {
+            Some(*reservation)
+        } else {
+            None
+        }
     }
 
     /// Emit the dual `CrossContextDivergenceMarker`s on a `NeedsRepair`
@@ -10113,6 +10425,7 @@ mod tests {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
+            xctx_nonce_dedup: HashMap::new(),
         }
     }
 
@@ -13393,6 +13706,106 @@ mod tests {
         xctx_supervisor_with_event_log(creator_did, creator_key, Box::new(TestEventLog))
     }
 
+    /// A persistence double that fails the persist for ONE specific context the
+    /// Nth time it is called (1-based), then succeeds — modelling a transient
+    /// Class-S persist failure at a chosen saga step (e.g. the target's
+    /// Commit-B settle persist). All other contexts / calls succeed.
+    #[derive(Clone)]
+    struct FailContextPersistOncePersistence {
+        target_hex: String,
+        fail_on_call: usize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ContextPersistence for FailContextPersistOncePersistence {
+        fn persist_context(
+            &self,
+            id: &str,
+            _snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if id == self.target_hex {
+                let n = self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    .saturating_add(1);
+                if n == self.fail_on_call {
+                    return Err("induced transient target persist failure".into());
+                }
+            }
+            Ok(())
+        }
+        fn load_context(
+            &self,
+            _id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A supervisor wired with a caller-supplied persistence backend (for the
+    /// settle-retry test that injects a transient persist failure).
+    fn xctx_supervisor_with_persistence(
+        creator_did: String,
+        creator_key: ed25519_dalek::VerifyingKey,
+        persistence: Box<dyn ContextPersistence>,
+    ) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestXctxSagaPersist".to_owned(),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(move |did: &DID| {
+            if did.as_ref() == creator_did {
+                Some(creator_key)
+            } else {
+                None
+            }
+        });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        Supervisor::with_providers(
+            crypto,
+            transport,
+            Box::new(TestEventLog),
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            None,
+            mls_storage,
+        )
+    }
+
     /// Build the CALLER context state: `caller_did` is a member (so the
     /// authorize-before-reserve `is_member` check passes) holding
     /// `ToolInterface` (so Prepare-A's outbound gate passes). `creator_did` is
@@ -13979,6 +14392,7 @@ mod tests {
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({})) }) as _
             })),
+            executor_output: None,
             prepared_a: None,
             prepared_b: None,
             committed: None,
@@ -14335,6 +14749,368 @@ mod tests {
             1,
             "Commit-in-progress replay MUST NOT re-invoke the tool"
         );
+    }
+
+    /// FIX 2 (§17.16.4): a Commit-in-progress recovery whose A-side
+    /// `xctx_committed_invocations` witness IS present resolves to `Committed`,
+    /// NOT a spurious `NeedsRepair`. We commit a real saga (both witnesses land),
+    /// then run the recovery re-drive and assert it returns `Committed` (the
+    /// A-side witness re-ack succeeded) — and the tool never re-runs.
+    ///
+    /// (The journal is the no-op test journal here, so the resolution is
+    /// asserted on the re-drive's RETURN value — the input `recover_committing_entry`
+    /// consumes to choose `mark_resolved(Committed)` vs the NeedsRepair append.)
+    #[tokio::test]
+    async fn xctx_commit_in_progress_with_witness_resolves_committed() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxWitnessCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWitnessCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |_input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "result": 3 }))
+            }
+        };
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let nonce = [0x42u8; 16];
+        let out = supervisor
+            .start_cross_context_tool_invocation_saga(
+                XCTX_CALLER,
+                XCTX_TARGET,
+                DID(caller_did.to_owned()),
+                XCTX_TOOL.to_owned(),
+                None,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                5,
+                2,
+                nonce,
+                now_ms,
+                &target_signing,
+                &caller_signing,
+                executor,
+            )
+            .await
+            .expect("saga commits");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "tool ran once");
+
+        // Recover the committed saga id from the receipt — its A-side witness is
+        // present in the (still-live) caller actor.
+        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+            serde_json::from_slice(&out.receipt.expect("receipt")).expect("decode");
+        let saga_id_str = receipt
+            .tool_invoked_event_id
+            .strip_prefix("ToolInvoked:")
+            .expect("event id carries saga id")
+            .to_owned();
+        let saga_id = SagaId(saga_id_str);
+
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: now_ms,
+            recorded_nonce: nonce,
+            recorded_chain_depth: 3,
+        };
+        // The re-drive re-acks Commit-A FROM THE WITNESS and resolves Committed —
+        // not a false NeedsRepair.
+        let resolution =
+            Box::pin(supervisor.redrive_xctx_commit_in_progress(&saga_id, &prepared)).await;
+        assert_eq!(
+            resolution,
+            CommitInProgressResolution::Committed,
+            "a Commit-in-progress recovery with a present A-side witness MUST resolve to \
+             Committed (not a false NeedsRepair)"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "recovery must not re-invoke the tool"
+        );
+
+        // Contrast: with NO A-side witness (a different, never-committed saga id),
+        // the same re-drive stays NeedsRepair — only a genuine commit resolves.
+        let absent = SagaId("never-committed-saga".to_owned());
+        let resolution_absent =
+            Box::pin(supervisor.redrive_xctx_commit_in_progress(&absent, &prepared)).await;
+        assert_eq!(
+            resolution_absent,
+            CommitInProgressResolution::NeedsRepair,
+            "a saga with no committed B-side / A-witness must stay NeedsRepair"
+        );
+    }
+
+    /// FIX 3 (crypto, §6.2.4 "Signer authorization"): the Commit-A path verifies
+    /// B's receipt signature against the key authorized for `target_context_id`
+    /// BEFORE settling. A receipt signed by a DIFFERENT key is rejected — the
+    /// saga aborts before any settle/record. Exercised directly on
+    /// `verify_commit_b_receipt`: a ctx holding target key Y rejects a receipt
+    /// signed by key X.
+    #[tokio::test]
+    async fn xctx_commit_a_rejects_receipt_signed_by_wrong_key() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
+
+        let authorized = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let attacker = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x42u8; 16];
+
+        // The ctx is authorized for the TARGET key `authorized`.
+        let ctx = divergence_ctx(
+            nonce,
+            "ToolInvoked:wrong-key-saga".to_owned(),
+            &authorized,
+            &caller_signing,
+            "did:dht:z6MkWrongKeyCaller",
+        );
+
+        // A receipt signed by the ATTACKER key (not authorized for the target).
+        let forged = CrossContextToolReceipt::sign(
+            &attacker,
+            XCTX_CALLER,
+            XCTX_TARGET,
+            "did:dht:z6MkWrongKeyCaller".to_owned(),
+            nonce,
+            XCTX_TOOL.to_owned(),
+            br#"{"result":3}"#.to_vec(),
+            "ToolInvoked:wrong-key-saga".to_owned(),
+            3,
+            1_700_000_000,
+        )
+        .expect("sign forged receipt");
+        let forged_bytes = serde_json::to_vec(&forged).expect("encode");
+
+        let saga_id = SagaId("wrong-key-saga".to_owned());
+        let result = Supervisor::verify_commit_b_receipt(&saga_id, &ctx, &forged_bytes);
+        assert!(
+            matches!(
+                &result,
+                Err(ContextError::CryptoFailed(m)) if m.contains("SCP-SAGA-13041")
+            ),
+            "a receipt signed by a key NOT authorized for the target context must be rejected \
+             before settle, got {result:?}"
+        );
+
+        // Sanity: the SAME receipt signed by the AUTHORIZED key verifies.
+        let valid = CrossContextToolReceipt::sign(
+            &authorized,
+            XCTX_CALLER,
+            XCTX_TARGET,
+            "did:dht:z6MkWrongKeyCaller".to_owned(),
+            nonce,
+            XCTX_TOOL.to_owned(),
+            br#"{"result":3}"#.to_vec(),
+            "ToolInvoked:wrong-key-saga".to_owned(),
+            3,
+            1_700_000_000,
+        )
+        .expect("sign valid receipt");
+        let valid_bytes = serde_json::to_vec(&valid).expect("encode");
+        assert!(
+            Supervisor::verify_commit_b_receipt(&saga_id, &ctx, &valid_bytes).is_ok(),
+            "a receipt signed by the authorized target key must verify"
+        );
+    }
+
+    /// FIX 5 (§6.2.4 "Exactly-once execution"): a transient Commit-B SETTLE
+    /// failure is retryable WITHOUT re-invoking the tool. The target's Commit-B
+    /// settle persist fails once (Class-S fail-closed → the capture rolls back),
+    /// so the FSM retries: reserve reports `ReadyToExecute` again, but the
+    /// executor output is STASHED in the ctx — the settle is re-sent with the
+    /// stashed bytes and the tool is NEVER re-invoked. The saga commits on retry
+    /// and the executor ran exactly once.
+    #[tokio::test]
+    async fn xctx_commit_b_settle_retry_does_not_reinvoke_tool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxSettleRetryCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        // Fail the TARGET context's 2nd persist (Prepare-B = call 1, Commit-B
+        // settle = call 2) exactly once; the retried settle (call 3) succeeds.
+        let persistence = FailContextPersistOncePersistence {
+            target_hex: hex::encode(XCTX_TARGET),
+            fail_on_call: 2,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let supervisor = xctx_supervisor_with_persistence(
+            creator_did.clone(),
+            creator_key,
+            Box::new(persistence),
+        );
+        let caller_did = "did:dht:z6MkXctxSettleRetryCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let a = input["a"].as_i64().unwrap_or(0);
+                let b = input["b"].as_i64().unwrap_or(0);
+                Ok(serde_json::json!({ "result": a + b }))
+            }
+        };
+
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let output = supervisor
+            .start_cross_context_tool_invocation_saga(
+                XCTX_CALLER,
+                XCTX_TARGET,
+                DID(caller_did.to_owned()),
+                XCTX_TOOL.to_owned(),
+                None,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                5,
+                2,
+                [0x42u8; 16],
+                now_ms,
+                &target_signing,
+                &caller_signing,
+                executor,
+            )
+            .await
+            .expect("saga must commit after the transient settle failure is retried");
+
+        // The transient settle failure was retried to a committed terminal …
+        let out_value: serde_json::Value =
+            serde_json::from_slice(&output.output.expect("output")).expect("decode");
+        assert_eq!(out_value, serde_json::json!({ "result": 3 }));
+        // … and despite the retry the tool executed EXACTLY ONCE (the stashed
+        // output was re-sent, never re-invoked).
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a Commit-B settle retry MUST re-send the stashed output, never re-invoke the tool"
+        );
+    }
+
+    /// FIX 1 (§6.2.4): a Commit-A whose mailbox SEND fails (the caller actor
+    /// died between `lookup` and send) does NOT drop the escrow ticket unbalanced
+    /// (no debug-assert panic under `--features testing`, no escrow leak in
+    /// release) and KEEPS the reservation consumable for a retry. We Prepare-A on
+    /// a live caller (staging a real reservation), DESPAWN the caller, then call
+    /// `commit_a_settle`: it returns Err but RECOVERS the reservation back into
+    /// `ctx.prepared_a` — proving the ticket was not dropped and the retry can
+    /// re-drive Commit-A.
+    #[tokio::test]
+    async fn xctx_commit_a_send_failure_recovers_ticket_for_retry() {
+        use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
+
+        let creator_did = "did:dht:z6MkXctxSendFailCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxSendFailCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x42u8; 16];
+
+        // Build a saga ctx and run the REAL Prepare-A so `prepared_a` holds a
+        // genuine `#[must_use]` reservation (its ticket's Drop guard fires if it
+        // is ever dropped unbalanced).
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            declared_cost: 5,
+            asserted_chain_depth: 2,
+            asserted_nonce: nonce,
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            target_signing_key: target_signing.clone(),
+            caller_signing_key: caller_signing.clone(),
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+        supervisor
+            .dispatch_xctx_prepare_a(&mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+
+        // Now the caller actor dies BEFORE Commit-A reaches it.
+        let despawned = supervisor.despawn_actor(&hex::encode(XCTX_CALLER)).await;
+        assert!(despawned, "caller actor despawned");
+
+        // Build a verified receipt signed by the target's authorized key (the
+        // Commit-A path passes the VERIFIED receipt; we mirror that here).
+        let receipt = CrossContextToolReceipt::sign(
+            &target_signing,
+            XCTX_CALLER,
+            XCTX_TARGET,
+            caller_did.to_owned(),
+            nonce,
+            XCTX_TOOL.to_owned(),
+            br#"{"result":3}"#.to_vec(),
+            "ToolInvoked:send-fail-saga".to_owned(),
+            3,
+            1_700_000_000,
+        )
+        .expect("sign receipt");
+        let receipt_bytes = serde_json::to_vec(&receipt).expect("encode");
+
+        let saga_id = SagaId("send-fail-saga".to_owned());
+        let result = supervisor
+            .commit_a_settle(&saga_id, &mut ctx, &receipt_bytes, &receipt)
+            .await;
+
+        // The send failed (caller gone) — but the ticket was NOT dropped: it is
+        // recovered back into `ctx.prepared_a`, consumable on retry. Reaching
+        // this assertion without a drop-guard panic IS the FIX-1 guarantee.
+        assert!(
+            result.is_err(),
+            "Commit-A to a despawned caller must surface the send failure"
+        );
+        assert!(
+            ctx.prepared_a.is_some(),
+            "the escrow reservation MUST be recovered into ctx for retry (never dropped \
+             unbalanced — no ticket-drop panic, no escrow leak)"
+        );
+
+        // Drain the recovered reservation cleanly so the test does not itself
+        // leak the must-use ticket (mirrors the run_saga tail's void+consume for
+        // a Commit-A that never landed).
+        if let Some(reservation) = ctx.prepared_a.take() {
+            reservation
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
     }
 
     /// §17.16.4 Prepare-in-progress replay aborts the Prepared side(s) and
