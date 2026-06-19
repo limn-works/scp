@@ -581,6 +581,50 @@ impl SagaPreparedStateSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Committed cross-context tool-invocation capture (spec §6.2.4)
+// ---------------------------------------------------------------------------
+
+/// Durable, `SagaId`-keyed capture of a COMMITTED cross-context tool
+/// invocation, held on the TARGET (B) actor (spec §6.2.4 "Exactly-once
+/// execution with durable output capture").
+///
+/// The tool executes **exactly once**; its output + the signed
+/// [`CrossContextToolReceipt`] are captured here so a Commit replayed after a
+/// crash (§17.16.4) re-emits the STORED output and re-emits the IDENTICAL
+/// signed receipt — **never re-invoking the tool** and never minting a fresh
+/// `tool_invoked_event_id`. Both the receipt and the raw output are reproduced
+/// byte-for-byte from this record.
+///
+/// **Class S.** Held in
+/// [`PerContextState.xctx_committed_outputs`](crate::context::actor::state::PerContextState::xctx_committed_outputs)
+/// and synchronously persisted fail-closed (ADR-049 §9) the same way
+/// `saga_pending` is — a crash that rolled the capture back behind an acked
+/// Commit-B would let a replayed Commit re-invoke the tool, breaking the
+/// exactly-once guarantee.
+///
+/// **Not bearer-bearing.** The receipt and tool output are public protocol
+/// artifacts (the receipt is the signed return-path response; the output is
+/// the tool result A already receives). There is no §9.4.3 secret here, so —
+/// unlike [`SagaPreparedState`] — this type derives `Serialize`/`Clone`
+/// directly and rides the public [`ContextSnapshot`](crate::context::state::ContextSnapshot)
+/// surface without a separate mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedToolInvocation {
+    /// The target's signed receipt over the staged provenance + output hash +
+    /// event id. Re-emitted verbatim on a replayed Commit so the signature
+    /// preimage reproduces byte-for-byte.
+    pub receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt,
+    /// The captured tool output bytes — the receipt's `output_jcs`, stored
+    /// alongside so a replay re-emits the exact output A originally received.
+    #[serde(with = "scp_protocol::serde_util::serde_bounded_bytes")]
+    pub output_bytes: Vec<u8>,
+    /// The `SagaId`-stable `ToolInvoked` event-log entry id (also carried on
+    /// the receipt; stored explicitly so a replay re-acks the same id without
+    /// re-deriving it).
+    pub tool_invoked_event_id: String,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

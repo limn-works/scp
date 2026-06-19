@@ -1259,6 +1259,8 @@ pub async fn create_context(
         // lazily by the messaging handler.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        xctx_committed_outputs: HashMap::new(),
+        xctx_committed_invocations: std::collections::HashSet::new(),
         // B-owned cross-context tool-invoke validation state (spec §6.2.4):
         // fresh on creation/import; repopulated when a gated tool interface is
         // established. Not rehydrated from any snapshot — reconstructable
@@ -1836,6 +1838,8 @@ pub async fn import_context(
         // foreign saga cannot drive local Commit/Abort.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        xctx_committed_outputs: HashMap::new(),
+        xctx_committed_invocations: std::collections::HashSet::new(),
         // B-owned cross-context tool-invoke validation state (spec §6.2.4):
         // fresh on creation/import; repopulated when a gated tool interface is
         // established. Not rehydrated from any snapshot — reconstructable
@@ -2278,6 +2282,14 @@ pub async fn restore_context(
         // secrecy, so restore starts both fresh.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::new(),
+        // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
+        // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
+        // with durable output capture") so a Commit replayed after a crash
+        // re-emits the STORED output + the IDENTICAL receipt rather than
+        // re-invoking the tool. The live `CommittedToolInvocation` is public (no
+        // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
+        xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
+        xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,

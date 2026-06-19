@@ -822,6 +822,8 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // saga must never drive a public importer's Commit/Abort, so it is
         // ALWAYS dropped from the public export.
         saga_pending: HashMap::new(),
+        xctx_committed_outputs: HashMap::new(),
+        xctx_committed_invocations: std::collections::HashSet::new(),
     })
 }
 
@@ -1010,6 +1012,8 @@ mod tests {
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
             saga_pending: HashMap::new(),
+            xctx_committed_outputs: HashMap::new(),
+            xctx_committed_invocations: std::collections::HashSet::new(),
         }
     }
 

@@ -530,5 +530,9 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         // ADR-049 §9 Class S (line 144): persist the staged saga slot
         // through its sanctioned mirror via the shared helper.
         saga_pending: crate::context::messaging_helpers::saga_pending_snapshot(state),
+        xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
+            state,
+        ),
+        xctx_committed_invocations: state.xctx_committed_invocations.clone(),
     }
 }

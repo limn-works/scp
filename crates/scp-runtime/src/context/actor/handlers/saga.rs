@@ -46,14 +46,22 @@ use scp_protocol::crypto::ucan::validate::{
     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryNonceTracker, ValidationContext,
 };
 
-use crate::context::actor::commands::{PreparedAFields, PreparedBFields, SagaPhaseMessage};
+use scp_protocol::context::tools::cross_context_saga::{
+    CommittedSide, CrossContextDivergenceMarker, CrossContextToolReceipt,
+};
+
+use crate::context::actor::commands::{
+    CommitBReserveOutcome, CommitBReserveReply, CommitBSettleOutcome, CommitBSettleReply,
+    PreparedAFields, PreparedBFields, SagaPhaseMessage, SigningKeyBytes,
+};
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::PerContextState;
 use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
 use crate::context::messaging_helpers::persist_state_fail_closed;
+use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::{
-    CrossContextToolInvocationPrepared, SagaPreparedState,
+    CommittedToolInvocation, CrossContextToolInvocationPrepared, SagaPreparedState,
 };
 use crate::context::tools_helpers::reserve_tool_economy;
 
@@ -92,6 +100,24 @@ fn hex_context_id(id: &[u8; 32]) -> String {
 
 /// Dispatch a [`SagaPhaseMessage`] against actor state.
 pub async fn dispatch(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    cmd: SagaPhaseMessage,
+) -> Outcome<()> {
+    match cmd {
+        // Prepare arms (slice 3b) route to a dedicated helper to keep this
+        // router within the per-function line budget.
+        prepare @ (SagaPhaseMessage::PrepareA { .. } | SagaPhaseMessage::PrepareB { .. }) => {
+            dispatch_prepare_phase(state, deps, prepare).await
+        }
+        // Commit (split) / Abort / divergence-marker arms (slice 4).
+        other => dispatch_commit_phase(state, deps, other).await,
+    }
+}
+
+/// Dispatch the Prepare-A / Prepare-B saga phases (slice 3b). Split out of
+/// [`dispatch`] so each router stays within the per-function line budget.
+async fn dispatch_prepare_phase(
     state: &mut PerContextState,
     deps: &ActorDeps,
     cmd: SagaPhaseMessage,
@@ -142,29 +168,144 @@ pub async fn dispatch(
             };
             prepare_b(state, deps, req, reply).await
         }
-        // Commit / Abort / divergence-marker bodies land in later slices. The
-        // dispatch `match` stays exhaustive so a new phase is a compile error.
-        SagaPhaseMessage::CommitB { reply, .. }
-        | SagaPhaseMessage::CommitA { reply, .. }
+        // Commit-side phases are matched in `dispatch` and never routed here.
+        // The `dispatch` router partitions Prepare vs Commit before calling
+        // this helper, so these arms are statically unreachable; return a typed
+        // error (NEVER panic — ADR-049 §10 handler panic ban) rather than
+        // `unreachable!`, routing each phase's reply to its typed sender.
+        SagaPhaseMessage::CommitBReserve { reply, .. } => misrouted_reserve(reply),
+        SagaPhaseMessage::CommitBSettle { reply, .. } => misrouted_settle(reply),
+        SagaPhaseMessage::CommitA { reply, .. }
         | SagaPhaseMessage::Abort { reply, .. }
-        | SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => not_implemented_unit(reply),
+        | SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => misrouted_unit(reply),
     }
 }
 
-/// Reply `NotImplemented` on a `Result<(), _>` oneshot and return the same
-/// error in the [`Outcome`]. Used by the slice-4/6 phase arms.
-fn not_implemented_unit(
-    reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+/// Dispatch the Commit (split reserve/settle), Abort, and divergence-marker
+/// saga phases (slice 4). Split out of [`dispatch`] to keep each router within
+/// the per-function line budget.
+async fn dispatch_commit_phase(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    cmd: SagaPhaseMessage,
 ) -> Outcome<()> {
-    let err = || {
-        ContextError::NotImplemented(
-            "saga Commit/Abort/divergence-marker handler — lands in a later \
-             slice of the cross-context tool-invocation saga"
-                .to_owned(),
-        )
-    };
-    let _ = reply.send(Err(err()));
-    Outcome::err(err())
+    match cmd {
+        SagaPhaseMessage::CommitBReserve { saga_id, reply } => {
+            commit_b_reserve(state, &saga_id, reply)
+        }
+        SagaPhaseMessage::CommitBSettle {
+            saga_id,
+            output_bytes,
+            target_signing_key,
+            reply,
+        } => {
+            commit_b_settle(
+                state,
+                deps,
+                &saga_id,
+                output_bytes,
+                &target_signing_key,
+                reply,
+            )
+            .await
+        }
+        SagaPhaseMessage::CommitA {
+            saga_id,
+            reservation,
+            caller_context_id,
+            caller_did,
+            target_context_id,
+            nonce,
+            receipt,
+            output_bytes,
+            reply,
+        } => {
+            let req = CommitARequest {
+                saga_id,
+                reservation: *reservation,
+                caller_context_id,
+                caller_did,
+                target_context_id,
+                nonce,
+                receipt,
+                output_bytes,
+            };
+            commit_a(state, deps, req, reply).await
+        }
+        SagaPhaseMessage::Abort {
+            saga_id,
+            reservation,
+            reply,
+        } => abort(state, deps, &saga_id, reservation.map(|b| *b), reply).await,
+        SagaPhaseMessage::EmitDivergenceMarker {
+            saga_id,
+            nonce,
+            committed_side,
+            committed_event_id,
+            signing_key,
+            reply,
+        } => emit_divergence_marker(
+            state,
+            deps,
+            &saga_id,
+            nonce,
+            committed_side,
+            &committed_event_id,
+            &signing_key,
+            reply,
+        ),
+        // Prepare arms are matched in `dispatch` and never routed here. They
+        // are statically unreachable; return a typed error per their reply
+        // shape (NEVER panic — ADR-049 §10 handler panic ban).
+        SagaPhaseMessage::PrepareA { reply, .. } => {
+            let err = misrouted_err("PrepareA");
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            Outcome::err(sketch)
+        }
+        SagaPhaseMessage::PrepareB { reply, .. } => {
+            let err = misrouted_err("PrepareB");
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            Outcome::err(sketch)
+        }
+    }
+}
+
+/// Typed error for a statically-unreachable mis-routed saga phase (the
+/// `dispatch` router partitions Prepare vs Commit, so neither helper should
+/// ever see the other's phases). Returning this — never `panic!`/`unreachable!`
+/// — keeps the handler panic ban (ADR-049 §10) intact even on an impossible
+/// branch.
+fn misrouted_err(phase: &str) -> ContextError {
+    ContextError::InvalidState(format!(
+        "SCP-SAGA-13038: saga phase '{phase}' reached the wrong dispatch helper \
+         (router partition invariant violated)"
+    ))
+}
+
+/// Mis-route reply for [`SagaPhaseMessage::CommitBReserve`]'s typed sender.
+fn misrouted_reserve(reply: CommitBReserveReply) -> Outcome<()> {
+    let err = misrouted_err("CommitBReserve");
+    let sketch = outcome_error_sketch(&err);
+    let _ = reply.send(Err(err));
+    Outcome::err(sketch)
+}
+
+/// Mis-route reply for [`SagaPhaseMessage::CommitBSettle`]'s typed sender.
+fn misrouted_settle(reply: CommitBSettleReply) -> Outcome<()> {
+    let err = misrouted_err("CommitBSettle");
+    let sketch = outcome_error_sketch(&err);
+    let _ = reply.send(Err(err));
+    Outcome::err(sketch)
+}
+
+/// Mis-route reply for a unit-reply saga phase's typed sender.
+fn misrouted_unit(reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
+    let err = misrouted_err("CommitA/Abort/EmitDivergenceMarker");
+    let sketch = outcome_error_sketch(&err);
+    let _ = reply.send(Err(err));
+    Outcome::err(sketch)
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +785,600 @@ fn validate_chain_depth(
         )));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Commit-B — target-context actor (split reserve / settle, spec §6.2.4)
+// ---------------------------------------------------------------------------
+
+/// Derive the `SagaId`-stable `ToolInvoked` event-log entry id (spec §6.2.4
+/// "`SagaId`-idempotent event-log append"). The id MUST be reproducible from
+/// durable state on a replayed Commit — it is a signed receipt-preimage field —
+/// so it is derived deterministically from the `SagaId` rather than minted from
+/// a fresh counter. The `ToolInvoked:` prefix matches the §5.16 event-name
+/// convention so the §6.2.4 auditor can recognise the entry type.
+fn tool_invoked_event_id(saga_id: &SagaId) -> String {
+    format!("ToolInvoked:{}", saga_id.0)
+}
+
+/// Commit-B reserve half (spec §6.2.4 "Commit", split-execution model). Runs on
+/// the LOCAL target actor. Confirms the staged prepared + session reservation
+/// are present and decides whether the FSM must run the executor.
+///
+/// Idempotency (§6.2.4 / §17.16.4): if this `SagaId`'s output was already
+/// captured (a replayed Commit), reply [`CommitBReserveOutcome::AlreadyCommitted`]
+/// with the STORED output + receipt + event id — the tool is NEVER re-invoked.
+/// Otherwise the staged `saga_pending` slot for this `SagaId` MUST be a
+/// cross-context tool invocation; reply [`CommitBReserveOutcome::ReadyToExecute`].
+///
+/// Read-only — no mutation, no Class-S persist.
+fn commit_b_reserve(
+    state: &PerContextState,
+    saga_id: &SagaId,
+    reply: CommitBReserveReply,
+) -> Outcome<()> {
+    // Replay short-circuit: a prior Commit-B already captured the output.
+    if let Some(committed) = state.xctx_committed_outputs.get(saga_id) {
+        let receipt = match jcs_receipt_bytes(&committed.receipt) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let sketch = outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                return Outcome::err(sketch);
+            }
+        };
+        let _ = reply.send(Ok(CommitBReserveOutcome::AlreadyCommitted {
+            receipt,
+            output_bytes: committed.output_bytes.clone(),
+            tool_invoked_event_id: committed.tool_invoked_event_id.clone(),
+        }));
+        return Outcome::ok(());
+    }
+
+    // Not yet committed: the staged prepared MUST be present (Prepare-B ran).
+    if let Some(SagaPreparedState::CrossContextToolInvocation(_)) = state.saga_pending.get(saga_id)
+    {
+        let _ = reply.send(Ok(CommitBReserveOutcome::ReadyToExecute));
+        return Outcome::ok(());
+    }
+    let err = ContextError::InvalidState(format!(
+        "SCP-SAGA-13030: Commit-B reserve for saga '{}' found no staged cross-context \
+         tool-invocation prepared state (Prepare-B never ran, or the slot was rolled back)",
+        saga_id.0
+    ));
+    let sketch = outcome_error_sketch(&err);
+    let _ = reply.send(Err(err));
+    Outcome::err(sketch)
+}
+
+/// Commit-B settle half (spec §6.2.4 "Commit", target side). Runs on the LOCAL
+/// target actor with the executor's captured `output_bytes`.
+///
+/// On the FIRST settle: canonicalizes the output to JCS, signs the
+/// [`CrossContextToolReceipt`] over the STAGED `recorded_nonce` /
+/// `recorded_chain_depth` / `recorded_timestamp_ms` + `output_hash` + the
+/// `SagaId`-stable `tool_invoked_event_id` using the target's Active Signing
+/// Key, durably captures the receipt + output keyed by `SagaId`, appends
+/// `ToolInvoked` to the local log, clears the staged `saga_pending` slot,
+/// Class-S sync-persists fail-closed, and replies. On a REPLAY (output already
+/// captured) re-emits the STORED bytes verbatim — no re-invoke, no re-append,
+/// no re-sign.
+async fn commit_b_settle(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    output_bytes: Vec<u8>,
+    target_signing_key: &SigningKeyBytes,
+    reply: CommitBSettleReply,
+) -> Outcome<()> {
+    // Replay: re-emit the stored capture byte-for-byte; never re-invoke / re-sign.
+    if let Some(committed) = state.xctx_committed_outputs.get(saga_id) {
+        return reemit_committed_settle(committed, reply);
+    }
+
+    match commit_b_first_settle(state, deps, saga_id, &output_bytes, target_signing_key) {
+        Ok(outcome) => {
+            let _ = reply.send(Ok(outcome));
+            Outcome::ok_mutated(())
+        }
+        // `mutated` is reported by the settle body itself: a pre-append failure
+        // (no staged slot, signing) leaves state untouched; an at/after-append
+        // failure (then rolled back) still touched the event log, so the actor
+        // must persist. This is precise — never code-string-sniffed.
+        Err((mutated, err)) => {
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            if mutated {
+                Outcome::err_mutated(sketch)
+            } else {
+                Outcome::err(sketch)
+            }
+        }
+    }
+}
+
+/// Re-emit a durably-captured Commit-B settle on a replay (spec §6.2.4
+/// "Crash recovery §17.16.4"): the stored receipt + output are returned
+/// verbatim. The tool is NOT re-invoked and nothing is re-signed.
+fn reemit_committed_settle(
+    committed: &CommittedToolInvocation,
+    reply: CommitBSettleReply,
+) -> Outcome<()> {
+    match jcs_receipt_bytes(&committed.receipt) {
+        Ok(receipt) => {
+            let _ = reply.send(Ok(CommitBSettleOutcome {
+                receipt,
+                output_bytes: committed.output_bytes.clone(),
+                tool_invoked_event_id: committed.tool_invoked_event_id.clone(),
+            }));
+            Outcome::ok(())
+        }
+        Err(err) => {
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            Outcome::err(sketch)
+        }
+    }
+}
+
+/// First (non-replay) Commit-B settle: sign the receipt over the STAGED
+/// provenance + captured output, append `ToolInvoked`, durably capture the
+/// output keyed by `SagaId`, clear the staged slot, and Class-S persist
+/// fail-closed. Returns the settle outcome (the caller sends the reply).
+///
+/// On a persist failure the durable capture + staged slot are rolled back so a
+/// retried settle re-runs cleanly. The error is returned as `(mutated, err)`:
+/// `mutated == false` for the pre-append failures (no staged slot — 13031; or
+/// receipt signing — 13032-13034), `true` once the `ToolInvoked` append has
+/// run (the event log was touched even if the durable capture was rolled back).
+fn commit_b_first_settle(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    output_bytes: &[u8],
+    target_signing_key: &SigningKeyBytes,
+) -> Result<CommitBSettleOutcome, (bool, ContextError)> {
+    // The staged prepared carries the B-recorded provenance the receipt
+    // preimage MUST be signed over (never re-read from the wire).
+    let Some(SagaPreparedState::CrossContextToolInvocation(prepared)) =
+        state.saga_pending.get(saga_id)
+    else {
+        return Err((
+            false,
+            ContextError::InvalidState(format!(
+                "SCP-SAGA-13031: Commit-B settle for saga '{}' found no staged cross-context \
+                 tool-invocation prepared state",
+                saga_id.0
+            )),
+        ));
+    };
+
+    // Build the signed receipt from STAGED provenance + the captured output.
+    // Pre-append: a signing failure leaves state untouched (mutated = false).
+    let event_id = tool_invoked_event_id(saga_id);
+    let receipt = build_signed_receipt(prepared, output_bytes, &event_id, target_signing_key)
+        .map_err(|e| (false, e))?;
+    // The receipt's JCS output bytes are the canonical preimage A re-hashes.
+    let canonical_output = receipt.output_jcs.clone();
+
+    // Snapshot the fields the ToolInvoked record needs before we drop the
+    // `&prepared` borrow by mutating state. `recorded_chain_depth` /
+    // `recorded_timestamp_ms` are B's staged values (never re-read from wire).
+    let caller_did_str = prepared.caller_did.0.clone();
+    let target_context_id = prepared.target_context_id;
+    let caller_context_id = prepared.caller_context_id;
+    let tool_registration_id = prepared.tool_registration_id.clone();
+    let target_hex = hex_context_id(&target_context_id);
+
+    // Append `ToolInvoked` to the local (target) log (spec §6.2.4 "Commit"):
+    // caller ctx id / caller DID actor / B's re-derived depth + staged
+    // timestamp. The SagaId-stable event id makes the append idempotent — a
+    // replay short-circuits before reaching here.
+    let tool_invoked_payload = serde_json::json!({
+        "saga_id": saga_id.0,
+        "tool_invoked_event_id": event_id,
+        "caller_context_id": hex_context_id(&caller_context_id),
+        "tool_registration_id": tool_registration_id,
+        "chain_depth": receipt.chain_depth,
+        "timestamp_ms": receipt.timestamp_ms,
+    });
+    // At-append onward: the event log is touched, so any failure is `mutated`.
+    deps.event_log
+        .append_context_event_with_payload(
+            &target_context_id,
+            &event_id,
+            &caller_did_str,
+            Some(&tool_invoked_payload),
+        )
+        .map_err(|e| (true, e))?;
+
+    // Durably capture the output + signed receipt keyed by SagaId (§6.2.4
+    // "Exactly-once execution with durable output capture") and clear the
+    // staged slot (the session reservation is now applied via the capture).
+    state.xctx_committed_outputs.insert(
+        saga_id.clone(),
+        CommittedToolInvocation {
+            receipt: receipt.clone(),
+            output_bytes: canonical_output.clone(),
+            tool_invoked_event_id: event_id.clone(),
+        },
+    );
+    state.saga_pending.remove(saga_id);
+
+    // Class-S sync-persist fail-closed BEFORE acking (ADR-049 §9): the durable
+    // output capture MUST land before the caller learns Commit-B succeeded, or a
+    // crash in the coalesce window would re-invoke the tool on replay. On
+    // persist failure roll the capture + slot back so a retry re-runs settle.
+    if let Err(persist_err) = persist_state_fail_closed(state, deps, &target_hex) {
+        state.xctx_committed_outputs.remove(saga_id);
+        state.saga_pending.insert(
+            saga_id.clone(),
+            SagaPreparedState::CrossContextToolInvocation(reprepare_from_receipt(
+                &receipt,
+                &tool_registration_id,
+            )),
+        );
+        return Err((true, persist_err));
+    }
+
+    // The capture + persist landed; serializing the receipt for the reply is a
+    // pure encode of already-committed state — a failure here is `mutated`.
+    let receipt_bytes = jcs_receipt_bytes(&receipt).map_err(|e| (true, e))?;
+    Ok(CommitBSettleOutcome {
+        receipt: receipt_bytes,
+        output_bytes: canonical_output,
+        tool_invoked_event_id: event_id,
+    })
+}
+
+/// Sign the [`CrossContextToolReceipt`] over the staged B-recorded provenance +
+/// `SHA-256(jcs(output))` + the `SagaId`-stable event id, using the target's
+/// Active Signing Key (spec §6.2.4 "Receipt / response return path"). The
+/// output is canonicalized to JCS so the receipt is self-verifying (the
+/// verifier re-hashes the carried bytes with no re-canonicalization step).
+fn build_signed_receipt(
+    prepared: &CrossContextToolInvocationPrepared,
+    output_bytes: &[u8],
+    event_id: &str,
+    target_signing_key: &SigningKeyBytes,
+) -> Result<CrossContextToolReceipt, ContextError> {
+    // Canonicalize the executor output to JCS — the exact bytes the preimage
+    // hashes and the receipt carries (Output canonicalization obligation).
+    let output_value: serde_json::Value = serde_json::from_slice(output_bytes).map_err(|e| {
+        ContextError::CryptoFailed(format!(
+            "SCP-SAGA-13032: Commit-B tool output is not valid JSON, cannot canonicalize \
+             for the receipt: {e}"
+        ))
+    })?;
+    let output_jcs = scp_protocol::jcs::to_vec(&output_value).map_err(|e| {
+        ContextError::CryptoFailed(format!(
+            "SCP-SAGA-13033: Commit-B receipt output JCS canonicalization failed: {e}"
+        ))
+    })?;
+
+    let signing_key = target_signing_key.to_signing_key();
+    CrossContextToolReceipt::sign(
+        &signing_key,
+        prepared.caller_context_id,
+        prepared.target_context_id,
+        prepared.caller_did.0.clone(),
+        prepared.recorded_nonce,
+        prepared.tool_registration_id.clone(),
+        output_jcs,
+        event_id.to_owned(),
+        prepared.recorded_chain_depth,
+        prepared.recorded_timestamp_ms,
+    )
+    .map_err(|e| {
+        ContextError::CryptoFailed(format!(
+            "SCP-SAGA-13034: Commit-B receipt signing failed: {e}"
+        ))
+    })
+}
+
+/// Reconstruct the staged [`CrossContextToolInvocationPrepared`] from a built
+/// receipt, used ONLY to roll the `saga_pending` slot back on a Commit-B
+/// persist failure (so a retry re-runs settle cleanly). Every field is
+/// recoverable from the receipt (which is built from the staged prepared).
+fn reprepare_from_receipt(
+    receipt: &CrossContextToolReceipt,
+    tool_registration_id: &str,
+) -> CrossContextToolInvocationPrepared {
+    CrossContextToolInvocationPrepared {
+        caller_context_id: receipt.caller_context_id,
+        target_context_id: receipt.target_context_id,
+        caller_did: DID(receipt.caller_did.clone()),
+        tool_registration_id: tool_registration_id.to_owned(),
+        // The UCAN proof id is not carried on the receipt; the rolled-back slot
+        // only needs to be a well-formed cross-context prepared so a retried
+        // settle re-signs. The proof was already validated at Prepare-B and the
+        // re-signed receipt does not depend on it.
+        ucan_proof_id: String::new(),
+        recorded_timestamp_ms: receipt.timestamp_ms,
+        recorded_nonce: receipt.nonce,
+        recorded_chain_depth: receipt.chain_depth,
+    }
+}
+
+/// JCS-encode a [`CrossContextToolReceipt`] to the wire bytes the FSM forwards.
+fn jcs_receipt_bytes(receipt: &CrossContextToolReceipt) -> Result<Vec<u8>, ContextError> {
+    scp_protocol::jcs::to_vec(receipt).map_err(|e| {
+        ContextError::CryptoFailed(format!(
+            "SCP-SAGA-13035: Commit-B receipt serialization failed: {e}"
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Commit-A — caller-context actor (spec §6.2.4)
+// ---------------------------------------------------------------------------
+
+/// Owned inputs for [`commit_a`], grouped to keep the handler signature within
+/// the clippy argument budget.
+struct CommitARequest {
+    saga_id: SagaId,
+    reservation: PreparedAFields,
+    caller_context_id: [u8; 32],
+    caller_did: DID,
+    target_context_id: [u8; 32],
+    nonce: [u8; 16],
+    receipt: Vec<u8>,
+    output_bytes: Vec<u8>,
+}
+
+/// Commit-A handler (spec §6.2.4 "Commit", caller side). Runs on the LOCAL
+/// caller-context actor.
+///
+/// Settles the escrow + outbound-rate-limit reservation staged at Prepare-A
+/// (§19.2.2), appends `CrossContextToolInvoked` referencing the target ctx id +
+/// the SAME `nonce` (the join key between the two records, §6.2.4 "Dual
+/// event-log recording"), Class-S sync-persists fail-closed, and acks.
+/// Idempotent by `SagaId`: a replay re-acks without re-settling or re-appending
+/// (the reservation's RAII ticket is consumed, so a true double-settle cannot
+/// occur — but the durable marker is the idempotency witness).
+async fn commit_a(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    req: CommitARequest,
+    reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    use crate::context::tools_helpers::{ToolSettleRequest, settle_tool_economy};
+
+    let caller_hex = hex_context_id(&req.caller_context_id);
+
+    // Idempotency: a prior Commit-A already recorded this saga. Re-ack as a
+    // no-op; the reservation handed back on replay is released (RAII) rather
+    // than double-settled. (`xctx_committed_invocations` records committed A-side
+    // sagas; absent ⇒ first Commit-A.)
+    if state.xctx_committed_invocations.contains(&req.saga_id) {
+        crate::context::tools_helpers::rollback_tool_economy(
+            state,
+            deps,
+            req.reservation.reservation.ticket,
+        )
+        .await;
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+
+    // Settle (capture) the escrow + outbound rate-limit reservation. The
+    // reservation was staged at Prepare-A and held by the FSM; Commit-A applies
+    // it via the existing single-context settle/capture path (§19.2.2).
+    let settle_request = ToolSettleRequest::Capture {
+        generation: req.reservation.reservation.generation,
+        ticket: req.reservation.reservation.ticket,
+    };
+    if let Err(err) =
+        settle_tool_economy(state, deps, &caller_hex, &req.caller_did, settle_request).await
+    {
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err_mutated(sketch);
+    }
+
+    // Append `CrossContextToolInvoked` to the local (caller) log: references the
+    // target ctx id + the SAME nonce as B's `ToolInvoked` so an auditor joins
+    // the two records into one provenance edge (spec §6.2.4 "Dual event-log
+    // recording"). The output hash links the record to the verified receipt.
+    let event_name = format!("CrossContextToolInvoked:{}", req.saga_id.0);
+    let invoked_payload = serde_json::json!({
+        "saga_id": req.saga_id.0,
+        "target_context_id": hex_context_id(&req.target_context_id),
+        "nonce": hex_nonce(&req.nonce),
+        "output_hash": hex_output_hash(&req.output_bytes),
+        "receipt_len": req.receipt.len(),
+    });
+    if let Err(err) = deps.event_log.append_context_event_with_payload(
+        &req.caller_context_id,
+        &event_name,
+        req.caller_did.as_ref(),
+        Some(&invoked_payload),
+    ) {
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err_mutated(sketch);
+    }
+
+    // Record the committed A-side saga (the idempotency witness) and Class-S
+    // persist fail-closed before acking: a crash that rolled the settle/marker
+    // back behind an acked Commit-A would double-settle on replay.
+    state.xctx_committed_invocations.insert(req.saga_id.clone());
+    if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
+        state.xctx_committed_invocations.remove(&req.saga_id);
+        let sketch = outcome_error_sketch(&persist_err);
+        let _ = reply.send(Err(persist_err));
+        return Outcome::err_mutated(sketch);
+    }
+
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
+}
+
+// ---------------------------------------------------------------------------
+// Abort — either side (spec §6.2.4 "Reservation release on every terminal path")
+// ---------------------------------------------------------------------------
+
+/// Abort handler (spec §6.2.4 "Reservation release on every terminal path").
+/// Runs on EITHER side's local actor.
+///
+/// RAII-releases the staged reservations — escrow / outbound-RL on the CALLER
+/// side (handed back via `reservation`, rolled back through the existing
+/// rollback path); the tool-session on the TARGET side is released by clearing
+/// the staged `saga_pending` slot (B stages no `ToolEconomyTicket`). Class-S
+/// sync-persists fail-closed and acks. Idempotent: if the saga is already
+/// terminal (no slot, no reservation) it is a clean no-op.
+async fn abort(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    reservation: Option<PreparedAFields>,
+    reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let context_hex = hex_context_id(&state.context_id);
+
+    // CALLER side: release the held escrow + outbound-RL reservation (RAII).
+    if let Some(prepared) = reservation {
+        crate::context::tools_helpers::rollback_tool_economy(
+            state,
+            deps,
+            prepared.reservation.ticket,
+        )
+        .await;
+    }
+
+    // TARGET side: clear the staged tool-session slot (releases the session
+    // reservation). Idempotent — a missing slot is a clean no-op.
+    let had_slot = state.saga_pending.remove(saga_id).is_some();
+
+    // If nothing was staged and no reservation was handed back, the saga was
+    // already terminal — ack without a (redundant) persist.
+    if !had_slot {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+
+    // Class-S sync-persist fail-closed before acking: the cleared slot MUST
+    // durably land so a crash respawn does not re-stage a stale saga.
+    if let Err(persist_err) = persist_state_fail_closed(state, deps, &context_hex) {
+        let sketch = outcome_error_sketch(&persist_err);
+        let _ = reply.send(Err(persist_err));
+        return Outcome::err_mutated(sketch);
+    }
+
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
+}
+
+// ---------------------------------------------------------------------------
+// EmitDivergenceMarker — either side (spec §6.2.4 "Dual event-log recording")
+// ---------------------------------------------------------------------------
+
+/// Emit a signed [`CrossContextDivergenceMarker`] into the LOCAL event log on a
+/// `NeedsRepair` outcome (spec §6.2.4 "Dual event-log recording"). Runs on the
+/// LOCAL actor; the emitting side's Active Signing Key is passed per-call (the
+/// actor holds no key).
+///
+/// The marker records which side committed, the `SagaId`, the `nonce`, and the
+/// committed-side event id — making a one-sided commit durably auditable rather
+/// than a silent repudiation primitive. Class-S sync-persists fail-closed.
+// Sync: the body performs only synchronous event-log append + Class-S persist,
+// so it does not `.await`. Keeping it sync lets it take a shared
+// `&PerContextState` borrow (which is `!Send`) without making the actor future
+// `!Send` — a shared ref held across an `.await` would poison the actor task.
+#[allow(clippy::too_many_arguments)]
+fn emit_divergence_marker(
+    state: &PerContextState,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    nonce: [u8; 16],
+    committed_side: CommittedSide,
+    committed_event_id: &str,
+    signing_key: &SigningKeyBytes,
+    reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let context_hex = hex_context_id(&state.context_id);
+
+    let key = signing_key.to_signing_key();
+    let marker = match CrossContextDivergenceMarker::sign(
+        &key,
+        saga_id.0.clone(),
+        nonce,
+        committed_side,
+        committed_event_id.to_owned(),
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            let err = ContextError::CryptoFailed(format!(
+                "SCP-SAGA-13036: divergence-marker signing failed for saga '{}': {e}",
+                saga_id.0
+            ));
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            return Outcome::err(sketch);
+        }
+    };
+
+    // Serialize the signed marker as the event payload so an auditor can verify
+    // it directly from the log entry.
+    let marker_payload = match serde_json::to_value(&marker) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = ContextError::CryptoFailed(format!(
+                "SCP-SAGA-13037: divergence-marker serialization failed for saga '{}': {e}",
+                saga_id.0
+            ));
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            return Outcome::err(sketch);
+        }
+    };
+    let event_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
+    if let Err(err) = deps.event_log.append_context_event_with_payload(
+        &state.context_id,
+        &event_name,
+        "",
+        Some(&marker_payload),
+    ) {
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    }
+
+    // Class-S sync-persist fail-closed: the divergence record is the durable
+    // audit witness operator-repair relies on; it MUST land before acking.
+    if let Err(persist_err) = persist_state_fail_closed(state, deps, &context_hex) {
+        let sketch = outcome_error_sketch(&persist_err);
+        let _ = reply.send(Err(persist_err));
+        return Outcome::err_mutated(sketch);
+    }
+
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
+}
+
+/// Lowercase-hex encode a 16-byte nonce (the join key between the two
+/// event-log records, recorded on both for the §6.2.4 auditor).
+fn hex_nonce(nonce: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for b in nonce {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Lowercase-hex of `SHA-256(jcs(output))` — the verifiable link from the
+/// caller's `CrossContextToolInvoked` record to the receipt's `output_hash`
+/// without journaling the (possibly large/sensitive) output (§6.2.4).
+fn hex_output_hash(output_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest: [u8; 32] = Sha256::digest(output_bytes).into();
+    let mut s = String::with_capacity(64);
+    for b in &digest {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,10 +2032,314 @@ mod tests {
         assert!(st.saga_pending.is_empty());
     }
 
+    // --- Commit-B / Commit-A / Abort tests --------------------------------
+
+    /// A target signing key wrapped for the per-call receipt-signing argument.
+    fn signing_key_bytes(seed: u8) -> SigningKeyBytes {
+        SigningKeyBytes::from_signing_key(&ed25519_dalek::SigningKey::from_bytes(&[seed; 32]))
+    }
+
+    /// Stage a Prepare-B slot for `saga_id` by running the real `prepare_b`
+    /// (ungated tool) so Commit-B has the B-recorded provenance to sign over.
+    async fn stage_prepared_b(
+        st: &mut PerContextState,
+        deps: &ActorDeps,
+        ctx_byte: u8,
+        saga_id: &str,
+        now_ms: u64,
+    ) {
+        let mut req = prepare_b_request(ctx_byte, None, 2, now_ms);
+        req.saga_id = SagaId(saga_id.to_owned());
+        let (tx, rx) = oneshot::channel();
+        let out = prepare_b(st, deps, req, tx).await;
+        assert!(out.result.is_ok(), "stage prepare_b: {:?}", out.result);
+        rx.await.unwrap().expect("prepared-B staged");
+    }
+
     #[tokio::test]
-    async fn dispatch_commit_phase_arms_are_not_implemented() {
-        let issuer = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let mut st = target_state(0xBB, OTHER, CALLER).await;
+    async fn commit_b_reserve_then_settle_stages_output_appends_and_signs() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut st = target_state(0xC1, OTHER, CALLER).await;
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = deps.clock.now_millis();
+        let saga = SagaId("saga-commit-b-1".to_owned());
+        stage_prepared_b(&mut st, &deps, 0xC1, &saga.0, now_ms).await;
+
+        // Reserve: slot present, not yet committed ⇒ ReadyToExecute.
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_reserve(&st, &saga, tx);
+        assert!(out.result.is_ok());
+        assert!(matches!(
+            rx.await.unwrap().expect("reserve"),
+            CommitBReserveOutcome::ReadyToExecute
+        ));
+
+        // Settle: capture output, append ToolInvoked, sign a verifiable receipt.
+        let target_key = signing_key_bytes(0x55);
+        let output = br#"{"result":42}"#.to_vec();
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_settle(&mut st, &deps, &saga, output.clone(), &target_key, tx).await;
+        assert!(out.result.is_ok(), "settle: {:?}", out.result);
+        let settled = rx.await.unwrap().expect("settled");
+
+        // The receipt verifies against the target's signing key.
+        let receipt: CrossContextToolReceipt =
+            serde_json::from_slice(&settled.receipt).expect("receipt json");
+        receipt
+            .verify(&target_key.to_signing_key().verifying_key())
+            .expect("receipt verifies against target signing key");
+        // The receipt is signed over B's STAGED provenance: re-derived depth 3
+        // (incoming 2 + 1) and the staged wire nonce.
+        assert_eq!(receipt.chain_depth, 3);
+        assert_eq!(receipt.nonce, [0x42; 16]);
+        assert_eq!(receipt.tool_invoked_event_id, settled.tool_invoked_event_id);
+        // The output was captured durably and the staged slot cleared.
+        assert!(st.xctx_committed_outputs.contains_key(&saga));
+        assert!(st.saga_pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_b_settle_replay_re_emits_identical_receipt_without_re_append() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut st = target_state(0xC2, OTHER, CALLER).await;
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = deps.clock.now_millis();
+        let saga = SagaId("saga-commit-b-replay".to_owned());
+        stage_prepared_b(&mut st, &deps, 0xC2, &saga.0, now_ms).await;
+
+        let target_key = signing_key_bytes(0x66);
+        let output = br#"{"result":7}"#.to_vec();
+
+        let (tx, rx) = oneshot::channel();
+        commit_b_settle(&mut st, &deps, &saga, output.clone(), &target_key, tx).await;
+        let first = rx.await.unwrap().expect("first settle");
+        // Capture the durable event id; a replay must reproduce it.
+        let captured_event_id = st
+            .xctx_committed_outputs
+            .get(&saga)
+            .unwrap()
+            .tool_invoked_event_id
+            .clone();
+
+        // Replay: a DIFFERENT output + a DIFFERENT key would re-sign divergently
+        // if the tool were re-invoked — but the replay re-emits the STORED
+        // capture, so the receipt + event id are byte-for-byte identical.
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_settle(
+            &mut st,
+            &deps,
+            &saga,
+            br#"{"result":999}"#.to_vec(),
+            &signing_key_bytes(0x77),
+            tx,
+        )
+        .await;
+        assert!(out.result.is_ok());
+        let replay = rx.await.unwrap().expect("replay settle");
+
+        assert_eq!(
+            first.receipt, replay.receipt,
+            "receipt must be identical on replay"
+        );
+        assert_eq!(
+            first.output_bytes, replay.output_bytes,
+            "stored output re-emitted"
+        );
+        assert_eq!(replay.tool_invoked_event_id, captured_event_id);
+        // Reserve on a committed saga short-circuits to AlreadyCommitted.
+        let (tx, rx) = oneshot::channel();
+        commit_b_reserve(&st, &saga, tx);
+        assert!(matches!(
+            rx.await.unwrap().expect("reserve replay"),
+            CommitBReserveOutcome::AlreadyCommitted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn commit_b_settle_canonicalizes_output_so_receipt_self_verifies() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut st = target_state(0xC3, OTHER, CALLER).await;
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = deps.clock.now_millis();
+        let saga = SagaId("saga-commit-b-jcs".to_owned());
+        stage_prepared_b(&mut st, &deps, 0xC3, &saga.0, now_ms).await;
+
+        let target_key = signing_key_bytes(0x88);
+        // Non-canonical (pretty-printed, reordered keys) output — the handler
+        // re-canonicalizes so the receipt's output_jcs is the hashed preimage.
+        let output = br#"{ "b": 2, "a": 1 }"#.to_vec();
+        let (tx, rx) = oneshot::channel();
+        commit_b_settle(&mut st, &deps, &saga, output, &target_key, tx).await;
+        let settled = rx.await.unwrap().expect("settled");
+        let receipt: CrossContextToolReceipt =
+            serde_json::from_slice(&settled.receipt).expect("receipt json");
+        // Self-verifying: output_hash recomputes from the carried JCS bytes.
+        receipt
+            .verify(&target_key.to_signing_key().verifying_key())
+            .expect("self-verifying receipt");
+        assert_eq!(receipt.output_jcs, br#"{"a":1,"b":2}"#.to_vec());
+    }
+
+    #[tokio::test]
+    async fn commit_a_settles_escrow_and_appends_invoked_idempotently() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // Prepare-A runs on the CALLER context.
+        let mut st = target_state(0xC4, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        // Stage Prepare-A to obtain the held reservation (FSM carries it).
+        let (tx, rx) = oneshot::channel();
+        prepare_a(
+            &mut st,
+            &deps,
+            &[0xC4; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            5,
+            tx,
+        )
+        .await;
+        let prepared_a = rx.await.unwrap().expect("prepared-A");
+
+        let saga = SagaId("saga-commit-a-1".to_owned());
+        let nonce = [0x42; 16];
+        let req = CommitARequest {
+            saga_id: saga.clone(),
+            reservation: prepared_a,
+            caller_context_id: [0xC4; 32],
+            caller_did: DID(CALLER.to_owned()),
+            target_context_id: [0xEE; 32],
+            nonce,
+            receipt: br#"{"sig":"x"}"#.to_vec(),
+            output_bytes: br#"{"result":1}"#.to_vec(),
+        };
+        let (tx, rx) = oneshot::channel();
+        let out = commit_a(&mut st, &deps, req, tx).await;
+        assert!(out.result.is_ok(), "commit_a: {:?}", out.result);
+        rx.await.unwrap().expect("commit-a ack");
+        // The committed A-side saga is the idempotency witness.
+        assert!(st.xctx_committed_invocations.contains(&saga));
+
+        // Replay: a fresh reservation handed back is released (RAII); re-ack
+        // without re-settling (the witness short-circuits).
+        let (tx2, rx2) = oneshot::channel();
+        prepare_a(
+            &mut st,
+            &deps,
+            &[0xC4; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            5,
+            tx2,
+        )
+        .await;
+        let replay_reservation = rx2.await.unwrap().expect("prepared-A replay");
+        let replay_req = CommitARequest {
+            saga_id: saga.clone(),
+            reservation: replay_reservation,
+            caller_context_id: [0xC4; 32],
+            caller_did: DID(CALLER.to_owned()),
+            target_context_id: [0xEE; 32],
+            nonce,
+            receipt: br#"{"sig":"x"}"#.to_vec(),
+            output_bytes: br#"{"result":1}"#.to_vec(),
+        };
+        let (tx, rx) = oneshot::channel();
+        let out = commit_a(&mut st, &deps, replay_req, tx).await;
+        assert!(out.result.is_ok());
+        rx.await.unwrap().expect("commit-a replay ack");
+    }
+
+    #[tokio::test]
+    async fn abort_b_side_releases_session_by_clearing_slot() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut st = target_state(0xC5, OTHER, CALLER).await;
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = deps.clock.now_millis();
+        let saga = SagaId("saga-abort-b".to_owned());
+        stage_prepared_b(&mut st, &deps, 0xC5, &saga.0, now_ms).await;
+        assert!(!st.saga_pending.is_empty());
+
+        // Abort on the B side (no reservation): clears the staged slot.
+        let (tx, rx) = oneshot::channel();
+        let out = abort(&mut st, &deps, &saga, None, tx).await;
+        assert!(out.result.is_ok(), "abort: {:?}", out.result);
+        rx.await.unwrap().expect("abort ack");
+        assert!(st.saga_pending.is_empty());
+
+        // Idempotent: a second abort on the now-terminal saga is a clean no-op.
+        let (tx, rx) = oneshot::channel();
+        let out = abort(&mut st, &deps, &saga, None, tx).await;
+        assert!(out.result.is_ok());
+        rx.await.unwrap().expect("abort idempotent ack");
+    }
+
+    #[tokio::test]
+    async fn abort_a_side_releases_escrow_reservation() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xC6, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        // The caller starts with a finite budget; reserve, then abort releases it.
+        let (tx, rx) = oneshot::channel();
+        prepare_a(
+            &mut st,
+            &deps,
+            &[0xC6; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            5,
+            tx,
+        )
+        .await;
+        let prepared_a = rx.await.unwrap().expect("prepared-A");
+
+        // No staged slot on A (B stages the slot); abort releases the held
+        // escrow/rate-limit reservation via the rollback path and acks.
+        let saga = SagaId("saga-abort-a".to_owned());
+        let (tx, rx) = oneshot::channel();
+        let out = abort(&mut st, &deps, &saga, Some(prepared_a), tx).await;
+        assert!(out.result.is_ok(), "abort-a: {:?}", out.result);
+        rx.await.unwrap().expect("abort-a ack");
+    }
+
+    #[tokio::test]
+    async fn emit_divergence_marker_appends_verifiable_marker() {
+        use scp_protocol::context::tools::cross_context_saga::CrossContextDivergenceMarker;
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let st = target_state(0xC7, OTHER, CALLER).await;
         let deps = build_deps(
             OTHER.to_owned(),
             issuer.verifying_key(),
@@ -1308,20 +2347,90 @@ mod tests {
         )
         .await;
 
+        let signing = signing_key_bytes(0x99);
+        let saga = SagaId("saga-divergence".to_owned());
         let (tx, rx) = oneshot::channel();
-        let out = dispatch(
-            &mut st,
+        let out = emit_divergence_marker(
+            &st,
             &deps,
-            SagaPhaseMessage::CommitB {
-                saga_id: SagaId("s".to_owned()),
-                reply: tx,
-            },
+            &saga,
+            [0xAB; 16],
+            CommittedSide::Target,
+            "evt-committed-9",
+            &signing,
+            tx,
+        );
+        assert!(out.result.is_ok(), "emit: {:?}", out.result);
+        rx.await.unwrap().expect("emit ack");
+
+        // The marker the handler signed verifies against the emitting key.
+        let marker = CrossContextDivergenceMarker::sign(
+            &signing.to_signing_key(),
+            saga.0.clone(),
+            [0xAB; 16],
+            CommittedSide::Target,
+            "evt-committed-9".to_owned(),
+        )
+        .expect("marker");
+        marker
+            .verify(&signing.to_signing_key().verifying_key())
+            .expect("marker verifies");
+    }
+
+    #[tokio::test]
+    async fn commit_b_reserve_without_staged_slot_is_rejected() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let st = target_state(0xC8, OTHER, CALLER).await;
+        // `commit_b_reserve` is a sync, deps-less read-only check.
+        let _deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
         )
         .await;
-        assert!(matches!(out.result, Err(ContextError::NotImplemented(_))));
-        assert!(matches!(
-            rx.await.unwrap(),
-            Err(ContextError::NotImplemented(_))
-        ));
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_reserve(&st, &SagaId("never-prepared".to_owned()), tx);
+        assert!(out.result.is_err());
+        let err = rx.await.unwrap().expect_err("must reject");
+        assert!(matches!(err, ContextError::InvalidState(m) if m.contains("SCP-SAGA-13030")));
+    }
+
+    #[tokio::test]
+    async fn commit_b_settle_fail_closed_rolls_back_capture() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut st = target_state(0xC9, OTHER, CALLER).await;
+        // Stage with a passing persistence, then swap to a failing one for settle.
+        let ok_deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = ok_deps.clock.now_millis();
+        let saga = SagaId("saga-settle-failclose".to_owned());
+        stage_prepared_b(&mut st, &ok_deps, 0xC9, &saga.0, now_ms).await;
+
+        let fail_deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let (tx, rx) = oneshot::channel();
+        let out = commit_b_settle(
+            &mut st,
+            &fail_deps,
+            &saga,
+            br#"{"result":1}"#.to_vec(),
+            &signing_key_bytes(0xAA),
+            tx,
+        )
+        .await;
+        assert!(out.result.is_err());
+        let err = rx.await.unwrap().expect_err("persist must fail-close");
+        assert!(matches!(err, ContextError::PersistenceFailed(_)));
+        // The capture was rolled back; the staged slot restored for a retry.
+        assert!(!st.xctx_committed_outputs.contains_key(&saga));
+        assert!(st.saga_pending.contains_key(&saga));
     }
 }

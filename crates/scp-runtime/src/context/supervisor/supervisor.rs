@@ -8795,6 +8795,8 @@ mod tests {
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
             saga_pending: HashMap::new(),
+            xctx_committed_outputs: HashMap::new(),
+            xctx_committed_invocations: std::collections::HashSet::new(),
         }
     }
 
@@ -10992,6 +10994,40 @@ mod tests {
             ),
         );
 
+        // Committed cross-context tool invocation (ADR-049 §9 line 144 — spec
+        // §6.2.4 "Exactly-once execution with durable output capture"). Both the
+        // TARGET-side durable output capture and the CALLER-side commit witness
+        // are Class S: a coalesce-window rollback would re-invoke the tool /
+        // double-settle the escrow on replay. Seed both so the round-trip
+        // asserts they survive the production sync-persist builder.
+        let committed_saga_id =
+            crate::context::supervisor::saga_journal::SagaId("saga-class-s-committed".to_owned());
+        let committed_receipt =
+            scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[0x3Cu8; 32]),
+                [0x5Au8; 32],
+                [0x6Bu8; 32],
+                "did:example:class-s-caller".to_owned(),
+                [0xC7u8; 16],
+                "class-s-tool-v1".to_owned(),
+                br#"{"result":42}"#.to_vec(),
+                "ToolInvoked:saga-class-s-committed".to_owned(),
+                4,
+                1_700_000_000_456,
+            )
+            .expect("Class-S committed receipt signs");
+        state.xctx_committed_outputs.insert(
+            committed_saga_id.clone(),
+            crate::context::supervisor::saga_prepared_state::CommittedToolInvocation {
+                receipt: committed_receipt.clone(),
+                output_bytes: br#"{"result":42}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:saga-class-s-committed".to_owned(),
+            },
+        );
+        state
+            .xctx_committed_invocations
+            .insert(committed_saga_id.clone());
+
         // Build the snapshot via the EXACT production sync-persist builder
         // (`build_snapshot_from_state`, the one `persist_state_fail_closed`
         // calls), then round-trip through the real on-disk serialization format.
@@ -11085,6 +11121,35 @@ mod tests {
             }
             _ => panic!("Class S: rehydrated wrong variant"),
         }
+
+        // Committed cross-context tool invocation (spec §6.2.4 "Exactly-once
+        // execution with durable output capture"): the TARGET-side durable
+        // output capture (signed receipt + output) and the CALLER-side commit
+        // witness MUST both survive the snapshot round-trip. A capture dropped
+        // here would re-invoke the tool on replay; a witness dropped here would
+        // double-settle the escrow.
+        let restored_committed = restored
+            .xctx_committed_outputs
+            .get(&committed_saga_id)
+            .expect("Class S: committed cross-context output capture must round-trip");
+        assert_eq!(
+            restored_committed.receipt, committed_receipt,
+            "Class S: the signed receipt must round-trip byte-for-byte (replay reproducibility)"
+        );
+        assert_eq!(
+            restored_committed.tool_invoked_event_id,
+            "ToolInvoked:saga-class-s-committed"
+        );
+        assert_eq!(
+            restored_committed.output_bytes,
+            br#"{"result":42}"#.to_vec()
+        );
+        assert!(
+            restored
+                .xctx_committed_invocations
+                .contains(&committed_saga_id),
+            "Class S: the caller-side commit witness must round-trip (idempotency / no double-settle)"
+        );
     }
 
     /// Drive a membership mutation through its sync-persisting helper boundary

@@ -1013,6 +1013,38 @@ pub struct PerContextState {
     /// Class-S snapshot.
     pub xctx_nonce_dedup: NonceDedup,
 
+    /// Target-side (B-owned) durable capture of COMMITTED cross-context tool
+    /// invocations, keyed by `SagaId` (spec §6.2.4 "Exactly-once execution with
+    /// durable output capture"). Populated at Commit-B settle with the captured
+    /// tool output, the signed [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt),
+    /// and the `tool_invoked_event_id`, so a Commit replayed after a crash
+    /// (§17.16.4) re-emits the STORED output and the IDENTICAL signed receipt —
+    /// NEVER re-invoking the tool, never minting a fresh event id.
+    ///
+    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9), the same
+    /// discipline as [`Self::saga_pending`]: a crash that rolled the capture
+    /// back behind an acked Commit-B would re-invoke the tool on replay and
+    /// re-sign a divergent receipt, breaking the exactly-once + receipt-
+    /// reproducibility guarantees. Survives same-node restore; dropped (like
+    /// `saga_pending`) on cross-node export/import — a foreign node must never
+    /// drive local Commit replay.
+    pub xctx_committed_outputs:
+        HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedToolInvocation>,
+
+    /// Caller-side (A-owned) durable set of COMMITTED cross-context tool
+    /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
+    /// §17.16.4 crash recovery: "A re-acks its `CrossContextToolInvoked` append
+    /// and re-settles escrow as a no-op"). Commit-A inserts the `SagaId` here as
+    /// the idempotency witness BEFORE acking; a replayed Commit-A finds the
+    /// witness and re-acks without re-settling the escrow or re-appending the
+    /// `CrossContextToolInvoked` record.
+    ///
+    /// **Class S** — synchronously persisted fail-closed (ADR-049 §9): without
+    /// it, a crash that rolled the witness back behind an acked Commit-A would
+    /// double-settle the escrow on replay. Survives same-node restore; dropped
+    /// on cross-node export/import (a foreign saga must never drive local replay).
+    pub xctx_committed_invocations: std::collections::HashSet<SagaId>,
+
     /// In-flight broadcast-publish reservations awaiting their apply
     /// phase (ADR-049 §SequenceReservation). Phase 1
     /// (`ReserveBroadcastPublish`) reserves a broadcast sequence and
@@ -1175,6 +1207,8 @@ impl PerContextState {
             saga_pending: HashMap::new(),
             xctx_ucan_proofs: InMemoryProofResolver::new(),
             xctx_nonce_dedup: NonceDedup::new(),
+            xctx_committed_outputs: HashMap::new(),
+            xctx_committed_invocations: std::collections::HashSet::new(),
             pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
             lifecycle_state: ContextLifecycleState::Open,
@@ -1389,6 +1423,8 @@ mod tests {
             saga_pending,
             xctx_ucan_proofs,
             xctx_nonce_dedup,
+            xctx_committed_outputs,
+            xctx_committed_invocations,
             pending_broadcast_publishes,
             welcome_scratchpad,
             lifecycle_state,
@@ -1452,6 +1488,10 @@ mod tests {
             let mut dedup = xctx_nonce_dedup;
             assert!(!dedup.is_replayed(&[0u8; 16], 0));
         }
+        // No committed cross-context tool invocations on a fresh context
+        // (target-side durable output capture + caller-side commit witness).
+        assert!(xctx_committed_outputs.is_empty());
+        assert!(xctx_committed_invocations.is_empty());
         assert!(pending_broadcast_publishes.is_empty());
         assert!(welcome_scratchpad.is_none());
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);
@@ -1500,6 +1540,8 @@ mod tests {
             saga_pending: _,
             xctx_ucan_proofs: _,
             xctx_nonce_dedup: _,
+            xctx_committed_outputs: _,
+            xctx_committed_invocations: _,
             pending_broadcast_publishes: _,
             welcome_scratchpad: _,
             lifecycle_state: _,

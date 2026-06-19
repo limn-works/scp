@@ -2121,6 +2121,8 @@ pub fn build_snapshot_from_state(
         // its sanctioned serialization mirror so a Prepare's staged evidence
         // survives an actor crash. See [`saga_pending_snapshot`].
         saga_pending: saga_pending_snapshot(state),
+        xctx_committed_outputs: xctx_committed_outputs_snapshot(state),
+        xctx_committed_invocations: state.xctx_committed_invocations.clone(),
     }
 }
 
@@ -2152,6 +2154,24 @@ pub(in crate::context) fn saga_pending_snapshot(
             )
         })
         .collect()
+}
+
+/// Build the Class-S snapshot projection of the actor's COMMITTED
+/// cross-context tool-invocation captures (spec §6.2.4 "Exactly-once
+/// execution with durable output capture"; ADR-049 §9). The live
+/// [`CommittedToolInvocation`](crate::context::supervisor::saga_prepared_state::CommittedToolInvocation)
+/// carries no §9.4.3 bearer bytes (public receipt + output), so — unlike
+/// [`saga_pending_snapshot`] — the snapshot stores it directly via `Clone`.
+/// Used at every snapshot builder so a crash between Commit-B capture and the
+/// next coalesced write cannot lose the durable output (which would re-invoke
+/// the tool on replay).
+pub(in crate::context) fn xctx_committed_outputs_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<
+    crate::context::supervisor::saga_journal::SagaId,
+    crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
+> {
+    state.xctx_committed_outputs.clone()
 }
 
 // ---------------------------------------------------------------------------

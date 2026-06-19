@@ -2581,13 +2581,69 @@ pub struct PreparedBFields {
     pub recorded_chain_depth: u8,
 }
 
+/// Reply payload for [`SagaPhaseMessage::CommitBReserve`] (spec §6.2.4
+/// "Commit", split-execution model). The Commit-B phase is two actor
+/// round-trips with the non-`Send` tool executor running supervisor-side in
+/// between (the executor cannot cross the mailbox per ADR-049 §3). This is the
+/// first round-trip's reply: it tells the supervisor FSM whether to run the
+/// executor or short-circuit to the stored output.
+///
+/// **Not `Serialize` / `Clone`.** The `AlreadyCommitted` payload carries the
+/// captured output bytes + the signed receipt; it is consumed once by the FSM.
+#[derive(Debug)]
+pub enum CommitBReserveOutcome {
+    /// The staged prepared + session reservation are present and this
+    /// `SagaId`'s `ToolInvoked` has NOT yet been appended. The FSM MUST now run
+    /// the tool executor supervisor-side, capture the output, and call
+    /// [`SagaPhaseMessage::CommitBSettle`].
+    ReadyToExecute,
+    /// Idempotent replay (spec §6.2.4 "Crash recovery §17.16.4"): this
+    /// `SagaId`'s `ToolInvoked` was already appended on a prior Commit-B. The
+    /// tool MUST NOT be re-invoked — the stored output + the original signed
+    /// receipt are re-emitted verbatim. The FSM skips the executor and treats
+    /// this as a Commit-B success.
+    AlreadyCommitted {
+        /// The original signed receipt bytes (JCS of [`CrossContextToolReceipt`]).
+        receipt: Vec<u8>,
+        /// The captured tool output bytes (the receipt's `output_jcs`).
+        output_bytes: Vec<u8>,
+        /// The `SagaId`-stable `ToolInvoked` event-log entry id.
+        tool_invoked_event_id: String,
+    },
+}
+
+/// Reply payload for [`SagaPhaseMessage::CommitBSettle`] (spec §6.2.4
+/// "Commit", target side). The second Commit-B round-trip's reply: the signed
+/// receipt + the captured output the FSM forwards to Commit-A.
+///
+/// On a replayed `CommitBSettle` (output already captured for this `SagaId`)
+/// the SAME stored bytes are returned — byte-for-byte identical receipt and
+/// `tool_invoked_event_id` — and the tool is NOT re-invoked.
+#[derive(Debug)]
+pub struct CommitBSettleOutcome {
+    /// The target's signed receipt bytes (JCS of [`CrossContextToolReceipt`]).
+    pub receipt: Vec<u8>,
+    /// The captured tool output bytes the FSM forwards to Commit-A.
+    pub output_bytes: Vec<u8>,
+    /// The `SagaId`-stable `ToolInvoked` event-log entry id.
+    pub tool_invoked_event_id: String,
+}
+
+/// Reply-channel type alias for [`SagaPhaseMessage::CommitBReserve`].
+pub type CommitBReserveReply = oneshot::Sender<Result<CommitBReserveOutcome, ContextError>>;
+
+/// Reply-channel type alias for [`SagaPhaseMessage::CommitBSettle`].
+pub type CommitBSettleReply = oneshot::Sender<Result<CommitBSettleOutcome, ContextError>>;
+
 /// See [`ContextCommand::SagaPhase`]. The per-phase messages the supervisor
 /// FSM dispatches to a participant actor for a cross-context tool-invocation
 /// saga (spec §6.2.4). Each variant carries a typed `oneshot` reply.
 ///
 /// The Prepare-A / Prepare-B arms have real handler bodies (slice 3b); the
-/// Commit / Abort / divergence-marker arms are dispatched in later slices and
-/// their handler bodies return [`ContextError::NotImplemented`] for now. The
+/// Commit (split [`Self::CommitBReserve`] / [`Self::CommitBSettle`] /
+/// [`Self::CommitA`]), [`Self::Abort`], and [`Self::EmitDivergenceMarker`]
+/// arms have real handler bodies (slice 4). The supervisor FSM that *drives*
+/// them is a later slice — these handlers are compiled-but-not-yet-driven. The
 /// dispatch `match` stays exhaustive so adding a phase is a compile error.
 #[non_exhaustive]
 pub enum SagaPhaseMessage {
@@ -2648,19 +2704,81 @@ pub enum SagaPhaseMessage {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<PreparedBFields, ContextError>>,
     },
-    /// Commit-B — target executes the tool and applies the staged session.
-    /// Handler body lands in a later slice.
-    CommitB {
+    /// Commit-B (reserve half) — runs on the LOCAL target-context actor. The
+    /// FIRST of the two Commit-B round-trips (spec §6.2.4 "Commit", split per
+    /// ADR-049 §3: the non-`Send` executor cannot cross the mailbox, so it runs
+    /// supervisor-side BETWEEN this reserve and the [`Self::CommitBSettle`]).
+    ///
+    /// Confirms the staged prepared + session reservation are present for this
+    /// `SagaId`. Idempotency (§6.2.4 / §17.16.4): if this `SagaId`'s output was
+    /// already captured (a replayed Commit), it replies
+    /// [`CommitBReserveOutcome::AlreadyCommitted`] with the STORED output +
+    /// receipt + event id and the FSM skips the executor — the tool is NEVER
+    /// re-invoked. Otherwise it replies [`CommitBReserveOutcome::ReadyToExecute`]
+    /// and the FSM runs the executor, then calls [`Self::CommitBSettle`].
+    ///
+    /// Read-only — performs no mutation, so no Class-S persist here.
+    CommitBReserve {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Oneshot reply channel. See [`CommitBReserveReply`].
+        reply: CommitBReserveReply,
+    },
+    /// Commit-B (settle half) — runs on the LOCAL target-context actor. The
+    /// SECOND of the two Commit-B round-trips (spec §6.2.4 "Commit", target
+    /// side), called by the FSM with the executor's captured output.
+    ///
+    /// Durably captures the output keyed by `SagaId` (so a later replay
+    /// re-emits it), `SagaId`-idempotently appends `ToolInvoked` → a stable
+    /// `tool_invoked_event_id`, signs the [`CrossContextToolReceipt`] over the
+    /// staged `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms`
+    /// plus `output_hash` plus the event id using `target_signing_key`, Class-S
+    /// sync-persists fail-closed, and replies the receipt + output bytes. A
+    /// replayed `CommitBSettle` (output already captured) re-emits the stored
+    /// bytes verbatim and does NOT re-append or re-sign.
+    CommitBSettle {
         /// Durable saga identifier.
         saga_id: crate::context::supervisor::saga_journal::SagaId,
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
+        /// The tool executor's captured output bytes (the FSM ran the executor
+        /// supervisor-side between reserve and settle). Hashed into the
+        /// receipt's `output_hash` and carried as the receipt's JCS output.
+        output_bytes: Vec<u8>,
+        /// The target context's Active Signing Key (§6.2.4 receipt signing).
+        /// The actor holds NO signing key (ADR-049): the FSM resolves the key
+        /// authorized for `target_context_id` and passes it per-call, exactly
+        /// like [`MessagingCommand::SendHeartbeat`] /
+        /// [`MessagingCommand::BuildLocalCheckpoint`]. Zeroizes on drop.
+        target_signing_key: SigningKeyBytes,
+        /// Oneshot reply channel. See [`CommitBSettleReply`].
+        reply: CommitBSettleReply,
     },
-    /// Commit-A — caller settles escrow, applies the outbound decrement, and
-    /// records `CrossContextToolInvoked`. Handler body lands in a later slice.
+    /// Commit-A — runs on the LOCAL caller-context actor. Settles the escrow
+    /// reservation (§19.2.2), applies the staged outbound rate-limit decrement,
+    /// and records `CrossContextToolInvoked` referencing the target ctx id + the
+    /// same `nonce` (spec §6.2.4 "Commit", caller side / "Dual event-log
+    /// recording"). Class-S sync-persists fail-closed. Idempotent by `SagaId`:
+    /// a replay re-acks without re-settling or re-appending.
     CommitA {
         /// Durable saga identifier.
         saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The caller-side escrow + outbound-rate-limit reservation staged at
+        /// Prepare-A and held by the FSM across the saga. Commit-A settles
+        /// (captures) it. Boxed to keep the variant size uniform under
+        /// `clippy::large_enum_variant`. The `#[must_use]` carrier's drop guard
+        /// releases on every terminal non-commit path; Commit-A consumes it.
+        reservation: Box<PreparedAFields>,
+        /// Caller context id (raw 32-byte digest) — the actor's own context;
+        /// the `CrossContextToolInvoked` actor field.
+        caller_context_id: [u8; 32],
+        /// Caller DID — the channel-authenticated initiator (the event actor).
+        caller_did: scp_identity::DID,
+        /// Target context id (raw 32-byte digest) — referenced by the
+        /// `CrossContextToolInvoked` record so an auditor can join it to B's log.
+        target_context_id: [u8; 32],
+        /// The 16-byte correlation nonce — the SAME nonce B staged into
+        /// `ToolInvoked`; the join key between the two records (§6.2.4 "Dual
+        /// event-log recording").
+        nonce: [u8; 16],
         /// The target's signed receipt bytes captured at Commit-B.
         receipt: Vec<u8>,
         /// The target's captured tool output bytes.
@@ -2668,17 +2786,29 @@ pub enum SagaPhaseMessage {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
-    /// Abort — release the staged reservations on either side (RAII). Handler
-    /// body lands in a later slice.
+    /// Abort — runs on EITHER side's local actor. RAII-releases the staged
+    /// reservations (escrow / outbound-RL on A — carried back via
+    /// `reservation`; tool-session on B — the staged `saga_pending` slot), clears
+    /// the saga slot, Class-S sync-persists fail-closed, and acks. Idempotent
+    /// no-op if the saga is already terminal (slot absent and no reservation).
     Abort {
         /// Durable saga identifier.
         saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// On the CALLER (A) side, the staged escrow + outbound-RL reservation
+        /// the FSM holds, handed back so Abort can RAII-release it (rollback
+        /// path). `None` on the TARGET (B) side, whose staged reservation lives
+        /// in `saga_pending` (the tool-session reservation is released by
+        /// clearing the slot — B stages no `ToolEconomyTicket` at Prepare-B).
+        /// Boxed under `clippy::large_enum_variant`.
+        reservation: Option<Box<PreparedAFields>>,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
     /// Emit a signed `CrossContextDivergenceMarker` on a `NeedsRepair`
-    /// outcome (spec §6.2.4 "Dual event-log recording"). Handler body lands in
-    /// a later slice.
+    /// outcome (spec §6.2.4 "Dual event-log recording") into the LOCAL event
+    /// log. Used by the FSM (slice 6) when the two sides diverge. The actor
+    /// holds no key, so the emitting side's Active Signing Key is passed
+    /// per-call.
     EmitDivergenceMarker {
         /// Durable saga identifier.
         saga_id: crate::context::supervisor::saga_journal::SagaId,
@@ -2688,6 +2818,10 @@ pub enum SagaPhaseMessage {
         committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
         /// The committed-side event id.
         committed_event_id: String,
+        /// The local (emitting) side's Active Signing Key. The actor holds no
+        /// key (ADR-049); the FSM passes the key authorized for this context
+        /// per-call. Zeroizes on drop.
+        signing_key: SigningKeyBytes,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },

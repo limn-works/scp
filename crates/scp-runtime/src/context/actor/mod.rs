@@ -715,9 +715,16 @@ impl ContextActor {
             ContextCommand::SagaPhase(SagaPhaseMessage::PrepareB { reply, .. }) => {
                 ack_not_impl(reply, "saga_phase");
             }
+            // CommitBReserve / CommitBSettle reply distinct outcome shapes, so
+            // they are acked separately from the unit-reply phase arms.
+            ContextCommand::SagaPhase(SagaPhaseMessage::CommitBReserve { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle { reply, .. }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
             ContextCommand::SagaPhase(
-                SagaPhaseMessage::CommitB { reply, .. }
-                | SagaPhaseMessage::CommitA { reply, .. }
+                SagaPhaseMessage::CommitA { reply, .. }
                 | SagaPhaseMessage::Abort { reply, .. }
                 | SagaPhaseMessage::EmitDivergenceMarker { reply, .. },
             ) => {
