@@ -897,6 +897,9 @@ impl ContextActor {
             QueriesCommand::GetRoleState { reply, .. } => {
                 ack_not_impl(reply, "queries::get_role_state");
             }
+            QueriesCommand::HasEstablishedToolInterface { reply, .. } => {
+                ack_not_impl(reply, "queries::has_established_tool_interface");
+            }
             QueriesCommand::PendingCommits { reply, .. } => {
                 ack_not_impl(reply, "queries::pending_commits");
             }

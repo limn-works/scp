@@ -127,7 +127,6 @@ async fn dispatch_prepare_phase(
             caller_context_id,
             caller_did,
             tool_registration_id,
-            declared_cost,
             reply,
         } => {
             prepare_a(
@@ -136,7 +135,6 @@ async fn dispatch_prepare_phase(
                 &caller_context_id,
                 &caller_did,
                 &tool_registration_id,
-                declared_cost,
                 reply,
             )
             .await
@@ -152,6 +150,7 @@ async fn dispatch_prepare_phase(
             asserted_chain_depth,
             asserted_nonce,
             asserted_timestamp_ms,
+            caller_source_role,
             reply,
         } => {
             let req = PrepareBRequest {
@@ -165,6 +164,7 @@ async fn dispatch_prepare_phase(
                 asserted_chain_depth,
                 asserted_nonce,
                 asserted_timestamp_ms,
+                caller_source_role,
             };
             prepare_b(state, deps, req, reply).await
         }
@@ -331,20 +331,22 @@ fn misrouted_witness(
 ///
 /// Validates that the caller holds `tool:interface` and is in the interface's
 /// `OutboundPolicy.allowed_callers`, then stages (does NOT apply) the outbound
-/// rate-limit decrement + escrow reservation of `declared_cost` via the
-/// existing reserve mechanism. The resulting `Send` [`ToolEconomyReservation`]
-/// is a `#[must_use]` RAII carrier the FSM holds — its drop releases the held
-/// escrow/rate-limit on every terminal non-commit path. The staged saga state
-/// is Class-S sync-persisted fail-closed BEFORE the reply, so a crash in the
-/// coalesce window cannot acknowledge a Prepare-A whose reservation did not
-/// durably land.
+/// rate-limit decrement + escrow reservation via the existing reserve
+/// mechanism. The escrow amount is the tool's REGISTERED per-invocation cost —
+/// [`reserve_tool_economy`] derives it from the caller context's economy policy
+/// / tool registry via `economy_pre_check`, NEVER from any caller-asserted
+/// value (a caller must not declare its own cheaper cost; spec §6.2.4 / §19.3).
+/// The resulting `Send` [`ToolEconomyReservation`] is a `#[must_use]` RAII
+/// carrier the FSM holds — its drop releases the held escrow/rate-limit on every
+/// terminal non-commit path. The staged saga state is Class-S sync-persisted
+/// fail-closed BEFORE the reply, so a crash in the coalesce window cannot
+/// acknowledge a Prepare-A whose reservation did not durably land.
 async fn prepare_a(
     state: &mut PerContextState,
     deps: &ActorDeps,
     caller_context_id: &[u8; 32],
     caller_did: &DID,
     tool_registration_id: &str,
-    _declared_cost: u64,
     reply: tokio::sync::oneshot::Sender<Result<PreparedAFields, ContextError>>,
 ) -> Outcome<()> {
     let context_id_hex = hex_context_id(caller_context_id);
@@ -359,11 +361,41 @@ async fn prepare_a(
         return Outcome::err(sketch);
     }
 
-    // 2. Stage (not apply) the outbound rate-limit decrement + escrow
-    //    reservation via the existing reserve mechanism. The reservation holds
-    //    the escrow/rate-limit; apply happens at Commit-A settle (slice 4).
-    //    No spending UCAN is presented on the OUTBOUND leg — the inbound
-    //    `require_spending_ucan` gate and §7 proof live on B's Prepare-B side.
+    // 2. Consume the §6.2.0.2 per-interface + per-caller sliding-window budget
+    //    on the OUTBOUND interface (spec §6.2.4 "Prepare", "Initiation consumes
+    //    budget; no terminal outcome refunds it"). This is the binding
+    //    constraint behind the §6.2.4 "Cache-eviction bound": a single caller's
+    //    TTL-window budget sized far below the dedup-cache capacity is what
+    //    forecloses a flood from evicting a still-within-TTL nonce. The consume
+    //    is non-refundable at initiation — once the sliding window is
+    //    incremented it is NEVER decremented back on any terminal outcome
+    //    (Aborted / timeout / NeedsRepair), so a caller that stalls or diverges
+    //    sagas burns its own quota. REUSES the same `RateLimit` /
+    //    `PerCallerRateLimit::check_and_increment` sliding-window mechanism the
+    //    single-context `invoke_cross_context` path consumes (spec §6.2.0.2).
+    if let Err(err) =
+        consume_outbound_interface_rate_limit(state, deps, caller_did, tool_registration_id)
+    {
+        // The §6.2.0.2 consume is non-refundable: if it incremented the window
+        // and THEN this branch is reached, the increment stays. (In practice a
+        // rejection here means the window was NOT incremented — `RateLimited`
+        // is the over-budget case where the call is denied.) Persist so any
+        // partial increment durably lands (fail-closed direction), then reply.
+        let _ = persist_state_fail_closed(state, deps, &context_id_hex);
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err_mutated(sketch);
+    }
+
+    // 3. Stage (not apply) the escrow reservation + the actor-owned
+    //    velocity/budget/hard-rate-limit bookkeeping via the existing reserve
+    //    mechanism. The reservation holds the escrow; apply happens at Commit-A
+    //    settle. The escrow amount is the tool's REGISTERED per-invocation cost
+    //    (derived by `reserve_tool_economy` from the economy policy / tool
+    //    registry via `economy_pre_check`), NEVER a caller-asserted value — a
+    //    caller must not declare its own cheaper cost. No spending UCAN is
+    //    presented on the OUTBOUND leg — the inbound `require_spending_ucan`
+    //    gate and §7 proof live on B's Prepare-B side.
     let now_secs = deps.clock.now_secs();
     let reservation = match reserve_tool_economy(
         state,
@@ -377,15 +409,18 @@ async fn prepare_a(
     {
         Ok(reservation) => reservation,
         Err(err) => {
-            // reserve_tool_economy rolls back its own staged bookkeeping on
-            // every failure branch, so no apply leaked — reply the typed error.
+            // reserve_tool_economy rolls back its OWN staged bookkeeping on
+            // every failure branch, so no escrow/velocity/budget leaked. The
+            // §6.2.0.2 budget consumed above is NOT rolled back (non-refundable
+            // at initiation); persist so it durably lands, then reply.
+            let _ = persist_state_fail_closed(state, deps, &context_id_hex);
             let sketch = outcome_error_sketch(&err);
             let _ = reply.send(Err(err));
-            return Outcome::err(sketch);
+            return Outcome::err_mutated(sketch);
         }
     };
 
-    // 3. Class-S sync-persist fail-closed BEFORE replying (ADR-049 §9): the
+    // 4. Class-S sync-persist fail-closed BEFORE replying (ADR-049 §9): the
     //    reserve mutated actor-owned velocity / rate-limit / budget bookkeeping;
     //    a crash in the coalesce window must not acknowledge a Prepare-A whose
     //    staged reservation did not durably land. On persist failure the
@@ -446,6 +481,79 @@ fn validate_outbound_caller(
     Ok(())
 }
 
+/// Consume one §6.2.0.2 sliding-window budget unit on the OUTBOUND interface for
+/// `tool_registration_id` — both the per-interface (`rate_limit`) AND the
+/// per-caller (`per_caller_rate_limit`) windows, exactly as the single-context
+/// [`invoke_cross_context`](scp_protocol::context::tools::interface::invoke_cross_context)
+/// path consumes them. Returns [`ContextError::RateLimited`] (the over-budget
+/// case) without incrementing the OTHER window when either is exhausted.
+///
+/// The consume is the §6.2.4 "Initiation consumes budget" point: each
+/// initiation increments the caller's sliding window, and NO terminal outcome
+/// decrements it back (the increment is non-refundable). This is the binding
+/// constraint behind the §6.2.4 "Cache-eviction bound" — a per-caller budget
+/// sized far below the dedup-cache capacity forecloses a flood from evicting a
+/// still-within-TTL nonce.
+///
+/// An interface with no configured limit (`None`) is unbounded by design and
+/// consumes nothing; the per-interface limit is checked first, then the
+/// per-caller limit, so an exhausted per-interface window short-circuits before
+/// the per-caller window is touched (matching `invoke_cross_context` order).
+fn consume_outbound_interface_rate_limit(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    caller_did: &DID,
+    tool_registration_id: &str,
+) -> Result<(), ContextError> {
+    let clock = deps.clock.as_ref();
+
+    let Some(interface) = state
+        .governance
+        .tool_interfaces
+        .iter_mut()
+        .find(|i| i.tool_id == tool_registration_id)
+    else {
+        // No interface row for this tool. The target-axis authorize-before-
+        // reserve gate already proved an established interface exists for the
+        // (caller, target, tool) triple before the saga reserved, so a missing
+        // row here is not the unauthorized-target case; there is simply no
+        // configured §6.2.0.2 window to consume (unbounded by design).
+        return Ok(());
+    };
+
+    // Per-interface sliding window first (spec §6.2.0.2, `invoke_cross_context`
+    // order): a single per-interface check_and_increment is the consume.
+    if let Some(rate_limit) = interface.rate_limit.as_mut()
+        && !rate_limit.check_and_increment(clock)
+    {
+        let retry_after_secs = rate_limit.retry_after_secs(clock);
+        return Err(ContextError::RateLimited {
+            resource: "tool_interface".to_owned(),
+            message: format!(
+                "SCP-SAGA-13023: per-interface §6.2.0.2 rate limit exceeded for tool \
+                 '{tool_registration_id}' (retry after {retry_after_secs}s)"
+            ),
+        });
+    }
+
+    // Per-caller sliding window, independent of the per-interface window.
+    if let Some(per_caller) = interface.per_caller_rate_limit.as_mut()
+        && !per_caller.check_and_increment(caller_did, clock)
+    {
+        let retry_after_secs = per_caller.retry_after_secs_for(caller_did, clock);
+        return Err(ContextError::RateLimited {
+            resource: "tool_interface_caller".to_owned(),
+            message: format!(
+                "SCP-SAGA-13024: per-caller §6.2.0.2 rate limit exceeded for caller \
+                 '{caller_did}' on tool '{tool_registration_id}' (retry after \
+                 {retry_after_secs}s)"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Prepare-B — target-context actor
 // ---------------------------------------------------------------------------
@@ -465,6 +573,9 @@ struct PrepareBRequest {
     asserted_chain_depth: u8,
     asserted_nonce: [u8; 16],
     asserted_timestamp_ms: u64,
+    /// Channel-authenticated caller role in the caller context (NOT
+    /// envelope-asserted); enforced against `InboundPolicy.allowed_source_roles`.
+    caller_source_role: Option<String>,
 }
 
 /// Prepare-B handler (spec §6.2.4 "Prepare", target side). Runs on the LOCAL
@@ -669,27 +780,65 @@ fn validate_ucan_rebind(
     })
 }
 
-/// (2) Inbound policy: when the interface requires a spending UCAN, a proof
-/// MUST be present (and was validated in step (1)).
+/// (2) Inbound policy (spec §6.2.4 "Prepare-B... validates `InboundPolicy`
+/// (source role, inbound rate, `require_spending_ucan`)"). Two binding gates at
+/// this layer:
+///
+/// - **`allowed_source_roles`** — the channel-authenticated caller's role
+///   (`req.caller_source_role`, resolved supervisor-side from the caller
+///   context, NEVER envelope-asserted) MUST be in the allow-set. Empty allow-set
+///   = any role (matching the `InboundPolicy` default). A caller whose
+///   authenticated role is absent from a non-empty allow-set is rejected.
+/// - **`require_spending_ucan`** — when set, a proof MUST be present (validated
+///   in step (1)).
+///
+/// The per-interface inbound rate is enforced by the per-interface `RateLimit`
+/// (the §6.2.0.2 sliding window) on the consume path, not re-checked here.
 fn validate_inbound_policy(
     state: &PerContextState,
     req: &PrepareBRequest,
 ) -> Result<(), ContextError> {
-    if let Some(interface) = state
+    let Some(interface) = state
         .governance
         .tool_interfaces
         .iter()
         .find(|i| i.tool_id == req.tool_registration_id)
-        && let Some(inbound) = interface.inbound_policy.as_ref()
-        && inbound.require_spending_ucan
-        && req.ucan_proof_id.is_none()
-    {
+    else {
+        return Ok(());
+    };
+    let Some(inbound) = interface.inbound_policy.as_ref() else {
+        return Ok(());
+    };
+
+    // `allowed_source_roles`: empty = any role. A non-empty allow-set requires
+    // the channel-authenticated caller's role to be present.
+    if !inbound.allowed_source_roles.is_empty() {
+        let role_allowed = req
+            .caller_source_role
+            .as_ref()
+            .is_some_and(|role| inbound.allowed_source_roles.iter().any(|r| r == role));
+        if !role_allowed {
+            return Err(ContextError::PermissionDenied(format!(
+                "SCP-SAGA-13025: caller role {} is not in inbound allowed_source_roles \
+                 for tool '{}'",
+                req.caller_source_role
+                    .as_deref()
+                    .map_or_else(|| "<none>".to_owned(), |r| format!("'{r}'")),
+                req.tool_registration_id
+            )));
+        }
+    }
+
+    // `require_spending_ucan`: a gated interface demands a proof (validated in
+    // step (1) when present).
+    if inbound.require_spending_ucan && req.ucan_proof_id.is_none() {
         return Err(ContextError::PermissionDenied(format!(
             "SCP-SAGA-13015: inbound policy requires a spending UCAN but none was \
              carried for tool '{}'",
             req.tool_registration_id
         )));
     }
+
     Ok(())
 }
 
@@ -1665,6 +1814,16 @@ mod tests {
         asserted_chain_depth: u8,
         now_ms: u64,
     ) -> PrepareBRequest {
+        prepare_b_request_with_role(ctx_byte, ucan_proof_id, asserted_chain_depth, now_ms, None)
+    }
+
+    fn prepare_b_request_with_role(
+        ctx_byte: u8,
+        ucan_proof_id: Option<String>,
+        asserted_chain_depth: u8,
+        now_ms: u64,
+        caller_source_role: Option<String>,
+    ) -> PrepareBRequest {
         PrepareBRequest {
             saga_id: SagaId("saga-xctx-1".to_owned()),
             caller_context_id: [0x99; 32],
@@ -1676,6 +1835,7 @@ mod tests {
             asserted_chain_depth,
             asserted_nonce: [0x42; 16],
             asserted_timestamp_ms: now_ms,
+            caller_source_role,
         }
     }
 
@@ -1701,7 +1861,6 @@ mod tests {
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
-            5,
             tx,
         )
         .await;
@@ -1744,7 +1903,6 @@ mod tests {
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
-            5,
             tx,
         )
         .await;
@@ -1787,7 +1945,6 @@ mod tests {
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
-            5,
             tx,
         )
         .await;
@@ -1814,13 +1971,180 @@ mod tests {
             &[0x11; 32],
             &DID(CALLER.to_owned()),
             TOOL,
-            5,
             tx,
         )
         .await;
         assert!(out.result.is_err());
         let err = rx.await.unwrap().expect_err("persist must fail-close");
         assert!(matches!(err, ContextError::PersistenceFailed(_)));
+    }
+
+    /// FIX C (escrow reserves the REGISTERED cost, never a caller-asserted one).
+    /// `prepare_a` no longer takes any caller-supplied cost — the escrow amount
+    /// is derived entirely by `reserve_tool_economy` from the context's own
+    /// economic policy. With the default (no policy ⇒ free) policy the reserve
+    /// deducts NOTHING from the caller's budget, proving no caller-asserted
+    /// positive cost can leak into the reservation. The compile-time absence of
+    /// a cost parameter on `prepare_a` is the structural half of this guard.
+    #[tokio::test]
+    async fn prepare_a_escrow_uses_registered_cost_not_caller_value() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0x11, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        // No economic policy is configured ⇒ the REGISTERED cost is 0; the
+        // reserve must deduct exactly the registered (policy-derived) amount.
+        let budget_before = st
+            .governance
+            .budget_tracker
+            .remaining(&DID(CALLER.to_owned()))
+            .0;
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        let (tx, rx) = oneshot::channel();
+        let out = prepare_a(
+            &mut st,
+            &deps,
+            &[0x11; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            tx,
+        )
+        .await;
+        assert!(out.result.is_ok(), "prepare_a outcome: {:?}", out.result);
+        let prepared = rx.await.unwrap().expect("prepared-A");
+
+        // The registered cost is 0, so the budget is untouched — no
+        // caller-asserted positive cost was reserved.
+        let budget_after = st
+            .governance
+            .budget_tracker
+            .remaining(&DID(CALLER.to_owned()))
+            .0;
+        assert_eq!(
+            budget_before, budget_after,
+            "the escrow reservation must reserve the REGISTERED (policy-derived) cost — \
+             with no policy that is 0, so the budget must be untouched"
+        );
+
+        crate::context::tools_helpers::rollback_tool_economy(
+            &mut st,
+            &deps,
+            prepared.reservation.ticket,
+        )
+        .await;
+    }
+
+    /// FIX B.1 (§6.2.0.2 per-interface sliding-window budget consumed at
+    /// initiation, non-refundable). An interface whose per-interface `rate_limit`
+    /// is already exhausted (max_calls = 0) rejects Prepare-A with a typed
+    /// `RateLimited` (SCP-SAGA-13023) BEFORE the escrow reserve runs — the
+    /// initiation-consumes-budget gate.
+    #[tokio::test]
+    async fn prepare_a_rejects_when_per_interface_rate_budget_exhausted() {
+        use scp_protocol::context::tools::interface::{RateLimit, ToolInterface};
+        use std::time::Duration;
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0x11, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        // A per-interface §6.2.0.2 window with ZERO budget (no calls, no burst)
+        // is already exhausted, so the consume rejects at initiation.
+        let zero_budget = RateLimit::with_burst(
+            0,
+            Duration::from_mins(1),
+            0,
+            Duration::from_secs(1),
+            deps.clock.as_ref(),
+        );
+        st.governance.tool_interfaces.push(ToolInterface {
+            source_context: hex_context_id(&[0x11; 32]),
+            target_context: hex_context_id(&[0x22; 32]),
+            tool_id: TOOL.to_owned(),
+            rate_limit: Some(zero_budget),
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: None,
+        });
+
+        let (tx, rx) = oneshot::channel();
+        let _ = prepare_a(
+            &mut st,
+            &deps,
+            &[0x11; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            tx,
+        )
+        .await;
+        let err = rx.await.unwrap().expect_err("over-budget must reject");
+        assert!(
+            matches!(err, ContextError::RateLimited { ref message, .. } if message.contains("SCP-SAGA-13023")),
+            "expected per-interface §6.2.0.2 RateLimited (SCP-SAGA-13023), got {err:?}"
+        );
+    }
+
+    /// FIX B.1 — per-CALLER §6.2.0.2 window. An interface whose per-caller window
+    /// is exhausted (max_calls_per_caller = 0) rejects Prepare-A with
+    /// `RateLimited` (SCP-SAGA-13024), independent of the per-interface window.
+    #[tokio::test]
+    async fn prepare_a_rejects_when_per_caller_rate_budget_exhausted() {
+        use scp_protocol::context::tools::interface::{PerCallerRateLimit, ToolInterface};
+        use std::time::Duration;
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0x11, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+
+        let zero_caller_budget =
+            PerCallerRateLimit::with_burst(0, Duration::from_mins(1), 0, Duration::from_secs(1));
+        st.governance.tool_interfaces.push(ToolInterface {
+            source_context: hex_context_id(&[0x11; 32]),
+            target_context: hex_context_id(&[0x22; 32]),
+            tool_id: TOOL.to_owned(),
+            rate_limit: None,
+            per_caller_rate_limit: Some(zero_caller_budget),
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: None,
+        });
+
+        let (tx, rx) = oneshot::channel();
+        let _ = prepare_a(
+            &mut st,
+            &deps,
+            &[0x11; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            tx,
+        )
+        .await;
+        let err = rx
+            .await
+            .unwrap()
+            .expect_err("over-caller-budget must reject");
+        assert!(
+            matches!(err, ContextError::RateLimited { ref message, .. } if message.contains("SCP-SAGA-13024")),
+            "expected per-caller §6.2.0.2 RateLimited (SCP-SAGA-13024), got {err:?}"
+        );
     }
 
     // --- Prepare-B tests --------------------------------------------------
@@ -1879,6 +2203,95 @@ mod tests {
                 panic!("wrong staged variant — expected CrossContextToolInvocation")
             }
         }
+    }
+
+    /// FIX B.2 (`InboundPolicy.allowed_source_roles` enforced at Prepare-B). An
+    /// ungated tool whose interface restricts `allowed_source_roles` to a set
+    /// that does NOT contain the channel-authenticated caller's role rejects
+    /// with SCP-SAGA-13025 and stages nothing — the role is evaluated against
+    /// the supervisor-resolved `caller_source_role`, never an envelope value.
+    #[tokio::test]
+    async fn prepare_b_rejects_caller_role_not_in_allowed_source_roles() {
+        use scp_protocol::context::tools::interface::{InboundPolicy, ToolInterface};
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // Ungated tool (no UCAN proof) on the TARGET context 0x55.
+        let mut st = target_state(0x55, OTHER, CALLER).await;
+        st.governance.tool_interfaces.push(ToolInterface {
+            source_context: hex_context_id(&[0x99; 32]),
+            target_context: hex_context_id(&[0x55; 32]),
+            tool_id: TOOL.to_owned(),
+            rate_limit: None,
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: Some(InboundPolicy {
+                allowed_source_roles: vec!["admin".to_owned()],
+                ..InboundPolicy::default()
+            }),
+        });
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = deps.clock.now_millis();
+
+        // The channel-authenticated caller role is "member", NOT in {admin}.
+        let req = prepare_b_request_with_role(0x55, None, 2, now_ms, Some("member".to_owned()));
+        let (tx, rx) = oneshot::channel();
+        let _ = prepare_b(&mut st, &deps, req, tx).await;
+        let err = rx
+            .await
+            .unwrap()
+            .expect_err("disallowed source role must reject");
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref m) if m.contains("SCP-SAGA-13025")),
+            "expected allowed_source_roles rejection (SCP-SAGA-13025), got {err:?}"
+        );
+        // Nothing was staged.
+        assert!(
+            !st.saga_pending
+                .contains_key(&SagaId("saga-xctx-1".to_owned())),
+            "a rejected Prepare-B must not stage a prepared slot"
+        );
+    }
+
+    /// FIX B.2 — the allow path: a caller whose channel-authenticated role IS in
+    /// `allowed_source_roles` is admitted (the inbound gate does not over-block).
+    #[tokio::test]
+    async fn prepare_b_accepts_caller_role_in_allowed_source_roles() {
+        use scp_protocol::context::tools::interface::{InboundPolicy, ToolInterface};
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0x56, OTHER, CALLER).await;
+        st.governance.tool_interfaces.push(ToolInterface {
+            source_context: hex_context_id(&[0x99; 32]),
+            target_context: hex_context_id(&[0x56; 32]),
+            tool_id: TOOL.to_owned(),
+            rate_limit: None,
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: Some(InboundPolicy {
+                allowed_source_roles: vec!["member".to_owned(), "admin".to_owned()],
+                ..InboundPolicy::default()
+            }),
+        });
+        let deps = build_deps(
+            OTHER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let now_ms = deps.clock.now_millis();
+
+        let req = prepare_b_request_with_role(0x56, None, 2, now_ms, Some("member".to_owned()));
+        let (tx, rx) = oneshot::channel();
+        let out = prepare_b(&mut st, &deps, req, tx).await;
+        assert!(out.result.is_ok(), "prepare_b: {:?}", out.result);
+        rx.await.unwrap().expect("an allowed role must be admitted");
     }
 
     #[tokio::test]
@@ -2311,7 +2724,6 @@ mod tests {
             &[0xC4; 32],
             &DID(CALLER.to_owned()),
             TOOL,
-            5,
             tx,
         )
         .await;
@@ -2345,7 +2757,6 @@ mod tests {
             &[0xC4; 32],
             &DID(CALLER.to_owned()),
             TOOL,
-            5,
             tx2,
         )
         .await;
@@ -2415,7 +2826,6 @@ mod tests {
             &[0xC6; 32],
             &DID(CALLER.to_owned()),
             TOOL,
-            5,
             tx,
         )
         .await;

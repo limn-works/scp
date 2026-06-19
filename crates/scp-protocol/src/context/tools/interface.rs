@@ -357,8 +357,12 @@ impl RateLimit {
     /// When the base rate limit is exhausted, burst allowance is checked:
     /// up to `burst_allowance` additional calls are permitted if they occur
     /// within `burst_window` of the first burst call (spec §6.2.0.2).
+    ///
+    /// Consuming a unit (`true`) is the §6.2.0.2 "initiation consumes budget"
+    /// point for the cross-context tool-invocation saga's Prepare-A outbound
+    /// decrement (spec §6.2.4); the increment is non-refundable.
     #[allow(clippy::cast_possible_truncation)]
-    fn check_and_increment(&mut self, clock: &dyn Clock) -> bool {
+    pub fn check_and_increment(&mut self, clock: &dyn Clock) -> bool {
         let now = clock.now_millis();
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = self.window.as_millis() as u64;

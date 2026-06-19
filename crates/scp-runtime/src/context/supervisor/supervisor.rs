@@ -113,9 +113,6 @@ pub enum SagaInput {
         /// tool's registered schema specificity floor (spec §9.2.1) and passed
         /// to the supervisor-side executor at Commit-B.
         input: serde_json::Value,
-        /// The declared per-invocation cost the caller (A) side escrows at
-        /// Prepare-A (spec §19.3).
-        declared_cost: u64,
         /// Caller-asserted chain depth — advisory/untrusted; used only for the
         /// `>= max_chain_depth` reject and as the `+1` base for B's re-derived
         /// `recorded_chain_depth` (spec §6.2.4 "Chain-depth enforcement").
@@ -269,14 +266,18 @@ struct CrossContextSagaCtx<'a> {
     ucan_proof_id: Option<String>,
     /// Tool input — validated at Prepare-B, executed at Commit-B.
     input: serde_json::Value,
-    /// Caller-declared per-invocation escrow cost (Prepare-A).
-    declared_cost: u64,
     /// Caller-asserted advisory chain depth (freshness/`+1` base only).
     asserted_chain_depth: u8,
     /// Caller-asserted 16-byte wire nonce (freshness + dual-log join key).
     asserted_nonce: [u8; 16],
     /// Caller-asserted send-time (ms) — §9.14 skew check only.
     asserted_timestamp_ms: u64,
+    /// The channel-authenticated caller's role in the caller context, resolved
+    /// supervisor-side at initiation (NOT envelope-asserted). Carried to
+    /// Prepare-B so B enforces `InboundPolicy.allowed_source_roles` against the
+    /// real role (spec §6.2.4 "Caller authentication"). `None` ⇒ no explicit
+    /// role assignment.
+    caller_source_role: Option<String>,
     /// The target context's Active Signing Key — receipt + divergence-marker
     /// signing (Commit-B / NeedsRepair). The actor holds no custody key
     /// (ADR-049); the FSM rebuilds a `SigningKeyBytes` (zeroizes on drop) per
@@ -3005,6 +3006,7 @@ impl Supervisor {
             | QueriesCommand::MemberRole { .. }
             | QueriesCommand::ContextParams { .. }
             | QueriesCommand::GetRoleState { .. }
+            | QueriesCommand::HasEstablishedToolInterface { .. }
             | QueriesCommand::PendingCommits { .. }
             | QueriesCommand::CommitFault { .. }
             | QueriesCommand::LocalMlsEpoch { .. }
@@ -4754,16 +4756,35 @@ impl Supervisor {
     ///
     /// # Authorization
     ///
-    /// Before reserving the participant context set, the initiator (`caller_did`)
-    /// is verified to be a member of `caller_context_id` (forward-obligation
-    /// closure, supervisor.rs). A non-member is rejected with
-    /// [`ContextError::PermissionDenied`] WITHOUT reserving any context — so a
-    /// caller cannot name (and thereby reserve / deny) a victim's context.
+    /// Before reserving the participant context set, TWO authorize-before-reserve
+    /// gates run — one per axis of the `{caller, target}` set the reservation
+    /// would lock — so a reservation is never taken on the strength of one side
+    /// alone:
+    ///
+    /// 1. **Caller axis.** The initiator (`caller_did`) is verified to be a
+    ///    member of `caller_context_id`. A non-member is rejected — so a caller
+    ///    cannot name (and thereby reserve / deny) a caller context it does not
+    ///    belong to.
+    /// 2. **Target axis.** The caller context is verified to hold a
+    ///    bidirectionally-approved `ToolInterface` to `target_context_id` for
+    ///    `tool_registration_id` (the §6.2.0.1 standing consent the §6.2.4
+    ///    invocation rides — §6.2.4 does NOT create the interface). Without this,
+    ///    a caller who is a member of its OWN context could name an arbitrary
+    ///    victim `target_context_id` and reserve the victim's saga slot before
+    ///    any target-side check ran (those run inside Prepare-B, AFTER
+    ///    reservation), wedging legitimate sagas touching the victim with
+    ///    `ActorBusy`. This gate closes that wedge: a caller can only reserve a
+    ///    target it has a real established interface with.
+    ///
+    /// Either gate failing rejects with [`ContextError::PermissionDenied`]
+    /// WITHOUT reserving any context.
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if the initiator is not a member of
-    ///   `caller_context_id`, or any Prepare-side §6.2.4 check rejects.
+    ///   `caller_context_id`, no established interface to `target_context_id`
+    ///   exists for `tool_registration_id`, or any Prepare-side §6.2.4 check
+    ///   rejects.
     /// - [`ContextError::ActorBusy`] (`SagaBusy`) on a participant-set overlap.
     /// - [`ContextError::ContextNotRegistered`] if a participant actor is not
     ///   co-resident.
@@ -4778,7 +4799,6 @@ impl Supervisor {
         tool_registration_id: String,
         ucan_proof_id: Option<String>,
         input: serde_json::Value,
-        declared_cost: u64,
         asserted_chain_depth: u8,
         asserted_nonce: [u8; 16],
         asserted_timestamp_ms: u64,
@@ -4790,9 +4810,10 @@ impl Supervisor {
         F: FnOnce(serde_json::Value) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'static,
     {
-        // Authorize-before-reserve (forward obligation): the initiator MUST be a
-        // member of the caller context it names. Reject WITHOUT reserving so a
-        // non-member cannot reserve (and thereby deny) a victim's context id.
+        // Authorize-before-reserve gate 1 (caller axis, forward obligation): the
+        // initiator MUST be a member of the caller context it names. Reject
+        // WITHOUT reserving so a non-member cannot reserve (and thereby deny) a
+        // caller context id it does not belong to.
         let caller_hex = hex::encode(caller_context_id);
         if !self.is_member(&caller_hex, caller_did.as_ref()).await {
             return Err(ContextError::PermissionDenied(format!(
@@ -4800,6 +4821,42 @@ impl Supervisor {
                  of caller context '{caller_hex}' — not authorized to initiate over it"
             )));
         }
+
+        // Authorize-before-reserve gate 2 (target axis, BLACK-624-02): the caller
+        // context MUST hold a bidirectionally-approved interface to the named
+        // target for this tool (the §6.2.0.1 standing consent the §6.2.4
+        // invocation rides — it does NOT create the interface). Without this, a
+        // caller who is a member of its OWN context could name an arbitrary
+        // victim target_context_id and reserve the victim's saga slot before any
+        // target-side check ran (those run inside Prepare-B, AFTER reservation),
+        // wedging legitimate sagas touching the victim with ActorBusy. Reject
+        // WITHOUT reserving so the wedge is foreclosed.
+        let target_hex = hex::encode(target_context_id);
+        if !self
+            .has_established_tool_interface(&caller_hex, &target_hex, &tool_registration_id)
+            .await
+        {
+            return Err(ContextError::PermissionDenied(format!(
+                "SCP-SAGA-13022: cross-context saga from caller context '{caller_hex}' to target \
+                 context '{target_hex}' has no established interface for tool \
+                 '{tool_registration_id}' — not authorized to invoke (and not authorized to \
+                 reserve the target's saga slot)"
+            )));
+        }
+
+        // Resolve the channel-authenticated caller's source ROLE in the caller
+        // context (spec §6.2.4 "Caller authentication": all InboundPolicy checks
+        // MUST evaluate the channel-authenticated identity). The caller's role
+        // is authoritative only in the caller context the supervisor just proved
+        // membership of (gate 1); it is read HERE supervisor-side and carried to
+        // Prepare-B so B can enforce `InboundPolicy.allowed_source_roles` against
+        // the real channel-authenticated role, never an envelope-asserted one.
+        // `None` ⇒ the caller has no explicit role assignment (only valid if the
+        // interface's `allowed_source_roles` is empty = any).
+        let caller_source_role = self
+            .member_role(&caller_hex, caller_did.as_ref())
+            .await
+            .map(|assignment| assignment.role_name);
 
         // Box the executor into the non-generic FSM-carried trait object. The
         // closure runs supervisor-side at Commit-B (off the actor mailbox).
@@ -4813,10 +4870,10 @@ impl Supervisor {
             tool_registration_id: tool_registration_id.clone(),
             ucan_proof_id: ucan_proof_id.clone(),
             input: input.clone(),
-            declared_cost,
             asserted_chain_depth,
             asserted_nonce,
             asserted_timestamp_ms,
+            caller_source_role,
             target_signing_key: target_signing_key.clone(),
             caller_signing_key: caller_signing_key.clone(),
             executor: Some(boxed_executor),
@@ -4835,7 +4892,6 @@ impl Supervisor {
             tool_registration_id,
             ucan_proof_id,
             input,
-            declared_cost,
             asserted_chain_depth,
             asserted_nonce,
             asserted_timestamp_ms,
@@ -5663,7 +5719,6 @@ impl Supervisor {
         let caller_context_id = ctx.caller_context_id;
         let caller_did = ctx.caller_did.clone();
         let tool_registration_id = ctx.tool_registration_id.clone();
-        let declared_cost = ctx.declared_cost;
 
         let prepared = actor
             .send(move |reply| {
@@ -5671,7 +5726,6 @@ impl Supervisor {
                     caller_context_id,
                     caller_did,
                     tool_registration_id,
-                    declared_cost,
                     reply,
                 })
             })
@@ -5708,6 +5762,7 @@ impl Supervisor {
         let asserted_chain_depth = ctx.asserted_chain_depth;
         let asserted_nonce = ctx.asserted_nonce;
         let asserted_timestamp_ms = ctx.asserted_timestamp_ms;
+        let caller_source_role = ctx.caller_source_role.clone();
 
         let prepared = actor
             .send(move |reply| {
@@ -5722,6 +5777,7 @@ impl Supervisor {
                     asserted_chain_depth,
                     asserted_nonce,
                     asserted_timestamp_ms,
+                    caller_source_role,
                     reply,
                 })
             })
@@ -7571,6 +7627,43 @@ impl Supervisor {
         }
     }
 
+    /// Returns `true` iff the caller context `source_context_hex` holds a
+    /// bidirectionally-approved `ToolInterface` to `target_context_hex` for
+    /// `tool_registration_id` (spec §6.2.0.1 standing consent). Routes through
+    /// the CALLER context's actor mailbox via [`Self::dispatch_query`].
+    ///
+    /// The query is addressed to the caller context (the initiator is a member
+    /// of it, already authorized) and reads that context's own
+    /// `tool_interfaces`, so it is the target-side authorize-before-reserve gate
+    /// for [`Self::start_cross_context_tool_invocation_saga`]: a caller cannot
+    /// name a victim `target_context_id` it has no established interface with
+    /// (spec §6.2.4 "Target-context binding" rides the §6.2.0.1 consent — it
+    /// does NOT create it). `false` on an unknown context or no matching
+    /// both-approved interface.
+    #[must_use]
+    pub async fn has_established_tool_interface(
+        &self,
+        source_context_hex: &str,
+        target_context_hex: &str,
+        tool_registration_id: &str,
+    ) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::HasEstablishedToolInterface {
+            context_id: source_context_hex.to_owned(),
+            source_context_hex: source_context_hex.to_owned(),
+            target_context_hex: target_context_hex.to_owned(),
+            tool_registration_id: tool_registration_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return false;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
     /// Returns every member DID currently associated with `context_id`
     /// (empty if the context is unknown). Routes through the actor
     /// mailbox via [`Self::dispatch_query`].
@@ -8991,6 +9084,7 @@ impl Supervisor {
             | QueriesCommand::MemberRole { context_id, .. }
             | QueriesCommand::ContextParams { context_id, .. }
             | QueriesCommand::GetRoleState { context_id, .. }
+            | QueriesCommand::HasEstablishedToolInterface { context_id, .. }
             | QueriesCommand::PendingCommits { context_id, .. }
             | QueriesCommand::CommitFault { context_id, .. }
             | QueriesCommand::LocalMlsEpoch { context_id, .. }
@@ -9332,6 +9426,10 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         // Legacy `get_role_state` returns `None`.
         QueriesCommand::GetRoleState { reply, .. } => {
             let _ = reply.send(Ok(None));
+        }
+        // An unknown caller context holds no established interface.
+        QueriesCommand::HasEstablishedToolInterface { reply, .. } => {
+            let _ = reply.send(Ok(false));
         }
         // Legacy `pending_commits` returns an empty `Vec`.
         QueriesCommand::PendingCommits { reply, .. } => {
@@ -13839,6 +13937,22 @@ mod tests {
             Capability::ToolInterface,
             Capability::ToolInvokeAll,
         ]);
+        // Established (both-approved) outbound interface caller→target for
+        // XCTX_TOOL, so the target-axis authorize-before-reserve gate (gate 2)
+        // passes. Source/target ids are the hex id-form §6.2.4 stores.
+        st.governance.tool_interfaces.push(
+            scp_protocol::context::tools::interface::ToolInterface {
+                source_context: hex::encode(XCTX_CALLER),
+                target_context: hex::encode(XCTX_TARGET),
+                tool_id: XCTX_TOOL.to_owned(),
+                rate_limit: None,
+                per_caller_rate_limit: None,
+                approved_by_source: true,
+                approved_by_target: true,
+                outbound_policy: None,
+                inbound_policy: None,
+            },
+        );
         st
     }
 
@@ -13980,7 +14094,6 @@ mod tests {
                 XCTX_TOOL.to_owned(),
                 None, // ungated tool — no UCAN proof
                 serde_json::json!({ "a": 1, "b": 2 }),
-                5, // declared_cost
                 2, // asserted_chain_depth
                 nonce,
                 now_ms,
@@ -14141,7 +14254,6 @@ mod tests {
                 XCTX_TOOL.to_owned(),
                 Some("proof-other".to_owned()),
                 serde_json::json!({ "a": 1, "b": 2 }),
-                5,
                 1,
                 [0x43u8; 16],
                 now_ms,
@@ -14173,7 +14285,6 @@ mod tests {
                 XCTX_TOOL.to_owned(),
                 Some("proof-other".to_owned()),
                 serde_json::json!({ "a": 1, "b": 2 }),
-                5,
                 1,
                 [0x44u8; 16],
                 now_ms2,
@@ -14186,6 +14297,88 @@ mod tests {
         assert!(
             !matches!(err2, ContextError::ActorBusy(_)),
             "the aborted saga must RELEASE its reservation (no ActorBusy), got {err2:?}"
+        );
+    }
+
+    /// FIX A target-wedge (BLACK-624-02): a caller who is a member of its OWN
+    /// context but has NO established interface to a VICTIM target cannot reserve
+    /// (and thereby wedge) the victim's saga slot. The saga rejects with the
+    /// target-axis authorize-before-reserve error (SCP-SAGA-13022) BEFORE any
+    /// reservation, and a LEGITIMATE saga touching the victim target is NOT
+    /// locked out afterward (the victim slot was never taken).
+    #[tokio::test]
+    async fn xctx_saga_unestablished_target_is_rejected_before_reservation() {
+        const XCTX_VICTIM: [u8; 32] = [0xBBu8; 32];
+
+        let creator_did = "did:dht:z6MkXctxWedgeCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxWedgeCaller";
+
+        // The caller context has an established interface to XCTX_TARGET only —
+        // NOT to XCTX_VICTIM. The caller is a member of its own context (so the
+        // caller-axis is_member gate trivially passes).
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        supervisor
+            .spawn_actor_with_state(
+                caller_state,
+                supervisor
+                    .build_actor_deps(&DID("did:example:xctx-wedge-caller-owner".to_owned()))
+                    .await
+                    .expect("caller deps"),
+                None,
+            )
+            .await
+            .expect("spawn caller actor");
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+
+        // The caller names the VICTIM target it has NO established interface
+        // with. The saga MUST reject at the target-axis gate, before reserving.
+        let err = supervisor
+            .start_cross_context_tool_invocation_saga(
+                XCTX_CALLER,
+                XCTX_VICTIM,
+                DID(caller_did.to_owned()),
+                XCTX_TOOL.to_owned(),
+                None,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0x4Au8; 16],
+                now_ms,
+                &target_signing,
+                &caller_signing,
+                |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
+            )
+            .await
+            .expect_err("a caller with no established interface to the victim must be rejected");
+        assert!(
+            matches!(&err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13022")),
+            "expected target-axis authorize-before-reserve rejection (SCP-SAGA-13022), got: {err:?}"
+        );
+
+        // The victim's saga slot was NEVER reserved — a legitimate saga that
+        // genuinely involves the victim target can still reserve it. (We exercise
+        // the SAME reservation critical section the start path uses.)
+        let legit =
+            supervisor.test_reserve_saga_context_set(&SagaInput::CrossContextToolInvocation {
+                caller_context_id: [0xC1u8; 32],
+                target_context_id: XCTX_VICTIM,
+                caller_did: DID("did:dht:zLegit".to_owned()),
+                tool_registration_id: "legit-tool".to_owned(),
+                ucan_proof_id: None,
+                input: serde_json::json!({}),
+                asserted_chain_depth: 0,
+                asserted_nonce: [0u8; 16],
+                asserted_timestamp_ms: 0,
+            });
+        assert!(
+            !matches!(legit, Err(ContextError::ActorBusy(_))),
+            "the victim target slot must be free (the rejected saga never reserved it), \
+             got {:?}",
+            legit.err()
         );
     }
 
@@ -14213,7 +14406,6 @@ mod tests {
                 tool_registration_id: XCTX_TOOL.to_owned(),
                 ucan_proof_id: None,
                 input: serde_json::json!({}),
-                declared_cost: 0,
                 asserted_chain_depth: 0,
                 asserted_nonce: [0u8; 16],
                 asserted_timestamp_ms: 0,
@@ -14233,7 +14425,6 @@ mod tests {
                 XCTX_TOOL.to_owned(),
                 None,
                 serde_json::json!({ "a": 1, "b": 2 }),
-                5,
                 1,
                 [0x45u8; 16],
                 now_ms,
@@ -14293,7 +14484,6 @@ mod tests {
                 XCTX_TOOL.to_owned(),
                 None,
                 serde_json::json!({ "a": 1, "b": 2 }),
-                5,
                 1,
                 [0x46u8; 16],
                 now_ms,
@@ -14383,10 +14573,10 @@ mod tests {
             tool_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
-            declared_cost: 5,
             asserted_chain_depth: 2,
             asserted_nonce: nonce,
             asserted_timestamp_ms: 1_700_000_000,
+            caller_source_role: None,
             target_signing_key: target_signing.clone(),
             caller_signing_key: caller_signing.clone(),
             executor: Some(Box::new(|_v: serde_json::Value| {
@@ -14697,7 +14887,6 @@ mod tests {
                 XCTX_TOOL.to_owned(),
                 None,
                 serde_json::json!({ "a": 1, "b": 2 }),
-                5,
                 2,
                 nonce,
                 now_ms,
@@ -14795,7 +14984,6 @@ mod tests {
                 XCTX_TOOL.to_owned(),
                 None,
                 serde_json::json!({ "a": 1, "b": 2 }),
-                5,
                 2,
                 nonce,
                 now_ms,
@@ -14982,7 +15170,6 @@ mod tests {
                 XCTX_TOOL.to_owned(),
                 None,
                 serde_json::json!({ "a": 1, "b": 2 }),
-                5,
                 2,
                 [0x42u8; 16],
                 now_ms,
@@ -15040,10 +15227,10 @@ mod tests {
             tool_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
-            declared_cost: 5,
             asserted_chain_depth: 2,
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
             target_signing_key: target_signing.clone(),
             caller_signing_key: caller_signing.clone(),
             executor: Some(Box::new(|_v: serde_json::Value| {
@@ -15159,6 +15346,7 @@ mod tests {
                     asserted_chain_depth: 2,
                     asserted_nonce: [0x99u8; 16],
                     asserted_timestamp_ms: prepare_now_ms,
+                    caller_source_role: None,
                     reply,
                 })
             })

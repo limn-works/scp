@@ -2411,6 +2411,32 @@ pub enum QueriesCommand {
             Result<Option<scp_protocol::context::roles::ContextRoleState>, ContextError>,
         >,
     },
+    /// Established-interface predicate (spec §6.2.0.1 / §6.2.4 target-side
+    /// authorize-before-reserve). `true` iff this actor's context holds a
+    /// bidirectionally-approved [`ToolInterface`](scp_protocol::context::tools::interface::ToolInterface)
+    /// whose `source_context` equals `source_context_hex`, `target_context`
+    /// equals `target_context_hex`, and `tool_id` equals `tool_registration_id`.
+    ///
+    /// The supervisor consults the CALLER context's actor BEFORE reserving the
+    /// `{caller, target}` participant-context set, so a caller cannot name a
+    /// victim `target_context_id` it has no established interface with and
+    /// thereby wedge the victim's saga slot (spec §6.2.4 "Target-context
+    /// binding" rides the §6.2.0.1 standing consent — it does NOT create it).
+    HasEstablishedToolInterface {
+        /// Context identifier string (routing; the actor owns exactly one
+        /// context).
+        context_id: String,
+        /// Source (caller) context id, lowercase 64-hex of the raw 32-byte
+        /// digest.
+        source_context_hex: String,
+        /// Target context id, lowercase 64-hex of the raw 32-byte digest.
+        target_context_hex: String,
+        /// Context-local tool registration id (indexes the source registry).
+        tool_registration_id: String,
+        /// Oneshot reply channel. `Ok(false)` iff the context is unknown or no
+        /// matching both-approved interface exists.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
     /// Pending MLS Commit retry queue (PR #1606 C6). Cloned vec.
     PendingCommits {
         /// Context identifier string.
@@ -2650,8 +2676,11 @@ pub enum SagaPhaseMessage {
     /// Prepare-A — runs on the LOCAL caller-context actor. Validates the
     /// caller holds `tool:interface` and is in `OutboundPolicy.allowed_callers`,
     /// stages (not applies) the outbound rate-limit decrement + escrow
-    /// reservation of `declared_cost`, persists Class-S fail-closed, and
-    /// replies the `Send` reservation handles.
+    /// reservation of the tool's REGISTERED per-invocation cost (resolved from
+    /// the caller's economy policy / tool registry by
+    /// [`reserve_tool_economy`](crate::context::tools_helpers::reserve_tool_economy),
+    /// NOT any caller-asserted value), persists Class-S fail-closed, and replies
+    /// the `Send` reservation handles.
     PrepareA {
         /// Caller context id (raw 32-byte digest) — the actor's own context.
         caller_context_id: [u8; 32],
@@ -2661,8 +2690,6 @@ pub enum SagaPhaseMessage {
         caller_did: scp_identity::DID,
         /// Context-local tool registration id being invoked at the target.
         tool_registration_id: String,
-        /// The declared per-invocation cost to escrow (spec §19.3).
-        declared_cost: u64,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<PreparedAFields, ContextError>>,
     },
@@ -2701,6 +2728,12 @@ pub enum SagaPhaseMessage {
         /// Caller-asserted send-time (ms) — used ONLY for the §9.14 skew
         /// freshness check, never recorded (spec §6.2.4 "Recorded timestamp").
         asserted_timestamp_ms: u64,
+        /// The channel-authenticated caller's ROLE in the caller context,
+        /// resolved supervisor-side at initiation (NOT envelope-asserted). B
+        /// enforces `InboundPolicy.allowed_source_roles` against this real role
+        /// (spec §6.2.4 "Caller authentication" + InboundPolicy "source role").
+        /// `None` ⇒ no explicit role assignment.
+        caller_source_role: Option<String>,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<PreparedBFields, ContextError>>,
     },

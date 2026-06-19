@@ -122,7 +122,6 @@ fn cross_context(caller: [u8; 32], target: [u8; 32]) -> SagaInput {
         tool_registration_id: "tool-1".to_owned(),
         ucan_proof_id: None,
         input: serde_json::json!({}),
-        declared_cost: 0,
         asserted_chain_depth: 0,
         asserted_nonce: [0u8; 16],
         asserted_timestamp_ms: 0,
