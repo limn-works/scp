@@ -481,7 +481,47 @@ async fn prepare_a(
         return Outcome::err_mutated(sketch);
     }
 
-    let _ = reply.send(Ok(PreparedAFields { reservation }));
+    // Reply with the staged reservation. The `PreparedAFields` carries the
+    // `#[must_use]` `ToolEconomyTicket`, whose `Drop` guard fires (a
+    // `debug_assert!` panic under `--features testing`, an escrow leak in
+    // release) if the value is dropped without being settled or rolled back. If
+    // the supervisor's reply receiver is GONE — the §6.2.4 `dispatch_prepare_phase`
+    // 30s phase-timeout fired (or the start was cancelled) and dropped the
+    // oneshot receiver AFTER this handler already durably persisted the
+    // deduction + the `xctx_caller_reservations` record — `reply.send` returns
+    // `Err(returned_prepared)` and would otherwise drop the carrier INSIDE this
+    // actor, tripping the unbalanced-drop guard. Recover the ticket and BALANCE
+    // it via `void_external_and_consume` (consumes the `#[must_use]` ticket +
+    // voids any external escrow idempotently) — but DELIBERATELY leave the
+    // durable deduction + record in place. The saga can only ABORT after a lost
+    // Prepare-A reply (a `Commit-A` is impossible — the supervisor never received
+    // the carrier it needs), and that abort reverses the LOCAL economy from the
+    // durable record (supervisor `prepared_a == None` → record-based
+    // `Abort { None }`), which idempotently re-voids the same escrow. Reversing
+    // the local deduction HERE too would double-reverse — so we void escrow +
+    // balance the ticket only, and let the abort's record path own the single
+    // local reversal.
+    // `reply.send(Ok(prepared))` returns `Err(Ok(prepared))` if the receiver is
+    // gone (the sent value — an `Ok(PreparedAFields)` — handed back). The inner
+    // `Ok` destructure recovers the carrier; it always matches because we sent an
+    // `Ok`.
+    if let Err(returned_prepared) = reply.send(Ok(PreparedAFields { reservation }))
+        && let Ok(PreparedAFields { reservation }) = returned_prepared
+    {
+        tracing::warn!(
+            saga_id = %saga_id.0,
+            context = %context_id_hex,
+            "cross-context saga Prepare-A — the supervisor's reply receiver was gone \
+             (phase-timeout / cancel) after the deduction + durable reservation record \
+             were persisted; balancing the held reservation ticket (void external escrow \
+             + consume) and leaving the durable record so the supervisor's abort reverses \
+             the LOCAL economy from it (no double-reverse)"
+        );
+        reservation
+            .ticket
+            .void_external_and_consume(deps.payment_adapter.as_ref())
+            .await;
+    }
     Outcome::ok_mutated(())
 }
 
@@ -1717,13 +1757,23 @@ async fn abort(
     // terminal path (here and Commit-A) so it can never double-reverse. Which
     // path REVERSES depends on whether the in-memory carrier survived:
     //
-    //   * `Some(reservation)` — the LIVE abort. The carrier is authoritative: it
-    //     reverses via the GENERATION-CHECKED ticket rollback (precise
-    //     velocity-token rollback + escrow void; a despawn+respawn between
-    //     Prepare-A and this Abort makes it void only the external escrow and
-    //     consume the ticket, never touching the respawned instance's owned
-    //     state). We then REMOVE the durable record WITHOUT re-reversing — the
-    //     carrier already did the reversal.
+    //   * `Some(reservation)` — the LIVE abort. The carrier rolls back via the
+    //     GENERATION-CHECKED ticket rollback. On a generation MATCH the carrier
+    //     is authoritative (precise velocity-token rollback + escrow void) and we
+    //     REMOVE the durable record WITHOUT re-reversing. On a generation
+    //     MISMATCH — a despawn+respawn-from-OWN-snapshot between Prepare-A and
+    //     this Abort rehydrated the deduction + record under a fresh generation
+    //     while the supervisor still holds the OLD-generation carrier — the
+    //     generation-checked rollback voids ONLY the external escrow + consumes
+    //     the ticket and DOES NOT reverse the rehydrated instance's LOCAL economy
+    //     (it correctly refuses a confused-deputy write keyed on the stale
+    //     generation). The LOCAL deduction is real and still durable, so we FALL
+    //     THROUGH to reverse it from the still-present record via the
+    //     gen-agnostic `reverse_caller_reservation_record` (the SAME path the
+    //     `None` arm uses, keyed by `record.actor_did` not by generation) BEFORE
+    //     removing the record. Each case reverses LOCAL exactly once (match: the
+    //     carrier; mismatch: the record), the record path's escrow re-void is
+    //     idempotent, and the record is removed exactly once.
     //
     //   * `None` — the §17.16.4 crash-recovery abort. The carrier died with the
     //     crash, so we reverse FROM the durable record UNCONDITIONALLY (NO
@@ -1749,19 +1799,41 @@ async fn abort(
     // so the removal outlives a crash and cannot reverse a released reservation.
     let (local_rollback_ran, had_caller_record_consumed) = match reservation {
         Some(prepared) => {
-            let ran = crate::context::tools_helpers::rollback_tool_economy_generation_checked(
-                state,
-                deps,
-                prepared.reservation.generation,
-                prepared.reservation.ticket,
-            )
-            .await;
-            // Consume the durable record (the carrier was authoritative). Its
-            // removal is an owned mutation that MUST be persisted so a later
-            // spurious crash-abort cannot reverse an already-released reservation
-            // from a stale record.
+            let carrier_ran =
+                crate::context::tools_helpers::rollback_tool_economy_generation_checked(
+                    state,
+                    deps,
+                    prepared.reservation.generation,
+                    prepared.reservation.ticket,
+                )
+                .await;
+            // On a generation MISMATCH the carrier voided only the external
+            // escrow and refused the confused-deputy LOCAL write (`carrier_ran ==
+            // false`), so the rehydrated instance's LOCAL budget / velocity /
+            // hard-rate-limit are STILL deducted. The durable record is the
+            // source of truth for the caller reversal: fall through and reverse
+            // the LOCAL economy from it via the gen-agnostic record path (which
+            // idempotently re-voids the same escrow) BEFORE removing the record.
+            // On a MATCH the carrier already reversed LOCAL — we only consume the
+            // record, never re-reversing. Either way LOCAL is reversed exactly
+            // once and the record is removed exactly once.
+            let local_ran = if carrier_ran {
+                true
+            } else if let Some(record) = state.xctx_caller_reservations.get(saga_id).cloned() {
+                crate::context::tools_helpers::reverse_caller_reservation_record(
+                    state, deps, &record,
+                )
+                .await
+            } else {
+                // No record to reverse from (e.g. a generation-mismatch carrier
+                // for a saga whose record was already drained). Nothing local ran.
+                false
+            };
+            // Consume the durable record. Its removal is an owned mutation that
+            // MUST be persisted so a later spurious crash-abort cannot reverse an
+            // already-released reservation from a stale record.
             let consumed = state.xctx_caller_reservations.remove(saga_id).is_some();
-            (ran, consumed)
+            (local_ran, consumed)
         }
         None => {
             // Crash-recovery abort: reverse from the durable record if present.
@@ -4133,44 +4205,125 @@ mod tests {
         // external-only path.
     }
 
-    /// FIX 2 end-to-end: the saga `abort` handler tolerates a
-    /// generation-mismatched reservation (despawn+respawn between Prepare-A and
-    /// Abort) without panicking on the ticket's unbalanced-drop guard, and acks.
+    /// HIGH 1 (gen-mismatch `Abort { Some }` record fallthrough): a CALLER-side
+    /// `Abort { Some(reservation) }` whose carrier generation MISMATCHES the live
+    /// instance — a watchdog respawn-FROM-OWN-SNAPSHOT between Prepare-A and the
+    /// abort rehydrated the deduction + durable record under a fresh generation
+    /// while the supervisor still holds the OLD-generation carrier — MUST still
+    /// reverse the caller's LOCAL economy. The generation-checked carrier
+    /// rollback correctly refuses the confused-deputy LOCAL write (voiding only
+    /// the external escrow), so the handler MUST FALL THROUGH to reverse the
+    /// rehydrated LOCAL economy from the still-present durable record before
+    /// consuming it.
+    ///
+    /// PRE-FIX this path voided only the escrow and removed the record
+    /// UNCONDITIONALLY — the LOCAL deduction stayed forever (a durable
+    /// over-charge) and the only repair record was destroyed. This test bumps the
+    /// live generation so the carrier mismatches and asserts the hard-rate-limit
+    /// token + velocity ARE reversed (and the refund persisted). It FAILS against
+    /// the pre-fix code (no local reversal) and PASSES once the fallthrough lands.
     #[tokio::test]
-    async fn abort_a_side_with_stale_generation_does_not_panic() {
+    async fn abort_a_side_gen_mismatch_reverses_local_from_record() {
+        use std::sync::atomic::Ordering;
+
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0xD2, OTHER, CALLER).await;
         st.role_state.creator_did = CALLER.to_owned();
+        let persist_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let deps = build_deps(
             CALLER.to_owned(),
             issuer.verifying_key(),
-            Box::new(OkPersistence),
+            Box::new(SpyPersistence {
+                persist_calls: Arc::clone(&persist_calls),
+            }),
         )
         .await;
+
+        let caller = DID(CALLER.to_owned());
+        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let now_secs = deps.clock.now_secs();
+        let velocity_before = st
+            .governance
+            .velocity_tracker
+            .get_velocity(&caller, now_secs);
 
         let saga = SagaId("saga-abort-stale-gen".to_owned());
         let (tx, rx) = oneshot::channel();
-        prepare_a(
-            &mut st,
-            &deps,
-            &saga,
-            &[0xD2; 32],
-            &DID(CALLER.to_owned()),
-            TOOL,
-            tx,
-        )
-        .await;
+        prepare_a(&mut st, &deps, &saga, &[0xD2; 32], &caller, TOOL, tx).await;
         let prepared = rx.await.unwrap().expect("prepared-A");
+        // Prepare-A staged the durable record + moved owned economy.
+        assert!(
+            st.xctx_caller_reservations.contains_key(&saga),
+            "Prepare-A must stage a durable caller-reservation record"
+        );
+        let hrl_after_reserve = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("reserve created a hard-rate-limit entry");
+        assert!(
+            hrl_after_reserve < burst_milli,
+            "reserve must have consumed a hard-rate-limit token"
+        );
+        assert!(
+            st.governance
+                .velocity_tracker
+                .get_velocity(&caller, now_secs)
+                > velocity_before,
+            "reserve must have recorded velocity"
+        );
 
-        // Simulate the despawn+respawn: bump the live generation past the
-        // reservation's.
+        // Simulate the respawn-from-own-snapshot: bump the live generation past
+        // the carrier's so the generation-checked carrier rollback refuses the
+        // LOCAL write. The deduction + record are the rehydrated owned state.
         st.generation = st.generation.wrapping_add(1);
+
+        // Measure ONLY the abort's persist.
+        persist_calls.store(0, Ordering::SeqCst);
 
         let (tx, rx) = oneshot::channel();
         let out = abort(&mut st, &deps, &saga, Some(prepared), tx).await;
         assert!(out.result.is_ok(), "abort with stale gen: {:?}", out.result);
+        assert!(
+            out.mutated,
+            "reversing LOCAL from the record on the mismatch path mutates owned state ⇒ mutated"
+        );
         rx.await.unwrap().expect("abort ack");
-        // No panic ⇒ the generation-checked rollback voided external + consumed.
+
+        // The record was consumed.
+        assert!(
+            !st.xctx_caller_reservations.contains_key(&saga),
+            "the durable record must be consumed on the mismatch abort"
+        );
+        // The refund was Class-S persisted (Prepare-A persisted the deduction;
+        // skipping this persist permanently over-charges on a crash-after-ack).
+        assert!(
+            persist_calls.load(Ordering::SeqCst) >= 1,
+            "the gen-mismatch abort MUST persist the record-driven refund"
+        );
+        // CORE: the LOCAL economy IS reversed from the record — hard-rate-limit
+        // back to full burst, velocity rolled back. PRE-FIX these stay deducted.
+        let hrl_after_abort = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after abort");
+        assert_eq!(
+            hrl_after_abort, burst_milli,
+            "the gen-mismatch abort must refund the hard-rate-limit token from the record \
+             (full burst) — NOT leave the caller over-charged"
+        );
+        assert_eq!(
+            st.governance
+                .velocity_tracker
+                .get_velocity(&caller, now_secs),
+            velocity_before,
+            "the gen-mismatch abort must roll back the recorded velocity from the record"
+        );
     }
 
     #[tokio::test]
@@ -4973,6 +5126,93 @@ mod tests {
                 .map(|(tokens, _)| *tokens),
             Some(hrl_after_commit),
             "a spurious abort must not reverse the already-settled reservation"
+        );
+    }
+
+    /// HIGH 3 (lost Prepare-A reply balances the must-use ticket): `prepare_a`
+    /// durably persists the deduction + record, then replies with the
+    /// `PreparedAFields` carrying the `#[must_use]` `ToolEconomyTicket`. If the
+    /// supervisor's reply RECEIVER is gone (the §6.2.4 30s phase-timeout fired /
+    /// the start was cancelled and dropped the oneshot receiver), `reply.send`
+    /// returns `Err(prepared)` and the carrier would otherwise be dropped INSIDE
+    /// the actor — tripping the ticket's unbalanced-drop guard (a `debug_assert!`
+    /// PANIC under `--features testing`, an escrow leak in release). The fix
+    /// recovers the ticket and BALANCES it via `void_external_and_consume`,
+    /// leaving the durable deduction + record so the supervisor's eventual abort
+    /// reverses the LOCAL economy from the record.
+    ///
+    /// This drops the receiver BEFORE calling `prepare_a` and asserts (a) NO
+    /// panic (the `debug_assert` is live under `--features testing`), (b) the
+    /// handler still reports a mutation, and (c) the deduction + durable record
+    /// are persisted (left for the abort's record path). PRE-FIX this PANICS on
+    /// the unbalanced drop.
+    #[tokio::test]
+    async fn prepare_a_lost_reply_balances_ticket_and_keeps_record() {
+        use std::sync::atomic::Ordering;
+
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut st = target_state(0xDC, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+        let persist_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(SpyPersistence {
+                persist_calls: Arc::clone(&persist_calls),
+            }),
+        )
+        .await;
+
+        let caller = DID(CALLER.to_owned());
+        let burst_milli = st.governance.hard_rate_limit.config().burst * 1000;
+        let saga = SagaId("saga-prepare-a-lost-reply".to_owned());
+
+        // The supervisor's reply receiver is already GONE before the handler
+        // runs — exactly the phase-timeout / cancel window. `reply.send` will
+        // return `Err(prepared)` and the handler must balance the recovered
+        // ticket rather than drop it (the `#[must_use]` guard PANICS under
+        // `--features testing` on an unbalanced drop).
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+
+        // No panic here ⇒ the recovered ticket was balanced. (Pre-fix this
+        // unwinds on the debug_assert in `ToolEconomyTicket::drop`.)
+        let out = prepare_a(&mut st, &deps, &saga, &[0xDC; 32], &caller, TOOL, tx).await;
+        assert!(
+            out.result.is_ok(),
+            "prepare_a with a dropped reply receiver must still complete: {:?}",
+            out.result
+        );
+        assert!(
+            out.mutated,
+            "prepare_a staged + persisted the deduction/record ⇒ mutated"
+        );
+
+        // The durable deduction + record are LEFT in place — the abort's record
+        // path (supervisor `prepared_a == None` → `Abort { None }`) owns the
+        // single LOCAL reversal, so the deduction must survive here.
+        assert!(
+            st.xctx_caller_reservations.contains_key(&saga),
+            "the durable reservation record must survive a lost Prepare-A reply \
+             (the abort reverses LOCAL from it)"
+        );
+        let hrl_after = st
+            .governance
+            .hard_rate_limit
+            .snapshot_entries()
+            .get(CALLER)
+            .map(|(tokens, _)| *tokens)
+            .expect("reserve created a hard-rate-limit entry");
+        assert!(
+            hrl_after < burst_milli,
+            "the deduction must NOT be reversed here (left for the abort's record path): \
+             burst_milli={burst_milli}, after={hrl_after}"
+        );
+        // The deduction + record were Class-S persisted (fail-closed before the
+        // reply attempt).
+        assert!(
+            persist_calls.load(Ordering::SeqCst) >= 1,
+            "prepare_a must Class-S persist the deduction + record before replying"
         );
     }
 }

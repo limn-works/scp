@@ -716,6 +716,10 @@ scan_file() {
         raw_hash = 0
         in_string = 0
         seen_test = 0
+        test_gate_line = 0
+        nontrailing_hit = 0
+        pending_test_gate = 0
+        pending_test_line = 0
         depth = 0
         in_fn = 0
         fn_name = ""
@@ -755,28 +759,6 @@ scan_file() {
     {
         raw = $0
 
-        # Trailing test-MODULE cutoff: once a top-level (column-0) test-gated
-        # module opens, every line below it is test code and is not scanned.
-        # The trailing test module is gated by a column-0 attribute in one of
-        # these forms:
-        #     #[cfg(test)]
-        #     #[cfg(all(test, feature = "testing"))]   (e.g. lifecycle_helpers)
-        #     #[cfg(any(test, feature = "testing"))]   (e.g. context/mod.rs)
-        # The column-0 anchor (`^`) is deliberate: an INTERSPERSED testing-only
-        # accessor (a single `#[cfg(any(test, ..))]` / `#[cfg(feature =
-        # "testing")]` fn sitting INSIDE an impl/among production fns, always
-        # indented) must NOT trigger the "skip rest of file" cutoff, or the
-        # production fns BELOW it (e.g. the reserve_tool_economy consume sites in
-        # tools_helpers.rs) would stop being scanned and the gate would go
-        # vacuous. Indented test gates are left in the production stream; they
-        # carry no Class-S marker, and the assignment markers (normalize_assign)
-        # only fire on real writes. Every column-0 test gate in the scan tree is
-        # verified to be a TRAILING module (no column-0 production fn follows).
-        if (raw ~ /^#\[cfg\(test\)\]/ \
-            || raw ~ /^#\[cfg\(all\(test[,)]/ \
-            || raw ~ /^#\[cfg\(any\(test[,)]/) { seen_test = 1 }
-        if (seen_test) next
-
         # Reduce the physical line to its CODE SKELETON: the content of every
         # comment and literal (line/block comment, string, byte string, raw
         # string, raw byte string, char literal) is removed so that a brace,
@@ -791,6 +773,11 @@ scan_file() {
         # one `*/` early while a multi-line ordinary/byte string was wrongly
         # treated as closed at EOL (wave-12) — each leaking a brace that closed
         # the function body early and blinding every later Class-S mutation.
+        #
+        # MOVED ABOVE the test-MODULE cutoff (wave-14): the cutoff now matches the
+        # STRIPPED `line`, not the raw physical line, so a `#[cfg(test)]` token
+        # sitting INSIDE a string / comment cannot wrongly trigger the "skip rest
+        # of file" cutoff and blind every later production mutation.
         line = strip_code(raw)
         # A line that the scanner left fully inside an unterminated (nested) block
         # comment, raw string, or ordinary/byte string contributes no code: skip
@@ -798,6 +785,71 @@ scan_file() {
         # `strip_code` set the multi-line state for the NEXT line; the closer line
         # resumes scanning after the close.
         if (block_depth > 0 || in_raw_string || in_string) next
+
+        # Trailing test-MODULE cutoff: once a top-level (column-0) test-gated
+        # MODULE opens, every line below it is test code and is not scanned.
+        # The trailing test module is gated by a column-0 attribute in one of
+        # these forms, IMMEDIATELY decorating a `mod` (a `pub mod` / `mod`):
+        #     #[cfg(test)]
+        #     #[cfg(all(test, feature = "testing"))]   (e.g. lifecycle_helpers)
+        #     #[cfg(any(test, feature = "testing"))]   (e.g. context/mod.rs)
+        #
+        # WAVE-14 ROOT-CAUSE FIX. The cutoff now fires ONLY when the test gate
+        # decorates a `mod` — NOT for a column-0 test gate that decorates a SINGLE
+        # `#[cfg(any(test, feature = "testing"))]` PRODUCTION-COMPILED item (a
+        # testing-only `pub fn` / `impl` / `pub use` that IS compiled into the
+        # `testing` feature and sits AMONG production items, e.g.
+        # `context/mod.rs::test_supervisor`, `SagaInput::test_cross_context_for_gating`,
+        # the `pub use SagaSetReservation` in `supervisor/mod.rs`). The prior cutoff
+        # matched the gate alone and (mis)treated such COLUMN-0 interspersed gates
+        # as a "skip rest of file" trigger — wrongly blinding every production
+        # mutation BELOW them (in supervisor.rs the first such gate is at line 207,
+        # ~10k production lines ABOVE the real trailing `mod tests`, so the gate was
+        # silently vacuous over the entire saga subsystem). An interspersed
+        # single-item test gate carries no Class-S marker and must stay in the
+        # production scan stream; only a `mod`-form gate is a trailing module.
+        #
+        # We look ahead from the gate, skipping blank lines and further column-0
+        # `#[..]` attribute lines, to the first real column-0 code token: a `mod`
+        # ⇒ trailing-module cutoff; anything else ⇒ interspersed item (no cutoff).
+        # All matched against the STRIPPED `line` so a token inside a literal /
+        # comment cannot trip either path.
+        if (line ~ /^#\[cfg\(test\)\]/ \
+            || line ~ /^#\[cfg\(all\(test[,)]/ \
+            || line ~ /^#\[cfg\(any\(test[,)]/) { pending_test_gate = 1; pending_test_line = NR }
+        else if (pending_test_gate \
+            && line ~ /^(pub[[:space:]]+)?(mod|impl|trait|struct|enum|union|fn|const|static|type|use|macro_rules|extern|unsafe)([[:space:]]|!|<|\()/ \
+            || (pending_test_gate && line ~ /^(pub[[:space:]]*\([^)]*\)[[:space:]]+)(mod|use|fn|const|static|type|struct|enum|trait)([[:space:]]|<|\()/)) {
+            # First real column-0 ITEM-START line after the gate decides
+            # mod-vs-item. (Blank lines and multi-line `#[..]` attribute
+            # continuations — neither of which start with an item keyword — are
+            # implicitly skipped: they fall through to neither branch and the gate
+            # stays pending until a real item line is reached.)
+            if (line ~ /^(pub[[:space:]]+)?mod[[:space:]]/) {
+                # Trailing test MODULE — the legitimate "skip rest of file" shape.
+                seen_test = 1; test_gate_line = pending_test_line
+            }
+            # else: interspersed single-item test gate — NOT a cutoff. The item
+            # falls through into the normal production scan stream below.
+            pending_test_gate = 0
+        }
+
+        # NON-TRAILING test-module structural assertion (wave-14): the cutoff
+        # above TRUSTS that the trailing `mod`-form test gate is the LAST thing in
+        # the file. If a column-0 PRODUCTION item — `fn` / `impl` / a `pub` item —
+        # follows the test MODULE (the module closed and production code resumes at
+        # column 0), the gate is NOT trailing: the cutoff would skip that
+        # production region (an un-scanned vacuum) and any Class-S mutation in it
+        # would go undetected. Flag it (HIT) so the un-scanned vacuum is surfaced
+        # rather than silently trusted. Matched against the STRIPPED `line` so a
+        # `fn` / `impl` / `pub` token inside a string / comment cannot
+        # false-positive. Emitted once per file.
+        if (seen_test && !nontrailing_hit \
+            && line ~ /^(pub([[:space:]]|\()|impl([[:space:]]|<)|(async[[:space:]]+)?fn[[:space:]]|unsafe[[:space:]]+impl[[:space:]])/) {
+            printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
+            nontrailing_hit = 1
+        }
+        if (seen_test) next
 
         # Detect a top-level function definition (column 0, allowing pub/async
         # qualifiers). Capture the name. We only treat a fn as "open" once we
@@ -1117,11 +1169,13 @@ run_scan() {
             scan_file "$file"
         done > "$tmp_out"
 
-    local hits govhits scanned_total
+    local hits govhits nttest scanned_total
     hits=$(grep -c $'^HIT\t' "$tmp_out" 2>/dev/null || true)
     hits=${hits:-0}
     govhits=$(grep -c $'^GOVHIT\t' "$tmp_out" 2>/dev/null || true)
     govhits=${govhits:-0}
+    nttest=$(grep -c $'^NTTEST\t' "$tmp_out" 2>/dev/null || true)
+    nttest=${nttest:-0}
     scanned_total=$(awk -F'\t' '$1=="SCANNED"{s+=$3} END{print s+0}' "$tmp_out")
 
     if [[ "$hits" -ne 0 ]]; then
@@ -1168,6 +1222,30 @@ run_scan() {
         printf 'reviewable allowlist add. See ADR-049 §9 (round-9 keystone).\n' >&2
     fi
 
+    # Wave-14 structural guard — NON-TRAILING test module: a column-0 test gate
+    # followed by a column-0 production `fn` / `impl` / `pub` item. The
+    # trailing-test-module cutoff would skip that production region (an un-scanned
+    # vacuum), so any Class-S mutation in it would go undetected. The cutoff
+    # TRUSTS without asserting that every column-0 test gate is trailing; this
+    # asserts it.
+    if [[ "$nttest" -ne 0 ]]; then
+        printf '\n%sFAILED%s: %d file(s) have a column-0 test gate (`#[cfg(test)]` /\n' \
+            "$C_RED" "$C_RESET" "$nttest" >&2
+        printf '`#[cfg(all(test,..))]` / `#[cfg(any(test,..))]`) FOLLOWED by a column-0\n' >&2
+        printf 'production `fn` / `impl` / `pub` item — a NON-trailing test module. The\n' >&2
+        printf 'trailing-test cutoff would skip that production region, leaving an\n' >&2
+        printf 'UN-SCANNED vacuum where a Class-S mutation could hide:\n' >&2
+        while IFS=$'\t' read -r tag file line fn; do
+            [[ "$tag" == "NTTEST" ]] || continue
+            printf '      %s%s:%s%s  (column-0 test gate not trailing)\n' \
+                "$C_DIM" "$file" "$line" "$C_RESET" >&2
+        done < "$tmp_out"
+        printf '\n' >&2
+        printf 'Move the test module to the END of the file (it MUST be trailing), or split\n' >&2
+        printf 'the production items above it into their own non-test region. The cutoff\n' >&2
+        printf 'relies on the test module being the last thing in the file.\n' >&2
+    fi
+
     # Round-9 keystone — allowlist coupling: every CLASS_C_GOVERNANCE_LEAVES /
     # CLASS_C_EXCEPTIONS entry must name a real function.
     local coupling_failed=0
@@ -1188,7 +1266,7 @@ run_scan() {
         return 1
     fi
 
-    if [[ "$hits" -eq 0 && "$govhits" -eq 0 && "$coupling_failed" -eq 0 ]]; then
+    if [[ "$hits" -eq 0 && "$govhits" -eq 0 && "$nttest" -eq 0 && "$coupling_failed" -eq 0 ]]; then
         return 0
     fi
     return 1
@@ -1732,6 +1810,63 @@ self_test() {
         printf '}\n'
     } > "$fdir/char_unicode_escape_brace.rs"
 
+    # (35) NON-TRAILING TEST MODULE (wave-14) — a column-0 test gate FOLLOWED by
+    # a column-0 production item is NOT a trailing test module: the cutoff would
+    # skip that production region (an un-scanned vacuum). MUST emit an NTTEST HIT.
+    {
+        printf 'pub async fn prod_before_test_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf 'pub fn prod_after_test_fixture() {\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/nontrailing_test_module.rs"
+
+    # (36) TRAILING TEST MODULE (wave-14) — the legitimate shape: a column-0 test
+    # gate with NO column-0 production item after it. MUST NOT emit an NTTEST HIT
+    # (the over-restriction guard: an ordinary trailing test module is fine).
+    {
+        printf 'pub fn prod_only_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(all(test, feature = "testing"))]\n'
+        printf 'mod trailing_tests {\n'
+        printf '    fn another_helper() {}\n'
+        printf '    #[test]\n'
+        printf '    fn it_works() {}\n'
+        printf '}\n'
+    } > "$fdir/trailing_test_module.rs"
+
+    # (37) INTERSPERSED single-item test gate (wave-14 root-cause regression) — a
+    # COLUMN-0 `#[cfg(any(test, feature = "testing"))]` decorating a SINGLE
+    # production-compiled item (a testing-only `pub fn`), NOT a `mod`. It must NOT
+    # trigger the trailing-module cutoff: the production Class-S mutation BELOW it
+    # MUST still be scanned and (lacking a fail-closed persist) caught. This is the
+    # exact shape — `context/mod.rs::test_supervisor`,
+    # `SagaInput::test_cross_context_for_gating`, `supervisor/mod.rs`'s testing
+    # `pub use` — that the prior raw-line cutoff wrongly skipped, silently
+    # blinding the scanner over ~10k lines of production saga code.
+    {
+        printf '#[cfg(any(test, feature = "testing"))]\n'
+        printf '#[must_use]\n'
+        printf 'pub fn interspersed_test_helper_fixture() -> u8 {\n'
+        printf '    0\n'
+        printf '}\n'
+        printf '\n'
+        printf 'pub async fn prod_after_interspersed_gate_fixture() {\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/interspersed_item_gate.rs"
+
     local rc=0
     local out
     out=$(
@@ -2042,6 +2177,43 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'unicode-escape char literals was wrongly flagged — the strip over-stripped\n' >&2
         printf 'real code or a brace inside the char literal leaked.\n' >&2
+        rc=1
+    fi
+    # (35) NON-TRAILING test module — a column-0 test gate followed by a column-0
+    # production item MUST emit an NTTEST HIT (the un-scanned-vacuum guard).
+    if ! grep -q $'^NTTEST\t.*/nontrailing_test_module\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a NON-trailing test module (a column-0 test gate\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'followed by a column-0 production item) was NOT flagged — the cutoff would\n' >&2
+        printf 'skip the production region below it, an un-scanned vacuum.\n' >&2
+        rc=1
+    fi
+    # (36) TRAILING test module — a legitimate trailing `#[cfg(test)]` mod with no
+    # column-0 production item after it MUST NOT emit an NTTEST HIT (over-restriction
+    # guard).
+    if grep -q $'^NTTEST\t.*/trailing_test_module\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: an ordinary TRAILING test module was wrongly flagged\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'as non-trailing — the structural assertion is over-restrictive.\n' >&2
+        rc=1
+    fi
+    # (37) INTERSPERSED single-item test gate (root-cause regression) — the
+    # column-0 `#[cfg(any(test,..))] pub fn` must NOT cut off the scan: the
+    # production Class-S mutation below it MUST still be caught …
+    if ! grep -q $'^HIT\t.*\tprod_after_interspersed_gate_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a production Class-S mutation BELOW a column-0\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'interspersed single-item test gate was NOT caught — the cutoff wrongly\n' >&2
+        printf 'treated the single-item `#[cfg(testing)]` gate as a trailing-module cutoff\n' >&2
+        printf 'and blinded the scanner (the wave-14 root-cause regression).\n' >&2
+        rc=1
+    fi
+    # … and the single-item gate must NOT be reported as a non-trailing test module
+    # (it gates an item, not a `mod`, so there is no cutoff to be non-trailing).
+    if grep -q $'^NTTEST\t.*/interspersed_item_gate\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a column-0 interspersed single-item test gate was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'wrongly flagged as a non-trailing test MODULE (it gates an item, not a mod).\n' >&2
         rc=1
     fi
 

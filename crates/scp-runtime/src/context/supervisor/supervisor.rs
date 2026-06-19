@@ -7098,6 +7098,18 @@ impl Supervisor {
     ///   `ReversalOutstanding` so the journal stays non-terminal until a respawn
     ///   + sweep reverses the LOCAL economy from the record.
     ///
+    ///   If `prepared_a` is `None` (the carrier never reached `ctx` — e.g. the
+    ///   §6.2.4 30s Prepare-A phase-timeout dropped the supervisor's reply
+    ///   receiver AFTER the actor durably persisted the deduction + record), this
+    ///   does NOT mean nothing was prepared. The durable record is the source of
+    ///   truth: we drive a record-based `Abort { None }` (via
+    ///   [`Self::redrive_caller_local_reversal`]) so the caller reverses the
+    ///   LOCAL economy from the record if present — a clean no-op (→
+    ///   `SettledOrAbsent`) only for a genuinely-nothing-prepared saga. Without
+    ///   this, a lost Prepare-A reply would strand the caller's durable deduction
+    ///   under a terminal `Aborted` forever (the startup sweep re-drives only
+    ///   non-terminal journals).
+    ///
     /// - TARGET side: send `Abort` with `None` reservation so the actor clears
     ///   its staged `saga_pending` slot (releasing the session reservation).
     ///   Only meaningful if Prepare-B staged a slot. The target side carries no
@@ -7113,11 +7125,16 @@ impl Supervisor {
     ) -> CallerAbortReversal {
         use crate::context::actor::commands::SagaPhaseMessage;
 
-        // CALLER side (only if Prepare-A staged a reservation). When no
-        // reservation was staged there is no caller economy to reverse, so the
-        // terminal marker is always safe.
+        // CALLER side. A `Some` carrier is the LIVE-abort fast path (rolled back
+        // BY the actor via the generation-checked carrier rollback). A `None`
+        // carrier does NOT mean "nothing prepared": the deduction + durable
+        // record land BEFORE the carrier reaches `ctx`, so a lost Prepare-A reply
+        // leaves `None` over a real durable deduction — reconciled below via the
+        // record-based `Abort { None }` re-drive.
+        // Used by BOTH arms: the `Some` carrier path (lookup + `Abort { Some }`)
+        // and the `None` record-reconcile path (the `Abort { None }` re-drive).
+        let caller_hex = hex::encode(ctx.caller_context_id);
         let caller_reversal = if let Some(reservation) = ctx.prepared_a.take() {
-            let caller_hex = hex::encode(ctx.caller_context_id);
             if let Some(caller) = self.lookup(&caller_hex) {
                 let abort_saga_id = saga_id.clone();
                 // The Abort command carries the `#[must_use]` reservation (whose
@@ -7235,8 +7252,26 @@ impl Supervisor {
                 Self::reversal_outstanding()
             }
         } else {
-            // No staged caller reservation ⇒ no caller LOCAL economy to reverse.
-            CallerAbortReversal::SettledOrAbsent
+            // `ctx.prepared_a` is `None`. This does NOT prove "nothing was
+            // prepared": Prepare-A DURABLY persists the caller's deduction + the
+            // `xctx_caller_reservations` record BEFORE the in-memory carrier
+            // reaches `ctx.prepared_a`, so the carrier is absent whenever the
+            // Prepare-A REPLY was lost — e.g. the §6.2.4 `dispatch_prepare_phase`
+            // 30s phase-timeout fired and dropped the supervisor's reply receiver
+            // even though the caller actor already committed the deduction +
+            // record. Keying the caller reversal solely on the volatile carrier
+            // would then leave the caller over-charged forever under a terminal
+            // `Aborted` (the §17.16.4 startup sweep re-drives only NON-terminal
+            // journals). So the durable record — not the carrier — is the source
+            // of truth: drive a record-based `Abort { None }` to the caller (the
+            // SAME path `redrive_caller_local_reversal` uses — re-`lookup` +
+            // `Abort { None }`), which reverses the LOCAL economy from the record
+            // if one exists and is a clean no-op (→ `SettledOrAbsent`) for a
+            // genuinely-nothing-prepared saga. Folding its outcome into the
+            // verdict makes EVERY abort path reconcile the durable record before
+            // `mark_resolved(Aborted)`.
+            self.redrive_caller_local_reversal(saga_id, &caller_hex)
+                .await
         };
 
         // TARGET side (only if Prepare-B may have staged a slot). The target
@@ -16696,6 +16731,140 @@ mod tests {
             !snap.xctx_caller_reservations.contains_key(&saga_id),
             "the durable CallerReservationRecord MUST be consumed by the reversal so it can \
              never double-reverse"
+        );
+    }
+
+    /// HIGH 2 (§6.2.4 review wave-14): `abort_xctx_participants` with
+    /// `ctx.prepared_a == None` MUST still reconcile the durable
+    /// `CallerReservationRecord`. The carrier is `None` whenever the Prepare-A
+    /// REPLY was lost — e.g. the `dispatch_prepare_phase` 30s `PHASE_TIMEOUT`
+    /// fired and dropped the supervisor's reply receiver EVEN THOUGH the caller
+    /// actor already durably persisted the deduction + record. Pre-fix the `else`
+    /// branch returned `SettledOrAbsent` WITHOUT consulting the record or sending
+    /// anything, so the abort marked the saga terminal-`Aborted` while the caller
+    /// stayed over-charged forever (the §17.16.4 sweep re-drives only NON-terminal
+    /// journals). The fix drives a record-based `Abort { None }` (the same path
+    /// `redrive_caller_local_reversal` uses) so EVERY abort path reconciles the
+    /// record before `mark_resolved(Aborted)`.
+    ///
+    /// We Prepare-A on a live caller (staging the durable record + deduction),
+    /// then BALANCE + DROP the in-memory carrier exactly as a lost-reply
+    /// supervisor would (so `ctx.prepared_a == None` over a real durable
+    /// deduction), then call `abort_xctx_participants` directly. The captured
+    /// snapshot MUST show the hard-rate-limit token refunded to full burst and the
+    /// record consumed. PRE-FIX it returns `SettledOrAbsent` and the token stays
+    /// deducted ⇒ FAIL.
+    #[tokio::test]
+    async fn abort_with_lost_carrier_reconciles_durable_record() {
+        let creator_did = "did:dht:z6MkXctxHigh2Creator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let persistence = CapturingPersistence::default();
+        let supervisor = xctx_supervisor_with_persistence(
+            creator_did.clone(),
+            creator_key,
+            Box::new(persistence.clone()),
+        );
+        let caller_did = "did:dht:z6MkXctxHigh2Caller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let saga_id = SagaId("high2-lost-carrier-saga".to_owned());
+
+        let mut ctx = CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            asserted_chain_depth: 2,
+            asserted_nonce: [0x42u8; 16],
+            asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
+            caller_source_role: None,
+            target_signing_key: target_signing.clone(),
+            caller_signing_key: caller_signing.clone(),
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
+            })),
+            executor_output: None,
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
+        };
+
+        // Real Prepare-A: stages the durable record + deduction on the live
+        // caller and returns the must-use carrier into `ctx.prepared_a`.
+        supervisor
+            .dispatch_xctx_prepare_a(&saga_id, &mut ctx)
+            .await
+            .expect("Prepare-A stages a real reservation");
+        assert!(ctx.prepared_a.is_some(), "Prepare-A held a reservation");
+
+        // Baseline: the reserve moved owned state and staged the record.
+        let burst_milli = {
+            let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+            let token_after_reserve = snap
+                .hard_rate_limit_state
+                .get(caller_did)
+                .map(|(tokens, _)| *tokens)
+                .expect("reserve created a hard-rate-limit entry");
+            assert!(
+                snap.xctx_caller_reservations.contains_key(&saga_id),
+                "Prepare-A staged the durable caller reservation record"
+            );
+            let burst = token_after_reserve + 1000; // one token = 1000 milli-tokens
+            assert!(token_after_reserve < burst, "reserve consumed a token");
+            burst
+        };
+
+        // Simulate the LOST Prepare-A reply: the supervisor never received the
+        // carrier (phase-timeout dropped the reply receiver). A lost-carrier
+        // supervisor balances the recovered must-use ticket (void escrow +
+        // consume) and leaves `ctx.prepared_a == None` over the real durable
+        // deduction. We reproduce exactly that state.
+        if let Some(prepared) = ctx.prepared_a.take() {
+            prepared
+                .reservation
+                .ticket
+                .void_external_and_consume(supervisor.payment_adapter_ref())
+                .await;
+        }
+        assert!(
+            ctx.prepared_a.is_none(),
+            "the lost-carrier state has prepared_a == None over a durable deduction"
+        );
+
+        // Drive the abort. The fix's `else` branch re-drives `Abort { None }`,
+        // reversing the caller's LOCAL economy from the durable record.
+        let verdict = supervisor.abort_xctx_participants(&saga_id, &mut ctx).await;
+        assert_eq!(
+            verdict,
+            CallerAbortReversal::SettledOrAbsent,
+            "a delivered record-based Abort{{None}} settles the caller reversal"
+        );
+
+        // CORE: the caller's LOCAL economy IS reversed and the record consumed.
+        // PRE-FIX the else branch returned SettledOrAbsent without driving
+        // anything, so the token stays deducted and the record stays present.
+        let snap = flush_and_read_snapshot(&supervisor, &persistence, XCTX_CALLER).await;
+        let token_after_abort = snap
+            .hard_rate_limit_state
+            .get(caller_did)
+            .map(|(tokens, _)| *tokens)
+            .expect("hard-rate-limit entry present after abort");
+        assert_eq!(
+            token_after_abort, burst_milli,
+            "the prepared_a==None abort MUST reverse the caller's LOCAL economy from the \
+             durable record (refund to full burst) — the caller is NOT over-charged"
+        );
+        assert!(
+            !snap.xctx_caller_reservations.contains_key(&saga_id),
+            "the durable record MUST be consumed by the record-based reversal"
         );
     }
 
