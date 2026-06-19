@@ -585,6 +585,51 @@ scan_file() {
         if (is_column0_reopening_test_gate(t)) return 0
         return 1
     }
+    # is_attr_prefixed_production — TRUE iff a STRIPPED remainder is PRODUCTION
+    # content possibly PREFIXED by one or more balanced leading `#[..]` attributes
+    # on the SAME physical line — the wave-20 shape `#[rustfmt::skip] pub fn evil()
+    # { ..class-s mutation.. }` (whole attribute + item on ONE line). `#[rustfmt::
+    # skip]` is the directive to PRESERVE hand-formatting, so rustfmt leaves that
+    # one-line shape byte-for-byte unchanged (and it compiles), so it is NOT fmt-
+    # prevented: a bare `is_production_remainder` / `is_column0_code_line` sees the
+    # leading `^#[` and returns 0 (they look PAST an attribute expecting the item on
+    # a FOLLOWING line), silently swallowing the resume. We therefore PEEL each
+    # balanced leading attribute via `strip_leading_attr` (the SAME primitive GAP-2
+    # already trusts — convergent, no new spelling enumeration) and test the final
+    # remainder. A re-opening `#[cfg(test)]` gate encountered while peeling is a
+    # legitimate second test module, NOT production: return 0 so it does not
+    # false-fire (the GAP-2 same-line gate+mod detector consumes a same-line
+    # `#[cfg(test)] mod` before this is ever reached; this guard is belt-and-braces).
+    # If the remainder after peeling all leading attributes is non-empty and is
+    # itself neither a (further) attribute, blank, comment, nor a re-opening test
+    # gate, it is production content. A `#[rustfmt::skip]` / `#[inline]` / any
+    # balanced attribute(s) followed by a whole item ON THE SAME LINE is thereby
+    # seen as production, not skipped.
+    function is_attr_prefixed_production(s,   t, peeled) {
+        t = s
+        sub(/^[[:space:]]+/, "", t)
+        if (t == "") return 0
+        # Peel balanced leading attributes one at a time. A re-opening test gate
+        # among them means a legitimate (second) test module is being entered, not
+        # a production resume.
+        while (t ~ /^#!?\[/) {
+            if (is_column0_reopening_test_gate(t)) return 0
+            peeled = strip_leading_attr(t)
+            # strip_leading_attr returns "" if the leading attribute is NOT balanced
+            # on this physical line (a multi-line attribute head). A multi-line head
+            # is handled by the attr-carry, not here, so it is not a same-line
+            # production resume: not flagged.
+            if (peeled == "") return 0
+            t = peeled
+        }
+        # After peeling every leading attribute, what remains decides it. The bare
+        # production test (non-empty, not a re-opening gate) — note a residual
+        # leading `#[` cannot occur here (the while-loop consumed all balanced
+        # leading attributes, and an unbalanced head returned 0 above).
+        if (t == "") return 0
+        if (is_column0_reopening_test_gate(t)) return 0
+        return 1
+    }
     # brace_close_pos — given a STRIPPED line and the test-module CODE brace depth
     # BEFORE this line (`pre`), return the 1-based index of the `}` that brings the
     # running depth to 0 (the brace that CLOSES the trailing test module), or 0 if
@@ -646,22 +691,40 @@ scan_file() {
     # `#[cfg(test)] mod x {} fn resumed() {..}` is still surfaced. Shared by the
     # same-line gate+mod path (GAP-2) and the pending-gate path so both behave
     # identically. `line` (the stripped physical line) is read as a global.
-    function enter_test_module(opens, closes) {
+    function enter_test_module(opens, closes,   close_pos, remainder) {
         after_test_module = 0
         in_test_module = 1
-        test_mod_depth = opens - closes
-        if (test_mod_depth <= 0) {
+        # WAVE-20 (HOLE-1) — detect the degenerate same-line close POSITIONALLY,
+        # not by NET brace count. The module opens at depth 0 before this line; find
+        # the `}` that brings the running CODE depth back to 0. A NET count
+        # (`opens - closes <= 0`) MISSES `#[cfg(test)] mod x {} pub fn resumed() {
+        # ..class-s mutation.. }`: that line nets `opens-closes = 1` (the trailing
+        # production fn re-opens a brace), so the `<= 0` branch was skipped and the
+        # scanner stayed in_test_module at depth 1, ABSORBING the production fn body
+        # (hiding its mutation). This is the SAME net-count flaw the in_test_module
+        # close branch already fixed via `brace_close_pos`; `enter_test_module` was
+        # left on net counting. Find the close positionally and re-eval the
+        # remainder, mirroring the GAP-1 close-line path.
+        close_pos = brace_close_pos(line, 0)
+        if (close_pos > 0) {
+            # The module opened AND closed on this one physical line.
             in_test_module = 0
             test_mod_depth = 0
             after_test_module = 1
-            # The module opened and closed on this one physical line (depth 0
-            # before it). Re-evaluate the post-close remainder for a same-line
-            # production vacuum, mirroring the in_test_module close branch.
-            if (!nontrailing_hit \
-                && is_production_remainder(remainder_after_brace_close(line, 0))) {
+            remainder = substr(line, close_pos + 1)
+            # Re-evaluate the post-close remainder for a same-line production
+            # vacuum, mirroring the in_test_module close branch. A leading balanced
+            # attribute on the resume (`} #[rustfmt::skip] fn evil() {..}` shape on
+            # the remainder) is peeled by is_attr_prefixed_production (HOLE-2).
+            if (!nontrailing_hit && is_attr_prefixed_production(remainder)) {
                 printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
                 nontrailing_hit = 1
             }
+        } else {
+            # A genuinely-trailing module (`mod t {` with body on later lines):
+            # carry the CODE brace depth forward; the in_test_module close branch
+            # finds the close on a later line.
+            test_mod_depth = opens - closes
         }
     }
     # normalize_assign — collapse whitespace around a bare assignment `=` so a
@@ -1119,9 +1182,12 @@ scan_file() {
             # miss same-line production). Fail-closed direction: a same-line
             # re-opening test gate in the remainder is treated as non-content (not
             # re-entered from a remainder), which can only ever over-report a
-            # vacuum, never hide one.
+            # vacuum, never hide one. WAVE-20 (HOLE-2): the remainder may itself
+            # begin with a balanced leading attribute (`} #[rustfmt::skip] pub fn
+            # evil(){..}`); is_attr_prefixed_production peels it so the attribute-
+            # prefixed whole-item resume is seen as production, not skipped.
             if (!nontrailing_hit \
-                && is_production_remainder(substr(line, tm_close_pos + 1))) {
+                && is_attr_prefixed_production(substr(line, tm_close_pos + 1))) {
                 printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
                 nontrailing_hit = 1
             }
@@ -1173,9 +1239,11 @@ scan_file() {
                 # closed the attribute: if it is column-0 production content, the
                 # module was NOT trailing — an un-scanned vacuum. (The attribute
                 # decorates that production item; the item itself begins after the
-                # closer on the same physical line.)
+                # closer on the same physical line.) WAVE-20 (HOLE-2): a SECOND
+                # leading attribute on the decorated item (`)] #[inline] pub fn
+                # x(){..}`) is peeled by is_attr_prefixed_production.
                 if (after_test_module && !nontrailing_hit \
-                    && is_production_remainder(remainder_after_attr_close(line, attr_pre))) {
+                    && is_attr_prefixed_production(remainder_after_attr_close(line, attr_pre))) {
                     printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
                     nontrailing_hit = 1
                 }
@@ -1201,6 +1269,14 @@ scan_file() {
         }
 
         # Detect the column-0 test gate that opens a trailing test module.
+        #
+        # ACCEPTED OVER-REPORT SHAPES (wave-20, CLASS-B fail-CLOSED): a multi-line
+        # attribute `))]` closer SHARING a line with `mod {`, and a `mod NAME` whose
+        # opening `{` is on the NEXT physical line, can over-report NTTEST. Both are
+        # rustfmt-IMPOSSIBLE (cargo-fmt always separates the closer / opening brace
+        # onto their own lines) with no live occurrence in the scan tree, so per the
+        # convergence ceiling they are left as accepted fail-closed over-reports —
+        # we do NOT enumerate further attribute/brace placements to chase them.
         #
         # GAP-2 — SAME-LINE `#[cfg(test)] mod NAME {`. The gate and the `mod` it
         # decorates may share ONE physical line. The reopening-gate test below is
@@ -1272,12 +1348,27 @@ scan_file() {
         # see a re-opening gate (skipped — its `mod` is handled above) or a real
         # production line. Any column-0 code line that is NOT such a gate — any
         # item spelling whatsoever — is the un-scanned vacuum.
+        #
+        # WAVE-20 (HOLE-2) — ATTRIBUTE-PREFIXED WHOLE-ITEM RESUME. A production item
+        # resuming with a balanced leading attribute on the SAME physical line
+        # (`#[rustfmt::skip] pub fn evil() { ..class-s mutation.. }`) is NOT caught
+        # by `is_column0_code_line` (it excludes any `^#[` line, looking PAST the
+        # attribute to a FOLLOWING line) AND does NOT enter the multi-line attr-carry
+        # (the whole `#[attr] item` line is bracket-balanced). `#[rustfmt::skip]` is
+        # the directive to PRESERVE hand-formatting, so this one-line shape is left
+        # byte-for-byte unchanged by rustfmt (it is NOT fmt-prevented). We therefore
+        # ALSO fire when is_attr_prefixed_production peels the balanced leading
+        # attribute(s) and finds production content after — reusing strip_leading_attr
+        # (the SAME primitive GAP-2 already trusts; convergent, no new enumeration).
+        # is_attr_prefixed_production returns 0 for a re-opening `#[cfg(test)]` gate,
+        # so a legitimate second test module is not false-fired.
         if (after_test_module && !nontrailing_hit) {
-            if (!is_column0_reopening_test_gate(line) && is_column0_code_line(line)) {
-                # A column-0 production code line after the module closed (a `mod`
-                # decorated by a re-opening gate was consumed by the detector above
-                # and `next`ed before reaching here). The test module was NOT
-                # trailing — an un-scanned vacuum.
+            if ((!is_column0_reopening_test_gate(line) && is_column0_code_line(line)) \
+                || is_attr_prefixed_production(line)) {
+                # A column-0 production code line (possibly attribute-prefixed) after
+                # the module closed (a `mod` decorated by a re-opening gate was
+                # consumed by the detector above and `next`ed before reaching here).
+                # The test module was NOT trailing — an un-scanned vacuum.
                 printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
                 nontrailing_hit = 1
             }
@@ -1768,6 +1859,18 @@ run_scan() {
 #        closing at EOF → no HIT (the tracker follows the body to its real closing
 #        brace); (48) a module followed only by comments/blank lines → no HIT
 #        (commentary is not production content).
+#   (49-54) WAVE-19 LINE-GRANULARITY — close-line production resume (49), multi-
+#        line-attribute-closer resume (50), same-line `#[cfg(test)] mod {}` trailing
+#        (51) / non-trailing (52), multi-line test-cfg gate (53), and a NON-test
+#        multi-line attr carry before a trailing module (54).
+#   (55-56) WAVE-20 — (55) a DEGENERATE `#[cfg(test)] mod x {}` + same-line
+#        production fn → HIT (entry-path positional close; pre-wave-20 NET count
+#        absorbed the fn body); (56a/56b) an attribute-prefixed whole-item resume
+#        (`#[rustfmt::skip] pub fn evil(){..}`) on its own line / sharing the
+#        module-closing `}` line → HIT (is_attr_prefixed_production peels the
+#        balanced leading attribute, which is fmt-clean and was silently swallowed);
+#        (56c) a legitimate second `#[cfg(test)] mod` → no HIT (attr-peel returns 0
+#        on a re-opening test gate).
 # Set NO_CLASS_S_SELFTEST=1 to skip (not recommended).
 # ---------------------------------------------------------------------------
 self_test() {
@@ -2729,6 +2832,84 @@ self_test() {
         printf '}\n'
     } > "$fdir/attr_carry_trailing.rs"
 
+    # (55) WAVE-20 HOLE-1 — DEGENERATE MODULE + SAME-LINE PRODUCTION RESUME. A
+    # `#[cfg(test)] mod x {} pub fn resumed() {` with the degenerate (empty-body)
+    # module AND a trailing production fn that OPENS a brace on the SAME physical
+    # line (the fn BODY — carrying a Class-S mutation — spans the FOLLOWING lines).
+    # That line nets `opens - closes = 1` (the trailing `fn .. {` re-opens a brace
+    # the line does not close). The pre-wave-20 `enter_test_module` detected the
+    # degenerate close via the NET brace count (`opens - closes <= 0`), so the `<= 0`
+    # branch was SKIPPED, the scanner stayed in_test_module at depth 1 and ABSORBED
+    # the production fn body — hiding its Class-S mutation (a silent vacuum). The
+    # positional `brace_close_pos(line, 0)` close now finds the module-closing `}`
+    # even on a net-positive line, so this MUST emit an NTTEST HIT. Non-vacuity:
+    # revert the positional entry-path close → no NTTEST (silent).
+    {
+        printf 'pub fn hole1_prod_before_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)] mod hole1_degenerate_tests {} pub fn hole1_resumed_production() {\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/hole1_degenerate_sameline.rs"
+
+    # (56) WAVE-20 HOLE-2 — ATTRIBUTE-PREFIXED WHOLE-ITEM SINGLE-LINE RESUME. After
+    # a test module closes, a production item resumes with a balanced leading
+    # `#[rustfmt::skip]` attribute AND the whole item on ONE physical line. Two
+    # shapes, both fmt-CLEAN (`#[rustfmt::skip]` PRESERVES hand-formatting, so the
+    # one-line shape is left byte-for-byte unchanged and compiles):
+    #   (56a) the resume on its OWN line after the module's `}` (after-module guard);
+    #   (56b) the close-line TWIN — the resume SHARES the module-closing `}` line
+    #         (`} #[rustfmt::skip] pub fn evil(){..}`).
+    # Pre-wave-20, both `is_column0_code_line` and `is_production_remainder` excluded
+    # any `^#[` line (they look PAST an attribute to a FOLLOWING line) and the whole
+    # `#[attr] item` line is bracket-balanced (so it does NOT enter the multi-line
+    # attr-carry) → silently swallowed. is_attr_prefixed_production peels the leading
+    # attribute (reusing strip_leading_attr) so BOTH MUST emit an NTTEST HIT.
+    # Non-vacuity: revert the attr-peel → no NTTEST (silent).
+    {
+        printf 'pub fn hole2a_prod_before_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod hole2a_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[rustfmt::skip] pub fn hole2a_evil() { state.xctx_caller_reservations.insert(saga_id, record); persist_state_best_effort(state, deps, ctx); }\n'
+    } > "$fdir/hole2a_attr_prefixed_ownline.rs"
+    {
+        printf 'pub fn hole2b_prod_before_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod hole2b_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '} #[rustfmt::skip] pub fn hole2b_evil(){ state.xctx_caller_reservations.insert(saga_id, record); persist_state_best_effort(state, deps, ctx); }\n'
+    } > "$fdir/hole2b_attr_prefixed_closeline.rs"
+
+    # (56c) CONTROL — a LEGITIMATE second `#[cfg(test)] mod more {}` after the first
+    # test module MUST NOT emit an NTTEST HIT (is_attr_prefixed_production must
+    # return 0 for a re-opening test gate). Guards against the attr-peel false-firing
+    # on a legal second test module.
+    {
+        printf 'pub fn hole2c_prod_before_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod hole2c_first_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod hole2c_more {}\n'
+    } > "$fdir/hole2c_second_test_mod_control.rs"
+
     local rc=0
     local out
     out=$(
@@ -3280,6 +3461,52 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'trailing test module was wrongly read as interspersed production (NTTEST) —\n' >&2
         printf 'the attr-carry did not keep the multi-line attribute transparent.\n' >&2
+        rc=1
+    fi
+    # (55) WAVE-20 HOLE-1 — a degenerate `#[cfg(test)] mod x {}` + same-line
+    # production fn (which re-opens a brace) MUST emit an NTTEST HIT. FAILS
+    # pre-wave-20 (the NET brace count kept the module looking un-closed, absorbing
+    # the production fn body — a silent vacuum). Non-vacuity: revert the positional
+    # entry-path close → no NTTEST.
+    if ! grep -q $'^NTTEST\t.*/hole1_degenerate_sameline\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a degenerate `#[cfg(test)] mod x {}` followed on the SAME\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'line by a production fn was NOT flagged — enter_test_module detected the\n' >&2
+        printf 'degenerate close by NET brace count, not positionally, so the trailing\n' >&2
+        printf 'production fn body was absorbed as test code (a silent un-scanned vacuum).\n' >&2
+        rc=1
+    fi
+    # (56a) WAVE-20 HOLE-2 — an attribute-prefixed whole-item resume on its OWN line
+    # after a test module (`#[rustfmt::skip] pub fn evil() { .. }`) MUST emit an
+    # NTTEST HIT. FAILS pre-wave-20 (is_column0_code_line excluded the `^#[` line and
+    # the balanced `#[attr] item` line did not enter the attr-carry → swallowed).
+    if ! grep -q $'^NTTEST\t.*/hole2a_attr_prefixed_ownline\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: an attribute-prefixed (`#[rustfmt::skip]`) whole-item\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'production resume on its own line after a test module was NOT flagged — the\n' >&2
+        printf 'after-module guard did not peel the leading attribute (is_attr_prefixed_\n' >&2
+        printf 'production), so a fmt-clean attribute-prefixed resume is a silent vacuum.\n' >&2
+        rc=1
+    fi
+    # (56b) WAVE-20 HOLE-2 close-line TWIN — the same attribute-prefixed whole-item
+    # resume SHARING the module-closing `}` line (`} #[rustfmt::skip] pub fn
+    # evil(){..}`) MUST emit an NTTEST HIT. FAILS pre-wave-20 (is_production_remainder
+    # on the post-`}` remainder saw the leading `#[` and returned 0).
+    if ! grep -q $'^NTTEST\t.*/hole2b_attr_prefixed_closeline\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: an attribute-prefixed whole-item resume SHARING the\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'module-closing `}` line was NOT flagged — the close-line remainder re-eval\n' >&2
+        printf 'did not peel the leading attribute (is_attr_prefixed_production).\n' >&2
+        rc=1
+    fi
+    # (56c) WAVE-20 HOLE-2 CONTROL — a LEGITIMATE second `#[cfg(test)] mod more {}`
+    # after the first test module MUST NOT emit an NTTEST HIT (the attr-peel must
+    # return 0 for a re-opening test gate — no false positive on legal Rust).
+    if grep -q $'^NTTEST\t.*/hole2c_second_test_mod_control\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a legitimate second `#[cfg(test)] mod` after the first\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'test module was wrongly flagged NTTEST — is_attr_prefixed_production false-\n' >&2
+        printf 'fired on a re-opening test gate instead of returning 0.\n' >&2
         rc=1
     fi
 
