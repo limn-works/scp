@@ -88,6 +88,7 @@ use crate::context::state::{
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::SagaPreparedState;
 use crate::crypto::mls::group::ScpMlsGroup;
+use crate::economy::adapter::PaymentReceipt;
 
 // ---------------------------------------------------------------------------
 // Lifecycle state (per-actor, actor-owned)
@@ -818,6 +819,15 @@ pub struct PerContextState {
     /// `state::PerContextState::receive_buffer`.
     pub receive_buffer: ReceiveBuffer,
 
+    /// Per-payee payment receipts captured in this context (spec §19.11).
+    ///
+    /// `PaymentReceived` is per-payee application activity, excluded from the
+    /// canonical Merkle log (ADR-011 amendment exclusion taxonomy §2). Receipts
+    /// are surfaced from this local buffer — NOT the durable event log — by the
+    /// `payment_history` query, so the count diverges per member without
+    /// perturbing the convergent `event_log_merkle_root` (§9.9.3).
+    pub payment_receipts: Vec<PaymentReceipt>,
+
     // -----------------------------------------------------------------
     // Mode-specific state
     // -----------------------------------------------------------------
@@ -1268,6 +1278,7 @@ impl PerContextState {
             role_state: empty_role_state_for_test(),
             event_log: None,
             receive_buffer: ReceiveBuffer::new(),
+            payment_receipts: Vec::new(),
             broadcast_context: None,
             migration_state: None,
             governance: GovernanceState::new_fresh_for_actor(context_id_str, admin_did, clock),
@@ -1492,6 +1503,7 @@ mod tests {
             role_state,
             event_log,
             receive_buffer,
+            payment_receipts,
             broadcast_context,
             migration_state,
             governance,
@@ -1535,6 +1547,7 @@ mod tests {
         // Event buffers + logs.
         assert!(event_log.is_none());
         assert_eq!(receive_buffer.len(), 0);
+        assert!(payment_receipts.is_empty());
 
         // Mode-specific metadata.
         assert!(broadcast_context.is_none());
@@ -1610,6 +1623,7 @@ mod tests {
             role_state: _,
             event_log: _,
             receive_buffer: _,
+            payment_receipts: _,
             broadcast_context: _,
             migration_state: _,
             governance: _,

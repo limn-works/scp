@@ -915,6 +915,9 @@ impl ContextActor {
             QueriesCommand::NeedsReconnect { reply, .. } => {
                 ack_not_impl(reply, "queries::needs_reconnect");
             }
+            QueriesCommand::PaymentHistory { reply, .. } => {
+                ack_not_impl(reply, "queries::payment_history");
+            }
             #[cfg(feature = "testing")]
             QueriesCommand::GetAccessKey { reply, .. } => {
                 ack_not_impl(reply, "queries::get_access_key");

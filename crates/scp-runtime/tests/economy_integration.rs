@@ -143,6 +143,7 @@ impl PaymentAdapter for TestAdapter {
             adapter_id: self.id.to_owned(),
             adapter_proof: vec![0xAB],
             timestamp: 1_000_001,
+            anchored: false,
             signature: vec![0xCD],
         })
     }
@@ -278,35 +279,6 @@ fn test_spending_capability() -> SpendingCapability {
         currency: scp_protocol::crypto::ucan::spending::CurrencyCode::from_code("USD").unwrap(),
         time_window: Duration::from_hours(24),
         allowed_adapters: vec!["test".to_owned()],
-    }
-}
-
-/// Creates an event for the event log from a receipt.
-fn make_payment_event(receipt: &PaymentReceipt, sequence: u64) -> Event {
-    let payload_data = serde_json::to_vec(receipt).unwrap();
-    Event {
-        event_type: EventType::PaymentReceived,
-        actor_did: receipt.payer.clone(),
-        timestamp: receipt.timestamp,
-        sequence,
-        payload: EventPayload { data: payload_data },
-        prev_hash: [0u8; 32],
-        signature: vec![0xFF; 64],
-    }
-}
-
-/// Creates a non-payment event.
-fn make_message_event(sequence: u64) -> Event {
-    Event {
-        event_type: EventType::MessageSent,
-        actor_did: DID::from("did:dht:z6MkAlice"),
-        timestamp: 1_000_000,
-        sequence,
-        payload: EventPayload {
-            data: b"hello".to_vec(),
-        },
-        prev_hash: [0u8; 32],
-        signature: vec![0xFF; 64],
     }
 }
 
@@ -680,10 +652,18 @@ async fn invariant_3_free_action_no_authorization_needed() {
 // Invariant 4: Receipts are provenance records
 // ===========================================================================
 
-/// Invariant 4: Complete paid action, store receipt in event log with Merkle
-/// inclusion proof.
+/// Invariant 4: Complete paid action, surface the receipt via the local
+/// receipt buffer, and prove the canonical Merkle log (which carries only
+/// convergent events) is independently provable.
+///
+/// `PaymentReceived` is per-payee application activity excluded from the
+/// canonical Merkle log (ADR-011 amendment exclusion taxonomy §2; convergent
+/// only under ADR-051). The receipt is surfaced via `payment_history` over the
+/// per-context local receipt buffer — NOT the durable log — while the durable
+/// log carries the convergent membership/governance events that all honest
+/// members append identically.
 #[tokio::test]
-async fn invariant_4_receipt_in_event_log_with_merkle_proof() {
+async fn invariant_4_receipt_local_buffer_and_convergent_log_merkle_proof() {
     let adapter = TestAdapter::new();
 
     // Execute authorize + capture to get a receipt.
@@ -704,15 +684,15 @@ async fn invariant_4_receipt_in_event_log_with_merkle_proof() {
 
     let receipt = adapter.capture(&auth).await.unwrap();
 
-    // Store receipt as event in a properly signed event log.
+    // The durable Merkle log carries only CONVERGENT events (membership /
+    // governance) — never the per-payee receipt. Build one so the inclusion
+    // proof exercises the real tree without implying PaymentReceived is a leaf.
     let (did, signing_key) = test_keypair();
-    let receipt_payload = serde_json::to_vec(&receipt).unwrap();
-
     let genesis_prev = [0u8; 32];
     let event0 = signed_event(
-        EventType::PaymentReceived,
+        EventType::MemberJoined,
         0,
-        receipt_payload,
+        b"did:dht:z6MkJoiner".to_vec(),
         genesis_prev,
         &signing_key,
         &did,
@@ -724,9 +704,9 @@ async fn invariant_4_receipt_in_event_log_with_merkle_proof() {
 
     let leaf0_hash = leaf_hash_of(&event0);
     let event1 = signed_event(
-        EventType::MessageSent,
+        EventType::GovernanceActionExecuted,
         1,
-        b"hello".to_vec(),
+        b"{\"action\":\"ChangeRole\"}".to_vec(),
         leaf0_hash,
         &signing_key,
         &did,
@@ -735,16 +715,17 @@ async fn invariant_4_receipt_in_event_log_with_merkle_proof() {
 
     assert_eq!(tree::event_count(&log), 2);
 
-    // Generate Merkle inclusion proof for the payment event (leaf 0).
+    // Merkle inclusion proof verifies for the convergent membership event.
     let proof = prove_inclusion(&log, 0).unwrap();
     assert!(
         verify_inclusion(&proof),
-        "Merkle inclusion proof should verify for payment event"
+        "Merkle inclusion proof should verify for the convergent member-joined event"
     );
 
-    // Query payment history from events.
-    let events = vec![event0, event1];
-    let history = payment_history(&events, None);
+    // The receipt is surfaced from the per-context local receipt buffer (spec
+    // §19.11) — NOT the durable Merkle log.
+    let receipts = vec![receipt];
+    let history = payment_history(&receipts, None);
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].amount, Amount(10));
 }
@@ -823,6 +804,7 @@ fn invariant_4_payment_history_with_filters() {
         adapter_id: "test".to_owned(),
         adapter_proof: vec![0x01],
         timestamp: 1_000_000,
+        anchored: false,
         signature: vec![0xFF; 64],
     };
 
@@ -837,22 +819,22 @@ fn invariant_4_payment_history_with_filters() {
         adapter_id: "test".to_owned(),
         adapter_proof: vec![0x02],
         timestamp: 2_000_000,
+        anchored: false,
         signature: vec![0xFF; 64],
     };
 
-    let events = vec![
-        make_payment_event(&receipt_alice, 0),
-        make_message_event(1),
-        make_payment_event(&receipt_bob, 2),
-    ];
+    // The per-context local receipt buffer (NOT the durable Merkle log —
+    // PaymentReceived is excluded from the canonical log per ADR-011 amendment
+    // exclusion taxonomy §2). `payment_history` reads this buffer directly.
+    let receipts = vec![receipt_alice, receipt_bob];
 
-    // Unfiltered: all payment events returned.
-    let all = payment_history(&events, None);
+    // Unfiltered: all receipts returned.
+    let all = payment_history(&receipts, None);
     assert_eq!(all.len(), 2);
 
     // Filter by payer.
     let alice_only = payment_history(
-        &events,
+        &receipts,
         Some(&ReceiptFilter {
             payer: Some("did:dht:z6MkAlice".to_owned()),
             ..Default::default()
@@ -863,7 +845,7 @@ fn invariant_4_payment_history_with_filters() {
 
     // Filter by time range.
     let after = payment_history(
-        &events,
+        &receipts,
         Some(&ReceiptFilter {
             after_timestamp: Some(1_500_000),
             ..Default::default()
@@ -1384,13 +1366,12 @@ async fn integration_full_lifecycle() {
         .unwrap();
     let tool_receipt = adapter.capture(&tool_auth).await.unwrap();
 
-    // Step 4: Verify receipts in payment history (invariant 4).
-    let events = vec![
-        make_payment_event(&msg_receipt, 0),
-        make_payment_event(&tool_receipt, 1),
-    ];
+    // Step 4: Verify receipts in payment history (invariant 4). `payment_history`
+    // reads the per-context local receipt buffer (PaymentReceived is excluded
+    // from the canonical Merkle log per ADR-011 amendment exclusion taxonomy §2).
+    let receipts = vec![msg_receipt, tool_receipt];
 
-    let history = payment_history(&events, None);
+    let history = payment_history(&receipts, None);
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].amount, Amount(10));
     assert_eq!(history[1].amount, Amount(50));
@@ -1719,6 +1700,7 @@ fn integration_merkle_tree_with_economic_events() {
         adapter_id: "test".to_owned(),
         adapter_proof: vec![0x01],
         timestamp: 1_000_000,
+        anchored: false,
         signature: vec![0xFF; 64],
     };
     let receipt_payload = serde_json::to_vec(&receipt).unwrap();

@@ -1587,10 +1587,8 @@ pub async fn capture_send_payment(
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     if let Some(a) = auth
-        && let Err(e) = crate::context::economy_helpers::complete_paid_action(
-            state, deps, a, sender_did, context_id,
-        )
-        .await
+        && let Err(e) =
+            crate::context::economy_helpers::complete_paid_action(state, deps, a, context_id).await
     {
         // H8: do NOT rollback budget — service was delivered.
         tracing::warn!(
@@ -3258,14 +3256,12 @@ mod pseudonym_routing_tests {
         );
         // The non-durable consequence is still surfaced as a local `ContextEvent`
         // in the receive buffer (the sole surfacing for velocity triggers).
-        let saw_triggered_ctx_event = state
-            .receive_buffer
-            .event_log_entries()
-            .iter()
-            .any(|e| matches!(
+        let saw_triggered_ctx_event = state.receive_buffer.event_log_entries().iter().any(|e| {
+            matches!(
                 e,
                 scp_protocol::context::membership::ContextEvent::ConsequenceTriggered { .. }
-            ));
+            )
+        });
         assert!(
             saw_triggered_ctx_event,
             "the non-durable velocity consequence must still emit a \
@@ -3536,14 +3532,12 @@ mod pseudonym_routing_tests {
         // Governance still surfaced the consequence as a local `ContextEvent`,
         // proving the buffered-drain call site DID run enforcement (a re-added
         // `if let Some` gate would leave the buffer without it).
-        let saw_triggered_ctx_event = state
-            .receive_buffer
-            .event_log_entries()
-            .iter()
-            .any(|e| matches!(
+        let saw_triggered_ctx_event = state.receive_buffer.event_log_entries().iter().any(|e| {
+            matches!(
                 e,
                 scp_protocol::context::membership::ContextEvent::ConsequenceTriggered { .. }
-            ));
+            )
+        });
         assert!(
             saw_triggered_ctx_event,
             "the buffered-drain call site must surface a ContextEvent::ConsequenceTriggered \

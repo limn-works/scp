@@ -1042,10 +1042,8 @@ pub async fn capture_join_payment(
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     if let Some(a) = auth
-        && let Err(e) = crate::context::economy_helpers::complete_paid_action(
-            state, deps, a, member_did, context_id,
-        )
-        .await
+        && let Err(e) =
+            crate::context::economy_helpers::complete_paid_action(state, deps, a, context_id).await
     {
         // H8: do NOT rollback budget — service was delivered (member joined).
         tracing::warn!(
@@ -1245,6 +1243,7 @@ pub async fn create_context(
         },
         role_state,
         receive_buffer: ReceiveBuffer::new(),
+        payment_receipts: Vec::new(),
         broadcast_context,
         migration_state: None,
         epoch: EpochState {
@@ -1758,6 +1757,7 @@ pub async fn import_context(
         members: actor_members,
         role_state: export.snapshot.role_state,
         receive_buffer: ReceiveBuffer::new(),
+        payment_receipts: Vec::new(),
         broadcast_context: None,
         migration_state: None,
         governance: GovernanceState {
@@ -2271,6 +2271,7 @@ pub async fn restore_context(
         },
         role_state: ctx_snapshot.role_state,
         receive_buffer: ReceiveBuffer::new(),
+        payment_receipts: Vec::new(),
         broadcast_context: broadcast_ctx,
         migration_state: ctx_snapshot.migration_state,
         epoch: EpochState {
@@ -3136,6 +3137,7 @@ mod restore_reconcile_tests {
                 adapter_id: "recording".to_owned(),
                 adapter_proof: vec![],
                 timestamp: 1_000_001,
+                anchored: false,
                 signature: vec![],
             })
         }
@@ -3635,5 +3637,130 @@ mod restore_reconcile_tests {
              the fail-closed persist) must void the escrow so a failing append \
              releases the hold instead of leaking it (ADR-049 §9 round-9)"
         );
+    }
+
+    /// Wave B convergence: `complete_paid_action` records the receipt in the
+    /// per-context local `payment_receipts` buffer and surfaces a local
+    /// `ContextEvent::PaymentReceived`, but mints NO durable Merkle leaf — so
+    /// `checkpoint_events_since` (which counts durable leaves) stays at 0. A
+    /// per-payee `PaymentReceived` leaf would diverge across honest members and
+    /// break §9.9.3 (ADR-051 §6 / phase-2.md exclusion taxonomy §2).
+    #[tokio::test]
+    async fn complete_paid_action_buffers_receipt_and_mints_no_durable_leaf() {
+        use scp_protocol::context::membership::ContextEvent;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MkPayConverge".to_owned(),
+        ));
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_: &DID| None);
+        let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
+            Arc::new(RecordingPaymentAdapter {
+                captured: Arc::clone(&captured),
+                voided: Arc::clone(&voided),
+            });
+
+        let admin = DID("did:dht:z6MkPayConvergeAdmin".to_owned());
+        let sup = Supervisor::with_providers(
+            crypto,
+            Box::new(OkTransport),
+            Box::new(OkEventLog),
+            key_resolver,
+            None,
+            Some(payment_adapter),
+            None,
+            None,
+            mls_storage(),
+        );
+        let deps = sup
+            .build_actor_deps(&admin)
+            .await
+            .expect("build_actor_deps");
+
+        let context_id = "ctx-pay-converge".to_owned();
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let now_secs = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            now_secs,
+            admin.clone(),
+        );
+        // A per-message cost so a paid action authorizes + captures.
+        state.governance.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
+            locked: false,
+            cost_schedule: scp_protocol::economy::types::CostSchedule {
+                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                per_message: Some(scp_protocol::economy::types::Amount(10)),
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["recording".to_owned()],
+            pricing_formula: None,
+            payee: admin.clone(),
+        });
+
+        // Sanity: no receipts and no durable leaves yet.
+        assert!(state.payment_receipts.is_empty());
+        assert_eq!(state.checkpoint_events_since, 0);
+
+        let payer = DID("did:dht:z6MkPayer".to_owned());
+        let auth = crate::context::economy_helpers::authorize_paid_action(
+            &mut state,
+            &deps,
+            scp_protocol::economy::types::PaidActionType::MessageSend,
+            &payer,
+            &context_id,
+        )
+        .await
+        .expect("authorize_paid_action")
+        .expect("a paid action is authorized for a per_message policy");
+
+        let receipt = crate::context::economy_helpers::complete_paid_action(
+            &mut state,
+            &deps,
+            auth,
+            &context_id,
+        )
+        .await
+        .expect("complete_paid_action")
+        .expect("a receipt is produced on capture");
+
+        // The receipt is recorded in the local buffer (spec §19.11).
+        assert_eq!(state.payment_receipts.len(), 1);
+        assert_eq!(state.payment_receipts[0].receipt_id, receipt.receipt_id);
+
+        // NO durable Merkle leaf was minted — the counter is untouched.
+        assert_eq!(
+            state.checkpoint_events_since, 0,
+            "PaymentReceived must mint no durable leaf (ADR-051 §6 / §9.9.3)"
+        );
+
+        // A local `ContextEvent::PaymentReceived` was surfaced, carrying both
+        // payer and payee from the receipt, with anchored == false.
+        let events = state.receive_buffer.drain();
+        let found = events.iter().find_map(|e| match e {
+            ContextEvent::PaymentReceived {
+                payer,
+                payee,
+                anchored,
+                ..
+            } => Some((payer.clone(), payee.clone(), *anchored)),
+            _ => None,
+        });
+        let (ev_payer, ev_payee, ev_anchored) =
+            found.expect("a local PaymentReceived event is emitted");
+        assert_eq!(ev_payer, receipt.payer);
+        assert_eq!(ev_payee, receipt.payee);
+        assert!(
+            !ev_anchored,
+            "the surfaced receipt is unanchored pre-ADR-051"
+        );
+
+        // The capture ran exactly once and nothing was voided.
+        assert_eq!(captured.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(voided.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

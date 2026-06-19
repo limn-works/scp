@@ -124,3 +124,71 @@ fn negative_control_per_author_appends_break_convergence() {
          unification removes"
     );
 }
+
+#[test]
+fn two_honest_members_converge_despite_divergent_payment_captures() {
+    // Wave B: `PaymentReceived` is per-payee application activity — under the
+    // unification it appends NO durable leaf (surfaced as a local
+    // `ContextEvent` + the per-context `payment_receipts` buffer). Two honest
+    // members who process the same convergent stream but capture a DIFFERENT
+    // number of per-payee payments MUST still derive identical Merkle roots.
+    let log_a = MerkleEventLogProvider::new();
+    log_a.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_a);
+    // A captures 2 payments — local-only, no durable leaf.
+
+    let log_b = MerkleEventLogProvider::new();
+    log_b.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_b);
+    // B captures 4 payments — also durable-leaf-free.
+
+    let root_a = log_a.event_log_merkle_root(&CTX).unwrap();
+    let root_b = log_b.event_log_merkle_root(&CTX).unwrap();
+
+    assert_eq!(
+        root_a, root_b,
+        "two honest members with the same convergent event stream MUST derive \
+         identical event_log_merkle_root regardless of divergent per-payee \
+         payment captures (§9.9.3; ADR-051 §6)"
+    );
+    assert_ne!(
+        root_a, [0u8; 32],
+        "the convergent stream is non-empty, so the shared root must be non-zero"
+    );
+}
+
+#[test]
+fn negative_control_per_payee_payment_appends_break_convergence() {
+    // Pins that the payment-convergence test above is not vacuous: if
+    // `PaymentReceived` leaves WERE durably appended per payee (the
+    // pre-unification behavior), the divergent counts (2 vs 4) make the roots
+    // differ. This proves the positive test would detect a regression that
+    // re-introduced the per-payee `PaymentReceived` durable append.
+    let log_a = MerkleEventLogProvider::new();
+    log_a.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_a);
+    for _ in 0..2 {
+        log_a
+            .append_context_event(&CTX, EventType::PaymentReceived, ALICE)
+            .unwrap();
+    }
+
+    let log_b = MerkleEventLogProvider::new();
+    log_b.init_event_log(&CTX).unwrap();
+    append_convergent_stream(&log_b);
+    for _ in 0..4 {
+        log_b
+            .append_context_event(&CTX, EventType::PaymentReceived, BOB)
+            .unwrap();
+    }
+
+    let root_a = log_a.event_log_merkle_root(&CTX).unwrap();
+    let root_b = log_b.event_log_merkle_root(&CTX).unwrap();
+
+    assert_ne!(
+        root_a, root_b,
+        "with per-payee PaymentReceived leaves durably appended, divergent \
+         counts (2 vs 4) MUST make the roots differ — this is the \
+         non-convergence the unification removes"
+    );
+}

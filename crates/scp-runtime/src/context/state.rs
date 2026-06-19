@@ -1535,6 +1535,7 @@ pub(crate) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
         | ContextEvent::ConsequenceTriggered { .. }
         | ContextEvent::ConsequenceEnforced { .. }
         | ContextEvent::PaymentCaptureFailed { .. }
+        | ContextEvent::PaymentReceived { .. }
         | ContextEvent::CommitBroadcastPending { .. }
         | ContextEvent::CommitBroadcastSucceeded { .. }
         | ContextEvent::EquivocationDetected { .. }

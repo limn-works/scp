@@ -431,6 +431,7 @@ async fn payment_receipt_fields() {
         adapter_id: "x402".to_owned(),
         adapter_proof: vec![0x01, 0x02, 0x03],
         timestamp: 1_700_000_000,
+        anchored: false,
         signature: vec![0xFF; 64],
     };
 

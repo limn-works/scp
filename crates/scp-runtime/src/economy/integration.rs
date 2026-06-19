@@ -462,6 +462,7 @@ mod tests {
                 adapter_id: "test".to_owned(),
                 adapter_proof: vec![0xAB],
                 timestamp: 1_000_001,
+                anchored: false,
                 signature: vec![0xCD],
             })
         }

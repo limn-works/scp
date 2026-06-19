@@ -3252,7 +3252,8 @@ impl Supervisor {
             | QueriesCommand::PendingCommits { .. }
             | QueriesCommand::CommitFault { .. }
             | QueriesCommand::LocalMlsEpoch { .. }
-            | QueriesCommand::NeedsReconnect { .. } => {
+            | QueriesCommand::NeedsReconnect { .. }
+            | QueriesCommand::PaymentHistory { .. } => {
                 reply_with_soft_default(cmd);
             }
             // EventLogEntries never reaches this method — `dispatch_query`
@@ -8734,6 +8735,35 @@ impl Supervisor {
         }
     }
 
+    /// Returns the payment receipts captured in `context_id` (spec §19.11),
+    /// optionally narrowed by `filter`. Empty `Vec` iff the context is unknown.
+    /// Routes through the actor mailbox via [`Self::dispatch_query`].
+    ///
+    /// Reads the actor-owned per-context local receipt buffer — `PaymentReceived`
+    /// is per-payee application activity excluded from the canonical Merkle log
+    /// (ADR-011 amendment exclusion taxonomy §2), so it is surfaced from the
+    /// local buffer rather than the durable event log.
+    #[must_use]
+    pub async fn payment_history(
+        &self,
+        context_id: &str,
+        filter: Option<crate::economy::receipt::ReceiptFilter>,
+    ) -> Vec<crate::economy::adapter::PaymentReceipt> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::PaymentHistory {
+            context_id: context_id.to_owned(),
+            filter,
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return Vec::new();
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        }
+    }
+
     /// Returns the role assignment for `did` in `context_id`, or `None`
     /// if the member has no role. Routes through the actor mailbox via
     /// [`Self::dispatch_query`].
@@ -10138,7 +10168,8 @@ impl Supervisor {
             | QueriesCommand::PendingCommits { context_id, .. }
             | QueriesCommand::CommitFault { context_id, .. }
             | QueriesCommand::LocalMlsEpoch { context_id, .. }
-            | QueriesCommand::NeedsReconnect { context_id, .. } => Some(context_id.as_str()),
+            | QueriesCommand::NeedsReconnect { context_id, .. }
+            | QueriesCommand::PaymentHistory { context_id, .. } => Some(context_id.as_str()),
             QueriesCommand::EventLogEntries { .. } => None,
             #[cfg(feature = "testing")]
             QueriesCommand::GetAccessKey { context_id, .. }
@@ -10496,6 +10527,10 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         // An unknown context has nothing to reconnect.
         QueriesCommand::NeedsReconnect { reply, .. } => {
             let _ = reply.send(Ok(false));
+        }
+        // An unknown context has no payment receipts (empty `Vec`).
+        QueriesCommand::PaymentHistory { reply, .. } => {
+            let _ = reply.send(Ok(Vec::new()));
         }
         // `EventLogEntries` does not take a per-context lock and never
         // reaches this fallback path; the top-level dispatch handles it

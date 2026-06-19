@@ -474,6 +474,16 @@ pub struct ParticipationProfile {
     /// Total tool invocations across all tool types.
     pub tool_invocation_count: u64,
 
+    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log.
+    ///
+    /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf: the count is
+    /// computed from per-author local `ContextEvent`s, not the Merkle log
+    /// (spec §7.3.2; ADR-011 amendment exclusion taxonomy §2). Truth-in-
+    /// advertising — consumers MUST NOT treat the count as Merkle-proven while
+    /// this is `false`. The flag is part of the signed preimage so it cannot be
+    /// stripped from a signed profile.
+    pub tool_invocation_count_anchored: bool,
+
     /// Number of contexts created.
     pub context_creation_count: u64,
 
@@ -515,6 +525,7 @@ impl ParticipationProfile {
     /// - `governance_actions_against` (u64 big-endian)
     /// - `governance_actions_by` (u64 big-endian)
     /// - `tool_invocation_count` (u64 big-endian)
+    /// - `tool_invocation_count_anchored` (1 byte: 0 or 1)
     /// - `context_creation_count` (u64 big-endian)
     /// - `role_progression_count` (u64 big-endian)
     /// - `attestation_count` (u64 big-endian)
@@ -524,8 +535,9 @@ impl ParticipationProfile {
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
         let did_bytes = self.subject_did.as_bytes();
-        // domain separator + 4 (length prefix) + did_bytes.len() + 8*8 (eight u64 fields) + 32 + 32
-        let capacity = DOMAIN_PARTICIPATION_V1.len() + 4 + did_bytes.len() + 64 + 64;
+        // domain separator + 4 (length prefix) + did_bytes.len() + 8*8 (eight
+        // u64 fields) + 1 (tool_invocation_count_anchored byte) + 32 + 32
+        let capacity = DOMAIN_PARTICIPATION_V1.len() + 4 + did_bytes.len() + 64 + 1 + 64;
         let mut buf = Vec::with_capacity(capacity);
 
         // Domain separator — prevents cross-protocol signature confusion.
@@ -541,6 +553,9 @@ impl ParticipationProfile {
         buf.extend_from_slice(&self.governance_actions_against.to_be_bytes());
         buf.extend_from_slice(&self.governance_actions_by.to_be_bytes());
         buf.extend_from_slice(&self.tool_invocation_count.to_be_bytes());
+        // Truth-in-advertising flag (spec §7.3.2) — one byte in the signed
+        // preimage so a signed profile binds whether the count is Merkle-anchored.
+        buf.push(u8::from(self.tool_invocation_count_anchored));
         buf.extend_from_slice(&self.context_creation_count.to_be_bytes());
         buf.extend_from_slice(&self.role_progression_count.to_be_bytes());
         buf.extend_from_slice(&self.attestation_count.to_be_bytes());
@@ -910,6 +925,9 @@ pub fn produce_participation_profile(
         governance_actions_against: record.governance_actions_against.len() as u64,
         governance_actions_by: record.governance_actions_by.len() as u64,
         tool_invocation_count: total_tool_invocations,
+        // `tool_invocation_count` is summed from local `ToolInvoked`
+        // `ContextEvent`s, not the Merkle log, until ADR-051 (spec §7.3.2).
+        tool_invocation_count_anchored: false,
         context_creation_count: record.context_creation_count,
         role_progression_count: record.role_history.len() as u64,
         attestation_count: record.attestation_history.len() as u64,
@@ -1499,6 +1517,7 @@ mod tests {
             governance_actions_against: 2,
             governance_actions_by: 5,
             tool_invocation_count: 203,
+            tool_invocation_count_anchored: false,
             context_creation_count: 3,
             role_progression_count: 4,
             attestation_count: 10,
@@ -1647,9 +1666,60 @@ mod tests {
         let bytes = profile.signable_bytes();
         let did_len = "did:key:test".len();
         let domain_len = b"SCP-PARTICIPATION-V1:".len();
-        // domain separator + 4 (length prefix) + did_len + 8*8 (8 u64 fields) + 32 + 32
-        let expected = domain_len + 4 + did_len + 64 + 64;
+        // domain separator + 4 (length prefix) + did_len + 8*8 (8 u64 fields)
+        // + 1 (tool_invocation_count_anchored byte) + 32 + 32
+        let expected = domain_len + 4 + did_len + 64 + 1 + 64;
         assert_eq!(bytes.len(), expected);
+    }
+
+    #[test]
+    fn signable_bytes_changes_with_tool_invocation_count_anchored() {
+        // The truth-in-advertising flag is part of the signed preimage (spec
+        // §7.3.2), so two profiles differing ONLY in it produce different
+        // `signable_bytes` — a signature cannot be transplanted between an
+        // anchored and an unanchored claim.
+        let mut profile_false = make_profile();
+        profile_false.tool_invocation_count_anchored = false;
+        let mut profile_true = make_profile();
+        profile_true.tool_invocation_count_anchored = true;
+
+        assert_ne!(
+            profile_false.signable_bytes(),
+            profile_true.signable_bytes(),
+            "flipping tool_invocation_count_anchored MUST change the signed preimage"
+        );
+    }
+
+    #[test]
+    fn signature_binds_tool_invocation_count_anchored() {
+        use ed25519_dalek::{Signer, Verifier};
+
+        let signing_key = test_signing_key(7);
+        let verifying_key = signing_key.verifying_key();
+
+        let mut profile = make_profile();
+        profile.tool_invocation_count_anchored = false;
+        profile.signer_public_key = verifying_key.to_bytes();
+        let sig = signing_key.sign(&profile.signable_bytes());
+        profile.signature = sig.to_bytes();
+
+        // The signature verifies over the unanchored profile.
+        assert!(
+            verifying_key
+                .verify(&profile.signable_bytes(), &sig)
+                .is_ok()
+        );
+
+        // Flipping the flag (without re-signing) breaks verification — the
+        // signature is bound to the anchored bit.
+        let mut tampered = profile;
+        tampered.tool_invocation_count_anchored = true;
+        assert!(
+            verifying_key
+                .verify(&tampered.signable_bytes(), &sig)
+                .is_err(),
+            "flipping the anchored bit MUST invalidate the bound signature"
+        );
     }
 
     #[test]
@@ -1664,6 +1734,7 @@ mod tests {
             governance_actions_against: 0,
             governance_actions_by: 0,
             tool_invocation_count: 0,
+            tool_invocation_count_anchored: false,
             context_creation_count: 0,
             role_progression_count: 0,
             attestation_count: 0,
@@ -1810,6 +1881,7 @@ mod tests {
             governance_actions_against: ov.governance_actions_against.unwrap_or(2),
             governance_actions_by: ov.governance_actions_by.unwrap_or(5),
             tool_invocation_count: ov.tool_invocation_count.unwrap_or(203),
+            tool_invocation_count_anchored: ov.tool_invocation_count_anchored.unwrap_or(false),
             context_creation_count: ov.context_creation_count.unwrap_or(3),
             role_progression_count: ov.role_progression_count.unwrap_or(4),
             attestation_count: ov.attestation_count.unwrap_or(10),
@@ -1832,6 +1904,7 @@ mod tests {
         governance_actions_against: Option<u64>,
         governance_actions_by: Option<u64>,
         tool_invocation_count: Option<u64>,
+        tool_invocation_count_anchored: Option<bool>,
         context_creation_count: Option<u64>,
         role_progression_count: Option<u64>,
         attestation_count: Option<u64>,

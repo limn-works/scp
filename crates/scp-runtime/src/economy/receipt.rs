@@ -12,7 +12,6 @@
 use serde::{Deserialize, Serialize};
 
 use super::adapter::{PaymentAdapter, PaymentError, PaymentReceipt, VerificationResult};
-use scp_event_log::{Event, EventType};
 
 // ---------------------------------------------------------------------------
 // PaymentVerifier
@@ -374,12 +373,15 @@ pub struct ReceiptFilter {
 // payment_history
 // ---------------------------------------------------------------------------
 
-/// Retrieves payment receipts from a context's event log.
+/// Retrieves payment receipts from a context's local receipt buffer.
 ///
-/// Scans the given events for [`EventType::PaymentReceived`] events and
-/// deserializes their payloads into [`PaymentReceipt`] records. Events that
-/// fail deserialization are silently skipped (they may be from a different
-/// protocol version).
+/// Filters the given per-context `payment_receipts` (the actor-owned local
+/// buffer — `PerContextState::payment_receipts`) by the optional `filter`
+/// (payer, payee, or time range). `PaymentReceived` is per-payee application
+/// activity excluded from the canonical Merkle log (ADR-011 amendment exclusion
+/// taxonomy §2; convergent only under ADR-051), so the receipts are read from
+/// the local buffer rather than the durable event log — this is what keeps the
+/// `event_log_merkle_root` convergent across honest members (§9.9.3).
 ///
 /// The optional `filter` parameter allows narrowing results by payer, payee,
 /// or time range.
@@ -387,20 +389,13 @@ pub struct ReceiptFilter {
 /// Corresponds to the SDK surface `SCP.Economy.paymentHistory(context)`
 /// (spec section 19.11).
 #[must_use]
-pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<PaymentReceipt> {
-    let mut receipts = Vec::new();
+pub fn payment_history(
+    receipts: &[PaymentReceipt],
+    filter: Option<&ReceiptFilter>,
+) -> Vec<PaymentReceipt> {
+    let mut matched = Vec::new();
 
-    for event in events {
-        if event.event_type != EventType::PaymentReceived {
-            continue;
-        }
-
-        // Attempt to deserialize the receipt from the event payload.
-        let receipt: PaymentReceipt = match serde_json::from_slice(&event.payload.data) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
+    for receipt in receipts {
         // Apply optional filter.
         if let Some(f) = filter {
             if let Some(ref payer) = f.payer
@@ -425,10 +420,10 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
             }
         }
 
-        receipts.push(receipt);
+        matched.push(receipt.clone());
     }
 
-    receipts
+    matched
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +439,7 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
 )]
 mod tests {
     use super::*;
-    use scp_event_log::{EventPayload, EventType};
+    use scp_event_log::EventType;
     use scp_identity::DID;
     use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
 
@@ -467,6 +462,7 @@ mod tests {
             adapter_id: "test".to_string(),
             adapter_proof: vec![0x01, 0x02],
             timestamp,
+            anchored: false,
             signature: vec![0xFF; 64],
         }
     }
@@ -474,36 +470,6 @@ mod tests {
     /// Creates a test `PaymentReceipt` with the default `receipt_id` `[0xAA; 32]`.
     fn make_receipt(payer: &str, payee: &str, amount: u64, timestamp: u64) -> PaymentReceipt {
         make_receipt_with_id([0xAA; 32], payer, payee, amount, timestamp)
-    }
-
-    /// Creates an `Event` with a `PaymentReceived` type carrying a serialized
-    /// receipt in its payload.
-    fn make_payment_event(receipt: &PaymentReceipt, sequence: u64) -> Event {
-        let payload_data = serde_json::to_vec(receipt).unwrap();
-        Event {
-            event_type: EventType::PaymentReceived,
-            actor_did: receipt.payer.clone(),
-            timestamp: receipt.timestamp,
-            sequence,
-            payload: EventPayload { data: payload_data },
-            prev_hash: [0u8; 32],
-            signature: vec![0xFF; 64],
-        }
-    }
-
-    /// Creates a non-payment event.
-    fn make_message_event(sequence: u64) -> Event {
-        Event {
-            event_type: EventType::MessageSent,
-            actor_did: DID::from("did:dht:z6MkAlice"),
-            timestamp: 1_000_000,
-            sequence,
-            payload: EventPayload {
-                data: b"hello".to_vec(),
-            },
-            prev_hash: [0u8; 32],
-            signature: vec![0xFF; 64],
-        }
     }
 
     // -------------------------------------------------------------------
@@ -526,52 +492,70 @@ mod tests {
         assert_eq!(receipt.adapter_id, deserialized.adapter_id);
         assert_eq!(receipt.adapter_proof, deserialized.adapter_proof);
         assert_eq!(receipt.timestamp, deserialized.timestamp);
+        assert_eq!(receipt.anchored, deserialized.anchored);
         assert_eq!(receipt.signature, deserialized.signature);
     }
 
     // -------------------------------------------------------------------
-    // payment_history returns receipts from PaymentReceived events
+    // anchored: round-trips false; a Merkle-requiring consumer rejects it
+    // -------------------------------------------------------------------
+
+    /// A consumer that requires Merkle-proven provenance accepts a receipt only
+    /// when `anchored == true` (spec §19 receipt `anchored` field). Until
+    /// ADR-051 every captured receipt is `anchored == false`, so this rejects.
+    const fn requires_merkle_proven(receipt: &PaymentReceipt) -> bool {
+        receipt.anchored
+    }
+
+    #[test]
+    fn receipt_anchored_round_trips_false_and_is_rejected_by_merkle_consumer() {
+        let receipt = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000);
+        // Construction default (pre-ADR-051) is unanchored.
+        assert!(!receipt.anchored);
+
+        // Serde round-trip preserves `anchored == false`.
+        let json = serde_json::to_string(&receipt).unwrap();
+        let deserialized: PaymentReceipt = serde_json::from_str(&json).unwrap();
+        assert!(
+            !deserialized.anchored,
+            "an unanchored receipt MUST round-trip as unanchored (spec §19)"
+        );
+
+        // A consumer requiring Merkle-proven provenance rejects it.
+        assert!(
+            !requires_merkle_proven(&deserialized),
+            "a Merkle-requiring consumer MUST reject an unanchored receipt (spec §19)"
+        );
+
+        // Positive control: an (artificially) anchored receipt is accepted.
+        let mut anchored = deserialized;
+        anchored.anchored = true;
+        assert!(requires_merkle_proven(&anchored));
+    }
+
+    // -------------------------------------------------------------------
+    // payment_history reads the per-context local receipt buffer
     // -------------------------------------------------------------------
 
     #[test]
-    fn payment_history_returns_receipts_from_payment_events() {
-        let receipt1 = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000);
-        let receipt2 = make_receipt("did:dht:z6MkBob", "did:dht:z6MkAlice", 200, 1_000_001);
-
-        let events = vec![
-            make_payment_event(&receipt1, 0),
-            make_message_event(1),
-            make_payment_event(&receipt2, 2),
+    fn payment_history_returns_receipts_from_local_buffer() {
+        let receipts = vec![
+            make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000),
+            make_receipt("did:dht:z6MkBob", "did:dht:z6MkAlice", 200, 1_000_001),
         ];
 
-        let history = payment_history(&events, None);
+        let history = payment_history(&receipts, None);
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].amount, Amount::new(100));
         assert_eq!(history[1].amount, Amount::new(200));
     }
 
     // -------------------------------------------------------------------
-    // payment_history skips non-payment events
+    // payment_history returns empty for an empty buffer
     // -------------------------------------------------------------------
 
     #[test]
-    fn payment_history_skips_non_payment_events() {
-        let events = vec![
-            make_message_event(0),
-            make_message_event(1),
-            make_message_event(2),
-        ];
-
-        let history = payment_history(&events, None);
-        assert!(history.is_empty());
-    }
-
-    // -------------------------------------------------------------------
-    // payment_history returns empty for empty event list
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn payment_history_returns_empty_for_no_events() {
+    fn payment_history_returns_empty_for_no_receipts() {
         let history = payment_history(&[], None);
         assert!(history.is_empty());
     }
@@ -582,12 +566,9 @@ mod tests {
 
     #[test]
     fn payment_history_filters_by_payer() {
-        let receipt_alice = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000);
-        let receipt_bob = make_receipt("did:dht:z6MkBob", "did:dht:z6MkAlice", 200, 1_000_001);
-
-        let events = vec![
-            make_payment_event(&receipt_alice, 0),
-            make_payment_event(&receipt_bob, 1),
+        let receipts = vec![
+            make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000),
+            make_receipt("did:dht:z6MkBob", "did:dht:z6MkAlice", 200, 1_000_001),
         ];
 
         let filter = ReceiptFilter {
@@ -595,7 +576,7 @@ mod tests {
             ..Default::default()
         };
 
-        let history = payment_history(&events, Some(&filter));
+        let history = payment_history(&receipts, Some(&filter));
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].payer, DID::from("did:dht:z6MkAlice"));
     }
@@ -606,12 +587,9 @@ mod tests {
 
     #[test]
     fn payment_history_filters_by_payee() {
-        let receipt1 = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000);
-        let receipt2 = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkCharlie", 200, 1_000_001);
-
-        let events = vec![
-            make_payment_event(&receipt1, 0),
-            make_payment_event(&receipt2, 1),
+        let receipts = vec![
+            make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000),
+            make_receipt("did:dht:z6MkAlice", "did:dht:z6MkCharlie", 200, 1_000_001),
         ];
 
         let filter = ReceiptFilter {
@@ -619,7 +597,7 @@ mod tests {
             ..Default::default()
         };
 
-        let history = payment_history(&events, Some(&filter));
+        let history = payment_history(&receipts, Some(&filter));
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].payee, DID::from("did:dht:z6MkCharlie"));
     }
@@ -630,14 +608,10 @@ mod tests {
 
     #[test]
     fn payment_history_filters_by_time_range() {
-        let receipt1 = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000);
-        let receipt2 = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 200, 2_000_000);
-        let receipt3 = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 300, 3_000_000);
-
-        let events = vec![
-            make_payment_event(&receipt1, 0),
-            make_payment_event(&receipt2, 1),
-            make_payment_event(&receipt3, 2),
+        let receipts = vec![
+            make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000),
+            make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 200, 2_000_000),
+            make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 300, 3_000_000),
         ];
 
         let filter = ReceiptFilter {
@@ -646,7 +620,7 @@ mod tests {
             ..Default::default()
         };
 
-        let history = payment_history(&events, Some(&filter));
+        let history = payment_history(&receipts, Some(&filter));
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].amount, Amount::new(200));
     }
@@ -657,14 +631,10 @@ mod tests {
 
     #[test]
     fn payment_history_combined_filters() {
-        let receipt1 = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000);
-        let receipt2 = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 200, 2_000_000);
-        let receipt3 = make_receipt("did:dht:z6MkBob", "did:dht:z6MkAlice", 300, 2_000_000);
-
-        let events = vec![
-            make_payment_event(&receipt1, 0),
-            make_payment_event(&receipt2, 1),
-            make_payment_event(&receipt3, 2),
+        let receipts = vec![
+            make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000),
+            make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 200, 2_000_000),
+            make_receipt("did:dht:z6MkBob", "did:dht:z6MkAlice", 300, 2_000_000),
         ];
 
         let filter = ReceiptFilter {
@@ -673,36 +643,9 @@ mod tests {
             ..Default::default()
         };
 
-        let history = payment_history(&events, Some(&filter));
+        let history = payment_history(&receipts, Some(&filter));
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].amount, Amount::new(200));
-    }
-
-    // -------------------------------------------------------------------
-    // payment_history skips malformed payloads gracefully
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn payment_history_skips_malformed_payloads() {
-        let good_receipt = make_receipt("did:dht:z6MkAlice", "did:dht:z6MkBob", 100, 1_000_000);
-
-        let bad_event = Event {
-            event_type: EventType::PaymentReceived,
-            actor_did: DID::from("did:dht:z6MkAlice"),
-            timestamp: 1_000_000,
-            sequence: 0,
-            payload: EventPayload {
-                data: b"not valid json".to_vec(),
-            },
-            prev_hash: [0u8; 32],
-            signature: vec![0xFF; 64],
-        };
-
-        let events = vec![bad_event, make_payment_event(&good_receipt, 1)];
-
-        let history = payment_history(&events, None);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].amount, Amount::new(100));
     }
 
     // -------------------------------------------------------------------

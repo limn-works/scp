@@ -2501,6 +2501,22 @@ pub enum QueriesCommand {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<bool, ContextError>>,
     },
+    /// Payment receipts captured in this context (spec §19.11). Read-only.
+    ///
+    /// Reads the actor-owned `state.payment_receipts` local buffer (NOT the
+    /// durable Merkle log — `PaymentReceived` is per-payee, excluded from the
+    /// canonical log per ADR-011 amendment exclusion taxonomy §2), applies the
+    /// optional [`ReceiptFilter`](crate::economy::receipt::ReceiptFilter), and
+    /// replies with the matching receipts. Empty `Vec` iff the context is
+    /// unknown (soft default, matching the other read variants).
+    PaymentHistory {
+        /// Context identifier string.
+        context_id: String,
+        /// Optional filter (payer / payee / time range). `None` returns all.
+        filter: Option<crate::economy::receipt::ReceiptFilter>,
+        /// Oneshot reply channel carrying the matching receipts.
+        reply: oneshot::Sender<Result<Vec<crate::economy::adapter::PaymentReceipt>, ContextError>>,
+    },
 
     // -------------------------------------------------------------------
     // `#[cfg(feature = "testing")]` accessors. Pure reads.

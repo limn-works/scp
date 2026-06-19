@@ -253,8 +253,7 @@ fn process_one_triggered_consequence(
 
     let action_type = consequence_action_type(&consequence.action);
     let rule = args.rules.get(consequence.rule_index);
-    let trigger_kind =
-        rule.map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
+    let trigger_kind = rule.map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
 
     // Durability gate (ADR-051 §6 / phase-2.md ADR-011 amendment "Consequence
     // emission"): a consequence leaf is a durable Merkle entry ONLY when its
@@ -265,9 +264,8 @@ fn process_one_triggered_consequence(
     // `ContextEvent`s — local enforcement still runs, but no durable leaf is
     // minted (a leaf would diverge across honest members and break §9.9.3). A
     // missing or unresolvable rule is treated as non-durable (fail-safe).
-    let durable = rule.is_some_and(|r| {
-        scp_protocol::trust::consequence::is_convergent_trigger(&r.trigger)
-    });
+    let durable =
+        rule.is_some_and(|r| scp_protocol::trust::consequence::is_convergent_trigger(&r.trigger));
 
     // Always emit `ConsequenceTriggered` into the receive buffer + event_tx
     // (regardless of member presence). The durable Merkle leaf is gated on
@@ -861,9 +859,7 @@ mod convergence_tests {
     //! leaves (root changes). Keyed on the enum via `is_convergent_trigger`,
     //! never on a string.
 
-    use super::{
-        ConsequenceStateSplit, EnforceConsequencesCtx, enforce_triggered_consequences,
-    };
+    use super::{ConsequenceStateSplit, EnforceConsequencesCtx, enforce_triggered_consequences};
     use crate::context::actor::state::PerContextState;
     use crate::context::builder::ContextEventLogProvider;
     use crate::context::providers::MerkleEventLogProvider;
@@ -890,7 +886,7 @@ mod convergence_tests {
             trigger,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }
     }
 
@@ -898,8 +894,11 @@ mod convergence_tests {
     /// against a fresh `PerContextState` + a `scp_event_log`-backed provider,
     /// returning `(merkle_root_delta_nonzero, consequence_triggered_event_seen)`.
     fn run_one(trigger: ConsequenceTrigger) -> (bool, bool) {
-        let mut state =
-            PerContextState::new_for_test_encrypted(CTX_BYTES, 1_700_000_000, DID(ADMIN.to_owned()));
+        let mut state = PerContextState::new_for_test_encrypted(
+            CTX_BYTES,
+            1_700_000_000,
+            DID(ADMIN.to_owned()),
+        );
         // The subject must be a member for enforcement to run; a non-member
         // would only emit `ConsequenceTriggered` and bail.
         state

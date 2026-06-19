@@ -306,6 +306,21 @@ pub fn commit_fault(state: &PerContextState) -> Option<CommitFaultMarker> {
     state.commit_fault.clone()
 }
 
+/// Returns the payment receipts captured in this context (spec §19.11),
+/// optionally narrowed by `filter`.
+///
+/// Reads the actor-owned `state.payment_receipts` local buffer — NOT the
+/// durable Merkle log. `PaymentReceived` is per-payee application activity
+/// excluded from the canonical log (ADR-011 amendment exclusion taxonomy §2),
+/// so surfacing it from the local buffer is what keeps `event_log_merkle_root`
+/// convergent across honest members (§9.9.3).
+pub fn payment_history(
+    state: &PerContextState,
+    filter: Option<&crate::economy::receipt::ReceiptFilter>,
+) -> Vec<crate::economy::adapter::PaymentReceipt> {
+    crate::economy::receipt::payment_history(&state.payment_receipts, filter)
+}
+
 // ===========================================================================
 // Receive buffer + degraded mode (actor-shape, mutating)
 // ===========================================================================

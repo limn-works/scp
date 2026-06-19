@@ -22,13 +22,13 @@ use std::sync::Arc;
 
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
 
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::economy_logic::PaidActionAuthorization;
-use crate::context::state::context_id_to_bytes;
 use crate::economy::adapter::{PaymentMetadata, PaymentReceipt};
 use crate::economy::integration;
 use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
@@ -170,8 +170,21 @@ pub async fn authorize_paid_action(
 
 /// Completes a paid action after successful execution (escrow capture).
 ///
-/// Calls `adapter.capture`, verifies the receipt, stores it in the event
-/// log, and updates actor-owned checkpoint tracking.
+/// Calls `adapter.capture`, verifies the receipt, surfaces it as a LOCAL
+/// `ContextEvent::PaymentReceived` (receive-buffer push + `event_tx`
+/// notification), and records it in the per-context `payment_receipts` buffer
+/// for the `payment_history` query (spec §19.11).
+///
+/// Per ADR-051 §6 / the phase-2.md ADR-011 amendment exclusion taxonomy §2, a
+/// `PaymentReceived` is per-payee application activity appended by the payee
+/// alone — it is **excluded from the canonical Merkle log** so that two honest
+/// members derive the same `event_log_merkle_root` (§9.9.3). The former durable
+/// `EventType::PaymentReceived` append (and its `checkpoint_events_since`
+/// increment) is removed; the local `ContextEvent` and the `payment_receipts`
+/// buffer are the sole surfacing of a capture. The emitted event carries BOTH
+/// `payer` and `payee` from the verified receipt (the payee records the
+/// payment per §19.6.1) with `anchored: false` (not Merkle-proven until
+/// ADR-051).
 ///
 /// # Errors
 ///
@@ -183,7 +196,6 @@ pub async fn complete_paid_action(
     state: &mut PerContextState,
     deps: &ActorDeps,
     auth: PaidActionAuthorization,
-    payer_did: &DID,
     context_id: &str,
 ) -> Result<Option<PaymentReceipt>, ContextError> {
     let processed = integration::process_paid_action(
@@ -203,21 +215,42 @@ pub async fn complete_paid_action(
     crate::context::economy_logic::verify_and_check_receipt(auth.adapter.as_ref(), &receipt)
         .await?;
 
-    let context_id_bytes = context_id_to_bytes(context_id);
-    if let Err(e) = deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::PaymentReceived,
-        payer_did.as_ref(),
-    ) {
-        tracing::warn!(
-            context_id,
-            "failed to store payment receipt in event log: {e}"
-        );
-    }
+    // Surface the capture as a LOCAL `ContextEvent` (no durable Merkle leaf —
+    // per-payee, non-convergent; ADR-051 §6 / phase-2.md §2). Both `payer` and
+    // `payee` come from the verified receipt; `anchored` is false (pre-ADR-051).
+    let event = ContextEvent::PaymentReceived {
+        receipt_id: receipt.receipt_id,
+        payer: receipt.payer.clone(),
+        payee: receipt.payee.clone(),
+        amount: receipt.amount.value(),
+        action: paid_action_label(&receipt.action_type).to_owned(),
+        anchored: false,
+    };
+    crate::context::state::emit_event_into(
+        &mut state.receive_buffer,
+        event,
+        context_id,
+        deps.event_tx.as_ref(),
+    );
 
-    state.checkpoint_events_since += 1;
+    // Record the receipt in the per-context local buffer that backs the
+    // `payment_history` query (spec §19.11) — NOT the durable Merkle log.
+    state.payment_receipts.push(receipt.clone());
 
     Ok(Some(receipt))
+}
+
+/// Maps a [`PaidActionType`] to the canonical action label carried in
+/// [`ContextEvent::PaymentReceived`] / [`ContextEvent::PaymentCaptureFailed`]
+/// (`"send_message"` / `"join_context"`; spec §19.6.1).
+const fn paid_action_label(action_type: &PaidActionType) -> &'static str {
+    match action_type {
+        PaidActionType::MessageSend => "send_message",
+        PaidActionType::ContextJoin => "join_context",
+        PaidActionType::ToolInvoke => "tool_invoke",
+        PaidActionType::SubscriptionPeriod => "subscription_period",
+        PaidActionType::ByteStored => "byte_stored",
+    }
 }
 
 // ---------------------------------------------------------------------------
