@@ -454,62 +454,52 @@ scan_file() {
         -v DELEGATES="$PERSIST_DELEGATES" -v FC_FUNCS="${FC_FUNCS:-}" \
         -v MUTATORS="$MUTATORS" -v CLASSC="$CLASS_C_EXCEPTIONS" \
         -v GOVLEAVES="$CLASS_C_GOVERNANCE_LEAVES" '
-    # is_column0_item_start — the SINGLE shared classifier for "this STRIPPED
-    # line opens a column-0 Rust ITEM". BOTH the trailing-test-module DETECTOR
-    # (mod-vs-item decision after a test gate) AND the NTTEST un-scanned-vacuum
-    # GUARD call this one function so the two can NEVER drift apart — a new item
-    # spelling is recognised by both the instant it is added here (convergent by
-    # construction, not a hand-maintained denylist of fn permutations).
+    # is_column0_code_line — TRUE iff the STRIPPED line is column-0 PRODUCTION
+    # CONTENT: a non-blank, non-comment, non-attribute line that begins at column
+    # 0 (no leading whitespace). This is the CLASSIFIER-FREE successor to the old
+    # `is_column0_item_start` item-kind enumerator. It does NOT try to recognise
+    # *what* item the line opens — only that a column-0 code line is present at
+    # all. It is used both by the trailing-test-module DETECTOR (to find the first
+    # real column-0 code line after a test gate, to decide mod-vs-item) and by the
+    # NTTEST un-scanned-vacuum GUARD (to detect ANY production resume after the
+    # closing brace of the trailing test module).
     #
-    # The alternation covers every column-0 Rust item keyword, each in any
-    # leading visibility / qualifier combination:
-    #   - visibility: (none) | pub | pub(<path>)
-    #   - item keyword: mod impl trait struct enum union fn const static type use
-    #                   macro_rules extern
-    #   - fn qualifier prefixes (in any order Rust permits):
-    #       async fn | const fn | unsafe fn | extern "C" fn |
-    #       async unsafe fn | const unsafe fn | unsafe const fn |
-    #       pub(crate) async unsafe fn | ... (the qualifier run is matched
-    #       generically as a sequence of {async,const,unsafe,extern "..."} tokens
-    #       before the `fn` keyword)
-    #   - item-producing macro invocation at column 0: `name! {` / `name!(` /
-    #     `name![` (e.g. a `make_things!{}` that expands to items) — these can
-    #     resume a production region after a trailing test module just like a
-    #     real item, so they MUST count as an item start for the vacuum guard.
+    # WAVE-18 REFRAME. The prior `is_column0_item_start` enumerated every column-0
+    # Rust item keyword + every fn/impl qualifier permutation + the single-ident
+    # item-macro spelling. That enumeration leaked a NEW spelling every wave
+    # (`unsafe fn`/`const fn`; `unsafe impl`/`unsafe trait`; `pub(crate) mod`; and
+    # finally the path-qualified item macro `foo::bar! {}` — the MAJORITY macro
+    # spelling, unrecognised because `::` falls outside the macro-ident char
+    # class). That is the non-convergent "one-more-spelling" anti-pattern. The
+    # NTTEST guard no longer needs to know the KIND of an item: with brace-depth
+    # tracking of the test module (see the per-line block below), ANY column-0
+    # production content after the closing brace of the module is a vacuum,
+    # whatever its spelling. So it collapses to the three things that are NOT
+    # production content — blank, comment-only, and attribute lines — and treats
+    # everything else as a column-0 code line. No item/macro spelling can evade
+    # it, because it matches no spelling: it matches the ABSENCE of the three
+    # non-content shapes.
     #
     # `s` is assumed already STRIPPED (comment/string content removed) by the
-    # caller, so a keyword inside a literal or comment cannot match.
-    function is_column0_item_start(s,   vis, qual) {
-        # Optional leading visibility: `pub ` or `pub(<...>) `.
-        vis = "(pub[[:space:]]*(\\([^)]*\\))?[[:space:]]+)?"
-        # Optional run of item qualifiers: async / const / unsafe / extern "ABI",
-        # in any legal order/repetition. These may precede ANY item keyword the
-        # qualifier is legal on — NOT just `fn`: `unsafe impl`, `unsafe trait`,
-        # `const fn`, `async unsafe fn`, `extern "C" fn`, `default unsafe impl`,
-        # `pub(crate) const unsafe fn`, etc. Wiring the qualifier run ONLY to `fn`
-        # (the prior shape) left a QUALIFIED NON-`fn` item — `unsafe impl Foo {`,
-        # `unsafe trait Bar {`, a `default`-qualified impl member — unrecognised,
-        # so a production region resuming after a trailing test module with one of
-        # those was an un-scanned vacuum (the wave-15 denylist had matched
-        # `unsafe impl` explicitly; the wave-16 refactor dropped that coverage).
-        # `default` is included because it qualifies trait-impl items.
-        qual = "((async|const|unsafe|extern([[:space:]]+\"[^\"]*\")?|default)[[:space:]]+)*"
-        # 1. An item keyword with optional visibility AND an optional leading
-        #    qualifier run, boundary-guarded by a following space, `!`, `<`, or `(`
-        #    so e.g. `constant` / `typeof` cannot false-match `const` / `type`. The
-        #    qualifier run is OPTIONAL (zero repetitions) so a bare `mod` / `impl` /
-        #    `struct` / `fn` with no qualifier still matches; when present it may
-        #    precede `fn` (`unsafe fn`, `const fn`, …) OR a non-`fn` item
-        #    (`unsafe impl`, `unsafe trait`, …) — the ONE generalisation that
-        #    closes the qualified-non-fn vacuum without a per-spelling denylist.
-        if (s ~ ("^" vis qual "(mod|impl|trait|struct|enum|union|fn|const|static|type|use|macro_rules|extern)([[:space:]]|!|<|\\()"))
-            return 1
-        # 2. A column-0 item-producing MACRO invocation: `ident! {` / `ident!(` /
-        #    `ident![`. (A statement macro inside a fn body is never at column 0
-        #    in this codebase, so the column-0 anchor keeps this precise.)
-        if (s ~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*![[:space:]]*[({[]/)
-            return 1
-        return 0
+    # caller, so a comment-only line is already empty here, and a token inside a
+    # literal/comment cannot make a non-code line look like code.
+    function is_column0_code_line(s) {
+        # Blank or comment-only (stripped to empty / whitespace-only): not code.
+        if (s ~ /^[[:space:]]*$/)
+            return 0
+        # Indented (leading whitespace): not a column-0 line — it is inside some
+        # still-open block, never a top-level production resume.
+        if (s ~ /^[[:space:]]/)
+            return 0
+        # A column-0 attribute line (`#[..]` / `#![..]`): not yet production
+        # content — the DETECTOR / GUARD look PAST it to the item it decorates (a
+        # `#[cfg(test)]` re-opening gate is handled explicitly by the caller).
+        if (s ~ /^#!?\[/)
+            return 0
+        # Anything else at column 0 is production content (an item of ANY
+        # spelling — fn / impl / trait / struct / a single-ident OR path-qualified
+        # item macro / a re-opened `mod` — or any other top-level token).
+        return 1
     }
     # is_column0_reopening_test_gate — TRUE iff the STRIPPED line is a column-0
     # `#[cfg(test)]` / `#[cfg(all(test..))]` / `#[cfg(any(test..))]` attribute,
@@ -522,13 +512,13 @@ scan_file() {
             || s ~ /^#\[cfg\(any\(test[,)]/)
     }
     # is_column0_mod_decl — TRUE iff the STRIPPED line is a column-0 `mod NAME`
-    # declaration with optional visibility, recognised by the SAME visibility
-    # grammar as `is_column0_item_start` (`pub` / `pub(crate)` / `pub(in path)`).
-    # BOTH the trailing-test-module accept and the SECOND-test-module accept call
-    # this so neither can use a NARROWER `vis` than the item classifier and wrongly
-    # reject a `pub(crate) mod more_tests` / `pub(in path) mod` re-opening test
-    # module — which would otherwise fall through `is_column0_item_start` as a
-    # generic item and false-fire NTTEST on perfectly legal Rust (a CI break).
+    # declaration with optional visibility (`pub` / `pub(crate)` / `pub(in path)`).
+    # The trailing-test-module DETECTOR uses it to recognise the `mod` that a
+    # `#[cfg(test)]` gate decorates (vs an interspersed single item), keeping the
+    # FULL visibility grammar so a `pub(crate) mod tests` / `pub(in path) mod`
+    # (trailing OR a legitimate second test module) is recognised as a module and
+    # not mistaken for a production resume — which would false-fire NTTEST on
+    # perfectly legal Rust (a CI break).
     function is_column0_mod_decl(s,   vis) {
         vis = "(pub[[:space:]]*(\\([^)]*\\))?[[:space:]]+)?"
         return (s ~ ("^" vis "mod[[:space:]]"))
@@ -794,13 +784,46 @@ scan_file() {
         in_raw_string = 0
         raw_hash = 0
         in_string = 0
-        seen_test = 0
+        # Trailing-test-module brace-depth state (wave-18 reframe). The cutoff no
+        # longer flips a single "skip rest of file" `seen_test` flag and classify
+        # every later column-0 line by item KIND; it TRACKS the trailing test
+        # the CODE brace depth of the trailing test module and treats ANY
+        # column-0 production content AFTER its closing brace as a non-trailing
+        # vacuum (NTTEST).
+        #   in_test_module     — currently inside a trailing test module body.
+        #   test_mod_depth      — CODE brace depth WITHIN that module (the module
+        #                         opens at depth 1 on its `mod .. {` line and CLOSES
+        #                         when this returns to 0).
+        #   after_test_module   — a trailing test module has CLOSED and we are
+        #                         scanning for the first column-0 production resume.
+        #   test_gate_line      — the gate line reported if a vacuum is found.
+        #   nontrailing_hit     — NTTEST already fired for this file (fire once).
+        #   pending_test_gate / pending_test_line — a column-0 `#[cfg(test)]` gate
+        #                         is armed; the next column-0 code line decides
+        #                         mod-vs-(interspersed item). The SAME pending-gate
+        #                         path recognises a legitimate SECOND test module
+        #                         after a prior one closed (a re-opening gate arms
+        #                         it; the following `mod` is consumed as a module),
+        #                         so no separate "second gate" state is needed.
+        in_test_module = 0
+        test_mod_depth = 0
+        after_test_module = 0
         test_gate_line = 0
         nontrailing_hit = 0
-        seen_test_set_nr = 0
         pending_test_gate = 0
         pending_test_line = 0
-        pending_second_test_gate = 0
+        # attr_bracket_depth — net unclosed `[` + `(` of an in-flight column-0
+        # MULTI-LINE attribute (`#[derive(\n  ...\n)]`, `#[allow(\n  ...\n)]`).
+        # A column-0 attribute whose brackets are unbalanced on its opening line
+        # CONTINUES onto following physical lines (e.g. a bare `)]` closer at
+        # column 0). Those continuation lines are NOT production content and MUST
+        # NOT be mistaken by the mod-vs-item DETECTOR / NTTEST GUARD for a column-0
+        # code line (else a `)]` closing a multi-line `#[allow(..)]` before a
+        # `mod tests {` would wrongly decide "interspersed item" and skip the
+        # module). Tracked here (with the same stripped-line bracket counts) so the
+        # whole attribute, however many lines it spans, is transparent — the
+        # classifier-free analogue of how `strip_code` carries multi-line literals.
+        attr_bracket_depth = 0
         depth = 0
         in_fn = 0
         fn_name = ""
@@ -867,107 +890,171 @@ scan_file() {
         # resumes scanning after the close.
         if (block_depth > 0 || in_raw_string || in_string) next
 
-        # Trailing test-MODULE cutoff: once a top-level (column-0) test-gated
-        # MODULE opens, every line below it is test code and is not scanned.
-        # The trailing test module is gated by a column-0 attribute in one of
-        # these forms, IMMEDIATELY decorating a `mod` (a `pub mod` / `mod`):
+        # Trailing test-MODULE handling — WAVE-18 BRACE-DEPTH REFRAME.
+        #
+        # Once a top-level (column-0) test-gated MODULE opens, its body is test
+        # code and is NOT scanned for Class-S markers (test mutations exercise the
+        # primitives directly and must not be flagged). The module is gated by a
+        # column-0 attribute in one of these forms, IMMEDIATELY decorating a `mod`:
         #     #[cfg(test)]
         #     #[cfg(all(test, feature = "testing"))]   (e.g. lifecycle_helpers)
         #     #[cfg(any(test, feature = "testing"))]   (e.g. context/mod.rs)
         #
-        # WAVE-14 ROOT-CAUSE FIX. The cutoff now fires ONLY when the test gate
-        # decorates a `mod` — NOT for a column-0 test gate that decorates a SINGLE
-        # `#[cfg(any(test, feature = "testing"))]` PRODUCTION-COMPILED item (a
-        # testing-only `pub fn` / `impl` / `pub use` that IS compiled into the
-        # `testing` feature and sits AMONG production items, e.g.
-        # `context/mod.rs::test_supervisor`, `SagaInput::test_cross_context_for_gating`,
-        # the `pub use SagaSetReservation` in `supervisor/mod.rs`). The prior cutoff
-        # matched the gate alone and (mis)treated such COLUMN-0 interspersed gates
-        # as a "skip rest of file" trigger — wrongly blinding every production
-        # mutation BELOW them (in supervisor.rs the first such gate is at line 207,
-        # ~10k production lines ABOVE the real trailing `mod tests`, so the gate was
-        # silently vacuous over the entire saga subsystem). An interspersed
-        # single-item test gate carries no Class-S marker and must stay in the
-        # production scan stream; only a `mod`-form gate is a trailing module.
+        # WHAT REPLACED WHAT. The pre-wave-18 cutoff flipped a single `seen_test`
+        # flag and then `next`ed EVERY remaining line, TRUSTING (without checking)
+        # that the test module was the LAST thing in the file. A separate NTTEST
+        # GUARD re-asserted that trust by classifying every later column-0 line via
+        # `is_column0_item_start` — an item-KIND enumerator that leaked a new
+        # spelling every wave (`unsafe fn`/`const fn`; `unsafe impl`/`unsafe trait`;
+        # `pub(crate) mod`; the path-qualified item macro `foo::bar! {}`). That is
+        # the non-convergent "one-more-spelling" anti-pattern.
         #
-        # We look ahead from the gate, skipping blank lines and further column-0
-        # `#[..]` attribute lines, to the first real column-0 code token: a `mod`
-        # ⇒ trailing-module cutoff; anything else ⇒ interspersed item (no cutoff).
-        # All matched against the STRIPPED `line` so a token inside a literal /
-        # comment cannot trip either path.
-        if (is_column0_reopening_test_gate(line)) { pending_test_gate = 1; pending_test_line = NR }
-        else if (pending_test_gate && is_column0_item_start(line)) {
-            # First real column-0 ITEM-START line after the gate decides
-            # mod-vs-item — recognised by the SHARED `is_column0_item_start`
-            # classifier (the SAME one the NTTEST guard uses below, so the two can
-            # never drift). (Blank lines and multi-line `#[..]` attribute
-            # continuations — neither of which start with an item keyword — are
-            # implicitly skipped: they fall through to neither branch and the gate
-            # stays pending until a real item line is reached.)
-            if (is_column0_mod_decl(line)) {
-                # Trailing test MODULE — the legitimate "skip rest of file" shape.
-                # Record the NR so the NTTEST guard below does NOT treat THIS very
-                # `mod` line (a column-0 item start) as a production resume.
-                # `is_column0_mod_decl` uses the SAME visibility grammar as
-                # `is_column0_item_start`, so a `pub(crate) mod tests` / `pub(in
-                # path) mod` trailing test module is accepted, not mis-scanned.
-                seen_test = 1; test_gate_line = pending_test_line; seen_test_set_nr = NR
+        # Instead, we now TRACK the CODE brace depth of the test module and detect
+        # its CLOSING brace structurally. After the module closes, ANY column-0
+        # production content (whatever its item/macro spelling) is a non-trailing
+        # vacuum — there is NOTHING to classify, so no spelling can evade the
+        # guard. The ONLY shapes that legitimately follow a closed test module
+        # WITHOUT being a vacuum are: blank / comment lines, attribute lines, and a
+        # SECOND `#[cfg(test)]`-gated `mod` (a file may carry several test
+        # modules); each is handled explicitly below.
+        #
+        # WAVE-14 ROOT-CAUSE (preserved): the module is recognised ONLY when the
+        # test gate decorates a `mod` — NOT a column-0 test gate that decorates a
+        # SINGLE production-compiled item (a testing-only `pub fn` / `impl` /
+        # `pub use` that IS compiled into the `testing` feature and sits AMONG
+        # production items, e.g. `context/mod.rs::test_supervisor`,
+        # `SagaInput::test_cross_context_for_gating`, the `pub use` in
+        # `supervisor/mod.rs`). Such an interspersed single-item gate carries no
+        # Class-S marker and must stay in the production scan stream; only a
+        # `mod`-form gate opens a module. The detector looks PAST blank / comment /
+        # attribute lines (via `is_column0_code_line`) to the first real column-0
+        # code line: a `mod` ⇒ module open; anything else ⇒ interspersed item (no
+        # cutoff, the item falls through into the normal production scan below).
+
+        # CODE brace counts for THIS stripped line, used to track the depth of
+        # the test module (the same braces the production fn-body model counts
+        # below via its own opens/closes — recounted here because the test
+        # module tracking runs BEFORE the production fn block).
+        tm_opens = gsub(/{/, "{", line)
+        tm_closes = gsub(/}/, "}", line)
+
+        if (in_test_module) {
+            # Inside a trailing test module body: track depth, skip from the
+            # production scan. The module CLOSES when depth returns to 0.
+            test_mod_depth += tm_opens - tm_closes
+            if (test_mod_depth <= 0) {
+                in_test_module = 0
+                test_mod_depth = 0
+                after_test_module = 1
             }
-            # else: interspersed single-item test gate — NOT a cutoff. The item
+            next
+        }
+
+        # MULTI-LINE ATTRIBUTE CARRY. A column-0 attribute whose `[`/`(` are not
+        # balanced on its opening line (`#[allow(\n  clippy::a,\n  clippy::b\n)]`,
+        # `#[derive(\n  Foo\n)]`) continues onto following physical lines — the
+        # last of which is often a bare column-0 `)]`. Such continuation lines are
+        # NOT production content; if the mod-vs-item DETECTOR or the NTTEST GUARD
+        # saw a `)]` as a "column-0 code line" it would (a) wrongly conclude the
+        # test gate decorated an interspersed item — skipping the `mod tests {`
+        # that actually follows the closing `)]` — or (b) false-fire NTTEST. We
+        # therefore carry the attribute bracket depth across lines (counting the
+        # STRIPPED line so a `(`/`[` inside a literal/comment cannot miscount) and
+        # SKIP every line until the attribute closes. A single-line attribute
+        # (`#[cfg(test)]`) is balanced (depth 0) and is NOT skipped — the gate
+        # detector below still sees it. `next` is taken for the opening line of a
+        # multi-line attribute and all its continuation lines, exactly as for an
+        # in-flight literal/comment.
+        attr_brk = gsub(/[([]/, "&", line)   # `(` or `[` opens (count only)
+        attr_brk_close = gsub(/[)\]]/, "&", line)   # `)` or `]` closes
+        if (attr_bracket_depth > 0) {
+            # Continuation of an in-flight multi-line attribute.
+            attr_bracket_depth += attr_brk - attr_brk_close
+            if (attr_bracket_depth < 0) attr_bracket_depth = 0
+            next
+        }
+        if (line ~ /^#!?\[/ && (attr_brk - attr_brk_close) > 0) {
+            # Opening line of a MULTI-LINE attribute: arm the carry and skip it.
+            # (A `#[cfg(test)]` re-opening gate is single-line/balanced, so it does
+            # NOT enter here — it is matched by the gate detector below.)
+            attr_bracket_depth = attr_brk - attr_brk_close
+            next
+        }
+
+        # Detect the column-0 test gate that opens a trailing test module.
+        if (is_column0_reopening_test_gate(line)) {
+            pending_test_gate = 1
+            pending_test_line = NR
+        } else if (pending_test_gate && is_column0_code_line(line)) {
+            # First real column-0 code line after the gate decides mod-vs-item.
+            # (Blank / comment / further attribute lines are skipped by
+            # `is_column0_code_line` so the gate stays pending until a real code
+            # line is reached.)
+            if (is_column0_mod_decl(line)) {
+                # A test MODULE opens here (the first trailing module, OR a
+                # legitimate SECOND test module reached after a prior one closed —
+                # this same `pending_test_gate` path handles both: a re-opening
+                # `#[cfg(test)]` gate armed it and this `mod` is the module it
+                # decorates). Record the gate line for the FIRST module only (a
+                # second module must not overwrite the original gate line that an
+                # eventual NTTEST reports). ENTER the module via brace depth: the
+                # `mod .. {` line contributes `tm_opens` (>=1).
+                if (!after_test_module) test_gate_line = pending_test_line
+                after_test_module = 0
+                in_test_module = 1
+                test_mod_depth = tm_opens - tm_closes
+                if (test_mod_depth <= 0) {
+                    # Degenerate single-line `mod x {}` — already balanced. Treat
+                    # the module as immediately closed (its body had nothing to
+                    # skip) and resume scanning for a production vacuum after it.
+                    in_test_module = 0
+                    test_mod_depth = 0
+                    after_test_module = 1
+                }
+                pending_test_gate = 0
+                next
+            }
+            # else: interspersed single-item test gate — NOT a module. The item
             # falls through into the normal production scan stream below.
             pending_test_gate = 0
         }
 
-        # NON-TRAILING test-module structural assertion: the cutoff above TRUSTS
-        # that the trailing `mod`-form test gate is the LAST thing in the file. If
-        # ANY column-0 PRODUCTION ITEM follows the test MODULE (the module closed
-        # and production code resumes at column 0), the gate is NOT trailing: the
-        # cutoff would skip that production region (an un-scanned vacuum) and any
-        # Class-S mutation in it would go undetected. Flag it (HIT) so the
-        # un-scanned vacuum is surfaced rather than silently trusted. Matched
-        # against the STRIPPED `line` so a token inside a string / comment cannot
-        # false-positive.
+        # NON-TRAILING test-module structural assertion (the un-scanned-vacuum
+        # GUARD). Once a trailing test module has CLOSED (`after_test_module`), the
+        # cutoff would have skipped everything below it. If ANY column-0 PRODUCTION
+        # content follows, the module was NOT trailing — that production region is
+        # an un-scanned vacuum where a Class-S mutation could hide. Flag it
+        # (NTTEST) so the vacuum is surfaced rather than silently trusted.
         #
-        # CONVERGENT GUARD (wave-16): the item-start recogniser is the SHARED
-        # `is_column0_item_start` — the SAME classifier the trailing-module
-        # DETECTOR above uses — so the guard can NEVER miss a "new spelling" of an
-        # item the detector already recognises (column-0 `mod resumed_prod {`,
-        # `extern "C" fn`, `async unsafe fn`, an item-producing `make_things!{}`,
-        # etc.). This REPLACES the prior hand-maintained denylist of fn
-        # permutations (`unsafe fn` / `const fn` / `unsafe impl` …), which was a
-        # SUBSET that drifted from the detector — a non-convergent
-        # "one-more-spelling" shape. Now a single shared function is the one source
-        # of truth for "what is a column-0 item start", used by both sites.
+        # CONVERGENT GUARD (wave-18): there is NO item-kind classifier here. The
+        # END of the module is found structurally (brace depth) and ANY column-0 code
+        # line after it is a vacuum, regardless of the item/macro spelling that
+        # resumes the region (`fn` / `impl` / `unsafe impl` / `unsafe trait` / a
+        # re-opened `mod` / a single-ident OR path-qualified item macro / anything
+        # else). This is immune to every present and future spelling because it
+        # matches the ABSENCE of the three non-content shapes (blank, comment,
+        # attribute) rather than enumerating the content shapes.
         #
-        # The ONE shape that legitimately resumes at column 0 after a test module
-        # WITHOUT being a production vacuum is a SECOND `#[cfg(test)]`-gated test
-        # `mod` (a file may carry several test modules). So: a column-0 re-opening
-        # test gate ARMS `pending_second_test_gate`; the column-0 `mod` that
-        # follows it is consumed as that legitimate second test module (no HIT) and
-        # re-arms the trailing-module state. Any OTHER column-0 item start — or a
-        # non-`mod` item even after a re-opening gate — fires NTTEST.
-        if (seen_test && !nontrailing_hit && NR != seen_test_set_nr) {
-            if (is_column0_reopening_test_gate(line)) {
-                pending_second_test_gate = 1
-            } else if (is_column0_item_start(line)) {
-                if (pending_second_test_gate && is_column0_mod_decl(line)) {
-                    # Legitimate SECOND test module — not a production resume. The
-                    # mod-accept uses the SAME visibility grammar as
-                    # `is_column0_item_start` (`is_column0_mod_decl`), so a
-                    # `pub(crate) mod more_tests` / `pub(in path) mod` second test
-                    # module is recognised here and NOT mis-fired as NTTEST.
-                    test_gate_line = NR
-                    pending_second_test_gate = 0
-                } else {
-                    # Production item (or a non-mod item after a re-opening gate):
-                    # the test module was NOT trailing — an un-scanned vacuum.
-                    printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
-                    nontrailing_hit = 1
-                    pending_second_test_gate = 0
-                }
+        # The ONE shape that legitimately resumes at column 0 after a closed test
+        # module WITHOUT being a vacuum is a SECOND `#[cfg(test)]`-gated `mod`.
+        # That case never reaches the NTTEST branch below: the re-opening
+        # `#[cfg(test)]` gate is matched by the DETECTOR above (which arms
+        # `pending_test_gate`) and the `mod` it decorates is consumed there as a
+        # module (re-entering `in_test_module` and taking `next`). So here we only
+        # see a re-opening gate (skipped — its `mod` is handled above) or a real
+        # production line. Any column-0 code line that is NOT such a gate — any
+        # item spelling whatsoever — is the un-scanned vacuum.
+        if (after_test_module && !nontrailing_hit) {
+            if (!is_column0_reopening_test_gate(line) && is_column0_code_line(line)) {
+                # A column-0 production code line after the module closed (a `mod`
+                # decorated by a re-opening gate was consumed by the detector above
+                # and `next`ed before reaching here). The test module was NOT
+                # trailing — an un-scanned vacuum.
+                printf("NTTEST\t%s\t%d\t%s\n", FILE, test_gate_line, "non_trailing_test_module")
+                nontrailing_hit = 1
             }
         }
-        if (seen_test) next
+        if (after_test_module) next
 
         # Detect a top-level function definition (column 0, allowing pub/async
         # qualifiers). Capture the name. We only treat a fn as "open" once we
@@ -1340,19 +1427,21 @@ run_scan() {
         printf 'reviewable allowlist add. See ADR-049 §9 (round-9 keystone).\n' >&2
     fi
 
-    # Wave-14 structural guard — NON-TRAILING test module: a column-0 test gate
-    # followed by a column-0 production `fn` / `impl` / `pub` item. The
-    # trailing-test-module cutoff would skip that production region (an un-scanned
-    # vacuum), so any Class-S mutation in it would go undetected. The cutoff
-    # TRUSTS without asserting that every column-0 test gate is trailing; this
-    # asserts it.
+    # Structural guard — NON-TRAILING test module (wave-18 brace-depth reframe): a
+    # column-0 test gate whose module does NOT close at EOF — ANY column-0
+    # production content (whatever the item/macro spelling) follows the module's
+    # closing brace. The trailing-test cutoff would skip that production region (an
+    # un-scanned vacuum), so any Class-S mutation in it would go undetected. The
+    # cutoff TRUSTS without asserting that every test module is trailing; this
+    # asserts it by tracking the module's brace depth and flagging any production
+    # resume after its close — with no item-kind classifier to leak a new spelling.
     if [[ "$nttest" -ne 0 ]]; then
         printf '\n%sFAILED%s: %d file(s) have a column-0 test gate (`#[cfg(test)]` /\n' \
             "$C_RED" "$C_RESET" "$nttest" >&2
-        printf '`#[cfg(all(test,..))]` / `#[cfg(any(test,..))]`) FOLLOWED by a column-0\n' >&2
-        printf 'production `fn` / `impl` / `pub` item — a NON-trailing test module. The\n' >&2
-        printf 'trailing-test cutoff would skip that production region, leaving an\n' >&2
-        printf 'UN-SCANNED vacuum where a Class-S mutation could hide:\n' >&2
+        printf '`#[cfg(all(test,..))]` / `#[cfg(any(test,..))]`) whose module is FOLLOWED\n' >&2
+        printf '(after its closing brace) by column-0 production content — a NON-trailing\n' >&2
+        printf 'test module. The trailing-test cutoff would skip that production region,\n' >&2
+        printf 'leaving an UN-SCANNED vacuum where a Class-S mutation could hide:\n' >&2
         while IFS=$'\t' read -r tag file line fn; do
             [[ "$tag" == "NTTEST" ]] || continue
             printf '      %s%s:%s%s  (column-0 test gate not trailing)\n' \
@@ -1431,6 +1520,26 @@ run_scan() {
 #        continuation line must not blind the later fn), (31) the OVER-STRIP guard
 #        (a fail-closed fn carrying a nested comment + multi-line string is NOT
 #        flagged).
+#   (35-45) NON-TRAILING TEST MODULE (the un-scanned-vacuum GUARD) — a column-0
+#        test gate whose module is NOT the last thing in the file IS flagged
+#        (NTTEST), while a genuinely-trailing module and a legitimate SECOND test
+#        module are NOT: (35) a fn resumes after the module → HIT; (36) ordinary
+#        trailing module → no HIT; (37) interspersed single-item test gate (not a
+#        module) → its production mutation still scanned, no NTTEST; (38-41,43,44)
+#        a production region resuming with various item/macro spellings → HIT;
+#        (42,45) a legitimate second `#[cfg(test)] mod` (incl. `pub(crate) mod`) →
+#        no HIT.
+#   (46-48) WAVE-18 BRACE-DEPTH REFRAME — the NTTEST guard now finds the END of
+#        the trailing test module by CODE BRACE DEPTH and flags ANY column-0
+#        production content after it, with NO item-kind classifier (the prior
+#        `is_column0_item_start` enumerator that leaked a new spelling every
+#        wave is DELETED): (46) a path-qualified item macro
+#        `scp_testing::storage_conformance! {}` resuming after the module → HIT
+#        (the black-hat gap; non-vacuity: reverting the brace-depth logic stops
+#        this HIT); (47) a genuinely-trailing module with a deeply-nested body
+#        closing at EOF → no HIT (the tracker follows the body to its real closing
+#        brace); (48) a module followed only by comments/blank lines → no HIT
+#        (commentary is not production content).
 # Set NO_CLASS_S_SELFTEST=1 to skip (not recommended).
 # ---------------------------------------------------------------------------
 self_test() {
@@ -2168,6 +2277,88 @@ self_test() {
         printf '}\n'
     } > "$fdir/pubcrate_second_test_module.rs"
 
+    # (46) NON-TRAILING test module resuming with a column-0 PATH-QUALIFIED item
+    # macro `scp_testing::storage_conformance! { .. }` (wave-18 — the black-hat
+    # gap, and the whole reason for the reframe). A path-qualified macro is the
+    # MAJORITY macro spelling in the tree (`foo::bar!`), and the prior
+    # single-ident `is_column0_item_start` macro branch (`^[A-Za-z_][A-Za-z0-9_]*!`)
+    # did NOT match it — the `::` falls outside the ident char class — so a
+    # production region resuming through one after a trailing test module was an
+    # un-scanned vacuum (a Class-S mutation in the macro body invisible to the
+    # cutoff). The brace-depth reframe is CLASSIFIER-FREE: after the test module
+    # CLOSES, ANY column-0 production line (whatever the spelling) is a vacuum, so
+    # this MUST now emit an NTTEST HIT. This is the non-vacuity proof for the
+    # reframe — reverting the brace-depth logic makes this fixture stop HITting.
+    {
+        printf 'pub fn pathmacro_prod_before_test_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod pathmacro_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf 'scp_testing::storage_conformance! {\n'
+        printf '    fn generated(&self) {\n'
+        printf '        state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '        persist_state_best_effort(state, deps, ctx);\n'
+        printf '    }\n'
+        printf '}\n'
+    } > "$fdir/nontrailing_path_macro.rs"
+
+    # (47) GENUINELY-TRAILING test module whose body carries NESTED
+    # column-0-LOOKING content but CLOSES at EOF with nothing after it (wave-18).
+    # The module body has deeply-nested helpers and a (test-only) Class-S mutation;
+    # the brace-depth tracker must follow the body to its real closing `}` at EOF
+    # and NOT mistake an inner construct for the module close. With nothing after
+    # the closing brace, this is a legitimate trailing module and MUST NOT emit an
+    # NTTEST HIT (over-restriction / premature-close guard for the brace tracker).
+    {
+        printf 'pub fn trailing_nested_prod_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod trailing_nested_tests {\n'
+        printf '    mod inner {\n'
+        printf '        fn helper() {\n'
+        printf '            if true {\n'
+        printf '                let _ = || {\n'
+        printf '                    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '                };\n'
+        printf '            }\n'
+        printf '        }\n'
+        printf '    }\n'
+        printf '    #[test]\n'
+        printf '    fn it_works() {}\n'
+        printf '}\n'
+    } > "$fdir/trailing_nested_test_module.rs"
+
+    # (48) NON-TRAILING test module followed ONLY by comments / blank lines then
+    # EOF (wave-18). After the module closes, the remaining lines are NOT
+    # production content (a `//` comment strips to empty; a blank line is empty),
+    # so `is_column0_code_line` rejects them and the guard MUST NOT fire. This
+    # proves comments/blanks after the close are transparent — only a real
+    # production item triggers NTTEST, never trailing commentary.
+    {
+        printf 'pub fn comments_after_close_prod_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod comments_after_close_tests {\n'
+        printf '    #[test]\n'
+        printf '    fn it_works() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf '// A trailing explanatory comment after the test module.\n'
+        printf '// Another comment line.\n'
+        printf '\n'
+        printf '/* a trailing block comment */\n'
+        printf '\n'
+    } > "$fdir/comments_after_close.rs"
+
     local rc=0
     local out
     out=$(
@@ -2600,6 +2791,41 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf '/ `pub(in path) mod` was wrongly flagged NTTEST — the second-module accept uses\n' >&2
         printf 'a narrower visibility grammar than the item-start classifier.\n' >&2
+        rc=1
+    fi
+    # (46) NON-TRAILING test module resuming with a column-0 PATH-QUALIFIED item
+    # macro `scp_testing::storage_conformance! { .. }` (wave-18 — the black-hat
+    # gap). The classifier-free brace-depth reframe MUST flag the production resume
+    # after the module closes, regardless of the path-macro spelling that the prior
+    # single-ident macro branch could not match. This is the non-vacuity proof:
+    # reverting the brace-depth logic makes this assertion fail (no HIT).
+    if ! grep -q $'^NTTEST\t.*/nontrailing_path_macro\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a NON-trailing test module resuming with a column-0\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'PATH-QUALIFIED item macro `scp_testing::storage_conformance! {}` was NOT\n' >&2
+        printf 'flagged — the un-scanned-vacuum guard misses the path-macro item-start shape\n' >&2
+        printf '(the black-hat gap the wave-18 brace-depth reframe closes).\n' >&2
+        rc=1
+    fi
+    # (47) GENUINELY-TRAILING test module with deeply-nested column-0-LOOKING body
+    # content closing at EOF MUST NOT emit an NTTEST HIT — the brace-depth tracker
+    # must follow the body to its real closing brace and not close the module
+    # early on an inner construct (premature-close / over-restriction guard).
+    if grep -q $'^NTTEST\t.*/trailing_nested_test_module\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a genuinely-trailing test module with a nested body was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'wrongly flagged NTTEST — the brace-depth tracker closed the module early on an\n' >&2
+        printf 'inner construct instead of following it to the real closing brace at EOF.\n' >&2
+        rc=1
+    fi
+    # (48) NON-TRAILING test module followed ONLY by comments / blank lines then
+    # EOF MUST NOT emit an NTTEST HIT — comments and blanks are not production
+    # content, so the guard must stay silent (only a real item triggers NTTEST).
+    if grep -q $'^NTTEST\t.*/comments_after_close\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a test module followed only by comments / blank lines was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'wrongly flagged NTTEST — trailing commentary was mistaken for a production\n' >&2
+        printf 'resume (a `//`/`/* */` comment must strip to non-content).\n' >&2
         rc=1
     fi
 
