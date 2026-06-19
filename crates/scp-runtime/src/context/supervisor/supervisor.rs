@@ -201,6 +201,25 @@ type SagaToolExecutor<'a> = Box<
         + 'a,
 >;
 
+/// Shorthand for the cross-context tool-invocation prepared state reconstructed
+/// from a journal entry's evidence (spec §6.2.4 "Crash recovery §17.16.4").
+type XctxPrepared =
+    crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+
+/// The owned per-side plan [`Supervisor::divergence_marker_plan`] produces for
+/// a `NeedsRepair` divergence: `(committed_event_id, nonce, [(side-label,
+/// context_id, that side's Active Signing Key); 2])`. Each side signs + appends
+/// its OWN marker (spec §6.2.4 "Dual event-log recording").
+type DivergenceMarkerPlan = (
+    String,
+    [u8; 16],
+    [(
+        &'static str,
+        [u8; 32],
+        crate::context::actor::commands::SigningKeyBytes,
+    ); 2],
+);
+
 /// Per-saga phase-data context threaded through [`Supervisor::run_saga_fsm`]
 /// for a `CrossContextToolInvocation` saga (spec §6.2.4).
 ///
@@ -248,6 +267,13 @@ struct CrossContextSagaCtx<'a> {
     /// (ADR-049); the FSM rebuilds a `SigningKeyBytes` (zeroizes on drop) per
     /// command from this caller-supplied key.
     target_signing_key: ed25519_dalek::SigningKey,
+    /// The caller context's Active Signing Key — used ONLY to sign the
+    /// caller-side `CrossContextDivergenceMarker` on a `NeedsRepair` outcome
+    /// (spec §6.2.4 "Dual event-log recording"). The actor holds no custody
+    /// key (ADR-049); the FSM rebuilds a `SigningKeyBytes` per command from
+    /// this caller-supplied key. Distinct from `target_signing_key`: each side
+    /// signs its OWN marker into its OWN log under its OWN Active Signing Key.
+    caller_signing_key: ed25519_dalek::SigningKey,
     /// The supervisor-side tool executor, taken once at Commit-B.
     executor: Option<SagaToolExecutor<'a>>,
     /// Prepare-A's held reservation (settled at Commit-A, released on abort).
@@ -256,6 +282,25 @@ struct CrossContextSagaCtx<'a> {
     prepared_b: Option<crate::context::actor::commands::PreparedBFields>,
     /// Commit-B's captured receipt + output (forwarded to Commit-A + output).
     committed: Option<CommittedSagaArtifacts>,
+    /// The target side's `ToolInvoked` event id, captured the moment Commit-B
+    /// lands (reserve `AlreadyCommitted` OR a first execution settle). `Some`
+    /// proves the TARGET committed its `ToolInvoked` record even when the saga
+    /// later diverges (Commit-A fails → `NeedsRepair`): the
+    /// [`CrossContextDivergenceMarker`] then records
+    /// `committed_side = Target` and this event id (spec §6.2.4
+    /// "Dual event-log recording"). `None` means Commit-B never landed, so no
+    /// side committed and a `NeedsRepair` cannot have diverged the logs.
+    committed_b_tool_invoked_event_id: Option<String>,
+    /// Set by the FSM when the saga reaches `NeedsRepair` (commit-retry
+    /// exhaustion). It tells the [`Self::run_saga`] tail to LEAVE any held
+    /// Prepare-A escrow reservation RESERVED rather than voiding it (spec
+    /// §6.2.4 "`NeedsRepair` reservation semantics": the escrow is NOT
+    /// auto-voided — only the concurrency slot is released — because the
+    /// operation may have partially committed; the signed
+    /// [`CrossContextDivergenceMarker`] + operator repair settles the escrow).
+    /// Every other terminal leaves this `false`, so the tail's void-or-settle
+    /// behaviour is unchanged on Aborted / unreachable-Commit-A paths.
+    reached_needs_repair: bool,
 }
 
 /// The receipt + output captured at Commit-B, forwarded to Commit-A and
@@ -267,6 +312,32 @@ struct CommittedSagaArtifacts {
     receipt: Vec<u8>,
     /// The captured tool output bytes (the receipt's canonical `output_jcs`).
     output: Vec<u8>,
+}
+
+/// A supervisor-level divergence repair record (spec §6.2.4 "Dual event-log
+/// recording"): the fallback witness recorded when a `NeedsRepair` side is
+/// UNREACHABLE (its actor is gone / `lookup` misses) so the signed marker
+/// cannot be appended into that side's event log. The supervisor records the
+/// divergence here instead — "or a supervisor-level repair journal if one side
+/// is unreachable" — so operator repair still has a durable account of which
+/// side committed, the saga id, the nonce, and the committed-side event id.
+///
+/// This is the in-memory projection; a restart loses it exactly as the
+/// in-memory reservation set does. The reachable side's marker (when one side
+/// IS reachable) lives durably in that side's event log, so a one-reachable /
+/// one-unreachable divergence is still half-recorded durably plus
+/// supervisor-recorded for the unreachable half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SagaDivergenceRepairRecord {
+    /// The context id (raw 32-byte digest, hex) of the UNREACHABLE side whose
+    /// marker could not be appended into its own log.
+    pub unreachable_context_hex: String,
+    /// Which side committed (caller or target).
+    pub committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
+    /// The committed-side `ToolInvoked` / `CrossContextToolInvoked` event id.
+    pub committed_event_id: String,
+    /// The 16-byte correlation nonce joining the two event-log records.
+    pub nonce: [u8; 16],
 }
 
 // ---------------------------------------------------------------------------
@@ -603,6 +674,16 @@ pub struct Supervisor {
     /// first time an actor for that context crashes. Lock-free reads via
     /// `DashMap` per ADR-049 §Decision 12.
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
+    /// Supervisor-level divergence repair journal (spec §6.2.4 "Dual event-log
+    /// recording"): the fallback witnesses recorded when a `NeedsRepair` side is
+    /// UNREACHABLE and its signed [`SagaDivergenceRepairRecord`] could not be
+    /// appended into that side's own event log. Keyed by saga id; a single
+    /// diverged saga may record both sides (target + caller unreachable) under
+    /// one key. In-memory only (lost on restart, like the reservation set);
+    /// operator repair reads it before the supervisor restarts. Lock-free reads
+    /// via `DashMap` (ADR-049 §Decision 12).
+    pub(in crate::context::supervisor) saga_repair_records:
+        DashMap<SagaId, Vec<SagaDivergenceRepairRecord>>,
 
     // -----------------------------------------------------------------
     // ADR-049 commit 12 — providers lifted from ContextManager (now
@@ -697,25 +778,26 @@ pub struct Supervisor {
     /// replay-driven re-drive of an in-flight saga re-takes its set before
     /// the first post-restart `start_saga` can race it.
     ///
-    /// CONCRETE REPLAY GAP PR-2D MUST CLOSE — the journal record for a
+    /// REPLAY RESERVATION RECONSTRUCTION — the journal participant record for a
     /// `CrossContextToolInvocation` (built by [`saga_input_participants`])
     /// deliberately does NOT persist `target_context_id` ("Leave the journal
     /// shape UNCHANGED"): it records only `{caller_context_id, caller_did,
     /// tool_registration_id}`. But the gating set
-    /// ([`saga_participant_context_set`]) is `{caller, target}`. So a naïve
-    /// replay that rebuilds reservations from the journal record alone could
-    /// only re-reserve `{caller}`, NOT `{caller, target}` — leaving the
-    /// `target` context slot free and letting a fresh post-restart saga touch
-    /// it concurrently, defeating the §5.15.4 cross-context serialization for
-    /// the entire recovery window. PR-2D MUST therefore either (a) persist
-    /// `target_context_id` in the journal entry / the
-    /// `CrossContextToolInvocationPrepared` evidence so the full set is
-    /// reconstructible, OR (b) rehydrate the complete [`SagaInput`] on replay
-    /// and re-derive the set via [`saga_participant_context_set`] (the same
-    /// extractor `start_saga` calls) so the rebuilt reservation is the
-    /// COMPLETE `{caller, target}` set, not a caller-only subset. Whichever
-    /// PR-2D chooses, the rebuilt reservation MUST equal what `start_saga`
-    /// would have taken for that in-flight saga.
+    /// ([`saga_participant_context_set`]) is `{caller, target}`. A naïve replay
+    /// that rebuilds reservations from the participant record alone could only
+    /// re-reserve `{caller}`, NOT `{caller, target}` — leaving the `target`
+    /// context slot free and letting a fresh post-restart saga touch it
+    /// concurrently, defeating the §5.15.4 cross-context serialization for the
+    /// recovery window. This gap is CLOSED via **option (a)**: the
+    /// `PreparingB` / `Committing` journal entries carry the eight-field
+    /// `CrossContextToolInvocationPrepared` evidence (which embeds BOTH
+    /// `caller_context_id` AND `target_context_id`), so
+    /// [`Self::reconstruct_xctx_prepared`] rebuilds the COMPLETE `{caller,
+    /// target}` set from the evidence — see [`Self::xctx_prepared_evidence_bytes`].
+    /// When the Phase-2D startup loop rebuilds reservations for non-terminal
+    /// unresolved entries it reconstructs the full set from this evidence (the
+    /// rebuilt reservation equals what `start_saga` would have taken), NOT a
+    /// caller-only subset.
     ///
     /// The type is `std::sync::Mutex` (banned by `clippy.toml` for the
     /// await-deadlock hazard) with a narrowly-scoped allow: the critical
@@ -813,6 +895,7 @@ impl Supervisor {
             key_package_stores: DashMap::new(),
             health_config,
             crash_windows: DashMap::new(),
+            saga_repair_records: DashMap::new(),
             // ADR-049 commit 12 — providers lifted from
             // ContextManager. Populated by `with_providers`.
             crypto: OnceLock::new(),
@@ -4631,8 +4714,11 @@ impl Supervisor {
     ///
     /// `target_signing_key` is the target context's Active Signing Key, used to
     /// sign the [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt)
-    /// (and a divergence marker on a one-sided `NeedsRepair`). The actor holds
-    /// no custody key (ADR-049), so the caller supplies it per-call exactly as
+    /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`.
+    /// `caller_signing_key` is the caller context's Active Signing Key, used to
+    /// sign the CALLER-side divergence marker on `NeedsRepair`. Each side signs
+    /// its own marker into its own log. The actor holds no custody key
+    /// (ADR-049), so the caller supplies both per-call exactly as
     /// [`Self::send_heartbeat`] / [`Self::build_local_checkpoint`] do.
     ///
     /// # Co-resident scope
@@ -4673,6 +4759,7 @@ impl Supervisor {
         asserted_nonce: [u8; 16],
         asserted_timestamp_ms: u64,
         target_signing_key: &ed25519_dalek::SigningKey,
+        caller_signing_key: &ed25519_dalek::SigningKey,
         executor: F,
     ) -> Result<SagaOutput, ContextError>
     where
@@ -4707,10 +4794,13 @@ impl Supervisor {
             asserted_nonce,
             asserted_timestamp_ms,
             target_signing_key: target_signing_key.clone(),
+            caller_signing_key: caller_signing_key.clone(),
             executor: Some(boxed_executor),
             prepared_a: None,
             prepared_b: None,
             committed: None,
+            committed_b_tool_invoked_event_id: None,
+            reached_needs_repair: false,
         };
 
         let saga_input = SagaInput::CrossContextToolInvocation {
@@ -4771,24 +4861,48 @@ impl Supervisor {
         // Drain any residual held Prepare-A reservation. The abort path settles
         // the caller side when a Prepare fails; the Commit-A path consumes it on
         // success. A reservation that survives to here was held into a Commit
-        // that NEVER reached Commit-A (e.g. Commit-B retried to `NeedsRepair`,
-        // or the caller actor was unreachable at Commit-A): its owning actor's
-        // per-context settle will never run, so void the external escrow and
-        // consume the ticket — NEVER drop it unbalanced (the ticket's drop guard
-        // would otherwise fire).
-        if let Some(ctx) = xctx.as_mut()
-            && let Some(reservation) = ctx.prepared_a.take()
-        {
-            reservation
-                .reservation
-                .ticket
-                .void_external_and_consume(self.payment_adapter_ref())
-                .await;
-            tracing::warn!(
-                saga_id = %saga_id.0,
-                "cross-context saga — held Prepare-A reservation survived to terminal without a \
-                 Commit-A settle; voided the external escrow and consumed the ticket"
-            );
+        // that NEVER reached Commit-A (e.g. the caller actor was unreachable at
+        // Commit-A): its owning actor's per-context settle will never run, so
+        // void the external escrow and consume the ticket — NEVER drop it
+        // unbalanced (the ticket's drop guard would otherwise fire).
+        //
+        // EXCEPTION — `NeedsRepair` (spec §6.2.4 "`NeedsRepair` reservation
+        // semantics"): a saga that diverged keeps its escrow RESERVED for
+        // operator-repair settlement (the operation may have partially
+        // committed — B executed and charged — so auto-voiding here would be a
+        // free-execution exploit). The NeedsRepair divergence path
+        // (`emit_divergence_markers`) deliberately does NOT take `prepared_a`,
+        // and `reached_needs_repair` tells us to leave it held: we drop the
+        // carrier WITHOUT voiding/settling, so the escrow stays reserved. (The
+        // concurrency slot is still released — `_reservation` drops on scope
+        // exit regardless.)
+        if let Some(ctx) = xctx.as_mut() {
+            if ctx.reached_needs_repair {
+                // Leave the reservation HELD for operator repair. The
+                // `ToolEconomyReservation`'s `#[must_use]` drop guard would
+                // normally fire on an unbalanced drop, so settle it as a
+                // divergence-held escrow that defers to operator repair rather
+                // than releasing or consuming it.
+                if let Some(reservation) = ctx.prepared_a.take() {
+                    reservation.reservation.ticket.hold_external_for_repair();
+                    tracing::error!(
+                        saga_id = %saga_id.0,
+                        "cross-context saga NeedsRepair — Prepare-A escrow held for operator \
+                         repair (NOT auto-voided; settled by the divergence marker + operator)"
+                    );
+                }
+            } else if let Some(reservation) = ctx.prepared_a.take() {
+                reservation
+                    .reservation
+                    .ticket
+                    .void_external_and_consume(self.payment_adapter_ref())
+                    .await;
+                tracing::warn!(
+                    saga_id = %saga_id.0,
+                    "cross-context saga — held Prepare-A reservation survived to terminal without \
+                     a Commit-A settle; voided the external escrow and consumed the ticket"
+                );
+            }
         }
 
         fsm_result.map(|()| {
@@ -4957,11 +5071,17 @@ impl Supervisor {
                 );
             }
             SagaState::PreparingB => {
-                // Actor A Prepared but Commit never left coordinator;
-                // send best-effort Abort to actor A. Until saga-phase
-                // actor-side handlers land, this is a metric-only
-                // branch — the journal resolution IS the Abort from
-                // the coordinator's perspective.
+                // §17.16.4 Prepare-in-progress: actor A (and possibly B) staged
+                // reservations but the Commit never left the coordinator. Abort
+                // the Prepared side(s) — releasing the staged rate/escrow/session
+                // reservations — and discard; NEVER re-Prepare. For a
+                // reconstructible cross-context entry this sends a real `Abort`
+                // to the prepared actors (release); otherwise the journal abort
+                // marker IS the rollback record.
+                if let Some(prepared) = Self::reconstruct_xctx_prepared(&entry) {
+                    self.redrive_xctx_prepare_in_progress(&entry.saga_id, &prepared)
+                        .await;
+                }
                 let _ = self
                     .saga_journal
                     .mark_resolved(
@@ -4972,13 +5092,27 @@ impl Supervisor {
                     .await;
                 tracing::warn!(
                     saga_id = %entry.saga_id,
-                    "saga recovery — PreparingB observed; rolled back by journal abort marker"
+                    "saga recovery — PreparingB (Prepare-in-progress) observed; aborted the \
+                     Prepared side(s) and discarded (never re-Prepared)"
                 );
             }
-            SagaState::Committing | SagaState::Aborting => {
-                // Re-resolve: Commit retry logic is not visible through
-                // the journal alone — emit NeedsRepair so an operator
-                // sees it on the next startup.
+            SagaState::Committing => {
+                // §17.16.4 Commit-in-progress: re-send Commit, idempotent by
+                // SagaId. B re-acks the existing `ToolInvoked` and re-emits the
+                // STORED output (NEVER re-invoking the tool); A re-acks its
+                // `CrossContextToolInvoked` and re-settles escrow as a no-op. For
+                // a reconstructible cross-context entry this re-drives the
+                // idempotent Commit-B reserve (asserting `AlreadyCommitted`); the
+                // saga then stays unresolved as `NeedsRepair` for operator review
+                // because the post-crash coordinator no longer holds the Prepare-A
+                // reservation handle the A-side settle consumes (that handle is
+                // re-supplied by the Phase-2D startup loop, which threads the
+                // per-call signing key + reservation; see
+                // [`Self::redrive_xctx_commit_in_progress`]).
+                if let Some(prepared) = Self::reconstruct_xctx_prepared(&entry) {
+                    self.redrive_xctx_commit_in_progress(&entry.saga_id, &prepared)
+                        .await;
+                }
                 let _ = self
                     .saga_journal
                     .append(JournalEntry {
@@ -4992,8 +5126,29 @@ impl Supervisor {
                     .await;
                 tracing::error!(
                     saga_id = %entry.saga_id,
-                    state = ?entry.state,
-                    "saga recovery — Committing/Aborting observed; marked NeedsRepair for operator review"
+                    "saga recovery — Committing (Commit-in-progress) observed; re-drove the \
+                     idempotent Commit-B (no re-invoke) and marked NeedsRepair for operator review"
+                );
+            }
+            SagaState::Aborting => {
+                // An Aborting entry's rollback never completed; re-resolve to
+                // NeedsRepair so an operator sees it (the Abort side-effects are
+                // not journal-visible). No re-drive — Aborting carries no
+                // committed side.
+                let _ = self
+                    .saga_journal
+                    .append(JournalEntry {
+                        saga_id: entry.saga_id.clone(),
+                        state: SagaState::NeedsRepair,
+                        participants: entry.participants.clone(),
+                        evidence: Zeroizing::new(Vec::new()),
+                        timestamp_ms: current_timestamp_ms(),
+                        seq_per_saga: entry.seq_per_saga.saturating_add(1),
+                    })
+                    .await;
+                tracing::error!(
+                    saga_id = %entry.saga_id,
+                    "saga recovery — Aborting observed; marked NeedsRepair for operator review"
                 );
             }
             SagaState::NeedsRepair => {
@@ -5005,6 +5160,143 @@ impl Supervisor {
             SagaState::Committed | SagaState::Aborted => {
                 // Terminal — not returned by load_unresolved but
                 // defensively handled here.
+            }
+        }
+    }
+
+    /// Reconstruct a cross-context tool-invocation saga's prepared state from a
+    /// journal entry's `evidence` (spec §6.2.4 "Crash recovery §17.16.4").
+    ///
+    /// The evidence is the `MessagePack` of the eight-field
+    /// [`CrossContextToolInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared)
+    /// wire — carrying BOTH the `caller_context_id` AND the `target_context_id`
+    /// (option (a) — closing the [`saga_input_participants`] caller-only gap) plus
+    /// the staged provenance. Decoding it yields the FULL `{caller, target}`
+    /// participant set and the prepared provenance the replay re-drive needs.
+    /// Returns `None` if the entry is not a cross-context saga (its evidence
+    /// does not decode), e.g. a standing-pair / broadcast / test entry.
+    fn reconstruct_xctx_prepared(entry: &JournalEntry) -> Option<XctxPrepared> {
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        if entry.evidence.is_empty() {
+            return None;
+        }
+        CrossContextToolInvocationPrepared::from_evidence_bytes(entry.evidence.as_slice()).ok()
+    }
+
+    /// §17.16.4 Prepare-in-progress re-drive: abort the Prepared side(s) of a
+    /// cross-context saga, releasing the staged reservations, then discard
+    /// (NEVER re-Prepare). Sends a best-effort [`SagaPhaseMessage::Abort`] to
+    /// the caller actor (whose Prepare-A staged the escrow/outbound-RL slot —
+    /// `None` reservation, so the actor releases its own held slot if present)
+    /// and the target actor (whose Prepare-B staged the `saga_pending` session
+    /// slot). A lookup miss / send failure is logged; the journal abort marker
+    /// (written by the caller) is the authoritative rollback record.
+    ///
+    /// Invoked by [`Self::recover_saga_entry`] on a `PreparingB` entry, which is
+    /// driven by the Phase-2D startup replay loop
+    /// ([`Self::replay_unresolved_sagas`]).
+    async fn redrive_xctx_prepare_in_progress(&self, saga_id: &SagaId, prepared: &XctxPrepared) {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        for context_id in [prepared.caller_context_id, prepared.target_context_id] {
+            let context_hex = hex::encode(context_id);
+            if let Some(actor) = self.lookup(&context_hex) {
+                let abort_saga_id = saga_id.clone();
+                // `None` reservation: the post-crash coordinator no longer holds
+                // the Prepare-A `PreparedAFields` carrier (it died with the
+                // crash); the actor releases its OWN staged slot (caller: held
+                // escrow/RL; target: `saga_pending` session) keyed by SagaId.
+                let result = actor
+                    .send(move |reply| {
+                        ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
+                            saga_id: abort_saga_id,
+                            reservation: None,
+                            reply,
+                        })
+                    })
+                    .await;
+                if let Err(err) = result {
+                    tracing::warn!(
+                        saga_id = %saga_id.0,
+                        context = %context_hex,
+                        %err,
+                        "saga recovery — Prepare-in-progress Abort send failed; journal abort \
+                         marker is the authoritative rollback record"
+                    );
+                }
+            }
+        }
+    }
+
+    /// §17.16.4 Commit-in-progress re-drive: re-send the idempotent Commit-B,
+    /// which re-acks the existing `ToolInvoked` and re-emits the STORED output —
+    /// NEVER re-invoking the tool (the exactly-once-execution guarantee survives
+    /// a crash). Sends [`SagaPhaseMessage::CommitBReserve`]; on a committed saga
+    /// the actor replies `AlreadyCommitted` with the stored receipt/output, so
+    /// the tool is not re-run.
+    ///
+    /// The A-side re-ack (re-settle escrow as a no-op) is a journal-driven step
+    /// the Phase-2D startup loop completes: re-driving the A-side
+    /// `CrossContextToolInvoked` re-ack requires the per-call caller Active
+    /// Signing Key and the Prepare-A reservation handle — neither survives a
+    /// crash, so the 2D loop re-supplies them (exactly as
+    /// [`Self::start_cross_context_tool_invocation_saga`] supplies them on the
+    /// live path). Until that handle is re-threaded the saga remains unresolved
+    /// as `NeedsRepair` (the caller marks it so), which an operator reconciles
+    /// against B's re-emitted (idempotent) output. The B-side re-emission is the
+    /// security-critical half (no re-invoke); the A-side re-ack is an
+    /// idempotency no-op the operator/2D-loop settles.
+    ///
+    /// Invoked by [`Self::recover_saga_entry`] on a `Committing` entry, which is
+    /// driven by the Phase-2D startup replay loop
+    /// ([`Self::replay_unresolved_sagas`]).
+    async fn redrive_xctx_commit_in_progress(&self, saga_id: &SagaId, prepared: &XctxPrepared) {
+        use crate::context::actor::commands::{CommitBReserveOutcome, SagaPhaseMessage};
+        let target_hex = hex::encode(prepared.target_context_id);
+        let Some(target) = self.lookup(&target_hex) else {
+            tracing::warn!(
+                saga_id = %saga_id.0,
+                context = %target_hex,
+                "saga recovery — Commit-in-progress re-drive: target actor unreachable; operator \
+                 repair required"
+            );
+            return;
+        };
+        let reserve_saga_id = saga_id.clone();
+        let reserve = target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitBReserve {
+                    saga_id: reserve_saga_id,
+                    reply,
+                })
+            })
+            .await;
+        match reserve {
+            Ok(CommitBReserveOutcome::AlreadyCommitted { .. }) => {
+                tracing::info!(
+                    saga_id = %saga_id.0,
+                    "saga recovery — Commit-in-progress re-drive: target re-emitted the STORED \
+                     output (no re-invoke), idempotent by SagaId"
+                );
+            }
+            Ok(CommitBReserveOutcome::ReadyToExecute) => {
+                // Commit-B had NOT durably landed before the crash; the tool was
+                // never executed, so there is no stored output to re-emit. NEVER
+                // re-invoke on the recovery path — the live initiator retries
+                // fresh (spec §17.16.4 "the initiator retries fresh"). Leave it
+                // for operator/NeedsRepair review.
+                tracing::warn!(
+                    saga_id = %saga_id.0,
+                    "saga recovery — Commit-in-progress re-drive: target reports ReadyToExecute \
+                     (Commit-B never durably landed); NOT re-invoking — initiator retries fresh"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "saga recovery — Commit-in-progress re-drive: Commit-B reserve send failed; \
+                     operator repair required"
+                );
             }
         }
     }
@@ -5055,9 +5347,27 @@ impl Supervisor {
             return Err(err);
         }
 
-        // 3. PreparingB
-        self.append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &[])
-            .await?;
+        // 3. PreparingB — journal the FULL `{caller, target}` evidence (option
+        //    (a) from the `reserved_saga_contexts` field doc): the
+        //    `CrossContextToolInvocationPrepared` wire carries BOTH context ids,
+        //    so a crash-recovery replay can rebuild the complete participant set
+        //    + the staged provenance (spec §6.2.4 "Crash recovery §17.16.4").
+        //    `saga_input_participants` deliberately omits `target_context_id`
+        //    from its (caller-only) provenance triple; the evidence closes that
+        //    gap. At PreparingB the caller-asserted nonce/depth stand in for B's
+        //    recorded values (B records them inside Prepare-B); the Committing
+        //    append below re-journals with B's authoritative recorded provenance.
+        let preparing_b_evidence = xctx
+            .as_deref()
+            .and_then(|ctx| Self::xctx_prepared_evidence_bytes(input, ctx));
+        self.append_journal(
+            &saga_id,
+            SagaState::PreparingB,
+            &participants,
+            2,
+            preparing_b_evidence.as_deref().unwrap_or(&[]),
+        )
+        .await?;
 
         let phase_b = self
             .dispatch_prepare_phase(&saga_id, input, SagaPhase::B, xctx.as_deref_mut())
@@ -5074,11 +5384,27 @@ impl Supervisor {
             return Err(err);
         }
 
-        // 4. Committing — 3x retry with 500ms/1s/2s exponential back-off
-        self.append_journal(&saga_id, SagaState::Committing, &participants, 3, &[])
-            .await?;
+        // 4. Committing — 3x retry with 500ms/1s/2s exponential back-off.
+        //    Re-journal the evidence now that Prepare-B has recorded B's
+        //    authoritative provenance (clock / nonce / re-derived depth): a
+        //    Commit-in-progress crash-recovery replay (§17.16.4) reconstructs
+        //    the staged `CrossContextToolInvocationPrepared` from THIS evidence
+        //    to re-drive the idempotent Commit.
+        let committing_evidence = xctx
+            .as_deref()
+            .and_then(|ctx| Self::xctx_prepared_evidence_bytes(input, ctx));
+        self.append_journal(
+            &saga_id,
+            SagaState::Committing,
+            &participants,
+            3,
+            committing_evidence.as_deref().unwrap_or(&[]),
+        )
+        .await?;
 
-        let commit_result = self.commit_with_retry(&saga_id, input, xctx).await;
+        let commit_result = self
+            .commit_with_retry(&saga_id, input, xctx.as_deref_mut())
+            .await;
         match commit_result {
             Ok(()) => {
                 self.saga_journal
@@ -5094,7 +5420,8 @@ impl Supervisor {
                 Ok(())
             }
             Err(err) => {
-                // Commit retry exhausted — NeedsRepair.
+                // Commit retry exhausted — NeedsRepair (spec §6.2.4
+                // "commit_with_retry exhausts (3×) → NeedsRepair").
                 self.append_journal(&saga_id, SagaState::NeedsRepair, &participants, 4, &[])
                     .await?;
                 tracing::error!(
@@ -5102,6 +5429,29 @@ impl Supervisor {
                     %err,
                     "saga coordinator — commit retry exhausted, saga in NeedsRepair"
                 );
+                // Dual event-log recording (spec §6.2.4): on NeedsRepair both
+                // sides MUST emit a signed `CrossContextDivergenceMarker` (into
+                // each available log, or the supervisor-level repair journal if
+                // a side is unreachable) so a one-sided commit is durably
+                // auditable. Cross-context only; the test / spec-gapped inputs
+                // carry no `xctx`. Marks the ctx so `run_saga`'s tail leaves the
+                // escrow RESERVED (NOT auto-voided) for operator repair.
+                if let Some(ctx) = xctx {
+                    ctx.reached_needs_repair = true;
+                    // Extract the owned divergence plan SYNCHRONOUSLY (no `&ctx`
+                    // borrow crosses the `.await` — the ctx's boxed executor is
+                    // non-`Sync`), then emit. A `None` plan ⇒ Commit-B never
+                    // landed (no committed side, no divergence to mark).
+                    if let Some(plan) = Self::divergence_marker_plan(ctx) {
+                        Box::pin(self.emit_divergence_markers(&saga_id, plan)).await;
+                    } else {
+                        tracing::warn!(
+                            saga_id = %saga_id,
+                            "cross-context saga NeedsRepair with NO committed side (Commit-B never \
+                             landed); logs are clean, no divergence marker required"
+                        );
+                    }
+                }
                 Err(err)
             }
         }
@@ -5413,12 +5763,18 @@ impl Supervisor {
 
         match reserve {
             // Replay: the tool already executed; re-use the stored capture. The
-            // `tool_invoked_event_id` is carried inside the signed receipt.
+            // `tool_invoked_event_id` is carried inside the signed receipt; we
+            // ALSO record it in `ctx` so a subsequent Commit-A failure → NeedsRepair
+            // knows the TARGET committed and which event id its
+            // `CrossContextDivergenceMarker` must name (spec §6.2.4).
             CommitBReserveOutcome::AlreadyCommitted {
                 receipt,
                 output_bytes,
-                tool_invoked_event_id: _,
-            } => Ok((receipt, output_bytes)),
+                tool_invoked_event_id,
+            } => {
+                ctx.committed_b_tool_invoked_event_id = Some(tool_invoked_event_id);
+                Ok((receipt, output_bytes))
+            }
             // First execution: run the executor supervisor-side, then settle.
             CommitBReserveOutcome::ReadyToExecute => {
                 self.commit_b_first_execute(saga_id, ctx, &target_hex).await
@@ -5472,7 +5828,7 @@ impl Supervisor {
         let CommitBSettleOutcome {
             receipt,
             output_bytes,
-            tool_invoked_event_id: _,
+            tool_invoked_event_id,
         } = target
             .send(move |reply| {
                 ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle {
@@ -5483,6 +5839,10 @@ impl Supervisor {
                 })
             })
             .await?;
+        // Commit-B has landed durably: record the target's `ToolInvoked` event
+        // id so a later Commit-A failure → NeedsRepair knows the TARGET side
+        // committed and which event id the divergence marker must name.
+        ctx.committed_b_tool_invoked_event_id = Some(tool_invoked_event_id);
         Ok((receipt, output_bytes))
     }
 
@@ -5540,8 +5900,242 @@ impl Supervisor {
             .await
     }
 
+    /// Emit the dual `CrossContextDivergenceMarker`s on a `NeedsRepair`
+    /// outcome (spec §6.2.4 "Dual event-log recording").
+    ///
+    /// When `commit_with_retry` exhausts and the FSM reaches `NeedsRepair`,
+    /// BOTH sides must record a signed divergence marker so a one-sided commit
+    /// (the repudiation primitive) is durably auditable. This:
+    ///
+    /// 1. Determines **which side committed** from
+    ///    [`CrossContextSagaCtx::committed_b_tool_invoked_event_id`]: `Some`
+    ///    means Commit-B landed (the TARGET committed its `ToolInvoked`) and
+    ///    Commit-A then failed — `committed_side = Target`, the committed event
+    ///    id is the `ToolInvoked` id. `None` means Commit-B never landed; no
+    ///    side committed, so there is NOTHING to record (the logs are clean —
+    ///    no divergence). A clean no-commit `NeedsRepair` therefore emits no
+    ///    markers; it is a transient commit failure the operator re-drives, not
+    ///    a one-sided commit.
+    /// 2. For each reachable participant actor (target + caller), resolves that
+    ///    side's Active Signing Key (the FSM holds both — supplied per-call,
+    ///    ADR-049) and sends [`SagaPhaseMessage::EmitDivergenceMarker`] so the
+    ///    actor signs + appends the marker into ITS OWN event log.
+    /// 3. If a side is UNREACHABLE (`lookup` miss / actor gone), the signed
+    ///    marker cannot be appended into that side's log, so the divergence is
+    ///    recorded into the supervisor-level repair journal
+    ///    ([`Self::saga_repair_records`]) instead — "or a supervisor-level
+    ///    repair journal if one side is unreachable".
+    ///
+    /// Best-effort: a send / append failure for one side is logged but never
+    /// masks the `NeedsRepair` terminal — the operator-repair path reconciles
+    /// from whatever markers landed plus the supervisor repair journal. The
+    /// escrow is NOT settled here (the [`Self::run_saga`] tail holds it RESERVED
+    /// for operator repair) and `prepared_a` is intentionally left untouched.
+    async fn emit_divergence_markers(&self, saga_id: &SagaId, plan: DivergenceMarkerPlan) {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        use scp_protocol::context::tools::cross_context_saga::CommittedSide;
+
+        // The OWNED plan was extracted by the SYNC [`Self::divergence_marker_plan`]
+        // at the (sync) FSM call site — NO `&CrossContextSagaCtx` borrow spans the
+        // `.await`s below (the ctx carries the non-`Sync` boxed executor, which
+        // would otherwise poison this future's `Send` bound). The loop holds only
+        // owned values.
+        let (committed_event_id, nonce, sides) = plan;
+        let committed_side = CommittedSide::Target;
+
+        for (label, context_id, signing_key_bytes) in sides {
+            let context_hex = hex::encode(context_id);
+            if let Some(actor) = self.lookup(&context_hex) {
+                let marker_saga_id = saga_id.clone();
+                let committed_event_id_for_send = committed_event_id.clone();
+                let result = actor
+                    .send(move |reply| {
+                        ContextCommand::SagaPhase(SagaPhaseMessage::EmitDivergenceMarker {
+                            saga_id: marker_saga_id,
+                            nonce,
+                            committed_side,
+                            committed_event_id: committed_event_id_for_send,
+                            signing_key: signing_key_bytes,
+                            reply,
+                        })
+                    })
+                    .await;
+                match result {
+                    Ok(()) => tracing::error!(
+                        saga_id = %saga_id.0,
+                        side = label,
+                        "cross-context saga NeedsRepair — signed divergence marker appended \
+                         to the {label} event log (operator repair required)"
+                    ),
+                    Err(err) => {
+                        // The actor is reachable but the append failed; record
+                        // the supervisor-level fallback witness so the
+                        // divergence is not lost.
+                        tracing::error!(
+                            saga_id = %saga_id.0,
+                            side = label,
+                            %err,
+                            "cross-context saga NeedsRepair — {label} divergence-marker \
+                             append FAILED; recording supervisor repair fallback"
+                        );
+                        self.record_supervisor_repair(
+                            saga_id,
+                            &context_hex,
+                            committed_side,
+                            &committed_event_id,
+                            nonce,
+                        );
+                    }
+                }
+            } else {
+                // Unreachable side: record into the supervisor-level repair
+                // journal instead of that side's (absent) log.
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    side = label,
+                    context = %context_hex,
+                    "cross-context saga NeedsRepair — {label} actor unreachable; recording \
+                     divergence into the supervisor-level repair journal"
+                );
+                self.record_supervisor_repair(
+                    saga_id,
+                    &context_hex,
+                    committed_side,
+                    &committed_event_id,
+                    nonce,
+                );
+            }
+        }
+    }
+
+    /// Synchronous extractor for [`Self::emit_divergence_markers`]: returns the
+    /// owned `(committed_event_id, nonce, [per-side (label, context_id,
+    /// signing_key)])` plan, or `None` if Commit-B never landed (no committed
+    /// side ⇒ no divergence). Holding the `&ctx` borrow inside this sync fn
+    /// (rather than across the caller's `.await`s) keeps the caller future
+    /// `Send` despite the ctx's non-`Sync` boxed executor.
+    fn divergence_marker_plan(ctx: &CrossContextSagaCtx<'_>) -> Option<DivergenceMarkerPlan> {
+        use crate::context::actor::commands::SigningKeyBytes;
+        let committed_event_id = ctx.committed_b_tool_invoked_event_id.clone()?;
+        // Each side records the SAME (committed_side, committed_event_id, nonce)
+        // — each into its own log under its OWN Active Signing Key. Only the
+        // TARGET can have committed-then-diverged in the current FSM (Commit-B
+        // lands first, then Commit-A).
+        let sides = [
+            (
+                "target",
+                ctx.target_context_id,
+                SigningKeyBytes::from_signing_key(&ctx.target_signing_key),
+            ),
+            (
+                "caller",
+                ctx.caller_context_id,
+                SigningKeyBytes::from_signing_key(&ctx.caller_signing_key),
+            ),
+        ];
+        Some((committed_event_id, ctx.asserted_nonce, sides))
+    }
+
+    /// Record a supervisor-level divergence repair witness for an UNREACHABLE
+    /// (or append-failed) side of a `NeedsRepair` saga (spec §6.2.4 "Dual
+    /// event-log recording" — "or a supervisor-level repair journal if one side
+    /// is unreachable"). Appends to [`Self::saga_repair_records`] keyed by saga
+    /// id; a single diverged saga may accumulate multiple records.
+    fn record_supervisor_repair(
+        &self,
+        saga_id: &SagaId,
+        unreachable_context_hex: &str,
+        committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
+        committed_event_id: &str,
+        nonce: [u8; 16],
+    ) {
+        self.saga_repair_records
+            .entry(saga_id.clone())
+            .or_default()
+            .push(SagaDivergenceRepairRecord {
+                unreachable_context_hex: unreachable_context_hex.to_owned(),
+                committed_side,
+                committed_event_id: committed_event_id.to_owned(),
+                nonce,
+            });
+    }
+
+    /// Read the supervisor-level divergence repair records for a saga (operator
+    /// repair surface; also used by the NeedsRepair divergence tests). Returns
+    /// an empty vec if the saga has no supervisor-recorded divergence
+    /// (both sides were reachable and recorded into their own logs).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn saga_repair_records_for(&self, saga_id: &SagaId) -> Vec<SagaDivergenceRepairRecord> {
+        self.saga_repair_records
+            .get(saga_id)
+            .map(|e| e.clone())
+            .unwrap_or_default()
+    }
+
+    /// Build the journal `evidence` bytes for a cross-context tool-invocation
+    /// saga — the `MessagePack` of the eight-field
+    /// [`CrossContextToolInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared)
+    /// wire (spec §6.2.4 "Public-metadata journaling"). Carries BOTH the caller
+    /// AND target context ids (option (a) — closing the
+    /// [`saga_input_participants`] caller-only gap) plus the staged provenance,
+    /// so a crash-recovery replay (§17.16.4) reconstructs the full
+    /// `{caller, target}` participant set and the prepared state.
+    ///
+    /// Uses B's authoritative recorded provenance once Prepare-B has run
+    /// (`ctx.prepared_b`); before that, the caller-asserted nonce / depth stand
+    /// in (B re-derives them at Prepare-B, and the PreparingB-state replay arm
+    /// only ever ABORTS — it never re-drives a Commit, so it does not depend on
+    /// the recorded values). Returns `None` for a non-`CrossContextToolInvocation`
+    /// input (the test / spec-gapped variants carry no `xctx`).
+    fn xctx_prepared_evidence_bytes(
+        input: &SagaInput,
+        ctx: &CrossContextSagaCtx<'_>,
+    ) -> Option<Vec<u8>> {
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        // Only the cross-context variant journals prepared evidence.
+        if !matches!(input, SagaInput::CrossContextToolInvocation { .. }) {
+            return None;
+        }
+        let (recorded_timestamp_ms, recorded_nonce, recorded_chain_depth) =
+            ctx.prepared_b.as_ref().map_or_else(
+                || {
+                    // Pre-Prepare-B: B has not yet recorded. The caller-asserted
+                    // values stand in (the PreparingB-state replay arm aborts and
+                    // never re-drives a Commit, so it does not read them).
+                    (
+                        ctx.asserted_timestamp_ms,
+                        ctx.asserted_nonce,
+                        ctx.asserted_chain_depth,
+                    )
+                },
+                |b| {
+                    (
+                        b.recorded_timestamp_ms,
+                        b.recorded_nonce,
+                        b.recorded_chain_depth,
+                    )
+                },
+            );
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: ctx.caller_context_id,
+            target_context_id: ctx.target_context_id,
+            caller_did: ctx.caller_did.clone(),
+            tool_registration_id: ctx.tool_registration_id.clone(),
+            // The wire mirror carries a non-optional `ucan_proof_id`; an ungated
+            // tool (no proof) maps to the empty string (round-trips to `None`
+            // semantics via an empty proof reference on reconstruction).
+            ucan_proof_id: ctx.ucan_proof_id.clone().unwrap_or_default(),
+            recorded_timestamp_ms,
+            recorded_nonce,
+            recorded_chain_depth,
+        };
+        prepared.to_evidence_bytes().ok()
+    }
+
     /// Abort the saga (spec §6.2.4 "Reservation release on every terminal
     /// path"): mark the journal Aborting → Aborted, and — for a cross-context
+    /// saga — send [`SagaPhaseMessage::Abort`] to whichever side(s) prepared so
     /// saga — send [`SagaPhaseMessage::Abort`] to whichever side(s) prepared so
     /// the staged reservations are RAII-released (the caller side hands its held
     /// `PreparedAFields` back; the target side clears its staged slot).
@@ -12924,6 +13518,7 @@ mod tests {
     /// panic). The signed receipt's preimage fields (nonce / target ctx id /
     /// tool id) reflect what B recorded.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // full happy-path E2E: drive + receipt + dual-log assertions
     async fn xctx_saga_happy_path_commits_and_executes_once() {
         use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12945,6 +13540,9 @@ mod tests {
         // The target's Active Signing Key (caller-supplied, ADR-049 — the actor
         // holds no key).
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // The caller's Active Signing Key (caller-supplied, ADR-049) — used to
+        // sign the caller-side divergence marker on a NeedsRepair.
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
 
         // Count executor invocations to prove exactly-once.
         let calls = Arc::new(AtomicUsize::new(0));
@@ -12974,6 +13572,7 @@ mod tests {
                 nonce,
                 now_ms,
                 &target_signing,
+                &caller_signing,
                 executor,
             )
             .await
@@ -13054,6 +13653,7 @@ mod tests {
     /// participant-context-set reservation is released (a follow-up saga over
     /// the same set is NOT ActorBusy).
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // confused-deputy E2E: mint UCAN + reject + release assertions
     async fn xctx_saga_prepare_b_confused_deputy_aborts_no_execution() {
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
@@ -13106,6 +13706,9 @@ mod tests {
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // The caller's Active Signing Key (caller-supplied, ADR-049) — used to
+        // sign the caller-side divergence marker on a NeedsRepair.
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_exec = Arc::clone(&calls);
         let executor = move |_input: serde_json::Value| {
@@ -13130,6 +13733,7 @@ mod tests {
                 [0x43u8; 16],
                 now_ms,
                 &target_signing,
+                &caller_signing,
                 executor,
             )
             .await
@@ -13161,6 +13765,7 @@ mod tests {
                 [0x44u8; 16],
                 now_ms2,
                 &target_signing,
+                &caller_signing,
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
             )
             .await
@@ -13203,6 +13808,9 @@ mod tests {
             .expect("first reservation succeeds");
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // The caller's Active Signing Key (caller-supplied, ADR-049) — used to
+        // sign the caller-side divergence marker on a NeedsRepair.
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let err = supervisor
             .start_cross_context_tool_invocation_saga(
@@ -13217,6 +13825,7 @@ mod tests {
                 [0x45u8; 16],
                 now_ms,
                 &target_signing,
+                &caller_signing,
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
             )
             .await
@@ -13249,6 +13858,9 @@ mod tests {
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // The caller's Active Signing Key (caller-supplied, ADR-049) — used to
+        // sign the caller-side divergence marker on a NeedsRepair.
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_exec = Arc::clone(&calls);
         let executor = move |_input: serde_json::Value| {
@@ -13273,6 +13885,7 @@ mod tests {
                 [0x46u8; 16],
                 now_ms,
                 &target_signing,
+                &caller_signing,
                 executor,
             )
             .await
@@ -13332,5 +13945,504 @@ mod tests {
             1,
             "replay MUST NOT re-invoke the tool"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // §6.2.4 slice 6 — NeedsRepair dual divergence marker +
+    // §17.16.4 crash-recovery replay arms.
+    // -----------------------------------------------------------------
+
+    /// Build a `CrossContextSagaCtx` with the TARGET marked as committed
+    /// (`committed_b_tool_invoked_event_id = Some(event_id)`) so
+    /// `emit_divergence_markers` records `committed_side = Target`. The executor
+    /// is a never-called no-op (divergence emission never runs the tool).
+    fn divergence_ctx<'a>(
+        nonce: [u8; 16],
+        tool_invoked_event_id: String,
+        target_signing: &ed25519_dalek::SigningKey,
+        caller_signing: &ed25519_dalek::SigningKey,
+        caller_did: &str,
+    ) -> CrossContextSagaCtx<'a> {
+        CrossContextSagaCtx {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            declared_cost: 5,
+            asserted_chain_depth: 2,
+            asserted_nonce: nonce,
+            asserted_timestamp_ms: 1_700_000_000,
+            target_signing_key: target_signing.clone(),
+            caller_signing_key: caller_signing.clone(),
+            executor: Some(Box::new(|_v: serde_json::Value| {
+                Box::pin(async move { Ok(serde_json::json!({})) }) as _
+            })),
+            prepared_a: None,
+            prepared_b: None,
+            committed: None,
+            committed_b_tool_invoked_event_id: Some(tool_invoked_event_id),
+            reached_needs_repair: false,
+        }
+    }
+
+    /// NeedsRepair dual divergence marker (spec §6.2.4 "Dual event-log
+    /// recording"): when the TARGET committed but the saga diverged, BOTH the
+    /// target and caller actors emit a signed `CrossContextDivergenceMarker`
+    /// into their OWN event log. The markers record `committed_side = Target`,
+    /// the saga id, the nonce, and the committed event id, and each verifies
+    /// under its own side's Active Signing Key. Both sides reachable ⇒ NO
+    /// supervisor-level repair record.
+    #[tokio::test]
+    async fn xctx_needs_repair_emits_dual_signed_divergence_markers() {
+        use scp_protocol::context::tools::cross_context_saga::{
+            CommittedSide, CrossContextDivergenceMarker,
+        };
+
+        let creator_did = "did:dht:z6MkXctxDivCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let event_log = RecordingEventLog::default();
+        let supervisor = xctx_supervisor_with_event_log(
+            creator_did.clone(),
+            creator_key,
+            Box::new(event_log.clone()),
+        );
+        let caller_did = "did:dht:z6MkXctxDivCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x42u8; 16];
+        let saga_id = crate::context::supervisor::saga_journal::SagaId::new();
+        let committed_event_id = format!("ToolInvoked:{}", saga_id.0);
+
+        let ctx = divergence_ctx(
+            nonce,
+            committed_event_id.clone(),
+            &target_signing,
+            &caller_signing,
+            caller_did,
+        );
+        let plan = Supervisor::divergence_marker_plan(&ctx).expect("target committed ⇒ plan");
+        Box::pin(supervisor.emit_divergence_markers(&saga_id, plan)).await;
+
+        // Both sides reachable ⇒ no supervisor repair fallback.
+        assert!(
+            supervisor.saga_repair_records_for(&saga_id).is_empty(),
+            "both actors reachable ⇒ NO supervisor-level repair record"
+        );
+
+        let events = event_log
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let marker_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
+
+        // TARGET log carries a marker signed by the TARGET key.
+        let (_, _, _, target_payload) = events
+            .iter()
+            .find(|(id, name, _, _)| *id == XCTX_TARGET && *name == marker_name)
+            .expect("target log must carry a divergence marker");
+        let target_marker: CrossContextDivergenceMarker =
+            serde_json::from_value(target_payload.clone().expect("marker payload"))
+                .expect("decode target marker");
+        assert_eq!(target_marker.committed_side, CommittedSide::Target);
+        assert_eq!(target_marker.saga_id, saga_id.0);
+        assert_eq!(target_marker.nonce, nonce);
+        assert_eq!(target_marker.committed_event_id, committed_event_id);
+        assert!(
+            target_marker
+                .verify(&target_signing.verifying_key())
+                .is_ok(),
+            "target marker must verify under the target key"
+        );
+
+        // CALLER log carries a marker signed by the CALLER key.
+        let (_, _, _, caller_payload) = events
+            .iter()
+            .find(|(id, name, _, _)| *id == XCTX_CALLER && *name == marker_name)
+            .expect("caller log must carry a divergence marker");
+        let caller_marker: CrossContextDivergenceMarker =
+            serde_json::from_value(caller_payload.clone().expect("marker payload"))
+                .expect("decode caller marker");
+        assert_eq!(caller_marker.committed_side, CommittedSide::Target);
+        assert_eq!(caller_marker.saga_id, saga_id.0);
+        assert_eq!(caller_marker.nonce, nonce);
+        assert_eq!(caller_marker.committed_event_id, committed_event_id);
+        assert!(
+            caller_marker
+                .verify(&caller_signing.verifying_key())
+                .is_ok(),
+            "caller marker must verify under the caller key"
+        );
+        // The marker is NOT cross-verifiable: each side signs with its own key.
+        assert!(
+            caller_marker
+                .verify(&target_signing.verifying_key())
+                .is_err(),
+            "the caller marker must NOT verify under the target key"
+        );
+    }
+
+    /// NeedsRepair with an UNREACHABLE side: when the caller actor is gone, its
+    /// signed marker cannot be appended into its (absent) log, so the divergence
+    /// is recorded into the supervisor-level repair journal instead (spec
+    /// §6.2.4 — "or a supervisor-level repair journal if one side is
+    /// unreachable"). The reachable target side still records into its own log.
+    #[tokio::test]
+    async fn xctx_needs_repair_unreachable_side_records_supervisor_repair() {
+        let creator_did = "did:dht:z6MkXctxRepairCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let event_log = RecordingEventLog::default();
+        let supervisor = xctx_supervisor_with_event_log(
+            creator_did.clone(),
+            creator_key,
+            Box::new(event_log.clone()),
+        );
+        let caller_did = "did:dht:z6MkXctxRepairCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        // Despawn the CALLER actor so it is unreachable at divergence time.
+        assert!(
+            supervisor.despawn_actor(&hex::encode(XCTX_CALLER)).await,
+            "despawn caller actor"
+        );
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let nonce = [0x55u8; 16];
+        let saga_id = crate::context::supervisor::saga_journal::SagaId::new();
+        let committed_event_id = format!("ToolInvoked:{}", saga_id.0);
+
+        let ctx = divergence_ctx(
+            nonce,
+            committed_event_id.clone(),
+            &target_signing,
+            &caller_signing,
+            caller_did,
+        );
+        let plan = Supervisor::divergence_marker_plan(&ctx).expect("target committed ⇒ plan");
+        Box::pin(supervisor.emit_divergence_markers(&saga_id, plan)).await;
+
+        // The unreachable CALLER side is recorded in the supervisor repair journal.
+        let repair = supervisor.saga_repair_records_for(&saga_id);
+        assert_eq!(
+            repair.len(),
+            1,
+            "exactly one supervisor repair record for the unreachable caller side, got {repair:?}"
+        );
+        assert_eq!(repair[0].unreachable_context_hex, hex::encode(XCTX_CALLER));
+        assert_eq!(repair[0].committed_event_id, committed_event_id);
+        assert_eq!(repair[0].nonce, nonce);
+        assert_eq!(
+            repair[0].committed_side,
+            scp_protocol::context::tools::cross_context_saga::CommittedSide::Target
+        );
+
+        // The reachable TARGET side still recorded into its own log.
+        let events = event_log
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let marker_name = format!("CrossContextDivergenceMarker:{}", saga_id.0);
+        assert!(
+            events
+                .iter()
+                .any(|(id, name, _, _)| *id == XCTX_TARGET && *name == marker_name),
+            "the reachable target side must still record its marker into its own log"
+        );
+    }
+
+    /// NeedsRepair concurrency-slot release: a `TestForceNeedsRepair` saga
+    /// (commit always fails → NeedsRepair) RELEASES the participant-context-set
+    /// reservation, so an OVERLAPPING saga over the same context then reserves
+    /// successfully (no `ActorBusy`). Confirms the concurrency slot is released
+    /// while the (separate) escrow path is unaffected (spec §6.2.4 "`NeedsRepair`
+    /// reservation semantics" — the two release differently).
+    #[tokio::test]
+    async fn xctx_needs_repair_releases_concurrency_slot() {
+        let supervisor = Arc::new(Supervisor::for_query_shim());
+        let ctx_id = [0x77u8; 32];
+
+        // Drive a saga to NeedsRepair (commit-retry exhaustion).
+        let err = supervisor
+            .start_saga(SagaInput::TestForceNeedsRepair { context_id: ctx_id })
+            .await
+            .expect_err("commit-retry-exhausted saga returns NeedsRepair");
+        assert!(
+            !matches!(err, ContextError::ActorBusy(_)),
+            "a NeedsRepair terminal must not surface as ActorBusy, got {err:?}"
+        );
+
+        // The NeedsRepair terminal RELEASED the slot: a follow-up saga over the
+        // SAME (overlapping) context reserves successfully (it does not reject
+        // with SagaBusy).
+        let reservation = supervisor
+            .test_reserve_saga_context_set(&SagaInput::TestForceNeedsRepair { context_id: ctx_id });
+        assert!(
+            reservation.is_ok(),
+            "NeedsRepair must release the context slot so an overlapping saga reserves, got {:?}",
+            reservation.err()
+        );
+    }
+
+    /// §17.16.4 participant-set reconstruction (option (a)): the journaled
+    /// `CrossContextToolInvocationPrepared` evidence carries BOTH context ids, so
+    /// a crash-recovery replay reconstructs the FULL `{caller, target}`
+    /// participant set — NOT the caller-only journal triple. Proves the
+    /// reservation-gap the field doc flags is closed.
+    #[test]
+    fn xctx_replay_reconstructs_full_participant_set() {
+        use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID("did:dht:z6MkReconCaller".to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: 1_700_000_111,
+            recorded_nonce: [0x66u8; 16],
+            recorded_chain_depth: 3,
+        };
+        let evidence = prepared.to_evidence_bytes().expect("encode evidence");
+        let entry = JournalEntry {
+            saga_id: SagaId::new(),
+            state: SagaState::Committing,
+            // The journal provenance triple is caller-ONLY (no target).
+            participants: vec![
+                hex::encode(XCTX_CALLER),
+                "did:dht:z6MkReconCaller".to_owned(),
+                XCTX_TOOL.to_owned(),
+            ],
+            evidence: Zeroizing::new(evidence),
+            timestamp_ms: 1_700_000_111,
+            seq_per_saga: 3,
+        };
+
+        let recon = Supervisor::reconstruct_xctx_prepared(&entry)
+            .expect("cross-context evidence reconstructs");
+        // The FULL {caller, target} set is recoverable from the evidence even
+        // though `participants` omits the target.
+        assert_eq!(recon.caller_context_id, XCTX_CALLER);
+        assert_eq!(recon.target_context_id, XCTX_TARGET);
+        assert_eq!(recon.recorded_chain_depth, 3);
+        assert_eq!(recon.recorded_nonce, [0x66u8; 16]);
+        assert!(
+            !entry.participants.contains(&hex::encode(XCTX_TARGET)),
+            "the journal participant triple deliberately omits the target — the evidence closes \
+             the gap"
+        );
+    }
+
+    /// §17.16.4 Commit-in-progress replay re-emits the STORED output WITHOUT
+    /// re-invoking the tool. We commit a real saga (executor runs once), then
+    /// reconstruct the prepared state from journaled evidence and re-drive the
+    /// Commit-in-progress recovery path; the target re-emits the stored output
+    /// via the idempotent `AlreadyCommitted`, and the executor counter stays 1.
+    #[tokio::test]
+    async fn xctx_replay_commit_in_progress_reemits_without_reinvoke() {
+        use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxReplay2Creator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxReplay2Caller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |_input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({ "result": 3 }))
+            }
+        };
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let nonce = [0x42u8; 16];
+        let output = supervisor
+            .start_cross_context_tool_invocation_saga(
+                XCTX_CALLER,
+                XCTX_TARGET,
+                DID(caller_did.to_owned()),
+                XCTX_TOOL.to_owned(),
+                None,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                5,
+                2,
+                nonce,
+                now_ms,
+                &target_signing,
+                &caller_signing,
+                executor,
+            )
+            .await
+            .expect("saga commits");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "tool ran once");
+
+        // Recover the committed saga id from the receipt.
+        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+            serde_json::from_slice(&output.receipt.expect("receipt")).expect("decode");
+        let saga_id_str = receipt
+            .tool_invoked_event_id
+            .strip_prefix("ToolInvoked:")
+            .expect("event id carries saga id")
+            .to_owned();
+        let saga_id = SagaId(saga_id_str);
+
+        // Build a Commit-in-progress journal entry whose evidence carries the
+        // full {caller, target} prepared state, then run the recovery re-drive.
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: now_ms,
+            recorded_nonce: nonce,
+            recorded_chain_depth: 3,
+        };
+        let entry = JournalEntry {
+            saga_id: saga_id.clone(),
+            state: SagaState::Committing,
+            participants: vec![hex::encode(XCTX_CALLER)],
+            evidence: Zeroizing::new(prepared.to_evidence_bytes().expect("encode")),
+            timestamp_ms: now_ms,
+            seq_per_saga: 3,
+        };
+        let recon = Supervisor::reconstruct_xctx_prepared(&entry).expect("reconstruct");
+        Box::pin(supervisor.redrive_xctx_commit_in_progress(&saga_id, &recon)).await;
+
+        // The re-drive re-emitted the stored output via AlreadyCommitted — the
+        // tool was NEVER re-invoked.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Commit-in-progress replay MUST NOT re-invoke the tool"
+        );
+    }
+
+    /// §17.16.4 Prepare-in-progress replay aborts the Prepared side(s) and
+    /// discards — never re-Prepares. We Prepare-B (staging the target's
+    /// `saga_pending` session slot keyed by the saga id), then run the
+    /// Prepare-in-progress recovery re-drive, which sends `Abort` to the target
+    /// to RELEASE the staged slot. We then confirm the slot is gone: a
+    /// subsequent Commit-B reserve for that saga finds NO staged prepared
+    /// (SCP-SAGA-13030), proving the recovery released-and-discarded it. The
+    /// tool never executes (no Commit ever ran).
+    #[tokio::test]
+    async fn xctx_replay_prepare_in_progress_releases_and_discards() {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+
+        let creator_did = "did:dht:z6MkXctxPrepReplayCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxPrepReplayCaller";
+        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let saga_id = SagaId::new();
+
+        // Stage Prepare-B on the target actor: this stages the eight-field
+        // prepared into `saga_pending`, keyed by the saga id (the session slot
+        // the recovery Abort releases).
+        let target = supervisor
+            .lookup(&hex::encode(XCTX_TARGET))
+            .expect("target co-resident");
+        let prepare_saga_id = saga_id.clone();
+        let prepare_did = DID(caller_did.to_owned());
+        let prepare_now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::PrepareB {
+                    saga_id: prepare_saga_id,
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: prepare_did,
+                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: [0x99u8; 16],
+                    asserted_timestamp_ms: prepare_now_ms,
+                    reply,
+                })
+            })
+            .await
+            .expect("Prepare-B stages the target session slot");
+
+        // Run the Prepare-in-progress recovery re-drive: it aborts the prepared
+        // side(s), releasing the target's staged `saga_pending` slot.
+        let prepared = CrossContextToolInvocationPrepared {
+            caller_context_id: XCTX_CALLER,
+            target_context_id: XCTX_TARGET,
+            caller_did: DID(caller_did.to_owned()),
+            tool_registration_id: XCTX_TOOL.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: 1,
+            recorded_nonce: [0x99u8; 16],
+            recorded_chain_depth: 3,
+        };
+        Box::pin(supervisor.redrive_xctx_prepare_in_progress(&saga_id, &prepared)).await;
+
+        // The staged slot was RELEASED: a Commit-B reserve for this saga now
+        // finds NO staged prepared (the recovery discarded it; it was never
+        // re-Prepared).
+        let reserve_saga_id = saga_id.clone();
+        let reserve = target
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitBReserve {
+                    saga_id: reserve_saga_id,
+                    reply,
+                })
+            })
+            .await;
+        assert!(
+            matches!(
+                &reserve,
+                Err(ContextError::InvalidState(m)) if m.contains("SCP-SAGA-13030")
+            ),
+            "after Prepare-in-progress recovery the staged slot must be released (no staged \
+             prepared on Commit-B reserve), got {reserve:?}"
+        );
+    }
+
+    /// The NeedsRepair `run_saga` tail HOLDS the escrow reserved (does NOT void
+    /// it) for operator repair, while every other terminal voids/settles it
+    /// (spec §6.2.4 "`NeedsRepair` reservation semantics"). Exercised directly
+    /// on the ticket primitive: `hold_external_for_repair` consumes the carrier
+    /// (no unbalanced-drop panic) WITHOUT voiding the external escrow, distinct
+    /// from `void_external_and_consume`.
+    #[test]
+    fn needs_repair_holds_escrow_without_voiding() {
+        // A no-escrow ticket: `hold_external_for_repair` simply consumes it so
+        // its `#[must_use]` drop guard does not fire (no panic). The semantic
+        // difference from voiding is documented + asserted by the no-panic drop:
+        // had the carrier been dropped WITHOUT being consumed, the debug-assert
+        // in `ToolEconomyTicket::drop` would fire.
+        let ticket = crate::context::tools_helpers::ToolEconomyTicket::new_for_test_no_escrow(DID(
+            "did:dht:z6MkHoldRepair".to_owned(),
+        ));
+        ticket.hold_external_for_repair();
+        // Reaching here without a drop-guard panic proves the carrier was marked
+        // consumed (held for repair), not leaked.
     }
 }

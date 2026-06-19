@@ -255,6 +255,37 @@ impl ToolEconomyTicket {
         self.consumed = true;
         self.needs_hard_rate_limit_refund = false;
     }
+
+    /// Hold the ticket's external escrow RESERVED for operator repair on a
+    /// cross-context-saga `NeedsRepair` divergence (spec §6.2.4 "`NeedsRepair`
+    /// reservation semantics"). Unlike [`Self::void_external_and_consume`], this
+    /// DELIBERATELY does NOT void the payment-escrow hold: the operation may have
+    /// partially committed (the target executed and charged while the caller's
+    /// settle did not land), so auto-voiding would be a free-execution exploit.
+    /// The escrow stays held; the signed `CrossContextDivergenceMarker` plus
+    /// operator repair settles it later (reconciling which side committed).
+    ///
+    /// This only marks the supervisor-side carrier ticket consumed so its
+    /// unbalanced-drop guard does not fire — the external payment-escrow hold
+    /// itself is untouched and remains active until operator repair settles it.
+    /// The hard-rate-limit refund flag is cleared (the at-initiation budget
+    /// consumption is NOT refunded on any non-`Committed` terminal, including
+    /// `NeedsRepair` — spec §6.2.4 "Initiation consumes budget").
+    pub fn hold_external_for_repair(mut self) {
+        if self.escrow.is_some() {
+            tracing::error!(
+                actor_did = %self.actor_did,
+                "cross-context saga NeedsRepair — external payment escrow held RESERVED for \
+                 operator repair (NOT voided; the operation may have partially committed)"
+            );
+        }
+        // Mark consumed so the supervisor-side carrier's unbalanced-drop guard
+        // does not fire; the external hold is intentionally left in place.
+        self.consumed = true;
+        // No hard-rate-limit refund: initiation consumes budget, no terminal
+        // refunds it (anti-griefing, §6.2.4).
+        self.needs_hard_rate_limit_refund = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
