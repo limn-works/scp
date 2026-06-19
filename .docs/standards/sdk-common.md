@@ -83,7 +83,6 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13019` | handler | Invocation nonce already seen in target dedup cache (replay) |
 | `SCP-SAGA-13020` | handler | Re-derived chain depth exceeds `max_chain_depth` |
 | `SCP-SAGA-13021` | handler | Input does not conform to registered schema |
-| `SCP-SAGA-13022` | supervisor | No established interface for the (caller, target, tool) triple (target-axis authorize-before-reserve) |
 | `SCP-SAGA-13023` | handler | Per-interface §6.2.0.2 rate limit exceeded |
 | `SCP-SAGA-13024` | handler | Per-caller §6.2.0.2 rate limit exceeded |
 | `SCP-SAGA-13025` | handler | Caller role not in inbound `allowed_source_roles` |
@@ -98,8 +97,6 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13036` | handler | Divergence-marker signing failed |
 | `SCP-SAGA-13037` | handler | Divergence-marker serialization failed |
 | `SCP-SAGA-13038` | handler | Saga phase reached the wrong dispatch helper |
-| `SCP-SAGA-13040` | supervisor | Commit — target receipt missing for saga |
-| `SCP-SAGA-13041` | supervisor | Commit — target receipt signature invalid |
 | `SCP-SAGA-13050` | supervisor | Initiator is not a member of the named caller context (caller-axis authorize-before-reserve) |
 | `SCP-SAGA-13051` | supervisor | Prepare — `CrossContextToolInvocation` reached `start_saga` without an executor context |
 | `SCP-SAGA-13052` | supervisor | Prepare-A — caller context is not a co-resident actor |
@@ -112,6 +109,9 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13059` | supervisor | Commit-A — no held reservation and witness absent (Commit-A did not durably land) |
 | `SCP-SAGA-13060` | supervisor | Commit-B settle — target context is not a co-resident actor |
 | `SCP-SAGA-13061` | supervisor | Commit-A — caller context is not a co-resident actor |
+| `SCP-SAGA-13062` | supervisor | No established interface for the (caller, target, tool) triple (target-axis authorize-before-reserve) |
+| `SCP-SAGA-13063` | supervisor | Commit — target receipt missing for saga |
+| `SCP-SAGA-13064` | supervisor | Commit — target receipt signature invalid |
 
 ### Registered SCP-ATTEST- codes
 

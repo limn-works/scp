@@ -114,18 +114,14 @@ fn standing_pair(a: &str, b: &str) -> SagaInput {
 /// envelope fields are placeholders — these gating tests never reach
 /// Prepare-B (no co-resident actors), so only the two context ids (the
 /// reservation key) are load-bearing.
+///
+/// The variant is construction-sealed against production callers (only
+/// `start_cross_context_tool_invocation_saga` can build it there); this gating
+/// test reaches it through the `test`/`testing`-gated
+/// [`SagaInput::test_cross_context_for_gating`] constructor, which fills the
+/// same placeholders.
 fn cross_context(caller: [u8; 32], target: [u8; 32]) -> SagaInput {
-    SagaInput::CrossContextToolInvocation {
-        caller_context_id: caller,
-        target_context_id: target,
-        caller_did: DID("did:example:caller".to_owned()),
-        tool_registration_id: "tool-1".to_owned(),
-        ucan_proof_id: None,
-        input: serde_json::json!({}),
-        asserted_chain_depth: 0,
-        asserted_nonce: [0u8; 16],
-        asserted_timestamp_ms: 0,
-    }
+    SagaInput::test_cross_context_for_gating(caller, target)
 }
 
 /// Assert a saga terminated at a NON-busy terminal. Driving a

@@ -73,6 +73,32 @@ pub const ACTOR_MAILBOX_CAPACITY: usize = 256;
 // SagaInput / SagaOutput — plan §"Cross-context saga protocol"
 // ---------------------------------------------------------------------------
 
+/// Construction seal for [`SagaInput::CrossContextToolInvocation`]. A field of
+/// this type makes the variant un-constructible outside this module: the seal's
+/// single field is PRIVATE, so no `CrossContextSagaSeal { .. }` literal is
+/// possible outside `supervisor.rs`, and the only constructor
+/// ([`Self::new`]) is module-private. A cross-context tool invocation can
+/// therefore only be started via
+/// [`Supervisor::start_cross_context_tool_invocation_saga`] — the sole entry
+/// point that supplies the supervisor-side executor + signing keys. The variant
+/// remains freely pattern-matchable (`{ .. }`) everywhere; only its
+/// construction is sealed.
+///
+/// The TYPE is named at the enclosing `pub enum`'s visibility (so the
+/// `private_interfaces` lint is satisfied — the field is `pub` by enum
+/// inheritance), but CONSTRUCTABILITY is gated by the private field, exactly the
+/// "nameable ≠ constructible" discipline ADR-049 §5 uses for `OwnedIdentityDid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossContextSagaSeal(());
+
+impl CrossContextSagaSeal {
+    /// Mint the seal. Module-private: only `supervisor.rs` can construct it, so
+    /// only `supervisor.rs` can construct a `CrossContextToolInvocation` input.
+    const fn new() -> Self {
+        Self(())
+    }
+}
+
 /// Input to `Supervisor::start_saga`. The variant enumerates the 3
 /// saga types defined in plan §"Cross-context saga protocol"
 /// (standing-pair create, cross-context tool invoke, broadcast hosting
@@ -82,6 +108,24 @@ pub const ACTOR_MAILBOX_CAPACITY: usize = 256;
 /// The type is a discriminated union so that adding a fourth saga type
 /// later is a compile error at every call site — the default branch is
 /// not permitted.
+///
+/// # Construction of `CrossContextToolInvocation` is sealed
+///
+/// The `CrossContextToolInvocation` variant carries a private
+/// [`CrossContextSagaSeal`] guard field, so it CANNOT be constructed outside
+/// this module: an external caller cannot name the seal type to build the
+/// variant. This makes a "construct it, then hand it to the generic
+/// [`Supervisor::start_saga`]" misuse a COMPILE error rather than a runtime
+/// abort — a cross-context tool invocation can only be started through the
+/// dedicated [`Supervisor::start_cross_context_tool_invocation_saga`], which is
+/// the only entry point that can supply the supervisor-side tool executor and
+/// the target/caller Active Signing Keys the FSM needs (Agent-first API tenet:
+/// a required choice the type system can enforce must not be skippable). The
+/// generic `start_saga` therefore only ever receives the publicly-constructible
+/// variants (`StandingPairCreate` / `BroadcastHostingHandshake`, both
+/// `NotImplemented` today). External pattern-matching on
+/// `CrossContextToolInvocation { .. }` is still allowed; only construction is
+/// sealed.
 pub enum SagaInput {
     /// Standing-pair creation between two identities. Full field set
     /// arrives with `handlers/standing.rs` in commit 11.
@@ -126,6 +170,14 @@ pub enum SagaInput {
         /// Caller-asserted send-time (ms) — used ONLY for the §9.14 skew
         /// freshness check, never recorded (spec §6.2.4 "Recorded timestamp").
         asserted_timestamp_ms: u64,
+        /// Private construction seal (see the `SagaInput` doc-comment): the
+        /// variant cannot be built outside this module because the field's
+        /// type is module-private, so the only way to start a cross-context
+        /// tool-invocation saga is the dedicated
+        /// [`Supervisor::start_cross_context_tool_invocation_saga`], which
+        /// supplies the executor + signing keys the generic `start_saga`
+        /// cannot.
+        _seal: CrossContextSagaSeal,
     },
     /// Broadcast hosting handshake.
     BroadcastHostingHandshake {
@@ -150,6 +202,39 @@ pub enum SagaInput {
         /// The single participant context this test saga reserves.
         context_id: [u8; 32],
     },
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl SagaInput {
+    /// Test-only constructor for a `CrossContextToolInvocation` input whose only
+    /// load-bearing fields are the `{caller, target}` participant context set
+    /// (every other field is a fixed placeholder). It exists so the
+    /// per-participant-context-set GATING tests — which drive a cross-context
+    /// input through the generic `start_saga` precisely to prove the reservation
+    /// is released on the executor-less misuse path — can still build the
+    /// variant the production seal otherwise forbids. It is gated behind
+    /// `test`/`testing` so no production FFI build can reach it: a production
+    /// cross-context saga is started ONLY via
+    /// [`Supervisor::start_cross_context_tool_invocation_saga`], which supplies
+    /// the executor + signing keys.
+    #[must_use]
+    pub fn test_cross_context_for_gating(
+        caller_context_id: [u8; 32],
+        target_context_id: [u8; 32],
+    ) -> Self {
+        Self::CrossContextToolInvocation {
+            caller_context_id,
+            target_context_id,
+            caller_did: DID("did:example:caller".to_owned()),
+            tool_registration_id: "tool-1".to_owned(),
+            ucan_proof_id: None,
+            input: serde_json::json!({}),
+            asserted_chain_depth: 0,
+            asserted_nonce: [0u8; 16],
+            asserted_timestamp_ms: 0,
+            _seal: CrossContextSagaSeal::new(),
+        }
+    }
 }
 
 /// Output from `Supervisor::start_saga` on success. Carries the durable
@@ -4877,6 +4962,28 @@ impl Supervisor {
     /// Either gate failing rejects with [`ContextError::PermissionDenied`]
     /// WITHOUT reserving any context.
     ///
+    /// # Forward obligation — `caller_did` MUST be channel-authenticated at the FFI seam
+    ///
+    /// This saga has NO production caller yet. Its channel-auth defenses — gate 1
+    /// above, the §6.2.4 *Caller authentication* clause, the aggregate
+    /// nonce-eviction replay bound (spec §6.2.4 *Cache-eviction bound*), and B's
+    /// `InboundPolicy` role check — ALL rest on `caller_did` (and
+    /// `caller_context_id`) being the AUTHENTICATED identity of the transport
+    /// leg, never an envelope-asserted value. The supervisor here only verifies
+    /// `is_member` (membership), which is NECESSARY but NOT SUFFICIENT: membership
+    /// does not by itself prove the request leg is authenticated as that member.
+    ///
+    /// Therefore the FFI/SDK wiring that eventually EXPOSES this saga MUST bind
+    /// `caller_did` / `caller_context_id` to the authenticated FFI principal /
+    /// channel — NOT merely to membership — per the §6.2.0 / §6.2.4
+    /// "channel-authenticated identity" requirement, before any value is passed
+    /// into this entry point. This is a forward obligation tied to the deferred
+    /// FFI surface (mirroring the ADR-049 §3a forward-obligation discipline and
+    /// the CLAUDE.md integration checklist: function → ContextManager → FFI →
+    /// SDK → `pipeline_wiring` assertion). It is recorded here as the upstream
+    /// anchor; the co-resident core path does not yet have an untrusted leg, so
+    /// the obligation lands with the wiring, not in this function.
+    ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if the initiator is not a member of
@@ -4936,7 +5043,7 @@ impl Supervisor {
             .await
         {
             return Err(ContextError::PermissionDenied(format!(
-                "SCP-SAGA-13022: cross-context saga from caller context '{caller_hex}' to target \
+                "SCP-SAGA-13062: cross-context saga from caller context '{caller_hex}' to target \
                  context '{target_hex}' has no established interface for tool \
                  '{tool_registration_id}' — not authorized to invoke (and not authorized to \
                  reserve the target's saga slot)"
@@ -4994,6 +5101,9 @@ impl Supervisor {
             asserted_chain_depth,
             asserted_nonce,
             asserted_timestamp_ms,
+            // This is the sole production construction site: the dedicated
+            // entry point supplied the executor + signing keys above.
+            _seal: CrossContextSagaSeal::new(),
         };
 
         // Per-participant-context-set reservation (ADR-049 §3a, spec §5.15.4):
@@ -5379,6 +5489,19 @@ impl Supervisor {
                 );
             }
             CommitInProgressResolution::NeedsRepair => {
+                // Append a plain (empty-evidence) NeedsRepair terminal. This is
+                // the divergence-class terminal for the NeedsRepair paths that do
+                // NOT go through `record_supervisor_repair` — target unreachable,
+                // `ReadyToExecute` (Commit-B never landed), a Commit-B reserve
+                // send failure, or a non-reconstructible entry — where it is the
+                // ONLY durable NeedsRepair record, so it MUST NOT be dropped. When
+                // the divergence WAS one-sided, `redrive_commit_a_witness` already
+                // wrote an evidence-bearing repair entry at a HIGHER seq (>= 5)
+                // via `record_supervisor_repair`; `load_unresolved` selects the
+                // max-seq entry per saga, so that richer entry supersedes this
+                // empty one — the empty append is harmless (never the surviving
+                // read), not authoritative. (Latest-per-saga = empty here does
+                // NOT mean "no divergence detail": it means no side committed.)
                 let _ = self
                     .saga_journal
                     .append(JournalEntry {
@@ -6130,7 +6253,7 @@ impl Supervisor {
         let receipt: CrossContextToolReceipt =
             serde_json::from_slice(receipt_bytes).map_err(|e| {
                 ContextError::CryptoFailed(format!(
-                    "SCP-SAGA-13040: cross-context saga Commit — target receipt for saga '{}' \
+                    "SCP-SAGA-13063: cross-context saga Commit — target receipt for saga '{}' \
                      is not a decodable CrossContextToolReceipt: {e}",
                     saga_id.0
                 ))
@@ -6138,7 +6261,7 @@ impl Supervisor {
         let authorized_target_key = ctx.target_signing_key.verifying_key();
         receipt.verify(&authorized_target_key).map_err(|e| {
             ContextError::CryptoFailed(format!(
-                "SCP-SAGA-13041: cross-context saga Commit — target receipt signature for saga \
+                "SCP-SAGA-13064: cross-context saga Commit — target receipt signature for saga \
                  '{}' does not verify under the key authorized for the target context (forged or \
                  tampered receipt — aborting before settle): {e}",
                 saga_id.0
@@ -14640,7 +14763,7 @@ mod tests {
     /// FIX A target-wedge (BLACK-624-02): a caller who is a member of its OWN
     /// context but has NO established interface to a VICTIM target cannot reserve
     /// (and thereby wedge) the victim's saga slot. The saga rejects with the
-    /// target-axis authorize-before-reserve error (SCP-SAGA-13022) BEFORE any
+    /// target-axis authorize-before-reserve error (SCP-SAGA-13062) BEFORE any
     /// reservation, and a LEGITIMATE saga touching the victim target is NOT
     /// locked out afterward (the victim slot was never taken).
     #[tokio::test]
@@ -14696,8 +14819,8 @@ mod tests {
             .await
             .expect_err("a caller with no established interface to the victim must be rejected");
         assert!(
-            matches!(&err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13022")),
-            "expected target-axis authorize-before-reserve rejection (SCP-SAGA-13022), got: {err:?}"
+            matches!(&err, ContextError::PermissionDenied(m) if m.contains("SCP-SAGA-13062")),
+            "expected target-axis authorize-before-reserve rejection (SCP-SAGA-13062), got: {err:?}"
         );
 
         // The victim's saga slot was NEVER reserved — a legitimate saga that
@@ -14714,6 +14837,7 @@ mod tests {
                 asserted_chain_depth: 0,
                 asserted_nonce: [0u8; 16],
                 asserted_timestamp_ms: 0,
+                _seal: CrossContextSagaSeal::new(),
             });
         assert!(
             !matches!(legit, Err(ContextError::ActorBusy(_))),
@@ -14750,6 +14874,7 @@ mod tests {
                 asserted_chain_depth: 0,
                 asserted_nonce: [0u8; 16],
                 asserted_timestamp_ms: 0,
+                _seal: CrossContextSagaSeal::new(),
             })
             .expect("first reservation succeeds");
 
@@ -15662,7 +15787,7 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Err(ContextError::CryptoFailed(m)) if m.contains("SCP-SAGA-13041")
+                Err(ContextError::CryptoFailed(m)) if m.contains("SCP-SAGA-13064")
             ),
             "a receipt signed by a key NOT authorized for the target context must be rejected \
              before settle, got {result:?}"

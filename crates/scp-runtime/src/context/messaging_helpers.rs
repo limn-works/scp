@@ -2122,7 +2122,7 @@ pub fn build_snapshot_from_state(
         // survives an actor crash. See [`saga_pending_snapshot`].
         saga_pending: saga_pending_snapshot(state),
         xctx_committed_outputs: xctx_committed_outputs_snapshot(state),
-        xctx_committed_invocations: state.xctx_committed_invocations.clone(),
+        xctx_committed_invocations: xctx_committed_invocations_snapshot(state),
         // ADR-049 §9 Class S (spec §6.2.4): persist the caller-side durable
         // reservation reversal records so a `PreparingB`-window crash can reverse
         // the caller deduction + void the escrow without the in-memory carrier.
@@ -2177,6 +2177,24 @@ pub(in crate::context) fn xctx_committed_outputs_snapshot(
     crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
 > {
     state.xctx_committed_outputs.clone()
+}
+
+/// Build the Class-S snapshot projection of the actor's caller-side (A-owned)
+/// COMMITTED cross-context tool-invocation witness set (spec §6.2.4 "Commit",
+/// caller side; §17.16.4 crash recovery; ADR-049 §9). The live
+/// [`PerContextState::xctx_committed_invocations`](crate::context::actor::state::PerContextState::xctx_committed_invocations)
+/// is a `{SagaId}` idempotency-witness set carrying no §9.4.3 bearer bytes, so —
+/// like [`xctx_committed_outputs_snapshot`] — the snapshot stores it directly
+/// via `Clone`. Exists so EVERY snapshot builder projects this Class-S saga
+/// field through ONE helper, exactly like its three siblings
+/// (`saga_pending_snapshot` / `xctx_committed_outputs_snapshot` /
+/// `xctx_nonce_dedup_snapshot`) — no Class-S saga field is centralized by
+/// convention alone. Without persisting it, a crash that rolled the witness back
+/// behind an acked Commit-A would double-settle the caller escrow on replay.
+pub(in crate::context) fn xctx_committed_invocations_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId> {
+    state.xctx_committed_invocations.clone()
 }
 
 /// Build the Class-S snapshot projection of the actor's B-owned cross-context

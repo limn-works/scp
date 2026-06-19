@@ -533,7 +533,8 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
             state,
         ),
-        xctx_committed_invocations: state.xctx_committed_invocations.clone(),
+        xctx_committed_invocations:
+            crate::context::messaging_helpers::xctx_committed_invocations_snapshot(state),
         xctx_caller_reservations: state.xctx_caller_reservations.clone(),
         xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(state),
     }

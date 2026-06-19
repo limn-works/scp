@@ -2,10 +2,13 @@
 //! [`SagaPhaseMessage`](crate::context::actor::commands::SagaPhaseMessage)
 //! and spec §6.2.4 (cross-context tool-invocation saga).
 //!
-//! # What runs here (slice 3b)
+//! # What runs here
 //!
-//! The supervisor FSM dispatches per-phase messages to a participant actor.
-//! This slice lands the two Prepare handlers, each running on a LOCAL actor:
+//! The supervisor FSM dispatches per-phase messages to a participant actor;
+//! this module implements every phase handler, each running on a LOCAL actor.
+//! All phases are fully implemented AND supervisor-driven (the FSM in
+//! `supervisor/supervisor.rs` drives them end-to-end via
+//! [`Supervisor::start_cross_context_tool_invocation_saga`](crate::context::supervisor::supervisor::Supervisor::start_cross_context_tool_invocation_saga)).
 //!
 //! - **Prepare-A** ([`prepare_a`]) — on the caller-context actor. Validates the
 //!   caller holds `tool:interface` and is in `OutboundPolicy.allowed_callers`,
@@ -27,10 +30,20 @@
 //!   [`CrossContextToolInvocationPrepared`] into `saga_pending`, and Class-S
 //!   sync-persists fail-closed before replying.
 //!
-//! The Commit / Abort / divergence-marker arms are dispatched in later slices;
-//! their handler bodies return [`ContextError::NotImplemented`] here. The
-//! supervisor FSM that *drives* these messages to the two local actors is a
-//! later slice too — these handlers are compiled-but-not-yet-driven.
+//! - **Commit** — split into [`commit_b_reserve`] → (supervisor-side execute) →
+//!   [`commit_b_settle`] (B records `ToolInvoked`, signs the
+//!   [`CrossContextToolReceipt`], durably captures the output keyed by `SagaId`
+//!   for replay) and [`commit_a`] (A re-acks from the durable
+//!   `xctx_committed_invocations` witness, settles escrow, records
+//!   `CrossContextToolInvoked`), with [`commit_a_check_witness`] serving the
+//!   §17.16.4 recovery witness query — all idempotent by `SagaId`.
+//!
+//! - **Abort** ([`abort`]) — releases the staged reservations (live carrier or
+//!   the durable caller-reservation record on the crash-recovery `None` path).
+//!
+//! - **Divergence marker** ([`emit_divergence_marker`]) — on a one-sided
+//!   `NeedsRepair`, each reachable side signs + appends its OWN
+//!   [`CrossContextDivergenceMarker`] into its own log.
 //!
 //! # Error band
 //!
@@ -94,13 +107,29 @@ pub(crate) const SAGA_NONCE_DEDUP_TTL_SECS: u64 = DEFAULT_CLOCK_SKEW_TOLERANCE_S
 /// margin: at this per-minute rate the worst-case distinct-nonce volume over
 /// the TTL window stays at or below half the
 /// [`NONCE_DEDUP_CAPACITY`](scp_protocol::crypto::sender_keys::NONCE_DEDUP_CAPACITY)
-/// (10 000), so a sustained in-budget inbound stream can NEVER fill the cache
-/// and evict a still-within-TTL `nonce` — TTL expiry, not capacity eviction,
-/// bounds the replay window. `500/min × 10 min × 2 = 10 000 = capacity`. A
-/// higher ceiling would let in-budget traffic erode the replay bound, so an
-/// interface configuring an inbound rate above this is REJECTED at Prepare-B
+/// (10 000), so a sustained in-budget inbound stream THROUGH ONE INTERFACE can
+/// never fill the cache and evict a still-within-TTL `nonce` — TTL expiry, not
+/// capacity eviction, bounds the replay window for that interface.
+/// `500/min × 10 min × 2 = 10 000 = capacity`. A higher ceiling would let one
+/// interface's in-budget traffic erode the replay bound, so an interface
+/// configuring an inbound rate above this is REJECTED at Prepare-B
 /// (`consume_inbound_interface_rate_limit`, `SCP-SAGA-13027`). The
-/// `nonce_dedup_replay_bound_holds` test asserts this derivation mechanically.
+/// `nonce_dedup_replay_bound_holds` test asserts this PER-INTERFACE derivation
+/// mechanically.
+///
+/// **Scope: per-interface, NOT aggregate (honest bound).** This ceiling is
+/// enforced per interface, but `xctx_nonce_dedup` is a SINGLE per-context-B
+/// cache shared across ALL inbound interfaces. With ≥3 distinct interfaces each
+/// at this ceiling, their summed volume CAN exceed the cache capacity over the
+/// TTL window and evict a still-fresh nonce — so this constant does NOT by
+/// itself bound the AGGREGATE replay window. The aggregate bound rests on the
+/// channel-authenticated `caller_did` gate (spec §6.2.4 *Cache-eviction bound* /
+/// *Caller authentication*): a replay must pass the supervisor's gate-1
+/// `is_member`/`caller_did` check on the attacker's OWN channel, so evicting a
+/// victim's nonce yields no usable replay (a third party cannot present the
+/// victim's `caller_did`; a caller replaying its own invocation re-spends its
+/// own non-refundable budget). This per-interface ceiling is defense-in-depth
+/// under that channel-auth argument, not a standalone aggregate guarantee.
 pub(crate) const MAX_SAFE_INBOUND_CALLS_PER_MINUTE: u64 = 500;
 
 /// Lowercase-hex encode a raw 32-byte context-id digest (the wire / role-state
@@ -1911,16 +1940,40 @@ mod tests {
     const OTHER: &str = "did:dht:z6MkOtherPrincipalXXX";
     const TOOL: &str = "calculator-v1";
 
-    /// Defense-in-depth: the §6.2.4 per-target nonce dedup cache
-    /// ([`PerContextState::xctx_nonce_dedup`]) must be bounded by its TTL
-    /// (`NONCE_EXPIRY_SECS`), never by capacity eviction, for the replay
-    /// guarantee to hold. The worst-case number of distinct nonces a caller can
-    /// land within the TTL window is the configured inbound accept rate
-    /// (`InboundPolicy::max_calls_per_minute`) scaled to the window. Assert that
-    /// (a) the DEFAULT inbound ceiling holds with a ≥2× margin, and (b) the
-    /// documented configuration ceiling [`MAX_SAFE_INBOUND_CALLS_PER_MINUTE`]
-    /// still holds with a ≥2× margin — so a config-time check (or this
-    /// invariant) catches a future high ceiling before it erodes the bound.
+    /// Defense-in-depth (PER-INTERFACE bound only): the §6.2.4 per-target nonce
+    /// dedup cache ([`PerContextState::xctx_nonce_dedup`]) should be bounded by
+    /// its TTL (`SAGA_NONCE_DEDUP_TTL_SECS`), not by capacity eviction, for a
+    /// SINGLE interface's replay guarantee to hold. The worst-case number of
+    /// distinct nonces ONE interface can land within the TTL window is its
+    /// configured inbound accept rate (`InboundPolicy::max_calls_per_minute`)
+    /// scaled to the window. This test asserts that (a) the DEFAULT inbound
+    /// ceiling and (b) the documented per-interface ceiling
+    /// [`MAX_SAFE_INBOUND_CALLS_PER_MINUTE`] each leave a ≥2× margin under the
+    /// shared cache capacity, so one in-budget interface can never fill the
+    /// cache and evict its own still-within-TTL nonce.
+    ///
+    /// **This per-interface guard does NOT bound the AGGREGATE (honest scope).**
+    /// `xctx_nonce_dedup` is a SINGLE per-context-B cache shared across ALL
+    /// inbound interfaces, but `consume_inbound_interface_rate_limit` enforces
+    /// `MAX_SAFE_INBOUND_CALLS_PER_MINUTE` PER INTERFACE. With ≥3 distinct
+    /// interfaces each at the ceiling, their summed in-budget volume CAN exceed
+    /// the cache capacity over the TTL window and evict a still-fresh nonce — so
+    /// this test's invariant, and the per-interface guard, do NOT establish the
+    /// aggregate replay bound. The aggregate replay bound rests instead on the
+    /// channel-authenticated `caller_did` gate (spec §6.2.4 *Cache-eviction
+    /// bound*, *Caller authentication*): a replayed `CrossContextToolInvoke`
+    /// must pass the supervisor's gate-1 `is_member`/`caller_did` check on the
+    /// ATTACKER's OWN authenticated channel — a third party cannot present a
+    /// victim's `caller_did`, and a caller replaying its own evicted invocation
+    /// merely re-spends its own non-refundable budget. Eviction therefore yields
+    /// no usable replay regardless of aggregate cache pressure. The per-interface
+    /// guard asserted below is DEFENSE-IN-DEPTH layered under that channel-auth
+    /// bound, not the aggregate bound itself. (No clean, cheap, NON-dynamic
+    /// aggregate guard exists: a static cap on the number of inbound interfaces
+    /// that actually preserved the cache margin would have to be 1 — arbitrary
+    /// and over-restrictive — and a per-context aggregate-rate accountant would
+    /// be exactly the dynamic mechanism the spec deliberately avoids in favor of
+    /// the channel-auth argument.)
     #[test]
     fn nonce_dedup_replay_bound_holds() {
         use scp_protocol::context::tools::interface::DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE;

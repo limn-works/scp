@@ -356,7 +356,8 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
             ctx,
         ),
-        xctx_committed_invocations: ctx.xctx_committed_invocations.clone(),
+        xctx_committed_invocations:
+            crate::context::messaging_helpers::xctx_committed_invocations_snapshot(ctx),
         xctx_caller_reservations: ctx.xctx_caller_reservations.clone(),
         xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(ctx),
     }
