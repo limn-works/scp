@@ -544,7 +544,7 @@ pub fn tool_invoke(
         })?;
 
         let result = with_manager(|mgr| {
-            mgr.invoke_tool(&context_id, &tool_id, &parsed_input, &identity_did)
+            mgr.invoke_tool(&context_id, &tool_id, &parsed_input)
         })
         .map_err(ScpWasmError::into_js)?;
 

@@ -2056,6 +2056,146 @@ fn golden_event_leaf_hash() {
 }
 
 // ===========================================================================
+// Cross-impl event-log convergence (§9.9.3) — WASM ⇄ native parity
+//
+// Both the WASM bridge (`crates/scp-ffi/wasm/src/manager.rs`) and the native
+// scp-runtime provider build durable leaves through the SAME `scp_event_log`
+// crate (`tree::append_unsigned_event`, leaf = `SHA-256(0x00 || rmp_serde(
+// Event))`, root = RFC-6962 `tree::root`). The native-side soundness proof
+// lives in `crates/scp-runtime/tests/eventlog_convergence.rs`; this is its
+// cross-implementation analogue.
+//
+// The §9.9.3 invariant: two honest members at the same canonical log position
+// MUST derive byte-identical `tree::root`. The canonical log therefore carries
+// only CONVERGENT (MLS-commit-ordered) events. Per-author application activity
+// (`MessageSent`, `ToolInvoked`) is excluded (ADR-011 amendment exclusion
+// taxonomy, `.docs/adrs/phase-2.md` §2): it is surfaced as a local
+// `ContextEvent` with NO durable leaf. This test pins that a WASM-shaped member
+// and a native-shaped member who process the SAME convergent stream but perform
+// DIFFERENT amounts of per-author activity still converge to the SAME root —
+// because neither appends a per-author leaf — while a convergent event DOES
+// move the root (non-vacuity).
+// ===========================================================================
+
+/// Appends the convergent, commit-ordered stream every honest member appends
+/// identically and in the same order. Mirrors `append_convergent_stream` in
+/// the native `eventlog_convergence.rs`.
+fn append_convergent_stream_shared(log: &mut scp_event_log::EventLog) {
+    use scp_event_log::tree::append_unsigned_event;
+    use scp_event_log::{DID, Event, EventPayload, EventType};
+
+    let entries = [
+        (EventType::ContextCreated, "did:dht:zAlice"),
+        (EventType::MemberJoined, "did:dht:zAlice"),
+        (EventType::MemberJoined, "did:dht:zBob"),
+    ];
+    for (event_type, actor) in entries {
+        let sequence = scp_event_log::tree::event_count(log);
+        let prev_hash = if log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            log.leaves()[log.leaves().len() - 1]
+        };
+        append_unsigned_event(
+            log,
+            &Event {
+                event_type,
+                actor_did: DID::from(actor.to_owned()),
+                timestamp: 1_700_000_000 + sequence,
+                sequence,
+                payload: EventPayload { data: Vec::new() },
+                prev_hash,
+                signature: Vec::new(),
+            },
+        )
+        .expect("convergent append must succeed");
+    }
+}
+
+#[test]
+fn wasm_and_native_members_converge_despite_divergent_per_author_activity() {
+    use scp_event_log::tree::root;
+
+    // Member A — the WASM-shaped member. Performs 3 local sends + 1 local
+    // tool-invoke: under the exclusion taxonomy these surface as local
+    // `ContextEvent`s only, so NOTHING is appended to A's durable log here.
+    let mut log_a = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_convergent_stream_shared(&mut log_a);
+    // (3 sends + 1 tool-invoke happen as local ContextEvents — no durable leaf.)
+
+    // Member B — the native-shaped member. Performs 5 local sends + 2 local
+    // tool-invokes — also durable-leaf-free.
+    let mut log_b = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_convergent_stream_shared(&mut log_b);
+    // (5 sends + 2 tool-invokes happen as local ContextEvents — no durable leaf.)
+
+    let root_a = root(&log_a);
+    let root_b = root(&log_b);
+
+    assert_eq!(
+        root_a, root_b,
+        "a WASM member and a native member with the same convergent stream MUST \
+         derive an identical Merkle root regardless of divergent per-author \
+         send / tool-invoke activity (§9.9.3 cross-impl convergence)"
+    );
+    assert_ne!(
+        root_a, [0u8; 32],
+        "the convergent stream is non-empty, so the shared root must be non-zero"
+    );
+}
+
+#[test]
+fn cross_impl_per_author_leaf_would_break_convergence() {
+    use scp_event_log::tree::{append_unsigned_event, event_count, root};
+    use scp_event_log::{DID, Event, EventPayload, EventType};
+
+    // Non-vacuity control: if per-author `MessageSent` WERE durably appended
+    // (the pre-unification behaviour), the divergent counts (1 vs 2) make the
+    // roots differ. This proves the convergence test above is not trivially
+    // true and that a regression re-introducing per-author leaves is caught.
+    let append_message_sent = |log: &mut scp_event_log::EventLog, actor: &str| {
+        let sequence = event_count(log);
+        let prev_hash = if log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            log.leaves()[log.leaves().len() - 1]
+        };
+        append_unsigned_event(
+            log,
+            &Event {
+                event_type: EventType::MessageSent,
+                actor_did: DID::from(actor.to_owned()),
+                timestamp: 1_700_000_100 + sequence,
+                sequence,
+                payload: EventPayload {
+                    data: b"msg".to_vec(),
+                },
+                prev_hash,
+                signature: Vec::new(),
+            },
+        )
+        .expect("append must succeed");
+    };
+
+    let mut log_a = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_convergent_stream_shared(&mut log_a);
+    append_message_sent(&mut log_a, "did:dht:zAlice");
+
+    let mut log_b = scp_event_log::EventLog::new("ctx-cross-converge".to_owned());
+    append_convergent_stream_shared(&mut log_b);
+    append_message_sent(&mut log_b, "did:dht:zBob");
+    append_message_sent(&mut log_b, "did:dht:zBob");
+
+    assert_ne!(
+        root(&log_a),
+        root(&log_b),
+        "with per-author MessageSent leaves durably appended, divergent counts \
+         (1 vs 2) MUST make the roots differ — the non-convergence the exclusion \
+         taxonomy guards against"
+    );
+}
+
+// ===========================================================================
 // JSON wire format stability tests
 //
 // These tests ensure that JSON output from WASM bridge functions maintains

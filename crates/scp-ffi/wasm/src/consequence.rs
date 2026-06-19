@@ -78,12 +78,17 @@ pub fn dispatch_consequences_for_subject(
     // dispatch_consequences` which does the same.
     let rules: Vec<ConsequenceRule> = ctx.consequence_rules().to_vec();
 
-    // Evaluate against the full event log (pure sync, no side effects).
-    // scp_event_log::EventLog::events() stores the full Event payload, so
-    // WASM has direct access to the data `evaluate_consequence_rules` needs.
+    // Evaluate against the merged event history (pure sync, no side effects):
+    // the durable Merkle log (convergent events) plus the recent receive
+    // buffer (per-author local `ContextEvent`s). This mirrors the native
+    // runtime's `event_log_entries_for_consequences`. After the ADR-011
+    // amendment exclusion taxonomy (`.docs/adrs/phase-2.md` §2) removed the
+    // per-author `MessageSent` / `ToolInvoked` Merkle leaves, velocity and
+    // tool-rate triggers MUST read those events from the receive buffer
+    // (Source 2) — local, per-receiver flow control needs no convergence.
     let triggered: Vec<TriggeredConsequence> = {
-        let events = ctx.event_log_events();
-        evaluate_consequence_rules(&rules, events, subject_did, now_secs)
+        let events = merged_consequence_events(ctx, now_secs);
+        evaluate_consequence_rules(&rules, &events, subject_did, now_secs)
     };
 
     let mut dispatcher = WasmConsequenceDispatcher { ctx };
@@ -95,6 +100,171 @@ pub fn dispatch_consequences_for_subject(
         &triggered,
         &rules,
     )
+}
+
+/// Maximum age (seconds) for receive-buffer events used in consequence
+/// evaluation. Events estimated older than this are discarded as stale,
+/// preventing manipulation via timestamp back-dating. Mirrors the native
+/// runtime's `MAX_BUFFER_EVENT_AGE_SECS`.
+const MAX_BUFFER_EVENT_AGE_SECS: u64 = 3600;
+
+/// Maximum clock-skew tolerance (seconds) for buffer-event timestamps. Events
+/// estimated more than this far in the future are discarded. Mirrors the
+/// native runtime's `MAX_FUTURE_TOLERANCE_SECS`.
+const MAX_FUTURE_TOLERANCE_SECS: u64 = 5;
+
+/// Maximum number of receive-buffer events consumed per consequence-evaluation
+/// cycle. Caps evaluation cost and prevents an attacker from flooding the
+/// buffer to drive synthetic high counts (e.g. inflating a `WarningCount`
+/// trigger). Mirrors the native runtime's `MAX_BUFFER_EVENTS_FOR_EVAL`.
+const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
+
+/// Encodes a governance target DID into the JSON payload shape the shared
+/// `WarningCount` / `Custom` trigger matcher decodes (`{"target_did": "..."}`).
+/// Mirrors the native runtime's `target_did_to_payload`.
+fn target_did_to_payload(did: Option<&scp_event_log::DID>) -> Vec<u8> {
+    did.map(|d| {
+        serde_json::to_vec(&serde_json::json!({ "target_did": d.as_ref() })).unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
+/// Collects the event history for consequence evaluation, merging the durable
+/// Merkle log with the recent receive buffer — the WASM analogue of the native
+/// runtime's `event_log_entries_for_consequences`.
+///
+/// Two sources are combined:
+///
+/// 1. **Durable log** ([`PerContextState::event_log_events`]) — convergent,
+///    commit-ordered events with real timestamps and `actor_did` (governance,
+///    membership, lifecycle, consequence-enforcement records). Per the ADR-011
+///    amendment exclusion taxonomy (`.docs/adrs/phase-2.md` §2) this no longer
+///    contains the per-author `MessageSent` / `ToolInvoked` leaves.
+///
+/// 2. **Receive buffer** ([`PerContextState::event_buffer_events`]) — recent
+///    local `ContextEvent`s, including the per-author `MessageSent` that
+///    velocity triggers need. Buffer events use estimated timestamps spaced one
+///    second apart backwards from `now`, and are bounded by
+///    [`MAX_BUFFER_EVENTS_FOR_EVAL`], [`MAX_BUFFER_EVENT_AGE_SECS`], and
+///    [`MAX_FUTURE_TOLERANCE_SECS`] to cap cost and resist back-dating /
+///    flooding manipulation.
+///
+/// Event types are projected onto the coarse trigger buckets the shared
+/// `matches_trigger` understands (governance / consequence variants collapse to
+/// [`scp_event_log::EventType::GovernanceAction`]).
+fn merged_consequence_events(ctx: &PerContextState, now_secs: u64) -> Vec<scp_event_log::Event> {
+    use scp_event_log::{Event, EventPayload, EventType};
+    use scp_protocol::context::membership::ContextEvent;
+
+    let mut events: Vec<Event> = Vec::new();
+
+    // Source 1: durable Merkle log. Project each entry's typed `EventType`
+    // onto the bucket `matches_trigger` understands. Governance and
+    // consequence-enforcement variants collapse to `GovernanceAction` so that
+    // `WarningCount` / `Custom` triggers (and recursive consequence rules) can
+    // observe prior governance and prior enforcement.
+    for entry in ctx.event_log_events() {
+        let event_type = match entry.event_type {
+            EventType::MessageSent => EventType::MessageSent,
+            EventType::MemberJoined => EventType::MemberJoined,
+            EventType::MemberLeft => EventType::MemberLeft,
+            EventType::RoleAssigned => EventType::RoleAssigned,
+            EventType::ToolRegistered | EventType::ToolRemoved | EventType::ToolInvoked => {
+                EventType::ToolInvoked
+            }
+            EventType::GovernanceAction
+            | EventType::GovernanceProposalCreated
+            | EventType::GovernanceVoteCast
+            | EventType::GovernanceVoteWithdrawn
+            | EventType::GovernanceProposalResolved
+            | EventType::GovernanceDeadlockRecovery
+            | EventType::GovernanceConflictDetected
+            | EventType::GovernanceConflictResolved
+            | EventType::GovernanceActionExecuted
+            | EventType::AccessRevoked
+            | EventType::ConsequenceTriggered
+            | EventType::ConsequenceEnforced
+            | EventType::ConsequenceEnforcementFailed
+            | EventType::ConsequenceEscalatedToSuspendAll => EventType::GovernanceAction,
+            _ => continue,
+        };
+        events.push(Event {
+            event_type,
+            actor_did: entry.actor_did.clone(),
+            timestamp: entry.timestamp,
+            sequence: events.len() as u64,
+            payload: entry.payload.clone(),
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        });
+    }
+
+    // Source 2: receive buffer (recent local `ContextEvent`s). Only accept
+    // events newer than the last durable entry to avoid double-counting.
+    let last_log_ts = events.last().map_or(0, |e| e.timestamp);
+    let buffer = ctx.event_buffer_events();
+    let buffer_len = buffer.len() as u64;
+    let next_seq = events.len() as u64;
+    let mut buffer_events_accepted: usize = 0;
+
+    for (idx, ctx_event) in buffer.iter().enumerate() {
+        let (event_type, actor_did, payload_data) = match ctx_event {
+            ContextEvent::MessageSent { sender_did, .. }
+            | ContextEvent::MessageReceived { sender_did, .. } => {
+                (EventType::MessageSent, sender_did.clone(), Vec::new())
+            }
+            ContextEvent::MemberJoined { member_did, .. } => {
+                (EventType::MemberJoined, member_did.clone(), Vec::new())
+            }
+            ContextEvent::MemberLeft { member_did } => {
+                (EventType::MemberLeft, member_did.clone(), Vec::new())
+            }
+            ContextEvent::GovernanceActionExecuted {
+                executor_did,
+                target_did,
+                ..
+            } => (
+                EventType::GovernanceAction,
+                executor_did.clone(),
+                target_did_to_payload(target_did.as_ref()),
+            ),
+            _ => continue,
+        };
+
+        // Oldest buffer event gets `now - (buffer_len - 1)`, newest gets `now`.
+        let estimated_ts =
+            now_secs.saturating_sub(buffer_len.saturating_sub(1).saturating_sub(idx as u64));
+
+        // Skip buffer events likely already covered by the durable log.
+        if estimated_ts <= last_log_ts && last_log_ts > 0 {
+            continue;
+        }
+        // Reject implausibly-future estimates (defense in depth).
+        if estimated_ts > now_secs.saturating_add(MAX_FUTURE_TOLERANCE_SECS) {
+            continue;
+        }
+        // Reject stale estimates (back-dating defense).
+        if now_secs.saturating_sub(estimated_ts) > MAX_BUFFER_EVENT_AGE_SECS {
+            continue;
+        }
+        // Cap the number of buffer events fed to the evaluator (flood defense).
+        if buffer_events_accepted >= MAX_BUFFER_EVENTS_FOR_EVAL {
+            break;
+        }
+        buffer_events_accepted += 1;
+
+        events.push(Event {
+            event_type,
+            actor_did,
+            timestamp: estimated_ts,
+            sequence: next_seq + idx as u64,
+            payload: EventPayload { data: payload_data },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        });
+    }
+
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +495,58 @@ mod tests {
         assert!(!ctx.member_has_capability_pub("did:test:admin", "messages:write"));
         // Other capabilities still allowed — Suspend is targeted.
         assert!(ctx.member_has_capability_pub("did:test:admin", "messages:read"));
+        let suspended = ctx.test_suspended_capabilities("did:test:admin").unwrap();
+        assert!(suspended.contains("messages:write"));
+    }
+
+    /// **E2-3b:** the velocity trigger fires from the RECEIVE BUFFER, not the
+    /// durable Merkle log. After the ADR-011 amendment exclusion taxonomy
+    /// (`.docs/adrs/phase-2.md` §2), `send_message` no longer appends a
+    /// `MessageSent` Merkle leaf — it surfaces a local
+    /// `ContextEvent::MessageSent` via `push_event`. This pins that
+    /// `dispatch_consequences_for_subject` still observes those per-author
+    /// events through `merged_consequence_events`' receive-buffer source, so
+    /// velocity rules keep firing (matching native flow control). The durable
+    /// event log is intentionally left EMPTY here.
+    #[test]
+    fn dispatch_velocity_fires_from_receive_buffer_not_durable_log() {
+        use scp_protocol::context::membership::ContextEvent;
+
+        let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
+        ctx.test_insert_ceiling("messages:write");
+        ctx.test_insert_ceiling("messages:read");
+
+        ctx.test_push_consequence_rule(rule(ConsequenceAction::Enforcement(
+            EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            },
+        )));
+
+        // Surface two per-author sends as LOCAL ContextEvents only (exactly
+        // what `send_message` does now) — NO durable leaf is appended.
+        ctx.push_event_pub(ContextEvent::MessageSent {
+            sender_did: LogDID("did:test:admin".to_owned()),
+            sequence_number: 0,
+            payload: b"hi".to_vec(),
+        });
+        ctx.push_event_pub(ContextEvent::MessageSent {
+            sender_did: LogDID("did:test:admin".to_owned()),
+            sequence_number: 1,
+            payload: b"hi".to_vec(),
+        });
+
+        // Precondition: the durable Merkle log is empty (no per-author leaf).
+        assert!(
+            ctx.event_log_events().is_empty(),
+            "per-author sends must NOT append durable Merkle leaves"
+        );
+
+        let dispatched = dispatch_consequences_for_subject(&mut ctx, "ctx", "did:test:admin", 1000);
+        assert_eq!(
+            dispatched, 1,
+            "velocity rule must fire from the receive-buffer MessageSent events"
+        );
+        assert!(!ctx.member_has_capability_pub("did:test:admin", "messages:write"));
         let suspended = ctx.test_suspended_capabilities("did:test:admin").unwrap();
         assert!(suspended.contains("messages:write"));
     }

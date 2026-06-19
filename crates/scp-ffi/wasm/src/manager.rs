@@ -578,6 +578,19 @@ impl PerContextState {
         self.event_log.events()
     }
 
+    /// Returns the recent receive-buffer events (local `ContextEvent`s) used
+    /// as a supplementary source for consequence evaluation.
+    ///
+    /// Per the ADR-011 amendment exclusion taxonomy
+    /// (`.docs/adrs/phase-2.md` §2), per-author application activity such as
+    /// `MessageSent` is no longer a durable Merkle leaf — it is surfaced only
+    /// as a local `ContextEvent` in this buffer. The consequence engine reads
+    /// velocity / rate triggers from here, mirroring the native runtime's
+    /// `event_log_entries_for_consequences` Source 2 (the receive buffer).
+    pub(crate) fn event_buffer_events(&self) -> &VecDeque<ContextEvent> {
+        &self.event_buffer
+    }
+
     /// Checks whether the subject is currently a member of the context.
     pub(crate) fn members_contains(&self, subject_did: &str) -> bool {
         self.members.contains_key(subject_did)
@@ -1583,11 +1596,13 @@ impl WasmContextManager {
             payload: recorded_payload.as_bytes().to_vec(),
         });
 
-        ctx.append_log_event(
-            EventType::MessageSent,
-            sender_did,
-            recorded_payload.as_bytes(),
-        );
+        // Per-author application activity (MessageSent) is NOT appended to the
+        // canonical Merkle log: each author mints leaves in its own per-author
+        // sequence with no global order, so two honest members would derive
+        // different `tree::root` and §9.9.3 equivocation detection would break.
+        // It is surfaced only as a local `ContextEvent` (the `push_event`
+        // above). This matches the native scp-runtime exclusion and the
+        // ADR-011 amendment exclusion taxonomy (`.docs/adrs/phase-2.md` §2).
 
         // Evaluate and enforce consequence rules for the sender. Mirrors
         // `scp_runtime::context::manager::messaging::send_message` which
@@ -1940,7 +1955,6 @@ impl WasmContextManager {
         context_id: &str,
         tool_id: &str,
         input_json: &serde_json::Value,
-        identity_did: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -1985,7 +1999,15 @@ impl WasmContextManager {
             })
         };
 
-        ctx.append_log_event(EventType::ToolInvoked, identity_did, tool_id.as_bytes());
+        // `ToolInvoked` is per-author application activity (ADR-011 amendment
+        // exclusion taxonomy, `.docs/adrs/phase-2.md` §2): appended only by its
+        // author in a per-author sequence with no global order, so a durable
+        // leaf would make honest members diverge on `tree::root` and break
+        // §9.9.3 equivocation detection. Native scp-runtime appends no durable
+        // leaf and surfaces no local `ContextEvent` for intra-context tool
+        // invocations, so neither does WASM. (`tool_invocation_count` is
+        // recomputed from local events; it carries `anchored=false` until
+        // ADR-051's causal DAG makes the count convergent.)
 
         Ok(result)
     }
@@ -4292,11 +4314,10 @@ impl WasmContextManager {
             payload: payload_base64.as_bytes().to_vec(),
         });
 
-        ctx.append_log_event(
-            EventType::MessageSent,
-            author_did,
-            payload_base64.as_bytes(),
-        );
+        // Per-author broadcast activity is surfaced only as a local
+        // `ContextEvent` (above), never as a canonical Merkle leaf — same
+        // per-author exclusion as `send_message` (ADR-011 amendment exclusion
+        // taxonomy, `.docs/adrs/phase-2.md` §2).
 
         Ok(())
     }
@@ -8032,8 +8053,10 @@ mod tests {
     /// **C2-E:** the C2 gate produces no false positive on free contexts.
     ///
     /// Native test runners cannot exercise the full `send_message` happy path
-    /// because `append_log_event` calls `crate::time::now_secs()`, which
-    /// panics under the wasm-bindgen stub on non-wasm targets (see C2-B).
+    /// because its consequence-dispatch step calls `crate::time::now_secs()`,
+    /// which panics under the wasm-bindgen stub on non-wasm targets (see C2-B).
+    /// (`send_message` no longer appends a durable `MessageSent` leaf — that
+    /// per-author event is surfaced only as a local `ContextEvent` now.)
     /// We instead set up a free context (no economic policy) and call
     /// `send_message` with a sender that is NOT a member: the C2 gate runs
     /// first, then the membership check returns `SCP-CTX-2019`. Observing
