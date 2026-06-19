@@ -567,6 +567,28 @@ scan_file() {
         }
         return ""
     }
+    # peel_leading_attrs — return `s` with leading whitespace trimmed and EVERY
+    # balanced single-line leading `#[..]` attribute peeled off, so a same-physical-
+    # line `#[rustfmt::skip] pub fn evil() { .. }` (or stacked `#[a] #[b] fn ..`)
+    # exposes its underlying item for the fn-detector to recognise. `#[rustfmt::skip]`
+    # PRESERVES hand-formatting, so attribute+item on one line is fmt-clean and
+    # reachable — a bare `^[[:space:]]*(pub..)?fn` anchor rejects the leading `#[`
+    # and would silently skip the function (and any Class-S mutation in its body,
+    # AND its `execute_*` governance-leaf classification). Reuses `strip_leading_attr`
+    # (the SAME primitive the NTTEST attr-peel uses — convergent, no new spelling
+    # enumeration). An UNBALANCED leading attribute (a multi-line `#[..]` head)
+    # stops the peel and returns the line as-is: the item is then on a LATER physical
+    # line and is recognised there normally, so this must not misread the head line.
+    function peel_leading_attrs(s,   t, peeled) {
+        t = s
+        sub(/^[[:space:]]+/, "", t)
+        while (t ~ /^#!?\[/) {
+            peeled = strip_leading_attr(t)
+            if (peeled == "") return t
+            t = peeled
+        }
+        return t
+    }
     # is_production_remainder — TRUE iff the post-structural-close remainder of a
     # physical line (already code-stripped) carries column-0 PRODUCTION content:
     # after trimming leading whitespace it is non-empty and is neither an
@@ -651,14 +673,6 @@ scan_file() {
             }
         }
         return 0
-    }
-    # remainder_after_brace_close — the substring of a STRIPPED line AFTER the `}`
-    # that closes the trailing test module (depth `pre` before this line), or ""
-    # if the module does not close on this line / nothing follows the closer.
-    function remainder_after_brace_close(s, pre,   p) {
-        p = brace_close_pos(s, pre)
-        if (p == 0) return ""
-        return substr(s, p + 1)
     }
     # remainder_after_attr_close — given a STRIPPED line and the in-flight
     # multi-line ATTRIBUTE bracket depth BEFORE this line (`pre`, the net unclosed
@@ -1379,13 +1393,33 @@ scan_file() {
         # qualifiers). Capture the name. We only treat a fn as "open" once we
         # see its opening brace (which may be on the signature line or a later
         # line for multi-line signatures).
-        if (!in_fn && line ~ /^[[:space:]]*(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
-            tmp = line
-            sub(/^[[:space:]]*(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+/, "", tmp)
-            sub(/[^A-Za-z0-9_].*$/, "", tmp)
-            pending_fn = tmp
-            pending_line = NR
-            pending = 1
+        # Peel any same-line leading `#[..]` attribute(s) before testing the fn
+        # anchor, so `#[rustfmt::skip] pub fn evil()` (fmt-clean — attribute + fn on
+        # ONE physical line) is recognised, its body scanned for Class-S markers,
+        # AND its `execute_*` governance-leaf class detected, exactly as a bare
+        # `pub fn evil()`. `det` is whitespace-trimmed by `peel_leading_attrs`, so
+        # the anchor drops the leading `^[[:space:]]*`. Brace counting below stays
+        # on the FULL `line` (an attribute carries no `{`/`}`), so `depth` and the
+        # fn-body floor are unaffected by the peel.
+        #
+        # ACCEPTED LIMITATION (CLASS-B, contrived, no live occurrence): a fn whose
+        # signature is NOT at the start of its physical line — e.g. an ENTIRE module
+        # body on one line, `#[rustfmt::skip] mod w { pub fn evil() {..} }` — is not
+        # detected (the mid-line `pub fn` sits past a `mod w {` the leading-attr peel
+        # does not span). Writing a whole module + fn on one physical line requires
+        # `#[rustfmt::skip]` and is not a shape any formatted code produces; per
+        # the convergence ceiling we do not chase it (an insider who can craft it can
+        # equally edit this gate).
+        if (!in_fn) {
+            det = peel_leading_attrs(line)
+            if (det ~ /^(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
+                tmp = det
+                sub(/^(pub[[:space:]]*(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+/, "", tmp)
+                sub(/[^A-Za-z0-9_].*$/, "", tmp)
+                pending_fn = tmp
+                pending_line = NR
+                pending = 1
+            }
         }
 
         opens = gsub(/{/, "{", line)
@@ -1992,6 +2026,33 @@ self_test() {
         printf '    persist_state_best_effort(state, deps, ctx);\n'
         printf '}\n'
     } > "$fdir/govleaf_bad.rs"
+
+    # (57) ATTRIBUTE-PREFIXED FN on one physical line — the fn-detector blind spot.
+    # `#[rustfmt::skip] pub fn ... {` keeps the attribute + signature on ONE line
+    # (rustfmt::skip preserves it — fmt-clean and reachable). The bare
+    # `^[[:space:]]*(pub..)?fn` anchor rejects the leading `#[`, so PRE-fix the fn
+    # was never recognised and its best-effort `suspend_all` mutation was silently
+    # swallowed. The detector now peels leading attributes (peel_leading_attrs), so
+    # the fn IS recognised and the un-persisted mutation MUST be caught (HIT).
+    {
+        printf '#[rustfmt::skip] pub fn skip_regular_fixture() {\n'
+        printf '    state.role_state.suspend_all(did.as_ref());\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/skip_regular.rs"
+
+    # (58) ATTRIBUTE-PREFIXED GOVERNANCE LEAF on one physical line. The `execute_*`
+    # governance-leaf classification keys on the fn NAME the detector extracts; a
+    # leading same-line `#[rustfmt::skip]` PRE-fix hid the whole fn, so the name was
+    # never extracted and the downward-auth leaf (best-effort, not allowlisted,
+    # carrying NO mutation marker) was swallowed. The peel exposes the name, so the
+    # GOVHIT (fail-closed-by-default) rule MUST catch it.
+    {
+        printf '#[rustfmt::skip] pub fn execute_skip_gov_fixture() {\n'
+        printf '    state.role_state.assign_role(did, lower_role);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/skip_gov.rs"
 
     # (9) Round-9 keystone — an allowlisted governance leaf that persists
     # best-effort MUST NOT be flagged. `execute_add_member` is a real
@@ -3049,6 +3110,28 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'CLASS_C_GOVERNANCE_LEAVES was NOT caught — the fail-closed-by-default\n' >&2
         printf 'rule is not wired (a downward-auth leaf could ride best-effort silently).\n' >&2
+        rc=1
+    fi
+    # (57) Attribute-prefixed regular fn (`#[rustfmt::skip] pub fn` on one line)
+    # with a best-effort `suspend_all` mutation MUST be caught — the fn-detector
+    # must peel the leading attribute and scan the body. (Pre-fix: silently
+    # swallowed because the fn was unrecognised.)
+    if ! grep -q $'^HIT\t.*\tskip_regular_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: an attribute-prefixed (`#[rustfmt::skip] pub fn`)\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'function with a best-effort Class-S mutation was NOT caught — the fn-detector\n' >&2
+        printf 'is not peeling a same-line leading attribute (fail-open: a mutation hides).\n' >&2
+        rc=1
+    fi
+    # (58) Attribute-prefixed governance leaf (`#[rustfmt::skip] pub fn execute_*`
+    # on one line) NOT in the allowlist MUST be caught (GOVHIT) — proves the
+    # `execute_*` name is still extracted (for fail-closed-by-default) after the
+    # leading attribute is peeled.
+    if ! grep -q $'^GOVHIT\t.*\texecute_skip_gov_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: an attribute-prefixed (`#[rustfmt::skip]`) governance\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'leaf was NOT caught — the `execute_*` name is lost when the fn-detector does\n' >&2
+        printf 'not peel a same-line leading attribute (fail-open: a downward leaf hides).\n' >&2
         rc=1
     fi
     # (9) Round-9 keystone: an allowlisted (upward) governance leaf that persists
