@@ -1024,17 +1024,19 @@ pub struct PerContextState {
     ///
     /// **Replay-bound invariant (defense-in-depth).** The cache is bounded by
     /// `NONCE_DEDUP_CAPACITY` (10,000) with oldest-first eviction; the replay
-    /// guarantee holds only while the *TTL* (`NONCE_EXPIRY_SECS`, 300 s), not
-    /// eviction, is what drops an entry. That requires the maximum number of
-    /// distinct nonces a caller can land within the TTL window to stay safely
-    /// below the capacity. The per-interface §6.2.0.2 inbound rate limit
+    /// guarantee holds only while the *TTL*
+    /// ([`SAGA_NONCE_DEDUP_TTL_SECS`](crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS),
+    /// 600 s — 2× the freshness skew tolerance), not eviction, is what drops an
+    /// entry. That requires the maximum number of distinct nonces a caller can
+    /// land within the TTL window to stay safely below the capacity. The
+    /// per-interface §6.2.0.2 inbound rate limit
     /// (`InboundPolicy::max_calls_per_minute`) caps that accept rate: worst-case
-    /// `max_calls_per_minute × (NONCE_EXPIRY_SECS / 60)` distinct nonces over
-    /// the window. The default (60/min ⇒ 300 over 5 min) holds with a ~33×
-    /// margin; the [`crate::context::actor::handlers::saga`] tests assert a ≥2×
-    /// margin against the default and a documented configuration ceiling so a
-    /// future high `max_calls_per_minute` cannot silently erode the
-    /// eviction-based bound.
+    /// `max_calls_per_minute × (SAGA_NONCE_DEDUP_TTL_SECS / 60)` distinct nonces
+    /// over the window. The default (60/min ⇒ 600 over the 10-minute window)
+    /// holds with a ~16× margin; the [`crate::context::actor::handlers::saga`]
+    /// tests assert a ≥2× margin against the default and a documented
+    /// configuration ceiling so a future high `max_calls_per_minute` cannot
+    /// silently erode the eviction-based bound.
     pub xctx_nonce_dedup: NonceDedup,
 
     /// Target-side (B-owned) durable capture of COMMITTED cross-context tool

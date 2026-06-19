@@ -1503,10 +1503,38 @@ async fn commit_a(
         return Outcome::err_mutated(sketch);
     }
 
+    // Order matters (provenance-integrity), mirroring `commit_b_first_settle`:
+    // the idempotency witness + Class-S persist land BEFORE the
+    // `CrossContextToolInvoked` event-log append. The event log is a SEPARATE
+    // provider not covered by `persist_state_fail_closed` and the append is NOT
+    // provider-idempotent, so appending FIRST (the inverse, B-side-documented
+    // hazard) would leave a DURABLE A-side `CrossContextToolInvoked` orphan when
+    // the post-append persist fails: the witness is rolled back, but the log
+    // entry already landed — an A-without-B record that B's log denies and that
+    // `divergence_marker_plan` (keyed off the B-committed event id) would not
+    // surface, a silent one-sided A-record. Appending only AFTER the witness +
+    // persist succeed makes a persist failure leave NO orphan log entry.
+
+    // Record the committed A-side saga (the idempotency witness) and Class-S
+    // persist fail-closed BEFORE the append: a crash that rolled the settle/marker
+    // back behind an acked Commit-A would double-settle on replay. On persist
+    // failure roll the witness back; the settle already mutated owned economy
+    // (`mutated = true`) but NO `CrossContextToolInvoked` was appended, so there
+    // is no orphan log entry — the FSM retry re-acks from the (now-absent) witness
+    // and the saga resolves correctly with no silent one-sided A-record.
+    state.xctx_committed_invocations.insert(req.saga_id.clone());
+    if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
+        state.xctx_committed_invocations.remove(&req.saga_id);
+        let sketch = outcome_error_sketch(&persist_err);
+        let _ = reply.send(Err(persist_err));
+        return Outcome::err_mutated(sketch);
+    }
+
     // Append `CrossContextToolInvoked` to the local (caller) log: references the
     // target ctx id + the SAME nonce as B's `ToolInvoked` so an auditor joins
     // the two records into one provenance edge (spec §6.2.4 "Dual event-log
     // recording"). The output hash links the record to the verified receipt.
+    // Runs ONLY after the witness + persist landed.
     let event_name = format!("CrossContextToolInvoked:{}", req.saga_id.0);
     let invoked_payload = serde_json::json!({
         "saga_id": req.saga_id.0,
@@ -1521,19 +1549,23 @@ async fn commit_a(
         req.caller_did.as_ref(),
         Some(&invoked_payload),
     ) {
+        // The append failed AFTER the witness + persist landed. Roll the witness
+        // back and RE-PERSIST so the rolled-back state is durable — otherwise the
+        // next Commit-A would see the already-persisted witness, re-ack as
+        // committed, and SKIP the append forever (a missing
+        // `CrossContextToolInvoked`). With the compensating re-persist, a retry
+        // re-runs Commit-A and appends exactly once. If the compensating persist
+        // ALSO fails the witness stays durable (a genuine fail-closed terminal —
+        // the operator / crash-recovery sweep reconciles), reported `mutated`.
+        // Mirrors `commit_b_first_settle`'s append-failure compensation.
+        state.xctx_committed_invocations.remove(&req.saga_id);
+        if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
+            let sketch = outcome_error_sketch(&persist_err);
+            let _ = reply.send(Err(persist_err));
+            return Outcome::err_mutated(sketch);
+        }
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
-        return Outcome::err_mutated(sketch);
-    }
-
-    // Record the committed A-side saga (the idempotency witness) and Class-S
-    // persist fail-closed before acking: a crash that rolled the settle/marker
-    // back behind an acked Commit-A would double-settle on replay.
-    state.xctx_committed_invocations.insert(req.saga_id.clone());
-    if let Err(persist_err) = persist_state_fail_closed(state, deps, &caller_hex) {
-        state.xctx_committed_invocations.remove(&req.saga_id);
-        let sketch = outcome_error_sketch(&persist_err);
-        let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
     }
 
@@ -2023,6 +2055,98 @@ mod tests {
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
+        }
+    }
+
+    /// Persistence that SUCCEEDS every call EXCEPT the `fail_at` (0-based) call,
+    /// which FAILS — drives the Commit-A witness-persist-failure path: Prepare-A's
+    /// own persists (reserve + Prepare-A tail) succeed, then the Commit-A
+    /// idempotency-witness persist fails, proving the `CrossContextToolInvoked`
+    /// append is sequenced AFTER (and gated on) that persist.
+    struct FailNthPersistence {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_at: usize,
+    }
+    impl ContextPersistence for FailNthPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == self.fail_at {
+                Err("induced nth-persist failure".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Event log that COUNTS `CrossContextToolInvoked:`-prefixed appends (the
+    /// A-side record) — used to assert a Commit-A whose witness-persist FAILS
+    /// appends NO `CrossContextToolInvoked` orphan (the append is gated behind
+    /// the successful witness persist).
+    struct CrossContextCountingEventLog {
+        xctx_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::context::builder::ContextEventLogProvider for CrossContextCountingEventLog {
+        fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event: &str,
+            _actor: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            if event.starts_with("CrossContextToolInvoked:") {
+                self.xctx_invoked_appends
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
         }
     }
 
@@ -3390,6 +3514,103 @@ mod tests {
         let out = commit_a(&mut st, &deps, replay_req, tx).await;
         assert!(out.result.is_ok());
         rx.await.unwrap().expect("commit-a replay ack");
+    }
+
+    /// Provenance-integrity (regression): a Commit-A whose idempotency-witness
+    /// Class-S persist FAILS must NOT durably append the A-side
+    /// `CrossContextToolInvoked` record. The append is sequenced AFTER (and gated
+    /// on) the witness persist — mirroring `commit_b_first_settle` — so a persist
+    /// failure leaves NO orphan A-side "the call happened" record that B's log
+    /// denies (the silent one-sided A-record / reverse-direction repudiation
+    /// primitive the append-before-persist inverse produced). The handler returns
+    /// `Err`/`mutated` (the escrow settle ran) and the witness is not left set, so
+    /// the FSM retry re-acks from the absent witness and resolves correctly.
+    #[tokio::test]
+    async fn commit_a_witness_persist_failure_appends_no_invoked_orphan() {
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        // Prepare-A runs on the CALLER context.
+        let mut st = target_state(0xC7, OTHER, CALLER).await;
+        st.role_state.creator_did = CALLER.to_owned();
+
+        // Stage Prepare-A with an Ok persistence to obtain the held reservation
+        // (the FSM carries it) — the reserve + Prepare-A tail persists must
+        // succeed so the reservation lands.
+        let stage_deps = build_deps(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(OkPersistence),
+        )
+        .await;
+        let (tx, rx) = oneshot::channel();
+        prepare_a(
+            &mut st,
+            &stage_deps,
+            &[0xC7; 32],
+            &DID(CALLER.to_owned()),
+            TOOL,
+            tx,
+        )
+        .await;
+        let prepared_a = rx.await.unwrap().expect("prepared-A");
+
+        // Commit-A deps: a counting event log (observes the A-side append) + a
+        // persistence whose FIRST call (the Commit-A witness persist) FAILS. The
+        // escrow capture itself performs no payment (test deps carry no payment
+        // adapter), so the only persist Commit-A drives is the witness persist.
+        let xctx_invoked_appends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let commit_deps = build_deps_with_providers(
+            CALLER.to_owned(),
+            issuer.verifying_key(),
+            Box::new(CrossContextCountingEventLog {
+                xctx_invoked_appends: Arc::clone(&xctx_invoked_appends),
+            }),
+            Box::new(FailNthPersistence {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_at: 0,
+            }),
+        )
+        .await;
+
+        let saga = SagaId("saga-commit-a-witness-failclose".to_owned());
+        let req = CommitARequest {
+            saga_id: saga.clone(),
+            reservation: prepared_a,
+            caller_context_id: [0xC7; 32],
+            caller_did: DID(CALLER.to_owned()),
+            target_context_id: [0xEE; 32],
+            nonce: [0x42; 16],
+            receipt: br#"{"sig":"x"}"#.to_vec(),
+            output_bytes: br#"{"result":1}"#.to_vec(),
+        };
+        let (tx, rx) = oneshot::channel();
+        let out = commit_a(&mut st, &commit_deps, req, tx).await;
+
+        // The witness persist failed: the handler returns Err and reports
+        // `mutated` (the escrow settle ran before the failed persist).
+        assert!(out.result.is_err(), "witness persist must fail-close");
+        assert!(
+            out.mutated,
+            "the escrow settle mutated owned economy ⇒ mutated"
+        );
+        let err = rx
+            .await
+            .unwrap()
+            .expect_err("commit-a must fail-close on witness persist");
+        assert!(matches!(err, ContextError::PersistenceFailed(_)));
+
+        // No orphan A-side record: the `CrossContextToolInvoked` append is gated
+        // behind the (failed) witness persist, so it NEVER ran.
+        assert_eq!(
+            xctx_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a witness-persist failure must NOT append CrossContextToolInvoked \
+             (append is sequenced after the witness persist)"
+        );
+        // The witness is not left set — a retry re-acks from the absent witness.
+        assert!(
+            !st.xctx_committed_invocations.contains(&saga),
+            "the rolled-back witness must not survive a persist failure"
+        );
     }
 
     #[tokio::test]

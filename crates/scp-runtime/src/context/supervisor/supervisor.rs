@@ -6592,6 +6592,17 @@ impl Supervisor {
         // — each into its own log under its OWN Active Signing Key. Only the
         // TARGET can have committed-then-diverged in the current FSM (Commit-B
         // lands first, then Commit-A).
+        //
+        // Keying off the B-committed event id alone is sound (no A-side symmetry
+        // needed): an A-without-B divergence is STRUCTURALLY IMPOSSIBLE. Commit-A
+        // (`commit_a`) appends its `CrossContextToolInvoked` ONLY after its
+        // idempotency-witness Class-S persist succeeds, which itself can only run
+        // after Commit-B landed and forwarded the receipt — so a durable A-side
+        // record can never exist without a durable B-side `ToolInvoked`. The
+        // append-before-persist inverse (which would have produced a silent
+        // A-without-B orphan on a persist failure) was the bug FIX corrected by
+        // mirroring `commit_b_first_settle`'s witness-persist-before-append
+        // ordering. A one-sided divergence is therefore always Target-committed.
         let sides = [
             (
                 "target",
