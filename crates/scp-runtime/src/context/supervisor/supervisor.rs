@@ -5484,6 +5484,23 @@ impl Supervisor {
     /// context (absent from durable persistence): its reservation record died with
     /// the context, so there is nothing to reverse and the saga is reaped instead
     /// of looping forever — see [`Self::caller_context_deleted_from_persistence`].
+    ///
+    /// **Known limitation — external escrow hold on a context deleted
+    /// mid-`PreparingB`.** When the caller context is reaped as permanently
+    /// deleted (above), its caller LOCAL economy died with the snapshot, so there
+    /// is nothing to reverse LOCALLY and terminal-`Aborted` is correct for the
+    /// local ledger. But if the saga had staged an EXTERNAL escrow hold during
+    /// Prepare-A, the `escrow_authorization` needed to RELEASE that external hold
+    /// lives ONLY in the deleted context snapshot — it is NOT reconstructible from
+    /// the journal evidence (the journal records the abort decision, not the
+    /// escrow authorization secret). Such an external hold is therefore
+    /// irrecoverable from journal evidence alone once the context is deleted;
+    /// terminal-`Aborted` is the best available resolution (the saga cannot loop
+    /// forever waiting for a context that will never return), and operator/
+    /// external-system reconciliation is the only path to release the stranded
+    /// external hold. This is a pre-existing boundary of the journal-evidence
+    /// model, called out here so a future change does not silently assume the
+    /// terminal marker also released the external escrow.
     async fn recover_preparing_b_entry(&self, entry: &JournalEntry) {
         // `caller_hex_from_participants` is `Some(hex)` iff THIS journal
         // entry names a caller context in `participants[0]` — i.e. it is a
@@ -5792,6 +5809,20 @@ impl Supervisor {
     /// (a transient storage failure must NOT be mistaken for deletion). In both
     /// cases the saga is left non-terminal for a later sweep, never reaped on a
     /// guess — reaping only on a CONFIRMED `Ok(None)` absence.
+    ///
+    /// **Backend assumption (`Ok(None)` ⇒ PERMANENTLY deleted).** Reaping on
+    /// `Ok(None)` is sound ONLY because every durable backend in-tree
+    /// distinguishes "absent" from "transiently unreadable": `Ok(None)` is
+    /// returned strictly when the snapshot KEY does not exist, and any I/O /
+    /// decode failure surfaces as `Err` (caught by the conservative arm above) —
+    /// there is no stored-but-transiently-`None` window. A FUTURE lazy on-disk
+    /// backend (e.g. one that returns `Ok(None)` for a not-yet-loaded shard, or
+    /// during a compaction window, before the key is actually known absent) MUST
+    /// preserve that contract — surfacing any uncertainty as `Err`, never
+    /// `Ok(None)` — or this reaper could mis-read a recoverable caller as deleted
+    /// and reap it, silently over-charging it (the durable
+    /// `CallerReservationRecord` would never be reversed). When in doubt, a
+    /// backend MUST err toward `Err` (leave non-terminal), never `Ok(None)`.
     fn caller_context_deleted_from_persistence(&self, caller_hex: &str) -> bool {
         let Some(persistence) = self.persistence_ref() else {
             // No backend ⇒ existence is unknowable; do not reap on a guess.
@@ -15948,12 +15979,6 @@ mod tests {
     fn xctx_recovery_supervisor_with_present_contexts(
         present: &[String],
     ) -> (Arc<Supervisor>, Arc<dyn SagaJournal>) {
-        use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
-
-        let storage = Arc::new(InMemoryStorage::new());
-        let journal: Arc<dyn SagaJournal> =
-            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
-
         let contexts: Arc<DashMap<String, crate::context::state::ContextSnapshot>> =
             Arc::new(DashMap::new());
         for hex_id in present {
@@ -15965,6 +15990,76 @@ mod tests {
         let persistence: Box<dyn ContextPersistence> = Box::new(MapPersistence {
             contexts: Arc::clone(&contexts),
         });
+        xctx_recovery_supervisor_with_persistence(persistence)
+    }
+
+    /// A `ContextPersistence` whose `load_context` ALWAYS returns `Err` — models a
+    /// TRANSIENT storage failure (the backend is reachable for some ops but the
+    /// existence read errored). The §17.16.4 reaper MUST treat this conservatively
+    /// as "context still present" (NOT deleted) so a transient read failure cannot
+    /// be mistaken for a permanent deletion and mis-reap a recoverable caller —
+    /// see [`Supervisor::caller_context_deleted_from_persistence`]'s `Err` arm.
+    struct ErringLoadPersistence;
+    impl ContextPersistence for ErringLoadPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Err("synthetic transient storage failure on load_context".into())
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Build a `with_providers_and_journal` recovery supervisor over a SHARED
+    /// durable saga journal + the GIVEN persistence backend. No xctx actors are
+    /// spawned, so a caller-reversal re-drive `lookup`-misses (the caller is
+    /// non-resident) and yields `ReversalOutstanding` — exactly the crash-recovery
+    /// sweep ordering the §17.16.4 invariant reasons about
+    /// (`replay_unresolved_sagas` running before the caller context is restored).
+    /// The persistence backend's `load_context` verdict (`Ok(None)` / `Ok(Some)` /
+    /// `Err`) then decides reap-vs-leave-non-terminal, which the returned journal
+    /// handle lets the test assert via `load_unresolved`.
+    fn xctx_recovery_supervisor_with_persistence(
+        persistence: Box<dyn ContextPersistence>,
+    ) -> (Arc<Supervisor>, Arc<dyn SagaJournal>) {
+        use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkRecoverySupervisor".to_owned(),
@@ -16133,6 +16228,38 @@ mod tests {
             stayed_non_terminal,
             "a present-but-not-restored caller context must NOT be reaped (its reversal is still \
              outstanding) — only an ABSENT (deleted) caller is reaped"
+        );
+    }
+
+    /// FIX 3 conservative-on-error guard: a `PreparingB` xctx entry whose caller
+    /// context existence check ERRORS (`load_context` ⇒ `Err`, a TRANSIENT storage
+    /// failure) must NOT be reaped — a transient read failure must not be mistaken
+    /// for a permanent deletion. The reaper's `Err` arm
+    /// ([`Supervisor::caller_context_deleted_from_persistence`]) returns `false`
+    /// (treat as still present), so the saga is LEFT non-terminal for a later
+    /// sweep (after the storage recovers). Without this guard an `Err` mis-read as
+    /// "deleted" would reap a still-recoverable caller and silently OVER-CHARGE it
+    /// (the durable `CallerReservationRecord` would never be reversed). This test
+    /// FAILS if the `Err` arm is inverted to reap (e.g. `Err(_) => true`).
+    #[tokio::test]
+    async fn xctx_corrupt_evidence_preparing_b_load_error_not_reaped() {
+        use crate::context::supervisor::saga_journal::SagaId;
+
+        let caller_hex = hex::encode(XCTX_CALLER);
+        // `load_context` ALWAYS errors → the existence check cannot confirm
+        // deletion → conservative leave-non-terminal.
+        let (supervisor, journal) =
+            xctx_recovery_supervisor_with_persistence(Box::new(ErringLoadPersistence));
+        let saga_id = SagaId("saga-corrupt-evidence-load-error-caller".to_owned());
+
+        let stayed_non_terminal =
+            replay_corrupt_evidence_preparing_b(&supervisor, &journal, &saga_id, &caller_hex).await;
+
+        assert!(
+            stayed_non_terminal,
+            "a corrupt-evidence PreparingB xctx entry whose caller-context existence check ERRORS \
+             (transient storage failure) must be LEFT non-terminal (conservative-on-error) — NOT \
+             reaped, which would over-charge a still-recoverable caller"
         );
     }
 

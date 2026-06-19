@@ -482,19 +482,29 @@ scan_file() {
     function is_column0_item_start(s,   vis, qual) {
         # Optional leading visibility: `pub ` or `pub(<...>) `.
         vis = "(pub[[:space:]]*(\\([^)]*\\))?[[:space:]]+)?"
-        # Optional run of fn qualifiers: async / const / unsafe / extern "ABI".
-        qual = "((async|const|unsafe|extern([[:space:]]+\"[^\"]*\")?)[[:space:]]+)*"
-        # 1. A plain item keyword (with optional visibility), boundary-guarded by
-        #    a following space, `!`, `<`, or `(` so e.g. `constant` / `typeof`
-        #    cannot false-match `const` / `type`.
-        if (s ~ ("^" vis "(mod|impl|trait|struct|enum|union|fn|const|static|type|use|macro_rules|extern)([[:space:]]|!|<|\\()"))
+        # Optional run of item qualifiers: async / const / unsafe / extern "ABI",
+        # in any legal order/repetition. These may precede ANY item keyword the
+        # qualifier is legal on — NOT just `fn`: `unsafe impl`, `unsafe trait`,
+        # `const fn`, `async unsafe fn`, `extern "C" fn`, `default unsafe impl`,
+        # `pub(crate) const unsafe fn`, etc. Wiring the qualifier run ONLY to `fn`
+        # (the prior shape) left a QUALIFIED NON-`fn` item — `unsafe impl Foo {`,
+        # `unsafe trait Bar {`, a `default`-qualified impl member — unrecognised,
+        # so a production region resuming after a trailing test module with one of
+        # those was an un-scanned vacuum (the wave-15 denylist had matched
+        # `unsafe impl` explicitly; the wave-16 refactor dropped that coverage).
+        # `default` is included because it qualifies trait-impl items.
+        qual = "((async|const|unsafe|extern([[:space:]]+\"[^\"]*\")?|default)[[:space:]]+)*"
+        # 1. An item keyword with optional visibility AND an optional leading
+        #    qualifier run, boundary-guarded by a following space, `!`, `<`, or `(`
+        #    so e.g. `constant` / `typeof` cannot false-match `const` / `type`. The
+        #    qualifier run is OPTIONAL (zero repetitions) so a bare `mod` / `impl` /
+        #    `struct` / `fn` with no qualifier still matches; when present it may
+        #    precede `fn` (`unsafe fn`, `const fn`, …) OR a non-`fn` item
+        #    (`unsafe impl`, `unsafe trait`, …) — the ONE generalisation that
+        #    closes the qualified-non-fn vacuum without a per-spelling denylist.
+        if (s ~ ("^" vis qual "(mod|impl|trait|struct|enum|union|fn|const|static|type|use|macro_rules|extern)([[:space:]]|!|<|\\()"))
             return 1
-        # 2. A `fn` preceded by a qualifier run (async/const/unsafe/extern "ABI"),
-        #    with optional visibility — `unsafe fn`, `const fn`, `async unsafe fn`,
-        #    `extern \"C\" fn`, `pub(crate) const unsafe fn`, etc.
-        if (s ~ ("^" vis qual "fn[[:space:]]"))
-            return 1
-        # 3. A column-0 item-producing MACRO invocation: `ident! {` / `ident!(` /
+        # 2. A column-0 item-producing MACRO invocation: `ident! {` / `ident!(` /
         #    `ident![`. (A statement macro inside a fn body is never at column 0
         #    in this codebase, so the column-0 anchor keeps this precise.)
         if (s ~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*![[:space:]]*[({[]/)
@@ -510,6 +520,18 @@ scan_file() {
         return (s ~ /^#\[cfg\(test\)\]/ \
             || s ~ /^#\[cfg\(all\(test[,)]/ \
             || s ~ /^#\[cfg\(any\(test[,)]/)
+    }
+    # is_column0_mod_decl — TRUE iff the STRIPPED line is a column-0 `mod NAME`
+    # declaration with optional visibility, recognised by the SAME visibility
+    # grammar as `is_column0_item_start` (`pub` / `pub(crate)` / `pub(in path)`).
+    # BOTH the trailing-test-module accept and the SECOND-test-module accept call
+    # this so neither can use a NARROWER `vis` than the item classifier and wrongly
+    # reject a `pub(crate) mod more_tests` / `pub(in path) mod` re-opening test
+    # module — which would otherwise fall through `is_column0_item_start` as a
+    # generic item and false-fire NTTEST on perfectly legal Rust (a CI break).
+    function is_column0_mod_decl(s,   vis) {
+        vis = "(pub[[:space:]]*(\\([^)]*\\))?[[:space:]]+)?"
+        return (s ~ ("^" vis "mod[[:space:]]"))
     }
     # normalize_assign — collapse whitespace around a bare assignment `=` so a
     # space-free ASSIGNMENT marker (`threshold_value=`, `role_state.ceiling=`)
@@ -882,10 +904,13 @@ scan_file() {
             # continuations — neither of which start with an item keyword — are
             # implicitly skipped: they fall through to neither branch and the gate
             # stays pending until a real item line is reached.)
-            if (line ~ /^(pub[[:space:]]+)?mod[[:space:]]/) {
+            if (is_column0_mod_decl(line)) {
                 # Trailing test MODULE — the legitimate "skip rest of file" shape.
                 # Record the NR so the NTTEST guard below does NOT treat THIS very
                 # `mod` line (a column-0 item start) as a production resume.
+                # `is_column0_mod_decl` uses the SAME visibility grammar as
+                # `is_column0_item_start`, so a `pub(crate) mod tests` / `pub(in
+                # path) mod` trailing test module is accepted, not mis-scanned.
                 seen_test = 1; test_gate_line = pending_test_line; seen_test_set_nr = NR
             }
             # else: interspersed single-item test gate — NOT a cutoff. The item
@@ -925,8 +950,12 @@ scan_file() {
             if (is_column0_reopening_test_gate(line)) {
                 pending_second_test_gate = 1
             } else if (is_column0_item_start(line)) {
-                if (pending_second_test_gate && line ~ /^(pub[[:space:]]+)?mod[[:space:]]/) {
-                    # Legitimate SECOND test module — not a production resume.
+                if (pending_second_test_gate && is_column0_mod_decl(line)) {
+                    # Legitimate SECOND test module — not a production resume. The
+                    # mod-accept uses the SAME visibility grammar as
+                    # `is_column0_item_start` (`is_column0_mod_decl`), so a
+                    # `pub(crate) mod more_tests` / `pub(in path) mod` second test
+                    # module is recognised here and NOT mis-fired as NTTEST.
                     test_gate_line = NR
                     pending_second_test_gate = 0
                 } else {
@@ -2065,6 +2094,80 @@ self_test() {
         printf '}\n'
     } > "$fdir/second_test_module.rs"
 
+    # (43) NON-TRAILING test module resuming with a column-0 `unsafe impl` whose
+    # INDENTED body carries a best-effort Class-S mutation (wave-17). A QUALIFIED
+    # NON-`fn` item (`unsafe impl`) is an item start that the prior classifier —
+    # whose qualifier run was wired ONLY to `fn` — did NOT recognise, so a
+    # production region resuming through it was an un-scanned vacuum (a Class-S
+    # mutation in its body invisible to the cutoff). It MUST now emit an NTTEST
+    # HIT (the generalised qualifier-run-before-any-keyword classifier).
+    {
+        printf 'pub fn unsafe_impl_prod_before_test_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod unsafe_impl_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf 'unsafe impl Foo for Bar {\n'
+        printf '    fn f(&self) {\n'
+        printf '        state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '        persist_state_best_effort(state, deps, ctx);\n'
+        printf '    }\n'
+        printf '}\n'
+    } > "$fdir/nontrailing_unsafe_impl.rs"
+
+    # (44) NON-TRAILING test module resuming with a column-0 `unsafe trait` and a
+    # `const`-qualified non-`fn` item (wave-17) — further QUALIFIED NON-`fn` item
+    # shapes the fn-only qualifier wiring missed. Either resuming a production
+    # region MUST emit an NTTEST HIT.
+    {
+        printf 'pub fn qualified_nonfn_prod_before_test_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod qualified_nonfn_interspersed_tests {\n'
+        printf '    fn a_test_helper() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf 'unsafe trait DangerousMarker {\n'
+        printf '    fn marker(&self);\n'
+        printf '}\n'
+    } > "$fdir/nontrailing_qualified_nonfn.rs"
+
+    # (45) LEGITIMATE SECOND TEST MODULE declared `pub(crate) mod more` /
+    # `pub(in path) mod` (wave-17 over-restriction guard) — the second-test-module
+    # accept previously matched the mod line with a NARROWER `^(pub )?mod` regex
+    # than `is_column0_item_start`'s `vis` grammar, so a `pub(crate) mod` /
+    # `pub(in path) mod` second test module fell through as a generic item and
+    # FALSE-fired NTTEST on legal Rust. It MUST NOT emit an NTTEST HIT.
+    {
+        printf 'pub fn pubcrate_second_test_mod_prod_fixture() {\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'mod first_tests {\n'
+        printf '    #[test]\n'
+        printf '    fn it_works() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'pub(crate) mod more_tests {\n'
+        printf '    #[test]\n'
+        printf '    fn it_also_works() {}\n'
+        printf '}\n'
+        printf '\n'
+        printf '#[cfg(test)]\n'
+        printf 'pub(in crate::foo) mod even_more_tests {\n'
+        printf '    #[test]\n'
+        printf '    fn it_still_works() {}\n'
+        printf '}\n'
+    } > "$fdir/pubcrate_second_test_module.rs"
+
     local rc=0
     local out
     out=$(
@@ -2462,6 +2565,41 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'flagged as a non-trailing production resume — the convergent guard over-fires on\n' >&2
         printf 'multi-test-module files.\n' >&2
+        rc=1
+    fi
+    # (43) NON-TRAILING test module resuming with a column-0 `unsafe impl` (a
+    # QUALIFIED NON-`fn` item) whose body carries a Class-S mutation MUST emit an
+    # NTTEST HIT. FAILS pre-FIX-1 (the qualifier run was wired only to `fn`, so
+    # `unsafe impl` was unrecognised and the indented mutation an un-scanned
+    # vacuum).
+    if ! grep -q $'^NTTEST\t.*/nontrailing_unsafe_impl\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a NON-trailing test module resuming with a column-0\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`unsafe impl` (a qualified NON-fn item) was NOT flagged — the item-start\n' >&2
+        printf 'classifier wires the qualifier run only to `fn`, leaving a qualified non-fn\n' >&2
+        printf 'item an un-scanned vacuum.\n' >&2
+        rc=1
+    fi
+    # (44) NON-TRAILING test module resuming with a column-0 `unsafe trait` /
+    # `const`-qualified non-`fn` item MUST emit an NTTEST HIT (further qualified
+    # non-fn shapes). FAILS pre-FIX-1.
+    if ! grep -q $'^NTTEST\t.*/nontrailing_qualified_nonfn\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a NON-trailing test module resuming with a column-0\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`unsafe trait` (a qualified NON-fn item) was NOT flagged — the qualifier run\n' >&2
+        printf 'does not generalise to non-fn item keywords.\n' >&2
+        rc=1
+    fi
+    # (45) LEGITIMATE SECOND test module declared `pub(crate) mod` / `pub(in path)
+    # mod` MUST NOT emit an NTTEST HIT. FAILS pre-FIX-2 (the second-module accept
+    # used a narrower `^(pub )?mod` regex than `is_column0_item_start`'s `vis`
+    # grammar, so a `pub(crate) mod` second test module fell through as a generic
+    # item and false-fired NTTEST on legal Rust — a CI break).
+    if grep -q $'^NTTEST\t.*/pubcrate_second_test_module\.rs\t' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a LEGITIMATE second test module declared `pub(crate) mod`\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '/ `pub(in path) mod` was wrongly flagged NTTEST — the second-module accept uses\n' >&2
+        printf 'a narrower visibility grammar than the item-start classifier.\n' >&2
         rc=1
     fi
 
