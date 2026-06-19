@@ -14,6 +14,7 @@
 //! | `scp_mls_encrypt_duration_seconds`| Histogram | MLS + sender key encryption latency            |
 //! | `scp_mls_decrypt_duration_seconds`| Histogram | MLS + sender key decryption latency            |
 //! | `scp_persistence_failures_total`  | Counter   | Persistence write failures (best-effort saves) |
+//! | `scp_saga_repair_needed_total`    | Counter   | Cross-context sagas landed in `NeedsRepair` requiring operator repair (§17.16.4) |
 //! | `scp_pseudonym_announcements_rejected_total` | Counter | Rejected pseudonym announcements (forged DID, reserved value, or cross-DID RID collision, §9.10.4) |
 //! | `scp_active_contexts`             | Gauge     | Number of registered (active) contexts         |
 //! | `scp_buffer_occupancy`            | Gauge     | Total events buffered across all contexts      |
@@ -43,6 +44,19 @@ pub fn record_decrypt_duration(duration: std::time::Duration) {
 /// Records a persistence failure (counter).
 pub fn record_persistence_failure() {
     metrics::counter!("scp_persistence_failures_total").increment(1);
+}
+
+/// Records a cross-context saga landing in `NeedsRepair` (§17.16.4).
+///
+/// Incremented at every site that records or re-surfaces a `NeedsRepair`
+/// terminal: the live FSM commit-retry-exhaustion tail, and the crash-recovery
+/// arms (commit-in-progress that could not confirm both sides, an Aborting
+/// entry whose rollback never completed, and a `NeedsRepair` carryover observed
+/// at process start). `NeedsRepair` is FSM-terminal but NOT resolved, so the
+/// recovery scan re-surfaces it each process start until an operator repairs it
+/// — a nonzero rate is the operator-alerting signal §17.16.4 names.
+pub(crate) fn record_saga_repair_needed() {
+    metrics::counter!("scp_saga_repair_needed_total").increment(1);
 }
 
 /// Records a rejected pseudonym announcement (§9.10.4).

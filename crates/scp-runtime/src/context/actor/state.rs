@@ -1009,8 +1009,18 @@ pub struct PerContextState {
     /// freshness/replay state lives where the authorization decision is made,
     /// since Prepare-A runs on the caller's actor and cannot authoritatively
     /// dedup against B's state. Prepare-B rejects a duplicate nonce and records
-    /// a fresh one on accept. Reconstructable freshness state, not in the
-    /// Class-S snapshot.
+    /// a fresh one on accept.
+    ///
+    /// **Class-S persisted — crash survival is load-bearing.** This cache IS
+    /// captured into the Class-S snapshot (its `(nonce, accepted-at-secs)`
+    /// entries are serialized by `xctx_nonce_dedup_snapshot`) and rehydrated on
+    /// restore (`NonceDedup::from_entries_with_ttl`). It is NOT reconstructable
+    /// freshness state: if it were dropped from the snapshot, a crash between
+    /// accept and the coalesce-window persist would clear the seen-nonce set and
+    /// re-open the §6.2.4 replay window an attacker could exploit by replaying a
+    /// captured envelope across the restart boundary. The persistence + restore
+    /// of this cache is what closes that window; do not delete it from the
+    /// snapshot.
     ///
     /// **Replay-bound invariant (defense-in-depth).** The cache is bounded by
     /// `NONCE_DEDUP_CAPACITY` (10,000) with oldest-first eviction; the replay

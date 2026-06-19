@@ -2665,12 +2665,13 @@ pub type CommitBSettleReply = oneshot::Sender<Result<CommitBSettleOutcome, Conte
 /// FSM dispatches to a participant actor for a cross-context tool-invocation
 /// saga (spec §6.2.4). Each variant carries a typed `oneshot` reply.
 ///
-/// The Prepare-A / Prepare-B arms have real handler bodies (slice 3b); the
-/// Commit (split [`Self::CommitBReserve`] / [`Self::CommitBSettle`] /
-/// [`Self::CommitA`]), [`Self::Abort`], and [`Self::EmitDivergenceMarker`]
-/// arms have real handler bodies (slice 4). The supervisor FSM that *drives*
-/// them is a later slice — these handlers are compiled-but-not-yet-driven. The
-/// dispatch `match` stays exhaustive so adding a phase is a compile error.
+/// Every arm has a real handler body AND is driven end-to-end by the supervisor
+/// FSM: Prepare-A / Prepare-B, the split Commit
+/// ([`Self::CommitBReserve`] / [`Self::CommitBSettle`] / [`Self::CommitA`]),
+/// [`Self::Abort`], and [`Self::EmitDivergenceMarker`] are all dispatched by
+/// `start_cross_context_tool_invocation_saga`'s FSM over the two co-resident
+/// participant actors. The dispatch `match` stays exhaustive so adding a phase
+/// is a compile error.
 #[non_exhaustive]
 pub enum SagaPhaseMessage {
     /// Prepare-A — runs on the LOCAL caller-context actor. Validates the

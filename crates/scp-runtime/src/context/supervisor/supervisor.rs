@@ -247,8 +247,12 @@ type DivergenceMarkerPlan = (
 /// - `prepared_a` — the caller-side escrow/rate-limit reservation staged at
 ///   Prepare-A and held across the saga (RAII-released on any abort, settled
 ///   at Commit-A),
-/// - `prepared_b` — B's recorded provenance from Prepare-B (drives nothing
-///   the FSM re-reads; held for completeness / future divergence emission),
+/// - `prepared_b` — B's recorded provenance from Prepare-B (B's clock / nonce /
+///   re-derived chain depth). Read by [`Self::xctx_prepared_evidence_bytes`] at
+///   Committing-evidence time: once recorded, B's values OVERRIDE the
+///   caller-asserted nonce / depth / timestamp in the journaled prepared
+///   evidence (the §17.16.4 replay/crash-recovery surface), so a recovered saga
+///   re-derives from B's authoritative provenance, not the caller's assertion,
 /// - `committed` — the receipt + output captured at Commit-B, forwarded to
 ///   Commit-A and surfaced in [`SagaOutput`].
 ///
@@ -304,6 +308,9 @@ struct CrossContextSagaCtx<'a> {
     /// Prepare-A's held reservation (settled at Commit-A, released on abort).
     prepared_a: Option<crate::context::actor::commands::PreparedAFields>,
     /// Prepare-B's recorded provenance (B's clock / nonce / re-derived depth).
+    /// Read by [`Self::xctx_prepared_evidence_bytes`]: once `Some`, these values
+    /// override the caller-asserted nonce / depth / timestamp in the journaled
+    /// prepared evidence (the §17.16.4 replay surface).
     prepared_b: Option<crate::context::actor::commands::PreparedBFields>,
     /// Commit-B's captured receipt + output (forwarded to Commit-A + output).
     committed: Option<CommittedSagaArtifacts>,
@@ -631,10 +638,11 @@ pub struct PendingSagaProjection {
 /// named fields foreclose. Per the project's Agent-first API tenet: one flat
 /// config object, every field named, no builder, no ordering to track.
 ///
-/// The two Active Signing Keys and the supervisor-side tool executor stay
-/// explicit parameters of the entry point — they are not envelope data (the
-/// keys are custody material the actor never holds; the executor is a non-`Send`
-/// closure), so folding them in would mix wire fields with capabilities.
+/// The two Active Signing Keys (carried in the named-field [`SagaSigningKeys`])
+/// and the supervisor-side tool executor stay explicit parameters of the entry
+/// point — they are not envelope data (the keys are custody material the actor
+/// never holds; the executor is a non-`Send` closure), so folding them onto the
+/// wire request would mix envelope fields with capabilities.
 #[derive(Debug, Clone)]
 pub struct CrossContextToolInvocationRequest {
     /// Raw 32-byte id of the caller (initiating) context.
@@ -656,6 +664,33 @@ pub struct CrossContextToolInvocationRequest {
     pub asserted_nonce: [u8; 16],
     /// Caller-asserted send-time (Unix ms), checked against §9.14 skew.
     pub asserted_timestamp_ms: u64,
+}
+
+/// The two Active Signing Keys a §6.2.4 cross-context saga signs under, named by
+/// role so the call site cannot transpose them.
+///
+/// `target` and `caller` are both `&SigningKey` of the SAME type; passed as two
+/// adjacent positional `&SigningKey` parameters a swap would compile and stay
+/// self-consistent (verification uses whichever key was supplied), silently
+/// signing each side's divergence marker under the wrong key — the same
+/// confused-deputy footgun the named-field [`CrossContextToolInvocationRequest`]
+/// foreclosed one layer up for the `[u8; 32]` ids. Naming the role at the call
+/// site (`SagaSigningKeys { target: &…, caller: &… }`) makes a swap a visible
+/// field-name error, not a silent miscapture. Per the Agent-first API tenet:
+/// one flat named-field object, no ordering to track.
+///
+/// The keys are held by reference (the entry point clones each into the
+/// FSM-carried context); they are capabilities, NOT envelope data, so they stay
+/// off the wire [`CrossContextToolInvocationRequest`].
+#[derive(Debug, Clone, Copy)]
+pub struct SagaSigningKeys<'a> {
+    /// The target context's Active Signing Key. Signs the
+    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt)
+    /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`.
+    pub target: &'a ed25519_dalek::SigningKey,
+    /// The caller context's Active Signing Key. Signs the CALLER-side divergence
+    /// marker on `NeedsRepair`.
+    pub caller: &'a ed25519_dalek::SigningKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -4776,14 +4811,16 @@ impl Supervisor {
     /// **exactly once** supervisor-side between the two Commit-B round-trips
     /// (the non-`Send` executor cannot cross the actor mailbox per ADR-049 §3).
     ///
-    /// `target_signing_key` is the target context's Active Signing Key, used to
-    /// sign the [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt)
-    /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`.
-    /// `caller_signing_key` is the caller context's Active Signing Key, used to
-    /// sign the CALLER-side divergence marker on `NeedsRepair`. Each side signs
-    /// its own marker into its own log. The actor holds no custody key
-    /// (ADR-049), so the caller supplies both per-call exactly as
-    /// [`Self::send_heartbeat`] / [`Self::build_local_checkpoint`] do.
+    /// `signing_keys` carries the two Active Signing Keys named by role
+    /// ([`SagaSigningKeys`]): `target` signs the
+    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt)
+    /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`;
+    /// `caller` signs the CALLER-side divergence marker on `NeedsRepair`. Each
+    /// side signs its own marker into its own log. The named fields make a
+    /// same-typed `&SigningKey` swap a compile-visible field-name error rather
+    /// than a silent miscapture. The actor holds no custody key (ADR-049), so
+    /// the caller supplies both per-call exactly as [`Self::send_heartbeat`] /
+    /// [`Self::build_local_checkpoint`] do.
     ///
     /// # Co-resident scope
     ///
@@ -4831,8 +4868,7 @@ impl Supervisor {
     pub async fn start_cross_context_tool_invocation_saga<F, Fut>(
         &self,
         request: CrossContextToolInvocationRequest,
-        target_signing_key: &ed25519_dalek::SigningKey,
-        caller_signing_key: &ed25519_dalek::SigningKey,
+        signing_keys: SagaSigningKeys<'_>,
         executor: F,
     ) -> Result<SagaOutput, ContextError>
     where
@@ -4914,8 +4950,8 @@ impl Supervisor {
             asserted_nonce,
             asserted_timestamp_ms,
             caller_source_role,
-            target_signing_key: target_signing_key.clone(),
-            caller_signing_key: caller_signing_key.clone(),
+            target_signing_key: signing_keys.target.clone(),
+            caller_signing_key: signing_keys.caller.clone(),
             executor: Some(boxed_executor),
             executor_output: None,
             prepared_a: None,
@@ -5236,12 +5272,18 @@ impl Supervisor {
                         seq_per_saga: entry.seq_per_saga.saturating_add(1),
                     })
                     .await;
+                // §17.16.4 operator-alerting metric: this entry is now
+                // NeedsRepair and requires operator repair.
+                crate::metrics::record_saga_repair_needed();
                 tracing::error!(
                     saga_id = %entry.saga_id,
                     "saga recovery — Aborting observed; marked NeedsRepair for operator review"
                 );
             }
             SagaState::NeedsRepair => {
+                // §17.16.4 operator-alerting metric: a NeedsRepair saga is
+                // re-surfaced at process start until an operator repairs it.
+                crate::metrics::record_saga_repair_needed();
                 tracing::error!(
                     saga_id = %entry.saga_id,
                     "saga recovery — NeedsRepair carryover; operator intervention required"
@@ -5302,6 +5344,9 @@ impl Supervisor {
                         seq_per_saga: entry.seq_per_saga.saturating_add(1),
                     })
                     .await;
+                // §17.16.4 operator-alerting metric: commit-in-progress could
+                // not confirm both sides; this saga is NeedsRepair.
+                crate::metrics::record_saga_repair_needed();
                 tracing::error!(
                     saga_id = %entry.saga_id,
                     "saga recovery — Commit-in-progress observed; re-drove the idempotent Commit-B \
@@ -5671,6 +5716,9 @@ impl Supervisor {
                 // "commit_with_retry exhausts (3×) → NeedsRepair").
                 self.append_journal(&saga_id, SagaState::NeedsRepair, &participants, 4, &[])
                     .await?;
+                // §17.16.4 operator-alerting metric: a saga reached the
+                // NeedsRepair terminal and requires operator repair.
+                crate::metrics::record_saga_repair_needed();
                 tracing::error!(
                     saga_id = %saga_id,
                     %err,
@@ -6592,7 +6640,6 @@ impl Supervisor {
 
     /// Abort the saga (spec §6.2.4 "Reservation release on every terminal
     /// path"): mark the journal Aborting → Aborted, and — for a cross-context
-    /// saga — send [`SagaPhaseMessage::Abort`] to whichever side(s) prepared so
     /// saga — send [`SagaPhaseMessage::Abort`] to whichever side(s) prepared so
     /// the staged reservations are RAII-released (the caller side hands its held
     /// `PreparedAFields` back; the target side clears its staged slot).
@@ -12869,15 +12916,17 @@ mod tests {
         let committed_receipt =
             scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[0x3Cu8; 32]),
-                [0x5Au8; 32],
-                [0x6Bu8; 32],
-                "did:example:class-s-caller".to_owned(),
-                [0xC7u8; 16],
-                "class-s-tool-v1".to_owned(),
-                br#"{"result":42}"#.to_vec(),
-                "ToolInvoked:saga-class-s-committed".to_owned(),
-                4,
-                1_700_000_000_456,
+                scp_protocol::context::tools::cross_context_saga::CrossContextToolReceiptFields {
+                    caller_context_id: [0x5Au8; 32],
+                    target_context_id: [0x6Bu8; 32],
+                    caller_did: "did:example:class-s-caller".to_owned(),
+                    nonce: [0xC7u8; 16],
+                    tool_registration_id: "class-s-tool-v1".to_owned(),
+                    output_jcs: br#"{"result":42}"#.to_vec(),
+                    tool_invoked_event_id: "ToolInvoked:saga-class-s-committed".to_owned(),
+                    chain_depth: 4,
+                    timestamp_ms: 1_700_000_000_456,
+                },
             )
             .expect("Class-S committed receipt signs");
         state.xctx_committed_outputs.insert(
@@ -14232,8 +14281,10 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 executor,
             )
             .await
@@ -14274,14 +14325,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let nonce_hex = {
-            let mut s = String::new();
-            for b in &nonce {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-            }
-            s
-        };
+        let nonce_hex = hex::encode(nonce);
         let tool_invoked = events
             .iter()
             .find(|(id, name, _, _)| *id == XCTX_TARGET && name.starts_with("ToolInvoked:"))
@@ -14394,8 +14438,10 @@ mod tests {
                     asserted_nonce: [0x43u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 executor,
             )
             .await
@@ -14427,8 +14473,10 @@ mod tests {
                     asserted_nonce: [0x44u8; 16],
                     asserted_timestamp_ms: now_ms2,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
             )
             .await
@@ -14489,8 +14537,10 @@ mod tests {
                     asserted_nonce: [0x4Au8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
             )
             .await
@@ -14571,8 +14621,10 @@ mod tests {
                     asserted_nonce: [0x45u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
             )
             .await
@@ -14632,8 +14684,10 @@ mod tests {
                     asserted_nonce: [0x46u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 executor,
             )
             .await
@@ -15037,8 +15091,10 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 executor,
             )
             .await
@@ -15136,8 +15192,10 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 executor,
             )
             .await
@@ -15241,8 +15299,10 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 executor,
             )
             .await
@@ -15320,7 +15380,9 @@ mod tests {
     #[tokio::test]
     async fn xctx_commit_a_rejects_receipt_signed_by_wrong_key() {
         use crate::context::supervisor::saga_journal::SagaId;
-        use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
+        use scp_protocol::context::tools::cross_context_saga::{
+            CrossContextToolReceipt, CrossContextToolReceiptFields,
+        };
 
         let authorized = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let attacker = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
@@ -15339,15 +15401,17 @@ mod tests {
         // A receipt signed by the ATTACKER key (not authorized for the target).
         let forged = CrossContextToolReceipt::sign(
             &attacker,
-            XCTX_CALLER,
-            XCTX_TARGET,
-            "did:dht:z6MkWrongKeyCaller".to_owned(),
-            nonce,
-            XCTX_TOOL.to_owned(),
-            br#"{"result":3}"#.to_vec(),
-            "ToolInvoked:wrong-key-saga".to_owned(),
-            3,
-            1_700_000_000,
+            CrossContextToolReceiptFields {
+                caller_context_id: XCTX_CALLER,
+                target_context_id: XCTX_TARGET,
+                caller_did: "did:dht:z6MkWrongKeyCaller".to_owned(),
+                nonce,
+                tool_registration_id: XCTX_TOOL.to_owned(),
+                output_jcs: br#"{"result":3}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:wrong-key-saga".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_700_000_000,
+            },
         )
         .expect("sign forged receipt");
         let forged_bytes = serde_json::to_vec(&forged).expect("encode");
@@ -15366,15 +15430,17 @@ mod tests {
         // Sanity: the SAME receipt signed by the AUTHORIZED key verifies.
         let valid = CrossContextToolReceipt::sign(
             &authorized,
-            XCTX_CALLER,
-            XCTX_TARGET,
-            "did:dht:z6MkWrongKeyCaller".to_owned(),
-            nonce,
-            XCTX_TOOL.to_owned(),
-            br#"{"result":3}"#.to_vec(),
-            "ToolInvoked:wrong-key-saga".to_owned(),
-            3,
-            1_700_000_000,
+            CrossContextToolReceiptFields {
+                caller_context_id: XCTX_CALLER,
+                target_context_id: XCTX_TARGET,
+                caller_did: "did:dht:z6MkWrongKeyCaller".to_owned(),
+                nonce,
+                tool_registration_id: XCTX_TOOL.to_owned(),
+                output_jcs: br#"{"result":3}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:wrong-key-saga".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_700_000_000,
+            },
         )
         .expect("sign valid receipt");
         let valid_bytes = serde_json::to_vec(&valid).expect("encode");
@@ -15442,8 +15508,10 @@ mod tests {
                     asserted_nonce: [0x42u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                &target_signing,
-                &caller_signing,
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
                 executor,
             )
             .await
@@ -15472,7 +15540,9 @@ mod tests {
     /// re-drive Commit-A.
     #[tokio::test]
     async fn xctx_commit_a_send_failure_recovers_ticket_for_retry() {
-        use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
+        use scp_protocol::context::tools::cross_context_saga::{
+            CrossContextToolReceipt, CrossContextToolReceiptFields,
+        };
 
         let creator_did = "did:dht:z6MkXctxSendFailCreator".to_owned();
         let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
@@ -15526,15 +15596,17 @@ mod tests {
         // Commit-A path passes the VERIFIED receipt; we mirror that here).
         let receipt = CrossContextToolReceipt::sign(
             &target_signing,
-            XCTX_CALLER,
-            XCTX_TARGET,
-            caller_did.to_owned(),
-            nonce,
-            XCTX_TOOL.to_owned(),
-            br#"{"result":3}"#.to_vec(),
-            "ToolInvoked:send-fail-saga".to_owned(),
-            3,
-            1_700_000_000,
+            CrossContextToolReceiptFields {
+                caller_context_id: XCTX_CALLER,
+                target_context_id: XCTX_TARGET,
+                caller_did: caller_did.to_owned(),
+                nonce,
+                tool_registration_id: XCTX_TOOL.to_owned(),
+                output_jcs: br#"{"result":3}"#.to_vec(),
+                tool_invoked_event_id: "ToolInvoked:send-fail-saga".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_700_000_000,
+            },
         )
         .expect("sign receipt");
         let receipt_bytes = serde_json::to_vec(&receipt).expect("encode");

@@ -48,6 +48,7 @@ use scp_protocol::crypto::ucan::validate::{
 
 use scp_protocol::context::tools::cross_context_saga::{
     CommittedSide, CrossContextDivergenceMarker, CrossContextToolReceipt,
+    CrossContextToolReceiptFields,
 };
 
 use crate::context::actor::commands::{
@@ -638,7 +639,10 @@ async fn prepare_b(
         let _ = reply.send(Err(persist_err));
         // The nonce stays recorded (fail-closed direction for replay
         // protection — un-recording would re-open the replay window the dedup
-        // cache exists to close). Report mutated so the partial state persists.
+        // cache exists to close). The persist just FAILED, so this recorded
+        // nonce did NOT durably land; report mutated so the actor flags the
+        // in-memory mutation as diverged-from-durable (it does not claim the
+        // state persisted).
         return Outcome::err_mutated(sketch);
     }
 
@@ -1286,15 +1290,17 @@ fn build_signed_receipt(
     let signing_key = target_signing_key.to_signing_key();
     CrossContextToolReceipt::sign(
         &signing_key,
-        prepared.caller_context_id,
-        prepared.target_context_id,
-        prepared.caller_did.0.clone(),
-        prepared.recorded_nonce,
-        prepared.tool_registration_id.clone(),
-        output_jcs,
-        event_id.to_owned(),
-        prepared.recorded_chain_depth,
-        prepared.recorded_timestamp_ms,
+        CrossContextToolReceiptFields {
+            caller_context_id: prepared.caller_context_id,
+            target_context_id: prepared.target_context_id,
+            caller_did: prepared.caller_did.0.clone(),
+            nonce: prepared.recorded_nonce,
+            tool_registration_id: prepared.tool_registration_id.clone(),
+            output_jcs,
+            tool_invoked_event_id: event_id.to_owned(),
+            chain_depth: prepared.recorded_chain_depth,
+            timestamp_ms: prepared.recorded_timestamp_ms,
+        },
     )
     .map_err(|e| {
         ContextError::CryptoFailed(format!(
@@ -1593,12 +1599,7 @@ fn emit_divergence_marker(
 /// Lowercase-hex encode a 16-byte nonce (the join key between the two
 /// event-log records, recorded on both for the §6.2.4 auditor).
 fn hex_nonce(nonce: &[u8; 16]) -> String {
-    let mut s = String::with_capacity(32);
-    for b in nonce {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    hex::encode(nonce)
 }
 
 /// Lowercase-hex of `SHA-256(jcs(output))` — the verifiable link from the
@@ -1607,12 +1608,7 @@ fn hex_nonce(nonce: &[u8; 16]) -> String {
 fn hex_output_hash(output_bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest: [u8; 32] = Sha256::digest(output_bytes).into();
-    let mut s = String::with_capacity(64);
-    for b in &digest {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    hex::encode(digest)
 }
 
 // ---------------------------------------------------------------------------

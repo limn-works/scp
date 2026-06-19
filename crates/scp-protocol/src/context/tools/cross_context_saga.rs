@@ -155,6 +155,45 @@ pub struct CrossContextToolReceipt {
     pub signature: [u8; 64],
 }
 
+/// The unsigned field set for [`CrossContextToolReceipt::sign`], named so the
+/// call site cannot transpose same-typed arguments.
+///
+/// [`CrossContextToolReceipt::sign`] otherwise takes the two adjacent `[u8; 32]`
+/// ids (`caller_context_id` / `target_context_id`) and three `String` fields
+/// (`caller_did` / `tool_registration_id` / `tool_invoked_event_id`) as
+/// positional arguments — a transposition surface strictly wider than the
+/// invocation envelope the same named-field pattern already closes one layer up.
+/// A swap of any same-typed pair compiles and signs a self-consistent-but-wrong
+/// receipt.
+/// Naming every field at the call site makes a swap a compile-visible field-name
+/// error. Per the Agent-first API tenet: one flat named-field object, no builder,
+/// no ordering to track.
+///
+/// The target's Active Signing Key stays a SEPARATE parameter of
+/// [`CrossContextToolReceipt::sign`] — it is signing capability material, not a
+/// receipt field, so folding it in would mix the receipt's data with the
+/// capability that authorizes it.
+pub struct CrossContextToolReceiptFields {
+    /// Raw 32-byte digest of the initiating (caller) context.
+    pub caller_context_id: [u8; 32],
+    /// Raw 32-byte digest of the executing (target) context.
+    pub target_context_id: [u8; 32],
+    /// The caller principal DID the receipt is issued to (confused-deputy binding).
+    pub caller_did: String,
+    /// Staged 16-byte correlation/dedup nonce (B's copy of the wire value).
+    pub nonce: [u8; 16],
+    /// Context-local tool registration id B executed (indexes B's own registry).
+    pub tool_registration_id: String,
+    /// The output as its JCS-canonical bytes — the exact preimage of `output_hash`.
+    pub output_jcs: Vec<u8>,
+    /// The target's `ToolInvoked` event-log entry id this receipt links to.
+    pub tool_invoked_event_id: String,
+    /// B's re-derived inbound chain depth (`incoming + 1`), never caller-asserted.
+    pub chain_depth: u8,
+    /// B's Prepare-B capture instant in Unix milliseconds (staged `recorded_timestamp_ms`).
+    pub timestamp_ms: u64,
+}
+
 impl CrossContextToolReceipt {
     /// Recompute `output_hash` from the carried JCS-canonical output bytes (§6.2.4).
     #[must_use]
@@ -206,19 +245,21 @@ impl CrossContextToolReceipt {
     ///
     /// Returns [`CrossContextSagaError::PreimageConstruction`] if the preimage
     /// cannot be built (unreachable in practice; §9.10.3 bounds messages to 256 KB).
-    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         target_signing_key: &SigningKey,
-        caller_context_id: [u8; 32],
-        target_context_id: [u8; 32],
-        caller_did: String,
-        nonce: [u8; 16],
-        tool_registration_id: String,
-        output_jcs: Vec<u8>,
-        tool_invoked_event_id: String,
-        chain_depth: u8,
-        timestamp_ms: u64,
+        fields: CrossContextToolReceiptFields,
     ) -> Result<Self, CrossContextSagaError> {
+        let CrossContextToolReceiptFields {
+            caller_context_id,
+            target_context_id,
+            caller_did,
+            nonce,
+            tool_registration_id,
+            output_jcs,
+            tool_invoked_event_id,
+            chain_depth,
+            timestamp_ms,
+        } = fields;
         let mut receipt = Self {
             caller_context_id,
             target_context_id,
@@ -398,15 +439,17 @@ mod tests {
     fn fixed_receipt(signing_key: &SigningKey) -> CrossContextToolReceipt {
         CrossContextToolReceipt::sign(
             signing_key,
-            [0x11; 32],
-            [0x22; 32],
-            "did:example:caller".to_owned(),
-            [0x33; 16],
-            "calc.add".to_owned(),
-            br#"{"result":42}"#.to_vec(),
-            "evt-tool-invoked-1".to_owned(),
-            3,
-            1_709_654_400_000,
+            CrossContextToolReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did:example:caller".to_owned(),
+                nonce: [0x33; 16],
+                tool_registration_id: "calc.add".to_owned(),
+                output_jcs: br#"{"result":42}"#.to_vec(),
+                tool_invoked_event_id: "evt-tool-invoked-1".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_709_654_400_000,
+            },
         )
         .expect("sign should succeed")
     }
@@ -550,28 +593,32 @@ mod tests {
 
         let a = CrossContextToolReceipt::sign(
             &sk,
-            [0x11; 32],
-            [0x22; 32],
-            "did:example:ab".to_owned(),
-            [0x33; 16],
-            "ctool".to_owned(),
-            b"{}".to_vec(),
-            "evt".to_owned(),
-            1,
-            1,
+            CrossContextToolReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did:example:ab".to_owned(),
+                nonce: [0x33; 16],
+                tool_registration_id: "ctool".to_owned(),
+                output_jcs: b"{}".to_vec(),
+                tool_invoked_event_id: "evt".to_owned(),
+                chain_depth: 1,
+                timestamp_ms: 1,
+            },
         )
         .expect("sign a");
         let b = CrossContextToolReceipt::sign(
             &sk,
-            [0x11; 32],
-            [0x22; 32],
-            "did:example:a".to_owned(),
-            [0x33; 16],
-            "bctool".to_owned(),
-            b"{}".to_vec(),
-            "evt".to_owned(),
-            1,
-            1,
+            CrossContextToolReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did:example:a".to_owned(),
+                nonce: [0x33; 16],
+                tool_registration_id: "bctool".to_owned(),
+                output_jcs: b"{}".to_vec(),
+                tool_invoked_event_id: "evt".to_owned(),
+                chain_depth: 1,
+                timestamp_ms: 1,
+            },
         )
         .expect("sign b");
 
@@ -589,28 +636,32 @@ mod tests {
 
         let a = CrossContextToolReceipt::sign(
             &sk,
-            [0x11; 32],
-            [0x22; 32],
-            "did".to_owned(),
-            [0x33; 16],
-            "t".to_owned(),
-            b"{}".to_vec(),
-            "evtX".to_owned(),
-            1,
-            1,
+            CrossContextToolReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did".to_owned(),
+                nonce: [0x33; 16],
+                tool_registration_id: "t".to_owned(),
+                output_jcs: b"{}".to_vec(),
+                tool_invoked_event_id: "evtX".to_owned(),
+                chain_depth: 1,
+                timestamp_ms: 1,
+            },
         )
         .expect("sign a");
         let b = CrossContextToolReceipt::sign(
             &sk,
-            [0x11; 32],
-            [0x22; 32],
-            "did".to_owned(),
-            [0x33; 16],
-            "t".to_owned(),
-            b"{}".to_vec(),
-            "evt".to_owned(),
-            1,
-            1,
+            CrossContextToolReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did".to_owned(),
+                nonce: [0x33; 16],
+                tool_registration_id: "t".to_owned(),
+                output_jcs: b"{}".to_vec(),
+                tool_invoked_event_id: "evt".to_owned(),
+                chain_depth: 1,
+                timestamp_ms: 1,
+            },
         )
         .expect("sign b");
         // a carries "evtX"; b carries "evt". Distinct VarBytes → distinct preimage.
