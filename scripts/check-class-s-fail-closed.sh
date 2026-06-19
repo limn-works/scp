@@ -488,30 +488,82 @@ scan_file() {
     # PREMATURELY. Every Class-S mutation after the poison then became invisible
     # (a live gate bypass on legal, cargo-fmt-clean code).
     #
-    # This is a single left-to-right character scanner. It carries three pieces
+    # This is a single left-to-right character scanner. It carries FOUR pieces
     # of MULTI-LINE state across physical lines via awk globals (like the
-    # pre-existing in_block): in_block (inside a block comment), in_raw_string
-    # (inside a raw or raw-byte string), and raw_hash (the OPENING hash count of
-    # the in-flight raw string, so the matching closer is found). Removed
-    # literal/comment content is replaced by a single space placeholder so
-    # adjacent code tokens never accidentally fuse; code characters (including a
-    # brace/paren/terminator/marker token that legitimately appears in CODE, not
-    # in a literal) are emitted verbatim so markers still match.
+    # pre-existing block_depth): block_depth (NESTING depth of in-flight block
+    # comments — Rust block comments NEST), in_raw_string (inside a raw or
+    # raw-byte string), raw_hash (the OPENING hash count of the in-flight raw
+    # string, so the matching closer is found), and in_string (inside an ordinary
+    # or byte string that was left UNTERMINATED at end of line — a Rust normal
+    # string may span physical lines both via a trailing `\` continuation AND via
+    # a bare literal newline). Removed literal/comment content is replaced by a
+    # single space placeholder so adjacent code tokens never accidentally fuse;
+    # code characters (including a brace/paren/terminator/marker token that
+    # legitimately appears in CODE, not in a literal) are emitted verbatim so
+    # markers still match.
     #
     # Lexical rules (Rust): a line comment runs to end of line; a block comment
-    # runs to the first close (we do not model the nesting Rust allows, matching
-    # the prior scanner) with in_block carrying it across lines; a string or byte
-    # string honors backslash escapes so an escaped quote does NOT end it; a raw
-    # or raw-byte string uses its opening hash count to find the closer and may
-    # span lines via in_raw_string + raw_hash; a char literal is a single char or
-    # backslash-escape between quotes and is DISTINGUISHED from a lifetime (a
-    # quote followed by an identifier that is NOT closed two chars later is a
-    # lifetime and is left as code, since it carries no brace).
+    # NESTS — `/* a /* b */ c */` ends at the SECOND `*/`, so we carry a
+    # block_depth COUNTER (each `/*` in code context increments, each `*/`
+    # decrements) across lines rather than a boolean; a string or byte string
+    # honors backslash escapes so an escaped quote does NOT end it AND may run
+    # PAST end of line (carried by in_string until the unescaped closing `"`),
+    # whether or not a trailing `\` continuation is present; a raw or raw-byte
+    # string uses its opening hash count to find the closer and may span lines via
+    # in_raw_string + raw_hash; a char literal is a single char or backslash-
+    # escape between quotes and is DISTINGUISHED from a lifetime (a quote followed
+    # by an identifier that is NOT closed two chars later is a lifetime and is
+    # left as code, since it carries no brace).
+    # scan_block_comment — advance through an in-flight (depth > 0) NESTED block
+    # comment starting at offset `bi`, counting `/*` (open) and `*/` (close)
+    # tokens to maintain block_depth. Returns the offset just past the token that
+    # drove block_depth back to 0, or 0 if the line ends still inside the comment
+    # (block_depth stays > 0, carried to the next physical line). Rust block
+    # comments NEST: `/* a /* b */ c */` ends at the SECOND `*/`, so a boolean
+    # "in_block" closed such a comment one `*/` early and leaked the trailing
+    # ` c */` (and any braces inside it) into the code residue.
+    function scan_block_comment(s, bi,   m, o2, c2t) {
+        m = bi
+        while (block_depth > 0) {
+            o2 = index(substr(s, m), "/*")
+            c2t = index(substr(s, m), "*/")
+            if (c2t == 0) {
+                # No close on the rest of the line: still inside the comment.
+                # A trailing open `/*` (o2 != 0) only deepens an already-open
+                # comment; depth is carried regardless. Signal "line consumed".
+                return 0
+            }
+            if (o2 != 0 && o2 < c2t) {
+                # A nested open precedes the next close: go deeper, resume after.
+                block_depth++
+                m = m + (o2 - 1) + 2
+            } else {
+                # The next close balances the innermost open.
+                block_depth--
+                m = m + (c2t - 1) + 2
+            }
+        }
+        return m
+    }
     function strip_code(s,   out, i, ch, n, c2, hashes, closer, j, k, nxt, nxt2) {
         out = ""
         n = length(s)
         i = 1
 
+        # Continuation of a multi-line ordinary/byte string from a previous line.
+        # Resume scanning for the unescaped closing `"` (honoring `\` escapes).
+        if (in_string) {
+            while (i <= n) {
+                if (substr(s, i, 1) == "\\") { i += 2; continue }
+                if (substr(s, i, 1) == "\"") { i++; in_string = 0; break }
+                i++
+            }
+            if (in_string) {
+                # Entire line is still inside the string (no closing quote).
+                return out
+            }
+            out = out " "
+        }
         # Continuation of a multi-line raw string from a previous line.
         if (in_raw_string) {
             closer = "\""
@@ -527,14 +579,14 @@ scan_file() {
             raw_hash = 0
             out = out " "
         }
-        # Continuation of a multi-line block comment from a previous line.
-        if (in_block) {
-            j = index(substr(s, i), "*/")
+        # Continuation of a multi-line NESTED block comment from a previous line.
+        if (block_depth > 0) {
+            j = scan_block_comment(s, i)
             if (j == 0) {
+                # Entire line is still inside the (nested) block comment.
                 return out
             }
-            i = i + (j - 1) + 2
-            in_block = 0
+            i = j
             out = out " "
         }
 
@@ -546,15 +598,17 @@ scan_file() {
             if (c2 == "//") {
                 break
             }
-            # Block comment open.
+            # Block comment open (NESTING). Enter at depth 1 and let
+            # scan_block_comment resolve any nested opens/closes on this line; if
+            # the line ends still inside, block_depth carries to the next line.
             if (c2 == "/*") {
-                j = index(substr(s, i + 2), "*/")
+                block_depth++
+                j = scan_block_comment(s, i + 2)
                 if (j == 0) {
-                    in_block = 1
                     out = out " "
                     break
                 }
-                i = i + 2 + (j - 1) + 2
+                i = j
                 out = out " "
                 continue
             }
@@ -582,16 +636,23 @@ scan_file() {
                 # Not a raw string: fall through and emit the r/b as code.
             }
             # Ordinary string or byte string. A backslash escapes the next char,
-            # so an escaped quote does NOT end the string.
+            # so an escaped quote does NOT end the string. If the closing quote is
+            # never found before end of line, the string is UNTERMINATED on this
+            # physical line — it continues on the next line (Rust allows a normal
+            # string to span lines via a trailing `\` continuation OR a bare
+            # newline). Carry that via in_string so the leaked closing brace on a
+            # later line is not miscounted.
             if (ch == "\"" || (ch == "b" && substr(s, i + 1, 1) == "\"")) {
                 k = i + ((ch == "\"") ? 1 : 2)
+                in_string = 1
                 while (k <= n) {
                     if (substr(s, k, 1) == "\\") { k += 2; continue }
-                    if (substr(s, k, 1) == "\"") { k++; break }
+                    if (substr(s, k, 1) == "\"") { k++; in_string = 0; break }
                     k++
                 }
                 i = k
                 out = out " "
+                if (in_string) break
                 continue
             }
             # Char literal vs lifetime. A quote begins a char literal iff what
@@ -639,9 +700,10 @@ scan_file() {
     }
     BEGIN {
         SQ = sprintf("%c", 39)   # single-quote char (kept out of awk source)
-        in_block = 0
+        block_depth = 0
         in_raw_string = 0
         raw_hash = 0
+        in_string = 0
         seen_test = 0
         depth = 0
         in_fn = 0
@@ -709,19 +771,22 @@ scan_file() {
         # string, raw byte string, char literal) is removed so that a brace,
         # paren, quote, `;`, or marker token INSIDE a literal/comment cannot be
         # miscounted by the brace-depth model, the paren/terminator logic, or the
-        # marker match. `strip_code` carries the multi-line `in_block` /
-        # `in_raw_string` (+ `raw_hash`) state across physical lines, so this is
-        # evaluated BEFORE the wave-10 empty-line carry and the chain-join.
-        # The prior naive single-regex string strip was UNSOUND on ordinary
-        # Rust: an escaped quote, a raw string, or a char literal containing a
-        # brace left a real brace/quote in the residue, closing the function body
-        # early and blinding every later Class-S mutation.
+        # marker match. `strip_code` carries the multi-line `block_depth` /
+        # `in_raw_string` (+ `raw_hash`) / `in_string` state across physical
+        # lines, so this is evaluated BEFORE the wave-10 empty-line carry and the
+        # chain-join. The prior strip was UNSOUND on ordinary Rust: an escaped
+        # quote, a raw string, or a char literal containing a brace left a real
+        # brace/quote in the residue (wave-11), AND a NESTED block comment closed
+        # one `*/` early while a multi-line ordinary/byte string was wrongly
+        # treated as closed at EOL (wave-12) — each leaking a brace that closed
+        # the function body early and blinding every later Class-S mutation.
         line = strip_code(raw)
-        # A line that the scanner left fully inside an unterminated block comment
-        # or raw string contributes no code: skip it entirely (it can carry no
-        # fn definition, brace, or marker). `strip_code` set the multi-line state
-        # for the NEXT line; the closer line resumes scanning after the close.
-        if (in_block || in_raw_string) next
+        # A line that the scanner left fully inside an unterminated (nested) block
+        # comment, raw string, or ordinary/byte string contributes no code: skip
+        # it entirely (it can carry no fn definition, brace, or marker).
+        # `strip_code` set the multi-line state for the NEXT line; the closer line
+        # resumes scanning after the close.
+        if (block_depth > 0 || in_raw_string || in_string) next
 
         # Detect a top-level function definition (column 0, allowing pub/async
         # qualifiers). Capture the name. We only treat a fn as "open" once we
@@ -1150,6 +1215,15 @@ run_scan() {
 #   (25) the OVER-STRIP / false-positive guard — a CORRECTLY fail-closed function
 #        carrying the same poison literals is NOT flagged (the marker and the
 #        fail-closed persist are real code that must survive the strip).
+#   (26-31) MULTI-LINE LITERAL/COMMENT STATE — a literal/comment spanning
+#        physical lines must not leak a brace into the body model: (26) NESTED
+#        block comment deflation (a commented-out `legacy(){}`'s `}` must stay in
+#        the comment), (27) nested-comment INFLATION (a leaked `{` must not
+#        swallow a separate later fn), (28) `\`-continuation string deflation,
+#        (29) BARE-newline string deflation, (30) string INFLATION (a `{` on a
+#        continuation line must not blind the later fn), (31) the OVER-STRIP guard
+#        (a fail-closed fn carrying a nested comment + multi-line string is NOT
+#        flagged).
 # Set NO_CLASS_S_SELFTEST=1 to skip (not recommended).
 # ---------------------------------------------------------------------------
 self_test() {
@@ -1465,6 +1539,123 @@ self_test() {
         printf '}\n'
     } > "$fdir/poison_fail_closed.rs"
 
+    # ----- MULTI-LINE LITERAL/COMMENT STATE (wave-12) -------------------------
+    # The wave-11 strip is correct WITHIN a physical line but carried only
+    # block-comment and raw-string state across lines, and modelled a block
+    # comment as a BOOLEAN (first `*/` closes) rather than a NESTING counter.
+    # Two classes of legal, rustc-accepted, cargo-fmt-clean Rust therefore still
+    # leaked a brace into the function-body model:
+    #   (A) a NESTED block comment — `/* a /* b */ c */` ends at the SECOND `*/`;
+    #       the boolean closed it at the first, leaking ` c */` (+ any braces) as
+    #       code;
+    #   (B) a multi-line ORDINARY/BYTE string — a normal string may span physical
+    #       lines via a trailing `\` continuation OR a bare newline; the prior
+    #       scan treated an unterminated-at-EOL string as closed, so a `}` (or
+    #       `{`) on the next line leaked.
+    # A leaked `}` DEFLATES the body (closes the fn early → every later Class-S
+    # mutation in that fn goes invisible); a leaked `{` INFLATES it (the fn never
+    # re-balances → it swallows every SUBSEQUENT fn in the file). Each fixture
+    # below proves one direction is now seen; the (31) guard proves no over-strip.
+
+    # (26) NESTED-COMMENT DEFLATION — an inner `/* compute */` inside an outer
+    # block comment must NOT close the outer comment; the `}` of the commented-out
+    # `legacy() {}` must stay inside the comment, not leak and close the body
+    # early. The best-effort Class-S mutation after the comment MUST be caught.
+    {
+        printf 'pub async fn nested_comment_deflation_fixture() {\n'
+        printf '    /* old impl:\n'
+        printf '       fn legacy() {\n'
+        printf '           /* compute */ let b = compute();\n'
+        printf '       }\n'
+        printf '    */\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/nested_comment_deflation.rs"
+
+    # (27) NESTED-COMMENT INFLATION — the same nesting hazard, but the early
+    # close (at the inner `*/`) exposes an UNBALANCED `{` (`fn leaked() {`) that
+    # the real comment never closes. Under the boolean lexer the leaked `{`
+    # inflated the FIRST fn's depth so it never returned to its floor and
+    # SWALLOWED the SEPARATE later fn — blinding the whole file. A best-effort
+    # Class-S mutation in that LATER fn MUST still be caught (proving the file is
+    # not blinded). The poison fn itself fail-closes so it is not the HIT.
+    {
+        printf 'pub async fn nested_comment_inflation_poison_fixture() {\n'
+        printf '    /* outer /* inner */ fn leaked() {\n'
+        printf '       still inside the real comment, but a boolean lexer sees code\n'
+        printf '    */\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf 'pub async fn nested_comment_inflation_victim_fixture() {\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/nested_comment_inflation.rs"
+
+    # (28) STRING-CONTINUATION DEFLATION (`\`-continuation) — an ordinary string
+    # closed with a trailing `\` line-continuation carries the closing `}` onto
+    # the continuation line, still INSIDE the string. The `}` must not leak and
+    # close the body early. Best-effort Class-S mutation after it MUST be caught.
+    {
+        printf 'pub async fn string_backslash_cont_deflation_fixture() {\n'
+        printf '    let _e = "payload must end with a closing brace \\\n'
+        printf '              } here";\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/string_backslash_cont_deflation.rs"
+
+    # (29) STRING-CONTINUATION DEFLATION (BARE newline) — Rust allows a literal
+    # newline inside a normal string with NO trailing `\`. The string runs across
+    # the bare line break; the `}` on the next physical line is still inside the
+    # string and must not leak. Best-effort Class-S mutation after it MUST be
+    # caught. (Covers the general unterminated-at-EOL case, not only `\`.)
+    {
+        printf 'pub async fn string_bare_newline_deflation_fixture() {\n'
+        printf '    let _e = "line one\n'
+        printf '} line two";\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/string_bare_newline_deflation.rs"
+
+    # (30) STRING INFLATION — a multi-line ordinary string whose continuation
+    # line (still inside the string to rustc) carries an UNBALANCED `{`. Under
+    # the prior scan the string was treated as closed at the first EOL, so the
+    # continuation line's `{` leaked, inflated the FIRST fn's depth, and SWALLOWED
+    # the SEPARATE later fn (blinding the file). The best-effort Class-S mutation
+    # in the LATER fn MUST still be caught. The poison fn fail-closes.
+    {
+        printf 'pub async fn string_inflation_poison_fixture() {\n'
+        printf '    let _e = "this string is not closed on this line\n'
+        printf '        and this continuation carries an opener { that rustc sees as string\n'
+        printf '        and the string finally closes here";\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+        printf '\n'
+        printf 'pub async fn string_inflation_victim_fixture() {\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/string_inflation.rs"
+
+    # (31) OVER-STRIP / FALSE-POSITIVE GUARD (wave-12) — a CORRECTLY fail-closed
+    # function carrying BOTH a nested block comment AND a multi-line string. The
+    # nesting-/string-aware strip must not over-strip the real mutation marker and
+    # fail-closed persist that follow the literals, so this MUST NOT HIT.
+    {
+        printf 'pub async fn multiline_literals_but_fail_closed_fixture() {\n'
+        printf '    /* outer /* inner */ still in comment {\n'
+        printf '    */\n'
+        printf '    let _e = "a brace } in a string spanning\n'
+        printf '              a bare newline { and closing here";\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+    } > "$fdir/multiline_literals_fail_closed.rs"
+
     local rc=0
     local out
     out=$(
@@ -1673,6 +1864,68 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'literals was wrongly flagged — the strip over-stripped real code or lost\n' >&2
         printf 'the fail-closed persist that follows the literals.\n' >&2
+        rc=1
+    fi
+
+    # (26) NESTED-COMMENT DEFLATION — the `}` of a commented-out `legacy() {}`
+    # inside a nested block comment must not leak and close the body early. The
+    # best-effort Class-S mutation after the comment MUST be caught.
+    if ! grep -q $'^HIT\t.*\tnested_comment_deflation_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation after a NESTED block comment was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'NOT caught — the block-comment lexer is boolean (closes at the first `*/`)\n' >&2
+        printf 'and a brace inside the comment leaked, closing the body prematurely.\n' >&2
+        rc=1
+    fi
+    # (27) NESTED-COMMENT INFLATION — a leaked `{` from an early-closed nested
+    # comment must NOT inflate the poison fn so it swallows the SEPARATE later fn.
+    # The best-effort mutation in the LATER (victim) fn MUST still be caught.
+    if ! grep -q $'^HIT\t.*\tnested_comment_inflation_victim_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a leaked `{` from a NESTED block comment blinded the\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'rest of the file — the later (victim) fn was swallowed by an inflated body\n' >&2
+        printf 'and its Class-S mutation went unscanned.\n' >&2
+        rc=1
+    fi
+    # (28) STRING-CONTINUATION DEFLATION (`\`-continuation) — a `}` carried onto a
+    # `\`-continuation line is still inside the string and must not leak. The
+    # best-effort Class-S mutation after the string MUST be caught.
+    if ! grep -q $'^HIT\t.*\tstring_backslash_cont_deflation_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation after a `\\`-CONTINUATION string\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'was NOT caught — the lexer treated the unterminated string as closed at EOL\n' >&2
+        printf 'and a `}` on the continuation line leaked, closing the body prematurely.\n' >&2
+        rc=1
+    fi
+    # (29) STRING-CONTINUATION DEFLATION (BARE newline) — a `}` on a bare-newline
+    # continuation of a normal string is still inside the string and must not
+    # leak. The best-effort Class-S mutation after it MUST be caught.
+    if ! grep -q $'^HIT\t.*\tstring_bare_newline_deflation_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation after a BARE-NEWLINE multi-line\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'string was NOT caught — the lexer did not carry the unterminated-at-EOL\n' >&2
+        printf 'string across the line break and a `}` inside it leaked.\n' >&2
+        rc=1
+    fi
+    # (30) STRING INFLATION — a `{` on a string-continuation line must NOT inflate
+    # the poison fn so it swallows the SEPARATE later fn. The best-effort mutation
+    # in the LATER (victim) fn MUST still be caught.
+    if ! grep -q $'^HIT\t.*\tstring_inflation_victim_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a leaked `{` from a multi-line string blinded the rest\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'of the file — the later (victim) fn was swallowed by an inflated body and\n' >&2
+        printf 'its Class-S mutation went unscanned.\n' >&2
+        rc=1
+    fi
+    # (31) OVER-STRIP / FALSE-POSITIVE GUARD (wave-12) — a CORRECTLY fail-closed
+    # function carrying both a nested block comment and a multi-line string MUST
+    # NOT be flagged. The nesting-/string-aware strip must not over-strip the real
+    # mutation marker and fail-closed persist that follow the literals.
+    if grep -q $'^HIT\t.*\tmultiline_literals_but_fail_closed_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a CORRECTLY fail-closed function carrying a nested\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'comment and a multi-line string was wrongly flagged — the strip over-stripped\n' >&2
+        printf 'real code or lost the fail-closed persist that follows the literals.\n' >&2
         rc=1
     fi
 
