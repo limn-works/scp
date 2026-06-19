@@ -1259,6 +1259,12 @@ pub async fn create_context(
         // lazily by the messaging handler.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        // B-owned cross-context tool-invoke validation state (spec §6.2.4):
+        // fresh on creation/import; repopulated when a gated tool interface is
+        // established. Not rehydrated from any snapshot — reconstructable
+        // interface state, never authorization secrecy.
+        xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::new(),
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
@@ -1830,6 +1836,12 @@ pub async fn import_context(
         // foreign saga cannot drive local Commit/Abort.
         recv_tracker: RecvSequenceTracker::new(),
         saga_pending: HashMap::new(),
+        // B-owned cross-context tool-invoke validation state (spec §6.2.4):
+        // fresh on creation/import; repopulated when a gated tool interface is
+        // established. Not rehydrated from any snapshot — reconstructable
+        // interface state, never authorization secrecy.
+        xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::new(),
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
@@ -2258,6 +2270,14 @@ pub async fn restore_context(
             .into_iter()
             .map(|(id, mirror)| (id, mirror.into_prepared()))
             .collect(),
+        // B-owned cross-context tool-invoke validation state (spec §6.2.4) is
+        // NOT in the Class-S snapshot: it is reconstructable interface state
+        // (UCAN proof index) and freshness/replay cache, repopulated when the
+        // tool interface is (re-)established. A coalesce-window rollback of
+        // freshness state is bounded by the §6.2.4 budget, not authorization
+        // secrecy, so restore starts both fresh.
+        xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
+        xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::new(),
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,

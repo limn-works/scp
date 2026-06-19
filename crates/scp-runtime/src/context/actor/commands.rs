@@ -2527,11 +2527,167 @@ pub enum QueriesCommand {
     },
 }
 
-/// See [`ContextCommand::SagaPhase`]. Saga phase routing lands with the
-/// saga path in commit 11.
+// ---------------------------------------------------------------------------
+// Saga-phase carrier types (spec §6.2.4)
+// ---------------------------------------------------------------------------
+
+/// Output of the Prepare-A handler (spec §6.2.4 "Prepare", caller side).
+///
+/// Carries the `Send` reservation handles the caller-context actor staged but
+/// did NOT apply: the escrow + outbound rate-limit reservation rolled into the
+/// existing [`ToolEconomyReservation`]. The supervisor FSM (slice 5) holds this
+/// across the saga; the [`ToolEconomyReservation`]'s
+/// `#[must_use]` drop guard releases the held escrow/rate-limit on every
+/// terminal non-commit path (abort, timeout, panic — spec §6.2.4 "Reservation
+/// release on every terminal path"). On Commit-A the FSM settles it.
+///
+/// **Not `Clone` / not `Serialize`.** The reservation is a single-owner RAII
+/// carrier — duplicating it would double-release the held ticket.
+#[must_use = "a PreparedAFields carries a ToolEconomyReservation that must be settled or released"]
+pub struct PreparedAFields {
+    /// The staged escrow + outbound rate-limit reservation (RAII release on
+    /// not-commit). Produced via the existing
+    /// [`reserve_tool_economy`](crate::context::tools_helpers::reserve_tool_economy)
+    /// mechanism so Prepare-A reuses the single-context reserve/settle split.
+    pub reservation: crate::context::tools_helpers::ToolEconomyReservation,
+}
+
+impl std::fmt::Debug for PreparedAFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedAFields")
+            .field("reservation", &self.reservation)
+            .finish()
+    }
+}
+
+/// Output of the Prepare-B handler (spec §6.2.4 "Prepare", target side).
+///
+/// Confirms that the target-context actor staged the eight-field
+/// [`CrossContextToolInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared)
+/// into `saga_pending` (with B-recorded `recorded_timestamp_ms` /
+/// `recorded_nonce` / `recorded_chain_depth`) and reserved the tool session,
+/// and surfaces the B-captured provenance values the supervisor needs to drive
+/// the Commit phase (slice 4) — so the FSM does not have to re-read B's staged
+/// slot to learn what B recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedBFields {
+    /// B's own wall-clock value captured once at Prepare-B (spec §6.2.4
+    /// "Recorded timestamp"). NOT the caller-asserted envelope `timestamp_ms`.
+    pub recorded_timestamp_ms: u64,
+    /// B's staged copy of the 16-byte wire nonce (spec §6.2.4 "Staged nonce").
+    pub recorded_nonce: [u8; 16],
+    /// B's re-derived inbound depth = `incoming chain_depth + 1` (spec §6.2.4
+    /// "Chain-depth enforcement"). NOT the caller-asserted advisory depth.
+    pub recorded_chain_depth: u8,
+}
+
+/// See [`ContextCommand::SagaPhase`]. The per-phase messages the supervisor
+/// FSM dispatches to a participant actor for a cross-context tool-invocation
+/// saga (spec §6.2.4). Each variant carries a typed `oneshot` reply.
+///
+/// The Prepare-A / Prepare-B arms have real handler bodies (slice 3b); the
+/// Commit / Abort / divergence-marker arms are dispatched in later slices and
+/// their handler bodies return [`ContextError::NotImplemented`] for now. The
+/// dispatch `match` stays exhaustive so adding a phase is a compile error.
+#[non_exhaustive]
 pub enum SagaPhaseMessage {
-    /// Placeholder.
-    Placeholder {
+    /// Prepare-A — runs on the LOCAL caller-context actor. Validates the
+    /// caller holds `tool:interface` and is in `OutboundPolicy.allowed_callers`,
+    /// stages (not applies) the outbound rate-limit decrement + escrow
+    /// reservation of `declared_cost`, persists Class-S fail-closed, and
+    /// replies the `Send` reservation handles.
+    PrepareA {
+        /// Caller context id (raw 32-byte digest) — the actor's own context.
+        caller_context_id: [u8; 32],
+        /// Caller DID — the channel-authenticated initiator (spec §6.2.4
+        /// "Caller authentication"; the supervisor binds this, not the
+        /// envelope).
+        caller_did: scp_identity::DID,
+        /// Context-local tool registration id being invoked at the target.
+        tool_registration_id: String,
+        /// The declared per-invocation cost to escrow (spec §19.3).
+        declared_cost: u64,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<PreparedAFields, ContextError>>,
+    },
+    /// Prepare-B — runs on the LOCAL target-context actor. Resolves the UCAN
+    /// proof and re-runs §7 validation re-bound to `caller_did` +
+    /// `tool_registration_id` (confused-deputy defense), validates inbound
+    /// policy / schema-specificity floor / target-context binding / freshness /
+    /// chain-depth, captures B-controlled provenance, stages the eight-field
+    /// prepared into `saga_pending`, persists Class-S fail-closed, and replies.
+    PrepareB {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Caller context id (raw 32-byte digest).
+        caller_context_id: [u8; 32],
+        /// Target context id (raw 32-byte digest) — MUST equal B's own context
+        /// (spec §6.2.4 "Target-context binding").
+        target_context_id: [u8; 32],
+        /// Channel-authenticated caller DID (spec §6.2.4 "Caller
+        /// authentication"). The confused-deputy re-bind audience.
+        caller_did: scp_identity::DID,
+        /// Context-local tool registration id (indexes B's own registry).
+        tool_registration_id: String,
+        /// UCAN proof reference — an INDEX into B's own UCAN store, never the
+        /// proof bytes (spec §6.2.4 normative (1)). `None` for an ungated tool.
+        ucan_proof_id: Option<String>,
+        /// The invocation input — validated against the tool's registered
+        /// schema specificity floor (spec §9.2.1); never journaled.
+        input: serde_json::Value,
+        /// Caller-asserted chain depth — advisory/untrusted; used only for the
+        /// `>= max_chain_depth` reject and as the `+1` base for B's re-derived
+        /// `recorded_chain_depth` (spec §6.2.4 "Chain-depth enforcement").
+        asserted_chain_depth: u8,
+        /// Caller-asserted 16-byte envelope nonce — checked against B's TTL
+        /// dedup cache, then staged on accept (spec §6.2.4 "Freshness").
+        asserted_nonce: [u8; 16],
+        /// Caller-asserted send-time (ms) — used ONLY for the §9.14 skew
+        /// freshness check, never recorded (spec §6.2.4 "Recorded timestamp").
+        asserted_timestamp_ms: u64,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<PreparedBFields, ContextError>>,
+    },
+    /// Commit-B — target executes the tool and applies the staged session.
+    /// Handler body lands in a later slice.
+    CommitB {
+        /// Durable saga identifier.
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+    /// Commit-A — caller settles escrow, applies the outbound decrement, and
+    /// records `CrossContextToolInvoked`. Handler body lands in a later slice.
+    CommitA {
+        /// Durable saga identifier.
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The target's signed receipt bytes captured at Commit-B.
+        receipt: Vec<u8>,
+        /// The target's captured tool output bytes.
+        output_bytes: Vec<u8>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+    /// Abort — release the staged reservations on either side (RAII). Handler
+    /// body lands in a later slice.
+    Abort {
+        /// Durable saga identifier.
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+    /// Emit a signed `CrossContextDivergenceMarker` on a `NeedsRepair`
+    /// outcome (spec §6.2.4 "Dual event-log recording"). Handler body lands in
+    /// a later slice.
+    EmitDivergenceMarker {
+        /// Durable saga identifier.
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The 16-byte correlation nonce joining the two event-log records.
+        nonce: [u8; 16],
+        /// Which side committed (caller or target).
+        committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
+        /// The committed-side event id.
+        committed_event_id: String,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },

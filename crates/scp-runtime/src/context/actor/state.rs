@@ -75,6 +75,7 @@ use scp_protocol::context::membership::{MembershipState, ReceiveBuffer};
 use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::crypto::access_keys::AccessKeyStore;
 use scp_protocol::crypto::sender_keys::{NonceDedup, SenderKey, SenderKeyStore};
+use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
 use scp_protocol::envelope::{ReorderBuffer, SequenceTracker};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -983,6 +984,35 @@ pub struct PerContextState {
     /// rejecting new Prepare while this map is non-empty.
     pub saga_pending: HashMap<SagaId, SagaPreparedState>,
 
+    /// Target-side (B-owned) UCAN proof store for cross-context tool
+    /// invocation (spec §6.2.4 normative (1)). Maps a `ucan_proof_id` — the
+    /// INDEX carried on the `CrossContextToolInvoke` envelope, never the proof
+    /// bytes — to the resolved [`UcanToken`](scp_protocol::crypto::ucan::UcanToken).
+    /// At Prepare-B the target resolves the carried `ucan_proof_id` against THIS
+    /// store and re-runs the full §7 validation re-bound to the carried
+    /// `caller_did` + `tool_registration_id` (the confused-deputy defense). The
+    /// store doubles as the delegation-chain `ProofResolver` for that
+    /// validation. Empty until a gated tool interface is established; the
+    /// freshness/replay state ([`Self::xctx_nonce_dedup`]) and this store both
+    /// live where the authorization decision is made — on B's actor.
+    ///
+    /// Not part of the Class-S snapshot: it is reconstructable interface state
+    /// repopulated when the tool interface is (re-)established, never
+    /// authorization secrecy whose coalesce-window rollback re-opens a replay.
+    pub xctx_ucan_proofs: InMemoryProofResolver,
+
+    /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
+    /// tool invocation (spec §6.2.4 "Freshness / anti-replay"). Keyed by the
+    /// 16-byte envelope `nonce`; bounded 10,000-entry / 5-minute-TTL /
+    /// oldest-first eviction (the same [`NonceDedup`] discipline §6.2.2 uses).
+    /// **B — the Prepare-B verifying party — owns this cache**: the
+    /// freshness/replay state lives where the authorization decision is made,
+    /// since Prepare-A runs on the caller's actor and cannot authoritatively
+    /// dedup against B's state. Prepare-B rejects a duplicate nonce and records
+    /// a fresh one on accept. Reconstructable freshness state, not in the
+    /// Class-S snapshot.
+    pub xctx_nonce_dedup: NonceDedup,
+
     /// In-flight broadcast-publish reservations awaiting their apply
     /// phase (ADR-049 §SequenceReservation). Phase 1
     /// (`ReserveBroadcastPublish`) reserves a broadcast sequence and
@@ -1143,6 +1173,8 @@ impl PerContextState {
             send_tracker: SendSequenceTracker::new(),
             recv_tracker: RecvSequenceTracker::new(),
             saga_pending: HashMap::new(),
+            xctx_ucan_proofs: InMemoryProofResolver::new(),
+            xctx_nonce_dedup: NonceDedup::new(),
             pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
             lifecycle_state: ContextLifecycleState::Open,
@@ -1355,6 +1387,8 @@ mod tests {
             send_tracker,
             recv_tracker,
             saga_pending,
+            xctx_ucan_proofs,
+            xctx_nonce_dedup,
             pending_broadcast_publishes,
             welcome_scratchpad,
             lifecycle_state,
@@ -1411,6 +1445,13 @@ mod tests {
         assert_eq!(send_tracker.last_issued(), 0);
         let _ = recv_tracker.last_seen(&DID("did:example:any".to_owned()));
         assert!(saga_pending.is_empty());
+        // B-owned cross-context tool-invoke validation state starts empty: no
+        // UCAN proofs indexed, no nonces seen (spec §6.2.4).
+        assert!(xctx_ucan_proofs.proofs.is_empty());
+        {
+            let mut dedup = xctx_nonce_dedup;
+            assert!(!dedup.is_replayed(&[0u8; 16], 0));
+        }
         assert!(pending_broadcast_publishes.is_empty());
         assert!(welcome_scratchpad.is_none());
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);
@@ -1457,6 +1498,8 @@ mod tests {
             send_tracker: _,
             recv_tracker: _,
             saga_pending: _,
+            xctx_ucan_proofs: _,
+            xctx_nonce_dedup: _,
             pending_broadcast_publishes: _,
             welcome_scratchpad: _,
             lifecycle_state: _,
