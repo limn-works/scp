@@ -477,8 +477,171 @@ scan_file() {
         gsub(/[[:space:]]*=[[:space:]]*/, "=", t)
         return t
     }
+    # strip_code — return the CODE SKELETON of one physical line: the line with
+    # the CONTENT of every comment and literal removed, so that braces, parens,
+    # quotes, and the `;` terminator that live INSIDE a literal or comment are
+    # NOT counted by the downstream brace-depth / paren / terminator / marker
+    # logic. The naive gsub it replaces (which stripped a double-quoted run with
+    # a single regex) was UNSOUND on ordinary Rust: an escaped quote, a raw
+    # string, or a char literal containing a brace left a real brace/quote in the
+    # residue, miscounting the function-body brace depth and closing the function
+    # PREMATURELY. Every Class-S mutation after the poison then became invisible
+    # (a live gate bypass on legal, cargo-fmt-clean code).
+    #
+    # This is a single left-to-right character scanner. It carries three pieces
+    # of MULTI-LINE state across physical lines via awk globals (like the
+    # pre-existing in_block): in_block (inside a block comment), in_raw_string
+    # (inside a raw or raw-byte string), and raw_hash (the OPENING hash count of
+    # the in-flight raw string, so the matching closer is found). Removed
+    # literal/comment content is replaced by a single space placeholder so
+    # adjacent code tokens never accidentally fuse; code characters (including a
+    # brace/paren/terminator/marker token that legitimately appears in CODE, not
+    # in a literal) are emitted verbatim so markers still match.
+    #
+    # Lexical rules (Rust): a line comment runs to end of line; a block comment
+    # runs to the first close (we do not model the nesting Rust allows, matching
+    # the prior scanner) with in_block carrying it across lines; a string or byte
+    # string honors backslash escapes so an escaped quote does NOT end it; a raw
+    # or raw-byte string uses its opening hash count to find the closer and may
+    # span lines via in_raw_string + raw_hash; a char literal is a single char or
+    # backslash-escape between quotes and is DISTINGUISHED from a lifetime (a
+    # quote followed by an identifier that is NOT closed two chars later is a
+    # lifetime and is left as code, since it carries no brace).
+    function strip_code(s,   out, i, ch, n, c2, hashes, closer, j, k, nxt, nxt2) {
+        out = ""
+        n = length(s)
+        i = 1
+
+        # Continuation of a multi-line raw string from a previous line.
+        if (in_raw_string) {
+            closer = "\""
+            for (k = 0; k < raw_hash; k++) closer = closer "#"
+            j = index(substr(s, i), closer)
+            if (j == 0) {
+                # Entire line is still inside the raw string.
+                return out
+            }
+            # Closer found: skip up to and including it, resume scanning after.
+            i = i + (j - 1) + length(closer)
+            in_raw_string = 0
+            raw_hash = 0
+            out = out " "
+        }
+        # Continuation of a multi-line block comment from a previous line.
+        if (in_block) {
+            j = index(substr(s, i), "*/")
+            if (j == 0) {
+                return out
+            }
+            i = i + (j - 1) + 2
+            in_block = 0
+            out = out " "
+        }
+
+        while (i <= n) {
+            ch = substr(s, i, 1)
+            c2 = substr(s, i, 2)
+
+            # Line comment: drop to end of line.
+            if (c2 == "//") {
+                break
+            }
+            # Block comment open.
+            if (c2 == "/*") {
+                j = index(substr(s, i + 2), "*/")
+                if (j == 0) {
+                    in_block = 1
+                    out = out " "
+                    break
+                }
+                i = i + 2 + (j - 1) + 2
+                out = out " "
+                continue
+            }
+            # Raw string / raw byte string: an r or br, then zero-or-more hash,
+            # then a double quote. The hash count fixes the closer.
+            if (ch == "r" || (ch == "b" && substr(s, i + 1, 1) == "r")) {
+                k = i + ((ch == "b") ? 2 : 1)
+                hashes = 0
+                while (substr(s, k, 1) == "#") { hashes++; k++ }
+                if (substr(s, k, 1) == "\"") {
+                    closer = "\""
+                    for (j = 0; j < hashes; j++) closer = closer "#"
+                    k = k + 1
+                    j = index(substr(s, k), closer)
+                    if (j == 0) {
+                        in_raw_string = 1
+                        raw_hash = hashes
+                        out = out " "
+                        break
+                    }
+                    i = k + (j - 1) + length(closer)
+                    out = out " "
+                    continue
+                }
+                # Not a raw string: fall through and emit the r/b as code.
+            }
+            # Ordinary string or byte string. A backslash escapes the next char,
+            # so an escaped quote does NOT end the string.
+            if (ch == "\"" || (ch == "b" && substr(s, i + 1, 1) == "\"")) {
+                k = i + ((ch == "\"") ? 1 : 2)
+                while (k <= n) {
+                    if (substr(s, k, 1) == "\\") { k += 2; continue }
+                    if (substr(s, k, 1) == "\"") { k++; break }
+                    k++
+                }
+                i = k
+                out = out " "
+                continue
+            }
+            # Char literal vs lifetime. A quote begins a char literal iff what
+            # follows is a single char (or a backslash escape) then a closing
+            # quote; otherwise it is a lifetime and is left as code. SQ is the
+            # single-quote character (built in BEGIN to keep it out of the awk
+            # source, which is wrapped in shell single quotes).
+            if (ch == SQ) {
+                nxt = substr(s, i + 1, 1)
+                if (nxt == "\\") {
+                    # Backslash escape: scan to the closing quote. The escape
+                    # protects whatever follows, including a quote or a brace.
+                    k = i + 2
+                    if (substr(s, k, 1) == "u" && substr(s, k + 1, 1) == "{") {
+                        # Unicode escape: skip to the closing brace, then quote.
+                        j = index(substr(s, k), "}")
+                        if (j > 0) k = k + (j - 1) + 1
+                    } else {
+                        k = k + 1
+                    }
+                    if (substr(s, k, 1) == SQ) {
+                        i = k + 1
+                        out = out " "
+                        continue
+                    }
+                    # Malformed: emit the quote as code and advance one.
+                } else {
+                    # Possible single-char literal: only if a closing quote sits
+                    # exactly two chars on. Otherwise it is a lifetime and must
+                    # be left as code.
+                    nxt2 = substr(s, i + 2, 1)
+                    if (nxt != "" && nxt2 == SQ) {
+                        i = i + 3
+                        out = out " "
+                        continue
+                    }
+                    # Lifetime (or stray quote): fall through, emit as code.
+                }
+            }
+
+            out = out ch
+            i++
+        }
+        return out
+    }
     BEGIN {
+        SQ = sprintf("%c", 39)   # single-quote char (kept out of awk source)
         in_block = 0
+        in_raw_string = 0
+        raw_hash = 0
         seen_test = 0
         depth = 0
         in_fn = 0
@@ -541,22 +704,24 @@ scan_file() {
             || raw ~ /^#\[cfg\(any\(test[,)]/) { seen_test = 1 }
         if (seen_test) next
 
-        line = raw
-        # Strip string literals first (so a `/*` inside a string cannot wedge
-        # the block-comment scanner, and so a marker name inside a string does
-        # not count).
-        if (!in_block) gsub(/"[^"]*"/, "", line)
-        # Strip //-comment tail.
-        if (!in_block) sub(/\/\/.*$/, "", line)
-        # Strip single-line /* .. */.
-        while (match(line, /\/\*.*\*\//)) {
-            line = substr(line, 1, RSTART - 1) substr(line, RSTART + RLENGTH)
-        }
-        # Open block comment.
-        if (match(line, /\/\*/)) { line = substr(line, 1, RSTART - 1); in_block = 1 }
-        # Close block comment.
-        if (in_block && match(line, /\*\//)) { line = substr(line, RSTART + RLENGTH); in_block = 0 }
-        if (in_block) next
+        # Reduce the physical line to its CODE SKELETON: the content of every
+        # comment and literal (line/block comment, string, byte string, raw
+        # string, raw byte string, char literal) is removed so that a brace,
+        # paren, quote, `;`, or marker token INSIDE a literal/comment cannot be
+        # miscounted by the brace-depth model, the paren/terminator logic, or the
+        # marker match. `strip_code` carries the multi-line `in_block` /
+        # `in_raw_string` (+ `raw_hash`) state across physical lines, so this is
+        # evaluated BEFORE the wave-10 empty-line carry and the chain-join.
+        # The prior naive single-regex string strip was UNSOUND on ordinary
+        # Rust: an escaped quote, a raw string, or a char literal containing a
+        # brace left a real brace/quote in the residue, closing the function body
+        # early and blinding every later Class-S mutation.
+        line = strip_code(raw)
+        # A line that the scanner left fully inside an unterminated block comment
+        # or raw string contributes no code: skip it entirely (it can carry no
+        # fn definition, brace, or marker). `strip_code` set the multi-line state
+        # for the NEXT line; the closer line resumes scanning after the close.
+        if (in_block || in_raw_string) next
 
         # Detect a top-level function definition (column 0, allowing pub/async
         # qualifiers). Capture the name. We only treat a fn as "open" once we
@@ -652,9 +817,11 @@ scan_file() {
             # cannot leak a stale prefix across a real statement boundary. We skip
             # the continuation/else decision, the marker re-scan (the buffer is
             # unchanged — no new match is possible), and the terminator reset (no
-            # terminator on an empty line) for this physical line. `depth` is still
-            # updated below via the (zero) opens/closes, and the fn-close logic
-            # still runs, so nothing else is affected.
+            # terminator on an empty line) for this physical line. `depth` is
+            # still updated here via the (zero) opens/closes; the fn-close check
+            # is skipped on this line but is inert — a function never closes on a
+            # brace-free line (opens==closes==0 leaves `depth` unchanged), so
+            # nothing else is affected.
             if (trimmed == "") {
                 depth += opens - closes
                 next
@@ -973,6 +1140,16 @@ run_scan() {
 #        flagged — the threshold markers fire only on removal / assignment;
 #   (14) a fail-closed signer removal (`.retain` + fail-closed persist) is NOT
 #        flagged.
+#   (21-24b) LEXICAL-STRIP SOUNDNESS — a Class-S mutation hidden BEHIND a poison
+#        literal whose brace would, under the old naive string strip, close the
+#        function body early IS still caught: (21) an escaped-quote string
+#        containing a brace (`"x\"}"` — the verified evasion), (22) a raw string
+#        containing a brace and a quote (`r#"a " } b"#`), (23) char literals
+#        holding braces (`'}'`, `'{'`), (24) a brace-inflating string (`"{{{"`),
+#        (24b) a byte string containing a brace (`b"}"`).
+#   (25) the OVER-STRIP / false-positive guard — a CORRECTLY fail-closed function
+#        carrying the same poison literals is NOT flagged (the marker and the
+#        fail-closed persist are real code that must survive the strip).
 # Set NO_CLASS_S_SELFTEST=1 to skip (not recommended).
 # ---------------------------------------------------------------------------
 self_test() {
@@ -1198,6 +1375,96 @@ self_test() {
         printf '}\n'
     } > "$fdir/multiline_comment_interposed_fixed.rs"
 
+    # ----- LEXICAL-STRIP SOUNDNESS (wave-11) ----------------------------------
+    # The brace-depth model that closes a function body depends on stripping the
+    # CONTENT of every literal/comment BEFORE counting braces. The prior naive
+    # string strip was unsound on ordinary Rust: an escaped quote, a raw string,
+    # or a char literal containing a brace left a real brace in the residue,
+    # closing the function PREMATURELY so every later Class-S mutation went
+    # invisible. Each fixture below puts a poison literal BEFORE a best-effort
+    # (NON fail-closed) Class-S mutation and asserts the gate STILL HITS — i.e.
+    # the brace model survived the literal and the mutation is still detected.
+    # SQ is the single-quote byte (\047), kept out of the single-quoted printf.
+    local SQ
+    SQ=$(printf '\047')
+
+    # (21) ESCAPED-QUOTE STRING containing a brace. `"x\"}"` — the `\"` must NOT
+    # end the string, so the `}` inside it must NOT be counted as a real brace.
+    # Before the fix the residue `}` closed the fn body early and the mutation
+    # below it was invisible (the verified evasion). MUST HIT.
+    {
+        printf 'pub async fn poison_escaped_quote_fixture() {\n'
+        printf '    let s = "x\\"}";\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/poison_escaped_quote.rs"
+
+    # (22) RAW STRING containing a brace AND a quote. `r#"a " } b"#` — the inner
+    # `"` must NOT end the string (only `"#` closes it), so neither the inner
+    # quote nor the `}` may be counted. MUST HIT.
+    {
+        printf 'pub async fn poison_raw_string_fixture() {\n'
+        printf '    let s = r#"a " } b"#;\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/poison_raw_string.rs"
+
+    # (23) CHAR LITERALS holding braces: a close brace then an open brace. Each
+    # brace lives inside a char literal and must NOT alter the depth (a net-zero
+    # pair that, if counted, would still corrupt the running depth mid-body).
+    # MUST HIT. Uses SQ for the single quotes so the printf stays single-quoted.
+    {
+        printf 'pub async fn poison_char_brace_fixture() {\n'
+        printf '    let close = %s}%s;\n' "$SQ" "$SQ"
+        printf '    let open = %s{%s;\n' "$SQ" "$SQ"
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/poison_char_brace.rs"
+
+    # (24) OPEN-BRACE INFLATION via an escaped-quote string carrying opening
+    # braces: `"\"{{{"`. The leading `\"` is an escaped quote INSIDE the string,
+    # so the whole `"\"{{{"` is one literal and the three `{` must NOT be
+    # counted. Under the old naive strip the regex matched only `"\"` (stopping
+    # at the backslash-quote) and left `{{{"` in the residue — three phantom
+    # opens plus a stray quote — inflating the depth so the body never returned
+    # to its floor and the mutation below went invisible. This is the inflation
+    # cousin of the (21) evasion and, like it, is defeated only by an
+    # escape-aware strip. MUST HIT.
+    {
+        printf 'pub async fn poison_brace_inflation_fixture() {\n'
+        printf '    let s = "\\"{{{";\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/poison_brace_inflation.rs"
+
+    # (24b) BYTE STRING containing a brace. `b"}"` honors the same escape rules
+    # as a plain string; the `}` inside must NOT be counted. MUST HIT.
+    {
+        printf 'pub async fn poison_byte_string_fixture() {\n'
+        printf '    let s = b"}";\n'
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/poison_byte_string.rs"
+
+    # (25) OVER-STRIP / FALSE-POSITIVE GUARD — a CORRECTLY fail-closed function
+    # carrying the SAME poison literals. The stricter strip must NOT over-strip
+    # real code: the mutation marker and the fail-closed persist below the
+    # literals are real CODE and must survive stripping, so this MUST NOT HIT.
+    {
+        printf 'pub async fn poison_but_fail_closed_fixture() {\n'
+        printf '    let a = "x\\"}";\n'
+        printf '    let b = r#"a " } b"#;\n'
+        printf '    let c = %s}%s;\n' "$SQ" "$SQ"
+        printf '    state.xctx_caller_reservations.insert(saga_id, record);\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+    } > "$fdir/poison_fail_closed.rs"
+
     local rc=0
     local out
     out=$(
@@ -1345,6 +1612,67 @@ self_test() {
         printf '%sSELF-TEST FAILED%s: an allowlisted upward governance leaf\n' \
             "$C_RED" "$C_RESET" >&2
         printf '(execute_add_member) was wrongly flagged by the fail-closed-by-default rule.\n' >&2
+        rc=1
+    fi
+
+    # (21) LEXICAL STRIP — escaped-quote string containing a brace. The brace
+    # inside `"x\"}"` must not be counted (the `\"` does not end the string), so
+    # the fn body does not close early and the Class-S mutation below it is still
+    # detected. MUST HIT. This is the verified evasion the wave-11 fix closes.
+    if ! grep -q $'^HIT\t.*\tpoison_escaped_quote_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation hidden behind an ESCAPED-QUOTE\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'string containing a brace was NOT caught — the strip is not escape-aware\n' >&2
+        printf 'and the brace model closed the function body prematurely.\n' >&2
+        rc=1
+    fi
+    # (22) LEXICAL STRIP — raw string containing a brace and a quote. Only `"#`
+    # closes `r#"a " } b"#`; the inner quote and brace must not be counted.
+    # MUST HIT.
+    if ! grep -q $'^HIT\t.*\tpoison_raw_string_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation hidden behind a RAW STRING\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'containing a brace/quote was NOT caught — the strip does not honor the\n' >&2
+        printf 'raw-string hash-delimited closer.\n' >&2
+        rc=1
+    fi
+    # (23) LEXICAL STRIP — char literals holding braces (`}` then `{`). A brace
+    # inside a char literal must not alter brace depth. MUST HIT.
+    if ! grep -q $'^HIT\t.*\tpoison_char_brace_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation hidden behind CHAR LITERALS\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'holding braces was NOT caught — the strip does not recognize char literals\n' >&2
+        printf '(and a brace in a char literal corrupted the brace-depth model).\n' >&2
+        rc=1
+    fi
+    # (24) LEXICAL STRIP — open-brace inflation via a `"{{{"` string. Braces in a
+    # string must not inflate depth (which would swallow a later real `}` and
+    # hide the mutation). MUST HIT.
+    if ! grep -q $'^HIT\t.*\tpoison_brace_inflation_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation hidden behind a brace-INFLATING\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'escaped-quote string was NOT caught — the strip counted in-string opening\n' >&2
+        printf 'braces left in the residue and the body never returned to its floor.\n' >&2
+        rc=1
+    fi
+    # (24b) LEXICAL STRIP — byte string `b"}"` containing a brace. MUST HIT.
+    if ! grep -q $'^HIT\t.*\tpoison_byte_string_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation hidden behind a BYTE STRING\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'containing a brace was NOT caught — the strip does not treat a byte\n' >&2
+        printf 'string as a string literal.\n' >&2
+        rc=1
+    fi
+    # (25) OVER-STRIP / FALSE-POSITIVE GUARD — a CORRECTLY fail-closed function
+    # carrying the same poison literals MUST NOT be flagged. The mutation marker
+    # and the fail-closed persist are real CODE below the literals and must
+    # survive the strip; if the stricter scanner over-stripped real code (or
+    # failed to see the fail-closed persist), this would wrongly HIT.
+    if grep -q $'^HIT\t.*\tpoison_but_fail_closed_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a CORRECTLY fail-closed function carrying poison\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'literals was wrongly flagged — the strip over-stripped real code or lost\n' >&2
+        printf 'the fail-closed persist that follows the literals.\n' >&2
         rc=1
     fi
 
