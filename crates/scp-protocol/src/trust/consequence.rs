@@ -88,6 +88,19 @@ pub enum ConsequenceTrigger {
 
     /// The subject invoked tools at a rate exceeding the threshold within the
     /// time window. Counted from `EventType::ToolInvoked` events.
+    ///
+    /// # Currently dormant / non-functional
+    ///
+    /// This trigger cannot fire today (native AND WASM). It keys on
+    /// `EventType::ToolInvoked`, but per-author `ToolInvoked` is no longer
+    /// durably logged and there is no corresponding `ContextEvent::ToolInvoked`
+    /// variant, so no convergent tool-invocation signal exists in the interim.
+    /// A configured `ToolRateExceeded` rule is therefore a no-op until a
+    /// convergent tool-rate input arrives with the ADR-051 causal-DAG ordering.
+    /// The variant is retained (removing it is an API change, out of scope) so
+    /// rules remain expressible against the eventual convergent signal. Tool
+    /// flooding remains bounded in the interim by the independent hard rate
+    /// limit, which does not depend on this trigger.
     ToolRateExceeded,
 
     /// The subject accumulated warnings (governance actions against them)

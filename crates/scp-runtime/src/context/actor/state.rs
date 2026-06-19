@@ -819,14 +819,28 @@ pub struct PerContextState {
     /// `state::PerContextState::receive_buffer`.
     pub receive_buffer: ReceiveBuffer,
 
-    /// Per-payee payment receipts captured in this context (spec §19.11).
+    /// RECENT per-payee payment receipts captured in this context (spec
+    /// §19.11). Bounded, in-memory, lost on actor respawn — NOT the complete
+    /// persisted payment history.
     ///
     /// `PaymentReceived` is per-payee application activity, excluded from the
     /// canonical Merkle log (ADR-011 amendment exclusion taxonomy §2). Receipts
     /// are surfaced from this local buffer — NOT the durable event log — by the
     /// `payment_history` query, so the count diverges per member without
     /// perturbing the convergent `event_log_merkle_root` (§9.9.3).
-    pub payment_receipts: Vec<PaymentReceipt>,
+    ///
+    /// # Bounded ring (oldest-evicted)
+    ///
+    /// Capacity is capped at
+    /// [`DEFAULT_BUFFER_CAPACITY`](scp_protocol::context::membership::DEFAULT_BUFFER_CAPACITY)
+    /// — the same bound as the sibling `receive_buffer` ring — so a long-lived
+    /// paid context cannot grow this buffer without limit (memory-growth DoS).
+    /// When the buffer is full a new receipt evicts the oldest (`pop_front`
+    /// before `push_back`). This buffer is therefore a SLIDING WINDOW of the
+    /// most recent captures, NOT the authoritative payment ledger; the full
+    /// persisted history is a separate, store-backed surface (not yet wired —
+    /// see [`crate::economy::receipt::payment_history`]).
+    pub payment_receipts: VecDeque<PaymentReceipt>,
 
     // -----------------------------------------------------------------
     // Mode-specific state
@@ -1278,7 +1292,7 @@ impl PerContextState {
             role_state: empty_role_state_for_test(),
             event_log: None,
             receive_buffer: ReceiveBuffer::new(),
-            payment_receipts: Vec::new(),
+            payment_receipts: VecDeque::new(),
             broadcast_context: None,
             migration_state: None,
             governance: GovernanceState::new_fresh_for_actor(context_id_str, admin_did, clock),

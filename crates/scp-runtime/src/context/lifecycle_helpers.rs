@@ -1243,7 +1243,7 @@ pub async fn create_context(
         },
         role_state,
         receive_buffer: ReceiveBuffer::new(),
-        payment_receipts: Vec::new(),
+        payment_receipts: VecDeque::new(),
         broadcast_context,
         migration_state: None,
         epoch: EpochState {
@@ -1757,7 +1757,7 @@ pub async fn import_context(
         members: actor_members,
         role_state: export.snapshot.role_state,
         receive_buffer: ReceiveBuffer::new(),
-        payment_receipts: Vec::new(),
+        payment_receipts: VecDeque::new(),
         broadcast_context: None,
         migration_state: None,
         governance: GovernanceState {
@@ -2271,7 +2271,7 @@ pub async fn restore_context(
         },
         role_state: ctx_snapshot.role_state,
         receive_buffer: ReceiveBuffer::new(),
-        payment_receipts: Vec::new(),
+        payment_receipts: VecDeque::new(),
         broadcast_context: broadcast_ctx,
         migration_state: ctx_snapshot.migration_state,
         epoch: EpochState {
@@ -3762,5 +3762,97 @@ mod restore_reconcile_tests {
         // The capture ran exactly once and nothing was voided.
         assert_eq!(captured.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(voided.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // ---------------------------------------------------------------
+        // Bounded ring: oldest-evicted at DEFAULT_BUFFER_CAPACITY.
+        // ---------------------------------------------------------------
+        // Pre-fill the buffer to exactly capacity with synthetic markers,
+        // tagging the OLDEST so we can prove it is the one evicted. The
+        // single real receipt captured above is dropped to make room.
+        let cap = scp_protocol::context::membership::DEFAULT_BUFFER_CAPACITY;
+        state.payment_receipts.clear();
+        let oldest_id = [0x01u8; 32];
+        for i in 0..cap {
+            let mut id = [0u8; 32];
+            id[0] = u8::try_from(i % 256).expect("i % 256 fits u8");
+            id[1] = u8::try_from((i / 256) % 256).expect("fits u8");
+            // The very first inserted marker carries the sentinel id so its
+            // eviction is unambiguous.
+            let id = if i == 0 { oldest_id } else { id };
+            state
+                .payment_receipts
+                .push_back(crate::economy::adapter::PaymentReceipt {
+                    receipt_id: id,
+                    payer: payer.clone(),
+                    payee: admin.clone(),
+                    amount: scp_protocol::economy::types::Amount(1),
+                    currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
+                    action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
+                    context_id: Some(context_id.clone()),
+                    adapter_id: "recording".to_owned(),
+                    adapter_proof: Vec::new(),
+                    timestamp: i as u64,
+                    anchored: false,
+                    signature: Vec::new(),
+                });
+        }
+        assert_eq!(
+            state.payment_receipts.len(),
+            cap,
+            "buffer is pre-filled to exactly capacity"
+        );
+        assert!(
+            state
+                .payment_receipts
+                .iter()
+                .any(|r| r.receipt_id == oldest_id),
+            "the oldest sentinel is present before the over-capacity push"
+        );
+
+        // One more real capture pushes past capacity, evicting the oldest.
+        let auth2 = crate::context::economy_helpers::authorize_paid_action(
+            &mut state,
+            &deps,
+            scp_protocol::economy::types::PaidActionType::MessageSend,
+            &payer,
+            &context_id,
+        )
+        .await
+        .expect("authorize_paid_action (2)")
+        .expect("a paid action is authorized for a per_message policy (2)");
+        let receipt2 = crate::context::economy_helpers::complete_paid_action(
+            &mut state,
+            &deps,
+            auth2,
+            &context_id,
+        )
+        .await
+        .expect("complete_paid_action (2)")
+        .expect("a receipt is produced on capture (2)");
+
+        // Length is held at the bound — oldest-evicted, not unbounded growth.
+        assert_eq!(
+            state.payment_receipts.len(),
+            cap,
+            "an over-capacity push must hold the buffer at DEFAULT_BUFFER_CAPACITY (oldest-evicted)"
+        );
+        // The oldest sentinel is gone.
+        assert!(
+            !state
+                .payment_receipts
+                .iter()
+                .any(|r| r.receipt_id == oldest_id),
+            "the oldest receipt must be evicted once the buffer is full"
+        );
+        // The newest real receipt is at the back.
+        assert_eq!(
+            state
+                .payment_receipts
+                .back()
+                .expect("buffer is non-empty")
+                .receipt_id,
+            receipt2.receipt_id,
+            "the newest receipt is pushed onto the back of the ring"
+        );
     }
 }

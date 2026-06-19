@@ -276,6 +276,17 @@ pub struct PaymentReceipt {
     /// provenance MUST reject an unanchored receipt. This field is deliberately
     /// EXCLUDED from the signing preimage (§19.6 receipt signature scope ends at
     /// `timestamp`).
+    ///
+    /// # UNSIGNED WIRE FIELD — do not trust the deserialized value
+    ///
+    /// Because `anchored` lies OUTSIDE the signed payload, it is NOT
+    /// authenticated by the receipt signature: a relay or peer can flip it
+    /// freely on the wire without invalidating the signature. A consumer MUST
+    /// derive anchoring from its own local Merkle / event-log state and MUST
+    /// NOT trust the deserialized wire value of this field. Today it is always
+    /// constructed `false` and no production code reads it across the wire, so
+    /// this is preventive — but the moment a consumer begins reading it, it
+    /// must treat the deserialized value as untrusted.
     pub anchored: bool,
     /// Ed25519 signature by the payer over the receipt data.
     pub signature: Vec<u8>,

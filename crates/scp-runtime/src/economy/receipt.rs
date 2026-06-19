@@ -373,26 +373,37 @@ pub struct ReceiptFilter {
 // payment_history
 // ---------------------------------------------------------------------------
 
-/// Retrieves payment receipts from a context's local receipt buffer.
+/// Retrieves RECENT payment receipts from a context's local receipt buffer.
 ///
 /// Filters the given per-context `payment_receipts` (the actor-owned local
-/// buffer — `PerContextState::payment_receipts`) by the optional `filter`
+/// ring buffer — `PerContextState::payment_receipts`) by the optional `filter`
 /// (payer, payee, or time range). `PaymentReceived` is per-payee application
 /// activity excluded from the canonical Merkle log (ADR-011 amendment exclusion
 /// taxonomy §2; convergent only under ADR-051), so the receipts are read from
 /// the local buffer rather than the durable event log — this is what keeps the
 /// `event_log_merkle_root` convergent across honest members (§9.9.3).
 ///
+/// # This returns RECENT buffered receipts, not the complete history
+///
+/// The backing buffer is a bounded, in-memory, oldest-evicted ring (capacity
+/// [`DEFAULT_BUFFER_CAPACITY`](scp_protocol::context::membership::DEFAULT_BUFFER_CAPACITY))
+/// that is lost on actor respawn. This function therefore returns a SLIDING
+/// WINDOW of the most recent captures — NOT the authoritative, complete payment
+/// ledger. The full persisted payment history is a separate, store-backed
+/// surface (not yet wired).
+///
 /// The optional `filter` parameter allows narrowing results by payer, payee,
 /// or time range.
 ///
-/// Corresponds to the SDK surface `SCP.Economy.paymentHistory(context)`
-/// (spec section 19.11).
+/// This is the runtime-side query. Its FFI bridge export and language-SDK
+/// wrapper exposure are separate, not-yet-implemented work — there is no
+/// `SCP.Economy.paymentHistory` SDK surface yet (spec section 19.11 describes
+/// the intended end state).
 #[must_use]
-pub fn payment_history(
-    receipts: &[PaymentReceipt],
-    filter: Option<&ReceiptFilter>,
-) -> Vec<PaymentReceipt> {
+pub fn payment_history<'a, I>(receipts: I, filter: Option<&ReceiptFilter>) -> Vec<PaymentReceipt>
+where
+    I: IntoIterator<Item = &'a PaymentReceipt>,
+{
     let mut matched = Vec::new();
 
     for receipt in receipts {

@@ -235,7 +235,16 @@ pub async fn complete_paid_action(
 
     // Record the receipt in the per-context local buffer that backs the
     // `payment_history` query (spec §19.11) — NOT the durable Merkle log.
-    state.payment_receipts.push(receipt.clone());
+    // Bounded oldest-evicted ring at the same capacity as the sibling
+    // `receive_buffer` so a long-lived paid context cannot grow this buffer
+    // without limit (memory-growth DoS). Evict the oldest before pushing the
+    // newest once the buffer is full.
+    if state.payment_receipts.len()
+        >= scp_protocol::context::membership::DEFAULT_BUFFER_CAPACITY
+    {
+        state.payment_receipts.pop_front();
+    }
+    state.payment_receipts.push_back(receipt.clone());
 
     Ok(Some(receipt))
 }
