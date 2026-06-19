@@ -626,6 +626,40 @@ scan_file() {
             # whitespace removed (used only to detect a leading-`.` continuation).
             trimmed = line
             sub(/^[[:space:]]+/, "", trimmed)
+
+            # EMPTY-LINE CARRY (the round-10 continuation-join fix). After comment
+            # and string stripping a physical line can strip to EMPTY — it was a
+            # comment-only line (`// ...`, a `/* .. */` whose text was removed) or
+            # a genuinely blank line. Such a line carries NO token, NO paren, and
+            # NO statement terminator, so it must be a TRANSPARENT no-op for the
+            # logical-line buffer: carry `chain_buf` forward UNCHANGED rather than
+            # letting the `else` branch reset it. Without this, an interposed
+            # comment/blank line BETWEEN two method-chain links discarded the
+            # accumulated receiver prefix (`state.xctx_caller_reservations`), so a
+            # split-token marker (`xctx_caller_reservations.insert(`,
+            # `saga_pending.insert(`, `membership.remove_member(`, ...) written
+            # with a comment interposed never fired — and `rustfmt` PRESERVES such
+            # an interposed comment, so the evasion survived `cargo fmt`. Carrying
+            # the buffer makes any number of interposed comment/blank lines
+            # anywhere in a chain transparent, so the split marker still glues.
+            #
+            # Correctness of the carry: an empty `line` contributes opens==0,
+            # closes==0 (computed above), so it does not alter paren-depth or
+            # `chain_unclosed`, and it cannot satisfy the `;`/`{`/`}` terminator —
+            # there is nothing to re-account. After a COMPLETED statement the
+            # buffer is already "" (reset at its terminator on the prior line), so
+            # carrying "" forward across a trailing blank line is harmless and
+            # cannot leak a stale prefix across a real statement boundary. We skip
+            # the continuation/else decision, the marker re-scan (the buffer is
+            # unchanged — no new match is possible), and the terminator reset (no
+            # terminator on an empty line) for this physical line. `depth` is still
+            # updated below via the (zero) opens/closes, and the fn-close logic
+            # still runs, so nothing else is affected.
+            if (trimmed == "") {
+                depth += opens - closes
+                next
+            }
+
             # Is the buffer mid-statement with an open call-paren? (more `(` than
             # `)` so far). Counted on the comment-stripped buffer.
             buf_opens = gsub(/\(/, "(", chain_buf)   # gsub returns the count
@@ -1109,6 +1143,61 @@ self_test() {
         printf '}\n'
     } > "$fdir/multiline_fixed.rs"
 
+    # (18) INTERPOSED-COMMENT CONTINUATION-JOIN — the round-10 bypass. The same
+    # split `xctx_caller_reservations.insert(` chain as (16), but with a
+    # comment-only line INTERPOSED BETWEEN two chain links. Before the
+    # empty-line-carry fix, the interposed comment stripped to empty and the
+    # `else` branch reset the logical-line buffer, discarding the
+    # `state.xctx_caller_reservations` receiver prefix — so the split marker never
+    # fired and a best-effort (NON-fail-closed) staged caller-reversal slipped the
+    # gate. `rustfmt` PRESERVES the interposed comment, so the evasion survived
+    # `cargo fmt`. With the carry, the comment is transparent and the marker
+    # glues. Best-effort persist models the hazard → MUST be caught.
+    {
+        printf 'pub async fn multiline_comment_interposed_missed_fixture() {\n'
+        printf '    let record = ticket.to_caller_reservation_record(now);\n'
+        printf '    state\n'
+        printf '        .xctx_caller_reservations\n'
+        printf '        // record the reversal handle\n'
+        printf '        .insert(saga_id.clone(), record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/multiline_comment_interposed_missed.rs"
+
+    # (19) INTERPOSED-BLANK-LINE CONTINUATION-JOIN — the same bypass via a
+    # genuinely BLANK line between two chain links (the other way a stripped-empty
+    # line can interpose). Same hazard, same fix: the blank line must be a
+    # transparent no-op so the split marker still glues. Best-effort persist →
+    # MUST be caught.
+    {
+        printf 'pub async fn multiline_blank_interposed_missed_fixture() {\n'
+        printf '    let record = ticket.to_caller_reservation_record(now);\n'
+        printf '    state\n'
+        printf '        .xctx_caller_reservations\n'
+        printf '\n'
+        printf '        .insert(saga_id.clone(), record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/multiline_blank_interposed_missed.rs"
+
+    # (20) INTERPOSED-COMMENT CONTINUATION-JOIN, SATISFIED — the same
+    # interposed-comment split chain as (18) but the function DOES persist
+    # fail-closed. The empty-line carry must NOT make this a false positive: the
+    # marker fires (mutation detected across the comment) but the fail-closed
+    # persist satisfies it, so it is NOT flagged. Guards against an over-aggressive
+    # carry that would HIT a properly-fail-closed multi-line mutator merely because
+    # a comment was interposed in its chain.
+    {
+        printf 'pub async fn multiline_comment_interposed_fixed_fixture() {\n'
+        printf '    let record = ticket.to_caller_reservation_record(now);\n'
+        printf '    state\n'
+        printf '        .xctx_caller_reservations\n'
+        printf '        // record the reversal handle\n'
+        printf '        .insert(saga_id.clone(), record);\n'
+        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '}\n'
+    } > "$fdir/multiline_comment_interposed_fixed.rs"
+
     local rc=0
     local out
     out=$(
@@ -1164,6 +1253,38 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'fail-closed was wrongly flagged — the continuation-join is over-aggressive\n' >&2
         printf '(it ignored the fail-closed persist on the joined statement chain).\n' >&2
+        rc=1
+    fi
+    # (18) INTERPOSED-COMMENT CONTINUATION-JOIN (round-10 bypass): a Class-S
+    # mutation whose split marker has a COMMENT-ONLY line interposed between two
+    # chain links, with a best-effort persist, MUST be caught. The empty-line
+    # carry must keep the receiver prefix alive across the comment so the marker
+    # still glues. (rustfmt preserves the interposed comment → it survives fmt.)
+    if ! grep -q $'^HIT\t.*\tmultiline_comment_interposed_missed_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation with a COMMENT interposed between\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'two method-chain links was NOT caught — the empty-line carry is dropping the\n' >&2
+        printf 'logical-line buffer on a stripped-empty comment line (the round-10 bypass).\n' >&2
+        rc=1
+    fi
+    # (19) INTERPOSED-BLANK-LINE CONTINUATION-JOIN: the same bypass via a blank
+    # line between two chain links MUST be caught.
+    if ! grep -q $'^HIT\t.*\tmultiline_blank_interposed_missed_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a Class-S mutation with a BLANK line interposed between\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'two method-chain links was NOT caught — the empty-line carry is dropping the\n' >&2
+        printf 'logical-line buffer on a blank line.\n' >&2
+        rc=1
+    fi
+    # (20) INTERPOSED-COMMENT CONTINUATION-JOIN, SATISFIED: the same
+    # interposed-comment split chain that DOES persist fail-closed MUST NOT be
+    # flagged — the carry must not turn a correctly-persisted multi-line mutator
+    # with an interposed comment into a false positive.
+    if grep -q $'^HIT\t.*\tmultiline_comment_interposed_fixed_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a multi-line Class-S mutation with an interposed comment\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'that DOES persist fail-closed was wrongly flagged — the empty-line carry is\n' >&2
+        printf 'over-aggressive (it ignored the fail-closed persist on the joined chain).\n' >&2
         rc=1
     fi
     # (11) Seam-1/black-hat: a best-effort NON-`execute_` ceiling-lowering leaf
