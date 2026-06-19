@@ -343,6 +343,52 @@ fi
 #     false-flagged. The `&mut.<field>` form also dodges the method-name collision
 #     that a receiver-agnostic `.remove_member(` would have with the unrelated MLS
 #     `crypto.remove_member(` (a different method on a different receiver).
+#
+# THE COMPLETE BOUNDED &mut-ACQUISITION GRAMMAR (wave-24). Wave-23 closed the
+# reference-ALIAS axis; the `ref mut` STRUCT-DESTRUCTURE-RENAME axis remained
+# open (black-hat wave-24). Rather than chase one-more-spelling, the marker set
+# now EXHAUSTS the FINITE grammar of "obtain mutable access to a named Class-S
+# field X in safe Rust". There are exactly these forms, and every one is covered:
+#   (1) inline `X.<mutating_method>(`  — the field-pinned method/assign markers
+#       (membership.remove_member, executed_proposals.insert, .ceiling=, ...).
+#   (2) `&mut <recv>.X` explicit borrow/alias — `normalize_borrow` -> `&mut.X`.
+#       HARDENED to the receiver shapes `&mut state.X`, `&mut self.inner.X`,
+#       `&mut (*state).X`, `&mut *state.X`, and the std::mem helpers
+#       `std::mem::take/swap/replace(&mut state.X, ..)` (the `&mut state.X`
+#       substring inside the call args matches the plain form). Self-test fixtures
+#       cover the deref/paren/mem:: variants.
+#   (3) `X: ref mut <bind>` destructure-rename — `normalize_refmut` -> `refmut:X`
+#       (covers `let Struct { X: ref mut b, .. } = ..`, `if let`, and `match`
+#       arms). Mutation-specific: a `X: ref b` read destructure or an `X` /
+#       `X: _` / `X: b` by-value bind carries no `ref mut` and is NOT flagged.
+#   (4) accessor `fn ...() -> &mut _ { &mut self.X }` — SELF-CATCHES via form (2):
+#       the accessor BODY contains `&mut self.X`, so the accessor fn itself is a
+#       Class-S mutator and must fail-close (or be an allowlisted pass-through).
+#       A self-test fixture proves the accessor body HITs.
+#   Plus WHOLE-STATE ALIASING `let s = &mut *state; s.X.insert(..)` — the FIELD
+#   access on the mutation line is still `s.X.insert(` which contains the
+#   form-(1) `X.insert(` token, so it is caught by the inline marker (fixture
+#   proves it). And the std::mem:: variants of form (2) above.
+#
+# CONVERGENCE-CEILING BOUNDARY (CLASS-B, insider-only — deliberately NOT chased).
+# A contrived TWO-HOP deref-write that never lets a field token and a mutating
+# token co-occur on one logical line — e.g. `let c = &mut rs.X; *c = ...;` where
+# `rs` is itself a prior `&mut` alias and the write is through a raw deref
+# assignment to a binding whose name carries no field token — or a raw-identifier
+# field name (`r#type`-style) — would need a data-flow analysis a source-text gate
+# cannot soundly perform. This is the BOUNDED residual: it requires an insider who
+# can already edit the gate, and it is the class the simplifier flags as the point
+# of diminishing returns. We do NOT add a fourth axis of markers for it.
+#
+# STRICTLY-SUPERIOR FUTURE DIRECTION (retire this marker set). The sound, bounded,
+# compiler-ENFORCED replacement is a TYPE-SYSTEM GUARD: make the Class-S fields
+# PRIVATE and expose a `#[must_use]` mutation GUARD (or a commit-method) that
+# performs the fail-closed persist on drop/commit — so a Class-S mutation that is
+# NOT followed by the fail-closed commit is a COMPILE error, not a gate miss. That
+# makes the invariant enforced by construction (the construction.md / ADR-052
+# direction) and would retire this entire marker grammar. Until that lands, this
+# gate is the defense-in-depth backstop; the marker completion above is framed as
+# EXHAUSTING the finite field-mut-acquisition grammar, NOT as one-more-spelling.
 # ---------------------------------------------------------------------------
 MUTATORS="commit_spending_ucan_nonce( \
 enforce_economy( \
@@ -367,7 +413,14 @@ role_state.ceiling= \
 &mut.threshold_signers \
 &mut.saga_pending \
 &mut.xctx_nonce_dedup \
-&mut.xctx_caller_reservations"
+&mut.xctx_caller_reservations \
+refmut:membership \
+refmut:executed_proposals \
+refmut:threshold_signers \
+refmut:saga_pending \
+refmut:xctx_nonce_dedup \
+refmut:xctx_caller_reservations \
+refmut:role_state"
 
 # Allowlisted pass-through MUTATION HELPERS (acknowledging caller persists).
 # Those that are CALL-STYLE pass-throughs (callers route a Class-S mutation
@@ -816,14 +869,67 @@ scan_file() {
     # (an unescaped `&` in gsub means the matched text). Applied to the
     # assignment-normalized COPY only, so consuming a trailing boundary byte here
     # cannot perturb the statement-termination recount (it runs on chain_buf).
+    #
+    # WAVE-24 DEREF/PAREN HARDENING (form 2 of the bounded grammar). The plain
+    # gsub requires WHITESPACE after the `mut` keyword (`&mut <recv>.<field>`), so
+    # the dereferenced receiver shapes `&mut *state.<field>` and the parenthesized
+    # `&mut (*state).<field>` — both legal, fmt-clean exclusive borrows of the same
+    # field — evaded it (the `*`/`(` after `mut` is not whitespace, not an
+    # identifier char). A SECOND gsub per field collapses the deref form: an
+    # OPTIONAL `(` then a REQUIRED `*` then the receiver path then an OPTIONAL `)`.
+    # Requiring the `*` keeps it deref-specific so it cannot collide with the plain
+    # case, and means `&mut` immediately followed by an identifier char
+    # (`&mutstate`, which Rust lexes as `& mutstate`, NOT `&mut state`) is NOT
+    # matched by either gsub — the plain gsub needs whitespace, the deref gsub
+    # needs the `*`. `std::mem::take/replace/swap(&mut state.<field>, ..)` already
+    # match the PLAIN gsub (the `&mut state.<field>` substring is intact inside the
+    # call args), so no mem:: special-case is needed; fixtures regression-guard it.
     function normalize_borrow(s,   t) {
         t = s
         gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.membership/, "\\&mut.membership", t)
+        gsub(/&mut[[:space:]]*\(?\*[A-Za-z_][A-Za-z0-9_.]*\)?\.membership/, "\\&mut.membership", t)
         gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.executed_proposals/, "\\&mut.executed_proposals", t)
+        gsub(/&mut[[:space:]]*\(?\*[A-Za-z_][A-Za-z0-9_.]*\)?\.executed_proposals/, "\\&mut.executed_proposals", t)
         gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.threshold_signers/, "\\&mut.threshold_signers", t)
+        gsub(/&mut[[:space:]]*\(?\*[A-Za-z_][A-Za-z0-9_.]*\)?\.threshold_signers/, "\\&mut.threshold_signers", t)
         gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.saga_pending/, "\\&mut.saga_pending", t)
+        gsub(/&mut[[:space:]]*\(?\*[A-Za-z_][A-Za-z0-9_.]*\)?\.saga_pending/, "\\&mut.saga_pending", t)
         gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.xctx_nonce_dedup/, "\\&mut.xctx_nonce_dedup", t)
+        gsub(/&mut[[:space:]]*\(?\*[A-Za-z_][A-Za-z0-9_.]*\)?\.xctx_nonce_dedup/, "\\&mut.xctx_nonce_dedup", t)
         gsub(/&mut[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\.xctx_caller_reservations/, "\\&mut.xctx_caller_reservations", t)
+        gsub(/&mut[[:space:]]*\(?\*[A-Za-z_][A-Za-z0-9_.]*\)?\.xctx_caller_reservations/, "\\&mut.xctx_caller_reservations", t)
+        return t
+    }
+    # normalize_refmut — collapse a STRUCT-DESTRUCTURE FIELD-RENAME that takes a
+    # MUTABLE binding of a uniquely-named Class-S field, `<field>: ref mut <bind>`
+    # (in `let Struct { <field>: ref mut b, .. } = ...`, an `if let`, or a `match`
+    # arm), to the canonical token `refmut:<field>`, so the destructure-rename axis
+    # of obtaining `&mut` access to a named field is caught at the BINDING site
+    # regardless of the later binding name (form 3 of the bounded &mut-acquisition
+    # grammar; the wave-23 black-hat gap). This is the THIRD and final way to take
+    # exclusive access to a named field in safe Rust:
+    #   (1) inline `<field>.<mutating_method>(`  — the field-pinned method markers.
+    #   (2) `&mut <recv>.<field>` explicit borrow — normalize_borrow (above).
+    #   (3) `<field>: ref mut <bind>` destructure-rename — THIS function.
+    # It is MUTATION-SPECIFIC: a READ destructure binds `<field>: ref <bind>`
+    # (SHARED, no `mut`) or `<field>` by copy / `<field>: <bind>` by value — none
+    # carry the `ref[[:space:]]+mut` token, so a by-value or by-ref-shared
+    # destructure (e.g. the `tests` module by-value `PerContextState { membership,
+    # role_state, .. }` witness, or a `{ membership: _, .. }` ignore) is
+    # NOT collapsed and NOT flagged. The `ref` keyword and `mut` keyword may be
+    # separated only by whitespace (Rust forbids any other token between them), and
+    # the field-name-to-`:` may carry optional whitespace; we normalize both to the
+    # bare `refmut:<field>` token. Applied to the COPY only (like normalize_borrow
+    # / normalize_assign), so it cannot perturb the statement-termination recount.
+    function normalize_refmut(s,   t) {
+        t = s
+        gsub(/membership[[:space:]]*:[[:space:]]*ref[[:space:]]+mut/, "refmut:membership", t)
+        gsub(/executed_proposals[[:space:]]*:[[:space:]]*ref[[:space:]]+mut/, "refmut:executed_proposals", t)
+        gsub(/threshold_signers[[:space:]]*:[[:space:]]*ref[[:space:]]+mut/, "refmut:threshold_signers", t)
+        gsub(/saga_pending[[:space:]]*:[[:space:]]*ref[[:space:]]+mut/, "refmut:saga_pending", t)
+        gsub(/xctx_nonce_dedup[[:space:]]*:[[:space:]]*ref[[:space:]]+mut/, "refmut:xctx_nonce_dedup", t)
+        gsub(/xctx_caller_reservations[[:space:]]*:[[:space:]]*ref[[:space:]]+mut/, "refmut:xctx_caller_reservations", t)
+        gsub(/role_state[[:space:]]*:[[:space:]]*ref[[:space:]]+mut/, "refmut:role_state", t)
         return t
     }
     # strip_code — return the CODE SKELETON of one physical line: the line with
@@ -1617,7 +1723,7 @@ scan_file() {
                 chain_buf = line
             }
 
-            mline = normalize_borrow(normalize_assign(chain_buf))
+            mline = normalize_refmut(normalize_borrow(normalize_assign(chain_buf)))
             for (mi = 1; mi <= nm; mi++) {
                 if (marr[mi] != "" && index(mline, marr[mi]) > 0) { fn_mutates = 1; break }
             }
@@ -2164,16 +2270,179 @@ self_test() {
         printf '}\n'
     } > "$fdir/read_alias_membership.rs"
 
-    # (65) RECEIVER-ALIASED xctx_caller_reservations INSERT that DOES fail-close
-    # MUST NOT be flagged — the companion borrow marker must still honour a
-    # fail-closed persist (no false positive on a correctly-persisted alias).
+    # ----- WAVE-24: `ref mut` STRUCT-DESTRUCTURE-RENAME axis (black-hat gap) -----
+    # The wave-23 alias hardening closed the `&mut <recv>.<field>` reference axis
+    # but NOT the `<field>: ref mut <bind>` destructure-rename axis: a handler can
+    # obtain `&mut` access to a Class-S field by destructuring `*state` and rebind
+    # the field with `ref mut`, then mutate through the rebinding. The mutation
+    # line is `resv.insert(` (no field token) and the binding carries NO `&mut`
+    # token, so BOTH the inline field marker AND the `&mut.<field>` borrow
+    # companion missed it pre-fix (these are non-`execute_` Class-S handlers with
+    # NO GOVHIT backstop). `normalize_refmut` collapses `<field>: ref mut` to the
+    # `refmut:<field>` marker, catching the binding site. One fixture per uniquely-
+    # named Class-S field; all best-effort persist (HAZARD) → MUST HIT.
+
+    # (66) `xctx_caller_reservations: ref mut` — the exact black-hat shape.
     {
-        printf 'pub fn aliased_xctx_reservation_fixed_fixture() {\n'
-        printf '    let resv = &mut state.xctx_caller_reservations;\n'
-        printf '    resv.insert(saga_id, record);\n'
+        printf 'pub async fn refmut_xctx_reservation_fixture() {\n'
+        printf '    let PerContextState { xctx_caller_reservations: ref mut resv, .. } = *state;\n'
+        printf '    resv.insert(saga_id.clone(), record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/refmut_xctx_reservation.rs"
+
+    # (67) `saga_pending: ref mut`.
+    {
+        printf 'pub async fn refmut_saga_pending_fixture() {\n'
+        printf '    let PerContextState { saga_pending: ref mut sp, .. } = *state;\n'
+        printf '    sp.insert(saga_id.clone(), pending);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/refmut_saga_pending.rs"
+
+    # (68) `xctx_nonce_dedup: ref mut`.
+    {
+        printf 'pub async fn refmut_xctx_nonce_dedup_fixture() {\n'
+        printf '    let PerContextState { xctx_nonce_dedup: ref mut dd, .. } = *state;\n'
+        printf '    dd.record(nonce);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/refmut_xctx_nonce_dedup.rs"
+
+    # (69) `membership: ref mut`.
+    {
+        printf 'pub async fn refmut_membership_fixture() {\n'
+        printf '    let PerContextState { membership: ref mut mem, .. } = *state;\n'
+        printf '    mem.remove_member(member_did);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/refmut_membership.rs"
+
+    # (70) `executed_proposals: ref mut`.
+    {
+        printf 'pub async fn refmut_executed_proposals_fixture() {\n'
+        printf '    let PerContextState { executed_proposals: ref mut ep, .. } = *state;\n'
+        printf '    ep.insert(proposal_id);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/refmut_executed_proposals.rs"
+
+    # (71) `threshold_signers: ref mut`.
+    {
+        printf 'pub async fn refmut_threshold_signers_fixture() {\n'
+        printf '    let PerContextState { threshold_signers: ref mut ts, .. } = *state;\n'
+        printf '    ts.retain(|s| keep(s));\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/refmut_threshold_signers.rs"
+
+    # (72) `role_state: ref mut` — role_state carries the capability ceiling, so a
+    # `ref mut` rebinding that lowers the ceiling through the rebinding is downward
+    # auth. (The `.ceiling=` marker still fires on the write line; this proves the
+    # binding-site marker ALSO fires, so a ceiling write spelled to dodge the
+    # `.ceiling=` token is still caught at the destructure.)
+    {
+        printf 'pub async fn refmut_role_state_fixture() {\n'
+        printf '    let PerContextState { role_state: ref mut rs, .. } = *state;\n'
+        printf '    rs.lower_ceiling(lowered);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/refmut_role_state.rs"
+
+    # (73) BY-VALUE DESTRUCTURE CONTROL — a `PerContextState { membership,
+    # role_state, .. }` destructure that binds the fields BY VALUE (no `ref mut`)
+    # MUST NOT be flagged: `normalize_refmut` requires `ref[[:space:]]+mut` after
+    # the colon, and a by-value bind has neither colon-rename nor `ref mut`. This
+    # MIRRORS the real `tests` module witness at state.rs (which destructures
+    # PerContextState by value) — proving the marker cannot false-flag it even if
+    # it were in a production region. No persist needed (it is a pure read of the
+    # moved bindings); fail-closed so neither HIT nor GOVHIT can fire for an
+    # unrelated reason.
+    {
+        printf 'pub fn byvalue_destructure_control_fixture() {\n'
+        printf '    let PerContextState { membership, role_state, saga_pending, .. } = snapshot;\n'
+        printf '    let _ = (membership, role_state, saga_pending);\n'
         printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
         printf '}\n'
-    } > "$fdir/aliased_xctx_reservation_fixed.rs"
+    } > "$fdir/byvalue_destructure_control.rs"
+
+    # (74) REF-SHARED DESTRUCTURE CONTROL — `<field>: ref <bind>` (SHARED, no
+    # `mut`) is a READ destructure and MUST NOT be flagged. Guards the
+    # read-vs-write precision of `normalize_refmut` (the `ref` without `mut` must
+    # not collapse to `refmut:`). Best-effort persist (a pure read need not
+    # fail-close); if the marker wrongly fired it would HIT.
+    {
+        printf 'pub fn refshared_destructure_control_fixture() {\n'
+        printf '    let PerContextState { membership: ref mem, saga_pending: ref sp, .. } = *state;\n'
+        printf '    let _ = (mem.count(), sp.len());\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/refshared_destructure_control.rs"
+
+    # (75) IGNORE-BIND DESTRUCTURE CONTROL — `<field>: _` (ignore) MUST NOT be
+    # flagged either (mirrors the second real `tests` witness that uses `: _`).
+    {
+        printf 'pub fn ignorebind_destructure_control_fixture() {\n'
+        printf '    let PerContextState { membership: _, saga_pending: _, .. } = snapshot;\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/ignorebind_destructure_control.rs"
+
+    # (76) ACCESSOR SELF-CATCH (form 4 of the bounded grammar). A
+    # `fn ...() -> &mut _ { &mut self.<field> }` accessor SELF-CATCHES via the
+    # `&mut.<field>` borrow companion: its BODY contains `&mut self.membership`, so
+    # the accessor fn is itself a Class-S mutator. Best-effort persist → MUST HIT.
+    # (This documents form (4) as COVERED, not a gap — there is no separate marker
+    # for it; it rides form (2).)
+    {
+        printf 'pub fn accessor_self_catch_fixture() {\n'
+        printf '    let alias = &mut self.membership;\n'
+        printf '    alias.remove_member(member_did);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/accessor_self_catch.rs"
+
+    # (77) WHOLE-STATE ALIAS — `let s = &mut *state; s.X.insert(..)`. The whole
+    # PerContextState is aliased, then the field is mutated through the alias. The
+    # mutation line is `s.xctx_caller_reservations.insert(` which STILL contains the
+    # inline form-(1) `xctx_caller_reservations.insert(` token, so the inline marker
+    # catches it WITHOUT any new machinery. Best-effort persist → MUST HIT. Proves
+    # whole-state aliasing does not open a hole.
+    {
+        printf 'pub async fn wholestate_alias_fixture() {\n'
+        printf '    let s = &mut *state;\n'
+        printf '    s.xctx_caller_reservations.insert(saga_id.clone(), record);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/wholestate_alias.rs"
+
+    # (78) DEREF/PAREN/mem:: BORROW VARIANTS (form 2 hardening). Three exclusive
+    # borrows of a Class-S field via the dereferenced/parenthesized/std::mem
+    # receiver shapes, each best-effort → MUST HIT. PRE-fix the plain
+    # `&mut <recv>.<field>` gsub (whitespace-required) missed the `&mut *state.X`
+    # and `&mut (*state).X` forms; `std::mem::take(&mut state.X)` already matched
+    # the plain substring but is asserted here as a regression guard.
+    {
+        printf 'pub async fn deref_borrow_fixture() {\n'
+        printf '    let a = &mut *state.saga_pending;\n'
+        printf '    a.insert(saga_id.clone(), pending);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/deref_borrow.rs"
+    {
+        printf 'pub async fn paren_deref_borrow_fixture() {\n'
+        printf '    let b = &mut (*state).membership;\n'
+        printf '    b.remove_member(member_did);\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/paren_deref_borrow.rs"
+    {
+        printf 'pub async fn mem_take_borrow_fixture() {\n'
+        printf '    let taken = std::mem::take(&mut state.xctx_nonce_dedup);\n'
+        printf '    let _ = taken;\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
+        printf '}\n'
+    } > "$fdir/mem_take_borrow.rs"
 
     # (8) Round-9 keystone — a governance leaf that persists BEST-EFFORT and is
     # NOT in CLASS_C_GOVERNANCE_LEAVES MUST be caught (GOVHIT). This models a
@@ -3323,12 +3592,113 @@ self_test() {
         printf '(read accessors would be false-positived).\n' >&2
         rc=1
     fi
-    # (65) RECEIVER-ALIASED xctx reservation insert that DOES fail-close MUST NOT
-    # be flagged — the borrow companion must honour a fail-closed persist.
-    if grep -q $'^HIT\t.*\taliased_xctx_reservation_fixed_fixture$' <<< "$out"; then
-        printf '%sSELF-TEST FAILED%s: a receiver-aliased reservation insert that DOES persist\n' \
+    # ----- WAVE-24 `ref mut` DESTRUCTURE-RENAME axis assertions -----
+    # (66)-(72) Each `<field>: ref mut <bind>` best-effort destructure-rename MUST
+    # HIT via the `refmut:<field>` marker. These are the EXACT black-hat wave-24
+    # bypasses (PRE-fix all exited the gate clean).
+    if ! grep -q $'^HIT\t.*\trefmut_xctx_reservation_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `xctx_caller_reservations: ref mut` destructure-rename\n' \
             "$C_RED" "$C_RESET" >&2
-        printf 'fail-closed was wrongly flagged — the borrow companion ignored the persist.\n' >&2
+        printf 'best-effort mutator was NOT caught — `normalize_refmut` / the\n' >&2
+        printf '`refmut:xctx_caller_reservations` marker is not wired (the wave-24 bypass).\n' >&2
+        rc=1
+    fi
+    if ! grep -q $'^HIT\t.*\trefmut_saga_pending_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `saga_pending: ref mut` destructure-rename mutator was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'NOT caught — the `refmut:saga_pending` marker is not wired.\n' >&2
+        rc=1
+    fi
+    if ! grep -q $'^HIT\t.*\trefmut_xctx_nonce_dedup_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `xctx_nonce_dedup: ref mut` destructure-rename mutator\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'was NOT caught — the `refmut:xctx_nonce_dedup` marker is not wired.\n' >&2
+        rc=1
+    fi
+    if ! grep -q $'^HIT\t.*\trefmut_membership_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `membership: ref mut` destructure-rename mutator was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'NOT caught — the `refmut:membership` marker is not wired.\n' >&2
+        rc=1
+    fi
+    if ! grep -q $'^HIT\t.*\trefmut_executed_proposals_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: an `executed_proposals: ref mut` destructure-rename\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'mutator was NOT caught — the `refmut:executed_proposals` marker is not wired.\n' >&2
+        rc=1
+    fi
+    if ! grep -q $'^HIT\t.*\trefmut_threshold_signers_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `threshold_signers: ref mut` destructure-rename mutator\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'was NOT caught — the `refmut:threshold_signers` marker is not wired.\n' >&2
+        rc=1
+    fi
+    if ! grep -q $'^HIT\t.*\trefmut_role_state_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `role_state: ref mut` destructure-rename mutator was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'NOT caught — the `refmut:role_state` marker is not wired.\n' >&2
+        rc=1
+    fi
+    # (73) BY-VALUE destructure control: a `PerContextState { membership,
+    # role_state, .. }` by-value destructure (mirroring the real state.rs tests
+    # witness) MUST NOT be flagged — `normalize_refmut` requires `ref mut`.
+    if grep -q $'^HIT\t.*\tbyvalue_destructure_control_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a BY-VALUE PerContextState destructure was wrongly\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'flagged — `normalize_refmut` is matching a by-value field bind as if it\n' >&2
+        printf 'carried `ref mut` (the real state.rs tests witness would false-fire).\n' >&2
+        rc=1
+    fi
+    # (74) REF-SHARED destructure control: `<field>: ref <bind>` (no `mut`) is a
+    # READ destructure and MUST NOT be flagged.
+    if grep -q $'^HIT\t.*\trefshared_destructure_control_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a SHARED (`ref`, no `mut`) field destructure was wrongly\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'flagged — `normalize_refmut` is collapsing a read destructure as `refmut:`.\n' >&2
+        rc=1
+    fi
+    # (75) IGNORE-BIND destructure control: `<field>: _` MUST NOT be flagged.
+    if grep -q $'^HIT\t.*\tignorebind_destructure_control_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `<field>: _` ignore destructure was wrongly flagged —\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`normalize_refmut` is matching a `: _` ignore bind as if it were `ref mut`.\n' >&2
+        rc=1
+    fi
+    # (76) ACCESSOR SELF-CATCH (form 4): a `&mut self.membership` accessor body MUST
+    # HIT via the `&mut.membership` borrow companion — documenting form (4) as
+    # COVERED (it rides form (2), no separate marker).
+    if ! grep -q $'^HIT\t.*\taccessor_self_catch_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `&mut self.<field>` accessor body was NOT caught —\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'form (4) of the bounded grammar (accessor self-catch via form (2)) is broken.\n' >&2
+        rc=1
+    fi
+    # (77) WHOLE-STATE ALIAS: `let s = &mut *state; s.X.insert(..)` MUST HIT via
+    # the inline `X.insert(` field marker (the field access survives the alias).
+    if ! grep -q $'^HIT\t.*\twholestate_alias_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a whole-state alias (`let s = &mut *state; s.X.insert`)\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'was NOT caught — the inline field marker missed the aliased field access.\n' >&2
+        rc=1
+    fi
+    # (78) DEREF/PAREN/mem:: BORROW VARIANTS (form 2 hardening) MUST each HIT.
+    if ! grep -q $'^HIT\t.*\tderef_borrow_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `&mut *state.<field>` deref borrow was NOT caught —\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`normalize_borrow` is not collapsing the dereferenced receiver form.\n' >&2
+        rc=1
+    fi
+    if ! grep -q $'^HIT\t.*\tparen_deref_borrow_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `&mut (*state).<field>` parenthesized deref borrow was\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'NOT caught — `normalize_borrow` is not collapsing the paren-deref form.\n' >&2
+        rc=1
+    fi
+    if ! grep -q $'^HIT\t.*\tmem_take_borrow_fixture$' <<< "$out"; then
+        printf '%sSELF-TEST FAILED%s: a `std::mem::take(&mut state.<field>)` borrow was NOT\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'caught — `normalize_borrow` no longer matches the `&mut state.<field>` substring\n' >&2
+        printf 'inside a std::mem helper call.\n' >&2
         rc=1
     fi
     # (8) Round-9 keystone: a best-effort governance leaf NOT in the allowlist
