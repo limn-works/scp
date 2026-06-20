@@ -1866,7 +1866,7 @@ export function createWasmBridge(): Bridge {
       // The WASM bridge returns the migrated identity AND a JSON-
       // serialized `DidRotationEvent` carrying the migration +
       // pre-rotation proofs. The SDK layer distributes the event to
-      // active context members per spec §9.12 step 4b.
+      // active context members per spec §9.12, ADR-003 §4b.
       return {
         did: result.identity.did,
         custodyType: result.identity.custodyType,
