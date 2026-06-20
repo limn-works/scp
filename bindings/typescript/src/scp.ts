@@ -2769,8 +2769,9 @@ export class SCP {
    * `{"ok": false, "error"}` on failure. `ok` means the adapter *responded*
    * — NOT that the payment is valid; scan `valid`/`all_valid` for validity.
    */
-  economyVerifyPaymentReceipts(receiptsJson: string): string {
-    return (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
+  economyVerifyPaymentReceipts(receiptsJson: string): unknown {
+    const raw = (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
+    return JSON.parse(raw) as unknown;
   }
 
   // ───────────────────────────────────────────────────────────────────────
