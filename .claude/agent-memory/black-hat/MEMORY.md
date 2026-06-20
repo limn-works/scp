@@ -274,3 +274,12 @@ Notes:
 
 ### NIT: validate.rs:702-710 enforce_ucan_category_a hand-rolls kid match instead of from_fragment (pre-existing). Drift risk only.
 ### CONTEXT: enforce_inner_envelope_category_a never called on live receive path (only sign.rs tests). Pre-existing, out of diff scope.
+
+## TS SDK fail-closed/parity (branch fix/sdk-coverage-fail-closed-and-parity @6f4ba65ff)
+### PRIMARY DEFENSE SOUND: test seam tree-shaken out of published bundle
+- __setBridgeForTests/assertTestEnvironment/isTestEnvironment NOT re-exported from index.ts; tsup entry=[index.ts] splitting:false => esbuild tree-shakes all 3 (grep count 0 in bundle). Only _evaluateTestEnv survives internally, not in export clause.
+- files:["dist/"] excludes src/; exports map only "." => deep subpath imports throw ERR_PACKAGE_PATH_NOT_EXPORTED. Runtime test-guard is defense-in-depth, not the boundary.
+- UCAN regex /^\[SCP-PERM-\d+\]/ anchoring sound: leading \n/space defeats ^ => message rethrown (fail-closed). extractCore marker/em-dash injection inert (indexOf=FIRST marker; startsWith prefix fixed by Rust). Misclassify-as-UCAN always lands `unknown` => all 6 CapabilityValidation fields false.
+### RESIDUAL low-sev: BUN_TEST=0 and BUN_TEST=false OPEN seam (length>0 only). Moot post-bundle (seam unreachable). Suggest falsey-value guard.
+### FINDING gate soundness: check-sdk-coverage.py accepts a TYPE name as proof of runtime capability
+- _extract_typescript_symbols folds interface/type_alias names into same set as runtime fns. _to_pascal(op) then matches a type. PROVEN: Governance/member_role matches `MemberRole` type not SCP.contextMemberRole; MCP/connect_client matches `McpClient` interface (alias also lists DELETED connectMcp; real impl mcpClientConnectStdio/Sse). Gate stays GREEN after deleting all runtime impls if same-named type survives. 2/184 TS ops affected. Softer re-intro of the suffix-match gap the PR claims closed. NOTE: file now in enforcement allowlist (CLAUDE.md) — report, don't self-edit.

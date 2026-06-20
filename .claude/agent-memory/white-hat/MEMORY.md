@@ -1,5 +1,21 @@
 # White Hat Agent Memory
 
+## TS SDK fail-closed test-seam Review (2026-06-20, branch fix/sdk-coverage-fail-closed-and-parity)
+
+### Defense architecture (TS bridge-swap hardening)
+- Two dangerous seams: `__setBridgeForTests` (bridge.ts:832) and `__constructScpWithNativeForTests` (scp.ts:2837). BOTH gated by `assertTestEnvironment` BEFORE the mutating op (`_nativeBridgeForScp.set` / `new SCP({NATIVE_OVERRIDE})`). Correct fail-closed ordering.
+- `_IS_TEST_ENVIRONMENT` frozen at IMPORT time (IIFE), so runtime `process.env` mutation post-import cannot flip it — defeats late-stage env-poisoning. Strong.
+- `Object.hasOwn` on NODE_ENV/BUN_TEST defeats `Object.prototype.NODE_ENV="test"` pollution. Tested (test-guard.test.ts:57).
+- BUN_TEST requires `!== undefined && .length > 0` — empty-string no longer elevates trust. Tested.
+- UCAN error regexes prefix-anchored `/^\[SCP-PERM-\d+\]/` (trust.ts:457,461,507) — embedded-substring forgery in a benign message body can't spoof classification.
+- `_nativeBridgeForScp` WeakMap has only 3 writers: getBridge (legit lazy init), getBridgeSync (read), __setBridgeForTests (guarded). NATIVE_OVERRIDE is module-private `unique symbol`, only reachable via guarded factory. No unguarded injection path.
+- package.json exports map is `"."` only — no subpath, so `import "@limn-works/scp-ts/internal/test-guard"` deep-import is blocked by Node/bundler resolution.
+
+### Residual (acknowledged, low severity)
+- NODE_ENV="development" intentionally permits the seam (dev builds need it). Acceptable by design but means any prod process mis-set to development at startup unlocks bridge swap. Defense relies on deploy hygiene, not code.
+- assertTestEnvironment is the SOLE layer gating the seam (no second independent check). Frozen-constant + import-time eval makes it strong, but it's one layer. Acceptable given exported test helpers are inherently a single-gate problem.
+- VERDICT: APPROVED. Defenses adequate; no new actionable findings.
+
 ## Governance-Gaps Feature Review (2026-03-05)
 
 ### P1 Findings

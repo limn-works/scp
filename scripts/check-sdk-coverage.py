@@ -239,17 +239,14 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("Governance", "member_count"): {
         "python": ["member_count", "context_member_count"],
         "typescript": ["contextMemberCount"],
-        "swift": ["memberCount"],
     },
     ("Governance", "is_member"): {
         "python": ["is_member", "context_is_member"],
         "typescript": ["contextIsMember"],
-        "swift": ["isMember"],
     },
     ("Governance", "member_role"): {
         "python": ["context_member_role"],
         "typescript": ["contextMemberRole"],
-        "swift": ["memberRole"],
     },
     # Governance rows whose method lives under context_* in Python / TypeScript.
     ("Governance", "handle_ttl_expiry"): {
@@ -1058,7 +1055,7 @@ def _check_operation_in_sdk(
         # Class.method patterns — use domain name as-is from JSON
         # (preserves EventLog, UCAN, MCP casing)
         f"{domain}.{op_name}",  # EventLog.verify
-        f"{domain}.{camel}",  # EventLog.verify
+        f"{domain}.{camel}",
     ]
 
     for candidate in candidates:
