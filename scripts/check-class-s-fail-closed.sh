@@ -344,13 +344,14 @@ fi
 #     that a receiver-agnostic `.remove_member(` would have with the unrelated MLS
 #     `crypto.remove_member(` (a different method on a different receiver).
 #
-# THE COMPLETE BOUNDED &mut-ACQUISITION GRAMMAR (wave-24). Wave-23 closed the
-# reference-ALIAS axis; the `ref mut` STRUCT-DESTRUCTURE-RENAME axis remained
-# open (black-hat wave-24). Rather than chase one-more-spelling, the marker set
-# now EXHAUSTS the FINITE grammar of "obtain mutable access to a named Class-S
-# field X in safe Rust". There are exactly these forms, and every one is covered:
+# WHAT THE &mut-ACQUISITION MARKERS COVER, AND WHAT THEY DO NOT (wave-25 honest
+# relabel). This gate is a BEST-EFFORT DEFENSE-IN-DEPTH backstop. It catches the
+# COMMON spellings by which a named Class-S field X is mutated, NOT an exhaustive
+# closure of the mutation grammar. The marker set covers these field-mut-ACQUISITION
+# spellings:
 #   (1) inline `X.<mutating_method>(`  — the field-pinned method/assign markers
-#       (membership.remove_member, executed_proposals.insert, .ceiling=, ...).
+#       (membership.remove_member, executed_proposals.insert, .ceiling=, ...) for
+#       the ENUMERATED method names. This is the open axis (see below).
 #   (2) `&mut <recv>.X` explicit borrow/alias — `normalize_borrow` -> `&mut.X`.
 #       HARDENED to the receiver shapes `&mut state.X`, `&mut self.inner.X`,
 #       `&mut (*state).X`, `&mut *state.X`, and the std::mem helpers
@@ -361,34 +362,50 @@ fi
 #       (covers `let Struct { X: ref mut b, .. } = ..`, `if let`, and `match`
 #       arms). Mutation-specific: a `X: ref b` read destructure or an `X` /
 #       `X: _` / `X: b` by-value bind carries no `ref mut` and is NOT flagged.
-#   (4) accessor `fn ...() -> &mut _ { &mut self.X }` — SELF-CATCHES via form (2):
-#       the accessor BODY contains `&mut self.X`, so the accessor fn itself is a
-#       Class-S mutator and must fail-close (or be an allowlisted pass-through).
-#       A self-test fixture proves the accessor body HITs.
+#   (4) accessor `fn ...() -> &mut _ { &mut self.X }` — rides form (2): the
+#       accessor BODY contains `&mut self.X`, so the accessor fn itself is flagged
+#       as a Class-S mutator and must fail-close (or be an allowlisted
+#       pass-through). A self-test fixture proves the accessor body HITs.
 #   Plus WHOLE-STATE ALIASING `let s = &mut *state; s.X.insert(..)` — the FIELD
 #   access on the mutation line is still `s.X.insert(` which contains the
 #   form-(1) `X.insert(` token, so it is caught by the inline marker (fixture
 #   proves it). And the std::mem:: variants of form (2) above.
 #
-# CONVERGENCE-CEILING BOUNDARY (CLASS-B, insider-only — deliberately NOT chased).
-# A contrived TWO-HOP deref-write that never lets a field token and a mutating
-# token co-occur on one logical line — e.g. `let c = &mut rs.X; *c = ...;` where
-# `rs` is itself a prior `&mut` alias and the write is through a raw deref
-# assignment to a binding whose name carries no field token — or a raw-identifier
-# field name (`r#type`-style) — would need a data-flow analysis a source-text gate
-# cannot soundly perform. This is the BOUNDED residual: it requires an insider who
-# can already edit the gate, and it is the class the simplifier flags as the point
-# of diminishing returns. We do NOT add a fourth axis of markers for it.
+# THIS GATE IS NOT EXHAUSTIVE (CLASS-A residual: autoref method-name evasion).
+# A Class-S field is a HashMap / HashSet, and a `&mut self` mutating method
+# acquires its borrow via AUTOREF — there is NO `&mut` or `ref mut` token on the
+# call line. So the field-mut-ACQUISITION SYNTAX of forms (2)/(3) is finite, but
+# the set of MUTATING METHODS reachable through form (1) is OPEN-ENDED. Only the
+# enumerated method names are markers; the stdlib-collection mutating-method
+# grammar is not closed. A determined or merely idiomatic refactor can mutate a
+# Class-S field with ZERO marker hit through any of:
+#   `.entry(k).or_insert_with(..)`, `.entry(k).and_modify(..)`, `.get_mut(k)`,
+#   `.drain()`, `.extend(..)`, `.clear()`, `.remove_entry(k)`, IndexMut
+#   `map[k] = v`, `.iter_mut()`, `.values_mut()`, ...
+# These spellings are NOT covered and CANNOT all be covered by a source-text gate:
+# enumerating one more method name only grows a denylist that the next idiomatic
+# spelling evades. This is a CONSCIOUSLY ACCEPTED Class-A residual — kept as
+# defense-in-depth (the enumerated spellings are still the common ones a regression
+# would use) until the type-system guard below lands. The markers are retained for
+# that backstop value; they are NOT claimed to be complete.
 #
-# STRICTLY-SUPERIOR FUTURE DIRECTION (retire this marker set). The sound, bounded,
-# compiler-ENFORCED replacement is a TYPE-SYSTEM GUARD: make the Class-S fields
-# PRIVATE and expose a `#[must_use]` mutation GUARD (or a commit-method) that
-# performs the fail-closed persist on drop/commit — so a Class-S mutation that is
-# NOT followed by the fail-closed commit is a COMPILE error, not a gate miss. That
-# makes the invariant enforced by construction (the construction.md / ADR-052
-# direction) and would retire this entire marker grammar. Until that lands, this
-# gate is the defense-in-depth backstop; the marker completion above is framed as
-# EXHAUSTING the finite field-mut-acquisition grammar, NOT as one-more-spelling.
+# THE SOUND, CONVERGENT ENFORCEMENT (the committed fix, not this gate). The Class-S
+# fail-closed invariant is enforced soundly by, in order:
+#   (1) A TYPE-SYSTEM GUARD (the next focused PR). Make the Class-S fields PRIVATE
+#       in PerContextState, expose `Deref` for reads (and NO `DerefMut`), and
+#       require every mutation to go through a `#[must_use]` commit-guard /
+#       combinator whose commit performs the fail-closed persist. A Class-S
+#       mutation NOT followed by the fail-closed persist is then a COMPILE error,
+#       enforced by construction — alias-proof AND method-name-proof, since no
+#       autoref method can reach a private field without the guard. This is the
+#       construction.md / ADR-052 direction and is what actually closes the
+#       Class-A residual above.
+#   (2) The crash-recovery + economy tests (they exercise the durable record on the
+#       real recovery paths).
+#   (3) Code review.
+# This text gate is item (0): a cheap, no-build defense-in-depth backstop that
+# raises the cost of the COMMON regressions until (1) retires it. It is explicitly
+# NOT the primary guarantee and is NOT exhaustive.
 # ---------------------------------------------------------------------------
 MUTATORS="commit_spending_ucan_nonce( \
 enforce_economy( \
@@ -2355,14 +2372,17 @@ self_test() {
     # the colon, and a by-value bind has neither colon-rename nor `ref mut`. This
     # MIRRORS the real `tests` module witness at state.rs (which destructures
     # PerContextState by value) — proving the marker cannot false-flag it even if
-    # it were in a production region. No persist needed (it is a pure read of the
-    # moved bindings); fail-closed so neither HIT nor GOVHIT can fire for an
-    # unrelated reason.
+    # it were in a production region. Persist is BEST-EFFORT (matching the sibling
+    # read controls 74/75) so the MUST-NOT-HIT assertion is FALSIFIABLE: if
+    # `normalize_refmut` ever wrongly fired on a by-value (no-`ref mut`) bind, this
+    # fixture WOULD HIT and the negative assertion below would catch it. (A
+    # fail-closed persist here would suppress any HIT unconditionally, making the
+    # negative assertion vacuous — that was the prior bug.)
     {
         printf 'pub fn byvalue_destructure_control_fixture() {\n'
         printf '    let PerContextState { membership, role_state, saga_pending, .. } = snapshot;\n'
         printf '    let _ = (membership, role_state, saga_pending);\n'
-        printf '    persist_state_fail_closed(state, deps, ctx)?;\n'
+        printf '    persist_state_best_effort(state, deps, ctx);\n'
         printf '}\n'
     } > "$fdir/byvalue_destructure_control.rs"
 
