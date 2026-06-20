@@ -2,6 +2,14 @@
 
 ## SCP Codebase Security Patterns
 
+### ADR-039 MessageSigner refactor (f7fb2fa6, double-zero round 2) -- 2026-06-20 -- ZERO FINDINGS
+- MessageSigner<'a> enum (supervisor.rs ~395-440) pairs key+persona; key()/signing_key_id() total const matches, no panic. Supervisor::send_message now takes non-optional MessageSigner, sets payload signing_key=Some(...)+signing_key_id from one source.
+- Mailbox seam: SendMessagePayload still carries 2 fields, but set atomically by supervisor; handle_send_message (handlers/messaging.rs:245-254) passes them straight to messaging_helpers::send_message which RE-PAIRS into MessageSigner at entry (~697-718). No independent re-derivation => persona cannot desync from key. Round-1 attribution property intact end-to-end.
+- Fail-closed CONSOLIDATED: single None check at messaging_helpers::send_message entry BEFORE rate-limit/velocity/economy mutation (no rollback needed). Removed broadcast+encrypted downstream None branches subsumed. No state mutated before the check.
+- FFI fail-closed REAL: uniffi/bridge.rs + napi/context.rs now resolved_signing_key.ok_or_else(Crypto{CRYPTO_4001})? => RETURN error, no panic, no unsigned send. PyO3 unchanged (resolve_signing_key already non-optional). All 3 hardcode MessageSigner::Active (NOT attacker-controllable).
+- validate.rs enforce_ucan_category_a kid-parse routed through SigningKeyId::from_fragment (primitives/identity.rs:200): byte-identical to old match (#active/#agent only, else None=>MalformedToken). absent kid still unwrap_or("#active"). #agent Category-A rejection below untouched. NO new accept path.
+- Only added expect() is in #[cfg(test)] mod live_supervisor_send (agent_binding_pipeline_tests.rs).
+
 ### ADR-039 Per-Message Persona Wiring (SCP-AB-021, ba06a8e0+7d4cdcf0) -- 2026-06-20 -- ZERO BLOCKING FINDINGS
 - KeyResolver widened to Fn(&DID, SigningKeyId)->Option<VerifyingKey>. Threaded signing_key_id through Supervisor::send_message -> handle_send_message -> messaging_helpers::send_message -> encrypt_and_send -> build_encrypted_envelope (removed hardcoded Active stamp at messaging_helpers.rs:178).
 - ATTRIBUTION INTEGRITY SOUND. verify_and_unwrap (messaging_helpers.rs:309) resolves key by SENDER-declared inner.signing_key_id, then verifies sig against THAT key. Forging persona fails: claim #agent while signing with #active => sig fails against registered #agent key. Mismatch caught at receive. Send-side has NO binding between signing_key and signing_key_id (both caller-supplied) -- usability footgun (produces unverifiable msg), NOT a forgery vector.
