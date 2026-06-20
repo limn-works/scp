@@ -2181,7 +2181,7 @@ class SCP:
         """Delegate to ``_scp_core.SCP.economy_budget_remaining``."""
         return await asyncio.to_thread(self._native.economy_budget_remaining, context_id, did)
 
-    async def economy_verify_payment_receipts(self, receipts_json: str) -> Any:
+    async def economy_verify_payment_receipts(self, receipts_json: str) -> dict[str, Any]:
         """Delegate to ``_scp_core.SCP.economy_verify_payment_receipts``.
 
         Verifies a batch of payment receipts against this instance's economy

@@ -106,6 +106,19 @@ export class Identity {
   }
 
   /**
+   * The serialized `scp_identity::DidRotationEvent` produced by
+   * {@link SCP.identityMigrate}. Present only on identities returned by
+   * `identityMigrate`; `undefined` for all other operations.
+   *
+   * Callers **MUST** distribute this rotation event to all active context
+   * members per spec §3.2.1 step 4b so peers can update their routing
+   * tables.
+   */
+  get rotationEventJson(): string | undefined {
+    return this._rawHandle.rotationEventJson;
+  }
+
+  /**
    * Constructs an `Identity` from a raw native NAPI handle.
    *
    * The native addon returns an opaque class instance with at least

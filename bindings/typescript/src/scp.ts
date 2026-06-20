@@ -827,12 +827,22 @@ export class SCP {
   }
 
   /**
-   * Migrates an identity to a fresh `#active` key while preserving DID
-   * continuity (spec §9.12, ADR-003 §4b/4c). Used when re-keying across a
-   * custody or device boundary; the returned handle is recovery-bearing.
+   * Migrates an identity across a custody or device boundary (spec §3.2.1,
+   * ADR-003 §4b/4c). Migration reveals the pre-rotation key and publishes
+   * a new DID document, creating an identity with a **NEW DID** — the
+   * returned {@link Identity} has a different DID from the input.
+   *
+   * The returned handle carries a `rotationEventJson` field (a serialized
+   * `scp_identity::DidRotationEvent`). Callers **MUST** distribute this
+   * rotation event to all active context members per spec §3.2.1 step 4b
+   * so peers can update their routing tables. Access it via
+   * `identity.rotationEventJson` on the returned `Identity`.
+   *
+   * Use {@link identityRotateKey} instead when you need to renew the
+   * `#active` signing key while preserving the same DID.
    *
    * @param identity The identity to migrate.
-   * @returns The migrated {@link Identity} (same DID, migrated key).
+   * @returns The migrated {@link Identity} with a NEW DID.
    */
   async identityMigrate(identity: Identity): Promise<Identity> {
     const bridge = await getBridge(this);
