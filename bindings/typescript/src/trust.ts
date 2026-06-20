@@ -29,7 +29,6 @@
  */
 
 import type { Context } from "./context";
-import { ContextError, UcanPermissionError } from "./errors";
 import type { SCP } from "./scp";
 import type { ConsequenceRule } from "./types";
 
@@ -449,10 +448,16 @@ export async function evaluateTrust(
         // fields. Any other error (e.g. validation/transport) is a genuine
         // fault and must propagate to the caller — matching the Python port,
         // which catches only `bridge.UcanError`.
-        if (!(error instanceof UcanPermissionError)) {
+        //
+        // The NAPI bridge throws plain Error objects (not UcanPermissionError)
+        // because ucanValidate bypasses mapBridgeError. We detect UCAN errors
+        // by the [SCP-PERM-NNNN] code prefix in the message instead of
+        // instanceof.
+        const msg = error instanceof Error ? error.message : String(error);
+        if (!/\[SCP-PERM-\d+\]/.test(msg)) {
           throw error;
         }
-        const failed = __classifyUcanError(error.message);
+        const failed = __classifyUcanError(msg);
         const passed = __PASSED_BEFORE[failed];
         capabilityValidation.tokensValid = passed.has("tokensValid");
         capabilityValidation.signaturesValid = passed.has("signaturesValid");
@@ -487,7 +492,12 @@ export async function evaluateTrust(
     // A missing/empty behavioral record is non-fatal: the subject simply has
     // no event-log history yet. Mirrors the Python port, which catches only
     // `ContextError` here — any other error is a genuine fault that propagates.
-    if (!(error instanceof ContextError)) {
+    //
+    // The NAPI bridge throws plain Error objects (not ContextError) because
+    // eventLogQuery bypasses mapBridgeError. We detect context errors by the
+    // [SCP-CTX-NNNN] code prefix in the message instead of instanceof.
+    const msg = error instanceof Error ? error.message : String(error);
+    if (!/\[SCP-CTX-\d+\]/.test(msg)) {
       throw error;
     }
   }

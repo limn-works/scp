@@ -16,7 +16,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { Context } from "../src/context";
-import { ContextError, UcanPermissionError, ValidationError } from "../src/errors";
+import { ValidationError } from "../src/errors";
 import type { SCP } from "../src/scp";
 import {
   __classifyUcanError,
@@ -220,11 +220,16 @@ function mountWithContext(): {
 /**
  * Runs evaluateTrust with a single capability token whose validation fails
  * with `errorMsg`, returning the resulting Layer-1 CapabilityValidation.
+ *
+ * `errorMsg` must be the full bridge-formatted message string including the
+ * `[SCP-PERM-NNNN]` prefix, because the real NAPI bridge throws a plain
+ * `Error` (not `UcanPermissionError`) — it bypasses `mapBridgeError`.
  */
 async function runLayer1(errorMsg: string): Promise<CapabilityValidation> {
   const { scp, native, context } = mountWithContext();
   native.__stub("ucanValidate", () =>
-    Promise.reject(new UcanPermissionError(errorMsg, "SCP-PERM-3001")),
+    // Simulate the real NAPI bridge: plain Error with the full formatted message.
+    Promise.reject(new Error(errorMsg)),
   );
   // No event-log history for this subject — Layer 2 is non-fatal.
   native.__stub("eventLogQuery", () => Promise.resolve([]));
@@ -400,10 +405,14 @@ describe("evaluateTrust — Layer 2 behavioral record", () => {
     expect(JSON.parse(call?.args[1] as string)).toEqual({ actor_did: "did:dht:z6MkBob" });
   });
 
-  it("leaves behavioral record null when the event-log query raises ContextError", async () => {
+  it("leaves behavioral record null when the event-log query raises a context error", async () => {
     const { scp, native, context } = mountWithContext();
+    // Simulate the real NAPI bridge: plain Error with the [SCP-CTX-NNNN] prefix,
+    // because eventLogQuery bypasses mapBridgeError and throws plain Error objects.
     native.__stub("eventLogQuery", () =>
-      Promise.reject(new ContextError("context not active", "SCP-CTX-2001")),
+      Promise.reject(
+        new Error("[SCP-CTX-1001] context error: not a member — check membership status"),
+      ),
     );
 
     const result = await evaluateTrust(scp, "did:dht:z6MkBob", context);
