@@ -1946,12 +1946,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // `{"all_valid":true,"results":[]}` — `all_valid` is vacuously true for
       // an empty batch, and `ok` (adapter-responded) is distinct from
       // `valid`/`all_valid` (payment validity).
-      const parsed = scp.economyVerifyPaymentReceipts(JSON.stringify([])) as {
-        all_valid: boolean;
-        results: unknown[];
-      };
-      expect(parsed.all_valid).toBe(true);
-      expect(parsed.results).toEqual([]);
+      const result = scp.economyVerifyPaymentReceipts([]);
+      expect(result.all_valid).toBe(true);
+      expect(result.results).toEqual([]);
     });
   });
 

@@ -99,7 +99,6 @@ export type {
   ChallengeResult,
   Endorsement,
   TrustEvaluation,
-  UcanFailureCategory,
 } from "./trust";
 export { evaluateTrust } from "./trust";
 
@@ -203,7 +202,12 @@ export type { DiscoveryMethod, ProvenanceRecord } from "./provenance";
 // Economy — types + display helper (stateful entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type { ObservableMetrics, PaidActionType } from "./economy";
+export type {
+  ObservableMetrics,
+  PaidActionType,
+  PaymentReceiptVerificationEntry,
+  PaymentReceiptVerificationResult,
+} from "./economy";
 export { formatAmount } from "./economy";
 
 // ---------------------------------------------------------------------------

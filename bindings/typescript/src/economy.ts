@@ -125,3 +125,44 @@ export function formatAmount(
   }
   return formatWithDecimals(amount, decimals);
 }
+
+// ---------------------------------------------------------------------------
+// Payment receipt verification
+// ---------------------------------------------------------------------------
+
+/** Per-receipt entry in a {@link PaymentReceiptVerificationResult}. */
+export interface PaymentReceiptVerificationEntry {
+  /** Opaque identifier for this receipt, as supplied by the caller. */
+  receipt_id: string;
+  /** Whether the payment adapter accepted the receipt as valid. */
+  valid: boolean;
+  /**
+   * Human-readable reason for rejection, present when `valid` is `false`.
+   * Absent when the receipt is valid.
+   */
+  reason?: string;
+}
+
+/**
+ * Result of verifying a batch of payment receipts via
+ * {@link SCP.economyVerifyPaymentReceipts}.
+ *
+ * Mirrors the Python SDK return shape for `economy_verify_payment_receipts`.
+ * `ok` indicates that the adapter responded for all receipts; `all_valid`
+ * is `true` iff every entry reached the adapter and was reported valid (and
+ * is vacuously `true` for an empty batch). Inspect `results` for per-receipt
+ * detail. `ok === true` means the adapter *responded* — NOT that the payment
+ * is valid; check `valid` / `all_valid` for validity.
+ */
+export interface PaymentReceiptVerificationResult {
+  /** `true` if the adapter responded for every receipt in the batch. */
+  ok: boolean;
+  /**
+   * `true` iff every receipt both reached the adapter (`ok === true`) and
+   * the adapter reported it valid (`result.valid === true`). Vacuously `true`
+   * for an empty batch.
+   */
+  all_valid: boolean;
+  /** Per-receipt verification outcomes. */
+  results: PaymentReceiptVerificationEntry[];
+}
