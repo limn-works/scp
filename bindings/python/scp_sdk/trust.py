@@ -762,6 +762,13 @@ async def evaluate_trust(
                 await asyncio.to_thread(instance.ucan_validate, context_id, token, "*")
             except bridge.UcanError as exc:
                 error_msg = str(exc)
+                # PERM-3030 is a caller-misuse error (handle belongs to a
+                # different SCP instance). Re-raise so the programming mistake
+                # is visible rather than being absorbed into a false all-False
+                # trust verdict. Mirrors TypeScript trust.ts line ~461:
+                #   if (/^\[SCP-PERM-3030\]/.test(msg)) throw error;
+                if error_msg.startswith("[SCP-PERM-3030]"):
+                    raise
                 failed_category = _classify_ucan_error(error_msg)
                 passed = _PASSED_BEFORE.get(failed_category, set())
 
