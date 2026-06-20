@@ -7,7 +7,7 @@
  * the flat `Bridge` interface was deleted from the SDK surface. The
  * previous integration suite exercised an in-memory mock `Bridge`
  * implementation that simulated the whole protocol state machine
- * (member join events, outlet handlers, UCAN revocation, broadcast
+ * (member join events, tool handlers, UCAN revocation, broadcast
  * subscribers, etc.). Those assertions tested the mock, not the SDK.
  *
  * What this file now covers, in three layers:
@@ -22,7 +22,7 @@
  *    `./mock-bridge`.
  * 3. **Real NAPI integration** — the SDK `SCP` class exercised
  *    end-to-end against the native NAPI addon and an in-process relay.
- *    Restores the Identity / Context / UCAN / Outlet / Broadcast /
+ *    Restores the Identity / Context / UCAN / Tool / Broadcast /
  *    Governance / Event-log / TTL / Storage / Error-path coverage the
  *    pre-ADR-048 mock-bridge suite owned, against the real stack so
  *    the assertions test protocol behavior rather than a simulator.
@@ -32,6 +32,7 @@
  * - `real-napi.test.ts` — the `Bridge` wrapper façade (`napi.*`)
  * - `e2e-relay.test.ts` — raw bridge send-pipeline through the relay
  * - `e2e-fullstack.test.ts` — FullStackNetwork A+ decrypt roundtrip
+ * - `e2e-cross-bridge.test.ts` — NAPI Node + WASM interop
  *
  * See ADR-022 in `.docs/adrs/phase-4.md` and ADR-048.
  */
@@ -53,7 +54,7 @@ import {
 import { IdentityAttestation, RevocationStatus } from "../src/identity";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
-import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } from "../src/types";
+import type { ConsequenceRule as ConsequenceRuleTypeAlias } from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
 
 /**
@@ -73,10 +74,10 @@ function generateX25519KeyPair(): { secret: Uint8Array; publicKey: Uint8Array } 
 }
 
 // ---------------------------------------------------------------------------
-// 1. EconomicPolicy schema validation (§19.3)
+// 1. EconomicPolicy schema validation (§19.3, ADR-034)
 //
 // `_validateEconomicPolicyJson` is the defense-in-depth validator the
-// SDK runs before forwarding the JSON to the Rust parser. These
+// WASM path runs before forwarding the JSON to the Rust parser. These
 // tests pin the accept/reject surface so schema drift is caught at
 // the SDK layer instead of silently landing in the bridge.
 // ---------------------------------------------------------------------------
@@ -179,7 +180,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
             kind: "SuspendCapability",
             capabilities: [
               "MessagesWrite",
-              { kind: "OutletCall", outletId: "calculator" },
+              { kind: "ToolInvoke", toolId: "calculator" },
               { kind: "Custom", name: "my-custom-cap" },
             ],
           },
@@ -217,7 +218,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
     }>;
     expect(decoded).toHaveLength(3);
 
-    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { OutletCall + Custom + unit })
+    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { ToolInvoke + Custom + unit })
     expect(decoded[0]?.trigger).toBe("MessageVelocity");
     expect(decoded[0]?.threshold).toBe(5);
     expect(decoded[0]?.window).toEqual({ secs: 3600, nanos: 0 });
@@ -226,7 +227,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
     };
     expect(action0.Enforcement?.SuspendCapability?.capabilities).toEqual([
       "MessagesWrite",
-      { OutletCall: "calculator" },
+      { ToolInvoke: "calculator" },
       { Custom: "my-custom-cap" },
     ]);
 
@@ -292,7 +293,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
     const types = await import("../src/types");
     expect(types.CONSEQUENCE_TRIGGER_VARIANTS).toEqual([
       "MessageVelocity",
-      "OutletRateExceeded",
+      "ToolRateExceeded",
       "WarningCount",
       "Custom",
     ]);
@@ -584,12 +585,10 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
     // `resume` and `shutdown` return Promise<undefined> so `afterEach`
     // teardown paths that `await scp.shutdown(...)` don't force every
     // test to set up a stub for a semantically-void operation.
-    await expect(
-      (mock as unknown as { resume: () => Promise<unknown> }).resume(),
-    ).resolves.toBeUndefined();
-    await expect(
-      (mock as unknown as { shutdown: (t: bigint) => Promise<unknown> }).shutdown(0n),
-    ).resolves.toBeUndefined();
+    expect(await (mock as unknown as { resume: () => Promise<unknown> }).resume()).toBeUndefined();
+    expect(
+      await (mock as unknown as { shutdown: (t: bigint) => Promise<unknown> }).shutdown(0n),
+    ).toBeUndefined();
   });
 
   it("lenient mode (`strict: false`) resolves unstubbed methods to undefined", async () => {
@@ -670,15 +669,16 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
 // What follows drives the SDK's caller-owned `SCP` class against the
 // real NAPI bridge with an in-process relay transport. The goal is the
 // same coverage the pre-ADR-048 mock-bridge suite owned — Identity,
-// Context, UCAN, Outlet, Broadcast, Governance, Event log, TTL, Storage,
+// Context, UCAN, Tool, Broadcast, Governance, Event log, TTL, Storage,
 // Error paths — but routed through the real MLS / UCAN / governance
 // pipeline so the assertions test protocol behavior rather than a
 // simulator.
 //
 // Skip-gracefully contract: if the platform-specific
-// `@limn-works/scp-ts-napi-*` package is unavailable (missing prebuilt
-// binary), the whole block skips — matching the pattern used by
-// `real-napi.test.ts`, `e2e-relay.test.ts`, and `scp-class.test.ts`.
+// `@limn-works/scp-ts-napi-*` package is unavailable (browser/WASM
+// runtime, missing prebuilt binary), the whole block skips — matching
+// the pattern used by `real-napi.test.ts`, `e2e-relay.test.ts`, and
+// `scp-class.test.ts`.
 // ---------------------------------------------------------------------------
 
 let napiSkipReason = "";
@@ -955,15 +955,22 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.identityCreateLinkAttestation rejects an unsupported proof method", async () => {
       const identity = await scp.identityCreate("in_memory");
-      await expect(
-        scp.identityCreateLinkAttestation(
+      let attestErr: unknown;
+      try {
+        await scp.identityCreateLinkAttestation(
           identity.did,
           "github.com",
           "alice",
           "https://example.com/proof",
           "not_a_valid_method",
-        ),
-      ).rejects.toThrow(/oauth|signed_post|dns_record|challenge_response/);
+        );
+      } catch (e) {
+        attestErr = e;
+      }
+      expect(attestErr).toBeInstanceOf(Error);
+      expect((attestErr as Error).message).toMatch(
+        /oauth|signed_post|dns_record|challenge_response/,
+      );
     });
 
     it("scp.identityVerifyLinkAttestation accepts a freshly-minted attestation", async () => {
@@ -988,7 +995,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // passing a *malformed* key hex rejects — which at least pins
       // the surface. A happy-path verify requires the issuer public
       // key hex, which is not exposed on the DID doc directly.
-      await expect(scp.identityVerifyLinkAttestation(attestationJson, "not-hex")).rejects.toThrow();
+      let verifyErr: unknown;
+      try {
+        await scp.identityVerifyLinkAttestation(attestationJson, "not-hex");
+      } catch (e) {
+        verifyErr = e;
+      }
+      expect(verifyErr).toBeInstanceOf(Error);
     });
   });
 
@@ -1061,9 +1074,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
       await scp.contextClose(ctx._rawHandle, admin.did);
       // After close, contextSend must fail.
-      await expect(
-        scp.contextSend(ctx._rawHandle, admin.did, new TextEncoder().encode("late")),
-      ).rejects.toThrow();
+      let sendAfterCloseErr: unknown;
+      try {
+        await scp.contextSend(ctx._rawHandle, admin.did, new TextEncoder().encode("late"));
+      } catch (e) {
+        sendAfterCloseErr = e;
+      }
+      expect(sendAfterCloseErr).toBeInstanceOf(Error);
     });
 
     it("scp.contextIsMember returns true for the creator, false for an outsider", async () => {
@@ -1098,15 +1115,20 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.contextCreate rejects an unknown governance model (SCP-GOV error)", async () => {
       const identity = await scp.identityCreate("in_memory");
-      await expect(
-        scp.contextCreate(
+      let govErr: unknown;
+      try {
+        await scp.contextCreate(
           identity,
           JSON.stringify({
             ceiling: ["messages:read"],
             governance: "does_not_exist",
           }),
-        ),
-      ).rejects.toThrow(/unsupported governance|governance/);
+        );
+      } catch (e) {
+        govErr = e;
+      }
+      expect(govErr).toBeInstanceOf(Error);
+      expect((govErr as Error).message).toMatch(/unsupported governance|governance/);
     });
 
     it("Broadcast-mode contextCreate produces a usable handle", async () => {
@@ -1132,9 +1154,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         JSON.stringify({ ceiling: ["messages:read", "messages:write", "context:close"] }),
       );
       await scp.contextClose(ctx._rawHandle, identity.did);
-      await expect(
-        scp.contextSend(ctx._rawHandle, identity.did, new TextEncoder().encode("late")),
-      ).rejects.toThrow();
+      let closedSendErr: unknown;
+      try {
+        await scp.contextSend(ctx._rawHandle, identity.did, new TextEncoder().encode("late"));
+      } catch (e) {
+        closedSendErr = e;
+      }
+      expect(closedSendErr).toBeInstanceOf(Error);
     });
 
     it("non-admin closing a single_admin context is rejected", async () => {
@@ -1148,7 +1174,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         }),
       );
       await scp.contextJoin(ctx._rawHandle, member.did);
-      await expect(scp.contextClose(ctx._rawHandle, member.did)).rejects.toThrow();
+      let nonAdminCloseErr: unknown;
+      try {
+        await scp.contextClose(ctx._rawHandle, member.did);
+      } catch (e) {
+        nonAdminCloseErr = e;
+      }
+      expect(nonAdminCloseErr).toBeInstanceOf(Error);
     });
   });
 
@@ -1186,9 +1218,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       const fullCap = token.capabilities[0];
       expect(fullCap).toBeDefined();
-      // Must not throw. The enforcing gate requires the presenting agent (the
-      // token's audience).
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, fullCap as string, member.did);
+      // Must not throw.
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, fullCap as string);
     });
 
     it("scp.ucanValidate rejects a capability that was not granted", async () => {
@@ -1198,9 +1229,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
         encoded: string;
       };
-      await expect(
-        scp.ucanValidate(ctx._rawHandle, token.encoded, "messages:write", member.did),
-      ).rejects.toThrow();
+      let notGrantedErr: unknown;
+      try {
+        await scp.ucanValidate(ctx._rawHandle, token.encoded, "messages:write");
+      } catch (e) {
+        notGrantedErr = e;
+      }
+      expect(notGrantedErr).toBeInstanceOf(Error);
     });
 
     it("scp.ucanValidate rejects a token a second time (ADR-016 step 9 nonce replay)", async () => {
@@ -1213,11 +1248,15 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       const cap = token.capabilities[0] as string;
       // First validation succeeds — nonce consumed.
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
       // Second presentation of the same token must be rejected.
-      await expect(
-        scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did),
-      ).rejects.toThrow();
+      let nonceReplayErr: unknown;
+      try {
+        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+      } catch (e) {
+        nonceReplayErr = e;
+      }
+      expect(nonceReplayErr).toBeInstanceOf(Error);
     });
 
     it("scp.ucanRevoke causes subsequent validation to fail", async () => {
@@ -1230,9 +1269,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       const cap = token.capabilities[0] as string;
       await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
-      await expect(
-        scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did),
-      ).rejects.toThrow();
+      let revokedErr: unknown;
+      try {
+        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+      } catch (e) {
+        revokedErr = e;
+      }
+      expect(revokedErr).toBeInstanceOf(Error);
     });
 
     it("scp.ucanDelegate scopes a minted token down to a subset audience", async () => {
@@ -1266,35 +1309,43 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
         encoded: string;
       };
-      await expect(
-        scp.ucanDelegate(ctx._rawHandle, other.did, admin.did, token.encoded, ["messages:read"]),
-      ).rejects.toThrow();
+      let delegateCeilingErr: unknown;
+      try {
+        await scp.ucanDelegate(ctx._rawHandle, other.did, admin.did, token.encoded, [
+          "messages:read",
+        ]);
+      } catch (e) {
+        delegateCeilingErr = e;
+      }
+      expect(delegateCeilingErr).toBeInstanceOf(Error);
     });
   });
 
   // -------------------------------------------------------------------
-  // 5.4 Outlet lifecycle — register, invoke (with UCAN), verify, sessions
+  // 5.4 Tool lifecycle — register, invoke (with UCAN), verify, sessions
   //
-  // Exercises the real ContextManager outlet-execution path with MLS +
-  // UCAN capability enforcement. Distinct from `outlets.test.ts` which
-  // focuses on the `defineOutletDefinition` helper shape.
+  // Exercises the real ContextManager tool-execution path with MLS +
+  // UCAN capability enforcement. Distinct from `tools.test.ts` which
+  // focuses on the `defineToolDefinition` helper shape.
   // -------------------------------------------------------------------
 
-  describe("Outlet lifecycle (real NAPI)", () => {
-    // scp.outletRegister accepts the public `OutletDefinition` shape and
-    // converts it to the NAPI field names internally (mirroring
-    // `internal/native.ts`), so these tests build the SDK-facing camelCase
-    // shape (`inputSchema`/`outputSchema` objects, `operator`).
+  describe("Tool lifecycle (real NAPI)", () => {
+    // scp.toolRegister passes the definition verbatim to the native
+    // bridge — which expects the NAPI field names (`inputSchemaJson`,
+    // `outputSchemaJson`, `operatorDid`) rather than the SDK-facing
+    // camelCase (`inputSchema`, `outputSchema`, `operator`). The
+    // `internal/native.ts` Bridge wrapper is the layer that performs
+    // the rename — callers of the SCP class directly must build the
+    // NAPI shape themselves. These tests exercise the direct surface.
 
     function makeNapiToolDef(args: {
       name: string;
       description: string;
       operator: string;
-      kind?: "query" | "action";
       input?: Record<string, unknown>;
       output?: Record<string, unknown>;
-    }): OutletDefinition {
-      // The Rust outlet-registration layer enforces a schema-specificity
+    }): Record<string, unknown> {
+      // The Rust tool-registration layer enforces a schema-specificity
       // floor (§6.2, §9.2.1): AT LEAST ONE of the input/output schemas
       // must declare ≥ 2 distinct property fields. Using a 2-field input
       // with a permissive output mirrors `real-napi.test.ts` — the
@@ -1303,24 +1354,22 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       return {
         name: args.name,
         description: args.description,
-        kind: args.kind ?? "action",
-        inputSchema: args.input ?? {
-          type: "object",
-          properties: { x: { type: "number" }, mode: { type: "string" } },
-          required: ["x", "mode"],
-        },
-        outputSchema: args.output ?? { type: "object" },
-        operator: args.operator,
+        inputSchemaJson: JSON.stringify(
+          args.input ?? {
+            type: "object",
+            properties: { x: { type: "number" }, mode: { type: "string" } },
+            required: ["x", "mode"],
+          },
+        ),
+        outputSchemaJson: JSON.stringify(args.output ?? { type: "object" }),
+        operatorDid: args.operator,
       };
     }
 
-    it("scp.outletRegister returns an outlet ID", async () => {
+    it("scp.toolRegister returns a tool ID", async () => {
       const identity = await scp.identityCreate("in_memory");
-      const ctx = await scp.contextCreate(
-        identity,
-        JSON.stringify({ ceiling: ["outlet:register"] }),
-      );
-      const outletId = await scp.outletRegister(
+      const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["tool:register"] }));
+      const toolId = await scp.toolRegister(
         ctx._rawHandle,
         makeNapiToolDef({
           name: "scp-class-echo",
@@ -1328,28 +1377,28 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           operator: identity.did,
         }),
       );
-      expect(typeof outletId).toBe("string");
-      expect(outletId.length).toBeGreaterThan(0);
+      expect(typeof toolId).toBe("string");
+      expect(toolId.length).toBeGreaterThan(0);
     });
 
-    it("scp.outletInvoke executes a registered outlet with a valid UCAN", async () => {
+    it("scp.toolInvoke executes a registered tool with a valid UCAN", async () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
+        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
       );
       await scp.contextJoin(ctx._rawHandle, member.did);
-      const outletId = await scp.outletRegister(
+      const toolId = await scp.toolRegister(
         ctx._rawHandle,
         makeNapiToolDef({ name: "scp-class-add", description: "Adds", operator: admin.did }),
       );
-      const ucan = (await scp.ucanMint(ctx._rawHandle, member.did, ["outlet:call:*"])) as {
+      const ucan = (await scp.ucanMint(ctx._rawHandle, member.did, ["tool:invoke:*"])) as {
         encoded: string;
       };
-      const result = await scp.outletInvoke(
+      const result = await scp.toolInvoke(
         ctx._rawHandle,
-        outletId,
+        toolId,
         JSON.stringify({ x: 7, mode: "double" }),
         member.did,
         ucan.encoded,
@@ -1359,14 +1408,14 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       JSON.parse(result);
     });
 
-    it("scp.outletInvoke fails without a UCAN for the matching capability", async () => {
+    it("scp.toolInvoke fails without a UCAN for the matching capability", async () => {
       const admin = await scp.identityCreate("in_memory");
       const outsider = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
+        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
       );
-      const outletId = await scp.outletRegister(
+      const toolId = await scp.toolRegister(
         ctx._rawHandle,
         makeNapiToolDef({
           name: "scp-class-denied",
@@ -1375,24 +1424,21 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         }),
       );
       await expect(
-        scp.outletInvoke(ctx._rawHandle, outletId, "{}", outsider.did, ""),
+        scp.toolInvoke(ctx._rawHandle, toolId, "{}", outsider.did, ""),
       ).rejects.toThrow();
     });
 
-    it("scp.outletVerify returns a verification summary", async () => {
+    it("scp.toolVerify returns a verification summary", async () => {
       const identity = await scp.identityCreate("in_memory");
-      const ctx = await scp.contextCreate(
-        identity,
-        JSON.stringify({ ceiling: ["outlet:register"] }),
-      );
-      const outletId = await scp.outletRegister(
+      const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["tool:register"] }));
+      const toolId = await scp.toolRegister(
         ctx._rawHandle,
         makeNapiToolDef({
           name: "scp-class-verify-me",
           description: "Verifiable",
           operator: identity.did,
           // 2-field input keeps us over the specificity floor; the
-          // output stays permissive so outletVerify's default payload
+          // output stays permissive so toolVerify's default payload
           // is accepted without a closed schema.
           input: {
             type: "object",
@@ -1401,7 +1447,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           },
         }),
       );
-      const verification = (await scp.outletVerify(ctx._rawHandle, outletId)) as {
+      const verification = (await scp.toolVerify(ctx._rawHandle, toolId)) as {
         passed: boolean;
         failures: unknown[];
       };
@@ -1579,11 +1625,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
   // -------------------------------------------------------------------
 
   describe("Governance (real NAPI)", () => {
-    it("scp.contextExecuteGovernanceAction rejects an untracked proposal id", async () => {
-      // Direct execute is BY ID: the runtime resolves the authoritative
-      // proposal from the context actor's own quorum-validated engine. A
-      // fabricated id (a forgery) must be rejected — a caller cannot smuggle in
-      // an action via a hand-crafted "approved" proposal.
+    it("scp.contextExecuteGovernanceAction changes a member's role", async () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
@@ -1594,25 +1636,46 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         }),
       );
       await scp.contextJoin(ctx._rawHandle, member.did);
-
-      const fabricated = "ab".repeat(32);
-      await expect(scp.contextExecuteGovernanceAction(ctx._rawHandle, fabricated)).rejects.toThrow(
-        /not tracked/,
+      const result = await scp.contextExecuteGovernanceAction(
+        ctx._rawHandle,
+        JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
+        admin.did,
       );
-
-      // The forged execute applied nothing: the member's role is unchanged.
-      const role = await scp.contextMemberRole(ctx._rawHandle, member.did);
-      expect(role !== null).toBe(true);
-      expect(String(role).toLowerCase()).not.toContain("moderator");
+      expect(typeof result).toBe("string");
+      const newRole = await scp.contextMemberRole(ctx._rawHandle, member.did);
+      expect(newRole !== null).toBe(true);
+      expect(String(newRole).toLowerCase()).toContain("moderator");
     });
 
-    it("scp.contextExecuteGovernanceAction rejects a malformed proposal id", async () => {
+    it("scp.contextExecuteGovernanceAction removes a member", async () => {
+      const admin = await scp.identityCreate("in_memory");
+      const member = await scp.identityCreate("in_memory");
+      const ctx = await scp.contextCreate(
+        admin,
+        JSON.stringify({
+          ceiling: ["messages:read", "member:invite", "member:remove", "role:assign"],
+          governance: "single_admin",
+        }),
+      );
+      await scp.contextJoin(ctx._rawHandle, member.did);
+      expect(await scp.contextIsMember(ctx._rawHandle, member.did)).toBe(true);
+      await scp.contextExecuteGovernanceAction(
+        ctx._rawHandle,
+        JSON.stringify({ RemoveMember: { did: member.did, reason: null } }),
+        admin.did,
+      );
+      expect(await scp.contextIsMember(ctx._rawHandle, member.did)).toBe(false);
+    });
+
+    it("scp.contextExecuteGovernanceAction rejects invalid JSON", async () => {
       const admin = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
       );
-      await expect(scp.contextExecuteGovernanceAction(ctx._rawHandle, "not-hex")).rejects.toThrow();
+      await expect(
+        scp.contextExecuteGovernanceAction(ctx._rawHandle, "{not-json", admin.did),
+      ).rejects.toThrow();
     });
 
     it("scp.contextGovernanceListProposals returns a JSON array (initially empty)", async () => {
@@ -1809,7 +1872,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.contextImport rejects malformed data", async () => {
       const identity = await scp.identityCreate("in_memory");
-      await expect(scp.contextImport(new Uint8Array([0, 1, 2, 3]), identity.did)).rejects.toThrow();
+      let importMalformedErr: unknown;
+      try {
+        await scp.contextImport(new Uint8Array([0, 1, 2, 3]), identity.did);
+      } catch (e) {
+        importMalformedErr = e;
+      }
+      expect(importMalformedErr).toBeInstanceOf(Error);
     });
   });
 
@@ -1851,10 +1920,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // named adapter against a registry.
       const paid = JSON.stringify({
         locked: false,
-        // ADR-060: monetary `Amount` values serialize as canonical decimal
-        // STRINGS in JSON (native integer only in MessagePack), so
-        // `per_message` is `"100"`, not a bare number.
-        cost_schedule: { currency: [85, 83, 68, 0], per_message: "100" },
+        cost_schedule: { currency: [85, 83, 68, 0], per_message: 100 },
         payment_adapters: ["x402"],
         pricing_formula: null,
         payee: "did:dht:zpayee",
@@ -1991,11 +2057,15 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         capabilities: string[];
       };
       const cap = token.capabilities[0] as string;
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
       await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
-      await expect(
-        scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did),
-      ).rejects.toThrow();
+      let e2eRevokedErr: unknown;
+      try {
+        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+      } catch (e) {
+        e2eRevokedErr = e;
+      }
+      expect(e2eRevokedErr).toBeInstanceOf(Error);
     });
 
     it("E2E broadcast lifecycle: create -> subscribe -> publish -> unsubscribe", async () => {
@@ -2048,20 +2118,16 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
     try {
       const idA = await a.identityCreate("in_memory");
       const idB = await b.identityCreate("in_memory");
-      // Two fresh SCPs mint distinct identities.
+      // Ephemeral instances are strictly isolated — no shared identity store.
       expect(idA.did).not.toBe(idB.did);
-      // Isolation is over KEY MATERIAL / storage, not public documents. Ephemeral
-      // instances share NO custody or storage, but they DO share the process-wide
-      // DHT (#1144) — the in-memory test double for Mainline — so B can resolve
-      // A's PUBLIC DID document, exactly as any node resolves any published DID in
-      // a real deployment. That resolution yields an "external" handle carrying no
-      // key material: B cannot sign or act as A. (Before ADR-062 Slice 1,
-      // `identityLoad`'s DHT fallback used a throwaway empty client and could
-      // never resolve anything — the fallback is now wired to the shared client,
-      // so cross-instance public resolution actually works.)
-      const aSeenByB = await b.identityLoad(idA.did);
-      expect(aSeenByB.did).toBe(idA.did);
-      expect(aSeenByB.custodyType).toBe("external");
+      // And loading A's DID on B must fail (B never saw it).
+      let isolationErr: unknown;
+      try {
+        await b.identityLoad(idA.did);
+      } catch (e) {
+        isolationErr = e;
+      }
+      expect(isolationErr).toBeInstanceOf(Error);
     } finally {
       await a.shutdown(1);
       await b.shutdown(1);
@@ -2261,7 +2327,8 @@ describe("IdentityAttestation value object", () => {
 
 // ---------------------------------------------------------------------------
 // 8. Error hierarchy — SDK-level regressions so consumers can rely on
-//    `instanceof` checks against the typed subclasses. Without a running
+//    `instanceof` checks against the typed subclasses. Restored from
+//    the pre-B4 `WASM economy fail-closed` section; without a running
 //    bridge these tests still pin the contract that the typed
 //    subclasses exist and extend `ScpError`.
 // ---------------------------------------------------------------------------
