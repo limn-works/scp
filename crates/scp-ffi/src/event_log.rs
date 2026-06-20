@@ -50,8 +50,8 @@ use crate::validate;
 #[pyclass(name = "Event")]
 #[derive(Debug)]
 pub struct PyEvent {
-    /// The event type (e.g., `"ContextCreated"`, `"MessageSent"`,
-    /// `"ToolInvoked"`).
+    /// The event type (e.g., `"ContextCreated"`, `"MemberJoined"`,
+    /// `"GovernanceActionExecuted"`).
     #[pyo3(get)]
     pub event_type: String,
 

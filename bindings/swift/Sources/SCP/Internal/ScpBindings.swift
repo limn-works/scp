@@ -8545,7 +8545,7 @@ public func FfiConverterTypeDataProvenance_lower(_ value: DataProvenance) -> Rus
  */
 public struct Event {
     /**
-     * The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`).
+     * The event type (e.g., `"ContextCreated"`, `"MemberJoined"`, `"GovernanceActionExecuted"`).
      */
     public var eventType: String
     /**
@@ -8569,7 +8569,7 @@ public struct Event {
     // declare one manually.
     public init(
         /**
-         * The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`).
+         * The event type (e.g., `"ContextCreated"`, `"MemberJoined"`, `"GovernanceActionExecuted"`).
          */eventType: String, 
         /**
          * DID of the actor who produced this event.

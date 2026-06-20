@@ -703,7 +703,7 @@ export interface TransportConfig {
 
 /** A protocol event from the context event log. */
 export interface Event {
-  /** Event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`). */
+  /** Event type (e.g., `"ContextCreated"`, `"MemberJoined"`, `"GovernanceActionExecuted"`). */
   readonly eventType: string;
   /** DID of the actor who produced this event. */
   readonly actorDid: string;

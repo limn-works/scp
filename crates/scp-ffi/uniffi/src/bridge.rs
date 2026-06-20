@@ -1848,7 +1848,7 @@ pub struct TransportStatus {
 /// See ADR-011 (Event Log) and spec §13 (Event Log).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Event {
-    /// The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`).
+    /// The event type (e.g., `"ContextCreated"`, `"MemberJoined"`, `"GovernanceActionExecuted"`).
     pub event_type: String,
     /// DID of the actor who produced this event.
     pub actor_did: String,
