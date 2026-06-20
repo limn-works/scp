@@ -1044,6 +1044,15 @@ def _check_operation_in_sdk(
     domain_snake = f"{domain_lower}_{op_name}"
     domain_camel = _to_camel(domain_snake)
 
+    # NOTE: The candidate list includes bare op_name/camelCase/PascalCase.
+    # These are necessary because Swift/Kotlin SDKs use bare method names
+    # (e.g. Swift: `addAgentKey`, Kotlin: `isMember`) rather than
+    # domain-prefixed forms. The tradeoff is that a fabricated op whose name
+    # collides with an unrelated SDK symbol will pass the gate — this is the
+    # name-existence vs name-resolution limitation documented in
+    # .docs/lessons/ast-gate-checks-definition-not-name-resolution.md.
+    # Cross-SDK name irregularities and all ops where domain-scoped matching
+    # is insufficient must use explicit ALIASES entries above.
     candidates = [
         # Raw operation names
         op_name,  # send_message
