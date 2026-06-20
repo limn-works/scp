@@ -10,12 +10,9 @@ See ADR-020 in ``.docs/adrs/phase-4.md`` and spec section 22 (Addressing).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from scp_sdk.errors import ScpError
-
-if TYPE_CHECKING:
-    pass
 
 
 def _bridge() -> Any:
@@ -101,7 +98,7 @@ def normalize_address(address: str) -> str:
     return bridge.discovery_normalize_address(address)
 
 
-async def discover_contexts(query: str) -> list[dict[str, Any]]:
+async def discover_contexts(scp: Any, query: str) -> list[dict[str, Any]]:
     """Discover contexts advertised by a DID or named by an ``scp://`` URI.
 
     For an ``scp://`` URI the lookup is a synchronous parse. For a ``did:``
@@ -109,11 +106,11 @@ async def discover_contexts(query: str) -> list[dict[str, Any]]:
     which may involve network (DHT) resolution — so the call is dispatched to
     a worker thread to avoid blocking the event loop.
 
-    Uses the module-level bridge singleton for stateless discovery queries,
-    consistent with the other discovery helpers in this module that do not
-    require an explicit SCP instance (spec sections 5.14.11, 18.2.2, and 18.4).
+    Takes an explicit ``scp`` instance for cross-SDK consistency with
+    ``discoverContexts(scp, query)`` in TypeScript and other SDK bindings.
 
     Args:
+        scp: An active :class:`~scp_sdk.SCP` instance.
         query: A ``did:`` identifier or an ``scp://`` context URI.
 
     Returns:
@@ -126,8 +123,7 @@ async def discover_contexts(query: str) -> list[dict[str, Any]]:
     """
     import asyncio
 
-    bridge = _bridge()
-    results = await asyncio.to_thread(bridge.context_discover, query)
+    results = await asyncio.to_thread(scp._native.context_discover, query)
     return [dict(item) for item in results]
 
 

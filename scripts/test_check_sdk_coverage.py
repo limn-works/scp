@@ -157,14 +157,14 @@ def test_gate_fails_on_unmatched_true_entry(tmp_path: Path) -> None:
                         "name": "nonexistent_operation_zzzzzz",
                         # python: true but the symbol won't exist anywhere
                         "python": True,
-                        # Other SDKs: false + valid exemption (no errors expected)
+                        # Other SDKs: false + valid exemption string (no errors expected)
                         "typescript": False,
                         "kotlin": False,
                         "swift": False,
                         "exemptions": {
-                            "typescript": {"reason": "Not implemented"},
-                            "kotlin": {"reason": "Not implemented"},
-                            "swift": {"reason": "Not implemented"},
+                            "typescript": "Not yet implemented in TypeScript SDK",
+                            "kotlin": "Not yet implemented in Kotlin SDK",
+                            "swift": "Not yet implemented in Swift SDK",
                         },
                     }
                 ],
@@ -181,9 +181,62 @@ def test_gate_fails_on_unmatched_true_entry(tmp_path: Path) -> None:
         f"Gate should have exited 1 for unmatched true entry, got {result.returncode}.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    # The gate prints the specific error phrase for unmatched-true cells.
-    assert "no matching SDK symbol was found" in result.stdout or "unmatched true" in result.stdout, (
-        f"Expected unmatched-true error phrase in stdout.\nstdout:\n{result.stdout}"
+    # The gate prints this specific per-operation error line for unmatched-true cells.
+    # Assert on the exact phrase from the error branch (not the summary label, which
+    # appears on every run regardless of error count).
+    assert "no matching SDK symbol was found" in result.stdout, (
+        f"Expected unmatched-true error phrase 'no matching SDK symbol was found' in stdout.\n"
+        f"stdout:\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 2b: Gate exits 1 when a required SDK key is missing entirely
+# ---------------------------------------------------------------------------
+
+
+def test_gate_fails_on_missing_sdk_key(tmp_path: Path) -> None:
+    """An op that omits a required SDK key entirely must fail.
+
+    The gate distinguishes a missing key (authoring gap — never evaluated for
+    that SDK) from an explicit false entry (deliberate exemption).  A missing
+    key must produce a specific error and exit 1, regardless of other entries.
+    """
+    synthetic_matrix = {
+        "capabilities": [
+            {
+                "domain": "Fake",
+                "operations": [
+                    {
+                        "name": "missing_key_op_zzzzzz",
+                        # swift key is entirely absent — not false, not true
+                        "python": False,
+                        "typescript": False,
+                        "kotlin": False,
+                        # "swift" key deliberately omitted
+                        "exemptions": {
+                            "python": "Not yet implemented in Python SDK",
+                            "typescript": "Not yet implemented in TypeScript SDK",
+                            "kotlin": "Not yet implemented in Kotlin SDK",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    matrix_file = tmp_path / "matrix.json"
+    matrix_file.write_text(json.dumps(synthetic_matrix), encoding="utf-8")
+
+    wrapper = _build_wrapper(tmp_path, matrix_file)
+    result = _run_wrapper(wrapper)
+
+    assert result.returncode == 1, (
+        f"Gate should have exited 1 for missing SDK key, got {result.returncode}.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    # The gate prints a per-op error that names the missing SDK key.
+    assert "missing SDK key" in result.stdout or "'swift'" in result.stdout, (
+        f"Expected missing-SDK-key error phrase in stdout.\nstdout:\n{result.stdout}"
     )
 
 
