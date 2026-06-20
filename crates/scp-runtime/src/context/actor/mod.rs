@@ -35,6 +35,7 @@
 //! - [`handlers`] — per-domain dispatch stubs (commits 7-11 migrate the
 //!   real handlers off `ContextManager`).
 
+pub mod class_s;
 pub mod commands;
 pub mod deps;
 pub mod handle;
@@ -130,7 +131,7 @@ pub struct ContextActor {
     /// `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder
     /// row 12b.2a rationale).
     #[allow(dead_code)] // read by 12b.2b handler bodies
-    state: Option<state::PerContextState>,
+    state: Option<class_s::ClassSCell>,
     /// Owned dependency bundle. `Some` / `None` mirrors [`Self::state`]
     /// — the two are always both `Some` or both `None`. Two-mode is
     /// bounded identically.
@@ -229,7 +230,11 @@ impl ContextActor {
         Self {
             context_id,
             inbox,
-            state: Some(state),
+            // Wrap the owned state in the Class-S fail-closed-persist cell.
+            // PR1 scaffolding: handlers still receive `&mut PerContextState`
+            // via `ClassSCell::state_mut()` at the dispatch boundary, so this
+            // is a pure ownership change with no behaviour difference.
+            state: Some(class_s::ClassSCell::new(state)),
             deps: Some(deps),
             ttl_timer: None,
             governance_timeout: None,
@@ -450,7 +455,7 @@ impl ContextActor {
         // and individual handler bodies call `shim_supervisor()` on the
         // handle when they need the legacy `Arc<Supervisor>` for
         // unmigrated paths.
-        let (mut state, deps) = {
+        let (mut cell, deps) = {
             #[allow(clippy::expect_used)]
             (
                 self.state.take().expect("state-bearing actor lost state"),
@@ -458,13 +463,17 @@ impl ContextActor {
             )
         };
 
-        let outcome = Self::dispatch_state(&mut state, &deps, cmd).await;
+        // PR1 scaffolding: obtain the bare `&mut PerContextState` via the
+        // temporary `state_mut()` escape hatch and pass it to handlers EXACTLY
+        // as before. No handler is migrated to the `ClassSCell` combinators in
+        // PR1, so dispatch behaviour is byte-for-byte unchanged.
+        let outcome = Self::dispatch_state(cell.state_mut(), &deps, cmd).await;
         if outcome.mutated {
             self.dirty = true;
         }
 
         // Restore.
-        self.state = Some(state);
+        self.state = Some(cell);
         self.deps = Some(deps);
     }
 
