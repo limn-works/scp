@@ -251,8 +251,8 @@ class IdentityAdvancedBridgeTest {
     @Nested
     inner class Migrate {
         // The simpler `migrate` overload is deprecated at ERROR level
-        // because it drops the rotation event required by spec §9.12
-        // spec §9.12, ADR-003 §4b. We still test that the underlying binding plumbing
+        // because it drops the rotation event required by spec §9.12, ADR-003 §4b.
+        // We still test that the underlying binding plumbing
         // works for any legacy in-tree caller until the overload is
         // removed. `DEPRECATION_ERROR` is the Kotlin-specific suppress
         // key for `DeprecationLevel.ERROR` (plain `DEPRECATION` only
