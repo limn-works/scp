@@ -70,6 +70,8 @@ from scp_sdk.discovery import (
     parse_address,
 )
 from scp_sdk.economy import (
+    PaymentReceiptVerificationEntry,
+    PaymentReceiptVerificationResult,
     auto_accept_blocked,
     check_policy_lock,
     estimate_cost,
@@ -280,6 +282,8 @@ __all__ = [
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",
+    "PaymentReceiptVerificationEntry",
+    "PaymentReceiptVerificationResult",
     "PromotionPolicy",
     "Proof",
     "ProtocolError",

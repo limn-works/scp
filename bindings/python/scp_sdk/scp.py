@@ -55,6 +55,7 @@ from typing import (
     runtime_checkable,
 )
 
+from scp_sdk.economy import PaymentReceiptVerificationResult
 from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
 
@@ -2185,21 +2186,23 @@ class SCP:
 
     async def economy_verify_payment_receipts(
         self, receipts: list[dict[str, Any]]
-    ) -> dict[str, Any]:
+    ) -> PaymentReceiptVerificationResult:
         """Delegate to ``_scp_core.SCP.economy_verify_payment_receipts``.
 
         Verifies a batch of payment receipts against this instance's economy
         state. The result reports cryptographic validity via the top-level
         ``all_valid`` flag and a per-receipt ``valid`` flag. Note that an
-        invalid-but-reachable receipt still carries ``ok == true`` — callers
+        invalid-but-reachable receipt still carries ``ok == True`` — callers
         scanning for failures MUST inspect ``valid``/``all_valid``, not ``ok``.
 
         Args:
-            receipts: List of payment receipt dicts to verify.
+            receipts: List of payment receipt dicts to verify. Maximum
+                10,000 receipts per call.
 
         Returns:
-            The parsed verification result (a dict with ``all_valid`` and a
-            list of per-receipt records carrying ``valid``/``ok``).
+            A :class:`~scp_sdk.PaymentReceiptVerificationResult` with
+            ``all_valid`` and a list of per-receipt
+            :class:`~scp_sdk.PaymentReceiptVerificationEntry` records.
 
         Raises:
             ScpError: If the receipts are invalid or the supervisor is
