@@ -2608,7 +2608,7 @@ pub struct Identity {
     pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// JSON-serialized `scp_did::DidRotationEvent` produced when this
     /// handle was minted by [`Scp::identity_migrate`]. SDK callers MUST
-    /// distribute the event to active context members per spec §3.2.1
+    /// distribute the event to active context members per spec §9.12
     /// step 4b. `None` for handles produced by `identity_create`,
     /// `rotate_key`, agent-key ops, or external load — those do not
     /// change the DID, so no `DidRotationEvent` is constructed.
@@ -2672,7 +2672,7 @@ impl Identity {
     /// Returns the JSON-serialized `DidRotationEvent` if this handle
     /// was produced by [`Scp::identity_migrate`]; `None` otherwise.
     /// SDK callers MUST distribute the event to active context members
-    /// per spec §3.2.1 step 4b.
+    /// per spec §9.12 step 4b.
     #[must_use]
     pub fn rotation_event_json(&self) -> Option<String> {
         self.rotation_event_json.clone()

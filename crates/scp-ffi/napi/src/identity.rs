@@ -463,7 +463,7 @@ pub(crate) struct NapiIdentityInner {
     /// JSON-serialized `scp_did::DidRotationEvent` produced when
     /// this handle was minted by [`NapiIdentity::migrate`]. SDK callers
     /// MUST distribute the event to active context members per spec
-    /// §3.2.1 step 4b. `None` for handles produced by `identity_create`,
+    /// §9.12 step 4b. `None` for handles produced by `identity_create`,
     /// `rotate_key`, agent-key ops, or external load — those operations
     /// do not change the DID, so no `DidRotationEvent` is constructed.
     pub(crate) rotation_event_json: Option<String>,
@@ -1020,7 +1020,7 @@ impl NapiIdentity {
     /// Returns the migrated identity. The handle exposes the
     /// `DidRotationEvent` JSON via the `rotationEventJson` getter
     /// (spec §9.12, ADR-003 §4b/4c). The SDK distributes the event to
-    /// active context members per spec §3.2.1 step 4b. Wire shape is
+    /// active context members per spec §9.12 step 4b. Wire shape is
     /// `serde_json::to_string(&scp_did::DidRotationEvent)`.
     #[napi]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
@@ -1143,7 +1143,7 @@ impl NapiIdentity {
 
     /// Returns the JSON-serialized `DidRotationEvent` if this handle was
     /// produced by [`NapiIdentity::migrate`]; `None` otherwise. The SDK
-    /// distributes the event to active context members per spec §3.2.1
+    /// distributes the event to active context members per spec §9.12
     /// step 4b.
     #[napi(getter, js_name = "rotationEventJson")]
     #[must_use]
