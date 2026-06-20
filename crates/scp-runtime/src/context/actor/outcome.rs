@@ -105,7 +105,7 @@ impl<T> Outcome<T> {
 /// variants survive (a `ContextError`-not-`Clone` workaround that had drifted
 /// into two divergent copies).
 #[must_use]
-pub fn outcome_error_sketch(err: &ContextError) -> ContextError {
+pub(crate) fn outcome_error_sketch(err: &ContextError) -> ContextError {
     match err {
         ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
         ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),

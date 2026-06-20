@@ -55,9 +55,7 @@
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::crypto::ucan::UcanToken;
-use scp_protocol::crypto::ucan::validate::{
-    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryNonceTracker, ValidationContext,
-};
+use scp_protocol::crypto::ucan::validate::{DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext};
 
 use scp_protocol::context::tools::cross_context_saga::{
     CommittedSide, CrossContextDivergenceMarker, CrossContextDivergenceMarkerFields,
@@ -141,6 +139,39 @@ pub(crate) const MAX_SAFE_INBOUND_CALLS_PER_MINUTE: u64 = 500;
 /// across both layers — a divergence here would split a saga's log lines.
 fn hex_context_id(id: &[u8; 32]) -> String {
     hex::encode(id)
+}
+
+/// No-op [`NonceTracker`](scp_protocol::crypto::ucan::validate::NonceTracker)
+/// for the cross-context UCAN re-bind path (`validate_ucan_rebind`).
+///
+/// The UCAN's OWN nonce is a long-lived delegation-proof concern and is
+/// deliberately NOT tracked here: re-validating the SAME stored proof on a
+/// later legitimate invocation must not falsely trip UCAN-nonce replay, and a
+/// long-lived proof's nonce timestamp is legitimately stale (well outside the
+/// §9.14 freshness window). The cross-context ENVELOPE replay is owned
+/// separately by B's `xctx_nonce_dedup` (the `validate_freshness` check). Both
+/// methods return `Ok(())` unconditionally — `validate_ucan` consults the
+/// tracker exactly once (Step 9, single token nonce; the delegation-chain walk
+/// never touches it), so this provides identical (zero) intra-call dedup to a
+/// fresh per-call tracker. Mirrors the accepted production `NoopNonceTracker`
+/// pattern in `broadcast.rs`.
+struct NoopNonceTracker;
+impl scp_protocol::crypto::ucan::validate::NonceTracker for NoopNonceTracker {
+    fn check_replay(
+        &self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_protocol::crypto::ucan::UcanError> {
+        Ok(())
+    }
+
+    fn record(
+        &mut self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_protocol::crypto::ucan::UcanError> {
+        Ok(())
+    }
 }
 
 /// Dispatch a [`SagaPhaseMessage`] against actor state.
@@ -951,11 +982,15 @@ fn validate_ucan_rebind(
         revoked_cids: &revoked,
     };
     // The cross-context ENVELOPE replay is owned by B's `xctx_nonce_dedup`
-    // (freshness check below); the UCAN's OWN nonce is a long-lived
-    // delegation-proof concern, so a fresh per-validation tracker is correct
-    // here — re-validating the SAME stored proof on a later legitimate
-    // invocation must not falsely trip UCAN-nonce replay.
-    let mut nonce_tracker = InMemoryNonceTracker::new();
+    // (the freshness check above in `validate_freshness`); the UCAN's OWN
+    // nonce is a long-lived delegation-proof concern, so it is deliberately
+    // NOT tracked here — a no-op tracker is correct. Re-validating the SAME
+    // stored proof on a later legitimate invocation must not falsely trip
+    // UCAN-nonce replay, and a long-lived proof's nonce timestamp is
+    // legitimately stale (well outside the §9.14 freshness window), so a
+    // format/freshness-checking tracker would wrongly reject it. This mirrors
+    // the accepted production `NoopNonceTracker` pattern in `broadcast.rs`.
+    let mut nonce_tracker = NoopNonceTracker;
 
     let mut ctx = ValidationContext {
         did_resolver: &did_resolver,
