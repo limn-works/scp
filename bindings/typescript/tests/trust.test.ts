@@ -452,6 +452,19 @@ describe("evaluateTrust — Layer 2 behavioral record", () => {
     const result = await evaluateTrust(scp, "did:dht:z6MkBob", context);
     expect(result.behavioralRecord).toBeNull();
   });
+
+  it("Layer 2 — non-context error propagates instead of swallowing to null", async () => {
+    const { scp, native, context } = mountWithContext();
+    // ucanValidate resolves (passes Layer 1)
+    native.__stub("ucanValidate", () => Promise.resolve(undefined));
+    // eventLogQuery rejects with a non-[SCP-CTX-] error (e.g. a network failure)
+    const networkError = new Error("Network timeout");
+    native.__stub("eventLogQuery", () => Promise.reject(networkError));
+
+    // The catch block in Layer 2 must re-throw non-context errors — it must NOT
+    // swallow them into behavioralRecord: null (which would hide genuine faults).
+    await expect(evaluateTrust(scp, "did:dht:z6MkBob", context)).rejects.toBe(networkError);
+  });
 });
 
 describe("evaluateTrust — result shape", () => {
