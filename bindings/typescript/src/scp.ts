@@ -2856,23 +2856,6 @@ export function __getNativeScp(scp: SCP): NativeScpInstance {
   return native;
 }
 
-/**
- * Production guard for the two test-only native-handle mutators.
- * Throws unless the current runtime is an explicitly allowed non-production
- * environment. The gate uses a positive allowlist — only `NODE_ENV=test`,
- * `NODE_ENV=development`, or Bun's test runner (detected via `BUN_TEST`) are
- * permitted. All other values (including `undefined`, `staging`, etc.) are
- * blocked so that misconfigured deployments and supply-chain attackers cannot
- * reach these hooks (round-3 red-hat RED-PR5-001/007).
- *
- * `process` may be undefined in browser/Deno contexts — those runtimes have
- * no `SCP` class at all (they load the WASM bridge instead), so a missing
- * `process` is treated as blocked.
- */
-function assertTestHookAllowed(hookName: string): void {
-  assertTestEnvironment(hookName);
-}
-
 // `__setNativeForTests` + `replaceNativeWithMock` removed in round-3 cleanup:
 // black-hat finding BLACK-PR5-003 noted that post-construction swaps via the
 // `nativeTestOverrides` WeakMap were invisible to the ~180 class methods
@@ -2896,7 +2879,7 @@ function assertTestHookAllowed(hookName: string): void {
  * @internal
  */
 export function __constructScpWithNativeForTests(native: unknown): SCP {
-  assertTestHookAllowed("__constructScpWithNativeForTests");
+  assertTestEnvironment("__constructScpWithNativeForTests");
   return new SCP({
     [NATIVE_OVERRIDE]: native as NativeScpInstance,
   } as unknown as ScpOptions);
